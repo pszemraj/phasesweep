@@ -207,6 +207,69 @@ def test_external_status_does_not_initialize_or_change_schema(
     engine.dispose()
 
 
+@pytest.mark.parametrize("database_state", ["uninitialized", "absent-study", "present-study"])
+def test_external_preflight_checks_study_presence_without_initializing_schema(
+    tmp_path, monkeypatch, database_state
+):
+    storage = f"sqlite:///{tmp_path / 'preflight.db'}"
+    if database_state != "uninitialized":
+        optuna.create_study(
+            study_name="read_t::p" if database_state == "present-study" else "unrelated",
+            storage=storage,
+        )
+    engine = sqlalchemy.create_engine(storage)
+    before = sqlalchemy.inspect(engine).get_table_names()
+    writes = []
+    loaded = []
+
+    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
+    def observe_sql(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith(("CREATE", "INSERT", "UPDATE", "DELETE", "ALTER")):
+            writes.append(statement)
+
+    def load_local_study(experiment, phase):
+        loaded.append(phase.name)
+        return optuna.load_study(study_name="read_t::p", storage=storage)
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(engine_optuna, "_load_phase_study", load_local_study)
+    experiment = _experiment(tmp_path).model_copy(
+        update={
+            "storage": "postgresql://localhost/preflight_placeholder",
+            "allow_external_rdb_single_host": True,
+        }
+    )
+
+    study = engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
+
+    assert (study is not None) is (database_state == "present-study")
+    assert loaded == (["p"] if database_state == "present-study" else [])
+    assert sqlalchemy.inspect(engine).get_table_names() == before
+    assert writes == []
+    engine.dispose()
+
+
+def test_external_preflight_fails_closed_when_study_presence_cannot_be_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from phasesweep.engine import StudyStorageUnavailableError
+
+    experiment = _experiment(tmp_path).model_copy(
+        update={
+            "storage": "postgresql://localhost/preflight_placeholder",
+            "allow_external_rdb_single_host": True,
+        }
+    )
+
+    def unavailable_engine(*args: object, **kwargs: object):
+        raise sqlalchemy.exc.OperationalError("connect", {}, RuntimeError("unavailable"))
+
+    monkeypatch.setattr(sqlalchemy, "create_engine", unavailable_engine)
+
+    with pytest.raises(StudyStorageUnavailableError, match="could not be read"):
+        engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
+
+
 def test_external_status_reads_counts_and_running_identities_in_one_statement(
     tmp_path, monkeypatch
 ):

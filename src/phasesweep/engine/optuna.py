@@ -377,6 +377,36 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
     return row is not None
 
 
+def _rdb_study_exists(experiment: Experiment, phase: Phase) -> bool:
+    """Return whether external RDB storage contains a phase study.
+
+    :param Experiment experiment: Parsed experiment with external RDB storage.
+    :param Phase phase: Phase whose stable study name should be checked.
+    :return bool: ``True`` when the storage contains the named study, ``False`` when its
+        Optuna ``studies`` table does not exist or contains no matching row.
+    :raises StudyStorageUnavailableError: The storage or its study table could not be read.
+    """
+    assert experiment.resolved_storage is not None
+    try:
+        engine = sqlalchemy.create_engine(experiment.resolved_storage)
+        try:
+            if not sqlalchemy.inspect(engine).has_table("studies"):
+                return False
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sqlalchemy.text("SELECT 1 FROM studies WHERE study_name = :study_name"),
+                    {"study_name": _phase_study_name(experiment, phase)},
+                ).fetchone()
+        finally:
+            engine.dispose()
+    except Exception as exc:  # noqa: BLE001 - mutating preflight must fail closed
+        raise StudyStorageUnavailableError(
+            f"External RDB storage could not be read while checking for study "
+            f"{_phase_study_name(experiment, phase)!r}."
+        ) from exc
+    return row is not None
+
+
 @dataclass
 class _JournalSnapshot(BaseJournalBackend):
     """Replay one captured journal without rereading or writing the live file."""
@@ -443,22 +473,23 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
 
     Recovery and read-like paths must not call ``create_study(load_if_exists=True)`` because
     that can create an empty study and make missing evidence look safe. This helper checks
-    file-backed storage before delegating to Optuna's loader, then treats an absent study as
+    persistent storage before delegating to Optuna's loader, then treats an absent study as
     ``None``.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose stable study name should be loaded.
     :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
-    :raises StudyStorageUnavailableError: File-backed storage exists but
+    :raises StudyStorageUnavailableError: Persistent storage exists but
         could not be read, so whether the study exists cannot be determined;
         callers on mutating paths must abort rather than treat this as absence.
     """
     if experiment.resolved_storage is None:
         return None
     backend = storage_backend(experiment.resolved_storage)
-    if backend == "sqlite" and not _sqlite_study_exists(experiment, phase):
-        return None
-    if backend == "journal":
+    if backend == "sqlite":
+        if not _sqlite_study_exists(experiment, phase):
+            return None
+    elif backend == "journal":
         if (
             _load_journal_study_snapshot(
                 experiment.resolved_storage, _phase_study_name(experiment, phase)
@@ -469,6 +500,9 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
         # Preflight verified a complete snapshot. Mutating callers still use
         # Optuna's normal backend, including its concurrent-append semantics.
         return _load_phase_study(experiment, phase)
+    elif not _rdb_study_exists(experiment, phase):
+        # Optuna initializes its schema even when load_study finds no study.
+        return None
     try:
         return _load_phase_study(experiment, phase)
     except KeyError:
