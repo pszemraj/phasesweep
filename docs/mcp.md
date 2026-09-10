@@ -75,6 +75,38 @@ MCP annotations mirror the effects in the table. Permissions, closed input schem
 
 Every structured tool result also carries `next_action`, containing the normal next tool name when another automatic workflow step is safe and `null` when the workflow is complete or user/operator input is required. An experiment-scoped `get_run_status` with no live run returns `get_run_results` when phase winners exist. `inspect_experiment` always returns `null` there: only the user may authorize a launch, so the server never proposes `launch_run` as an automatic next step.
 
+### Reading status responses
+
+Save the top-level `run_id` returned by `launch_run` and use it for `await_run`,
+`get_run_status`, and `get_run_results`. In status and await responses, process
+state is **`run.state`** and recovery is **`run.recovery_required`**. A successful
+`get_latest_run` lookup also nests these fields under `run`; when `found` is
+false, `run` is null. Experiment-scoped status can likewise have `run: null`
+when there is no tracked run. `launch_run` and `cancel_run` return `state` at
+the top level, so their shape should not be reused to parse status.
+
+For example, a terminal `await_run` response contains these fields (abridged):
+
+```json
+{
+  "run": {
+    "run_id": "example-run-id",
+    "state": "succeeded",
+    "recovery_required": false,
+    "failure": null
+  },
+  "publication_integrity": "ok",
+  "changed": true,
+  "reason": "terminal",
+  "next_action": "get_run_results"
+}
+```
+
+Follow the top-level `next_action`: repeat bounded `await_run` calls while
+directed, then read `get_run_results`. A client error or disconnect does not
+stop the detached experiment. Reconnect and reuse its saved `run_id`; if the
+ID was lost, recover it with `get_latest_run` before making another launch.
+
 ### Run state and recovery
 
 A launched sweep runs as a detached background process in its own session, so it survives the agent's tool call and a server restart and can be cancelled as a group. `get_run_status` reports `running` / `succeeded` / `failed` / `cancelled`. `await_run` waits without preventing cancellation or other MCP calls. Its 20-second default fits clients with a 30-second tool-call deadline under ordinary status-read latency; request a longer value only when the client allows it, and repeat the bounded call while the run remains active. It never starts another read predicted to finish after its deadline and waits out any remaining budget before returning, but a filesystem or storage read already running in its worker thread cannot be safely preempted and may itself finish after the requested timeout. `from_phase` requires every preceding winner to exist and satisfy the current fingerprint and completion policy; an incomplete timeout winner is accepted only while that phase still sets `allow_incomplete_on_timeout: true`. `launch_run` performs the authoritative readiness check before spawning.

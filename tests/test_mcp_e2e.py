@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from phasesweep import __version__
 from phasesweep.mcp import agent_prompt_text
 from phasesweep.mcp.server import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
@@ -311,6 +312,8 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     app, _registry, _store = make_mcp_app(catalog)
     server = build_server(app)
     initialization = server._mcp_server.create_initialization_options()
+    assert initialization.server_name == "phasesweep"
+    assert initialization.server_version == __version__
     assert initialization.instructions == agent_prompt_text(strip=True)
     for safety_contract in (
         "When `recovery_required` is true, stop",
@@ -338,8 +341,8 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     for tool_name, safety_contracts in {
         TOOL_LAUNCH_RUN: ("explicit user authorization", "Never retry permission"),
         TOOL_CANCEL_RUN: ("user explicitly asks", "Never cancel automatically"),
-        TOOL_GET_RUN_STATUS: ("stop if recovery_required",),
-        TOOL_AWAIT_RUN: ("stop immediately for recovery_required",),
+        TOOL_GET_RUN_STATUS: ("run.state", "stop if run.recovery_required"),
+        TOOL_AWAIT_RUN: ("run.state", "stop immediately if run.recovery_required"),
     }.items():
         for safety_contract in safety_contracts:
             assert safety_contract in descriptions[tool_name]

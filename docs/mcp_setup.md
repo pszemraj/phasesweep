@@ -54,6 +54,9 @@ Do not launch anything.
 
 A working connection returns only catalog-approved experiment IDs, descriptions, phase shape, metrics, and permitted actions. It does not launch a run.
 
+For an explicitly authorized run, follow the [tool workflow and response
+shapes](mcp.md#reading-status-responses) through launch, await, and result retrieval.
+
 ## What the installer changes
 
 By default, `--type all` installs two independent integrations:

@@ -29,6 +29,7 @@ from typing import Annotated, Any, Literal, NoReturn, TypeVar, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from phasesweep import __version__
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine import generation_id_source, read_status, read_winners
@@ -156,7 +157,8 @@ DESCRIPTION_LAUNCH_RUN = (
 DESCRIPTION_GET_RUN_STATUS = (
     "Read process state and per-phase progress for exactly one experiment_id or run_id. Use as a "
     "single status check when await_run is unsuitable; next await an active run or read terminal "
-    "results. Read-only: after launch always use run_id, and stop if recovery_required is true."
+    "results. State is run.state; stop if run.recovery_required is true. "
+    "Read-only: after launch always use run_id and follow the top-level next_action."
 )
 DESCRIPTION_GET_RUN_RESULTS = (
     "Return terminal per-phase winners, completeness, promotion context, metrics, gates, and "
@@ -173,8 +175,9 @@ DESCRIPTION_AWAIT_RUN = (
     "Wait up to timeout_seconds for a launched run to change, become terminal, or require "
     "recovery. Call after launch_run and repeat while running; omit timeout_seconds for a "
     "client-safe 20-second wait, and request longer waits only when the client permits them. "
-    "Next call get_run_results when terminal. Read-only: always reuse the run_id and stop "
-    "immediately for recovery_required."
+    "State is run.state; stop immediately if run.recovery_required is true. Follow the "
+    "top-level next_action and call get_run_results when terminal. Read-only: always reuse "
+    "the run_id, including after a client disconnect."
 )
 
 ExperimentId = Annotated[
@@ -2427,6 +2430,9 @@ def build_server(app: PhaseSweepMCP) -> Any:
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP("phasesweep", instructions=agent_prompt_text(strip=True))
+    # Pinned FastMCP 1.27 has no version constructor argument; leaving the
+    # underlying version unset advertises the MCP SDK as PhaseSweep's version.
+    mcp._mcp_server.version = __version__
 
     @mcp.tool(
         name=TOOL_LIST_EXPERIMENTS,

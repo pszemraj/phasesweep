@@ -46,6 +46,51 @@ The config uses 1000 training batches per trial. The upstream trainer validates 
 
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
+## MCP smoke
+
+For the same two-trial, 10-batch check through MCP, start from `gpu_smoke.yaml`
+instead of the full MCP experiment. From the repo root, copy it into a fresh
+scratch directory:
+
+```bash
+mkdir -p /tmp/phasesweep-tiny-decoder-mcp-smoke
+cp examples/tiny_decoder_enwik8/gpu_smoke.yaml /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml
+```
+
+In that copy, replace or add these **root keys**, using your actual absolute
+repo path for `execution.cwd`. Keep its trainer configuration, metric, and
+two-trial phase unchanged:
+
+```yaml
+experiment: tiny_decoder_enwik8_mcp_smoke
+storage: auto
+workdir: /tmp/phasesweep-tiny-decoder-mcp-smoke/runs
+provenance:
+  trainer: "run-trial-v2+decoder-template@9c90a551"
+  data: "enwik8-template-download"
+execution:
+  cwd: /absolute/path/to/phasesweep
+```
+
+MCP needs persistent storage; `auto` puts SQLite beside this sequential
+experiment's artifacts. Provenance identifies the same trainer and data as
+the full example. Explicit `execution.cwd` makes its repo-relative trainer
+command work when the config is in scratch storage.
+
+```bash
+phasesweep validate /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml
+phasesweep mcp init-catalog --from /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml -o /tmp/phasesweep-tiny-decoder-mcp-smoke/catalog.yaml
+```
+
+Review the generated catalog, enable `allow.launch`, and set `visible_params:
+all` if the agent should report the winning learning rate. Then follow the
+[MCP client setup](../../docs/mcp_setup.md) using that catalog and authorize
+the two-trial smoke. The [status response example](../../docs/mcp.md#reading-status-responses)
+shows how to await and retrieve its result. A completed persistent smoke is
+reused on a later launch; choose a new experiment name and scratch directory
+when you want two fresh trials. GPU leasing does not impose a VRAM quota:
+verify the workload and monitor GPU memory separately when sharing a device.
+
 ## MCP full sweep
 
 The MCP catalog exposes the same nine-attempt target with 1000 batches per attempt as the full CLI config above; it is not the two-attempt quick smoke. It pins the detached runner `cwd` to the PhaseSweep repo root, so the relative `trial_command` in `mcp_experiment.yaml` resolves consistently even if the MCP server is started from another shell cwd:

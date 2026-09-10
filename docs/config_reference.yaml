@@ -114,6 +114,7 @@
 # TPE enables its parallel constant-liar heuristic when this is > 1. TPE/CMA-ES cross-invocation top-ups are rejected because their process-local continuation state is not fully durable.
 
 # gpu_policy: Literal["single_per_trial", "whole_node", "none"] = "single_per_trial"
+# Controls device leases and visibility, not GPU memory quotas. Bound model/batch sizes in the trainer and monitor memory separately when sharing a device.
 # `single_per_trial` leases one detected/configured CUDA-visible token per active trainer; a single-job phase with no visible GPU runs without isolation.
 # `whole_node` requires n_jobs: 1 plus an explicit gpu_ids or gpu_devices list, and leases every configured token for the trainer. `none` acquires no GPU locks, forbids gpu_ids/gpu_devices, and with n_jobs > 1 requires allow_no_gpu_isolation: true.
 # gpu_policy is semantic: changing it invalidates reuse of an existing persistent phase study. Under whole_node the device-set SIZE is semantic too (it is the trainer's world size); which tokens spell the set remains run-control.
