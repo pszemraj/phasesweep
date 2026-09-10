@@ -1028,6 +1028,43 @@ def test_wandb_first_constructor_retries_transport_in_active_exception_chain(
     assert constructions["count"] == 2
 
 
+def test_wandb_first_constructor_retries_severed_sidecar_timeout(monkeypatch, tmp_path):
+    """W&B's suppressed sidecar timeout is retried through its API-error marker."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    authentication_error = pytest.importorskip("wandb.errors").AuthenticationError
+    wandb_api_failed_error = pytest.importorskip(
+        "wandb.sdk.lib.service.service_connection"
+    ).WandbApiFailedError
+    constructions = {"count": 0}
+
+    class Api:
+        def __init__(self, overrides=None, timeout=None):
+            constructions["count"] += 1
+            if constructions["count"] == 1:
+                try:
+                    try:
+                        raise TimeoutError("sidecar did not respond")
+                    except TimeoutError:
+                        raise wandb_api_failed_error("sidecar request timed out") from None
+                except wandb_api_failed_error as exc:
+                    raise authentication_error("could not verify API key") from exc
+
+        def run(self, path):
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    assert _poll_wandb_summary(
+        base_url="https://example.test",
+        entity="me",
+        project="proj",
+        run_id="attempt",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    ) == {"eval/loss": 0.123}
+    assert constructions["count"] == 2
+
+
 @pytest.mark.parametrize("chain_kind", ["from_none", "explicit_nontransport_cause"])
 def test_wandb_first_constructor_ignores_suppressed_transport_context(
     fake_wandb, tmp_path, chain_kind

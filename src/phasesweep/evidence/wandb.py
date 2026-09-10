@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, cast
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,9 @@ class WandbSetupError(RuntimeError):
 def _is_transient_transport_error(exc: Exception) -> bool:
     """Return whether the active exception chain contains a transport failure.
 
-    Follow explicit causes and unsuppressed implicit contexts.
+    Follow explicit causes and unsuppressed implicit contexts. W&B suppresses
+    a sidecar timeout when it raises ``WandbApiFailedError``, so recognize its
+    no-response and timeout status markers directly.
 
     :param Exception exc: W&B client-construction failure to classify.
     :return bool: Whether the failure is a connection or timeout error.
@@ -64,6 +66,13 @@ def _is_transient_transport_error(exc: Exception) -> bool:
     else:
         request_errors = (RequestsConnectionError, RequestsTimeout)
 
+    try:
+        from wandb.sdk.lib.service.service_connection import WandbApiFailedError
+    except ImportError:  # pragma: no cover - W&B is optional
+        service_api_errors: tuple[type[BaseException], ...] = ()
+    else:
+        service_api_errors = (WandbApiFailedError,)
+
     current: BaseException | None = exc
     seen: set[int] = set()
     while current is not None and id(current) not in seen:
@@ -73,6 +82,11 @@ def _is_transient_transport_error(exc: Exception) -> bool:
             (ConnectionError, TimeoutError, *request_errors),
         ):
             return True
+        if isinstance(current, service_api_errors):
+            response = cast(Any, current).response
+            status = response.http_status if response is not None else None
+            if status in (None, 0, 408, 504):
+                return True
         if current.__cause__ is not None:
             current = current.__cause__
         elif not current.__suppress_context__:
