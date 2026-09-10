@@ -1200,12 +1200,12 @@ class PhaseSweepMCP:
         :return tuple: Target id, status data, optional run state and handle,
             and result provenance.
         """
-        target_id, experiment, run, handle = self._resolve_read_target(
+        target_id, experiment, run, handle, snapshot = self._resolve_read_target(
             experiment_id=experiment_id,
             run_id=run_id,
             include_run=True,
         )
-        snapshot, result_source = self._result_snapshot_view(experiment, handle)
+        snapshot, result_source = self._result_snapshot_view(experiment, handle, snapshot)
         if snapshot is not None:
             status = self._snapshot_status_payload(
                 target_id,
@@ -1325,14 +1325,20 @@ class PhaseSweepMCP:
         experiment_id: str | None,
         run_id: str | None,
         include_run: bool,
-    ) -> tuple[str, Experiment | None, dict[str, Any] | None, RunHandle | None]:
+    ) -> tuple[
+        str,
+        Experiment | None,
+        dict[str, Any] | None,
+        RunHandle | None,
+        RunResultSnapshot | None,
+    ]:
         """Resolve status/winner reads to the catalog config or immutable run snapshot.
 
         :param str | None experiment_id: Catalog id for current experiment-level reads.
         :param str | None run_id: Persisted run id for immutable run-specific reads.
         :param bool include_run: Whether to include live run state in the returned payload.
         :return tuple: Target id, parsed experiment when a live read needs it, optional run
-            payload, and handle.
+            payload, handle, and captured terminal result snapshot.
         :raises McpToolError: If neither or both of ``experiment_id`` and
             ``run_id`` were provided.
         :raises UnknownRunError: If ``run_id`` names no persisted run.
@@ -1355,19 +1361,20 @@ class PhaseSweepMCP:
             # A complete terminal result snapshot contains every historical
             # status and winner fact this read exposes. The sibling config
             # snapshot is only needed for a live read or unavailable-result
-            # placeholder.
+            # placeholder. Carry the captured result through the request:
+            # recovery may mark the stored snapshot pending again.
             experiment = None if frozen_snapshot is not None else self._load_run_experiment(handle)
             run = None
             if include_run:
                 run = self._run_payload(handle)
-            return handle.experiment_id, experiment, run, handle
+            return handle.experiment_id, experiment, run, handle, frozen_snapshot
 
         assert experiment_id is not None
         reg = self._registry.get(experiment_id)
         live = self._runs.live_run_for(experiment_id)
         experiment = self._load_run_experiment(live) if live is not None else reg.experiment
         run = self._run_payload(live) if include_run and live is not None else None
-        return reg.id, experiment, run, live
+        return reg.id, experiment, run, live, None
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load and verify the immutable config snapshot for a persisted run.
@@ -1428,12 +1435,12 @@ class PhaseSweepMCP:
         :param str | None run_id: Optional detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
         """
-        target_id, experiment, _run, handle = self._resolve_read_target(
+        target_id, experiment, _run, handle, snapshot = self._resolve_read_target(
             experiment_id=experiment_id,
             run_id=run_id,
             include_run=False,
         )
-        snapshot, result_source = self._result_snapshot_view(experiment, handle)
+        snapshot, result_source = self._result_snapshot_view(experiment, handle, snapshot)
         if snapshot is not None:
             # The frozen snapshot already carries the represented generation's
             # own metric, phase plan, and drift verdict, captured under the
@@ -1540,6 +1547,7 @@ class PhaseSweepMCP:
         self,
         experiment: Experiment | None,
         handle: RunHandle | None,
+        snapshot: RunResultSnapshot | None,
     ) -> tuple[RunResultSnapshot | None, ResultSource]:
         """Resolve one run result without falling back to mutable terminal state.
 
@@ -1552,8 +1560,12 @@ class PhaseSweepMCP:
             current-state read or unavailable-result placeholder needs one. A complete terminal
             snapshot is self-contained and does not require it.
         :param RunHandle | None handle: Optional detached run being read.
+        :param RunResultSnapshot | None snapshot: Terminal snapshot already captured during
+            target resolution, reused without rereading mutable finalization state.
         :return tuple: Optional result view and its agent-visible provenance.
         """
+        if snapshot is not None:
+            return snapshot, "frozen_run_snapshot"
         if handle is None:
             return None, "current_shared_study"
         try:

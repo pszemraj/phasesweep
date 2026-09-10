@@ -2319,6 +2319,45 @@ def test_run_scoped_snapshot_survives_artifact_tree_relocation(
     assert results.winner_count == 1
 
 
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+def test_run_scoped_read_keeps_snapshot_when_recovery_begins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_tool: str,
+) -> None:
+    """Recovery cannot invalidate the terminal snapshot already selected for a read."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    store.config_snapshot_path(run_id).unlink()
+    read_terminal_status = store.recorded_terminal_status
+
+    def begin_recovery_after_status_read(handle: RunHandle) -> dict | None:
+        terminal = read_terminal_status(handle)
+        if terminal is not None and terminal.get("result_snapshot_state") == "complete":
+            # Match recover-run's first finalization write after this read has
+            # captured the complete snapshot, before response construction.
+            write_run_status(store, **{**terminal, "result_snapshot_state": "pending"})
+        return terminal
+
+    monkeypatch.setattr(store, "recorded_terminal_status", begin_recovery_after_status_read)
+
+    payload: GetRunResultsResult | GetRunStatusResult | AwaitRunResult
+    if read_tool == "winners":
+        results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+        assert results.winner_count == 1
+        payload = results
+    else:
+        payload = (
+            AwaitRunResult.model_validate(asyncio.run(app.await_run(run_id)))
+            if read_tool == "await_run"
+            else GetRunStatusResult.model_validate(app.status(run_id=run_id))
+        )
+        assert payload.phases[0].winner_present is True
+    assert payload.result_source == "frozen_run_snapshot"
+    assert payload.publication_integrity == "ok"
+    assert payload.represented_generation_id == run_id
+
+
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
     tmp_path: Path,
 ) -> None:
