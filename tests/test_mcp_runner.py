@@ -11,9 +11,11 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import optuna
@@ -21,6 +23,8 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import phasesweep.engine.generation as generation_ops
+import phasesweep.engine.optuna as engine_optuna
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
@@ -43,6 +47,7 @@ from phasesweep.engine.paths import (
     _generation_path,
     _generation_summary_path,
     _generations_dir,
+    _last_successful_generation_path,
     _summary_path,
     _trial_dir_for,
     _winner_path,
@@ -887,6 +892,141 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     phase = snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is False
     assert phase["running_attempts"] is None
+
+
+@pytest.mark.parametrize("pointer_commits", [True, False], ids=["commit", "abort"])
+def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pointer_commits: bool,
+) -> None:
+    """A pre-commit storage failure describes the new publication only after commit."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command="echo x=0.5 {overrides}",
+        n_trials=1,
+    )
+    generation_id = f"storage-unavailable-{'commit' if pointer_commits else 'abort'}"
+    capture_reads = 0
+    original_stats = engine_optuna._sqlite_phase_trial_stats
+
+    def transient_capture_failure(
+        experiment: Experiment,
+        phase: Phase,
+        published_trial: engine_optuna._TrialRef | None = None,
+    ) -> engine_optuna._PhaseTrialStats:
+        nonlocal capture_reads
+        if _generation_summary_path(experiment, generation_id).is_file():
+            capture_reads += 1
+
+            def locked_connect(*_args: object, **_kwargs: object) -> None:
+                raise sqlite3.OperationalError("database is locked")
+
+            with monkeypatch.context() as capture_patch:
+                capture_patch.setattr(engine_optuna.sqlite3, "connect", locked_connect)
+                return original_stats(experiment, phase, published_trial)
+        return original_stats(experiment, phase, published_trial)
+
+    monkeypatch.setattr(engine_optuna, "_sqlite_phase_trial_stats", transient_capture_failure)
+    if not pointer_commits:
+        pointer_path = _last_successful_generation_path(experiment)
+        original_write = generation_ops.artifact_io._write_yaml_atomic
+
+        def fail_pointer_write(path: Path, payload: object) -> None:
+            if path == pointer_path:
+                raise OSError("simulated publication abort")
+            original_write(path, payload)
+
+        monkeypatch.setattr(generation_ops.artifact_io, "_write_yaml_atomic", fail_pointer_write)
+
+    hook = mcp_runner._RunnerPublicationHook(
+        tmp_path / "status.json",
+        {
+            "run_id": generation_id,
+            "returncode": 0,
+            "error_class": None,
+            "cleanup_confirmed": True,
+            "failure": None,
+        },
+    )
+    if pointer_commits:
+        run_experiment(experiment, generation_id=generation_id, publication_hook=hook)
+    else:
+        with pytest.raises(OSError, match="simulated publication abort"):
+            run_experiment(experiment, generation_id=generation_id, publication_hook=hook)
+
+    assert capture_reads == 1
+    assert hook.snapshot is not None
+    phase = hook.snapshot["status"]["phases"][0]
+    assert phase["trial_data_available"] is False
+    assert phase["running_attempts"] is None
+    assert phase["published_study_unavailable"] is pointer_commits
+    assert hook.snapshot["status"]["is_published"] is pointer_commits
+
+
+def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: Path) -> None:
+    """Commit covers winners, skipped candidates, carried flags, and omitted phases."""
+    phase_names = ("carried", "new", "skipped", "old-only")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        phases=[
+            Phase(name=name, n_trials=1, sampler=SEEDED_RANDOM, search_space={})
+            for name in phase_names
+        ],
+    )
+    generation_id = "candidate-generation"
+    published_summary = {
+        "experiment": experiment.experiment,
+        "generation_id": generation_id,
+        "phases": [
+            {
+                "name": "carried",
+                "trial_number": 2,
+                "generation_id": "prior-generation",
+                "attempt_id": "carried-attempt",
+            },
+            {
+                "name": "new",
+                "trial_number": 0,
+                "generation_id": generation_id,
+                "attempt_id": "new-attempt",
+            },
+        ],
+        "promotion_decisions": [
+            {
+                "phase": "skipped",
+                "action": "skip",
+                "candidate_trial_number": 1,
+                "candidate_generation_id": generation_id,
+                "candidate_attempt_id": "skipped-attempt",
+            }
+        ],
+    }
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary_path.parent.mkdir(parents=True)
+    summary_path.write_text(yaml.safe_dump(published_summary))
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        generation_id=generation_id,
+        engine_winners={},
+    )
+    phases = {phase["phase"]: phase for phase in snapshot["status"]["phases"]}
+    phases["carried"]["trial_data_available"] = True
+    phases["carried"]["running_attempts"] = []
+    phases["carried"]["published_study_unavailable"] = True
+    phases["old-only"]["published_study_unavailable"] = True
+    committed = mcp_runner.mark_result_snapshot_published(
+        snapshot,
+        generation_id=generation_id,
+        published_summary=published_summary,
+    )
+
+    committed_phases = {phase["phase"]: phase for phase in committed["status"]["phases"]}
+    assert committed_phases["new"]["published_study_unavailable"] is True
+    assert committed_phases["skipped"]["published_study_unavailable"] is True
+    assert committed_phases["carried"]["published_study_unavailable"] is True
+    assert committed_phases["old-only"]["published_study_unavailable"] is False
 
 
 def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
@@ -1767,6 +1907,29 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     )
     with open_private_text(store.config_snapshot_path(run_id), "x") as output:
         output.write(config_path.read_text())
+    experiment = load_config(config_path)
+    original_stats = engine_optuna._sqlite_phase_trial_stats
+
+    def unavailable_during_prepared_capture(
+        captured_experiment: Experiment,
+        phase: Phase,
+        published_trial: engine_optuna._TrialRef | None = None,
+    ) -> engine_optuna._PhaseTrialStats:
+        if _generation_summary_path(captured_experiment, run_id).is_file():
+
+            def locked_connect(*_args: object, **_kwargs: object) -> None:
+                raise sqlite3.OperationalError("database is locked")
+
+            with monkeypatch.context() as capture_patch:
+                capture_patch.setattr(engine_optuna.sqlite3, "connect", locked_connect)
+                return original_stats(captured_experiment, phase, published_trial)
+        return original_stats(captured_experiment, phase, published_trial)
+
+    monkeypatch.setattr(
+        engine_optuna,
+        "_sqlite_phase_trial_stats",
+        unavailable_during_prepared_capture,
+    )
 
     if crash_boundary == "before_pointer":
         original_prepare = mcp_runner._RunnerPublicationHook.prepare
@@ -1777,12 +1940,14 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
             experiment: Experiment,
             generation_id: str,
             winners: dict[str, Winner],
+            summary: Mapping[str, object],
         ) -> None:
             original_prepare(
                 self,
                 experiment=experiment,
                 generation_id=generation_id,
                 winners=winners,
+                summary=summary,
             )
             os._exit(expected_exit)
 
@@ -1832,7 +1997,9 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     assert prepared["result_snapshot_state"] == "pending"
     assert prepared["result_publication_state"] == "prepared"
     assert prepared["result_publication_generation_id"] == run_id
-    experiment = load_config(config_path)
+    prepared_phase = prepared["result_snapshot"]["status"]["phases"][0]
+    assert prepared_phase["trial_data_available"] is False
+    assert prepared_phase["published_study_unavailable"] is False
     if damage_publication:
         _generation_summary_path(experiment, run_id).unlink()
     assert _last_successful_generation_id(experiment) == (
@@ -1868,6 +2035,9 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     snapshot = terminal["result_snapshot"]
     assert snapshot["status"]["represented_generation_id"] == run_id
     assert snapshot["winners"][0]["metric"] == 0.5
+    assert snapshot["status"]["phases"][0]["published_study_unavailable"] is (
+        crash_boundary == "after_pointer"
+    )
     if crash_boundary == "after_pointer":
         assert terminal["returncode"] == 0
         assert terminal["result_publication_state"] == "committed"

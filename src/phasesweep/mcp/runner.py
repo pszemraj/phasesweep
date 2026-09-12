@@ -444,6 +444,7 @@ class _RunnerPublicationHook(PublicationHook):
         self.snapshot: dict[str, object] | None = None
         self.state: Literal["prepared", "committed"] | None = None
         self.generation_id: str | None = None
+        self.summary: Mapping[str, object] | None = None
 
     def prepare(
         self,
@@ -451,12 +452,14 @@ class _RunnerPublicationHook(PublicationHook):
         experiment: Experiment,
         generation_id: str,
         winners: Mapping[str, Winner],
+        summary: Mapping[str, object],
     ) -> None:
         """Persist the exact run result before the last-success pointer advances.
 
         :param Experiment experiment: Executed frozen experiment configuration.
         :param str generation_id: Generation ready for publication.
         :param Mapping[str, Winner] winners: Engine-selected generation winners.
+        :param Mapping[str, object] summary: Validated generation summary awaiting publication.
         :raises Exception: If capture, validation, or durable persistence fails.
         """
         snapshot = capture_result_snapshot(
@@ -475,6 +478,7 @@ class _RunnerPublicationHook(PublicationHook):
         self.snapshot = snapshot
         self.state = "prepared"
         self.generation_id = generation_id
+        self.summary = summary
         self._status["result_publication_state"] = "prepared"
         self._status["result_publication_generation_id"] = generation_id
 
@@ -490,11 +494,17 @@ class _RunnerPublicationHook(PublicationHook):
         :raises RuntimeError: If no matching prepared snapshot exists.
         :raises OSError: If the committed receipt cannot be persisted.
         """
-        if self.state != "prepared" or self.snapshot is None or self.generation_id != generation_id:
+        if (
+            self.state != "prepared"
+            or self.snapshot is None
+            or self.generation_id != generation_id
+            or self.summary is None
+        ):
             raise RuntimeError("publication commit has no matching prepared run snapshot")
         committed = mark_result_snapshot_published(
             self.snapshot,
             generation_id=generation_id,
+            published_summary=self.summary,
         )
         self.snapshot = committed
         self.state = "committed"
@@ -517,6 +527,7 @@ class _RunnerPublicationHook(PublicationHook):
         self._status.pop("result_publication_generation_id", None)
         self.state = None
         self.generation_id = None
+        self.summary = None
 
 
 def _write_status(

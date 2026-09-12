@@ -315,7 +315,9 @@ def _validate_publishable_summary(
     return summary, summary_bytes
 
 
-def _validate_generation_publishable(experiment: Experiment, generation_id: str) -> bytes:
+def _validate_generation_publishable(
+    experiment: Experiment, generation_id: str
+) -> tuple[dict[str, Any], bytes]:
     """Validate a generation's complete result manifest before its publication commit.
 
     Checks the generation's immutable summary names this exact experiment and
@@ -337,7 +339,8 @@ def _validate_generation_publishable(experiment: Experiment, generation_id: str)
         or does not name this generation.
     :raises PublicationAccessError: A manifest artifact cannot be read as the current user.
     :raises PublicationIntegrityError: A manifest-listed artifact fails validation.
-    :return bytes: Exact summary bytes whose manifest was validated.
+    :return tuple[dict[str, Any], bytes]: Parsed summary and exact summary bytes whose
+        manifest was validated.
     """
     summary, summary_bytes = _validate_publishable_summary(
         summary_path=path_ops._generation_summary_path(experiment, generation_id),
@@ -352,7 +355,7 @@ def _validate_generation_publishable(experiment: Experiment, generation_id: str)
         generation_id,
         summary,
     )
-    return summary_bytes
+    return summary, summary_bytes
 
 
 def _publish_generation(
@@ -425,12 +428,13 @@ def _publish_generation(
     """
     with absorb_shutdown_signals() as absorbed:
         try:
-            summary_bytes = _validate_generation_publishable(experiment, generation_id)
+            summary, summary_bytes = _validate_generation_publishable(experiment, generation_id)
             if publication_hook is not None:
                 publication_hook.prepare(
                     experiment=experiment,
                     generation_id=generation_id,
                     winners=MappingProxyType(dict(winners)),
+                    summary=MappingProxyType(summary),
                 )
             artifact_io._write_yaml_atomic(
                 path_ops._last_successful_generation_path(experiment),

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -126,7 +126,7 @@ def recover_run(
     try:
         with recovery_lock:
             _cleanup_runner(identity, needs, confirm=confirm, earlier_boot=earlier_boot)
-            publication_action = _publication_recovery_action(config, needs)
+            publication_action, publication_summary = _publication_recovery_action(config, needs)
             evidence = _recover_trial_evidence(store, handle, config, needs, confirm=confirm)
             if not confirm:
                 emit(_preflight_message(run_id, needs, evidence, publication_action))
@@ -157,7 +157,14 @@ def recover_run(
             if needs.cleanup_needed:
                 _persist_cleanup_recovery(store, handle, config, evidence, emit=emit)
             _finish_result_recovery(
-                store, run_id, terminal_status, needs, evidence, publication_action, emit=emit
+                store,
+                run_id,
+                terminal_status,
+                needs,
+                evidence,
+                publication_action,
+                publication_summary,
+                emit=emit,
             )
     except RunRecoveryError:
         raise
@@ -400,32 +407,35 @@ def _cleanup_runner(
         raise RunRecoveryError("runner process-group cleanup is still uncertain")
 
 
-def _publication_recovery_action(config: Experiment, needs: _RecoveryNeeds) -> str | None:
+def _publication_recovery_action(
+    config: Experiment, needs: _RecoveryNeeds
+) -> tuple[str | None, Mapping[str, Any] | None]:
     """Choose how to reconcile a prepared result publication.
 
     :param Experiment config: Experiment whose last-success publication pointer is inspected.
     :param _RecoveryNeeds needs: Recorded prepared generation and other recovery decisions.
     :raises RunRecoveryError: The publication pointer cannot be interpreted safely.
-    :return str | None: ``"commit"`` when the authenticated pointer names the prepared
-        generation, ``"abort"`` when an authenticated pointer names another generation or is
-        absent, or ``None`` when none was prepared.
+    :return tuple[str | None, Mapping[str, Any] | None]: The action and its validated
+        publication summary. The action is ``"commit"`` when the authenticated pointer
+        names the prepared generation, ``"abort"`` when an authenticated pointer names
+        another generation or is absent, or ``None`` when none was prepared. The summary
+        is present only for ``"commit"``.
     """
     if isinstance(needs.prepared_publication_generation, str):
         publication = _resolve_publication_pointer(config)
         if publication.state == "ok":
-            return (
-                "commit"
-                if publication.generation_id == needs.prepared_publication_generation
-                else "abort"
-            )
+            if publication.generation_id == needs.prepared_publication_generation:
+                assert publication.summary is not None
+                return "commit", publication.summary
+            return "abort", None
         if publication.state == "absent":
-            return "abort"
+            return "abort", None
         raise RunRecoveryError(
             "the prepared run result cannot be reconciled because the "
             "last-success publication is invalid or unreadable. Restore the "
             "publication evidence or access to it before retrying recovery."
         )
-    return None
+    return None, None
 
 
 def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[str, optuna.Study]:
@@ -713,6 +723,7 @@ def _finish_result_recovery(
     needs: _RecoveryNeeds,
     evidence: _CleanupEvidence,
     publication_action: str | None,
+    publication_summary: Mapping[str, Any] | None,
     *,
     emit: Callable[[str], None],
 ) -> None:
@@ -728,6 +739,8 @@ def _finish_result_recovery(
     :param _RecoveryNeeds needs: Decisions governing unavailable, pending, and final snapshots.
     :param _CleanupEvidence evidence: Confirmed attempt IDs and locations for finalization.
     :param str | None publication_action: ``"commit"``, ``"abort"``, or no publication action.
+    :param Mapping[str, Any] | None publication_summary: Validated summary for a committed
+        prepared publication.
     :param Callable[[str], None] emit: Callback that receives result-recovery messages.
     :raises RunRecoveryError: Finalizing a required stored snapshot fails.
     """
@@ -739,9 +752,11 @@ def _finish_result_recovery(
         assert needs.stored_snapshot is not None
         if publication_action == "commit":
             assert isinstance(needs.prepared_publication_generation, str)
+            assert publication_summary is not None
             terminal_status["result_snapshot"] = mark_result_snapshot_published(
                 needs.stored_snapshot.model_dump(mode="json"),
                 generation_id=needs.prepared_publication_generation,
+                published_summary=publication_summary,
             )
             terminal_status["result_publication_state"] = "committed"
         else:

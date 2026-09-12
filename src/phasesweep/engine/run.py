@@ -83,12 +83,14 @@ class PublicationHook(Protocol):
         experiment: Experiment,
         generation_id: str,
         winners: Mapping[str, Winner],
+        summary: Mapping[str, Any],
     ) -> None:
         """Durably prepare sidecar state before the publication pointer advances.
 
         :param Experiment experiment: Exact experiment configuration being published.
         :param str generation_id: Generation whose validated result is ready to commit.
         :param Mapping[str, Winner] winners: Engine-selected winners for that generation.
+        :param Mapping[str, Any] summary: Validated generation summary awaiting publication.
         """
         ...
 

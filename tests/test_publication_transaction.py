@@ -23,6 +23,7 @@ import signal
 import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -288,10 +289,12 @@ def test_required_publication_sidecar_failure_prevents_pointer_commit(tmp_path: 
             experiment: Experiment,
             generation_id: str,
             winners: Mapping[str, Winner],
+            summary: Mapping[str, object],
         ) -> None:
             nonlocal prepared_generation
             prepared_generation = generation_id
             assert set(winners) == {"p"}
+            assert summary["generation_id"] == generation_id
             assert _last_successful_generation_id(experiment) is None
             raise OSError("simulated detached snapshot persistence failure")
 
@@ -318,8 +321,10 @@ def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) ->
             experiment: Experiment,
             generation_id: str,
             winners: Mapping[str, Winner],
+            summary: Mapping[str, object],
         ) -> None:
             assert set(winners) == {"p"}
+            assert summary["generation_id"] == generation_id
             assert _last_successful_generation_id(experiment) is None
             events.append(f"prepared:{generation_id}")
 
@@ -530,10 +535,10 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
 
     original_validate = generation_ops._validate_generation_publishable
 
-    def validate_then_signal(*args: object, **kwargs: object) -> bytes:
-        summary_bytes = original_validate(*args, **kwargs)
+    def validate_then_signal(*args: object, **kwargs: object) -> tuple[dict[str, Any], bytes]:
+        validated = original_validate(*args, **kwargs)
         os.kill(os.getpid(), signal.SIGTERM)
-        return summary_bytes
+        return validated
 
     monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
 
@@ -601,12 +606,12 @@ def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_
     original_validate = generation_ops._validate_generation_publishable
     signalled = {"done": False}
 
-    def validate_then_signal(*args: object, **kwargs: object) -> bytes:
-        summary_bytes = original_validate(*args, **kwargs)
+    def validate_then_signal(*args: object, **kwargs: object) -> tuple[dict[str, Any], bytes]:
+        validated = original_validate(*args, **kwargs)
         if not signalled["done"]:
             signalled["done"] = True
             os.kill(os.getpid(), signal.SIGTERM)
-        return summary_bytes
+        return validated
 
     monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
 
