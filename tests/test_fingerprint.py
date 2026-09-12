@@ -1906,7 +1906,7 @@ def test_published_phase_rejects_a_missing_storage_ledger(
     with pytest.raises(PublishedStudyMissingError) as excinfo:
         run_experiment(experiment)
 
-    assert "includes a winner for phase 'p'" in str(excinfo.value)
+    assert "records a selected trial for phase 'p'" in str(excinfo.value)
     assert "persistent study is missing" in str(excinfo.value)
     assert "Cleanup state is therefore unknown" not in str(excinfo.value)
     assert "Restore the original complete storage ledger and study" in str(excinfo.value)

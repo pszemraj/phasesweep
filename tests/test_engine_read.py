@@ -755,6 +755,55 @@ def test_baseline_promotion_checks_local_candidate_and_allows_skipped_source_los
     assert _generation_path(experiment).read_bytes() == generation_before
 
 
+@pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
+def test_skipped_promotion_candidate_requires_its_published_trial_history(
+    tmp_path: Path, n_jobs: int
+) -> None:
+    from phasesweep.engine import PublishedStudyMissingError
+
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        trial_command="echo x=-{trial_id}",
+        phases=[
+            Phase(
+                name=name,
+                n_trials=1,
+                n_jobs=n_jobs,
+                allow_no_gpu_isolation=True,
+                sampler=Sampler(type="random", seed=0),
+                promotion=(
+                    Promotion(min_delta_vs="base", min_delta=100, on_fail="skip")
+                    if name == "candidate"
+                    else None
+                ),
+            )
+            for name in ("base", "candidate")
+        ],
+    )
+    assert list(run_experiment(experiment)) == ["base"]
+    generation_before = _generation_path(experiment).read_bytes()
+    publication_before = _last_successful_generation_path(experiment).read_bytes()
+    assert all(
+        not phase["published_study_unavailable"] for phase in read_status(experiment)["phases"]
+    )
+
+    optuna.delete_study(
+        study_name="t::candidate",
+        storage=engine_optuna._resolve_storage(experiment.resolved_storage),
+    )
+
+    candidate = read_status(experiment)["phases"][1]
+    assert candidate["completed"] == 0
+    assert candidate["trial_data_available"] is True
+    assert candidate["published_study_unavailable"] is True
+    with pytest.raises(PublishedStudyMissingError, match="phase 'candidate'.*study is missing"):
+        run_experiment(experiment, from_phase="candidate")
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_path(experiment).read_bytes() == publication_before
+    assert engine_optuna._load_existing_phase_study(experiment, experiment.phases[1]) is None
+
+
 def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: str) -> None:
     """Publish an immutable generation (summary + record + phase winner) on disk.
 

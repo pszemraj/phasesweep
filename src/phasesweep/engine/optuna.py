@@ -84,16 +84,30 @@ def _published_phase_trial_refs(
 
     A continued baseline belongs to an earlier phase. Its promotion record
     identifies the local candidate whose history must survive in this phase.
+    A skipped candidate has no exposed winner; its identity is retained in
+    the summary's promotion decisions instead.
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
         their known terminal-count boundary; None when a published phase does
         not record a complete identity.
     """
+    phase_items = {
+        item["name"]: item
+        for item in (summary or {}).get("phases", ())
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+    for decision in (summary or {}).get("promotion_decisions", ()):
+        if (
+            isinstance(decision, Mapping)
+            and decision.get("action") == "skip"
+            and isinstance(decision.get("phase"), str)
+        ):
+            phase_items.setdefault(
+                decision["phase"], {"name": decision["phase"], "promotion": decision}
+            )
     refs: dict[str, _TrialRef | None] = {}
-    for item in (summary or {}).get("phases", ()):
-        if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
-            continue
+    for name, item in phase_items.items():
         promotion = item.get("promotion")
         source = promotion if isinstance(promotion, Mapping) else item
         prefix = "candidate_" if isinstance(promotion, Mapping) else ""
@@ -115,7 +129,7 @@ def _published_phase_trial_refs(
             and completion["completed_trials"] >= 0
             else None
         )
-        refs[item["name"]] = (
+        refs[name] = (
             _TrialRef(number, generation, attempt, finished_trials, completed_trials)
             if isinstance(number, int)
             and not isinstance(number, bool)

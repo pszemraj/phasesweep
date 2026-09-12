@@ -507,7 +507,7 @@ def _check_published_phase_studies(
                             " because the publication records no complete local trial identity"
                         )
         raise PublishedStudyMissingError(
-            f"Published generation {publication.generation_id!r} includes a winner for "
+            f"Published generation {publication.generation_id!r} records a selected trial for "
             f"phase {phase.name!r}, but its persistent study {missing}. That publication "
             "requires its original trial history; continuing could reuse incomplete or "
             "unrelated trials and replace the current publication. Restore the "
