@@ -2,7 +2,7 @@
 
 A PhaseSweep config is one operator-authored YAML containing the trainer's base configuration and the sweep plan. The orchestrator chooses parameter values, materializes a complete per-trial trainer YAML, manages trial directories, extracts evidence, and decides which winner is exposed downstream. Your trainer reads that YAML, runs the experiment, and provides the evidence that configured extractors read.
 
-Field types, defaults, accepted values, and validation constraints are listed in [config_reference.yaml](config_reference.yaml).
+Field types, defaults, accepted values, and validation constraints are listed in [config_reference.yaml](config_reference.yaml). PhaseSweep is alpha software and rejects deprecated config aliases. Run `phasesweep validate <config>` before launching; it reports obsolete or malformed fields and exits `2` without starting trials.
 
 ## Experiment keys
 
@@ -12,11 +12,9 @@ The top level of a single experiment describes identity, storage, the trainer bo
 
 `storage: auto` keeps that state with the experiment artifacts: it selects `<workdir>/<experiment>/study.db` for sequential phases or `study.journal` when any phase has `n_jobs > 1`, and resolves the required absolute URL. Auto storage requires nonempty `provenance` and the [persistent-storage sampler contract](#sampler-capability-on-persistent-storage); explicit URLs retain their current behavior, and omitted storage remains in-memory. Changing `n_jobs` so that auto storage selects a different backend cannot resume the existing artifact tree. Restore the previous parallelism setting to resume, or choose a new experiment name or workdir for the new backend; `rebind-workdir` does not convert between `study.db` and `study.journal`.
 
-`workdir` holds trial logs, result artifacts, winners, promotion decisions, and summaries. Persistent studies are bound to their resolved artifact root. If you move a complete auto-storage tree, follow the [relocation instructions](runtime.md#output-layout). The exact storage forms and concurrency constraints are in the [config reference](config_reference.yaml).
+`workdir` holds trial logs, result artifacts, winners, promotion decisions, and summaries. Persistent studies are bound to their resolved artifact root. If you move a complete auto-storage tree, follow the relocation procedure under [fingerprints and resume](runtime.md#fingerprints-and-resume). The exact storage forms and concurrency constraints are in the [config reference](config_reference.yaml).
 
-`trainer_config` is the trainer's ordinary base configuration, embedded directly in the PhaseSweep file. In the default `yaml_file` mode, PhaseSweep copies it for each trial, applies inherited, contract, fixed, and sampled dotted-path values, writes `<trial_dir>/trainer_config.yaml`, and exposes its shell-quoted path as `{config_path}`. Changing this mapping changes the experiment and phase fingerprints.
-
-String values inside `trainer_config` may contain `{trial_dir}`, `{trial_id}`, `{phase}`, or `{run_name}`. PhaseSweep expands those runtime placeholders before applying overrides, which makes output directories and run labels trial-specific without a wrapper script. Other strings, including sampled or fixed string values, remain literal.
+`trainer_config` supplies the trainer's base configuration in the default mode. Its per-trial materialization is described under [override formats](#override-formats).
 
 `trial_command` is the command template for one trial. The primary shape is `python train.py {config_path}`, adjusted to the flag or position where your trainer accepts a YAML path. The [config reference](config_reference.yaml) defines every placeholder; compatibility boundaries are explained under [override formats](#override-formats).
 
@@ -52,7 +50,7 @@ Use categorical parameters for explicit choices and integer or float parameters 
 
 ## Sampler capability on persistent storage
 
-The `sampler` block is optional and defaults to `type: tpe` with no seed, which is fine for an in-memory run. A persistent `storage` changes that, because the study outlives the process that created it, so each phase must state two things up front rather than discover them mid-sweep:
+The `sampler` block is optional and defaults to `type: tpe` with no seed, which is fine for an in-memory run. With persistent storage, choose the following seed and acknowledgement fields for each phase:
 
 | Sampler | Seed | `acknowledge_nonresumable` |
 | --- | --- | --- |
@@ -60,7 +58,7 @@ The `sampler` block is optional and defaults to `type: tpe` with no seed, which 
 | `random` | required | rejected |
 | `tpe`, `cmaes` | required | required (`true`) |
 
-An unseeded `tpe`, `random`, or `cmaes` phase draws a different sequence on every invocation, so the durable trials it accumulates cannot be reproduced or explained afterwards. `tpe` and `cmaes` additionally hold process-local sampler state that Optuna storage does not persist: PhaseSweep refuses to resume such a phase mid-target or to raise its `n_trials` later (see [runtime behavior](runtime.md#fingerprints-and-resume)). Setting `acknowledge_nonresumable: true` is your statement that you accept that contract and will run each target in one invocation; setting it on `grid` or `random`, which resume safely, is rejected as meaningless config.
+The table is enforced when the config loads. Use `grid` or seeded `random` when continuation matters. For `tpe` or `cmaes`, set both fields and plan around their [continuation behavior](runtime.md#fingerprints-and-resume).
 
 ```yaml
 storage: auto
@@ -90,7 +88,7 @@ phase 'weight_decay': sampler=random seed=1 (resumable, reproducible)
 > [!IMPORTANT]
 > `yaml_file` is the core workflow. Put the trainer's base config and PhaseSweep's search plan in the same operator-authored YAML, then pass `{config_path}` to the trainer.
 
-The default `yaml_file` mode materializes one complete `<trial_dir>/trainer_config.yaml` from the embedded `trainer_config` for every trial. It preserves nested mappings, lists, strings, booleans, finite numbers, and nulls. Dotted overrides update nested paths, and `{config_path}` is required even when a phase has no overrides so the trainer always receives its base configuration.
+The default `yaml_file` mode materializes one complete `<trial_dir>/trainer_config.yaml` from the embedded `trainer_config` for every trial. It expands `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}` inside base-config strings before applying dotted overrides; all other strings, including override values, remain literal. Nested mappings, lists, strings, booleans, finite numbers, and nulls are preserved. `{config_path}` is required even when a phase has no overrides so the trainer always receives its base configuration. Changing `trainer_config` changes the experiment and phase fingerprints.
 
 | Format | Use when |
 | --- | --- |
@@ -107,7 +105,7 @@ Each mode has a required template placeholder and distinct value encoding. The [
 
 ## Trainer contract
 
-The command in `trial_command` is the training or evaluation program for one trial. PhaseSweep creates the trial directory, materializes the selected input boundary, launches the process group, captures stdout/stderr, and then reads evidence. The trial process uses `execution.cwd` when configured. Otherwise it uses the directory where `phasesweep run` was invoked, or the catalog's pinned `cwd` for MCP-launched runs. The trainer must:
+For each trial, PhaseSweep creates the trial directory, materializes the selected input boundary, launches the process group, captures stdout/stderr, and then reads evidence. The trial process uses `execution.cwd` when configured. Otherwise it uses the directory where `phasesweep run` was invoked, or the catalog's pinned `cwd` for MCP-launched runs. The trainer must:
 
 - Read the complete YAML at `{config_path}` in the default mode, or parse the explicitly selected compatibility [override format](#override-formats).
 - Provide a finite objective through the configured extractor: call `report_objective(...)` or write a compatible JSON envelope, write log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary. `report_objective(...)` creates missing parent directories when the envelope uses a nested trial-relative path.
@@ -143,7 +141,7 @@ A `json_envelope` trainer publishes this versioned shape after successful evalua
 }
 ```
 
-Direct envelope writers copy the generation ID, attempt ID, and overrides digest from the reserved trial environment values listed in the [config reference](config_reference.yaml). The objective name, split, and evaluation policy must match the extractor config. The checkpoint must be a nonempty identity, the step must be a non-negative integer, and the objective value must be a finite JSON number rather than a string or boolean. Configured `checkpoint` and `expected_step` values are matched exactly.
+Direct envelope writers copy the generation ID, attempt ID, and overrides digest from the reserved trial environment values. The objective name, split, and evaluation policy must match the extractor config. The checkpoint must be a nonempty identity, the step must be a non-negative integer, and the objective value must be a finite JSON number rather than a string or boolean. Configured `checkpoint` and `expected_step` values are matched exactly.
 
 Python trainers can publish that envelope without reconstructing its managed fields or destination:
 
@@ -178,7 +176,7 @@ Overrides apply from inherited winners through contract values and phase-fixed v
 
 ## Extractors
 
-Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Primary metrics from local JSON must use `json_envelope`, which binds the result to the current attempt, resolved overrides, objective, split, and evaluation policy. Every envelope must declare a checkpoint and step; their values are bound only when the extractor config declares `checkpoint` or `expected_step`. Plain `json` remains available for constraints; its selected value must be a number, not a numeric string or boolean. Plain JSON constraints are attempt-location-scoped by the unique trial directory, but their contents do not echo or cross-check the attempt identity, so trainers must write current-attempt evidence rather than copy an artifact from another trial. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID` and an explicit, fingerprinted `base_url`; human-readable display names and ambient `WANDB_BASE_URL` do not participate in evidence correlation. Authentication still comes from the W&B SDK environment/configuration, so `WANDB_API_KEY` can rotate through `execution.passthrough_env`.
+Extractors turn trial evidence into finite floats. JSON and log extractors read files from the generation- and attempt-scoped `{trial_dir}`. Primary metrics from local JSON use the attempt-bound [result envelope](#result-envelope). Plain `json` remains available for constraints; its selected value must be a number, not a numeric string or boolean. Plain JSON constraints are attempt-location-scoped by the unique trial directory, but their contents do not echo or cross-check the attempt identity, so trainers must write current-attempt evidence rather than copy an artifact from another trial. W&B extractors use the immutable run ID assigned through `WANDB_RUN_ID` and an explicit, fingerprinted `base_url`; human-readable display names and ambient `WANDB_BASE_URL` do not participate in evidence correlation. Authentication still comes from the W&B SDK environment/configuration, so `WANDB_API_KEY` can rotate through `execution.passthrough_env`.
 
 For agent-facing artifact boundaries, see the [MCP security model](mcp.md#security-model).
 
@@ -243,11 +241,3 @@ studies:
 Suite-level `run.log` and the compatibility projection `suite_summary.yaml` use `suite.defaults.workdir`; each compiled study writes its normal experiment artifacts under that study's resolved `workdir`. Every invocation claims an immutable `suite_generations/<id>/` namespace selected through `last_successful_suite_generation.yaml`; the [runtime output contract](runtime.md#output-layout) covers publication integrity and historical reads. `show-winners` prints stored promotion decisions and comments, and labels the result historical when the current compiled suite differs.
 
 Suite promotion `min_delta_vs` may name a prior study or `study.phase`; a bare study name resolves to that study's final exposed phase. The candidate and baseline studies must resolve to identical metric contracts - name, goal, and extractor configuration - so promotion cannot subtract unrelated values. On promotion failure, `stop` aborts the suite, `skip` omits that study and continues until a later dependency requires it, and `continue_baseline` substitutes a clone of the baseline for the study's final winner. Suite decisions live in the suite-generation summary, not in a per-study `promotion.yaml`; `show-winners` never substitutes raw candidate winners from the compiled experiments. `timeout_seconds_per_run` applies independently to each compiled study and resets before the next one; there is no suite-wide deadline. `--from-phase` supports only single-experiment configs.
-
-## Updating older development configs
-
-PhaseSweep is alpha software and does not retain deprecated config aliases. Run `phasesweep validate <config>` before launching; strict validation names obsolete or malformed fields and exits `2` without starting trials.
-
-Bring older configs to the current contracts rather than mixing them into populated studies. Common updates are moving the trainer's base settings into `trainer_config` with a `{config_path}` command, using `json_envelope` for local objective evidence, declaring provenance for persistent storage, seeding persistent samplers, acknowledging TPE or CMA-ES restart limits, and declaring devices for `whole_node` phases. Accepted fields and constraints are listed in the [config reference](config_reference.yaml).
-
-Changes to the trainer boundary, base trainer config, execution context, search space, or evidence contract change fingerprints. Use a new experiment identity when the existing storage contains trials under an incompatible contract. Earlier published generations remain readable and report config drift.
