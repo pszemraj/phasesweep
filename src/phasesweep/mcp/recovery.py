@@ -406,20 +406,24 @@ def _publication_recovery_action(config: Experiment, needs: _RecoveryNeeds) -> s
     :param Experiment config: Experiment whose last-success publication pointer is inspected.
     :param _RecoveryNeeds needs: Recorded prepared generation and other recovery decisions.
     :raises RunRecoveryError: The publication pointer cannot be interpreted safely.
-    :return str | None: ``"commit"`` when the pointer names the prepared generation,
-        ``"abort"`` when it names another generation or is absent, or ``None`` when none was
-        prepared.
+    :return str | None: ``"commit"`` when the authenticated pointer names the prepared
+        generation, ``"abort"`` when an authenticated pointer names another generation or is
+        absent, or ``None`` when none was prepared.
     """
     if isinstance(needs.prepared_publication_generation, str):
         publication = _resolve_publication_pointer(config)
-        if publication.generation_id == needs.prepared_publication_generation:
-            return "commit"
-        if publication.state == "absent" or publication.generation_id is not None:
+        if publication.state == "ok":
+            return (
+                "commit"
+                if publication.generation_id == needs.prepared_publication_generation
+                else "abort"
+            )
+        if publication.state == "absent":
             return "abort"
         raise RunRecoveryError(
             "the prepared run result cannot be reconciled because the "
-            "last-success pointer is unreadable or malformed. Restore that "
-            "pointer before retrying recovery."
+            "last-success publication is invalid or unreadable. Restore the "
+            "publication evidence or access to it before retrying recovery."
         )
     return None
 
@@ -749,8 +753,8 @@ def _finish_result_recovery(
                 retryable=True,
                 actor="agent",
                 remediation=(
-                    "Report that this run's prepared result was not published. Start a new run "
-                    "only if the user still wants a published result."
+                    "Report that recovery could not confirm this run as the current published "
+                    "result. Start a new run only if the user still wants a published result."
                 ),
             ).model_dump(mode="json", exclude_none=True)
             terminal_status.pop("result_publication_state", None)

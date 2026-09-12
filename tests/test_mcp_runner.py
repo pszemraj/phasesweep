@@ -41,6 +41,7 @@ from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
+    _generation_summary_path,
     _generations_dir,
     _summary_path,
     _trial_dir_for,
@@ -1732,14 +1733,19 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
 
 
 @pytest.mark.parametrize(
-    ("crash_boundary", "expected_exit"),
-    (("before_pointer", 72), ("after_pointer", 73)),
+    ("crash_boundary", "expected_exit", "damage_publication"),
+    (
+        ("before_pointer", 72, False),
+        ("after_pointer", 73, False),
+        pytest.param("after_pointer", 73, True, id="after-pointer-invalid-publication"),
+    ),
 )
 def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     crash_boundary: str,
     expected_exit: int,
+    damage_publication: bool,
 ) -> None:
     """A hard exit cannot separate a publication from its frozen MCP result."""
     config_path, _config_sha256 = _constant_trial_config(tmp_path, crash_boundary)
@@ -1821,13 +1827,16 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     _pid, wait_status = os.waitpid(child, 0)
     assert os.waitstatus_to_exitcode(wait_status) == expected_exit
 
-    prepared = json.loads(store.status_path(run_id).read_text())
+    prepared_bytes = store.status_path(run_id).read_bytes()
+    prepared = json.loads(prepared_bytes)
     assert prepared["result_snapshot_state"] == "pending"
     assert prepared["result_publication_state"] == "prepared"
     assert prepared["result_publication_generation_id"] == run_id
     experiment = load_config(config_path)
+    if damage_publication:
+        _generation_summary_path(experiment, run_id).unlink()
     assert _last_successful_generation_id(experiment) == (
-        run_id if crash_boundary == "after_pointer" else None
+        run_id if crash_boundary == "after_pointer" and not damage_publication else None
     )
 
     command = [
@@ -1839,6 +1848,16 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         run_id,
     ]
     dry_run = CliRunner().invoke(cli_main, command)
+    if damage_publication:
+        assert read_status(experiment)["publication_integrity"] == "failed"
+        assert dry_run.exit_code != 0
+        assert "last-success publication is invalid or unreadable" in dry_run.output
+        recovered = CliRunner().invoke(cli_main, [*command, "--confirm"])
+        assert recovered.exit_code != 0
+        assert "last-success publication is invalid or unreadable" in recovered.output
+        assert store.status_path(run_id).read_bytes() == prepared_bytes
+        assert not store.cleanup_recovery_path(run_id).exists()
+        return
     assert dry_run.exit_code == 0, dry_run.output
     assert "prepared" in dry_run.output
     recovered = CliRunner().invoke(cli_main, [*command, "--confirm"])
@@ -1867,8 +1886,8 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
             "retryable": True,
             "actor": "agent",
             "remediation": (
-                "Report that this run's prepared result was not published. Start a new run "
-                "only if the user still wants a published result."
+                "Report that recovery could not confirm this run as the current published "
+                "result. Start a new run only if the user still wants a published result."
             ),
         }
 
