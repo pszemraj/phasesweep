@@ -413,6 +413,7 @@ def _promotion_decision_payload(
         "candidate_trial_number": candidate.trial_number,
         "candidate_generation_id": candidate.generation_id,
         "candidate_attempt_id": candidate.attempt_id,
+        "candidate_completion": candidate.completion,
         "baseline_trial_number": baseline.trial_number,
         "baseline_generation_id": baseline.generation_id,
         "baseline_attempt_id": baseline.attempt_id,

@@ -104,7 +104,12 @@ def _published_phase_trial_refs(
             and isinstance(decision.get("phase"), str)
         ):
             phase_items.setdefault(
-                decision["phase"], {"name": decision["phase"], "promotion": decision}
+                decision["phase"],
+                {
+                    "name": decision["phase"],
+                    "promotion": decision,
+                    "completion": decision.get("candidate_completion"),
+                },
             )
     refs: dict[str, _TrialRef | None] = {}
     for name, item in phase_items.items():
