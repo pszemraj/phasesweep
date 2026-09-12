@@ -1,6 +1,6 @@
 # Tiny Decoder Enwik8 example
 
-This example runs a tiny Enwik8 decoder training sweep with PhaseSweep. The trainer implementation comes from the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). Its complete base configuration lives under `trainer_config` in the same PhaseSweep YAML as the search plan. PhaseSweep applies each trial's inherited, fixed, and sampled values and materializes `trainer_config.yaml`; `run_trial.py` passes that file to the upstream trainer and publishes the final-checkpoint objective. The model shape stays fixed while the three phases tune optimizer scale, regularization, and training stability.
+This example runs a tiny Enwik8 decoder training sweep with PhaseSweep using the pinned [`decoder-pytorch-template`](upstream/) git submodule ([upstream project](https://github.com/pszemraj/decoder-pytorch-template)). The model shape stays fixed while three phases tune optimizer scale, regularization, and training stability; [`run_trial.py`](run_trial.py) passes each materialized trainer config to the upstream trainer and publishes the final-checkpoint objective.
 
 ## Setup
 
@@ -11,7 +11,7 @@ git submodule update --init examples/tiny_decoder_enwik8/upstream
 pip install -e examples/tiny_decoder_enwik8/upstream
 ```
 
-The submodule checkout also brings the dataset: `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. `run_trial.py` runs the trainer with the upstream checkout as its working directory, which is how the embedded relative `data_path: data/enwik8.gz` resolves.
+The submodule checkout also brings the [dataset](upstream/data/README.md): `upstream/data/enwik8.gz` (~36 MB, from the Hutter Prize distribution) ships inside the trainer repo, so no separate download step is needed. The wrapper runs the trainer with the upstream checkout as its working directory, which is how the embedded relative `data_path: data/enwik8.gz` resolves.
 
 For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-extra) as well.
 
@@ -38,17 +38,15 @@ phasesweep run examples/tiny_decoder_enwik8/experiment.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/experiment.yaml
 ```
 
-A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 batches each). A resumed study launches only the attempts still needed to reach that target. Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`, as configured in `experiment.yaml`.
+A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 batches each). A resumed study launches only the attempts still needed to reach that target. Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`. The phase comments in [`experiment.yaml`](experiment.yaml) explain the learning-rate, weight-decay, and gradient-clipping order.
 
-The phase order is deliberate: `optimizer_scale` selects `learning_rate` first because it is the highest-leverage scale decision; `weight_decay` tunes that parameter after the update scale is fixed; then `clip_norm` selects `grad_clip_norm` as a stability/control knob. These are not perfectly independent, but they are closer to PhaseSweep's intended "mostly orthogonal consecutive sweeps" than mixing architecture shape, optimizer scale, and regularization in one chain.
-
-The config uses 1000 training batches per trial. The upstream trainer validates periodically at steps 0-900, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#extractors) verifies its attempt identity, overrides digest, and evaluation policy.
+The upstream trainer validates periodically at steps 0-900, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#extractors) verifies its attempt identity, overrides digest, and evaluation policy.
 
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
 ## MCP smoke
 
-For the same two-trial, 10-batch check through MCP, start from `gpu_smoke.yaml`
+For the same two-trial, 10-batch check through MCP, start from [`gpu_smoke.yaml`](gpu_smoke.yaml)
 instead of the full MCP experiment. From the repo root, copy it into a fresh
 scratch directory:
 
@@ -72,10 +70,8 @@ execution:
   cwd: /absolute/path/to/phasesweep
 ```
 
-MCP needs persistent storage; `auto` puts SQLite beside this sequential
-experiment's artifacts. Provenance identifies the same trainer and data as
-the full example. Explicit `execution.cwd` makes its repo-relative trainer
-command work when the config is in scratch storage.
+These root-key changes preserve the smoke search while satisfying the
+[persistent storage and absolute path requirements for MCP](../../docs/mcp.md#paths-and-the-working-directory).
 
 ```bash
 phasesweep validate /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml
@@ -83,17 +79,17 @@ phasesweep mcp init-catalog --from /tmp/phasesweep-tiny-decoder-mcp-smoke/experi
 ```
 
 Review the generated catalog, enable `allow.launch`, and set `visible_params:
-all` if the agent should report the winning learning rate. Then follow the
-[MCP client setup](../../docs/mcp_setup.md) using that catalog and authorize
-the two-trial smoke. The [status response example](../../docs/mcp.md#reading-status-responses)
-shows how to await and retrieve its result. A completed persistent smoke is
+all` if the agent should report the winning learning rate. Follow the
+[MCP client setup](../../docs/mcp_setup.md), authorize the two-trial smoke,
+then use the [status response workflow](../../docs/mcp.md#reading-status-responses).
+A completed persistent smoke is
 reused on a later launch; choose a new experiment name and scratch directory
 when you want two fresh trials. GPU leasing does not impose a VRAM quota:
 verify the workload and monitor GPU memory separately when sharing a device.
 
 ## MCP full sweep
 
-The MCP catalog exposes the same nine-attempt target with 1000 batches per attempt as the full CLI config above; it is not the two-attempt quick smoke. It pins the detached runner `cwd` to the PhaseSweep repo root, so the relative `trial_command` in `mcp_experiment.yaml` resolves consistently even if the MCP server is started from another shell cwd:
+Run the full sweep through [`catalog.yaml`](catalog.yaml), which registers [`mcp_experiment.yaml`](mcp_experiment.yaml) with the PhaseSweep repo root as its runner `cwd`:
 
 ```bash
 phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
@@ -101,8 +97,6 @@ phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml --dry
 phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
-Restart the selected client after installation, then ask it to list the available PhaseSweep experiments. `phasesweep mcp serve` is a stdio JSON-RPC endpoint for MCP clients, not an interactive terminal interface; use `mcp check` for a direct startup preflight.
+After installation, follow the [client restart and verification step](../../docs/mcp_setup.md#4-restart-and-verify).
 
-The MCP variant uses absolute scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`, as required for restart-stable MCP runs.
-
-Both persistent full configs, `experiment.yaml` and `mcp_experiment.yaml`, declare trainer and data provenance. The embedded trainer config is fingerprinted automatically; update the external provenance tokens whenever the wrapper, pinned template revision, data preparation, or dependencies change so PhaseSweep refuses an incompatible top-up.
+The MCP variant uses scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`.
