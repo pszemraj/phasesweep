@@ -80,6 +80,7 @@ FailureCode: TypeAlias = Literal[
     "cleanup_uncertain",
     "cancelled",
     "result_snapshot_unavailable",
+    "publication_not_committed",
     "internal_error",
 ]
 

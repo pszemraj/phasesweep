@@ -1742,7 +1742,13 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     expected_exit: int,
 ) -> None:
     """A hard exit cannot separate a publication from its frozen MCP result."""
-    config_path, config_sha256 = _constant_trial_config(tmp_path, crash_boundary)
+    config_path, _config_sha256 = _constant_trial_config(tmp_path, crash_boundary)
+    raw_config = yaml.safe_load(config_path.read_text())
+    raw_config["storage"] = "auto"
+    raw_config["provenance"] = {"revision": "test-fixture-v1"}
+    raw_config["phases"][0]["sampler"] = {"type": "random", "seed": 0}
+    config_path.write_text(yaml.safe_dump(raw_config))
+    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
     store = RunStore(tmp_path / "state")
     run_id = f"hard-exit-{crash_boundary.replace('_', '-')}"
     started_at = utc_now_iso()
@@ -1848,12 +1854,36 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         assert terminal["result_publication_state"] == "committed"
         assert snapshot["status"]["is_published"] is True
         assert snapshot["status"]["published_generation_id"] == run_id
+        failure = None
     else:
         assert terminal["returncode"] == 1
         assert terminal["error_class"] == "PublicationNotCommitted"
         assert "result_publication_state" not in terminal
         assert snapshot["status"]["is_published"] is False
         assert _last_successful_generation_id(experiment) is None
+        failure = {
+            "code": "publication_not_committed",
+            "stage": "execution",
+            "retryable": True,
+            "actor": "agent",
+            "remediation": (
+                "Report that this run's prepared result was not published. Start a new run "
+                "only if the user still wants a published result."
+            ),
+        }
+
+    assert terminal.get("failure") == failure
+    app, _registry, _store = make_mcp_app(
+        write_mcp_catalog(tmp_path, {crash_boundary: config_path})
+    )
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    for payload in (
+        app.status(run_id=run_id),
+        asyncio.run(app.await_run(run_id, timeout_seconds=0)),
+        app.latest_run(crash_boundary),
+    ):
+        assert payload["run"]["failure"] == failure
+    assert app.winners(run_id=run_id)["failure"] == failure
 
 
 def test_runner_refuses_to_persist_handle_without_linux_process_identity(

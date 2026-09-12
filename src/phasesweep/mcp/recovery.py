@@ -32,6 +32,7 @@ from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.errors import PhaseSweepError
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
+from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     ProcessIdentity,
     RunHandle,
@@ -731,6 +732,16 @@ def _finish_result_recovery(
         else:
             terminal_status["returncode"] = 1
             terminal_status["error_class"] = "PublicationNotCommitted"
+            terminal_status["failure"] = FailurePayload(
+                code="publication_not_committed",
+                stage="execution",
+                retryable=True,
+                actor="agent",
+                remediation=(
+                    "Report that this run's prepared result was not published. Start a new run "
+                    "only if the user still wants a published result."
+                ),
+            ).model_dump(mode="json", exclude_none=True)
             terminal_status.pop("result_publication_state", None)
             terminal_status.pop("result_publication_generation_id", None)
     if needs.snapshot_finalize_needed:
