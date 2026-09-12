@@ -143,6 +143,17 @@ def recover_run(
                     "result_snapshot_error": "HistoricalSnapshotUnavailable",
                 }
                 write_status_file(store.status_path(run_id), terminal_status)
+            if needs.snapshot_finalize_needed:
+                # Keep the run reserved before cleanup evidence can release it.
+                terminal_status.pop("result_snapshot_error", None)
+                terminal_status["result_snapshot_state"] = "pending"
+                try:
+                    write_status_file(store.status_path(run_id), terminal_status)
+                except Exception as exc:
+                    raise RunRecoveryError(
+                        f"failed to finalize terminal result snapshot for {run_id}: "
+                        f"{type(exc).__name__}"
+                    ) from None
             if needs.cleanup_needed:
                 _persist_cleanup_recovery(store, handle, config, evidence, emit=emit)
             _finish_result_recovery(
@@ -768,7 +779,7 @@ def _finalize_stored_terminal_result_snapshot(
     confirmed_attempt_ids: set[str],
     confirmed_attempt_locations: dict[str, tuple[str, int, str]],
 ) -> None:
-    """Finalize and persist the snapshot captured under the experiment lock.
+    """Finalize and persist the stored snapshot already marked pending under the lock.
 
     :param RunStore store: Existing run store containing the terminal status.
     :param str run_id: Run whose stored terminal snapshot should be finalized.
@@ -784,10 +795,7 @@ def _finalize_stored_terminal_result_snapshot(
             "shared state as historical evidence"
         )
     raw_snapshot = snapshot.model_dump(mode="json")
-    terminal_status.pop("result_snapshot_error", None)
-    terminal_status["result_snapshot_state"] = "pending"
     try:
-        write_status_file(store.status_path(run_id), terminal_status)
         terminal_status["result_snapshot"] = finalize_result_snapshot(
             raw_snapshot,
             confirmed_attempt_ids=confirmed_attempt_ids,

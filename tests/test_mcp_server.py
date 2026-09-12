@@ -81,6 +81,7 @@ from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
+    ExperimentBusyError,
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
     UnknownExperimentError,
@@ -4534,6 +4535,49 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert recovered_status["terminal_trials_this_run"] == 1
     assert recovered_status["terminal_trials_before_run"] == 0
     assert recovered_status["target_already_satisfied"] is False
+
+
+def test_operator_recovery_keeps_reservation_when_pending_status_cannot_be_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed snapshot preparation cannot publish cleanup as a finished recovery."""
+    run_id = "srv-pending-write-failure"
+    app, store, handle, attempt_id, command = _stage_stale_running_recovery_scaffold(
+        tmp_path,
+        run_id=run_id,
+        error_class="UnsafeProcessCleanupError",
+        include_generation_record=True,
+        mark_cleanup_uncertain=False,
+        snapshot_bound_to_generation=True,
+        kill_stale_group_stub=lambda *_args, **_kwargs: True,
+        cleanup_trial_stub=lambda *_args, **_kwargs: True,
+        monkeypatch=monkeypatch,
+    )
+
+    def refuse_status_write(_path: Path, _payload: dict) -> None:
+        raise OSError("status file unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("phasesweep.mcp.recovery.write_status_file", refuse_status_write)
+        failed = CliRunner().invoke(cli_main, command)
+
+    assert failed.exit_code != 0
+    assert "failed to finalize terminal result snapshot" in failed.output
+    assert store.recovery_required(handle)
+    assert app.status(run_id=run_id)["run"]["recovery_required"] is True
+    assert not store.cleanup_recovery_path(run_id).exists()
+    with pytest.raises(ExperimentBusyError):
+        app.launch("srv")
+
+    retried = CliRunner().invoke(cli_main, command)
+    assert retried.exit_code == 0, retried.output
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["reaped_attempt_ids"] == [attempt_id]
+    assert not store.recovery_required(handle)
+    phase = app.status(run_id=run_id)["phases"][0]
+    assert phase["trials"]["RUNNING"] == 0
+    assert phase["trials"]["FAIL"] == 1
 
 
 def test_operator_recovery_uses_runner_reconciliation_evidence(
