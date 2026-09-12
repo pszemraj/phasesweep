@@ -1054,9 +1054,8 @@ class PhaseSweepMCP:
             snapshot-unavailable failure; otherwise returns ``None`` when no
             valid failure was recorded.
         """
-        terminal = self._runs.recorded_terminal_status(handle)
-        if terminal is None:
-            return None
+        # A runner lost across a reboot is terminal even without a status file.
+        terminal = self._runs.recorded_terminal_status(handle) or {}
         persisted: dict[str, Any] | None = None
         try:
             if terminal.get("failure") is not None:

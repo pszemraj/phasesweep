@@ -3711,15 +3711,29 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     winners = app.winners(run_id=run_id)
     awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
 
+    failure = {
+        "code": "result_snapshot_unavailable",
+        "stage": "cleanup",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "Report that this run's historical results are unavailable and ask "
+            "the operator to inspect the PhaseSweep run or server diagnostics; "
+            "do not substitute mutable experiment-level results."
+        ),
+    }
     for payload in (status, awaited):
         assert payload["result_source"] == "terminal_snapshot_unavailable"
         assert payload["represented_generation_id"] is None
         assert payload["run"]["state"] == "failed"
         assert payload["run"]["recovery_required"] is False
+        assert payload["run"]["failure"] == failure
         assert payload["phases"][0]["running_trials_total"] == 0
         assert payload["phases"][0]["trial_data_available"] is False
     assert winners["result_source"] == "terminal_snapshot_unavailable"
     assert winners["represented_generation_id"] is None
+    assert winners["failure"] == failure
+    assert app.latest_run("srv")["run"]["failure"] == failure
     assert awaited["reason"] == "terminal"
 
 
