@@ -24,14 +24,14 @@ If you do not have an experiment yet, `phasesweep init` creates an installed-pac
 phasesweep mcp init-catalog --from ./experiment.yaml
 ```
 
-The command writes `catalog.yaml` with side effects disabled and winner values redacted. Its catalog validation also provisions the [private state layout](mcp.md#the-catalog) outside the project, under `${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>/`. The catalog pins that absolute path, and the private state's `origin` file identifies the catalog. Before continuing, review:
+The command writes `catalog.yaml` with side effects disabled and winner values redacted, validates it, and provisions its [private state layout](mcp.md#the-catalog). Before continuing, review:
 
 - every experiment description and config path;
 - `visible_params`, which controls sampled winner values visible to the agent;
 - `allow.launch`, `allow.cancel`, and `allow.from_phase`;
 - the catalog state directory and each experiment working directory.
 
-Add another `--from` for each experiment. Use `-o` to choose another catalog filename. For per-user scratch placement, provision an absolute owner-only `0700` directory and set `PHASESWEEP_HOME` before scaffolding: new MCP state goes under its `mcp/` directory. An existing catalog keeps its saved `state_dir`, including an older project-local `runs/.mcp` path; upgrading does not relocate its state. To use the new placement for future runs, resolve outstanding runs under the old catalog, then scaffold and review a new catalog with `-o NEW_CATALOG.yaml` and reinstall the client with `--catalog NEW_CATALOG.yaml`. Retain the old state for its run history and recovery. This setting does not change host locks; their default location is fixed to the OS account home, with `PHASESWEEP_LOCK_DIR` as the sole placement override. The scaffold is staged and validated before publication and never replaces an existing path. See [the catalog reference](mcp.md#the-catalog) for storage and path rules and the [security model](mcp.md#security-model) for the resulting authority boundary.
+Add another `--from` for each experiment. Use `-o` to choose another catalog filename. An existing catalog keeps its saved `state_dir`, including an older project-local `runs/.mcp` path; upgrading does not relocate it. To use a new placement for future runs, resolve outstanding runs under the old catalog, scaffold and review a new catalog with `-o NEW_CATALOG.yaml`, reinstall the client with `--catalog NEW_CATALOG.yaml`, and retain the old state for its run history and recovery. The scaffold is staged and validated before publication and never replaces an existing path. See [the catalog reference](mcp.md#the-catalog) for state placement, storage, and path rules, [runtime concurrency](runtime.md#concurrency-model) for host locks, and the [security model](mcp.md#security-model) for the resulting authority boundary.
 
 ### 3. Connect a client
 
