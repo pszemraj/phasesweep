@@ -85,9 +85,6 @@ phase 'weight_decay': sampler=random seed=1 (resumable, reproducible)
 
 ## Override formats
 
-> [!IMPORTANT]
-> `yaml_file` is the core workflow. Put the trainer's base config and PhaseSweep's search plan in the same operator-authored YAML, then pass `{config_path}` to the trainer.
-
 The default `yaml_file` mode materializes one complete `<trial_dir>/trainer_config.yaml` from the embedded `trainer_config` for every trial. It expands `{trial_dir}`, `{trial_id}`, `{phase}`, and `{run_name}` inside base-config strings before applying dotted overrides; all other strings, including override values, remain literal. Nested mappings, lists, strings, booleans, finite numbers, and nulls are preserved. `{config_path}` is required even when a phase has no overrides so the trainer always receives its base configuration. Changing `trainer_config` changes the experiment and phase fingerprints.
 
 | Format | Use when |
@@ -111,7 +108,7 @@ For each trial, PhaseSweep creates the trial directory, materializes the selecte
 - Provide a finite objective through the configured extractor: call `report_objective(...)` or write a compatible JSON envelope, write log evidence under `{trial_dir}`, or make the configured W&B run terminal with the metric in its summary. `report_objective(...)` creates missing parent directories when the envelope uses a nested trial-relative path.
 - Exit nonzero when the trial failed and should be recorded as failed.
 - When using W&B extraction or gates, let the W&B SDK use the injected `WANDB_RUN_ID`; `PHASESWEEP_RUN_NAME` remains available as the human-readable display name. Configure the evidence source's explicit `base_url`, and point the trainer at the same deployment (for example through fingerprinted top-level `env.WANDB_BASE_URL`).
-- When writing a `json_envelope` directly, copy `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` into it. `report_objective(...)` fills these fields automatically. PhaseSweep verifies all three before accepting the objective.
+- When writing a `json_envelope` directly, follow the [result envelope](#result-envelope) field requirements.
 
 PhaseSweep composes the configured environment, then injects trial identity, evidence-path, trainer-input digest, W&B identity, and GPU-isolation values as applicable. The [config reference](config_reference.yaml) lists every reserved variable and its meaning; the [GPU runtime contract](runtime.md#concurrency-model) covers device visibility and locking.
 
@@ -141,7 +138,7 @@ A `json_envelope` trainer publishes this versioned shape after successful evalua
 }
 ```
 
-Direct envelope writers copy the generation ID, attempt ID, and overrides digest from the reserved trial environment values. The objective name, split, and evaluation policy must match the extractor config. The checkpoint must be a nonempty identity, the step must be a non-negative integer, and the objective value must be a finite JSON number rather than a string or boolean. Configured `checkpoint` and `expected_step` values are matched exactly.
+Direct envelope writers copy `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID`, and `PHASESWEEP_OVERRIDES_SHA256` from the trial environment into the corresponding fields. PhaseSweep checks all three against the current attempt. The objective name, split, and evaluation policy must match the extractor config. The checkpoint must be a nonempty identity, the step must be a non-negative integer, and the objective value must be a finite JSON number rather than a string or boolean. Configured `checkpoint` and `expected_step` values are matched exactly.
 
 Python trainers can publish that envelope without reconstructing its managed fields or destination:
 
