@@ -7,6 +7,7 @@ import shlex
 import sys
 import textwrap
 import time
+import tracemalloc
 import types
 from dataclasses import replace
 from pathlib import Path
@@ -731,6 +732,50 @@ def test_log_regex_splits_carriage_return_progress_lines(tmp_path):
             ("first", 2.5, 1, 1),
         ],
     )
+
+
+def test_log_regex_streams_carriage_return_progress_lines(tmp_path):
+    """CR-only progress output must not be accumulated as one binary line."""
+    raw = b"eval_loss=1.0\r" * 10_000
+    (tmp_path / "stdout.log").write_bytes(raw)
+    cfg = LogRegexExtractor(
+        type="log_regex",
+        file="stdout.log",
+        pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
+        select="last",
+    )
+
+    provenance: dict = {}
+    tracemalloc.start()
+    try:
+        value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
+        _, peak_bytes = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert value == 1.0
+    assert provenance["source"]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert provenance["source"]["size_bytes"] == len(raw)
+    assert provenance["source"]["matched_line"] == 10_000
+    assert provenance["source"]["match_count"] == 10_000
+    assert peak_bytes < len(raw) * 8
+
+
+def test_log_regex_first_hashes_invalid_utf8_suffix_without_decoding_it(tmp_path):
+    """First-match selection still hashes later bytes without validating them."""
+    raw = b"eval_loss=1.0\n\xff"
+    (tmp_path / "stdout.log").write_bytes(raw)
+    cfg = LogRegexExtractor(
+        type="log_regex",
+        file="stdout.log",
+        pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
+        select="first",
+    )
+
+    provenance: dict = {}
+    assert run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance) == 1.0
+    assert provenance["source"]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert provenance["source"]["size_bytes"] == len(raw)
 
 
 def test_provenance_wandb_freezes_summary_subset(fake_wandb, tmp_path):

@@ -321,11 +321,11 @@ def _extract_log_regex(
 
     pattern = re.compile(cfg.pattern)
 
-    # Stream line-by-line to avoid 500 MB RSS on large training logs. Binary
-    # iteration feeds the evidence digest with the exact on-disk bytes; regex
-    # matching then runs on logical lines split with text-mode universal
-    # newline semantics (lone "\r" is a boundary too — tqdm-style progress
-    # logs separate updates with bare carriage returns).
+    # Stream with universal-newline boundaries while retaining each original
+    # terminator. ``surrogateescape`` lets us round-trip the exact source bytes
+    # into the evidence digest; lines that are still eligible for matching are
+    # then decoded strictly so invalid UTF-8 remains an evidence failure. This
+    # keeps CR-only tqdm progress output bounded to one logical line at a time.
     hasher = hashlib.sha256()
     size_bytes = 0
     result: float | None = None
@@ -333,41 +333,38 @@ def _extract_log_regex(
     count = 0
     line_no = 0
     try:
-        with target.open("rb") as fh:
-            for raw_line in fh:
+        with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+            for raw_text in fh:
+                raw_line = raw_text.encode("utf-8", errors="surrogateescape")
                 hasher.update(raw_line)
                 size_bytes += len(raw_line)
                 if cfg.select == "first" and result is not None:
                     # Value already selected; keep reading only to finish the
                     # whole-file digest.
                     continue
-                text = raw_line.decode("utf-8")
-                if text.endswith("\r\n"):
-                    text = text[:-2] + "\n"
-                elif text.endswith("\r"):
-                    text = text[:-1] + "\n"
-                parts = text.split("\r")
-                for line in [part + "\n" for part in parts[:-1]] + parts[-1:]:
-                    line_no += 1
-                    m = pattern.search(line)
-                    if m is None:
-                        continue
-                    try:
-                        v = float(m.group("value"))
-                    except (TypeError, ValueError):
-                        continue
-                    count += 1
-                    if cfg.select in ("first", "last"):
-                        result = v
-                        result_line = line_no
-                    elif cfg.select == "min":
-                        if result is None or v < result:
-                            result, result_line = v, line_no
-                    elif cfg.select == "max":
-                        if result is None or v > result:
-                            result, result_line = v, line_no
-                    if cfg.select == "first":
-                        break
+                line = raw_line.decode("utf-8")
+                if line.endswith("\r\n"):
+                    line = line[:-2] + "\n"
+                elif line.endswith("\r"):
+                    line = line[:-1] + "\n"
+                line_no += 1
+                m = pattern.search(line)
+                if m is None:
+                    continue
+                try:
+                    v = float(m.group("value"))
+                except (TypeError, ValueError):
+                    continue
+                count += 1
+                if cfg.select in ("first", "last"):
+                    result = v
+                    result_line = line_no
+                elif cfg.select == "min":
+                    if result is None or v < result:
+                        result, result_line = v, line_no
+                elif cfg.select == "max":
+                    if result is None or v > result:
+                        result, result_line = v, line_no
     except UnicodeError as exc:
         raise ExtractorError(f"Log file is not valid UTF-8 at {target}: {exc}") from exc
     except OSError as exc:
