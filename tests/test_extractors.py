@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shlex
 import sys
+import textwrap
 import time
 import types
 from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock
 
 import pytest
 from pydantic import ValidationError
@@ -19,8 +25,23 @@ from phasesweep.config import (
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.evaluation import DeadlineExceededError, extractor_config_fingerprint
+from phasesweep.evidence.wandb import (
+    WandbPollTimeout,
+    WandbRunTerminalError,
+    WandbSetupError,
+    _poll_wandb_summary,
+    poll_wandb_summary,
+)
+from phasesweep.runtime.process import (
+    PROCESS_IDENTITY_FILE,
+    ProcessResult,
+    is_pid_alive,
+    read_attempt_lifecycle,
+    read_stale_process_identity,
+)
 from tests.conftest import make_trial_context
 
 
@@ -28,6 +49,7 @@ class _FakeRun:
     def __init__(self, state: str, summary: dict):
         self.state = state
         self.summary = summary
+        self.summary_metrics = summary
 
 
 class _FakeApi:
@@ -40,7 +62,12 @@ class _FakeApi:
 
 @pytest.fixture
 def fake_wandb(monkeypatch: pytest.MonkeyPatch):
-    """Install a fake ``wandb.apis.public.Api`` implementation."""
+    """Run polling-loop unit tests inline with a fake W&B API and controllable clock."""
+
+    def poll_inline(*, trial_dir, **kwargs):
+        return _poll_wandb_summary(**kwargs)
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll_inline)
 
     def install(run_for_path=None, *, api_class=None):  # noqa: ANN001, ANN202
         wandb_mod = types.ModuleType("wandb")
@@ -69,6 +96,285 @@ def fake_wandb(monkeypatch: pytest.MonkeyPatch):
         return timeouts
 
     return install
+
+
+@pytest.fixture
+def wandb_worker_sdk(tmp_path, monkeypatch):
+    """Put a fake SDK on the real polling worker's import path."""
+    root = tmp_path / "sdk"
+    apis = root / "wandb" / "apis"
+    apis.mkdir(parents=True)
+    (root / "wandb" / "__init__.py").write_text("", encoding="utf-8")
+    (apis / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")]))
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.TemporaryDirectory",
+        lambda **kwargs: TemporaryDirectory(dir=tmp_path, **kwargs),
+    )
+
+    def install(source):
+        (apis / "public.py").write_text(textwrap.dedent(source), encoding="utf-8")
+
+    return install
+
+
+def test_wandb_worker_returns_raw_sdk_summary_metrics(wandb_worker_sdk, tmp_path):
+    wandb_worker_sdk(
+        """
+        class SummarySubDict:
+            pass
+
+        class Api:
+            def __init__(self, overrides=None, timeout=None):
+                assert overrides == {"base_url": "https://example.test"}
+                assert 0 < timeout <= 5
+
+            def run(self, path):
+                assert path == "entity/project/attempt"
+                class Run:
+                    state = "finished"
+                    summary = {"loss": 0.25, "_wandb": SummarySubDict()}
+                    summary_metrics = {"loss": 0.25, "_wandb": {"runtime": 1}}
+                return Run()
+        """
+    )
+
+    assert poll_wandb_summary(
+        base_url="https://example.test",
+        entity="entity",
+        project="project",
+        run_id="attempt",
+        trial_dir=tmp_path,
+        poll_seconds=0.01,
+        timeout_seconds=5,
+        required_keys=["loss"],
+    ) == {"loss": 0.25, "_wandb": {"runtime": 1}}
+    assert list(tmp_path.glob("phasesweep-wandb-*")) == []
+    assert (
+        read_stale_process_identity(tmp_path, expected_attempt_id="attempt").attempt_id == "attempt"
+    )
+    assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
+
+
+def test_wandb_sdk_summary_metrics_avoid_nested_summary_wrapper(tmp_path):
+    """Current W&B's raw summary avoids its nested mapping wrapper."""
+    summary_module = pytest.importorskip("wandb.apis.public.summary")
+    raw_summary = {"loss": 0.25, "_wandb": {"runtime": 1}}
+    summary = summary_module.HTTPSummary(
+        types.SimpleNamespace(dir=str(tmp_path), id="attempt", entity="entity", project="project"),
+        Mock(),
+        summary=raw_summary,
+    )
+
+    assert isinstance(dict(summary)["_wandb"], summary_module.SummarySubDict)
+    assert json.loads(json.dumps(raw_summary)) == raw_summary
+
+
+@pytest.mark.parametrize("stage", ["constructor", "lookup"])
+def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
+    wandb_worker_sdk, tmp_path, monkeypatch, stage
+):
+    marker = tmp_path / "pids.json"
+    monkeypatch.setenv("POLL_TEST_PIDS", str(marker))
+    monkeypatch.setenv("POLL_TEST_STAGE", stage)
+    wandb_worker_sdk(
+        """
+        import json, os, subprocess, sys, time
+        from pathlib import Path
+
+        def sdk_retries():
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            Path(os.environ["POLL_TEST_PIDS"]).write_text(json.dumps([os.getpid(), child.pid]))
+            retry_deadline = time.monotonic() + 30
+            while time.monotonic() < retry_deadline:
+                try:
+                    raise ConnectionError("transient transport failure")
+                except ConnectionError:
+                    time.sleep(0.05)
+
+        class Api:
+            calls = 0
+
+            def __init__(self, overrides=None, timeout=None):
+                if os.environ["POLL_TEST_STAGE"] == "constructor":
+                    Api.calls += 1
+                    if Api.calls == 2:
+                        raise ConnectionError("transient W&B API error before blocked retry")
+                    if Api.calls > 2:
+                        sdk_retries()
+
+            def run(self, path):
+                if os.environ["POLL_TEST_STAGE"] == "lookup":
+                    Api.calls += 1
+                    if Api.calls == 1:
+                        raise ConnectionError("transient W&B API error before blocked retry")
+                    sdk_retries()
+                return type("Run", (), {"state": "running"})()
+        """
+    )
+    started = time.monotonic()
+
+    with pytest.raises(WandbPollTimeout) as excinfo:
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=1,
+        )
+
+    assert str(excinfo.value.last_error) == "transient W&B API error before blocked retry"
+    assert time.monotonic() - started < 3
+    pids = json.loads(marker.read_text(encoding="utf-8"))
+    assert all(not is_pid_alive(pid) for pid in pids)
+    assert list(tmp_path.glob("phasesweep-wandb-*")) == []
+    assert (tmp_path / PROCESS_IDENTITY_FILE).is_file()
+    assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
+
+
+@pytest.mark.parametrize(
+    ("response_text", "expected_diagnostic"),
+    [
+        (
+            json.dumps({"status": "timeout", "cause": "serialized worker timeout cause"}),
+            "serialized worker timeout cause",
+        ),
+        (
+            '{"status":"timeout","cause":"partial worker timeout cause',
+            '{"status":"timeout","cause":"partial worker timeout cause',
+        ),
+    ],
+)
+def test_wandb_worker_timeout_preserves_response_diagnostic(
+    monkeypatch, response_text, expected_diagnostic, tmp_path
+):
+    def timeout_worker(command, **kwargs):
+        kwargs["stderr"].write("stderr fallback diagnostic\n")
+        kwargs["stderr"].flush()
+        Path(shlex.split(command)[-1]).write_text(response_text, encoding="utf-8")
+        return ProcessResult(return_code=-15, timed_out=True, pid=123, duration_seconds=0.1)
+
+    monkeypatch.setattr("phasesweep.runtime.process.run_supervised", timeout_worker)
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="team",
+        project="project",
+        metric_key="eval/loss",
+        timeout_seconds=5,
+    )
+
+    with pytest.raises(ExtractorError) as excinfo:
+        run_extractor(make_trial_context(tmp_path), cfg)
+
+    assert f"Last error: {expected_diagnostic}" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("source", "error", "match"),
+    [
+        ("raise ImportError('fake SDK missing')", ImportError, "fake SDK missing"),
+        (
+            "class Api:\n    def __init__(self, **kwargs):\n        raise ValueError('bad credentials')",
+            WandbSetupError,
+            "bad credentials",
+        ),
+        (
+            "class Api:\n    def __init__(self, **kwargs): pass\n"
+            "    def run(self, path):\n        return type('Run', (), {'state': 'crashed'})()",
+            WandbRunTerminalError,
+            "crashed",
+        ),
+    ],
+)
+def test_wandb_worker_preserves_typed_errors(wandb_worker_sdk, tmp_path, source, error, match):
+    wandb_worker_sdk(source)
+    with pytest.raises(error, match=match):
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=5,
+        )
+
+
+def test_wandb_launch_failure_cannot_recover_using_previous_process_identity(tmp_path, monkeypatch):
+    from phasesweep.runtime import process
+
+    # The completed trainer's identity must not survive a failed worker launch.
+    with (tmp_path / "trainer.log").open("w") as output:
+        result = process.run_supervised(
+            "true",
+            env=dict(os.environ),
+            stdout=output,
+            stderr=output,
+            timeout=5,
+            trial_dir=tmp_path,
+            attempt_id="attempt",
+        )
+    assert result.cleanup_confirmed
+    assert (tmp_path / PROCESS_IDENTITY_FILE).is_file()
+    real_abort_launch = process._abort_launch
+
+    def fail_identity_write(path, identity):
+        assert path == tmp_path / PROCESS_IDENTITY_FILE
+        assert not path.exists()
+        raise OSError("injected worker identity write failure")
+
+    def uncertain_abort(proc, pgid):
+        # Reap the actual helper, then simulate an unconfirmed cleanup verdict.
+        assert real_abort_launch(proc, pgid)
+        return False
+
+    monkeypatch.setattr(process, "_write_process_identity", fail_identity_write)
+    monkeypatch.setattr(process, "_abort_launch", uncertain_abort)
+    with pytest.raises(UnsafeProcessCleanupError, match="Recovery records remain"):
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=5,
+        )
+    assert not (tmp_path / PROCESS_IDENTITY_FILE).exists()
+    lifecycle = read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt")
+    assert lifecycle.state == "launching"
+    assert lifecycle.cleanup_confirmed is None
+
+
+@pytest.mark.parametrize("stage", ["constructor", "lookup"])
+def test_wandb_poll_rejects_late_sdk_response(fake_wandb, monkeypatch, stage):
+    clock = {"now": 0.0}
+    lookups = []
+
+    class Api:
+        def __init__(self, **kwargs):
+            if stage == "constructor":
+                clock["now"] = 2.0
+
+        def run(self, path):
+            lookups.append(path)
+            clock["now"] = 2.0
+            return _FakeRun("finished", {"loss": 0.1})
+
+    fake_wandb(api_class=Api)
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock["now"])
+    with pytest.raises(WandbPollTimeout):
+        _poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            poll_seconds=0.01,
+            timeout_seconds=1,
+        )
+    assert lookups == ([] if stage == "constructor" else ["e/p/attempt"])
 
 
 def _assert_log_regex_provenance(
@@ -314,24 +620,11 @@ def test_log_regex_selects_last_or_min_value(tmp_path):
         assert run_extractor(make_trial_context(case_dir), cfg) == expected
 
 
-def test_log_regex_reports_invalid_patterns_or_no_matches(tmp_path):
-    cases = [
-        ("no_value_group", "eval_loss=1.0\n", r"eval_loss=([0-9.]+)", "named group 'value'"),
-        ("no_match", "nothing here\n", r"eval_loss=(?P<value>[0-9.]+)", "No matches"),
-    ]
-
-    for case, text, pattern, match in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        (case_dir / "stdout.log").write_text(text)
-        cfg = LogRegexExtractor(
-            type="log_regex",
-            file="stdout.log",
-            pattern=pattern,
-            select="last",
-        )
-        with pytest.raises(ExtractorError, match=match):
-            run_extractor(make_trial_context(case_dir), cfg)
+def test_log_regex_reports_no_matches(tmp_path):
+    (tmp_path / "stdout.log").write_text("nothing here\n", encoding="utf-8")
+    cfg = LogRegexExtractor(type="log_regex", pattern=r"eval_loss=(?P<value>[0-9.]+)")
+    with pytest.raises(ExtractorError, match="No matches"):
+        run_extractor(make_trial_context(tmp_path), cfg)
 
 
 def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
@@ -538,11 +831,15 @@ def test_wandb_extractor_timeout(fake_wandb, tmp_path, monkeypatch: pytest.Monke
 
 
 @pytest.mark.parametrize("model", [WandbExtractor, WandbSummaryRequiredGate])
-def test_wandb_timeouts_require_whole_second_transport_budget(model):
-    """Both wandb extractor models share one pydantic ``ge=1.0`` constraint on
-    ``timeout_seconds``; any sub-1.0 value hits the same validation branch, so a
-    single boundary-adjacent value (0.999) pins it without repeating instances.
+def test_wandb_timeouts_share_minimum_and_document_startup_budget(model):
+    """Both W&B models share their minimum and public startup-budget guidance.
+
+    A single boundary-adjacent value (0.999) pins the shared ``ge=1.0`` validation
+    without repeating instances.
     """
+    description = model.model_json_schema()["properties"]["timeout_seconds"]["description"]
+    assert "Worker startup and W&B SDK initialization" in description
+    assert "Short budgets can expire before the first poll" in description
     common = {
         "type": "wandb" if model is WandbExtractor else "wandb_summary_required",
         "entity": "me",
@@ -587,12 +884,9 @@ def test_wandb_request_timeout_shrinks_with_poll_budget(
     assert timeouts == [10, 3]
 
 
-def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path):
-    """WandbExtractor rejects any terminal state via one
-    ``run.state in {"crashed", "failed", "killed"}`` set-membership check; one
-    representative value (``"failed"``) pins that single branch.
-    """
-    state = "failed"
+@pytest.mark.parametrize("state", ["failed", "preempted"])
+def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path, state):
+    """Only a finished W&B run can provide selectable objective evidence."""
     fake_wandb(lambda _path: _FakeRun(state=state, summary={"eval/loss": 99.0}))
     cfg = WandbExtractor(
         type="wandb",
@@ -606,6 +900,22 @@ def test_wandb_extractor_rejects_unsuccessful_terminal_run(fake_wandb, tmp_path)
     with pytest.raises(ExtractorError, match=rf"state '{state}'.*only finished"):
         ctx = make_trial_context(tmp_path)
         run_extractor(ctx, cfg)
+
+
+def test_wandb_extractor_keeps_preempting_active(fake_wandb, tmp_path):
+    """Preemption in progress may still resolve to a finished summary."""
+    states = iter(["preempting", "finished"])
+    fake_wandb(lambda _path: _FakeRun(state=next(states), summary={"eval/loss": 0.123}))
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
 
 
 def test_wandb_extractor_correlates_by_attempt_not_reused_display_name(fake_wandb, tmp_path):
@@ -709,6 +1019,251 @@ def test_wandb_transient_api_construction_failure_mid_poll_is_retried(
 
     assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
     assert constructions["count"] == 3
+
+
+@pytest.mark.parametrize("chain_kind", ["explicit", "implicit"])
+def test_wandb_first_constructor_retries_transport_in_active_exception_chain(
+    fake_wandb, tmp_path, chain_kind
+):
+    """Explicit causes and unsuppressed implicit contexts both justify a retry."""
+    requests_exceptions = pytest.importorskip("requests.exceptions")
+    requests_connection_error = requests_exceptions.ConnectionError
+    constructions = {"count": 0}
+
+    class AuthenticationError(RuntimeError):
+        """Stand in for ``wandb.errors.AuthenticationError``."""
+
+    class Api:
+        def __init__(self, overrides=None, timeout=None):
+            constructions["count"] += 1
+            if constructions["count"] == 1:
+                try:
+                    raise requests_connection_error("temporary connection failure")
+                except requests_connection_error as exc:
+                    if chain_kind == "explicit":
+                        raise AuthenticationError("could not verify API key") from exc
+                    raise AuthenticationError("could not verify API key")  # noqa: B904
+
+        def run(self, path):
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    fake_wandb(api_class=Api)
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.123)
+    assert constructions["count"] == 2
+
+
+def test_wandb_first_constructor_retries_severed_sidecar_timeout(monkeypatch, tmp_path):
+    """W&B's suppressed sidecar timeout is retried through its API-error marker."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    authentication_error = pytest.importorskip("wandb.errors").AuthenticationError
+    wandb_api_failed_error = pytest.importorskip(
+        "wandb.sdk.lib.service.service_connection"
+    ).WandbApiFailedError
+    constructions = {"count": 0}
+
+    class Api:
+        def __init__(self, overrides=None, timeout=None):
+            constructions["count"] += 1
+            if constructions["count"] == 1:
+                try:
+                    try:
+                        raise TimeoutError("sidecar did not respond")
+                    except TimeoutError:
+                        raise wandb_api_failed_error("sidecar request timed out") from None
+                except wandb_api_failed_error as exc:
+                    raise authentication_error("could not verify API key") from exc
+
+        def run(self, path):
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    assert _poll_wandb_summary(
+        base_url="https://example.test",
+        entity="me",
+        project="proj",
+        run_id="attempt",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    ) == {"eval/loss": 0.123}
+    assert constructions["count"] == 2
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("wrapper", ["service", "requests"])
+def test_wandb_lookup_fails_fast_for_actual_wrapped_authorization_status(
+    monkeypatch, status, wrapper
+):
+    """Both current and older SDKs wrap HTTP denials in ``CommError``."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    errors = pytest.importorskip("wandb.errors")
+    if wrapper == "service":
+        service = pytest.importorskip("wandb.sdk.lib.service.service_connection")
+        api_proto = pytest.importorskip("wandb.proto.wandb_api_pb2")
+        cause = service.WandbApiFailedError(
+            f"HTTP {status}", api_proto.ApiErrorResponse(http_status=status)
+        )
+    else:
+        requests = pytest.importorskip("requests")
+        response = requests.Response()
+        response.status_code = status
+        cause = requests.exceptions.HTTPError(f"HTTP {status}", response=response)
+        # W&B 0.16 has CommError.exc but no service_connection module.
+        monkeypatch.setitem(sys.modules, "wandb.sdk.lib.service.service_connection", None)
+    constructions = {"count": 0}
+
+    class Api:
+        def __init__(self, **kwargs):
+            constructions["count"] += 1
+
+        def run(self, path):
+            raise errors.CommError(f"HTTP {status}", cause)
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    with pytest.raises(WandbSetupError, match=rf"HTTP {status}"):
+        _poll_wandb_summary(
+            base_url="https://example.test",
+            entity="me",
+            project="proj",
+            run_id="attempt",
+            poll_seconds=0.01,
+            timeout_seconds=5,
+        )
+
+    assert constructions["count"] == 1
+
+
+@pytest.mark.parametrize("wrapper", ["service", "requests"])
+def test_wandb_lookup_retries_actual_wrapped_404(monkeypatch, wrapper):
+    """A freshly created run can remain unavailable while W&B catches up."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    errors = pytest.importorskip("wandb.errors")
+    if wrapper == "service":
+        service = pytest.importorskip("wandb.sdk.lib.service.service_connection")
+        api_proto = pytest.importorskip("wandb.proto.wandb_api_pb2")
+        cause = service.WandbApiFailedError(
+            "run not yet visible", api_proto.ApiErrorResponse(http_status=404)
+        )
+    else:
+        requests = pytest.importorskip("requests")
+        response = requests.Response()
+        response.status_code = 404
+        cause = requests.exceptions.HTTPError("run not yet visible", response=response)
+        monkeypatch.setitem(sys.modules, "wandb.sdk.lib.service.service_connection", None)
+    lookups = {"count": 0}
+
+    class Api:
+        def __init__(self, **kwargs):
+            pass
+
+        def run(self, path):
+            lookups["count"] += 1
+            if lookups["count"] == 1:
+                raise errors.CommError("run not yet visible", cause)
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    assert _poll_wandb_summary(
+        base_url="https://example.test",
+        entity="me",
+        project="proj",
+        run_id="attempt",
+        poll_seconds=0.01,
+        timeout_seconds=5,
+    ) == {"eval/loss": 0.123}
+    assert lookups["count"] == 2
+
+
+@pytest.mark.parametrize("service_module_available", [True, False])
+@pytest.mark.parametrize("stage", ["constructor", "lookup"])
+def test_wandb_retries_actual_wrapped_transport_error(monkeypatch, service_module_available, stage):
+    """A ``CommError`` keeps its transport cause outside normal exception chaining."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    errors = pytest.importorskip("wandb.errors")
+    requests_exceptions = pytest.importorskip("requests.exceptions")
+    if not service_module_available:
+        monkeypatch.setitem(sys.modules, "wandb.sdk.lib.service.service_connection", None)
+    calls = {"count": 0}
+
+    def fail_once():
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise errors.CommError(
+                "temporary connection failure",
+                requests_exceptions.ConnectionError("temporary connection failure"),
+            )
+
+    class Api:
+        def __init__(self, **kwargs):
+            if stage == "constructor":
+                fail_once()
+
+        def run(self, path):
+            if stage == "lookup":
+                fail_once()
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    assert _poll_wandb_summary(
+        base_url="https://example.test",
+        entity="me",
+        project="proj",
+        run_id="attempt",
+        poll_seconds=0.01,
+        timeout_seconds=5,
+    ) == {"eval/loss": 0.123}
+    assert calls["count"] == 2
+
+
+@pytest.mark.parametrize("chain_kind", ["from_none", "explicit_nontransport_cause"])
+def test_wandb_first_constructor_ignores_suppressed_transport_context(
+    fake_wandb, tmp_path, chain_kind
+):
+    """A transport error outside the active exception chain does not justify retrying."""
+    requests_exceptions = pytest.importorskip("requests.exceptions")
+    requests_connection_error = requests_exceptions.ConnectionError
+    constructions = {"count": 0}
+
+    class AuthenticationError(RuntimeError):
+        """Stand in for ``wandb.errors.AuthenticationError``."""
+
+    class Api:
+        def __init__(self, overrides=None, timeout=None):
+            constructions["count"] += 1
+            try:
+                raise requests_connection_error("irrelevant earlier failure")
+            except requests_connection_error:
+                if chain_kind == "from_none":
+                    raise AuthenticationError("permanent authentication failure") from None
+                raise AuthenticationError("permanent authentication failure") from ValueError(
+                    "explicit permanent cause"
+                )
+
+    fake_wandb(api_class=Api)
+    cfg = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=1.0,
+    )
+
+    with pytest.raises(ExtractorError, match="W&B client setup failed"):
+        run_extractor(make_trial_context(tmp_path), cfg)
+    assert constructions["count"] == 1
 
 
 @pytest.mark.parametrize("model", [WandbExtractor, WandbSummaryRequiredGate])

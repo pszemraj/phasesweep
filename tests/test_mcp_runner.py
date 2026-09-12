@@ -4,6 +4,7 @@ and the status.json written on the cancel path.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -21,12 +22,13 @@ import yaml
 from click.testing import CliRunner
 
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import Experiment, Phase, Sampler, load_config
+from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
     ActiveAttemptPersistenceError,
     ExperimentLockBusyError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
+    PublishedStudyMissingError,
     SamplerContinuationUnsupportedError,
     StudyStorageUnavailableError,
     TerminalReport,
@@ -34,17 +36,22 @@ from phasesweep.engine import (
     read_status,
     run_experiment,
 )
-from phasesweep.engine.guards import _experiment_lock
-from phasesweep.engine.state import (
-    Winner,
+from phasesweep.engine.locking import _experiment_lock
+from phasesweep.engine.optuna import _resolve_storage
+from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_path,
     _generations_dir,
-    _last_successful_generation_id,
     _summary_path,
     _trial_dir_for,
     _winner_path,
 )
+from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.state import (
+    Winner,
+)
 from phasesweep.mcp import runner as mcp_runner
+from phasesweep.mcp.errors import ConcurrencyLimitError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.process import (
@@ -58,10 +65,12 @@ from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
 from tests.mcp_helpers import (
     claim_runner_handle,
+    make_mcp_app,
     make_run_handle,
     runner_argv,
     runner_main,
     slow_mcp_config_text,
+    write_mcp_catalog,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -372,6 +381,318 @@ def test_attempt_registry_failure_requires_an_explicit_recovery_target() -> None
     assert "new experiment name" in failure["remediation"]
 
 
+def test_missing_published_study_is_an_operator_preflight_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A diagnosed absent ledger needs restoration, not process recovery."""
+    from phasesweep.mcp.redaction import status_payload
+    from phasesweep.mcp.server import GetRunStatusResult
+
+    monkeypatch.chdir(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    run_experiment(experiment)
+    generation_before = _generation_path(experiment).read_bytes()
+    (_experiment_dir(experiment) / "study.db").unlink()
+
+    snapshot = mcp_runner.capture_result_snapshot(experiment)
+    assert snapshot["status"]["phases"][0]["published_study_unavailable"] is True
+    payload = status_payload(
+        experiment_id="t",
+        status=read_status(experiment),
+        run=None,
+        result_source="current_shared_study",
+        elapsed_seconds=None,
+    )
+    assert GetRunStatusResult.model_validate(payload).phases[0].published_study_unavailable
+
+    store = RunStore(tmp_path / "state")
+    run_id = "missing-published-study"
+    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+        experiment_id="t",
+    )
+    with pytest.raises(PublishedStudyMissingError):
+        runner_main(
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config_path,
+                config_sha256=config_sha256,
+                experiment_id="t",
+                started_at=started_at,
+            ),
+            cwd=tmp_path,
+        )
+
+    status = json.loads(store.status_path(run_id).read_text())
+    assert status["failure"] == {
+        "code": "published_study_missing",
+        "stage": "preflight",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "Restore the original complete storage ledger and study, or use a new "
+            "experiment identity for a fresh run."
+        ),
+    }
+    assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
+    assert status["result_snapshot_state"] == "complete"
+    handle = store.get(run_id)
+    assert handle is not None
+    assert store.recovery_required(handle) is False
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert not (_experiment_dir(experiment) / "study.db").exists()
+
+
+@pytest.mark.parametrize("history", ["fresh", "published", "resume"])
+@pytest.mark.parametrize(
+    ("backend", "damage"),
+    [
+        ("sqlite", "header"),
+        ("journal", "garbage"),
+        ("journal", "truncated"),
+        ("journal", "permission-denied"),
+    ],
+)
+def test_damaged_storage_recovery_restores_catalog_capacity(
+    tmp_path: Path, backend: str, damage: str, history: str
+) -> None:
+    """Repairing a pre-launch ledger failure must let operator recovery release its slot."""
+    published = history != "fresh"
+    from_phase = "q" if history == "resume" else None
+    ledger = tmp_path / ("study.db" if backend == "sqlite" else "study.journal")
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"{backend}:///{ledger}",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+        execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
+    )
+    if from_phase is not None:
+        experiment = experiment.model_copy(
+            update={
+                "phases": [
+                    *experiment.phases,
+                    Phase(name="q", n_trials=1, inherits=["p"], sampler=SEEDED_RANDOM),
+                ]
+            }
+        )
+    if published:
+        run_experiment(experiment)
+        if from_phase is not None:
+            optuna.delete_study(
+                study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+            )
+        # A later configured phase legitimately has no study to restore yet.
+        experiment = experiment.model_copy(
+            update={
+                "phases": [
+                    *experiment.phases,
+                    experiment.phases[0].model_copy(update={"name": "later"}),
+                ]
+            }
+        )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    other = experiment.model_copy(update={"experiment": "other", "storage": "auto"})
+    other_path = tmp_path / "other.yaml"
+    other_path.write_text(yaml.safe_dump(other.model_dump(mode="json")))
+    app, _registry, store = make_mcp_app(
+        write_mcp_catalog(
+            tmp_path,
+            {"t": config_path, "other": other_path},
+            allow={"launch": True, "from_phase": True},
+        )
+    )
+    healthy = ledger.read_bytes() if published else b""
+    generation_before = _generation_path(experiment).read_bytes() if published else None
+    damaged = (
+        healthy
+        if damage == "permission-denied"
+        else (
+            b"invalid sqlite header" + healthy[21:]
+            if backend == "sqlite"
+            else healthy + (b"garbage\n" if damage == "garbage" else b'{"op_code":')
+        )
+    )
+    ledger.write_bytes(damaged)
+    original_mode = ledger.stat().st_mode
+    if damage == "permission-denied":
+        ledger.chmod(0)
+    resume_args = ["--from-phase", from_phase] if from_phase is not None else []
+    try:
+        refused_run = subprocess.run(
+            [sys.executable, "-m", "phasesweep", "run", str(config_path), *resume_args],
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+            timeout=30,
+        )
+        assert refused_run.returncode != 0
+        assert "Restore the original complete storage ledger" in refused_run.stderr
+
+        run_id = "damaged-storage"
+        digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        started_at = utc_now_iso()
+        claim_runner_handle(
+            store, run_id=run_id, config_sha256=digest, started_at=started_at, experiment_id="t"
+        )
+        snapshot = store.config_snapshot_path(run_id)
+        snapshot.write_bytes(config_path.read_bytes())
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "phasesweep.mcp.runner",
+                *runner_argv(
+                    store,
+                    run_id=run_id,
+                    config=snapshot,
+                    config_sha256=digest,
+                    experiment_id="t",
+                    started_at=started_at,
+                ),
+                "--cwd",
+                str(tmp_path),
+                *resume_args,
+            ],
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+            timeout=30,
+        )
+        assert result.returncode == 1, result.stderr
+        terminal_before = store.status_path(run_id).read_bytes()
+        status = json.loads(terminal_before)
+        assert status["from_phase"] == from_phase
+        assert status["cleanup_confirmed"] is False
+        assert status["failure"]["code"] == "cleanup_uncertain"
+        assert status["failure"]["retryable"] is False
+        assert status["failure"]["cause"]["code"] == "storage_unavailable"
+        assert status["failure"]["cause"]["stage"] == "preflight"
+        assert status["failure"]["cause"]["retryable"] is True
+        assert "restore the original complete storage ledger" in status["failure"]["remediation"]
+        assert "then run phasesweep mcp recover-run" in status["failure"]["remediation"]
+        assert app.status(run_id=run_id)["run"]["failure"] == status["failure"]
+        assert str(ledger) not in json.dumps(status["failure"])
+        assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
+        handle = store.get(run_id)
+        assert handle is not None
+        assert store.state(handle) == "running"
+        assert store.recovery_required(handle)
+        with pytest.raises(ConcurrencyLimitError):
+            app.launch("other")
+
+        recovery_args = [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--run-id",
+            run_id,
+        ]
+        for confirmation in ([], ["--confirm"]):
+            blocked = CliRunner().invoke(cli_main, [*recovery_args, *confirmation])
+            assert blocked.exit_code != 0
+            assert "could not be" in blocked.output
+            assert "Restore the original complete storage ledger" in blocked.output
+            if damage == "permission-denied":
+                assert ledger.stat().st_mode & 0o777 == 0
+            else:
+                assert ledger.read_bytes() == damaged
+            assert store.status_path(run_id).read_bytes() == terminal_before
+            assert not store.cleanup_recovery_path(run_id).exists()
+    finally:
+        if damage == "permission-denied":
+            ledger.chmod(original_mode)
+    if damage == "permission-denied":
+        assert ledger.read_bytes() == damaged
+
+    if published:
+        expected_diagnostics = {
+            "missing": "persistent study is missing",
+            "empty": "persistent study contains no trials",
+            "unrelated-trial": "persistent study does not contain the published trial identity",
+        }
+        for replacement in ("missing", "empty", "unrelated-trial"):
+            ledger.unlink()
+            if replacement != "missing":
+                study = optuna.create_study(
+                    study_name=f"t::{from_phase or 'p'}",
+                    storage=_resolve_storage(experiment.resolved_storage),
+                )
+                if replacement == "unrelated-trial":
+                    trial = study.ask()
+                    study.tell(trial, 0.5)
+            replacement_before = ledger.read_bytes() if ledger.exists() else None
+            for confirmation in ([], ["--confirm"]):
+                refused = CliRunner().invoke(cli_main, [*recovery_args, *confirmation])
+                assert refused.exit_code != 0, refused.output
+                assert "Published generation " in refused.output
+                assert expected_diagnostics[replacement] in refused.output
+                assert "Restore the original complete storage ledger" in refused.output
+                assert (ledger.read_bytes() if ledger.exists() else None) == replacement_before
+                assert store.status_path(run_id).read_bytes() == terminal_before
+                assert not store.cleanup_recovery_path(run_id).exists()
+                assert store.recovery_required(handle)
+            if replacement == "missing":
+                ledger.write_bytes(healthy)
+
+    ledger.write_bytes(healthy)
+    # A storage error after generation allocation, or an unrelated failure,
+    # still requires cleanup evidence attributable to that run.
+    for changed_fact in ("generation_claimed", "unrelated_failure", "execution_failure"):
+        unrelated = json.loads(terminal_before)
+        if changed_fact == "generation_claimed":
+            unrelated.pop("generation_unavailable_reason")
+        elif changed_fact == "unrelated_failure":
+            unrelated["failure"]["cause"]["code"] = "trainer_failed"
+        else:
+            unrelated["failure"]["cause"]["stage"] = "execution"
+        store.status_path(run_id).write_text(json.dumps(unrelated))
+        refused_recovery = CliRunner().invoke(cli_main, recovery_args)
+        assert refused_recovery.exit_code != 0
+        assert "could not confirm any trial-level cleanup evidence" in refused_recovery.output
+        assert not store.cleanup_recovery_path(run_id).exists()
+    store.status_path(run_id).write_bytes(terminal_before)
+    preflight = CliRunner().invoke(cli_main, recovery_args)
+    assert preflight.exit_code == 0, preflight.output
+    assert store.recovery_required(handle)
+    confirmed = CliRunner().invoke(cli_main, [*recovery_args, "--confirm"])
+    assert confirmed.exit_code == 0, confirmed.output
+    assert store.state(handle) == "failed"
+    assert not store.recovery_required(handle)
+    assert store.live_runs() == []
+    recovered_status = app.status(run_id=run_id)
+    assert recovered_status["run"]["state"] == "failed"
+    assert recovered_status["run"]["recovery_required"] is False
+    assert recovered_status["run"]["failure"] == status["failure"]
+    assert store.status_path(run_id).read_bytes() == terminal_before
+    assert (
+        _generation_path(experiment).read_bytes() if _generation_path(experiment).exists() else None
+    ) == generation_before
+    relaunch = app.launch("t", from_phase=from_phase)
+    relaunch_status = asyncio.run(app.await_run(relaunch["run_id"], timeout_seconds=30))
+    assert relaunch_status["reason"] == "terminal"
+    assert relaunch_status["run"]["state"] == "succeeded"
+    other_relaunch = app.launch("other")
+    other_status = asyncio.run(app.await_run(other_relaunch["run_id"], timeout_seconds=30))
+    assert other_status["reason"] == "terminal"
+    assert other_status["run"]["state"] == "succeeded"
+
+
 def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -534,7 +855,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
     assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
 
-@pytest.mark.parametrize("storage_kind", ["none", "missing-sqlite"])
+@pytest.mark.parametrize("storage_kind", ["none", "corrupt-sqlite"])
 def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -546,7 +867,11 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     so an empty list would claim there are no RUNNING rows (PR #5 review /
     reviewer 2, blocker 6).
     """
-    storage = None if storage_kind == "none" else f"sqlite:///{tmp_path / 'missing' / 'studies.db'}"
+    storage = None
+    if storage_kind == "corrupt-sqlite":
+        ledger = tmp_path / "studies.db"
+        ledger.write_text("not a database\n", encoding="utf-8")
+        storage = f"sqlite:///{ledger}"
     experiment = make_experiment(workdir=tmp_path / "runs", storage=storage, n_trials=1)
 
     def fail_redundant_read(*args: object, **kwargs: object) -> None:
@@ -743,7 +1068,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
     The detached runner must still record returncode 0 with a complete frozen
     snapshot, and the run store must derive ``succeeded``.
     """
-    import phasesweep.engine.run as engine_run
+    import phasesweep.engine.generation as generation_ops
 
     trainer = write_constant_trainer(tmp_path)
     config_path = tmp_path / "exp.yaml"
@@ -768,7 +1093,7 @@ phases:
     def fail_record_write(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated record write failure")
 
-    monkeypatch.setattr(engine_run, "_write_generation_record_once", fail_record_write)
+    monkeypatch.setattr(generation_ops, "_write_generation_record_once", fail_record_write)
 
     store = RunStore(tmp_path / "state")
     run_id = "record-fail-run"
@@ -1015,7 +1340,7 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
         raise NoFeasibleTrialError("trainer failed")
 
     captured: list[TerminalReport] = []
-    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
 
     with pytest.raises(ProcessCleanupUncertainError) as exc_info:
@@ -1078,7 +1403,7 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
         raise shutdown
 
     captured: list[TerminalReport] = []
-    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", cancel_run)
 
     with pytest.raises(PhaseSweepShutdown) as exc_info:
@@ -1122,7 +1447,7 @@ def test_shutdown_during_post_error_reconciliation_remains_cancellation(
         raise NoFeasibleTrialError("trainer failed")
 
     captured: list[TerminalReport] = []
-    monkeypatch.setattr("phasesweep.engine.run._preflight_existing_studies", preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
 
     with pytest.raises(PhaseSweepShutdown) as exc_info:
@@ -1584,42 +1909,71 @@ def test_runner_enters_the_project_directory_after_its_identity_is_durable(
 ) -> None:
     """``--cwd`` replaces the ambient cwd the server used to hand the child.
 
-    The chdir happens after ``_persist_spawned_handle``, so the first thing
-    that can observe the project directory already has a durable identity the
-    server can find and terminate.
+    The inherited lease stays held through ``_persist_spawned_handle``. The
+    subsequent chdir therefore exposes the project only after the server has
+    a durable identity it can find and terminate.
     """
     store = RunStore(tmp_path / "state")
     project = tmp_path / "project"
     project.mkdir()
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
+    pending = make_run_handle(
         run_id="r-cwd",
         config_sha256="a" * 64,
-        started_at=started_at,
         experiment_id="cancel_me",
+        launch_state="launching",
     )
+    preparation = store.prepare_launch(pending, b"experiment: unread\n")
+    inherited_lease_fd = os.dup(preparation.lease_fd)
+    preparation.close()
+    ready_read, ready_write = os.pipe()
+    ack_read, ack_write = os.pipe()
+    assert os.write(ack_write, b"A") == 1
+    os.close(ack_write)
+    ack_write = -1
     observed: dict[str, object] = {}
+    real_persist = mcp_runner._persist_spawned_handle
+
+    def persist_with_held_lease(*args: object, **kwargs: object) -> None:
+        os.fstat(inherited_lease_fd)
+        assert not store.is_pre_spawn_orphan("r-cwd")
+        real_persist(*args, **kwargs)
 
     def record_cwd(*_args: object, **_kwargs: object) -> None:
         observed["cwd"] = Path.cwd()
         observed["handle"] = store.get("r-cwd")
         raise ValueError("stop once the project directory is in effect")
 
+    monkeypatch.setattr(mcp_runner, "_persist_spawned_handle", persist_with_held_lease)
     monkeypatch.setattr(mcp_runner, "load_experiment_snapshot", record_cwd)
 
-    with pytest.raises(RuntimeError, match="stop once the project directory"):
-        runner_main(
-            runner_argv(
-                store,
-                run_id="r-cwd",
-                config=tmp_path / "unread.yaml",
-                config_sha256="a" * 64,
-                experiment_id="cancel_me",
-                started_at=started_at,
-            ),
-            cwd=project,
-        )
+    try:
+        with pytest.raises(RuntimeError, match="stop once the project directory"):
+            runner_main(
+                [
+                    *runner_argv(
+                        store,
+                        run_id="r-cwd",
+                        config=preparation.config_snapshot_path,
+                        config_sha256="a" * 64,
+                        experiment_id="cancel_me",
+                        started_at=pending.started_at,
+                    ),
+                    "--launch-ready-fd",
+                    str(ready_write),
+                    "--launch-ack-fd",
+                    str(ack_read),
+                    "--launch-lease-fd",
+                    str(inherited_lease_fd),
+                ],
+                cwd=project,
+            )
+        os.set_blocking(ready_read, False)
+        assert os.read(ready_read, 1) == b"R"
+    finally:
+        for fd in (ready_read, ready_write, ack_read, ack_write, inherited_lease_fd):
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
 
     assert observed["cwd"] == project.resolve()
     handle = observed["handle"]

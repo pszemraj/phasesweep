@@ -5,12 +5,10 @@
 ```bash
 git clone https://github.com/pszemraj/phasesweep.git
 cd phasesweep
-conda create -n phasesweep-dev python=3.11 pip
-conda activate phasesweep-dev
-pip install -e ".[dev,wandb]"
+python -m pip install -e ".[dev,wandb]"
 ```
 
-The `mcp` SDK is included in the development extra. Use another conda environment name if desired; all Python-dependent commands must run in the activated environment.
+The `mcp` SDK is included in the development extra. Run Python-dependent commands in the environment where you installed the project.
 
 ## Quality gates
 
@@ -28,7 +26,7 @@ The final script builds a wheel in a temporary directory, asserts its packaged-d
 
 Run `pytest` by itself, with no concurrent lint, type-check, or build jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise. There is currently no CI workflow, Makefile, or justfile wrapping these commands.
 
-The supported Optuna range is `>=4.0,<4.10`. PhaseSweep reads the local SQLite schema directly for read-only status and relies on sampler/storage behavior, so run the full suite at both dependency endpoints before widening that range.
+The supported Optuna range is `>=4.0,<4.10`. PhaseSweep reads SQL storage schemas directly for read-only status and relies on sampler/storage behavior, so run the full suite at both dependency endpoints before widening that range.
 
 ## Package map
 
@@ -39,30 +37,45 @@ The package is organized by behavior:
 - `phasesweep.evidence`: metric extractors, post-trial evidence gates, and W&B polling.
 - `phasesweep.reporting`: the trainer-side objective-envelope writer.
 - `phasesweep.runtime`: subprocess, GPU, lock, storage URL, and override helpers.
-- `phasesweep.mcp`: stdio MCP server, catalog registry, detached runner, run-handle store, and the client-config installer (`phasesweep.mcp.install`).
+- `phasesweep.mcp`: stdio MCP server, catalog registry, detached runner, run-handle store, operator recovery, and the client-config installer (`phasesweep.mcp.install`).
 - `phasesweep.cli`: Click command surface.
 
 Common package-root calls are `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, `runtime`, or `mcp`.
+
+Within the engine, use these modules to follow ownership and publication. Module names in this table are relative to `phasesweep.engine`: its `evidence` module validates saved trial artifacts, while the separate `phasesweep.evidence` package extracts metrics and evaluates gates.
+
+| Responsibility | Modules |
+| --- | --- |
+| Experiment, suite, and phase orchestration | `run`, `suite`, `phase` |
+| Resume selection and continuation preflight | `resume` |
+| Preflight ordering, lock ownership, and study continuation policy | `guards`, `locking`, `study_policy` |
+| Active-attempt ownership and stale or uncertain trial cleanup | `attempts`, `cleanup` |
+| Artifact-root ownership, relocation, and trial-evidence checks | `artifact_roots`, `relocation`, `evidence` |
+| Shared state types, direct paths, and semantic fingerprints | `state`, `paths`, `fingerprints` |
+| Publication validation and pointer resolution | `publication_validation`, `publication` |
+| Provenance, winner artifacts, and generation publication writes | `provenance`, `artifacts`, `generation` |
+
+`mcp.recovery.recover_run` coordinates operator recovery: resolve the recorded launch, determine the required repair, and check runner identity. Confirmed recovery holds the experiment lock through cleanup, evidence persistence, and stored-result finalization; preflight only reports the proposed actions. The CLI handles options and renders the service's messages and errors. Internal callers import each helper from its owning module.
 
 The control flow of a typical run is:
 
 ```mermaid
 flowchart TD
-    cli["CLI run"] --> dispatch["run_config"]
-    dispatch -->|Experiment| experiment["execute experiment"]
-    dispatch -->|Suite| suite["run_suite"]
+    cli["CLI run"] --> dispatch["run.run_config"]
+    dispatch -->|Experiment| experiment["run: execute experiment"]
+    dispatch -->|Suite| suite["suite.run_suite"]
     suite -->|"declaration order; dependencies must name prior studies"| experiment
-    experiment --> phase["_run_phase"]
+    experiment --> phase["phase._run_phase"]
     phase --> optimize["study.optimize / objective"]
     optimize --> launch["launch_trial / supervised trainer"]
     launch --> evidence["extract_trial_result"]
     evidence --> select["select_winner"]
     select --> promote["_apply_promotion"]
-    promote --> winner["_save_winner"]
+    promote --> winner["artifacts._save_winner"]
     winner --> more{"more phases?"}
     more -->|yes| phase
     more -->|no| summary["write generation summary"]
-    summary --> publish["_publish_generation validates result graph"]
+    summary --> publish["generation._publish_generation validates result graph"]
     publish --> sidecar["optional hook: prepare frozen MCP result"]
     sidecar --> pointer["commit last_successful_generation pointer"]
     pointer --> receipt["optional hook: record MCP commit receipt"]

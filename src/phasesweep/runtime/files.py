@@ -31,6 +31,19 @@ SHARED_DIR_MODE = 0o3770
 SHARED_FILE_MODE = 0o660
 
 
+def ensure_artifact_dir(path: Path) -> None:
+    """Create a self-ignoring artifact namespace without replacing its ignore file.
+
+    :param Path path: Managed experiment or suite directory, not its shared workdir.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        with (path / ".gitignore").open("x", encoding="utf-8") as handle:
+            handle.write("*\n")
+    except FileExistsError:
+        pass
+
+
 def file_sha256(path: Path) -> str:
     """Return a file's SHA-256 digest without holding all bytes in memory.
 
@@ -112,18 +125,53 @@ def _fcntl_available() -> bool:
     return True
 
 
+def xdg_home(variable: str, fallback: Path) -> Path:
+    """Return an absolute XDG base, falling back for unset or relative values.
+
+    :param str variable: XDG environment variable name.
+    :param Path fallback: Default absolute base directory.
+    :return Path: Selected base without creating it.
+    """
+    value = os.environ.get(variable)
+    path = Path(value) if value else fallback
+    return path if path.is_absolute() else fallback
+
+
+def phasesweep_home() -> Path | None:
+    """Return the validated private root override without creating it.
+
+    :return Path | None: Operator-provisioned root, or None when unset.
+    :raises UnsafePrivatePathError: The override is relative, missing, or unsafe.
+    """
+    override = os.environ.get("PHASESWEEP_HOME")
+    if not override:
+        return None
+    path = Path(override)
+    if not path.is_absolute():
+        raise UnsafePrivatePathError(f"PHASESWEEP_HOME must be an absolute path: {path}")
+    try:
+        validate_private_dir(path)
+    except FileNotFoundError as exc:
+        raise UnsafePrivatePathError(
+            f"PHASESWEEP_HOME {path} does not exist; provision an owner-only 0700 directory first."
+        ) from exc
+    return path
+
+
 def lock_dir() -> Path:
     """Return the validated same-host phasesweep lock directory.
 
-    The default is private to the current user. ``PHASESWEEP_LOCK_DIR`` selects
-    an existing operator-provisioned directory and is never created or chmodded
-    by phasesweep.
+    The default is ``.cache/phasesweep/locks`` under the effective user's
+    account home, independent of environment-based state/cache placement.
+    ``PHASESWEEP_LOCK_DIR`` selects an existing operator-provisioned directory
+    and is never created or chmodded by phasesweep.
 
     :return Path: Directory used for host-local lock files.
     :raises UnsafeLockPathError: ``PHASESWEEP_LOCK_DIR`` is relative, missing,
         contains a symlinked component, or fails the private/shared
-        ownership-and-mode check; or the default lock directory under the
-        user's cache cannot be created as owner-only.
+        ownership-and-mode check; the OS account has no absolute home; or
+        the default lock directory fails the owner-only checks.
+    :raises PlatformCapabilityError: The host lacks the required POSIX runtime.
     """
     override = os.environ.get(_LOCK_DIR_ENV)
     if override:
@@ -133,11 +181,28 @@ def lock_dir() -> Path:
         _lock_policy(path)
         return path
 
-    path = Path.home() / ".cache" / "phasesweep" / "locks"
+    require_posix_runtime()
+    import pwd
+
+    # Shells and services for one account must contend even when HOME or XDG
+    # settings differ. Only the explicit lock override may move this namespace.
+    try:
+        home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except KeyError as exc:
+        raise UnsafeLockPathError(
+            f"No OS account home exists for uid {os.geteuid()}; provision an absolute "
+            f"lock directory and set {_LOCK_DIR_ENV}."
+        ) from exc
+    if not home.is_absolute():
+        raise UnsafeLockPathError(
+            f"The OS account home is not absolute; provision an absolute lock directory "
+            f"and set {_LOCK_DIR_ENV}."
+        )
+    path = home / ".cache" / "phasesweep" / "locks"
     try:
         ensure_private_dir(path)
     except UnsafePrivatePathError as exc:
-        raise UnsafeLockPathError(f"Default lock directory {path} is unsafe.") from exc
+        raise UnsafeLockPathError(f"Default lock directory is unsafe: {exc}") from exc
     return path
 
 
@@ -1052,6 +1117,16 @@ def atomic_write_text(path: Path, text: str) -> None:
         handle.write(text)
 
 
+def local_storage_url(path: Path, backend: str) -> str:
+    """Encode an absolute SQLite or journal filename as a local URI URL.
+
+    :param Path path: Database or journal filename.
+    :param str backend: ``sqlite`` or ``journal``.
+    :return str: Absolute URL preserving reserved characters in the filename.
+    """
+    return f"{backend}:///file:{quote(str(path.resolve()), safe='/')}?uri=true"
+
+
 def storage_backend(storage: str | None) -> str | None:
     """Return the logical backend name for an Optuna storage URL.
 
@@ -1102,6 +1177,7 @@ def file_url_path(storage: str) -> str:
         sqlite:///:memory:                -> :memory:
         journal:///relative.journal       -> relative.journal
         journal:////tmp/absolute.journal  -> /tmp/absolute.journal
+        journal:///file:/tmp/a%3Fb?uri=true -> /tmp/a?b
 
     Args:
         storage: A file-style storage URL whose scheme is already known to be
@@ -1127,7 +1203,19 @@ def file_url_path(storage: str) -> str:
         path = rest
 
     path = path.split("?", 1)[0]
-    return path.split("#", 1)[0]
+    # SQLAlchemy treats '#' as a literal character in ordinary SQLite filenames.
+    # It becomes a fragment only when SQLite's file: URI handling is enabled.
+    if storage_backend(storage) != "sqlite" or _sqlite_uri_filename_enabled(storage, path):
+        path = path.split("#", 1)[0]
+    # Auto journal storage uses the same escaped file: URI convention as
+    # SQLite. Ordinary explicit journal paths keep their literal spelling.
+    if (
+        storage_backend(storage) == "journal"
+        and path.startswith("file:")
+        and _truthy_url_option(storage_url_query_options(storage).get("uri"))
+    ):
+        return unquote(urlsplit(path).path)
+    return path
 
 
 def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
@@ -1292,7 +1380,7 @@ def storage_recovery_locator(storage: str | None) -> str | None:
     backend = storage_backend(storage)
     if backend == "journal":
         path = Path(file_url_path(storage)).expanduser().resolve()
-        return "journal:///" + str(path)
+        return local_storage_url(path, "journal")
     if backend != "sqlite":
         return storage
 
@@ -1305,7 +1393,7 @@ def storage_recovery_locator(storage: str | None) -> str | None:
         if uri_path is None:
             # A non-local ``file:`` authority is not cwd-relative.
             return storage
-        frozen_database = "file:" + str(Path(uri_path).expanduser().resolve())
+        frozen_database = "file:" + quote(str(Path(uri_path).expanduser().resolve()), safe="/")
     else:
         frozen_database = str(Path(database).expanduser().resolve())
     return url.set(database=frozen_database).render_as_string(hide_password=False)
@@ -1358,6 +1446,7 @@ _RDB_CREDENTIAL_OPTION_NAMES = frozenset(
         "accesstoken",
         "apikey",
         "authtoken",
+        "passfile",
         "password",
         "passwd",
         "pwd",

@@ -12,15 +12,15 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
-from phasesweep.engine.guards import _experiment_semantic_fingerprint
+from phasesweep.engine.artifacts import _winner_source_or_default
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import (
     PublicationState,
     Winner,
     WinnerSource,
     WinnerSourceKind,
-    _generation_record_path,
-    _winner_source_or_default,
 )
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
 
@@ -72,6 +72,7 @@ class PhaseStatusSnapshot(_SnapshotModel):
     generation_trials: dict[str, NonNegativeInt]
     winner_present: bool
     trial_data_available: bool
+    published_study_unavailable: bool = False
     running_attempts: list[RunningAttemptSnapshot] | None = None
     """RUNNING rows the frozen counts describe, or ``None`` when unknown.
 
@@ -79,8 +80,8 @@ class PhaseStatusSnapshot(_SnapshotModel):
     pairs with ``trial_data_available: false`` -- an empty list would assert
     there are no RUNNING rows. Snapshots frozen before this field existed also
     parse as ``None``, which is the truthful reading: they recorded no
-    identities. A phase with readable trial data always carries a list, empty
-    when nothing is RUNNING.
+    identities. A phase with known trial counts always carries a list, empty
+    when nothing is RUNNING, including a confirmed absent study.
     """
 
 

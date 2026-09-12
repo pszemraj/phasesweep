@@ -61,11 +61,11 @@ log = logging.getLogger("phasesweep.mcp.runs")
 # 128+signum, so the runner records these as the "cancelled" terminal cause.
 _SIGNALLED_EXIT_CODES = frozenset({143, 130})
 _RUN_EVIDENCE_SUFFIXES = (
+    ".config.yaml",
+    ".status.json",
+    ".log",
     ".cleanup_uncertain.json",
     ".cleanup_recovery.json",
-    ".status.json",
-    ".config.yaml",
-    ".log",
     ".launch.lock",
 )
 
@@ -550,15 +550,7 @@ class RunStore:
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
         return any(
-            path.is_file()
-            for path in (
-                self.config_snapshot_path(run_id),
-                self.status_path(run_id),
-                self.log_path(run_id),
-                self.cleanup_uncertain_path(run_id),
-                self.cleanup_recovery_path(run_id),
-                self.launch_lease_path(run_id),
-            )
+            (self._logs_dir / f"{run_id}{suffix}").is_file() for suffix in _RUN_EVIDENCE_SUFFIXES
         )
 
     def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
@@ -694,11 +686,13 @@ class RunStore:
             return None
         return lease
 
-    def clear_pre_spawn_orphan(self, run_id: str) -> None:
-        """Remove one revalidated pre-spawn preparation durably.
+    def clear_pre_spawn_orphan(self, run_id: str) -> Path | None:
+        """Preserve any runner log and remove a revalidated preparation durably.
 
         :param str run_id: Orphan identity previously reported by launch.
         :raises ValueError: The evidence no longer has the provably pre-spawn shape.
+        :return Path | None: Preserved runner log path, including an archive from an
+            interrupted recovery, or None when no log existed.
         """
         lease: IO[str] | None = None
         if self.launch_lease_path(run_id).is_file():
@@ -710,16 +704,39 @@ class RunStore:
         paths = (
             self._runs_dir / f"{run_id}.json",
             self.config_snapshot_path(run_id),
-            self.log_path(run_id),
             self.launch_lease_path(run_id),
         )
+        recovered_log: Path | None = None
         try:
+            log_path = self.log_path(run_id)
+            archive_path = log_path.with_suffix(".log.recovered")
+            if log_path.exists() or log_path.is_symlink():
+                recovered_log = archive_path
+                # A child can fail before recording its identity. Keep its only
+                # diagnostic outside the active-run evidence namespace, and
+                # make the rename durable before removing the launch reservation.
+                # Run IDs include a fresh UUID and are never reused by the server;
+                # this rename is not an exclusive archive operation for reused IDs.
+                directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
+                try:
+                    os.rename(
+                        log_path.name,
+                        recovered_log.name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            elif archive_path.exists() or archive_path.is_symlink():
+                recovered_log = archive_path
             for path in paths:
                 with contextlib.suppress(FileNotFoundError):
                     _strict_unlink(path)
         finally:
             if lease is not None:
                 lease.close()
+        return recovered_log
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
         """Load and normalize one run handle, returning ``None`` when malformed.

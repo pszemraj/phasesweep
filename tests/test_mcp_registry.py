@@ -130,6 +130,31 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
         assert needle not in blob
 
 
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_auto_storage_is_absolute_for_mcp(tmp_path: Path, n_jobs: int) -> None:
+    import yaml
+
+    from phasesweep.config import Experiment
+    from phasesweep.mcp.config_snapshot import load_experiment_snapshot
+    from phasesweep.runtime.files import canonical_storage_identity, file_sha256, storage_backend
+
+    payload = yaml.safe_load(_experiment_yaml(tmp_path))
+    payload["storage"] = "auto"
+    payload["phases"][0].update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
+    config = _write(tmp_path / "exp.yaml", yaml.safe_dump(payload))
+    registered = Registry.load(write_mcp_catalog(tmp_path, {"auto": config})).get("auto")
+    assert registered.experiment.storage == "auto"
+    assert storage_backend(registered.experiment.resolved_storage) == (
+        "sqlite" if n_jobs == 1 else "journal"
+    )
+    assert not Path(registered.experiment.workdir).exists()
+    snapshot = load_experiment_snapshot(config, file_sha256(config), source="test")
+    assert isinstance(snapshot, Experiment)
+    assert canonical_storage_identity(snapshot.resolved_storage) == canonical_storage_identity(
+        registered.experiment.resolved_storage
+    )
+
+
 def test_two_catalog_ids_cannot_govern_one_experiment(tmp_path: Path) -> None:
     """Two entries resolving to one engine experiment must fail catalog load.
 

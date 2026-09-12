@@ -11,8 +11,8 @@ from __future__ import annotations
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine.artifacts import _winner_source_or_default
 from phasesweep.engine.read import ResultContext
-from phasesweep.engine.state import _winner_source_or_default
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState
 
@@ -268,6 +268,7 @@ def status_payload(
                 "target_already_satisfied": (terminal_trials_before_run >= target_terminal_trials),
                 "winner_present": phase["winner_present"],
                 "trial_data_available": phase["trial_data_available"],
+                "published_study_unavailable": phase.get("published_study_unavailable", False),
             }
         )
     return {

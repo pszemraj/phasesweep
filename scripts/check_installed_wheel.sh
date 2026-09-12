@@ -26,6 +26,11 @@ source_root="$smoke_root/source"
 mkdir -p "$wheel_dir" "$install_root" "$project_dir" \
   || fail "could not create the smoke directories under $smoke_root"
 
+# Catalog scaffolding now defaults outside the project. Keep its private state
+# under the same temporary root so the EXIT trap removes every smoke artifact.
+unset PHASESWEEP_HOME
+export XDG_STATE_HOME="$smoke_root/state"
+
 command -v git >/dev/null || fail "git is not on PATH"
 command -v pip >/dev/null || fail "pip is not on PATH; activate the project environment first"
 command -v python >/dev/null || fail "python is not on PATH; activate the project environment first"

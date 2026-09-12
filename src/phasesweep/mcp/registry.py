@@ -25,7 +25,7 @@ from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine.state import _experiment_dir
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
@@ -277,7 +277,7 @@ def _require_mcp_stable_paths(
         ``execution.cwd`` is relative, the storage backend is not local SQLite
         or JournalStorage, or its file path is empty or relative.
     """
-    storage = experiment.storage
+    storage = experiment.resolved_storage
     if storage is None or storage_is_in_memory(storage):
         raise CatalogError(
             f"{experiment_id!r}: storage must be persistent; "
@@ -439,7 +439,7 @@ def _claim_catalog_entry_identity(
         )
     namespace_owners[namespace] = loaded.id
 
-    storage_identity = canonical_storage_identity(loaded.experiment.storage)
+    storage_identity = canonical_storage_identity(loaded.experiment.resolved_storage)
     if storage_identity is None:
         return
     storage_key = f"{storage_identity}::{loaded.experiment.experiment}"

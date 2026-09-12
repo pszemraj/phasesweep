@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -21,7 +22,7 @@ from pydantic import ValidationError
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.cli import main as cli_boundary
-from phasesweep.config import Experiment, Suite, load_config
+from phasesweep.config import ExecutionContext, Experiment, Suite, load_config
 from phasesweep.engine import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
@@ -37,9 +38,25 @@ from phasesweep.engine import (
     TrialTargetRegressionError,
     UnsafeProcessCleanupError,
 )
-from phasesweep.engine.guards import _register_active_attempt
+from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.run import run_suite
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _attempts_dir,
+    _experiment_dir,
+    _generation_dir,
+    _generation_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+    _phase_dir,
+    _suite_generation_summary_path,
+    _winner_path,
+)
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _resolve_suite_publication_pointer,
+)
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -49,20 +66,8 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
-    _artifact_root_binding_path,
-    _attempts_dir,
-    _experiment_dir,
-    _generation_dir,
-    _generation_path,
-    _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_id,
-    _last_successful_generation_path,
-    _phase_dir,
-    _resolve_suite_publication_pointer,
-    _suite_generation_summary_path,
-    _winner_path,
 )
+from phasesweep.engine.suite import run_suite
 from phasesweep.errors import GpuConfigurationError, LockBusyError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
@@ -71,6 +76,7 @@ from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
     drop_artifact_root_binding,
+    make_experiment,
     write_constant_trainer,
     write_trainer,
     write_yaml,
@@ -102,6 +108,10 @@ def test_help_registers_commands_and_options() -> None:
     assert recovery_help.exit_code == 0
     for flag in ("--state-dir", "--run-id", "--confirm", "-h, --help"):
         assert flag in recovery_help.output
+    assert (
+        "restore the original complete storage ledger and access to it before recovery"
+        in " ".join(recovery_help.output.split()).lower()
+    )
 
     run_help = runner.invoke(cli_main, ["run", "--help"], terminal_width=120).output
     assert "--from-phase PHASE" in run_help
@@ -147,6 +157,10 @@ def test_help_registers_commands_and_options() -> None:
     init_help = runner.invoke(cli_main, ["mcp", "init-catalog", "--help"], terminal_width=120)
     assert init_help.exit_code == 0
     assert "--from PATH" in init_help.output
+    compact_init_help = "".join(init_help.output.split())
+    assert "PHASESWEEP_HOME/mcp/<catalog-digest>" in compact_init_help
+    assert "${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>" in compact_init_help
+    assert "state_dir next to the catalog" not in init_help.output
 
 
 def test_recover_run_expands_user_state_dir(
@@ -562,6 +576,33 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     status_obj = yaml.safe_load(result.output)
     assert status_obj["current_generation_id"] is not None
     assert status_obj["published_generation_id"] == status_obj["current_generation_id"]
+
+
+def test_status_logs_an_unreadable_journal_storage(tmp_path: Path) -> None:
+    """An unavailable journal leaves status usable but names the read failure in logs."""
+    ledger = tmp_path / "studies.journal"
+    ledger.write_text("not a journal record\n")
+    experiment = make_experiment(
+        storage=f"journal:///{ledger}",
+        workdir=tmp_path / "runs",
+        n_trials=1,
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "phasesweep", "status", str(config_path)],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    status = yaml.safe_load(result.stdout)
+    assert status["phases"][0]["trial_data_available"] is False
+    assert str(ledger) in result.stderr
+    assert "JSONDecodeError" in result.stderr
 
 
 def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: Path) -> None:
@@ -1057,6 +1098,89 @@ studies:
     return config_a, config_b, workdir_a, workdir_b
 
 
+@pytest.mark.parametrize("n_jobs", [1, 2])
+@pytest.mark.parametrize("partial", [False, True])
+def test_auto_storage_rebind_moves_ledger_with_artifacts(
+    tmp_path: Path, n_jobs: int, partial: bool
+) -> None:
+    old_workdir = tmp_path / "old ? %20"
+    new_workdir = tmp_path / "new # 🚀"
+    original = make_experiment(
+        storage="auto",
+        workdir=old_workdir,
+        n_trials=1,
+        n_jobs=n_jobs,
+        allow_no_gpu_isolation=True,
+        trial_command="echo x=0.5 {overrides}",
+        execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
+    )
+    original = original.model_copy(
+        update={"phases": [original.phases[0], original.phases[0].model_copy(update={"name": "q"})]}
+    )
+    run_experiment(original)
+    old_workdir.rename(new_workdir)
+    moved = original.model_copy(update={"workdir": str(new_workdir)})
+    config = tmp_path / "moved.yaml"
+    config.write_text(yaml.safe_dump(moved.model_dump(mode="json")))
+    if partial:
+        # Rebind must use the recorded old filename, not follow a replacement
+        # symlink when reconstructing the ledger's previous identity.
+        old_workdir.symlink_to(new_workdir, target_is_directory=True)
+        _load_existing_phase_study(moved, moved.phases[0]).set_user_attr(
+            ARTIFACT_ROOT_ATTR, str(_experiment_dir(moved))
+        )
+    with pytest.raises(ArtifactRootConflictError):
+        run_experiment(moved)
+    for _ in range(2):
+        result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
+        assert result.exit_code == 0, result.output
+    run_experiment(load_experiment(config))
+    for phase in moved.phases:
+        study = _load_existing_phase_study(moved, phase)
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(moved))
+        assert len(study.trials) == 1
+    assert_published_winner_evidence_local(_experiment_dir(moved))
+    if partial:
+        assert old_workdir.is_symlink()
+    else:
+        assert not old_workdir.exists()
+
+
+@pytest.mark.parametrize("damage", ["trainer_input", "running", "foreign_ledger"])
+def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> None:
+    original = make_experiment(
+        storage="auto",
+        workdir=tmp_path / "old",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+        execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
+    )
+    run_experiment(original)
+    new_workdir = tmp_path / "new"
+    Path(original.workdir).rename(new_workdir)
+    moved = original.model_copy(update={"workdir": str(new_workdir)})
+    if damage == "trainer_input":
+        next(_experiment_dir(moved).glob("p/trial_*/overrides_resolved.json")).unlink()
+    elif damage == "running":
+        _load_existing_phase_study(moved, moved.phases[0]).ask()
+    else:
+        foreign = original.model_copy(update={"workdir": str(tmp_path / "foreign")})
+        run_experiment(foreign)
+        shutil.copy2(_experiment_dir(foreign) / "study.db", _experiment_dir(moved) / "study.db")
+    config = tmp_path / "moved.yaml"
+    config.write_text(yaml.safe_dump(moved.model_dump(mode="json")))
+    binding = _artifact_root_binding_path(moved).read_bytes()
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
+    assert result.exit_code != 0
+    expected = {
+        "trainer_input": "generated trainer input",
+        "running": "RUNNING",
+        "foreign_ledger": "another storage",
+    }[damage]
+    assert expected in str(result.exception), result.exception
+    assert _artifact_root_binding_path(moved).read_bytes() == binding
+
+
 def test_rebind_workdir_moves_the_binding_to_a_relocated_tree(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1090,7 +1214,10 @@ def test_rebind_workdir_moves_the_binding_to_a_relocated_tree(
     assert "Traceback" not in captured.err
 
 
-def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(tmp_path: Path) -> None:
+@pytest.mark.parametrize("bound", [False, True])
+def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(
+    tmp_path: Path, bound: bool
+) -> None:
     """Explicit rebind is not an escape hatch around reverse root ownership."""
     config_a, _config_b, _workdir_a, _workdir_b = _movable_experiment_configs(tmp_path)
     owner = load_experiment(config_a)
@@ -1106,15 +1233,21 @@ def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(tmp_path: Pa
         storage=foreign.storage,
         direction="minimize",
     )
-    foreign_study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(foreign)))
+    if bound:
+        foreign_study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(foreign)))
 
     result = CliRunner().invoke(cli_main, ["rebind-workdir", str(foreign_config)])
 
     assert result.exit_code != 0
     assert result.exception is not None
-    assert "another storage ledger" in str(result.exception)
+    expected = "another storage ledger" if bound else "different storage ledger"
+    assert expected in str(result.exception)
+    assert "the next ordinary run binds" not in str(result.exception)
+    assert "run 'phasesweep rebind-workdir" not in str(result.exception)
     assert _artifact_root_binding_path(owner).read_bytes() == owner_binding
-    assert foreign_study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(foreign))
+    assert foreign_study.user_attrs.get(ARTIFACT_ROOT_ATTR) == (
+        str(_experiment_dir(foreign)) if bound else None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1161,6 +1294,84 @@ def test_rebind_workdir_refuses_a_destination_without_the_recorded_publication(
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("target", ["absent", "empty"])
+def test_explicit_storage_to_auto_rebind_explains_the_empty_target(
+    tmp_path: Path, legacy: bool, target: str
+) -> None:
+    """The old starter ledger stays usable; rebind must not recommend itself."""
+    config, _, _, _ = _movable_experiment_configs(tmp_path)
+    owner = load_experiment(config)
+    run_experiment(owner)
+    published = _last_successful_generation_id(owner)
+    binding_path = _artifact_root_binding_path(owner)
+    if legacy:
+        binding_path.unlink()
+    binding_before = binding_path.read_bytes() if binding_path.exists() else None
+    config.write_text(config.read_text().replace(str(owner.storage), "auto"))
+    migrated = load_experiment(config)
+    ledger = _experiment_dir(migrated) / "study.db"
+    if target == "empty":
+        optuna.create_study(study_name="t::p", storage=migrated.resolved_storage)
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
+
+    assert result.exit_code != 0
+    message = str(result.exception)
+    assert "keep the explicit storage setting" in message
+    assert "Rebinding does not move or convert storage ledgers" in message
+    assert "Nothing was written" in message
+    assert "run 'phasesweep rebind-workdir" not in message
+    assert "the next ordinary run binds" not in message
+    assert (binding_path.read_bytes() if binding_path.exists() else None) == binding_before
+    assert _last_successful_generation_id(migrated) == published
+    assert ledger.exists() is (target == "empty")
+    # Follow the stated remedy, including legacy adoption with the original ledger.
+    config.write_text(config.read_text().replace("storage: auto", f"storage: {owner.storage}"))
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
+    assert result.exit_code == 0, result.exception
+    assert run_experiment(load_experiment(config))["p"].trial_number == 0
+
+
+@pytest.mark.parametrize("damage", ["ledger", "study", "empty_study"])
+def test_missing_published_study_is_visible_in_status_and_rebind(
+    tmp_path: Path, damage: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config, _, _, _ = _movable_experiment_configs(tmp_path)
+    experiment = load_experiment(config)
+    run_experiment(experiment)
+    generation_before = _generation_path(experiment).read_bytes()
+    binding_before = _artifact_root_binding_path(experiment).read_bytes()
+    ledger = tmp_path / "studies.db"
+    if damage == "ledger":
+        ledger.unlink()
+    else:
+        optuna.delete_study(study_name="t::p", storage=experiment.storage)
+        if damage == "empty_study":
+            optuna.create_study(study_name="t::p", storage=experiment.storage)
+
+    status_result = CliRunner().invoke(cli_main, ["status", str(config)])
+    assert status_result.exit_code == 0, status_result.exception
+    status = yaml.safe_load(status_result.output)
+    assert status["publication_integrity"] == "ok"
+    assert status["is_published"] is True
+    assert status["phases"][0]["published_study_unavailable"] is True
+    assert status["phases"][0]["trial_data_available"] is True
+
+    for command in ("run", "rebind-workdir"):
+        exit_code = _invoke_cli_boundary([command, str(config)], monkeypatch)
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "Published generation" in captured.err
+        assert "Restore the original complete storage ledger and study" in captured.err
+        assert "the next ordinary run binds" not in captured.err
+        assert "Cleanup state is therefore unknown" not in captured.err
+        assert "Traceback" not in captured.err
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _artifact_root_binding_path(experiment).read_bytes() == binding_before
+    assert ledger.exists() is (damage != "ledger")
+
+
 def test_rebind_workdir_refuses_when_no_study_is_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1177,6 +1388,7 @@ def test_rebind_workdir_refuses_when_no_study_is_bound(
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "Traceback" not in captured.err
+    assert "the next ordinary run binds these empty studies" in captured.err
     study = optuna.load_study(study_name="t::p", storage=experiment.storage)
     assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
@@ -1440,7 +1652,11 @@ def test_rebind_workdir_refuses_when_one_phase_study_is_transiently_unreadable(
         return _load_existing_phase_study(experiment, phase)
 
     monkeypatch.setattr(
-        "phasesweep.engine.guards._load_existing_phase_study",
+        "phasesweep.engine.artifact_roots._load_existing_phase_study",
+        _flaky_load,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.relocation._load_existing_phase_study",
         _flaky_load,
     )
 

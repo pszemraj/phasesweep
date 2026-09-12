@@ -170,7 +170,7 @@ SearchParam = Annotated[
 
 
 # Samplers whose suggestions depend on process-local RNG/optimizer state that
-# Optuna storage does not persist. `phasesweep.engine.guards.
+# Optuna storage does not persist. `phasesweep.engine.study_policy.
 # _validate_sampler_continuation` refuses to resume one of these mid-target, so
 # each trial target must be run in a single invocation.
 NON_RESUMABLE_SAMPLERS = frozenset({"tpe", "cmaes"})

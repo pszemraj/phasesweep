@@ -9,6 +9,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import phasesweep.engine.publication_validation as validation_ops
 from phasesweep import load_config, load_experiment, run_config
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
@@ -28,21 +29,24 @@ from phasesweep.config import (
 from phasesweep.engine import (
     PhaseSweepError,
     PromotionError,
+    PublicationIntegrityError,
     RunRequestError,
     read_status,
     read_winner,
     run_experiment,
 )
-from phasesweep.engine.run import ExperimentRunOutcome
-from phasesweep.engine.selection import _apply_promotion, _apply_study_promotion
-from phasesweep.engine.state import (
-    Winner,
+from phasesweep.engine.paths import (
     _generation_path,
     _generation_promotion_decision_path,
     _generation_summary_path,
     _last_successful_generation_path,
     _promotion_decision_path,
     _trial_dir_for,
+)
+from phasesweep.engine.run import ExperimentRunOutcome
+from phasesweep.engine.selection import _apply_promotion, _apply_study_promotion
+from phasesweep.engine.state import (
+    Winner,
 )
 from phasesweep.evidence.evaluation import evaluate_gates
 from phasesweep.mcp.redaction import winners_payload
@@ -592,6 +596,14 @@ def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path)
     authoritative = yaml.safe_load(
         _generation_promotion_decision_path(experiment, successful, "candidate").read_text()
     )
+    # A decision made by this generation must still appear in its summary.
+    first_summary_path = _generation_summary_path(experiment, successful)
+    first_summary = yaml.safe_load(first_summary_path.read_text())
+    first_summary["promotion_decisions"] = []
+    with pytest.raises(PublicationIntegrityError, match="absent from the summary"):
+        validation_ops._validate_generation_manifest(
+            first_summary_path.parent, successful, first_summary
+        )
     _promotion_decision_path(experiment, "candidate").write_text(
         "generation_id: forged\naction: stop\nmessage: tampered\n"
     )
@@ -603,6 +615,49 @@ def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path)
         _generation_promotion_decision_path(experiment, resumed, "candidate").read_text()
     )
     assert copied == authoritative
+    summary_path = _generation_summary_path(experiment, resumed)
+    summary = yaml.safe_load(summary_path.read_text())
+    assert summary["promotion_decisions"] == [authoritative]
+    assert copied["generation_id"] == successful != resumed
+
+    # main (f789116) wrote schema-2 resumes with the projected promotion in
+    # the manifest but omitted it from promotion_decisions. Recreate those
+    # exact summary semantics and anchor the bytes as the old writer did.
+    assert summary["schema_version"] == 2
+    summary["promotion_decisions"] = []
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False), encoding="utf-8")
+    pointer_path = _last_successful_generation_path(experiment)
+    pointer = yaml.safe_load(pointer_path.read_text())
+    content = summary_path.read_bytes()
+    pointer["summary_size_bytes"] = len(content)
+    pointer["summary_sha256"] = hashlib.sha256(content).hexdigest()
+    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False), encoding="utf-8")
+
+    assert read_status(experiment)["publication_integrity"] == "ok"
+    assert read_winner(experiment, "candidate") is not None
+    run_experiment(experiment, from_phase="later")
+    upgraded = yaml.safe_load(pointer_path.read_text())["generation_id"]
+    upgraded_summary = yaml.safe_load(_generation_summary_path(experiment, upgraded).read_text())
+    assert upgraded != resumed
+    assert upgraded_summary["promotion_decisions"] == [authoritative]
+    assert read_status(experiment)["publication_integrity"] == "ok"
+
+    # Merely claiming a different generation cannot disguise a local decision
+    # omitted from the summary: the named source must hold the same decision.
+    first_promotion_path = _generation_promotion_decision_path(experiment, successful, "candidate")
+    original_content = first_promotion_path.read_bytes()
+    for source_generation in ("missing-source", resumed):
+        forged = {**authoritative, "generation_id": source_generation}
+        content = yaml.safe_dump(forged, sort_keys=False).encode("utf-8")
+        first_promotion_path.write_bytes(content)
+        for entry in first_summary["artifacts"]:
+            if entry.get("kind") == "promotion" and entry.get("phase") == "candidate":
+                entry["sha256"] = hashlib.sha256(content).hexdigest()
+        with pytest.raises(PublicationIntegrityError, match="source generation"):
+            validation_ops._validate_generation_manifest(
+                first_summary_path.parent, successful, first_summary
+            )
+    first_promotion_path.write_bytes(original_content)
 
 
 def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Path) -> None:

@@ -27,8 +27,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-import phasesweep.engine.run as engine_run
-import phasesweep.engine.state as engine_state
+import phasesweep.engine.artifacts as artifact_io
+import phasesweep.engine.generation as generation_ops
+import phasesweep.engine.publication_validation as validation_ops
+import phasesweep.engine.run as run_engine
+import phasesweep.engine.suite as suite_ops
 from phasesweep import load_config, run_experiment
 from phasesweep.config import Experiment, IntParam, Phase, Sampler, Suite
 from phasesweep.engine import (
@@ -41,25 +44,27 @@ from phasesweep.engine import (
     read_status,
     read_winner,
 )
-from phasesweep.engine.run import run_suite
-from phasesweep.engine.state import (
-    PublicationPointer,
+from phasesweep.engine.paths import (
     _generation_dir,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
-    _last_successful_generation_id,
     _last_successful_generation_path,
     _last_successful_suite_generation_path,
-    _resolve_publication_pointer,
-    _resolve_suite_publication_pointer,
     _suite_generation_path,
     _suite_generation_record_path,
     _suite_generation_summary_path,
     _suite_summary_path,
+)
+from phasesweep.engine.publication import (
+    PublicationPointer,
+    _last_successful_generation_id,
+    _resolve_publication_pointer,
+    _resolve_suite_publication_pointer,
     _unresolvable_pointer,
 )
+from phasesweep.engine.suite import run_suite
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
@@ -190,7 +195,7 @@ def test_summary_readback_refusals_are_publication_commit_errors(
         summary_path.write_text(summary_text)
 
     with pytest.raises(PublicationCommitError, match=match):
-        engine_run._validate_publishable_summary(
+        generation_ops._validate_publishable_summary(
             summary_path=summary_path,
             owner_key="experiment",
             owner_value="expected",
@@ -213,7 +218,7 @@ def test_precommit_validation_failure_keeps_prior_publication(
     def fail_validation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated pre-commit validation failure")
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", fail_validation)
+    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
 
     captured: list[str] = []
 
@@ -252,14 +257,14 @@ def test_pointer_commit_failure_keeps_prior_publication(
     assert first_generation is not None
 
     pointer_path = _last_successful_generation_path(experiment)
-    original_write = engine_run._write_yaml_atomic
+    original_write = artifact_io._write_yaml_atomic
 
     def flaky_write(path: Path, payload: object) -> None:
         if path == pointer_path:
             raise OSError("simulated pointer commit failure")
         return original_write(path, payload)
 
-    monkeypatch.setattr(engine_run, "_write_yaml_atomic", flaky_write)
+    monkeypatch.setattr(artifact_io, "_write_yaml_atomic", flaky_write)
 
     with pytest.raises(OSError, match="simulated pointer commit failure"):
         run_experiment(experiment)
@@ -356,9 +361,9 @@ def test_record_write_failure_after_commit_leaves_run_successful(
     def fail_record_write(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated record write failure")
 
-    monkeypatch.setattr(engine_run, "_write_generation_record_once", fail_record_write)
+    monkeypatch.setattr(generation_ops, "_write_generation_record_once", fail_record_write)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
@@ -366,7 +371,9 @@ def test_record_write_failure_after_commit_leaves_run_successful(
     assert second_generation is not None
     assert second_generation != first_generation
     assert any(
-        "failed to write the immutable generation record" in r.message for r in caplog.records
+        r.name == "phasesweep.engine.generation"
+        and "failed to write the immutable generation record" in r.message
+        for r in caplog.records
     )
     # The record itself never got created; publication still succeeded.
     assert not _generation_record_path(experiment, second_generation).is_file()
@@ -391,9 +398,9 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     def fail_projection(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated projection failure")
 
-    monkeypatch.setattr(engine_run, "_copy_yaml_projection", fail_projection)
+    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", fail_projection)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
@@ -458,7 +465,7 @@ def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_su
     def interrupt_record_write(*_args: object, **_kwargs: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(engine_run, "_write_generation_record_once", interrupt_record_write)
+    monkeypatch.setattr(generation_ops, "_write_generation_record_once", interrupt_record_write)
 
     winners = run_experiment(experiment)
 
@@ -521,14 +528,14 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
     """
     experiment = _stored_experiment(tmp_path)
 
-    original_validate = engine_run._validate_generation_publishable
+    original_validate = generation_ops._validate_generation_publishable
 
     def validate_then_signal(*args: object, **kwargs: object) -> bytes:
         summary_bytes = original_validate(*args, **kwargs)
         os.kill(os.getpid(), signal.SIGTERM)
         return summary_bytes
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", validate_then_signal)
+    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
 
     try:
         winners = run_experiment(experiment)
@@ -591,7 +598,7 @@ def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_
     )
     assert isinstance(config, Suite)
 
-    original_validate = engine_run._validate_generation_publishable
+    original_validate = generation_ops._validate_generation_publishable
     signalled = {"done": False}
 
     def validate_then_signal(*args: object, **kwargs: object) -> bytes:
@@ -601,7 +608,7 @@ def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_
             os.kill(os.getpid(), signal.SIGTERM)
         return summary_bytes
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", validate_then_signal)
+    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
 
     try:
         with pytest.raises(PhaseSweepShutdown) as exc_info:
@@ -638,7 +645,7 @@ def test_execution_failure_leaves_current_pointer_terminal(tmp_path: Path) -> No
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
-    assert _current_pointer_state(experiment) in engine_run._TERMINAL_GENERATION_STATES
+    assert _current_pointer_state(experiment) in generation_ops._TERMINAL_GENERATION_STATES
 
 
 # --------------------------------------------------------------------------
@@ -654,7 +661,7 @@ def test_generation_record_is_write_once(tmp_path: Path) -> None:
     assert generation_id is not None
     first_content = _generation_record_path(experiment, generation_id).read_bytes()
 
-    engine_run._write_generation_state(
+    generation_ops._write_generation_state(
         experiment,
         generation_id=generation_id,
         state="failed",
@@ -672,7 +679,7 @@ def test_generation_record_is_write_once(tmp_path: Path) -> None:
 
     # A second attempt at the SAME state is refused too -- not "monotonic",
     # truly write-once.
-    engine_run._write_generation_state(
+    generation_ops._write_generation_state(
         experiment,
         generation_id=generation_id,
         state="published",
@@ -694,7 +701,7 @@ def test_successful_publication_never_logs_a_record_refusal(
     noise on every publication.
     """
     experiment = _stored_experiment(tmp_path)
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.generation"):
         run_experiment(experiment)
         run_experiment(experiment)  # republish onto the same storage
     assert not [r for r in caplog.records if "Refusing to rewrite" in r.message]
@@ -728,13 +735,15 @@ def test_publication_refuses_invalid_winner_artifact(
     """
     experiment = _stored_experiment(tmp_path)
 
-    original = engine_run._validate_generation_publishable
+    original = generation_ops._validate_generation_publishable
 
     def delete_winner_then_validate(exp, generation_id: str) -> None:  # noqa: ANN001
         mutate_winner(_generation_winner_path(exp, generation_id, "p"))
         original(exp, generation_id)
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", delete_winner_then_validate)
+    monkeypatch.setattr(
+        generation_ops, "_validate_generation_publishable", delete_winner_then_validate
+    )
 
     with pytest.raises(RuntimeError, match=error_match):
         run_experiment(experiment)
@@ -797,7 +806,7 @@ def test_suite_publication_refuses_broken_component_manifest(
     suite = _stored_suite_config(tmp_path)
     component = suite.experiment_for_study(suite.studies[0])
 
-    original = engine_run._validate_suite_generation_publishable
+    original = suite_ops._validate_suite_generation_publishable
 
     def break_component_then_validate(suite_arg, generation_id: str) -> None:  # noqa: ANN001
         component_generation = _last_successful_generation_id(component)
@@ -806,7 +815,7 @@ def test_suite_publication_refuses_broken_component_manifest(
         original(suite_arg, generation_id)
 
     monkeypatch.setattr(
-        engine_run, "_validate_suite_generation_publishable", break_component_then_validate
+        suite_ops, "_validate_suite_generation_publishable", break_component_then_validate
     )
 
     with pytest.raises(RuntimeError, match="component manifest is invalid"):
@@ -939,7 +948,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
     summary_path.write_bytes(tampered)
 
     parsed_summary_bytes = False
-    original_safe_load = engine_state.yaml.safe_load
+    original_safe_load = validation_ops.yaml.safe_load
 
     def track_safe_load(stream):  # noqa: ANN001, ANN202
         nonlocal parsed_summary_bytes
@@ -947,7 +956,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
             parsed_summary_bytes = True
         return original_safe_load(stream)
 
-    monkeypatch.setattr(engine_state.yaml, "safe_load", track_safe_load)
+    monkeypatch.setattr(validation_ops.yaml, "safe_load", track_safe_load)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
@@ -1216,7 +1225,7 @@ def test_pinned_read_of_failed_publication_generation_reports_truthful_identity(
     def fail_validation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated pre-commit validation failure")
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", fail_validation)
+    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
 
     captured: list[str] = []
 
@@ -1330,7 +1339,7 @@ def test_suite_precommit_validation_failure_keeps_prior_publication(
     def fail_validation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated suite validation failure")
 
-    monkeypatch.setattr(engine_run, "_validate_suite_generation_publishable", fail_validation)
+    monkeypatch.setattr(suite_ops, "_validate_suite_generation_publishable", fail_validation)
 
     with pytest.raises(RuntimeError, match="simulated suite validation failure"):
         run_suite(suite)
@@ -1361,9 +1370,9 @@ def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
     def fail_projection(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated suite projection failure")
 
-    monkeypatch.setattr(engine_run, "_copy_yaml_projection", fail_projection)
+    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", fail_projection)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         results = run_suite(suite)
 
     assert set(results) == {"one"}
@@ -1441,7 +1450,7 @@ def test_suite_generation_record_is_write_once(tmp_path: Path) -> None:
     record_path = _suite_generation_record_path(suite, generation_id)
     first_content = record_path.read_bytes()
 
-    engine_run._write_suite_generation_state(
+    suite_ops._write_suite_generation_state(
         suite,
         generation_id=generation_id,
         state="failed",
@@ -1492,7 +1501,7 @@ def test_suite_manifest_names_the_generation_that_produced_its_winners(
     top_up = component.model_copy(
         update={"phases": [component.phases[0].model_copy(update={"n_trials": 2})]}
     )
-    original_promotion = engine_run._apply_study_promotion
+    original_promotion = suite_ops._apply_study_promotion
 
     def interleave(**kwargs: object):
         # Publish a newer component generation in the gap between the
@@ -1500,7 +1509,7 @@ def test_suite_manifest_names_the_generation_that_produced_its_winners(
         run_experiment(top_up)
         return original_promotion(**kwargs)
 
-    monkeypatch.setattr(engine_run, "_apply_study_promotion", interleave)
+    monkeypatch.setattr(suite_ops, "_apply_study_promotion", interleave)
     results = run_suite(config)
 
     summary = yaml.safe_load(_suite_summary_path(config).read_text())
@@ -1551,11 +1560,11 @@ def test_suite_state_write_failure_preserves_cancellation(
     def cancel(*_args: object, **_kwargs: object):
         raise shutdown
 
-    original_state = engine_run._write_suite_generation_state
+    original_state = suite_ops._write_suite_generation_state
 
-    monkeypatch.setattr(engine_run, "_run_experiment_outcome", cancel)
+    monkeypatch.setattr(run_engine, "_run_experiment_outcome", cancel)
     monkeypatch.setattr(
-        engine_run,
+        suite_ops,
         "_write_suite_generation_state",
         _fail_terminal_generation_state(
             original_state,
@@ -1564,7 +1573,7 @@ def test_suite_state_write_failure_preserves_cancellation(
     )
 
     with (
-        caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"),
+        caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"),
         pytest.raises(PhaseSweepShutdown) as exc_info,
     ):
         run_suite(config)
@@ -1964,10 +1973,10 @@ def test_experiment_state_write_failure_preserves_primary_error(
         n_trials=1,
         max_consecutive_failures=1,
     )
-    original = engine_run._write_generation_state
+    original = generation_ops._write_generation_state
 
     monkeypatch.setattr(
-        engine_run,
+        generation_ops,
         "_write_generation_state",
         _fail_terminal_generation_state(original, SystemExit("simulated persistence interruption")),
     )

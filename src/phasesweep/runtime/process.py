@@ -42,6 +42,7 @@ from pathlib import Path
 from types import FrameType
 from typing import IO, Any
 
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import strict_json_loads
@@ -808,18 +809,17 @@ def _wait_for_guardian_exit(proc: subprocess.Popen) -> bool:
 
 
 def _abort_launch(proc: subprocess.Popen, pgid: int | None) -> bool:
-    """Kill and unregister a subprocess whose launch failed before hand-off.
+    """Kill and unregister a subprocess after launch or supervision fails.
 
-    Shared by both launch-failure paths — the readiness-wait failure in
-    :func:`_spawn_blocked_supervisor` and the identity/payload-delivery
-    failure in :func:`run_supervised` — which otherwise ran this identical
-    three-step sequence independently. Resolves the target process group
-    (the registered ``pgid``, or the bare PID when registration never
-    happened), kills it, and unregisters it from the global registry if it
-    was registered.
+    Shared by the readiness-wait failure in
+    :func:`_spawn_blocked_supervisor` and the identity, payload-delivery, and
+    post-launch wait failures in :func:`run_supervised`. Resolves the target
+    process group (the registered ``pgid``, or the bare PID when registration
+    never happened), kills it, and unregisters it from the global registry if
+    it was registered.
 
     Args:
-        proc: The subprocess whose launch is being aborted.
+        proc: The subprocess whose launch or supervision is being aborted.
         pgid: The process-group ID it was registered under, or ``None`` if
             registration never completed.
 
@@ -1397,7 +1397,11 @@ def run_supervised(
     Raises:
         RuntimeError: The supervisor never signalled readiness, or signalled an
             unexpected byte, so no process group was ever created.
-        OSError: The supervisor process or its pipes could not be created.
+        OSError: The supervisor process or its pipes could not be created, or
+            an unexpected post-launch I/O failure occurred after its process
+            group was cleaned and reaped.
+        UnsafeProcessCleanupError: An unexpected failure after launch occurred
+            and cleanup of the trainer process group could not be confirmed.
 
     """
     import time
@@ -1603,18 +1607,61 @@ def run_supervised(
                 )
                 cleanup_confirmed = _kill_group(pgid, proc)
 
+    except PhaseSweepShutdown:
+        # The signal handler already made the authoritative cleanup attempt and
+        # attached its evidence to this control-flow exception. Preserve it
+        # unchanged; the engine uses that report when recording cancellation.
+        raise
+    except BaseException as exc:
+        # Once the trainer payload crossed the pipe, every exit from this wait
+        # owns a live process group until cleanup proves otherwise. An I/O or
+        # runtime failure must not unregister the group and let it continue
+        # outside both normal supervision and shutdown-handler tracking.
+        try:
+            cleanup_confirmed = _abort_launch(proc, pgid)
+        except PhaseSweepShutdown:
+            raise
+        except BaseException:
+            log.exception(
+                "Unexpected failure while waiting for trial process group %d, followed by "
+                "an exception during cleanup",
+                pgid,
+            )
+            raise UnsafeProcessCleanupError(
+                f"Unexpected failure while waiting for trial process group {pgid}; "
+                "cleanup could not be confirmed."
+            ) from exc
+        if not cleanup_confirmed:
+            raise UnsafeProcessCleanupError(
+                f"Unexpected failure while waiting for trial process group {pgid}; "
+                "cleanup could not be confirmed."
+            ) from exc
+        try:
+            _record_attempt_exited(
+                trial_dir,
+                attempt_id=attempt_id,
+                return_code=proc.returncode if proc.returncode is not None else -9,
+            )
+        except Exception:
+            log.exception(
+                "Trial process group %d was cleaned after an unexpected wait failure, but "
+                "its exited lifecycle could not be persisted",
+                pgid,
+            )
+        raise
     finally:
         if status_read is not None:
-            os.close(status_read)
+            with contextlib.suppress(OSError):
+                os.close(status_read)
         _unregister(pgid)
 
     # The identity record is deliberately RETAINED on clean exit (review
     # v0.5.17 / blocker 2 gap B): the orchestrator can still die between
     # here and the Optuna terminal commit (evidence extraction, gates), and
     # recovery must be able to distinguish "safely exited" from "identity
-    # missing". The durable 'exited' transition records that the whole group
-    # is confirmed gone; it is only written outside the exception paths
-    # above, so an interrupted wait can never claim a confirmed exit.
+    # missing". Both this normal path and the failed-wait cleanup path above
+    # write the durable 'exited' transition only after confirming that the
+    # whole group is gone; a wait exception alone is never proof of exit.
     if cleanup_confirmed:
         _record_attempt_exited(
             trial_dir,

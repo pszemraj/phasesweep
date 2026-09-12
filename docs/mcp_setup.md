@@ -8,10 +8,10 @@ Requirements: Python 3.11+, the [MCP runtime platform requirements](runtime.md#p
 
 ### 1. Install the MCP extra
 
-Install PhaseSweep and its optional MCP dependency in the conda environment whose executable the client should use:
+Install PhaseSweep and its optional MCP dependency in the Python environment whose executable the client should use:
 
 ```bash
-pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
 ```
 
 Reinstalling the same Git ref later may require adding `--force-reinstall` to the command above or selecting a changed ref. Contributor and editable-install setup is in [development](development.md).
@@ -24,14 +24,14 @@ If you do not have an experiment yet, `phasesweep init` creates an installed-pac
 phasesweep mcp init-catalog --from ./experiment.yaml
 ```
 
-The command writes `catalog.yaml` with side effects disabled and winner values redacted. Its catalog validation also provisions the [private state layout](mcp.md#the-catalog). Before continuing, review:
+The command writes `catalog.yaml` with side effects disabled and winner values redacted. Its catalog validation also provisions the [private state layout](mcp.md#the-catalog) outside the project, under `${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>/`. The catalog pins that absolute path, and the private state's `origin` file identifies the catalog. Before continuing, review:
 
 - every experiment description and config path;
 - `visible_params`, which controls sampled winner values visible to the agent;
 - `allow.launch`, `allow.cancel`, and `allow.from_phase`;
 - the catalog state directory and each experiment working directory.
 
-Add another `--from` for each experiment. Use `-o` to choose another catalog filename. The scaffold is staged and validated before publication and never replaces an existing path. See [the catalog reference](mcp.md#the-catalog) for storage and path rules and the [security model](mcp.md#security-model) for the resulting authority boundary.
+Add another `--from` for each experiment. Use `-o` to choose another catalog filename. For per-user scratch placement, provision an absolute owner-only `0700` directory and set `PHASESWEEP_HOME` before scaffolding: new MCP state goes under its `mcp/` directory. An existing catalog keeps its saved `state_dir`, including an older project-local `runs/.mcp` path; upgrading does not relocate its state. To use the new placement for future runs, resolve outstanding runs under the old catalog, then scaffold and review a new catalog with `-o NEW_CATALOG.yaml` and reinstall the client with `--catalog NEW_CATALOG.yaml`. Retain the old state for its run history and recovery. This setting does not change host locks; their default location is fixed to the OS account home, with `PHASESWEEP_LOCK_DIR` as the sole placement override. The scaffold is staged and validated before publication and never replaces an existing path. See [the catalog reference](mcp.md#the-catalog) for storage and path rules and the [security model](mcp.md#security-model) for the resulting authority boundary.
 
 ### 3. Connect a client
 
@@ -53,6 +53,9 @@ Do not launch anything.
 ```
 
 A working connection returns only catalog-approved experiment IDs, descriptions, phase shape, metrics, and permitted actions. It does not launch a run.
+
+For an explicitly authorized run, follow the [tool workflow and response
+shapes](mcp.md#reading-status-responses) through launch, await, and result retrieval.
 
 ## What the installer changes
 
@@ -116,12 +119,12 @@ phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
 
 This uses the server's startup validation and, only after every catalog entry passes, provisions and probes the private state layout. It launches no sweep.
 
-After replacing or recreating the conda environment, rerun `phasesweep mcp install` from the intended environment and restart each selected client so its absolute executable path and instructions are refreshed.
+After replacing or recreating the Python environment, rerun `phasesweep mcp install` from that environment and restart each selected client so its absolute executable path and instructions are refreshed.
 
 ## Troubleshooting
 
-- `MCP support is not installed`: activate the intended conda environment, run the install command from step 1, then retry.
-- The client cannot start `phasesweep-mcp`: run `phasesweep mcp check-install`. If its static launcher/catalog checks pass, activate the environment named by the absolute command, run `python -c 'import mcp, phasesweep.mcp.server'`, then run `phasesweep mcp check --catalog PATH`; repair the environment or rerun the installer if either check fails, then restart the client.
+- `MCP support is not installed`: install the MCP extra in the intended Python environment, then retry.
+- The client cannot start `phasesweep-mcp`: run `phasesweep mcp check-install`. If its static launcher/catalog checks pass, use the Python environment that provides the absolute command to run `python -c 'import mcp, phasesweep.mcp.server'`, then run `phasesweep mcp check --catalog PATH`; repair the environment or rerun the installer if either check fails, then restart the client.
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the corresponding catalog flag only if that is the authority you intend, then restart the MCP client.
 - `concurrency limit reached`: await one of the returned blocking run IDs. Do not cancel it or launch a replacement automatically.
 - `recovery_required: true`, unresolved launch, uncertain cleanup, or unavailable terminal snapshot: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
@@ -134,7 +137,7 @@ For a manual stdio entry, use the absolute values printed by `which phasesweep-m
 
 ```json
 {
-  "command": "/absolute/path/to/conda/env/bin/phasesweep-mcp",
+  "command": "/absolute/path/to/phasesweep-mcp",
   "args": ["--catalog", "/absolute/path/to/catalog.yaml"]
 }
 ```

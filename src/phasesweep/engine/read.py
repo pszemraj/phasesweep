@@ -10,7 +10,7 @@ Reads here are permissive about partial run state and never raise on a missing
 winner. They still fail closed when the artifact root belongs to another
 storage ledger: combining one database's trial counts with another database's
 publication is not a partial result. They do NOT re-verify phase fingerprints:
-that check belongs to the resume path in ``engine.state._load_winner``, not to
+that check belongs to the resume path in ``engine.artifacts._load_winner``, not to
 a status read.
 """
 
@@ -26,24 +26,33 @@ import yaml
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine.guards import (
-    _experiment_semantic_fingerprint,
+from phasesweep.engine.artifact_roots import (
+    _artifact_root_binding_applies,
     _validate_artifact_root_binding,
 )
-from phasesweep.engine.optuna import _phase_trial_stats
-from phasesweep.engine.state import (
-    PublicationState,
-    WinnerSource,
-    WinnerSourceKind,
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.optuna import (
+    _phase_trial_stats,
+    _published_phase_trial_refs,
+    _published_trial_history_available,
+)
+from phasesweep.engine.paths import (
     _generation_path,
     _generation_summary_path,
     _generation_winner_path,
+)
+from phasesweep.engine.publication import (
     _last_successful_generation_id,
-    _parse_winner_source,
     _published_summary_path_for,
     _published_winner_path,
     _published_winner_path_for,
     _resolve_publication_pointer,
+)
+from phasesweep.engine.state import (
+    PublicationState,
+    WinnerSource,
+    WinnerSourceKind,
+    _parse_winner_source,
 )
 
 ResultContext: TypeAlias = Literal["represented_generation", "current_config"]
@@ -94,13 +103,14 @@ def _phase_status_payloads(
     generation_trial_counts: Mapping[str, dict[str, int]],
     trial_data_available: Mapping[str, bool],
     running_attempts: Mapping[str, list[dict[str, Any]] | None],
+    unavailable_published_phases: set[str],
     winner_scope_generation_id: str | None = None,
     pinned: bool = False,
 ) -> list[dict[str, Any]]:
     """Build per-phase status payloads for CLI and MCP readers.
 
     ``winner_scope_generation_id`` must already be resolved by the caller
-    exactly once (e.g. a single :func:`phasesweep.engine.state._resolve_publication_pointer`
+    exactly once (e.g. a single :func:`phasesweep.engine.publication._resolve_publication_pointer`
     call, or a caller-pinned id) and is reused for every phase in this one
     call -- this function never re-resolves the last-success pointer itself,
     so one status object spanning several phases can never mix identities
@@ -111,8 +121,8 @@ def _phase_status_payloads(
     :param Mapping[str, dict[str, int]] trial_counts: Pre-read counts keyed by phase name.
     :param Mapping[str, dict[str, int]] generation_trial_counts: Counts for the represented generation, keyed by phase name.
     :param Mapping[str, bool] trial_data_available: Storage-read
-        availability keyed by phase name. Included only in the path-free status
-        view consumed by MCP.
+        availability keyed by phase name. True includes confirmed absent studies
+        with known zero counts; false means counts could not be established.
     :param Mapping[str, list[dict[str, Any]] | None] running_attempts:
         RUNNING trial identities keyed by phase name, from the same
         storage snapshot as ``trial_counts`` -- ``None`` for a phase whose
@@ -120,6 +130,8 @@ def _phase_status_payloads(
         consumed by MCP, whose terminal snapshot must not reread studies to
         learn which rows the RUNNING count refers to (PR #5 review /
         reviewer 2, blocker 6).
+    :param set[str] unavailable_published_phases: Published phases whose local
+        trial identity could not be matched in the storage snapshot.
     :param str | None winner_scope_generation_id: Already-resolved generation id
         whose winner files are represented. When ``pinned`` is ``False``
         (default), this is treated as an already-captured last-success id and
@@ -150,6 +162,8 @@ def _phase_status_payloads(
             "n_trials": phase.n_trials,
             "completed": counts.get("COMPLETE", 0),
             "generation_trials": generation_trial_counts[phase.name],
+            "trial_data_available": trial_data_available[phase.name],
+            "published_study_unavailable": phase.name in unavailable_published_phases,
         }
         if include_winner_path:
             payload.update(
@@ -160,7 +174,6 @@ def _phase_status_payloads(
                 {
                     "phase": phase.name,
                     "winner_present": winner_present,
-                    "trial_data_available": trial_data_available[phase.name],
                     "running_attempts": running_attempts[phase.name],
                 }
             )
@@ -270,7 +283,7 @@ def read_winner(
             consistent with this module's permissive contract and with
             ``_phase_trial_stats`` swallowing transient backend errors. The
         strict, fingerprint-verifying read used for ``--from-phase`` resume
-        lives in ``engine.state._load_winner`` and is intentionally not
+        lives in ``engine.artifacts._load_winner`` and is intentionally not
         relaxed here.
 
     """
@@ -560,6 +573,15 @@ def read_status(
     whatever else may be current by the time the read happens. ``trials``,
     ``running``, ``completed``, and ``trial_data_available`` are cumulative,
     all-time counts for the phase's study and are not generation-scoped.
+    ``published_study_unavailable`` reports a current published phase whose local
+    trial identity or recorded completion boundary could not be matched in storage.
+    When both it and ``trial_data_available`` are true, history is confirmed missing,
+    replaced, or incomplete; executing the phase is refused, while earlier phases
+    may still load saved winners via ``from_phase``. When ``trial_data_available``
+    is false, the history could not be completely inspected, including an incomplete
+    journal append; a run can report cleanup uncertainty and
+    require operator recovery before further MCP launches. Publication
+    integrity describes the artifacts separately.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional invocation identity to pin the
@@ -639,7 +661,15 @@ def read_status(
     else:
         is_published = represented_generation_id == published_generation_id
 
-    phase_stats = {phase.name: _phase_trial_stats(experiment, phase) for phase in experiment.phases}
+    published_trials = (
+        _published_phase_trial_refs(publication.summary)
+        if _artifact_root_binding_applies(experiment)
+        else {}
+    )
+    phase_stats = {
+        phase.name: _phase_trial_stats(experiment, phase, published_trials.get(phase.name))
+        for phase in experiment.phases
+    }
     summary_path: Path | None
     if pinned:
         assert winner_scope_generation_id is not None
@@ -719,6 +749,12 @@ def read_status(
         "metric": metric_payload,
         "phases": _phase_status_payloads(
             experiment,
+            unavailable_published_phases={
+                name
+                for name, stats in phase_stats.items()
+                if name in published_trials
+                and not _published_trial_history_available(stats, published_trials[name])
+            },
             include_winner_path=_include_winner_paths,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
             generation_trial_counts={

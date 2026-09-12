@@ -7,7 +7,6 @@ import importlib.util
 import json
 import logging
 import os
-import re
 import secrets
 import shlex
 import sys
@@ -16,7 +15,6 @@ from collections.abc import Callable, Iterator
 from importlib import resources
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 import click
 import yaml
@@ -30,60 +28,41 @@ from phasesweep.engine import (
     config_status,
     run_config,
 )
-from phasesweep.engine.guards import (
-    _apply_artifact_root_rebind,
-    _experiment_lock,
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
-    _inspect_active_attempts,
-    _inspect_cleanup_uncertain_trials,
-    _inspect_stale_running_trials,
-    _plan_artifact_root_rebinds,
-    _preflight_active_attempts,
-    _PreflightCleanupReport,
-    _previously_recovered_attempt_locations,
-    _reap_stale_trials,
-    _recover_cleanup_uncertain_trials,
-    _retire_active_attempt,
     _suite_fingerprint,
-    _suite_lock,
-    _validate_artifact_root_binding,
-    _validate_suite_artifact_root_rebind,
 )
-from phasesweep.engine.optuna import _load_existing_phase_study
-from phasesweep.engine.state import (
-    _experiment_dir,
+from phasesweep.engine.locking import _experiment_lock, _suite_lock
+from phasesweep.engine.paths import _experiment_dir, _suite_dir
+from phasesweep.engine.publication import (
     _published_summary_path_for,
     _published_winner_path_for,
     _resolve_publication_pointer,
     _resolve_suite_publication_pointer,
-    _suite_dir,
+)
+from phasesweep.engine.relocation import (
+    _apply_artifact_root_rebind,
+    _plan_artifact_root_rebinds,
+    _validate_suite_artifact_root_rebind,
 )
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND
-from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.install import installer as mcp_installer
 from phasesweep.mcp.install.targets import agent_ids
+from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
     CatalogCheckReport,
     Registry,
     check_catalog,
     require_linux_mcp_host,
 )
-from phasesweep.mcp.runs import RunStore, identity_from_earlier_boot, write_status_file
 from phasesweep.mcp.scaffold import scaffold_catalog_text
-from phasesweep.mcp.snapshots import (
-    finalize_result_snapshot,
-    mark_result_snapshot_published,
-    parse_result_snapshot,
-)
 from phasesweep.reporting import report_objective
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
     install_signal_handlers,
-    is_same_live_process,
-    kill_stale_group,
 )
-from phasesweep.runtime.time import utc_now_iso
 
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"], "max_content_width": 100}
 CONFIG_PATH = click.Path(exists=True, dir_okay=False, path_type=Path)
@@ -206,21 +185,10 @@ def _starter_experiment_text(target: Path) -> str:
         .read_text(encoding="utf-8")
     )
     runs_dir = target.parent / "runs"
-    storage_path = quote(str(runs_dir / "phases.db"), safe="/")
     # JSON and YAML double-quoted scalars share escaping for valid Unicode.
     # Keep non-ASCII workdir characters literal to avoid JSON's UTF-16 surrogate
-    # pairs; the SQLite URI percent-encodes its path for unambiguous URL parsing.
-    replacements = {
-        "__PHASESWEEP_WORKDIR__": json.dumps(str(runs_dir), ensure_ascii=False),
-        "__PHASESWEEP_STORAGE__": json.dumps(
-            f"sqlite:///file:{storage_path}?uri=true", ensure_ascii=False
-        ),
-    }
-    # Substitute every placeholder in one pass. Sequential str.replace calls
-    # rescan text a previous call already inserted, so a destination path that
-    # contains a placeholder literal would silently corrupt the rendered config.
-    pattern = re.compile("|".join(re.escape(placeholder) for placeholder in replacements))
-    return pattern.sub(lambda match: replacements[match.group(0)], template)
+    # pairs.
+    return template.replace("__PHASESWEEP_WORKDIR__", json.dumps(str(runs_dir), ensure_ascii=False))
 
 
 @contextlib.contextmanager
@@ -818,6 +786,10 @@ def rebind_workdir(config_path: Path) -> None:
     a rebind, never a move: PhaseSweep does not copy, delete, or verify the
     original tree.
 
+    With auto storage, the database must have moved with the artifact tree.
+    Its recorded previous filename is recognized without converting backends
+    or moving an explicit external database into the namespace.
+
     What it verifies at the destination, per experiment: the namespace exists;
     every trial the study ledger holds still has its evidence directory there,
     which is what rejects a stale copy taken before the ledger advanced; no
@@ -909,7 +881,9 @@ def _catalog_error_text(exc: CatalogError) -> str:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Operator-only recovery for MCP cleanup uncertainty, interrupted publication, or "
-        "terminal-result finalization. --confirm performs the reported actions."
+        "terminal-result finalization. If study storage is unavailable, restore the original "
+        "complete storage ledger and access to it before recovery. "
+        "--confirm performs the reported actions."
     ),
     short_help="Recover MCP cleanup or result finalization.",
 )
@@ -940,7 +914,8 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         be reconciled from its pointer, runner identity cannot rule out PID
         reuse, the runner still appears live, the run config snapshot is missing or
         does not match its recorded digest, no trial-level cleanup evidence can be
-        confirmed, or study recovery fails with a ``RuntimeError``.
+        confirmed, restored storage cannot account for published history, or study
+        recovery fails with a ``RuntimeError``.
     """
     state_dir = state_dir.expanduser().resolve()
     try:
@@ -948,439 +923,9 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
     except CatalogError as exc:
         raise click.ClickException(_catalog_error_text(exc)) from None
     try:
-        store = RunStore.open_existing(state_dir)
-    except ValueError as exc:
+        recover_run(state_dir, run_id, confirm=confirm, emit=click.echo)
+    except RunRecoveryError as exc:
         raise click.ClickException(str(exc)) from None
-    handle = store.get(run_id)
-    if handle is None:
-        with store.launch_lock() as acquired:
-            if not acquired:
-                raise click.ClickException(
-                    "another MCP launch is in progress; wait for it to finish and retry"
-                )
-            if store.is_pre_spawn_orphan(run_id):
-                if not confirm:
-                    click.echo(
-                        f"Recovery preflight for {run_id}: would remove the orphaned config "
-                        "snapshot left before any runner could spawn. Re-run with --confirm "
-                        "to perform that action."
-                    )
-                    return
-                try:
-                    store.clear_pre_spawn_orphan(run_id)
-                except ValueError as exc:
-                    raise click.ClickException(str(exc)) from None
-                click.echo(
-                    f"Removed pre-spawn orphan config snapshot for {run_id}; no runner or "
-                    "trainer was launched under that identity."
-                )
-                return
-        raise click.ClickException(f"unknown run id: {run_id}")
-    terminal_status = store.recorded_terminal_status(handle)
-    if handle.launch_state == "launching" and terminal_status is None:
-        refreshed_handle = store.get(run_id)
-        if refreshed_handle is not None:
-            refreshed_status = store.recorded_terminal_status(refreshed_handle)
-            if refreshed_handle.launch_state != "launching" or refreshed_status is not None:
-                handle = refreshed_handle
-                terminal_status = refreshed_status
-        if handle.launch_state == "launching" and terminal_status is None:
-            raise click.ClickException(
-                "launch outcome is unresolved: the durable handle cannot distinguish a "
-                "pre-spawn failure from a child that has not persisted its process identity. "
-                "The run remains reserved. Wait briefly and retry; if this persists after a "
-                "server crash, inspect the host because automated recovery cannot safely "
-                "declare that no runner was spawned."
-            )
-    cleanup_recovery_required = store.cleanup_recovery_required(handle)
-    snapshot_recovery_required = store.snapshot_recovery_required(handle)
-    terminal_cleanup_uncertain = (
-        terminal_status is not None
-        and terminal_status.get("cleanup_confirmed") is False
-        and cleanup_recovery_required
-    )
-    cleanup_already_recovered = (
-        terminal_status is not None
-        and terminal_status.get("cleanup_confirmed") is False
-        and not cleanup_recovery_required
-    )
-    runner_without_status = handle.launch_state == "spawned" and terminal_status is None
-    cleanup_recovery_needed = cleanup_recovery_required or runner_without_status
-    stored_snapshot = (
-        parse_result_snapshot(terminal_status) if terminal_status is not None else None
-    )
-    prepared_publication_generation = (
-        terminal_status.get("result_publication_generation_id")
-        if terminal_status is not None
-        and terminal_status.get("result_publication_state") == "prepared"
-        else None
-    )
-    snapshot_unavailable = (
-        terminal_status is not None and stored_snapshot is None
-    ) or runner_without_status
-    snapshot_finalize_needed = stored_snapshot is not None and (
-        terminal_cleanup_uncertain or cleanup_already_recovered or snapshot_recovery_required
-    )
-    if not cleanup_recovery_needed and snapshot_unavailable and not snapshot_recovery_required:
-        raise click.ClickException(
-            "this run has no immutable terminal result snapshot. Historical results cannot "
-            "be rebuilt from the current shared study because later runs may have changed it."
-        )
-    if not cleanup_recovery_needed and not snapshot_finalize_needed and not snapshot_unavailable:
-        click.echo("No cleanup uncertainty or terminal result repair is needed for this run.")
-        return
-
-    identity = store.cleanup_identity(handle)
-    # PID + /proc start time are unique only within one boot. A recorded boot
-    # id from an earlier boot proves the runner and every descendant are gone:
-    # without this guard a post-reboot PID recycle could fake liveness (blocking
-    # recovery forever) or absorb the group signal below (review v0.5.17 /
-    # finding E follow-up).
-    earlier_boot = identity_from_earlier_boot(identity.boot_id)
-    if (
-        cleanup_recovery_needed
-        and not earlier_boot
-        and identity.pid is not None
-        and identity.pid_starttime is None
-    ):
-        raise click.ClickException(
-            "runner process identity has no Linux /proc start time; refusing automated "
-            "recovery because PID reuse cannot be ruled out"
-        )
-    if not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise click.ClickException("runner still appears live; use cancel_run first")
-    snapshot = store.config_snapshot_path(run_id)
-    if not snapshot.is_file():
-        raise click.ClickException(f"run config snapshot is missing: {snapshot}")
-    try:
-        config = load_experiment_snapshot(
-            snapshot,
-            handle.config_sha256,
-            source=f"run snapshot {run_id}",
-        )
-    except OSError as exc:
-        raise click.ClickException(f"cannot read run config snapshot: {snapshot}") from exc
-    except ValueError as exc:
-        raise click.ClickException(f"{exc}; refusing recovery") from None
-
-    recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
-    try:
-        with recovery_lock:
-            # Lock contention proves another ordinary CLI or MCP orchestrator is
-            # using this exact output/storage namespace. Re-check runner liveness
-            # only after acquiring the lock, then keep it through every signal,
-            # study mutation, and recovery-state write.
-            if (
-                confirm
-                and not earlier_boot
-                and is_same_live_process(identity.pid, identity.pid_starttime)
-            ):
-                raise click.ClickException("runner still appears live; use cancel_run first")
-            if (
-                cleanup_recovery_needed
-                and confirm
-                and not earlier_boot
-                and not kill_stale_group(
-                    identity.pid,
-                    identity.pid_starttime,
-                    pgid=identity.pgid,
-                    grace_seconds=30.0,
-                )
-            ):
-                raise click.ClickException("runner process-group cleanup is still uncertain")
-
-            publication_recovery_action: str | None = None
-            if isinstance(prepared_publication_generation, str):
-                publication = _resolve_publication_pointer(config)
-                if publication.generation_id == prepared_publication_generation:
-                    publication_recovery_action = "commit"
-                elif publication.state == "absent" or publication.generation_id is not None:
-                    publication_recovery_action = "abort"
-                else:
-                    raise click.ClickException(
-                        "the prepared run result cannot be reconciled because the "
-                        "last-success pointer is unreadable or malformed. Restore that "
-                        "pointer before retrying recovery."
-                    )
-
-            reaped = 0
-            (
-                reaped_attempt_ids,
-                reaped_attempt_locations,
-            ) = store.cleanup_recovered_attempt_evidence(handle)
-            causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
-            inspected_attempt_ids: set[str] = set()
-            inspected_attempt_generations: dict[str, str] = {}
-            inspected_attempt_locations: dict[str, tuple[str, int, str]] = {}
-            registered_recovery_attempt_ids: set[str] = set()
-            registered_attempts_reconciled = 0
-            cleanup_recovered = 0
-            inspected_studies = 0
-            if cleanup_recovery_needed:
-                if confirm:
-                    active_report = _PreflightCleanupReport()
-                    registered_attempts = _preflight_active_attempts(
-                        config,
-                        active_report,
-                        retain_recovery_evidence=True,
-                    )
-                    registered_evidence = active_report.recovered_attempt_generations
-                    registered_recovery_attempt_ids.update(active_report.recovered_attempt_ids)
-                else:
-                    registered_attempts = _inspect_active_attempts(config)
-                    registered_evidence = registered_attempts
-                registered_attempts_reconciled = len(registered_attempts)
-                reaped_attempt_ids.update(
-                    attempt_id
-                    for attempt_id, generation_id in registered_evidence.items()
-                    if generation_id == run_id or attempt_id in causal_attempt_ids
-                )
-                for phase in config.phases:
-                    study = _load_existing_phase_study(config, phase)
-                    if study is None:
-                        continue
-                    inspected_studies += 1
-                    # Durable proof left by an interrupted earlier pass: the
-                    # study ledger is written before the run-level recovery
-                    # record, so a crash between them must still count as
-                    # trial-level evidence on retry (review v0.5.17 gap hunt).
-                    # Read before the fresh pass below, which appends to the
-                    # same ledger.
-                    previously_recovered = _previously_recovered_attempt_locations(
-                        study,
-                        phase.name,
-                        run_id,
-                        causal_attempt_ids=causal_attempt_ids,
-                    )
-                    reaped_attempt_ids.update(previously_recovered)
-                    reaped_attempt_locations.update(previously_recovered)
-                    if confirm:
-                        cleanup_recovered += _recover_cleanup_uncertain_trials(
-                            study,
-                            config,
-                            phase.name,
-                            recovered_attempt_ids=inspected_attempt_ids,
-                            recovered_attempt_generations=inspected_attempt_generations,
-                            recovered_attempt_locations=inspected_attempt_locations,
-                        )
-                        reaped += _reap_stale_trials(
-                            study,
-                            config,
-                            phase.name,
-                            recovered_attempt_ids=inspected_attempt_ids,
-                            recovered_attempt_generations=inspected_attempt_generations,
-                            recovered_attempt_locations=inspected_attempt_locations,
-                        )
-                    else:
-                        cleanup_recovered += _inspect_cleanup_uncertain_trials(
-                            study,
-                            phase.name,
-                            recovered_attempt_ids=inspected_attempt_ids,
-                            recovered_attempt_generations=inspected_attempt_generations,
-                            recovered_attempt_locations=inspected_attempt_locations,
-                        )
-                        reaped += _inspect_stale_running_trials(
-                            study,
-                            config,
-                            phase.name,
-                            recovered_attempt_ids=inspected_attempt_ids,
-                            recovered_attempt_generations=inspected_attempt_generations,
-                            recovered_attempt_locations=inspected_attempt_locations,
-                        )
-                for attempt_id in inspected_attempt_ids:
-                    if (
-                        inspected_attempt_generations.get(attempt_id) == run_id
-                        or attempt_id in causal_attempt_ids
-                    ):
-                        reaped_attempt_ids.add(attempt_id)
-                        location = inspected_attempt_locations.get(attempt_id)
-                        if location is not None:
-                            reaped_attempt_locations[attempt_id] = location
-            cleanup_evidence_count = len(reaped_attempt_ids)
-            if terminal_cleanup_uncertain and cleanup_evidence_count == 0:
-                if inspected_studies == 0:
-                    detail = (
-                        "no existing Optuna studies could be loaded from the run snapshot storage"
-                    )
-                else:
-                    detail = (
-                        "no RUNNING trials were reaped, no terminal trials recorded cleanup "
-                        "uncertainty, and no prior recovery pass left durable trial-level "
-                        "evidence"
-                    )
-                raise click.ClickException(
-                    "runner status recorded cleanup_confirmed=false, but recovery could not "
-                    f"confirm any trial-level cleanup evidence ({detail}). Refusing to clear "
-                    "cleanup uncertainty."
-                )
-
-            if not confirm:
-                actions = []
-                if cleanup_recovery_needed:
-                    actions.append(
-                        "attempt runner process-group cleanup, "
-                        f"reconcile {registered_attempts_reconciled} registered attempt(s), "
-                        f"reap {reaped} stale trial(s), and recover {cleanup_recovered} "
-                        "cleanup-uncertain terminal trial(s)"
-                    )
-                if snapshot_finalize_needed:
-                    if publication_recovery_action == "commit":
-                        actions.append(
-                            "bind the prepared snapshot to its committed publication and "
-                            "finalize it with cleanup evidence"
-                        )
-                    elif publication_recovery_action == "abort":
-                        actions.append(
-                            "record the prepared generation as unpublished and finalize its "
-                            "stored snapshot"
-                        )
-                    else:
-                        actions.append(
-                            "finalize the stored terminal snapshot with cleanup evidence"
-                        )
-                elif snapshot_unavailable:
-                    actions.append("record that the historical terminal snapshot is unavailable")
-                click.echo(
-                    f"Recovery preflight for {run_id}: would {' and '.join(actions)}. "
-                    "Re-run with --confirm to perform those actions."
-                )
-                return
-
-            if terminal_status is None:
-                terminal_status = {
-                    "run_id": run_id,
-                    "returncode": 1,
-                    "error_class": "RunnerExitedWithoutStatus",
-                    "cleanup_confirmed": True,
-                    "ended_at": utc_now_iso(),
-                    "result_snapshot_state": "failed",
-                    "result_snapshot_error": "HistoricalSnapshotUnavailable",
-                }
-                write_status_file(store.status_path(run_id), terminal_status)
-
-            if cleanup_recovery_needed:
-                payload = {
-                    "run_id": run_id,
-                    "config_sha256": handle.config_sha256,
-                    "recovered_at": utc_now_iso(),
-                    "cleanup_confirmed": True,
-                    "reaped_running_trials": reaped,
-                    "registered_attempts_reconciled": registered_attempts_reconciled,
-                    "reaped_attempt_ids": sorted(reaped_attempt_ids),
-                    "reaped_attempt_locations": {
-                        attempt_id: {
-                            "phase": phase_name,
-                            "trial_number": trial_number,
-                            "generation_id": generation_id,
-                        }
-                        for attempt_id, (
-                            phase_name,
-                            trial_number,
-                            generation_id,
-                        ) in sorted(reaped_attempt_locations.items())
-                    },
-                    "cleanup_uncertain_terminal_trials": cleanup_recovered,
-                }
-                private_atomic_write_text(
-                    store.cleanup_recovery_path(run_id),
-                    json.dumps(payload, indent=2) + "\n",
-                )
-                for attempt_id in registered_recovery_attempt_ids:
-                    _retire_active_attempt(config, attempt_id)
-                store.clear_cleanup_uncertain(handle)
-                click.echo(
-                    f"Cleared cleanup uncertainty for {run_id}; reconciled "
-                    f"{registered_attempts_reconciled} registered attempt(s), reaped {reaped} "
-                    f"stale trial(s), and confirmed {cleanup_recovered} cleanup-uncertain "
-                    "trial(s)."
-                )
-
-            if snapshot_recovery_required and stored_snapshot is None:
-                assert terminal_status is not None
-                terminal_status["result_snapshot_state"] = "failed"
-                terminal_status["result_snapshot_error"] = "InterruptedFinalization"
-                write_status_file(store.status_path(run_id), terminal_status)
-
-            if publication_recovery_action is not None:
-                assert terminal_status is not None
-                assert stored_snapshot is not None
-                if publication_recovery_action == "commit":
-                    assert isinstance(prepared_publication_generation, str)
-                    terminal_status["result_snapshot"] = mark_result_snapshot_published(
-                        stored_snapshot.model_dump(mode="json"),
-                        generation_id=prepared_publication_generation,
-                    )
-                    terminal_status["result_publication_state"] = "committed"
-                else:
-                    terminal_status["returncode"] = 1
-                    terminal_status["error_class"] = "PublicationNotCommitted"
-                    terminal_status.pop("result_publication_state", None)
-                    terminal_status.pop("result_publication_generation_id", None)
-
-            if snapshot_finalize_needed:
-                _finalize_stored_terminal_result_snapshot(
-                    store,
-                    run_id,
-                    terminal_status,
-                    confirmed_attempt_ids=reaped_attempt_ids,
-                    confirmed_attempt_locations=reaped_attempt_locations,
-                )
-
-                click.echo(f"Finalized stored terminal result snapshot for {run_id}.")
-            elif snapshot_unavailable:
-                click.echo(
-                    f"Historical terminal result snapshot for {run_id} is unavailable and was "
-                    "not rebuilt from mutable shared state."
-                )
-    except RuntimeError as exc:
-        raise click.ClickException(str(exc)) from None
-
-
-def _finalize_stored_terminal_result_snapshot(
-    store: RunStore,
-    run_id: str,
-    terminal_status: dict,
-    *,
-    confirmed_attempt_ids: set[str],
-    confirmed_attempt_locations: dict[str, tuple[str, int, str]],
-) -> None:
-    """Finalize and persist a snapshot captured before the experiment lock was released.
-
-    :param RunStore store: Existing run store containing the terminal status.
-    :param str run_id: Run whose stored terminal snapshot should be finalized.
-    :param dict terminal_status: Validated terminal process status to enrich.
-    :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to FAIL.
-    :param dict[str, tuple[str, int, str]] confirmed_attempt_locations: Exact
-        phase, trial, and generation locators for reconciled attempts.
-    :raises click.ClickException: If the stored snapshot is unavailable or persistence fails.
-    """
-    snapshot = parse_result_snapshot(terminal_status)
-    if snapshot is None:
-        raise click.ClickException(
-            f"run {run_id} has no immutable snapshot to finalize; refusing to read current "
-            "shared state as historical evidence"
-        )
-    raw_snapshot = snapshot.model_dump(mode="json")
-    terminal_status.pop("result_snapshot_error", None)
-    terminal_status["result_snapshot_state"] = "pending"
-    try:
-        write_status_file(store.status_path(run_id), terminal_status)
-        terminal_status["result_snapshot"] = finalize_result_snapshot(
-            raw_snapshot,
-            confirmed_attempt_ids=confirmed_attempt_ids,
-            confirmed_attempt_locations=confirmed_attempt_locations,
-        )
-        terminal_status["result_snapshot_state"] = "complete"
-        write_status_file(store.status_path(run_id), terminal_status)
-    except Exception as exc:  # noqa: BLE001 - convert operator repair failures to CLI errors
-        terminal_status["result_snapshot"] = raw_snapshot
-        terminal_status["result_snapshot_state"] = "pending"
-        terminal_status["result_snapshot_error"] = type(exc).__name__
-        with contextlib.suppress(Exception):
-            write_status_file(store.status_path(run_id), terminal_status)
-        raise click.ClickException(
-            f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
-        ) from None
 
 
 @mcp.command(
@@ -1475,10 +1020,12 @@ def _echo_catalog_report(report: CatalogCheckReport) -> None:
     context_settings=CONTEXT_SETTINGS,
     help=(
         "Write an annotated MCP catalog for existing experiment configs: absolute "
-        "state_dir next to the catalog, one read-only entry per --from config "
-        "(visible_params: none, no allow block). The staged catalog is validated with "
-        "the server startup path before it is published. Existing files are never overwritten; "
-        "edit the result, then re-check it with `phasesweep mcp check`."
+        "state_dir under PHASESWEEP_HOME/mcp/<catalog-digest> or "
+        "${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>, one read-only "
+        "entry per --from config (visible_params: none, no allow block). The staged "
+        "catalog is validated with the server startup path before it is published. "
+        "Existing files are never overwritten; edit the result, then re-check it with "
+        "`phasesweep mcp check`."
     ),
     short_help="Scaffold an MCP catalog.",
 )
@@ -1535,7 +1082,13 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
 
     try:
         text = scaffold_catalog_text(output, from_configs)
-        if not _publish_staged_text(output, text, validate=Registry.load):
+
+        def validate_scaffold(staged: Path) -> None:
+            """Validate the staged catalog and identify its final origin."""
+            registry = Registry.load(staged)
+            private_atomic_write_text(registry.state_dir / "origin", str(output.resolve()) + "\n")
+
+        if not _publish_staged_text(output, text, validate=validate_scaffold):
             click.echo(
                 f"phasesweep mcp init-catalog: {output} already exists; refusing to "
                 "overwrite. Pass -o to choose another name.",

@@ -16,8 +16,9 @@ from pathlib import Path
 from phasesweep import config_status, load_config, run_experiment
 from phasesweep.config import Suite
 from phasesweep.engine import read_status
+from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import _generation_winner_path, _last_successful_generation_id
 from tests.conftest import write_trainer, write_yaml
 
 EXPERIMENT_STATUS_KEYS = [
@@ -74,6 +75,8 @@ PHASE_STATUS_KEYS = {
     "n_trials",
     "completed",
     "generation_trials",
+    "published_study_unavailable",
+    "trial_data_available",
     "name",
     "winner",
 }
@@ -95,7 +98,6 @@ READ_STATUS_ONLY_KEYS = {
 READ_STATUS_ONLY_PHASE_KEYS = {
     "phase",
     "winner_present",
-    "trial_data_available",
     "running_attempts",
 }
 """Phase keys that exist only in the path-free read_status view.

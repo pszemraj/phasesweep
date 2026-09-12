@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import select
 import signal
 import stat
 import subprocess
@@ -207,9 +209,57 @@ def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-lease", launch_state="launching")
     preparation = store.prepare_launch(handle, b"experiment: exp\n")
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    proc: subprocess.Popen | None = None
+    child = (
+        "import os, sys\n"
+        "lease_fd, ready_fd, release_fd = map(int, sys.argv[1:])\n"
+        "os.fstat(lease_fd)\n"
+        "os.write(ready_fd, b'R')\n"
+        "raise SystemExit(0 if os.read(release_fd, 1) == b'X' else 2)\n"
+    )
+    try:
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                child,
+                str(preparation.lease_fd),
+                str(ready_write),
+                str(release_read),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(preparation.lease_fd, ready_write, release_read),
+        )
+        os.close(ready_write)
+        ready_write = -1
+        os.close(release_read)
+        release_read = -1
+        readable, _, _ = select.select([ready_read], [], [], 5)
+        assert readable and os.read(ready_read, 1) == b"R"
 
-    assert not store.is_pre_spawn_orphan(handle.run_id)
-    preparation.close()
+        assert not store.is_pre_spawn_orphan(handle.run_id)
+        preparation.close()
+        assert not store.is_pre_spawn_orphan(handle.run_id)
+
+        assert os.write(release_write, b"X") == 1
+        os.close(release_write)
+        release_write = -1
+        assert proc.wait(timeout=5) == 0
+    finally:
+        with contextlib.suppress(OSError):
+            preparation.close()
+        for fd in (ready_read, ready_write, release_read, release_write):
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
     assert store.is_pre_spawn_orphan(handle.run_id)
     store.clear_pre_spawn_orphan(handle.run_id)
     assert not store.run_evidence_exists(handle.run_id)

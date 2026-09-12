@@ -8,7 +8,11 @@ Field types, defaults, accepted values, and validation constraints are listed in
 
 The top level of a single experiment describes identity, storage, the trainer boundary, the objective, and the ordered phase plan. `experiment` is used in study names, output paths, and same-host lock identity, not only for display.
 
-`storage` holds Optuna study state. Use in-memory storage for disposable runs, SQLite for sequential persistent runs, Journal storage for same-host parallel work, or an external RDB under the explicit single-host contract. `workdir` holds trial logs, result artifacts, winners, promotion decisions, and summaries. Persistent studies are bound to their resolved artifact root; use the [workdir rebind procedure](runtime.md#fingerprints-and-resume) after moving a tree. The exact storage forms and concurrency constraints are in the [config reference](config_reference.yaml).
+`storage` holds Optuna study state. Use in-memory storage for disposable runs, SQLite for sequential persistent runs, Journal storage for same-host parallel work, or an external RDB under the explicit single-host contract.
+
+`storage: auto` keeps that state with the experiment artifacts: it selects `<workdir>/<experiment>/study.db` for sequential phases or `study.journal` when any phase has `n_jobs > 1`, and resolves the required absolute URL. Auto storage requires nonempty `provenance` and the [persistent-storage sampler contract](#sampler-capability-on-persistent-storage); explicit URLs retain their current behavior, and omitted storage remains in-memory. Changing `n_jobs` so that auto storage selects a different backend cannot resume the existing artifact tree. Restore the previous parallelism setting to resume, or choose a new experiment name or workdir for the new backend; `rebind-workdir` does not convert between `study.db` and `study.journal`.
+
+`workdir` holds trial logs, result artifacts, winners, promotion decisions, and summaries. Persistent studies are bound to their resolved artifact root. If you move a complete auto-storage tree, follow the [relocation instructions](runtime.md#output-layout). The exact storage forms and concurrency constraints are in the [config reference](config_reference.yaml).
 
 `trainer_config` is the trainer's ordinary base configuration, embedded directly in the PhaseSweep file. In the default `yaml_file` mode, PhaseSweep copies it for each trial, applies inherited, contract, fixed, and sampled dotted-path values, writes `<trial_dir>/trainer_config.yaml`, and exposes its shell-quoted path as `{config_path}`. Changing this mapping changes the experiment and phase fingerprints.
 
@@ -59,7 +63,8 @@ The `sampler` block is optional and defaults to `type: tpe` with no seed, which 
 An unseeded `tpe`, `random`, or `cmaes` phase draws a different sequence on every invocation, so the durable trials it accumulates cannot be reproduced or explained afterwards. `tpe` and `cmaes` additionally hold process-local sampler state that Optuna storage does not persist: PhaseSweep refuses to resume such a phase mid-target or to raise its `n_trials` later (see [runtime behavior](runtime.md#fingerprints-and-resume)). Setting `acknowledge_nonresumable: true` is your statement that you accept that contract and will run each target in one invocation; setting it on `grid` or `random`, which resume safely, is rejected as meaningless config.
 
 ```yaml
-storage: sqlite:///runs.db
+storage: auto
+provenance: {revision: my-trainer-and-data-v1}
 phases:
   - name: depth
     n_trials: 4
@@ -90,7 +95,7 @@ The default `yaml_file` mode materializes one complete `<trial_dir>/trainer_conf
 | Format | Use when |
 | --- | --- |
 | `yaml_file` | Default and primary: the trainer accepts one complete YAML config. |
-| `argparse` | Compatibility with a trainer that already accepts `--key value` tokens. |
+| `argparse` | Compatibility with a trainer that accepts flags; emits `--key=value` so negative numbers and option-like strings remain values. |
 | `json_file` | Compatibility with a trainer that already accepts an overrides-only JSON object. |
 | `hydra` | Compatibility with an existing Hydra/OmegaConf entry point. |
 
