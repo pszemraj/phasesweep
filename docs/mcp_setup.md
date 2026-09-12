@@ -92,7 +92,7 @@ phasesweep mcp install --agent codex --yes --allow-user-scope
 phasesweep mcp install --agent claude --agent cursor --type mcp --yes
 ```
 
-`--agent` may be repeated. `--type mcp|instructions|all` selects the integration, `--project DIR` anchors project-scoped files, and `--catalog PATH` overrides `<project>/catalog.yaml`. Unattended user-scoped writes require `--allow-user-scope`; `--yes` alone is not sufficient. A dry run still performs the catalog preflight from step 2, but it does not edit client files.
+`--agent` may be repeated. `--type mcp|instructions|all` selects the integration, `--project DIR` anchors project-scoped files, and `--catalog PATH` overrides `<project>/catalog.yaml`. An unattended, non-dry-run user-scoped MCP install requires `--allow-user-scope`; `--yes` alone is not sufficient. A dry run still performs the catalog preflight from step 2, but it does not edit client files.
 
 An instructions-only install needs no catalog or MCP SDK:
 
@@ -109,7 +109,7 @@ phasesweep mcp check-install
 phasesweep mcp check-install --agent claude
 ```
 
-The report distinguishes a resolvable managed launcher (`ok`), missing or non-executable launchers, scripts whose shebang interpreter is gone, unreadable or missing catalogs, unmanaged entries, absent entries, and unreadable client configuration. It inspects files but deliberately does not execute a configured launcher, parse the catalog, import the MCP SDK from another environment, or test server startup. From the environment named by the launcher, `python -c 'import mcp, phasesweep.mcp.server'` checks the runtime imports and `phasesweep mcp check --catalog PATH` checks catalog startup. A recognized legacy launcher entry still reports `ok` but carries an explicit caveat that it is not the pinned absolute executable and that rerunning the installer will pin it. Executable failures are reported before catalog failures because the server cannot read a catalog if it cannot start.
+The report distinguishes a resolvable managed launcher (`ok`), missing or non-executable launchers, scripts whose shebang interpreter is gone, unreadable or missing catalogs, unmanaged entries, `not-configured` entries, and unreadable client configuration. It inspects files but deliberately does not execute a configured launcher, parse the catalog, import the MCP SDK from another environment, or test server startup. From the environment named by the launcher, `python -c 'import mcp, phasesweep.mcp.server'` checks the runtime imports and `phasesweep mcp check --catalog PATH` checks catalog startup. A recognized legacy launcher entry still reports `ok` but carries an explicit caveat that it is not the pinned absolute executable and that rerunning the installer will pin it. Executable failures are reported before catalog failures because the server cannot read a catalog if it cannot start.
 
 For CI, explicit catalog review, or troubleshooting, run:
 
