@@ -102,8 +102,7 @@ For example, a terminal `await_run` response contains these fields (abridged):
 }
 ```
 
-The packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md) define
-the launch, monitoring, reconnection, and result-retrieval sequence.
+Follow the [agent workflow](../src/phasesweep/mcp/agent_prompt.md) for launch, monitoring, reconnection, and result retrieval.
 
 ### Run state and recovery
 
@@ -152,10 +151,10 @@ The installer can place the same instructions in supported project instruction f
 
 The server prevents an agent from:
 
-- set or change `trial_command`, `env`, `storage`, `workdir`, search spaces, samplers, gates, or any safety waiver - no tool accepts a config or these fields;
-- reference a config by path - tools accept catalog experiment IDs or server-minted run IDs according to their scope; an unknown ID is a clean error;
-- read raw trial artifacts, metric histories, trainer output, or rendered commands - **no tool returns log text**, because commands and trainer output can carry secrets or PII. Operator-visible log locations are listed under [inspecting runs](#inspecting-runs);
-- double-launch (rejected by a run-handle check and ultimately the engine's same-host lock), delete runs, or corrupt state.
+- changing `trial_command`, `env`, `storage`, `workdir`, search spaces, samplers, gates, or safety waivers - no tool accepts a config or these fields;
+- referencing a config by path - tools accept catalog experiment IDs or server-minted run IDs according to their scope; an unknown ID is a clean error;
+- reading raw trial artifacts, metric histories, trainer output, or rendered commands - no tool returns log text, because commands and trainer output can carry secrets or PII. Operator-visible log locations are listed under [inspecting runs](#inspecting-runs);
+- double-launching (rejected by a run-handle check and ultimately the engine's same-host lock), deleting runs, or corrupting state.
 
 Outbound payloads are built only from path-free typed views. Catalog listings are count-paginated with `limit` and `next_cursor`. Metric descriptors label objective-evidence assurance. `get_run_results` reports the concrete `winner_source`, whether it belongs to the represented or a prior generation, and safe promotion context; it returns sampled `params` under the [catalog visibility policy](#the-catalog) and omits composed `effective_overrides`, which can include operator-authored fixed or inherited values such as private dataset IDs, paths, or tokens. Keep secrets, access tokens, private paths, dataset IDs, hostnames, or other sensitive values out of searchable parameter choices unless you deliberately expose them. A backstop converts any unexpected exception into a path-free operator-directed error rather than leaking a traceback; recoverable domain errors are surfaced as MCP tool errors for model self-correction.
 
@@ -176,7 +175,7 @@ Location scoping alone does not validate a file's contents: a log copied into th
 
 Between `exec` and the runner's first durable handle write, the server cannot yet name the process it created, so code that runs in that window could leave the recorded process group and make later cleanup confirmation false. The runner is therefore spawned from `state_dir` with `-P` (no cwd or script directory on `sys.path`), `-s` plus `PYTHONNOUSERSITE=1` (no user site directory), and with `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, and `PYTHONEXECUTABLE` removed from its environment. A project-local `phasesweep` shadow package, a project `sitecustomize.py`, or an injected module therefore cannot execute during interpreter startup. Every other environment variable is inherited unchanged.
 
-This layer narrows the **agent's** authority. It does **not** sandbox the training subprocess, which remains as trusted as the human who wrote its command. Registering a malicious config runs it - your decision, identical to running `phasesweep run` by hand.
+MCP restricts tool inputs and outputs. Training subprocesses run without a sandbox, with the authority of the human-authored command, just as they do through `phasesweep run`.
 
 ## Inspecting runs
 
