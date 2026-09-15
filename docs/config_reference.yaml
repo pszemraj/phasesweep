@@ -245,7 +245,7 @@
 # pattern: str (required)
 # Python regex with a named `(?P<value>...)` group. Invalid syntax or a missing group fails configuration validation before any trial is allocated. No numeric match in the trainer's output fails the trial.
 # select: Literal["last", "first", "min", "max"] = "last"
-# `first` stops matching at the first numeric match; every mode still reads the whole file so the frozen evidence digest covers all of it.
+# Selection considers every numeric match, including multiple matches on one logical line. `first` stops matching at the first numeric match; every mode still reads the whole file so the frozen evidence digest covers all of it.
 
 # type: Literal["wandb"] (required)
 # base_url: str = "https://api.wandb.ai"
@@ -283,7 +283,7 @@
 # source: Literal["file", "directory", "json"] (required)
 # path: str (required)
 # key: str | None = null
-# `json` requires key and a non-negative integer byte value; `file` and `directory` forbid key. Directory size recursively sums regular files.
+# `json` requires key and a non-negative integer byte value; `file` and `directory` forbid key. Directory size recursively sums regular files without descending through directory symlinks, and an inspection error fails the gate rather than accepting a partial total.
 # min_bytes: int | None = null (>= 0)
 # max_bytes: int | None = null (>= 0)
 # At least one inclusive bound is required and min_bytes must be <= max_bytes.

@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -348,23 +350,23 @@ def _extract_log_regex(
                 elif line.endswith("\r"):
                     line = line[:-1] + "\n"
                 line_no += 1
-                m = pattern.search(line)
-                if m is None:
-                    continue
-                try:
-                    v = float(m.group("value"))
-                except (TypeError, ValueError):
-                    continue
-                count += 1
-                if cfg.select in ("first", "last"):
-                    result = v
-                    result_line = line_no
-                elif cfg.select == "min":
-                    if result is None or v < result:
-                        result, result_line = v, line_no
-                elif cfg.select == "max":
-                    if result is None or v > result:
-                        result, result_line = v, line_no
+                for match in pattern.finditer(line):
+                    try:
+                        v = float(match.group("value"))
+                    except (TypeError, ValueError):
+                        continue
+                    count += 1
+                    if cfg.select in ("first", "last"):
+                        result = v
+                        result_line = line_no
+                    elif cfg.select == "min":
+                        if result is None or v < result:
+                            result, result_line = v, line_no
+                    elif cfg.select == "max":
+                        if result is None or v > result:
+                            result, result_line = v, line_no
+                    if cfg.select == "first":
+                        break
     except UnicodeError as exc:
         raise ExtractorError(f"Log file is not valid UTF-8 at {target}: {exc}") from exc
     except OSError as exc:
@@ -661,11 +663,40 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         label = f"{gate.path} file size"
     elif gate.source == "directory":
         try:
-            if not path.is_dir():
-                return GateResult(gate.type, False, f"{gate.path} is not a directory")
-            size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            root = path.stat(follow_symlinks=False)
         except OSError as exc:
-            return GateResult(gate.type, False, f"could not inspect {gate.path}: {exc}")
+            return GateResult(gate.type, False, f"could not inspect {gate.path}: {path}: {exc}")
+        if not stat.S_ISDIR(root.st_mode):
+            return GateResult(gate.type, False, f"{gate.path} is not a directory")
+        directories = [path]
+        size = 0
+        while directories:
+            directory = directories.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        entry_path = Path(entry.path)
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                directories.append(entry_path)
+                            # Preserve Path.rglob's file-link behavior: file
+                            # symlinks contribute their target size, while the
+                            # non-following directory check above prevents a
+                            # linked directory from being traversed.
+                            elif entry.is_file():
+                                size += entry_path.stat().st_size
+                        except OSError as exc:
+                            return GateResult(
+                                gate.type,
+                                False,
+                                f"could not inspect {gate.path}: {entry_path}: {exc}",
+                            )
+            except OSError as exc:
+                return GateResult(
+                    gate.type,
+                    False,
+                    f"could not inspect {gate.path}: {directory}: {exc}",
+                )
         label = f"{gate.path} directory size"
     else:
         assert gate.key is not None

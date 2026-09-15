@@ -621,11 +621,167 @@ def test_log_regex_selects_last_or_min_value(tmp_path):
         assert run_extractor(make_trial_context(case_dir), cfg) == expected
 
 
+@pytest.mark.parametrize(
+    ("select", "line", "expected", "match_count"),
+    [
+        ("last", "loss=9 loss=1\n", 1.0, 2),
+        ("min", "loss=9 loss=1\n", 1.0, 2),
+        ("max", "loss=1 loss=9\n", 9.0, 2),
+        ("first", "loss=bad loss=1\n", 1.0, 1),
+    ],
+)
+def test_log_regex_considers_every_numeric_match_per_line(
+    tmp_path: Path, select: str, line: str, expected: float, match_count: int
+) -> None:
+    """One log line can contribute multiple numeric candidates."""
+    raw = line.encode("utf-8")
+    (tmp_path / "stdout.log").write_bytes(raw)
+    cfg = LogRegexExtractor(
+        type="log_regex",
+        pattern=r"loss=(?P<value>[^\s]+)",
+        select=select,
+    )
+
+    provenance: dict = {}
+    assert run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance) == expected
+    assert provenance["source"] == {
+        "kind": "file",
+        "path": "stdout.log",
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size_bytes": len(raw),
+        "matched_line": 1,
+        "match_count": match_count,
+    }
+
+
 def test_log_regex_reports_no_matches(tmp_path):
     (tmp_path / "stdout.log").write_text("nothing here\n", encoding="utf-8")
     cfg = LogRegexExtractor(type="log_regex", pattern=r"eval_loss=(?P<value>[0-9.]+)")
     with pytest.raises(ExtractorError, match="No matches"):
         run_extractor(make_trial_context(tmp_path), cfg)
+
+
+def test_artifact_size_directory_gate_rejects_unreadable_subtree(tmp_path: Path) -> None:
+    """An incomplete traversal cannot establish a checkpoint-size bound."""
+    if os.geteuid() == 0:
+        pytest.skip("Permission-denial reproduction requires an unprivileged user")
+    private = tmp_path / "checkpoint" / "weights"
+    private.mkdir(parents=True)
+    (private / "model.bin").write_bytes(b"x" * 16_384)
+    private.chmod(0)
+    try:
+        result = evaluate_gates(
+            make_trial_context(tmp_path),
+            [
+                ArtifactSizeGate(
+                    type="artifact_size",
+                    path="checkpoint",
+                    source="directory",
+                    max_bytes=1024,
+                )
+            ],
+        )[0]
+    finally:
+        private.chmod(0o700)
+
+    assert result.passed is False
+    assert "could not inspect checkpoint" in result.detail
+
+
+def test_artifact_size_directory_gate_counts_file_symlinks_not_directory_symlinks(
+    tmp_path: Path,
+) -> None:
+    """File-link targets count, while linked directories are not traversed."""
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "metadata.bin").write_bytes(b"meta")
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "weights.bin").write_bytes(b"x" * 16_384)
+    (external / "metadata-link.bin").write_bytes(b"linked!")
+    (checkpoint / "linked-weights").symlink_to(external, target_is_directory=True)
+    (checkpoint / "linked-metadata.bin").symlink_to(external / "metadata-link.bin")
+
+    result = evaluate_gates(
+        make_trial_context(tmp_path),
+        [
+            ArtifactSizeGate(
+                type="artifact_size",
+                path="checkpoint",
+                source="directory",
+                max_bytes=11,
+            )
+        ],
+    )[0]
+
+    assert result.passed is True
+    assert "directory size 11 within bounds" in result.detail
+
+
+def test_artifact_size_directory_gate_reports_root_inspection_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A root metadata error is failed evidence with its original path detail."""
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    real_stat = Path.stat
+
+    def fail_root_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == checkpoint and not follow_symlinks:
+            raise OSError("root metadata unavailable")
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", fail_root_stat)
+
+    result = evaluate_gates(
+        make_trial_context(tmp_path),
+        [
+            ArtifactSizeGate(
+                type="artifact_size",
+                path="checkpoint",
+                source="directory",
+                max_bytes=1024,
+            )
+        ],
+    )[0]
+
+    assert result.passed is False
+    assert str(checkpoint) in result.detail
+    assert "root metadata unavailable" in result.detail
+
+
+def test_artifact_size_directory_gate_reports_descendant_stat_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child metadata error cannot be silently excluded from a directory size."""
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    child = checkpoint / "model.bin"
+    child.write_bytes(b"payload")
+    real_stat = Path.stat
+
+    def fail_child_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == child and follow_symlinks:
+            raise OSError("descendant metadata unavailable")
+        return real_stat(self, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", fail_child_stat)
+
+    result = evaluate_gates(
+        make_trial_context(tmp_path),
+        [
+            ArtifactSizeGate(
+                type="artifact_size",
+                path="checkpoint",
+                source="directory",
+                max_bytes=1024,
+            )
+        ],
+    )[0]
+
+    assert result.passed is False
+    assert str(child) in result.detail
+    assert "descendant metadata unavailable" in result.detail
 
 
 def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):

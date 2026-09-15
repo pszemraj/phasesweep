@@ -428,7 +428,11 @@ class JsonScalarBoundGate(_TrialFilePathModel, _JsonKeyModel):
 
 
 class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
-    """Require artifact bytes to fall inside optional bounds."""
+    """Require artifact bytes to fall inside optional bounds.
+
+    Directory sources recursively count regular files and file-symlink targets,
+    but do not traverse directory symlinks.
+    """
 
     type: Literal["artifact_size"]
     source: Literal["file", "directory", "json"]
