@@ -1820,8 +1820,14 @@ class PhaseSweepMCP:
             }
             if before == "running":
                 with self._runs.transition_lock(handle):
-                    # Recovery may have finalized this run after the first
-                    # state read. Only a still-running run needs a new marker.
+                    # Launch may have durably replaced a pending handle with
+                    # its runner identity, and recovery may have finalized the
+                    # run after the first read. Use the latest handle for both
+                    # the state decision and any subsequent signal.
+                    refreshed = self._runs.get(run_id)
+                    if refreshed is None:
+                        raise UnknownRunError(run_id)
+                    handle = refreshed
                     before = self._runs.state(handle)
                     recovery_required = self._runs.recovery_required(handle)
                     state_before = {

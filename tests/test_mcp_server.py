@@ -1343,7 +1343,9 @@ def test_completed_lease_cleanup_failure_cannot_replace_launch_success(
     assert store.launch_lease_path(result["run_id"]).is_file()
 
 
-def test_cancel_refuses_unsettled_launch_without_runner_identity(tmp_path: Path) -> None:
+def test_cancel_refuses_unsettled_launch_without_runner_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
@@ -1361,6 +1363,42 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(tmp_path: Path)
 
     assert not store.cleanup_uncertain_path(pending.run_id).exists()
     assert store.recovery_required(pending)
+
+    spawned = replace(
+        pending,
+        launch_state="spawned",
+        pid=999999,
+        pgid=999999,
+        pid_starttime=111,
+    )
+    original_state = store.state
+    first_read = True
+
+    def complete_launch_after_state_read(saved: RunHandle) -> RunState:
+        nonlocal first_read
+        state = original_state(saved)
+        if first_read:
+            first_read = False
+            store.update(spawned)
+        return state
+
+    signalled: list[tuple[int | None, int | None, int | None]] = []
+
+    def kill_runner(
+        pid: int | None, starttime: int | None, *, pgid: int | None, grace_seconds: float
+    ) -> bool:
+        signalled.append((pid, starttime, pgid))
+        return True
+
+    monkeypatch.setattr(store, "state", complete_launch_after_state_read)
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", kill_runner)
+
+    cancelled = app.cancel(pending.run_id)
+
+    assert store.get(pending.run_id) == spawned
+    assert signalled == [(999999, 111, 999999)]
+    assert cancelled["state"] == "running"
+    assert cancelled["recovery_required"] is True
 
 
 @pytest.mark.parametrize(
