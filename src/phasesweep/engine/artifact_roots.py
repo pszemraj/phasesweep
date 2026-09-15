@@ -442,12 +442,15 @@ def _check_published_phase_studies(
     loaded: Mapping[str, optuna.Study],
     *,
     from_phase: str | None = None,
+    include_historical_phases: bool = False,
 ) -> None:
     """Require published trial identity and history for phases that would execute.
 
     :param Experiment experiment: Experiment whose current publication is checked.
     :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
     :param str | None from_phase: Resume point; earlier phases only load winners.
+    :param bool include_historical_phases: Check every phase in the publication
+        during rebind, including phases removed from the current config.
     :raises PublishedStudyMissingError: A reached published trial is absent,
         replaced, or its recorded history boundary is missing.
     :raises PublicationAccessError: The last publication cannot be read.
@@ -461,13 +464,18 @@ def _check_published_phase_studies(
         raise PublicationIntegrityError(publication.error or "Published result is invalid.")
     published_trials = _published_phase_trial_refs(publication.summary)
     reached = from_phase is None
-    for phase in experiment.phases:
-        if phase.name == from_phase:
+    phase_names = (
+        published_trials
+        if include_historical_phases
+        else (phase.name for phase in experiment.phases)
+    )
+    for phase_name in phase_names:
+        if phase_name == from_phase:
             reached = True
-        if not reached or phase.name not in published_trials:
+        if not reached or phase_name not in published_trials:
             continue
-        study = loaded.get(phase.name)
-        expected = published_trials[phase.name]
+        study = loaded.get(phase_name)
+        expected = published_trials[phase_name]
         missing = "is missing"
         if study is not None:
             try:
@@ -498,7 +506,7 @@ def _check_published_phase_studies(
             except Exception as exc:
                 raise StudyStorageUnavailableError(
                     "Could not inspect persistent study storage for published phase "
-                    f"{phase.name!r}."
+                    f"{phase_name!r}."
                 ) from exc
             if not matched:
                 if not trials:
@@ -516,7 +524,7 @@ def _check_published_phase_studies(
                         )
         raise PublishedStudyMissingError(
             f"Published generation {publication.generation_id!r} records a selected trial for "
-            f"phase {phase.name!r}, but its persistent study {missing}. That publication "
+            f"phase {phase_name!r}, but its persistent study {missing}. That publication "
             "requires its original trial history; continuing could reuse incomplete or "
             "unrelated trials and replace the current publication. Restore the "
             "original complete storage ledger and study, or use a new experiment identity "

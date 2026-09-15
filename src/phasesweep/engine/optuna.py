@@ -337,14 +337,15 @@ def _resolve_storage(url: str | None) -> Any:
     return url
 
 
-def _phase_study_name(experiment: Experiment, phase: Phase) -> str:
+def _phase_study_name(experiment: Experiment, phase: Phase | str) -> str:
     """Return the stable Optuna study name for a phase.
 
     :param Experiment experiment: Parsed experiment config supplying the experiment name.
-    :param Phase phase: Phase whose name is appended to the study namespace.
+    :param Phase | str phase: Phase or historical phase name appended to the namespace.
     :return str: Stable Optuna study name for the experiment/phase pair.
     """
-    return f"{experiment.experiment}::{phase.name}"
+    name = phase if isinstance(phase, str) else phase.name
+    return f"{experiment.experiment}::{name}"
 
 
 def _create_phase_study(
@@ -370,11 +371,11 @@ def _create_phase_study(
     )
 
 
-def _load_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study:
+def _load_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study:
     """Load an existing persistent Optuna study for a phase.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
-    :param Phase phase: Phase whose stable study name is loaded.
+    :param Phase | str phase: Phase or historical phase name whose study is loaded.
     :return optuna.Study: Existing Optuna study for the phase.
     """
     return optuna.load_study(
@@ -383,7 +384,7 @@ def _load_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study:
     )
 
 
-def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
+def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
     """Return whether a SQLite storage already contains the phase study.
 
     Strict and tri-state on purpose (PR #5 review / reviewer 2, issue 1):
@@ -398,7 +399,7 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
     part of the contract.
 
     :param Experiment experiment: Parsed experiment config with SQLite storage.
-    :param Phase phase: Phase whose stable study name should be checked.
+    :param Phase | str phase: Phase or historical phase name to check.
     :return bool: ``True`` when the database contains the study, ``False``
         when the database or its schema does not exist.
     :raises StudyStorageUnavailableError: The database file exists but could
@@ -436,11 +437,11 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
     return row is not None
 
 
-def _rdb_study_exists(experiment: Experiment, phase: Phase) -> bool:
+def _rdb_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
     """Return whether external RDB storage contains a phase study.
 
     :param Experiment experiment: Parsed experiment with external RDB storage.
-    :param Phase phase: Phase whose stable study name should be checked.
+    :param Phase | str phase: Phase or historical phase name to check.
     :return bool: ``True`` when the storage contains the named study, ``False`` when its
         Optuna ``studies`` table does not exist or contains no matching row.
     :raises StudyStorageUnavailableError: The storage or its study table could not be read.
@@ -527,7 +528,7 @@ def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.St
         return None
 
 
-def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study | None:
+def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study | None:
     """Load a phase study only if it already exists.
 
     Recovery and read-like paths must not call ``create_study(load_if_exists=True)`` because
@@ -536,7 +537,7 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.S
     ``None``.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
-    :param Phase phase: Phase whose stable study name should be loaded.
+    :param Phase | str phase: Phase or historical phase name whose study is loaded.
     :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
     :raises StudyStorageUnavailableError: Persistent storage exists but
         could not be read, so whether the study exists cannot be determined;

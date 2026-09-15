@@ -1100,8 +1100,9 @@ studies:
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
 @pytest.mark.parametrize("partial", [False, True])
+@pytest.mark.parametrize("drop_published_phase", [False, True])
 def test_auto_storage_rebind_moves_ledger_with_artifacts(
-    tmp_path: Path, n_jobs: int, partial: bool
+    tmp_path: Path, n_jobs: int, partial: bool, drop_published_phase: bool
 ) -> None:
     old_workdir = tmp_path / "old ? %20"
     new_workdir = tmp_path / "new # 🚀"
@@ -1120,6 +1121,8 @@ def test_auto_storage_rebind_moves_ledger_with_artifacts(
     run_experiment(original)
     old_workdir.rename(new_workdir)
     moved = original.model_copy(update={"workdir": str(new_workdir)})
+    if drop_published_phase:
+        moved = moved.model_copy(update={"phases": moved.phases[:1]})
     config = tmp_path / "moved.yaml"
     config.write_text(yaml.safe_dump(moved.model_dump(mode="json")))
     if partial:
@@ -1134,8 +1137,9 @@ def test_auto_storage_rebind_moves_ledger_with_artifacts(
     for _ in range(2):
         result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
         assert result.exit_code == 0, result.output
-    run_experiment(load_experiment(config))
-    for phase in moved.phases:
+    if not drop_published_phase:
+        run_experiment(load_experiment(config))
+    for phase in original.phases:
         study = _load_existing_phase_study(moved, phase)
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(moved))
         assert len(study.trials) == 1
@@ -1146,7 +1150,9 @@ def test_auto_storage_rebind_moves_ledger_with_artifacts(
         assert not old_workdir.exists()
 
 
-@pytest.mark.parametrize("damage", ["trainer_input", "running", "foreign_ledger"])
+@pytest.mark.parametrize(
+    "damage", ["trainer_input", "running", "foreign_ledger", "removed_phase_trial"]
+)
 def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> None:
     original = make_experiment(
         storage="auto",
@@ -1155,18 +1161,31 @@ def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> No
         trial_command="echo x=0.5 {overrides}",
         execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
     )
+    if damage == "removed_phase_trial":
+        original = original.model_copy(
+            update={
+                "phases": [
+                    original.phases[0],
+                    original.phases[0].model_copy(update={"name": "q"}),
+                ]
+            }
+        )
     run_experiment(original)
     new_workdir = tmp_path / "new"
     Path(original.workdir).rename(new_workdir)
     moved = original.model_copy(update={"workdir": str(new_workdir)})
+    if damage == "removed_phase_trial":
+        moved = moved.model_copy(update={"phases": moved.phases[:1]})
     if damage == "trainer_input":
         next(_experiment_dir(moved).glob("p/trial_*/overrides_resolved.json")).unlink()
     elif damage == "running":
         _load_existing_phase_study(moved, moved.phases[0]).ask()
-    else:
+    elif damage == "foreign_ledger":
         foreign = original.model_copy(update={"workdir": str(tmp_path / "foreign")})
         run_experiment(foreign)
         shutil.copy2(_experiment_dir(foreign) / "study.db", _experiment_dir(moved) / "study.db")
+    else:
+        shutil.rmtree(next(_phase_dir(moved, "q").glob("trial_*")))
     config = tmp_path / "moved.yaml"
     config.write_text(yaml.safe_dump(moved.model_dump(mode="json")))
     binding = _artifact_root_binding_path(moved).read_bytes()
@@ -1176,6 +1195,7 @@ def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> No
         "trainer_input": "overrides_resolved.json",
         "running": "RUNNING",
         "foreign_ledger": "another storage",
+        "removed_phase_trial": "q",
     }[damage]
     assert expected in str(result.exception), result.exception
     assert _artifact_root_binding_path(moved).read_bytes() == binding
@@ -1668,8 +1688,9 @@ def test_rebind_workdir_refuses_when_one_phase_study_is_transiently_unreadable(
     failures: list[str] = []
 
     def _flaky_load(experiment: Any, phase: Any) -> optuna.Study | None:
-        if phase.name == "q" and not failures:
-            failures.append(phase.name)
+        phase_name = phase if isinstance(phase, str) else phase.name
+        if phase_name == "q" and not failures:
+            failures.append(phase_name)
             raise RuntimeError("transient storage failure")
         return _load_existing_phase_study(experiment, phase)
 

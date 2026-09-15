@@ -33,6 +33,7 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.optuna import (
     _load_existing_phase_study,
+    _published_phase_trial_refs,
 )
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -43,6 +44,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import (
     _last_successful_generation_id,
+    _resolve_publication_pointer,
     _resolve_suite_publication_pointer,
 )
 from phasesweep.engine.state import (
@@ -109,21 +111,31 @@ class _ArtifactRootRebindPlan:
 def _artifact_root_rebind_entries(
     experiment: Experiment,
 ) -> tuple[_ArtifactRootRebindEntry, ...]:
-    """Load every existing phase study with the artifact root it currently records.
+    """Load current and published historical phase studies with their artifact roots.
 
     :param Experiment experiment: Parsed experiment whose phase studies are read.
-    :return tuple[_ArtifactRootRebindEntry, ...]: Each existing study with its
-        declared phase name and its recorded binding (``None`` when unbound).
+    :return tuple[_ArtifactRootRebindEntry, ...]: Each represented study with its
+        phase name and recorded binding (``None`` when unbound).
     :raises ArtifactRootRebindError: A phase study exists but cannot be read, so
         what it is bound to is unknown and a rebind cannot be safe.
     """
     entries: list[_ArtifactRootRebindEntry] = []
-    for phase in experiment.phases:
+    names = [phase.name for phase in experiment.phases]
+    publication = _resolve_publication_pointer(experiment)
+    if publication.state == "ok":
+        summary = publication.summary or {}
+        names.extend(
+            item["name"]
+            for item in summary.get("phase_plan", ())
+            if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+        )
+        names.extend(_published_phase_trial_refs(summary))
+    for phase_name in dict.fromkeys(names):
         try:
-            study = _load_existing_phase_study(experiment, phase)
+            study = _load_existing_phase_study(experiment, phase_name)
         except Exception as exc:
             raise ArtifactRootRebindError(
-                f"Cannot inspect the persistent study for phase {phase.name!r} of experiment "
+                f"Cannot inspect the persistent study for phase {phase_name!r} of experiment "
                 f"{experiment.experiment!r}. Refusing to rebind while any study's current "
                 "artifact root is unknown. Nothing was written."
             ) from exc
@@ -132,7 +144,7 @@ def _artifact_root_rebind_entries(
         bound = study.user_attrs.get(ARTIFACT_ROOT_ATTR)
         entries.append(
             _ArtifactRootRebindEntry(
-                phase_name=phase.name,
+                phase_name=phase_name,
                 study=study,
                 previous=bound if isinstance(bound, str) else None,
             )
@@ -498,7 +510,9 @@ def _plan_artifact_root_rebinds(
             if has_studies_to_rebind and plan.entries:
                 _validate_artifact_root_destination(plan.experiment, plan.entries)
             _check_published_phase_studies(
-                plan.experiment, {entry.phase_name: entry.study for entry in plan.entries}
+                plan.experiment,
+                {entry.phase_name: entry.study for entry in plan.entries},
+                include_historical_phases=True,
             )
         except (
             ArtifactRootConflictError,
