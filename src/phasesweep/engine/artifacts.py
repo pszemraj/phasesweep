@@ -222,6 +222,7 @@ def _winner_common_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
         "winner_source": _winner_source_payload(winner, phase_name),
+        "trainer_input": winner.trainer_input,
     }
     if winner.promotion is not None:
         payload["promotion"] = winner.promotion
@@ -461,6 +462,9 @@ def _load_winner(
                 dict(data["objective_provenance"])
                 if isinstance(data.get("objective_provenance"), dict)
                 else None
+            ),
+            trainer_input=(
+                dict(data["trainer_input"]) if isinstance(data.get("trainer_input"), dict) else None
             ),
             trainer_env_digest=stored_env_digest,
             trainer_inherit_env=(

@@ -8,6 +8,7 @@ from collections.abc import Iterator
 import optuna
 
 import phasesweep.engine.artifacts as artifact_io
+import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config import Experiment, Phase
@@ -51,7 +52,9 @@ def _preflight_skipped_winners(
         # Safe to re-resolve the published pointer per phase here, unlike status
         # reads: this preflight runs under _experiment_lock, and this
         # experiment's pointer only advances at this run's final publish.
-        winners[phase.name] = artifact_io._load_winner(experiment, phase, inherited)
+        winner = artifact_io._load_winner(experiment, phase, inherited)
+        evidence_ops._verify_skipped_winner_evidence(experiment, phase, winner)
+        winners[phase.name] = winner
 
     raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
 

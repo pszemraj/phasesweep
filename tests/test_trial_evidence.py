@@ -21,8 +21,10 @@ import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.artifacts as artifact_io
+import phasesweep.engine.evidence as evidence_ops
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Phase, Sampler
+from phasesweep.config import Experiment, IntParam, Phase, Promotion, Sampler
 from phasesweep.engine import (
     NoFeasibleTrialError,
     TrialEvidenceMissingError,
@@ -136,6 +138,54 @@ def _trial_count(experiment: Experiment) -> int:
         storage=experiment.storage,
     )
     return len(study.get_trials(deepcopy=False))
+
+
+def _phase_trial_count(experiment: Experiment, phase_name: str) -> int:
+    """Return the durable trial count for one named phase."""
+    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, phase),
+        storage=experiment.storage,
+    )
+    return len(study.get_trials(deepcopy=False))
+
+
+_MARKED_TRAINER = """
+import argparse
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument("--out")
+parser.add_argument("--phase_marker", default="")
+args, _ = parser.parse_known_args()
+if args.phase_marker:
+    Path(args.phase_marker).write_text("launched\\n")
+print("x=0.5")
+"""
+
+
+def _from_phase_evidence_experiment(
+    tmp_path: Path,
+    *,
+    resumed_trials: int = 1,
+) -> tuple[Experiment, Path]:
+    """Build a two-phase experiment whose resumed trainer leaves a marker."""
+    marker = tmp_path / "resumed-trainer-ran"
+    trainer = write_trainer(tmp_path / "from_phase_trainer.py", _MARKED_TRAINER)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(name="p", n_trials=1, sampler=Sampler(type="random", seed=0)),
+            Phase(
+                name="q",
+                n_trials=resumed_trials,
+                sampler=Sampler(type="random", seed=1),
+                fixed_overrides={"phase_marker": str(marker)},
+            ),
+        ],
+    )
+    return experiment, marker
 
 
 def _pointer_bytes(experiment: Experiment) -> bytes:
@@ -351,6 +401,126 @@ def test_republishing_refuses_a_winner_whose_objective_bytes_changed(tmp_path: P
         run_experiment(_evidence_experiment(tmp_path))
 
     assert _pointer_bytes(experiment) == pointer_before
+
+
+# --------------------------------------------------------------------------
+# --from-phase preflight: skipped winners are verified against their source
+# trial before downstream work can begin, without needing the prior ledger.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    [
+        pytest.param("changed", "bytes behind the published metric", id="same-size-edit"),
+        pytest.param(
+            "missing", "objective evidence in 'stdout.log', which is missing", id="missing"
+        ),
+    ],
+)
+def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
+    tmp_path: Path,
+    damage: str,
+    expected: str,
+) -> None:
+    """A carried winner's source must verify before the resumed phase can run."""
+    original, marker = _from_phase_evidence_experiment(tmp_path)
+    run_experiment(original)
+    marker.unlink()
+    source = _sole_trial_dir(original)
+    pointer_before = _pointer_bytes(original)
+    if damage == "changed":
+        original_bytes = (source / "stdout.log").read_bytes()
+        (source / "stdout.log").write_bytes(b"y" + original_bytes[1:])
+        assert (source / "stdout.log").stat().st_size == len(original_bytes)
+    else:
+        (source / "stdout.log").unlink()
+
+    resumed, _ = _from_phase_evidence_experiment(tmp_path, resumed_trials=2)
+    with pytest.raises(TrialEvidenceMissingError, match=expected):
+        run_experiment(resumed, from_phase="q")
+
+    assert _phase_trial_count(resumed, "q") == 1
+    assert not marker.exists()
+    assert _pointer_bytes(resumed) == pointer_before
+
+
+def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Winner serialization supplies enough evidence identity to skip a missing study."""
+    experiment, _marker = _from_phase_evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    payload = yaml.safe_load(
+        (_generations_dir(experiment) / generation_id / "phases" / "p" / "winner.yaml").read_text()
+    )
+    p_study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=experiment.storage,
+    )
+    assert (
+        payload["trainer_input"]
+        == p_study.get_trials(deepcopy=False)[0].user_attrs[TRAINER_INPUT_ATTR]
+    )
+    optuna.delete_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=experiment.storage,
+    )
+
+    resumed = run_experiment(experiment, from_phase="q")
+
+    assert resumed["p"].trial_number == 0
+
+
+def test_from_phase_promotion_uses_the_baseline_source_evidence(tmp_path: Path) -> None:
+    """A promoted skipped winner resolves evidence from its baseline, not exposure phase."""
+    trainer = write_trainer(tmp_path / "promotion_trainer.py", _CONSTANT_TRAINER)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(name="base", n_trials=1, sampler=Sampler(type="random", seed=0)),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=1),
+                promotion=Promotion(
+                    min_delta_vs="base", min_delta=1.0, on_fail="continue_baseline"
+                ),
+            ),
+            Phase(name="later", n_trials=1, sampler=Sampler(type="random", seed=2)),
+        ],
+    )
+    winners = run_experiment(experiment)
+    assert winners["candidate"].source is not None
+    assert winners["candidate"].source.phase == "base"
+    candidate_dir = _phase_dir(experiment, "candidate")
+    for trial_dir in candidate_dir.glob("trial_*"):
+        shutil.rmtree(trial_dir)
+    optuna.delete_study(
+        study_name=_phase_study_name(experiment, experiment.phases[1]),
+        storage=experiment.storage,
+    )
+
+    resumed = run_experiment(experiment, from_phase="later")
+
+    assert resumed["candidate"].source is not None
+    assert resumed["candidate"].source.phase == "base"
+
+
+def test_skipped_winner_evidence_uses_the_relocated_artifact_tree(tmp_path: Path) -> None:
+    """Historical evidence is reconstructed under the current relocated workdir."""
+    experiment, _marker = _from_phase_evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    moved_workdir = tmp_path / "moved-runs"
+    Path(experiment.workdir).rename(moved_workdir)
+    moved = experiment.model_copy(update={"workdir": str(moved_workdir)})
+
+    winner = artifact_io._load_winner(moved, moved.phases[0], {})
+    evidence_ops._verify_skipped_winner_evidence(moved, moved.phases[0], winner)
 
 
 # --------------------------------------------------------------------------

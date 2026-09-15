@@ -319,6 +319,9 @@ def _clone_winner_from_baseline(
             if baseline.objective_provenance is not None
             else None
         ),
+        trainer_input=(
+            dict(baseline.trainer_input) if baseline.trainer_input is not None else None
+        ),
         # The exposed result IS the baseline's trial, so it keeps the baseline's
         # environment identity rather than the candidate phase's.
         trainer_env_digest=baseline.trainer_env_digest,

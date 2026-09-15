@@ -101,6 +101,10 @@ class Winner:
     # remote summary subset (review v0.5.17 / finding F). None for dry-run
     # placeholders and winners persisted before the record existed.
     objective_provenance: dict[str, Any] | None = None
+    # Versioned identity of the generated input consumed by the source trial.
+    # Persisted with the winner so --from-phase can verify carried evidence
+    # even if the older Optuna ledger is no longer available.
+    trainer_input: dict[str, Any] | None = None
     # Identity of the semantic environment the winning trial ran under: the
     # SHA-256 of its composed trainer environment after explicitly classified
     # ``passthrough_env`` values are removed, plus the ``inherit_env`` contract.

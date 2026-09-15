@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import optuna
 
-from phasesweep.config import Experiment
+from phasesweep.config import Experiment, Phase
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
@@ -23,6 +23,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
     TRAINER_INPUT_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
+    Winner,
 )
 from phasesweep.runtime.files import (
     file_sha256,
@@ -280,6 +281,7 @@ def _verify_trial_evidence_dir(
     provenance: Mapping[str, Any] | None,
     trainer_input: Any,
     verify_objective_digest: bool,
+    verify_trainer_input: bool = True,
 ) -> None:
     """Require one trial's evidence directory and audit artifacts to still exist.
 
@@ -306,6 +308,7 @@ def _verify_trial_evidence_dir(
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
     :param Any trainer_input: Versioned historical generated-input record.
     :param bool verify_objective_digest: Re-hash the objective source as well.
+    :param bool verify_trainer_input: Content-verify the generated trainer input.
     :raises TrialEvidenceMissingError: The directory, an audit artifact, the
         generated trainer input, or recorded objective source is missing,
         foreign, or altered.
@@ -327,7 +330,8 @@ def _verify_trial_evidence_dir(
                 f"{subject} is missing its {filename!r} audit artifact under "
                 f"{str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
             )
-    _verify_trainer_input_evidence(trial_dir, trainer_input, subject=subject)
+    if verify_trainer_input:
+        _verify_trainer_input_evidence(trial_dir, trainer_input, subject=subject)
     _verify_objective_source_evidence(
         trial_dir,
         provenance,
@@ -455,4 +459,65 @@ def _verify_winner_objective_evidence(
         provenance=selected.objective_provenance,
         trainer_input=selected.trainer_input,
         verify_objective_digest=True,
+    )
+
+
+def _verify_skipped_winner_evidence(
+    experiment: Experiment,
+    phase: Phase,
+    winner: Winner,
+) -> None:
+    """Content-verify a skipped winner against its concrete source trial.
+
+    ``--from-phase`` has no reason to require the prior phase's Optuna study:
+    the authenticated winner artifact contains the source phase, trial, generation,
+    attempt, objective provenance, and (for new publications) generated-input
+    identity needed to inspect the source tree directly. This matters for a
+    promotion fallback, whose exposed phase did not run the selected trial.
+
+    Older winner artifacts predate serialized ``trainer_input``. Their explicit
+    compatibility policy is to retain structural and objective-content verification
+    while omitting only the generated-input hash check that the historical artifact
+    cannot supply; no ledger lookup is used to fill that gap.
+
+    :param Experiment experiment: Experiment owning the artifact tree.
+    :param Phase phase: Exposed skipped phase whose winner is being carried.
+    :param Winner winner: Authenticated winner loaded from the prior publication.
+    :raises TrialEvidenceMissingError: The winner lacks a coherent concrete source,
+        or that source's evidence has been removed or changed.
+    """
+    source = winner.source
+    phase_names = {candidate.name for candidate in experiment.phases}
+    if (
+        source is None
+        or source.phase not in phase_names
+        or source.trial_number != winner.trial_number
+        or source.generation_id != winner.generation_id
+        or source.attempt_id != winner.attempt_id
+        or source.generation_id is None
+        or source.attempt_id is None
+    ):
+        raise TrialEvidenceMissingError(
+            f"Skipped phase {phase.name!r} winner has no coherent concrete source trial. "
+            f"{_TRIAL_EVIDENCE_REMEDY}"
+        )
+    trial_dir = _trial_dir_for(
+        experiment,
+        source.phase,
+        source.trial_number,
+        generation_id=source.generation_id,
+        attempt_id=source.attempt_id,
+    )
+    _verify_trial_evidence_dir(
+        trial_dir,
+        subject=(
+            f"Skipped phase {phase.name!r} winner source phase {source.phase!r} trial "
+            f"{source.trial_number} (generation {source.generation_id!r}, attempt "
+            f"{source.attempt_id!r})"
+        ),
+        attempt_id=source.attempt_id,
+        provenance=winner.objective_provenance,
+        trainer_input=winner.trainer_input,
+        verify_objective_digest=True,
+        verify_trainer_input=winner.trainer_input is not None,
     )
