@@ -845,6 +845,29 @@ def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path:
     assert store.recovery_required(handle)
 
 
+def test_terminal_status_written_during_liveness_check_does_not_require_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-racing-status", pid=999999, starttime=111)
+    store.create(handle)
+
+    def runner_finishes(_pid: int | None, _starttime: int | None) -> bool:
+        write_run_status(
+            store,
+            handle.run_id,
+            returncode=0,
+            cleanup_confirmed=True,
+            result_snapshot_state="failed",
+        )
+        return False
+
+    monkeypatch.setattr(mcp_runs, "is_same_live_process", runner_finishes)
+    assert store.state(handle) == "succeeded"
+    assert store.recovery_required(handle) is False
+    assert not store.cleanup_uncertain_path(handle.run_id).exists()
+
+
 def test_earlier_boot_clears_a_persisted_cleanup_uncertainty_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = replace(

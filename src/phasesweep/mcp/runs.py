@@ -902,16 +902,7 @@ class RunStore:
             else:
                 return "running"
         if status is not None:
-            if self._terminal_cleanup_uncertain(handle, status):
-                return "running"
-            if status.get("result_snapshot_state") == "pending":
-                return "running"
-            rc = status.get("returncode")
-            if rc == 0:
-                return "succeeded"
-            if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
-                return "cancelled"
-            return "failed"
+            return self._state_from_status(handle, status)
         if handle.launch_state == "launching" or handle.pid is None:
             # The launching record is durable before Popen. After a server
             # crash it cannot distinguish "not spawned" from "spawned but the
@@ -936,10 +927,33 @@ class RunStore:
         # cleanup-uncertain recovery below.
         if is_same_live_process(handle.pid, handle.pid_starttime):
             return "running"
+        # A runner can publish its terminal status while the liveness probe
+        # observes its exit. Do not reserve recovery from the stale first read.
+        status = self._read_status(handle)
+        if status is not None:
+            return self._state_from_status(handle, status)
         if self._cleanup_recovered(handle):
             return "failed"
         self.mark_cleanup_uncertain(handle)
         return "running"
+
+    def _state_from_status(self, handle: RunHandle, status: Mapping[str, object]) -> RunState:
+        """Classify a recorded status after the run's cleanup marker is considered.
+
+        :param RunHandle handle: Run whose terminal status was recorded.
+        :param Mapping[str, object] status: Validated status payload.
+        :return RunState: Derived running or terminal state.
+        """
+        if self._terminal_cleanup_uncertain(handle, status):
+            return "running"
+        if status.get("result_snapshot_state") == "pending":
+            return "running"
+        rc = status.get("returncode")
+        if rc == 0:
+            return "succeeded"
+        if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
+            return "cancelled"
+        return "failed"
 
     def recorded_terminal_status(self, handle: RunHandle) -> dict | None:
         """Return the runner-written terminal status payload, if readable.
