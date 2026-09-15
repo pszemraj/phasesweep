@@ -397,6 +397,16 @@ def _load_winner(
         )
 
     if stored_fp != current_fp:
+        if revisions := fingerprint_ops._evaluation_semantics(experiment, phase):
+            evaluators = ", ".join(revisions)
+            raise StudyFingerprintMismatchError(
+                f"Skipped phase {phase.name!r} winner file {path} was produced by a "
+                f"different phase config or evaluator interpretation for {evaluators} "
+                f"(semantic fingerprint {stored_fp[:16]}... != "
+                f"current {current_fp[:16]}...). Carrying it forward could mix "
+                "incompatible evidence interpretations. Preserve the historical artifacts "
+                "and use a fresh experiment identity and ledger."
+            )
         raise StudyFingerprintMismatchError(
             f"Winner file {path} was produced by a different phase config "
             f"(stored fingerprint {stored_fp[:16]}... != current "

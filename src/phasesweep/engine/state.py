@@ -142,6 +142,10 @@ TRIAL_DIR_ATTR = "phasesweep_trial_dir"
 GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
+# Evaluator revisions are recorded separately so run preflight can refuse a
+# later affected study before an unrelated earlier phase adds trial rows; its
+# complete phase fingerprint still binds config and inherited winner semantics.
+PHASE_EVALUATION_SEMANTICS_ATTR = "phasesweep_phase_evaluation_semantics"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 STUDY_SCHEMA_VERSION = 2
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"

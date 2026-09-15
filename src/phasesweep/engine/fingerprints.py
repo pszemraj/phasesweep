@@ -15,9 +15,15 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
 )
 from phasesweep.engine.state import (
+    PHASE_EVALUATION_SEMANTICS_ATTR,
     PHASE_FINGERPRINT_ATTR,
     Winner,
 )
+from phasesweep.evidence.evaluation import (
+    DIRECTORY_SIZE_EVALUATION_REVISION,
+    LOG_REGEX_EVALUATION_REVISION,
+)
+from phasesweep.evidence.models import ArtifactSizeGate, LogRegexExtractor
 
 _RUN_CONTROL_KEYS = frozenset(
     {
@@ -54,6 +60,28 @@ _RUN_CONTROL_KEYS = frozenset(
 FINGERPRINT_SCHEMA_VERSION = 5
 SUITE_FINGERPRINT_SCHEMA_VERSION = 4
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 4
+
+
+def _evaluation_semantics(experiment: Experiment, phase: Phase | None = None) -> dict[str, int]:
+    """Return revisions only for evaluators that can affect these results.
+
+    :param Experiment experiment: Config supplying objectives, constraints, and contracts.
+    :param Phase | None phase: One phase, or all phases for a publication identity.
+    :return dict[str, int]: Active evaluator kinds and their semantic revisions.
+    """
+    revisions: dict[str, int] = {}
+    if isinstance(experiment.metric.extractor, LogRegexExtractor) or any(
+        isinstance(constraint.extractor, LogRegexExtractor) for constraint in experiment.constraints
+    ):
+        revisions["log_regex extractor"] = LOG_REGEX_EVALUATION_REVISION
+    phases = experiment.phases if phase is None else [phase]
+    for candidate in phases:
+        gates = list(candidate.gates)
+        for contract_name in candidate.contracts:
+            gates.extend(experiment.contracts[contract_name].gates)
+        if any(isinstance(gate, ArtifactSizeGate) and gate.source == "directory" for gate in gates):
+            revisions["artifact_size directory gate"] = DIRECTORY_SIZE_EVALUATION_REVISION
+    return revisions
 
 
 def _execution_identity(experiment: Experiment) -> dict[str, Any]:
@@ -134,6 +162,8 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
             {"name": phase.name, **_semantic_phase_dump(phase)} for phase in experiment.phases
         ],
     }
+    if revisions := _evaluation_semantics(experiment):
+        payload["evaluation_semantics"] = revisions
     return _semantic_payload_digest(payload)
 
 
@@ -169,21 +199,25 @@ def _suite_fingerprint(suite: Suite) -> str:
         rules, and resolved experiments contribute to the digest.
     :return str: SHA-256 of the canonical suite payload.
     """
+    studies = []
+    for study in suite.studies:
+        experiment = suite.experiment_for_study(study)
+        item = {
+            "name": study.name,
+            "depends_on": study.depends_on,
+            "promotion": (
+                None if study.promotion is None else study.promotion.model_dump(mode="json")
+            ),
+            "experiment": experiment.model_dump(mode="json"),
+            "execution_identity": _execution_identity(experiment),
+        }
+        if revisions := _evaluation_semantics(experiment):
+            item["evaluation_semantics"] = revisions
+        studies.append(item)
     payload = {
         "fingerprint_schema_version": SUITE_FINGERPRINT_SCHEMA_VERSION,
         "suite": suite.suite,
-        "studies": [
-            {
-                "name": study.name,
-                "depends_on": study.depends_on,
-                "promotion": (
-                    None if study.promotion is None else study.promotion.model_dump(mode="json")
-                ),
-                "experiment": suite.experiment_for_study(study).model_dump(mode="json"),
-                "execution_identity": _execution_identity(suite.experiment_for_study(study)),
-            }
-            for study in suite.studies
-        ],
+        "studies": studies,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
@@ -209,7 +243,7 @@ def _phase_semantic_payload(
     :return dict[str, Any]: JSON-serializable configured trial semantics.
     """
     semantic_phase = _semantic_phase_dump(phase)
-    return {
+    payload = {
         "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
         "trial_command": experiment.trial_command,
         "trainer_config": experiment.trainer_config,
@@ -227,6 +261,9 @@ def _phase_semantic_payload(
             parent: inherited_winners[parent].effective_overrides for parent in phase.inherits
         },
     }
+    if revisions := _evaluation_semantics(experiment, phase):
+        payload["evaluation_semantics"] = revisions
+    return payload
 
 
 def _phase_fingerprint(
@@ -251,6 +288,52 @@ def _phase_fingerprint(
     return _semantic_payload_digest(payload)
 
 
+def _only_failed_trials(study: optuna.Study) -> bool:
+    """Return whether recovery left no reusable or still-running trial readings.
+
+    :param optuna.Study study: Existing phase study after stale-trial reaping.
+    :return bool: ``True`` for an empty study or one containing only failed trials.
+    """
+    return all(
+        trial.state == optuna.trial.TrialState.FAIL for trial in study.get_trials(deepcopy=False)
+    )
+
+
+def _verify_evaluation_semantics(
+    study: optuna.Study,
+    experiment: Experiment,
+    phase: Phase,
+    *,
+    stamp_safe: bool,
+) -> None:
+    """Refuse an affected study whose historical evaluator revision is unknown.
+
+    :param optuna.Study study: Existing or newly created phase study.
+    :param Experiment experiment: Current evidence configuration.
+    :param Phase phase: Phase whose direct and contract gates contribute.
+    :param bool stamp_safe: Record the revision after a safe fingerprint check.
+    :raises StudyFingerprintMismatchError: Reusable or running trials have no
+        matching evaluator revision.
+    """
+    revisions = _evaluation_semantics(experiment, phase)
+    if not revisions:
+        return
+    recorded = study.user_attrs.get(PHASE_EVALUATION_SEMANTICS_ATTR)
+    if recorded == revisions:
+        return
+    if not _only_failed_trials(study):
+        evaluators = ", ".join(revisions)
+        raise StudyFingerprintMismatchError(
+            f"Phase {phase.name!r} study {study.study_name!r} has incompatible or "
+            f"unrecorded evaluation semantics for {evaluators} (stored {recorded!r}, "
+            f"current {revisions!r}). Its populated history cannot establish which "
+            "evidence interpretation produced those readings. Preserve the historical "
+            "artifacts and use a fresh experiment identity and ledger."
+        )
+    if stamp_safe:
+        study.set_user_attr(PHASE_EVALUATION_SEMANTICS_ATTR, revisions)
+
+
 def _verify_fingerprint(
     study: optuna.Study,
     experiment: Experiment,
@@ -264,12 +347,23 @@ def _verify_fingerprint(
     :param Phase phase: Phase whose fingerprint must match.
     :param dict[str, Winner] inherited_winners: Parent winners contributing to identity.
     :raises StudyFingerprintMismatchError: The populated study has an incompatible
-        persisted fingerprint.
+        persisted fingerprint or evaluator revision.
     :return str: Verified current fingerprint.
     """
+    _verify_evaluation_semantics(study, experiment, phase, stamp_safe=False)
     fp = _phase_fingerprint(experiment, phase, inherited_winners)
     existing = study.user_attrs.get(PHASE_FINGERPRINT_ATTR)
     if existing is None:
+        if not _only_failed_trials(study) and (
+            revisions := _evaluation_semantics(experiment, phase)
+        ):
+            evaluators = ", ".join(revisions)
+            raise StudyFingerprintMismatchError(
+                f"Phase {phase.name!r} study {study.study_name!r} has no semantic "
+                f"fingerprint for {evaluators}. Its populated history cannot establish "
+                "which evidence interpretation produced those readings. Preserve the "
+                "historical artifacts and use a fresh experiment identity and ledger."
+            )
         study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
     elif existing != fp:
         # A zero-trial study must not permanently bind its semantic identity:
@@ -285,12 +379,35 @@ def _verify_fingerprint(
                 fp,
             )
             study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
+            _verify_evaluation_semantics(study, experiment, phase, stamp_safe=True)
             return fp
+        if (revisions := _evaluation_semantics(experiment, phase)) and _only_failed_trials(study):
+            legacy_payload = _phase_semantic_payload(experiment, phase, inherited_winners)
+            legacy_payload.pop("evaluation_semantics", None)
+            if existing == _semantic_payload_digest(legacy_payload):
+                log.warning(
+                    "Rebinding legacy evaluator fingerprint of failed-only study %s: "
+                    "no reusable trial readings exist.",
+                    study.study_name,
+                )
+                study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
+                _verify_evaluation_semantics(study, experiment, phase, stamp_safe=True)
+                return fp
+        if revisions := _evaluation_semantics(experiment, phase):
+            evaluators = ", ".join(revisions)
+            raise StudyFingerprintMismatchError(
+                f"Phase {phase.name!r} study {study.study_name!r} was created with a "
+                f"different phase config or evaluator interpretation for {evaluators} "
+                f"(semantic fingerprint {existing} != {fp}). "
+                "Resuming could mix incompatible evidence interpretations. Preserve the "
+                "historical artifacts and use a fresh experiment identity and ledger."
+            )
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} was created with a different phase config "
             f"(fingerprint {existing} != {fp}). Use a new experiment name, delete the "
             f"old study, or rename the phase."
         )
+    _verify_evaluation_semantics(study, experiment, phase, stamp_safe=True)
     return fp
 
 

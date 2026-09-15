@@ -419,6 +419,11 @@ def _run_experiment_outcome(
             # primary error, and publication on that path is covered by the
             # selection-time winner check.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
+            resume_ops._preflight_evaluation_semantics(
+                experiment,
+                from_phase=from_phase,
+                existing_studies=existing_studies,
+            )
             resume_ops._reject_bound_descendant_topups(
                 experiment,
                 from_phase=from_phase,

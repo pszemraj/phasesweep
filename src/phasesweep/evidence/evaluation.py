@@ -39,19 +39,28 @@ from phasesweep.runtime.time import utc_now_iso
 # Version of the objective evidence provenance payload frozen alongside a
 # metric at extraction time (review v0.5.17 / finding F).
 EVIDENCE_PROVENANCE_SCHEMA_VERSION = 1
+# Bump only evaluators whose interpretation changed. These revisions are
+# semantic inputs to study, winner, and publication fingerprints; package
+# versions alone do not determine whether old trial readings can be reused.
+LOG_REGEX_EVALUATION_REVISION = 2
+DIRECTORY_SIZE_EVALUATION_REVISION = 2
 
 
 def extractor_config_fingerprint(cfg: Extractor) -> str:
-    """Return the SHA-256 identity of an extractor's exact configuration.
+    """Return the SHA-256 identity of an extractor's evaluation contract.
 
     Frozen into evidence provenance so a forensic review can prove which
     extractor contract produced a published scalar even after the experiment
     config changes (review v0.5.17 / finding F).
 
     :param Extractor cfg: Concrete extractor config to fingerprint.
-    :return str: Hex SHA-256 of the extractor's canonical JSON dump.
+    :return str: Hex SHA-256 of the canonical configuration and, for log-regex,
+        its evaluation revision.
     """
-    dumped = json.dumps(cfg.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    payload = cfg.model_dump(mode="json")
+    if isinstance(cfg, LogRegexExtractor):
+        payload["evaluation_revision"] = LOG_REGEX_EVALUATION_REVISION
+    dumped = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
 

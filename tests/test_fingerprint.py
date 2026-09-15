@@ -16,11 +16,15 @@ import yaml
 
 from phasesweep import __version__, load_experiment, run_experiment
 from phasesweep.config import (
+    ArtifactSizeGate,
     CategoricalParam,
+    Constraint,
+    Contract,
     ExecutionContext,
     Experiment,
     FloatParam,
     IntParam,
+    JsonEnvelopeExtractor,
     JsonEqualsGate,
     LogRegexExtractor,
     Metric,
@@ -54,7 +58,11 @@ from phasesweep.engine.artifacts import _load_winner, _save_winner
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
+    _evaluation_semantics,
     _phase_fingerprint,
+    _phase_semantic_payload,
+    _semantic_payload_digest,
+    _verify_fingerprint,
 )
 from phasesweep.engine.optuna import _sqlite_study_exists
 from phasesweep.engine.paths import (
@@ -84,6 +92,7 @@ from phasesweep.engine.resume import _reject_bound_descendant_topups
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
+    PHASE_EVALUATION_SEMANTICS_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
@@ -573,6 +582,165 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             assert fp_a == fp_b, case
         else:
             assert fp_a != fp_b, case
+
+
+@pytest.mark.parametrize(
+    ("scenario", "evaluator"),
+    [
+        ("objective", "log_regex extractor"),
+        ("constraint", "log_regex extractor"),
+        ("phase-directory", "artifact_size directory gate"),
+        ("contract-directory", "artifact_size directory gate"),
+        ("json-envelope", None),
+        ("file-size", None),
+        ("unused-contract-directory", None),
+    ],
+)
+def test_evaluator_revision_rejects_only_affected_legacy_fingerprints(
+    scenario: str, evaluator: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A populated study must not reuse old readings, but unaffected digests stay stable."""
+    envelope = Metric(
+        extractor=JsonEnvelopeExtractor(
+            type="json_envelope", objective_name="loss", split="validation", policy="final"
+        )
+    )
+    experiment = make_experiment(n_trials=1, metric=None if scenario == "objective" else envelope)
+    config = experiment.model_dump(mode="json")
+    directory_gate = ArtifactSizeGate(
+        type="artifact_size", source="directory", path="checkpoint", max_bytes=1024
+    )
+    if scenario == "constraint":
+        config["constraints"] = [
+            Constraint(
+                name="memory",
+                max=10,
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"memory=(?P<value>[0-9.]+)"),
+            ).model_dump(mode="json")
+        ]
+    elif scenario == "phase-directory":
+        config["phases"][0]["gates"] = [directory_gate.model_dump(mode="json")]
+    elif scenario in {"contract-directory", "unused-contract-directory"}:
+        config["contracts"] = {
+            "checkpoint_limit": Contract(gates=[directory_gate]).model_dump(mode="json")
+        }
+        if scenario == "contract-directory":
+            config["phases"][0]["contracts"] = ["checkpoint_limit"]
+    elif scenario == "file-size":
+        config["phases"][0]["gates"] = [
+            ArtifactSizeGate(
+                type="artifact_size", source="file", path="checkpoint.bin", max_bytes=1024
+            ).model_dump(mode="json")
+        ]
+    experiment = Experiment.model_validate(config)
+    phase = experiment.phases[0]
+    revisions = _evaluation_semantics(experiment, phase)
+    assert (evaluator in revisions) if evaluator is not None else not revisions
+
+    current_payload = _phase_semantic_payload(experiment, phase, {})
+    legacy_payload = dict(current_payload)
+    legacy_payload.pop("evaluation_semantics", None)
+    legacy_fingerprint = _semantic_payload_digest(legacy_payload)
+    assert (_phase_fingerprint(experiment, phase, {}) != legacy_fingerprint) is (
+        evaluator is not None
+    )
+
+    # Publication identities apply the same conditional revision, including
+    # each compiled study in a suite, without perturbing unaffected histories.
+    from phasesweep.engine import fingerprints as fingerprint_ops
+
+    suite = Suite(
+        suite="evaluation_revision",
+        defaults=SuiteDefaults(
+            workdir=experiment.workdir,
+            trial_command=experiment.trial_command,
+            override_format=experiment.override_format,
+            metric=experiment.metric,
+            constraints=experiment.constraints,
+            contracts=experiment.contracts,
+        ),
+        studies=[StudySpec(name="study", phases=experiment.phases)],
+    )
+    current_experiment_fp = fingerprint_ops._experiment_semantic_fingerprint(experiment)
+    current_suite_fp = fingerprint_ops._suite_fingerprint(suite)
+    with monkeypatch.context() as patch:
+        patch.setattr(fingerprint_ops, "_evaluation_semantics", lambda _experiment, _phase=None: {})
+        legacy_experiment_fp = fingerprint_ops._experiment_semantic_fingerprint(experiment)
+        legacy_suite_fp = fingerprint_ops._suite_fingerprint(suite)
+    assert (current_experiment_fp != legacy_experiment_fp) is (evaluator is not None)
+    assert (current_suite_fp != legacy_suite_fp) is (evaluator is not None)
+
+    study = optuna.create_study()
+    study.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+    study.tell(study.ask(), 1.0)
+    if evaluator is None:
+        assert _verify_fingerprint(study, experiment, phase, {}) == legacy_fingerprint
+    else:
+        with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
+            _verify_fingerprint(study, experiment, phase, {})
+
+    unstamped = optuna.create_study()
+    unstamped.tell(unstamped.ask(), 1.0)
+    if evaluator is None:
+        assert _verify_fingerprint(unstamped, experiment, phase, {}) == legacy_fingerprint
+    else:
+        with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
+            _verify_fingerprint(unstamped, experiment, phase, {})
+
+        # Recovery-only FAIL trials carry no objective or gate reading to mix.
+        # Rebind only when the stored identity is this exact pre-revision config.
+        failed_only = optuna.create_study()
+        failed_only.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+        failed_only.tell(failed_only.ask(), state=optuna.trial.TrialState.FAIL)
+        assert _verify_fingerprint(failed_only, experiment, phase, {}) == _phase_fingerprint(
+            experiment, phase, {}
+        )
+        assert failed_only.user_attrs[PHASE_EVALUATION_SEMANTICS_ATTR] == revisions
+
+    current = optuna.create_study()
+    current_fingerprint = _phase_fingerprint(experiment, phase, {})
+    assert _verify_fingerprint(current, experiment, phase, {}) == current_fingerprint
+    if evaluator is not None:
+        assert current.user_attrs[PHASE_EVALUATION_SEMANTICS_ATTR] == revisions
+    current.tell(current.ask(), 1.0)
+    assert _verify_fingerprint(current, experiment, phase, {}) == current_fingerprint
+
+
+def test_evaluator_revision_preflight_checks_later_independent_studies() -> None:
+    """A late old gate must be refused before an earlier phase can top up."""
+    from phasesweep.engine.resume import _preflight_evaluation_semantics
+
+    experiment = make_experiment(
+        metric=Metric(
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope", objective_name="loss", split="validation", policy="final"
+            )
+        ),
+        phases=[
+            Phase(name="first", n_trials=2),
+            Phase(
+                name="second",
+                n_trials=1,
+                gates=[
+                    ArtifactSizeGate(
+                        type="artifact_size", source="directory", path="checkpoint", max_bytes=1024
+                    )
+                ],
+            ),
+        ],
+    )
+    first = optuna.create_study()
+    second = optuna.create_study()
+    first.tell(first.ask(), 1.0)
+    second.tell(second.ask(), 1.0)
+    before = [trial.number for trial in first.get_trials(deepcopy=False)]
+    with pytest.raises(StudyFingerprintMismatchError, match="Phase 'second'.*directory gate"):
+        _preflight_evaluation_semantics(
+            experiment,
+            from_phase=None,
+            existing_studies={"first": first, "second": second},
+        )
+    assert [trial.number for trial in first.get_trials(deepcopy=False)] == before
 
 
 def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
