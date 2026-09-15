@@ -2443,6 +2443,47 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
         assert payload["reason"] == "terminal"
 
 
+@pytest.mark.parametrize("read_tool", ["status", "await_run"])
+def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
+) -> None:
+    """A frozen result can coexist with cleanup uncertainty added during the read."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    original_run_payload = app._run_payload
+    marked = False
+
+    def reserve_after_run_payload(saved: RunHandle) -> dict[str, Any]:
+        nonlocal marked
+        run = original_run_payload(saved)
+        if not marked:
+            assert run["state"] == "succeeded"
+            marked = True
+            write_run_status(store, **{**complete, "cleanup_confirmed": False})
+            store.mark_cleanup_uncertain(saved)
+        return run
+
+    monkeypatch.setattr(app, "_run_payload", reserve_after_run_payload)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = (
+        asyncio.run(app.await_run(run_id, timeout_seconds=0))
+        if read_tool == "await_run"
+        else app.status(run_id=run_id)
+    )
+
+    assert marked
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["run"]["state"] == "running"
+    assert payload["run"]["recovery_required"] is True
+    if read_tool == "await_run":
+        assert payload["reason"] == "recovery_required"
+
+
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
     tmp_path: Path,
 ) -> None:
