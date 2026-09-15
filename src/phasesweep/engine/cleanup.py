@@ -27,6 +27,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
 )
+from phasesweep.engine.study_policy import _restore_prelaunch_environment_identity
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.runtime.process import (
     StaleProcessIdentity,
@@ -83,6 +84,8 @@ def _reap_stale_trials(
 
             if TRIAL_DIR_ATTR in trial.user_attrs:
                 _resolve_attempt_for_reaping(trial, trial_dir, study.study_name)
+            else:
+                _restore_prelaunch_environment_identity(study, trial)
         except ProcessCleanupUncertainError:
             if uncertain_attempt_ids is not None and isinstance(attempt_id, str) and attempt_id:
                 uncertain_attempt_ids.add(attempt_id)

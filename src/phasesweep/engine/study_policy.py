@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import optuna
 
@@ -17,6 +17,8 @@ from phasesweep.engine.errors import (
     TrialTargetRegressionError,
 )
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
     PHASE_RECOVERY_ATTR,
@@ -24,9 +26,13 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
+    TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
+
+_ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
+_ALLOCATION_CONTEXT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -394,6 +400,116 @@ def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
         study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
 
 
+def _allocation_contexts(study: optuna.Study) -> list[dict[str, Any]]:
+    """Return valid pre-Optuna allocation records from a study's durable context.
+
+    :param optuna.Study study: Study holding the allocation context.
+    :return list[dict[str, Any]]: Valid allocation records, ordered by creation.
+    """
+    raw = study.user_attrs.get(_ALLOCATION_CONTEXT_ATTR)
+    if not isinstance(raw, dict) or raw.get("schema_version") != _ALLOCATION_CONTEXT_SCHEMA_VERSION:
+        return []
+    allocations = raw.get("allocations")
+    if not isinstance(allocations, list):
+        return []
+    records: list[dict[str, Any]] = []
+    for record in allocations:
+        if (
+            not isinstance(record, dict)
+            or not isinstance(record.get("generation_id"), str)
+            or not record["generation_id"]
+            or type(record.get("first_trial_number")) is not int
+            or record["first_trial_number"] < 0
+            or not isinstance(record.get("trainer_environment"), str)
+            or not record["trainer_environment"]
+        ):
+            continue
+        records.append(record)
+    return records
+
+
+def _record_allocation_context(
+    study: optuna.Study,
+    *,
+    generation_id: str,
+    trainer_environment: str,
+) -> None:
+    """Persist environment provenance before Optuna allocates a trial.
+
+    A trial is allocated by ``Study.ask()`` before the objective can write any
+    trial attrs. The recorded boundary identifies the environment for a trial
+    that dies in precisely that gap, without assigning an environment to older
+    or executed trials whose provenance is absent.
+
+    :param optuna.Study study: Study about to allocate work.
+    :param str generation_id: Generation that owns the pending allocation.
+    :param str trainer_environment: Semantic trainer-environment digest.
+    """
+    trials = study.get_trials(deepcopy=False)
+    first_trial_number = max((trial.number for trial in trials), default=-1) + 1
+    records = _allocation_contexts(study)
+    records.append(
+        {
+            "generation_id": generation_id,
+            "first_trial_number": first_trial_number,
+            "trainer_environment": trainer_environment,
+        }
+    )
+    study.set_user_attr(
+        _ALLOCATION_CONTEXT_ATTR,
+        {
+            "schema_version": _ALLOCATION_CONTEXT_SCHEMA_VERSION,
+            "allocations": records,
+        },
+    )
+
+
+def _prelaunch_trial_environment(
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+) -> str | None:
+    """Return the recorded environment for an allocation that never launched.
+
+    A context can cover a missing trial identity only when the trial number is
+    at or after its durable pre-allocation boundary and the trial never reached
+    the per-attempt metadata written before any trainer can start. This keeps
+    legacy or executed trials with missing environment provenance rejected.
+
+    :param optuna.Study study: Study containing the allocation context.
+    :param optuna.trial.FrozenTrial trial: Trial with a missing environment attr.
+    :return str | None: Covered environment digest, or ``None`` when unknown.
+    """
+    attrs = trial.user_attrs
+    if any(attr in attrs for attr in (TRIAL_DIR_ATTR, ATTEMPT_ID_ATTR, GENERATION_ID_ATTR)):
+        return None
+    for record in reversed(_allocation_contexts(study)):
+        if trial.number >= record["first_trial_number"]:
+            return record["trainer_environment"]
+    return None
+
+
+def _restore_prelaunch_environment_identity(
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+) -> bool:
+    """Restore environment provenance for one covered unlaunched trial.
+
+    :param optuna.Study study: Study containing the allocation context.
+    :param optuna.trial.FrozenTrial trial: Still-RUNNING prelaunch allocation.
+    :return bool: Whether a missing environment identity was restored.
+    """
+    if (
+        isinstance(trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR), str)
+        and trial.user_attrs[TRAINER_ENV_DIGEST_ATTR]
+    ):
+        return False
+    environment = _prelaunch_trial_environment(study, trial)
+    if environment is None:
+        return False
+    optuna.Trial(study, trial._trial_id).set_user_attr(TRAINER_ENV_DIGEST_ATTR, environment)
+    return True
+
+
 def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> None:
     """Refuse to allocate into a different or unknown semantic environment cohort.
 
@@ -407,12 +523,18 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
     trials = study.get_trials(deepcopy=False)
     if not trials:
         return
-    missing = [
-        trial.number
-        for trial in trials
-        if not isinstance(trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR), str)
-        or not trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
-    ]
+    missing: list[int] = []
+    recorded: set[str] = set()
+    for trial in trials:
+        environment = trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
+        if isinstance(environment, str) and environment:
+            recorded.add(environment)
+            continue
+        environment = _prelaunch_trial_environment(study, trial)
+        if environment is None:
+            missing.append(trial.number)
+        else:
+            recorded.add(environment)
     if missing:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} contains populated legacy trial(s) without a "
@@ -420,7 +542,6 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
             "which environment cohort owns those results. Use a new experiment name, or "
             "archive/delete the legacy study before running again."
         )
-    recorded = {trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] for trial in trials}
     if recorded != {current_digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))
         raise StudyFingerprintMismatchError(

@@ -1146,6 +1146,92 @@ def test_reaper_falls_back_for_prelaunch_trial_without_trial_dir_attr(
     }
 
 
+def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Allocations interrupted before the objective retain environment provenance."""
+
+    class PowerLoss(BaseException):
+        pass
+
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'allocation.db'}",
+        trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        override_format="argparse",
+        n_trials=3,
+        sampler=Sampler(type="random", seed=1),
+    )
+
+    def allocate_then_die(self: optuna.Study, _objective: object, **_kwargs: object) -> None:
+        self.ask()
+        raise PowerLoss("after allocation, before objective metadata")
+
+    for _ in range(2):
+        with monkeypatch.context() as patch:
+            patch.setattr(optuna.Study, "optimize", allocate_then_die)
+            with pytest.raises(PowerLoss, match="after allocation"):
+                run_experiment(exp)
+
+    winners = run_experiment(exp)
+
+    assert winners["p"].metric == pytest.approx(1.0)
+    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    trials = study.get_trials(deepcopy=False)
+    assert [trial.state for trial in trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    identity = _environment_identity(exp)
+    assert all(trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest for trial in trials)
+
+
+def test_allocation_context_covers_first_environment_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed first environment write does not poison abort recovery."""
+
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'first-write.db'}",
+        trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=1),
+    )
+
+    real_set_user_attr = optuna.Trial.set_user_attr
+    failed = False
+
+    def fail_first_environment_write(self: optuna.Trial, key: str, value: object) -> None:
+        nonlocal failed
+        if key == TRAINER_ENV_DIGEST_ATTR and not failed:
+            failed = True
+            raise OSError("first environment write failed")
+        real_set_user_attr(self, key, value)
+
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", fail_first_environment_write)
+
+    with pytest.raises(OSError, match="first environment write failed"):
+        run_experiment(exp)
+
+    resumed = exp.model_copy(update={"phases": [exp.phases[0].model_copy(update={"n_trials": 2})]})
+    winners = run_experiment(resumed)
+
+    assert winners["p"].metric == pytest.approx(1.0)
+    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    trials = study.get_trials(deepcopy=False)
+    assert [trial.state for trial in trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    assert TRAINER_ENV_DIGEST_ATTR not in trials[0].user_attrs
+    assert run_experiment(resumed)["p"].metric == pytest.approx(1.0)
+
+
 @pytest.mark.parametrize("bad_value", ["", 123])
 def test_reaper_raises_for_malformed_trial_dir_attr(
     tmp_path: Path,

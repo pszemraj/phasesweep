@@ -66,6 +66,7 @@ from phasesweep.engine.study_policy import (
     _AcceptedPartialDecision,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
+    _record_allocation_context,
     _record_trial_target,
     _validate_environment_cohort,
     _validate_study_direction,
@@ -1172,6 +1173,12 @@ def _run_phase(
         _consecutive_failures = current_policy_state.consecutive_failures
     try:
         try:
+            assert generation_id is not None
+            _record_allocation_context(
+                study,
+                generation_id=generation_id,
+                trainer_environment=environment_identity.digest,
+            )
             study.optimize(
                 objective,
                 n_trials=remaining,
