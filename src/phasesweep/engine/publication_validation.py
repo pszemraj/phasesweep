@@ -375,7 +375,7 @@ def _validate_winner_source_generation(
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
 ) -> None:
-    """Require a carried-forward winner's source generation to exist in this tree.
+    """Validate a carried or baseline winner against its source in this tree.
 
     A winner's own ``generation_id`` may legitimately name an earlier
     generation - a top-up that reselects an existing trial, or a ``--from-phase``
@@ -385,7 +385,8 @@ def _validate_winner_source_generation(
     generation that exists only in some *other* artifact tree, or no tree at
     all, and the publication still validated as ``ok`` (PR #5 review /
     reviewer 2, blocker 7). The cited namespace is where the evidence behind
-    that number lives, so it has to resolve here.
+    that number lives, so it has to resolve here. A baseline exposure within
+    the publishing generation also has to match its cited source phase winner.
 
     Deviating deliberately from a blanket "the source must also hold a winner
     record for this phase": a crash between trial completion and publication
@@ -415,7 +416,8 @@ def _validate_winner_source_generation(
         published manifest, or recorded a different winning result.
     """
     source_generation = payload["generation_id"]
-    if source_generation == generation_id:
+    same_generation = source_generation == generation_id
+    if same_generation and source_phase == phase_name:
         return
     if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
         raise fail(f"winner for phase {phase_name!r} has no valid winner_source phase")
@@ -426,7 +428,7 @@ def _validate_winner_source_generation(
             f"winner for phase {phase_name!r} cites source generation "
             f"{source_generation!r}, which is not a valid generation name"
         )
-    source_dir = generation_dir.parent / source_generation
+    source_dir = generation_dir if same_generation else generation_dir.parent / source_generation
     if not source_dir.is_dir():
         raise fail(
             f"winner for phase {phase_name!r} cites source generation "
@@ -469,7 +471,7 @@ def _validate_winner_source_generation(
             f"{source_phase!r} is not a mapping"
         )
     source_summary_path = source_dir / GENERATION_SUMMARY_FILENAME
-    if source_summary_path.is_file():
+    if source_summary_path.is_file() and not same_generation:
         try:
             source_summary = yaml.safe_load(source_summary_path.read_bytes())
         except PermissionError as exc:

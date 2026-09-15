@@ -39,6 +39,7 @@ from phasesweep.engine.paths import (
     _generation_path,
     _generation_promotion_decision_path,
     _generation_summary_path,
+    _generation_winner_path,
     _last_successful_generation_path,
     _promotion_decision_path,
     _trial_dir_for,
@@ -203,6 +204,32 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     summary = yaml.safe_load((tmp_path / "runs" / "t" / "summary.yaml").read_text())
     assert summary["promotion_decisions"][0] == decision
     assert summary["phases"][1]["promotion"] == decision
+
+    generation_id = winners["candidate"].generation_id
+    assert generation_id is not None
+    candidate_path = _generation_winner_path(exp, generation_id, "candidate")
+    candidate = yaml.safe_load(candidate_path.read_text())
+    candidate["metric"]["objective"] = 999.0
+    candidate_path.write_text(yaml.safe_dump(candidate, sort_keys=False))
+    summary_path = _generation_summary_path(exp, generation_id)
+    published_summary = yaml.safe_load(summary_path.read_text())
+    published_summary["phases"][1]["metric"] = 999.0
+    artifact = next(
+        item
+        for item in published_summary["artifacts"]
+        if item["kind"] == "winner" and item["phase"] == "candidate"
+    )
+    artifact["sha256"] = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(published_summary, sort_keys=False))
+    pointer_path = _last_successful_generation_path(exp)
+    pointer = yaml.safe_load(pointer_path.read_text())
+    summary_bytes = summary_path.read_bytes()
+    pointer["summary_size_bytes"] = len(summary_bytes)
+    pointer["summary_sha256"] = hashlib.sha256(summary_bytes).hexdigest()
+    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
+
+    assert read_status(exp)["publication_integrity"] == "failed"
+    assert read_winner(exp, "candidate") is None
 
 
 def test_successful_promotion_keeps_independent_candidate_keys(tmp_path: Path) -> None:
