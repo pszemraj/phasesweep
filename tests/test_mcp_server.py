@@ -4512,6 +4512,10 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["reaped_attempt_ids"] == [attempt_id]
     assert store.recovery_required(handle)
+    assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
+    frozen_status = app.status(run_id=run_id)
+    assert frozen_status["result_source"] == "frozen_run_snapshot"
+    assert frozen_status["phases"][0]["trials"]["RUNNING"] == 1
     assert len(runner_cleanup_calls) == 1
     assert len(trial_cleanup_calls) == 1
 
@@ -4537,11 +4541,11 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert recovered_status["target_already_satisfied"] is False
 
 
-def test_operator_recovery_keeps_reservation_when_pending_status_cannot_be_written(
+def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_written(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Failed snapshot preparation cannot publish cleanup as a finished recovery."""
+    """Failed final status persistence keeps the prior frozen result and reservation."""
     run_id = "srv-pending-write-failure"
     app, store, handle, attempt_id, command = _stage_stale_running_recovery_scaffold(
         tmp_path,
@@ -4565,8 +4569,16 @@ def test_operator_recovery_keeps_reservation_when_pending_status_cannot_be_writt
     assert failed.exit_code != 0
     assert "failed to finalize terminal result snapshot" in failed.output
     assert store.recovery_required(handle)
-    assert app.status(run_id=run_id)["run"]["recovery_required"] is True
-    assert not store.cleanup_recovery_path(run_id).exists()
+    frozen_status = app.status(run_id=run_id)
+    assert frozen_status["run"]["recovery_required"] is True
+    assert frozen_status["result_source"] == "frozen_run_snapshot"
+    assert frozen_status["phases"][0]["trials"]["RUNNING"] == 1
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
+    assert awaited["result_source"] == "frozen_run_snapshot"
+    assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
+    assert store.cleanup_recovery_path(run_id).is_file()
+    assert store.cleanup_uncertain_path(run_id).is_file()
     with pytest.raises(ExperimentBusyError):
         app.launch("srv")
 
@@ -4574,6 +4586,7 @@ def test_operator_recovery_keeps_reservation_when_pending_status_cannot_be_writt
     assert retried.exit_code == 0, retried.output
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["reaped_attempt_ids"] == [attempt_id]
+    assert not store.cleanup_uncertain_path(run_id).exists()
     assert not store.recovery_required(handle)
     phase = app.status(run_id=run_id)["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
@@ -4674,7 +4687,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     having found no cleanup evidence.
     """
     run_id = "srv-cleanup-recovery-retry"
-    _app, store, handle, attempt_id, command = _stage_stale_running_recovery_scaffold(
+    app, store, handle, attempt_id, command = _stage_stale_running_recovery_scaffold(
         tmp_path,
         run_id=run_id,
         error_class="cancelled",
@@ -4700,6 +4713,11 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     assert store.cleanup_uncertain_path(run_id).is_file()
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["reaped_attempt_ids"] == [attempt_id]
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["result_snapshot_state"] == "complete"
+    frozen_status = app.status(run_id=run_id)
+    assert frozen_status["result_source"] == "frozen_run_snapshot"
+    assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
 
     retry = runner.invoke(cli_main, command)
 
@@ -4874,6 +4892,17 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     store, handle, trial_number, config, command = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=False
     )
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment),
+    )
     recovery_record = store.cleanup_recovery_path(run_id)
 
     def crash_on_recovery_record(path: Path, text: str) -> None:
@@ -4894,6 +4923,11 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     study = _load_first_phase_study(config)
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
     assert not recovery_record.exists()
+    assert store.recovery_required(handle)
+    assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    assert app.status(run_id=run_id)["result_source"] == "frozen_run_snapshot"
+    assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
 
     monkeypatch.setattr("phasesweep.mcp.recovery.private_atomic_write_text", real_write)
 

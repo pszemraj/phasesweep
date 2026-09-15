@@ -125,7 +125,13 @@ def recover_run(
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
     try:
         with recovery_lock:
-            _cleanup_runner(identity, needs, confirm=confirm, earlier_boot=earlier_boot)
+            _cleanup_runner(
+                identity,
+                needs,
+                confirm=confirm,
+                earlier_boot=earlier_boot,
+                cleanup_recorded=store._cleanup_recovered(handle),
+            )
             publication_action, publication_summary = _publication_recovery_action(config, needs)
             evidence = _recover_trial_evidence(store, handle, config, needs, confirm=confirm)
             if not confirm:
@@ -143,8 +149,12 @@ def recover_run(
                     "result_snapshot_error": "HistoricalSnapshotUnavailable",
                 }
                 write_status_file(store.status_path(run_id), terminal_status)
-            if needs.snapshot_finalize_needed:
-                # Keep the run reserved before cleanup evidence can release it.
+            if (
+                needs.snapshot_finalize_needed
+                and terminal_status.get("result_snapshot_state") != "complete"
+            ):
+                # Reserve unfinished snapshots before cleanup can release the run.
+                # A complete snapshot must stay readable if cleanup persistence fails.
                 terminal_status.pop("result_snapshot_error", None)
                 terminal_status["result_snapshot_state"] = "pending"
                 try:
@@ -154,8 +164,15 @@ def recover_run(
                         f"failed to finalize terminal result snapshot for {run_id}: "
                         f"{type(exc).__name__}"
                     ) from None
+            repairing_complete_snapshot = (
+                needs.snapshot_finalize_needed
+                and terminal_status.get("result_snapshot_state") == "complete"
+            )
+            if repairing_complete_snapshot and not earlier_boot:
+                # Keep the recovery reservation while the prior frozen result stays readable.
+                store.mark_cleanup_uncertain(handle)
             if needs.cleanup_needed:
-                _persist_cleanup_recovery(store, handle, config, evidence, emit=emit)
+                _persist_cleanup_recovery(store, handle, config, evidence)
             _finish_result_recovery(
                 store,
                 run_id,
@@ -166,6 +183,15 @@ def recover_run(
                 publication_summary,
                 emit=emit,
             )
+            if needs.cleanup_needed or repairing_complete_snapshot:
+                store.clear_cleanup_uncertain(handle)
+            if needs.cleanup_needed:
+                emit(
+                    f"Cleared cleanup uncertainty for {run_id}; reconciled "
+                    f"{evidence.registered_attempts_reconciled} registered attempt(s), "
+                    f"reaped {evidence.reaped} stale trial(s), and confirmed "
+                    f"{evidence.cleanup_recovered} cleanup-uncertain trial(s)."
+                )
     except RunRecoveryError:
         raise
     except RuntimeError as exc:
@@ -379,7 +405,12 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
 
 
 def _cleanup_runner(
-    identity: ProcessIdentity, needs: _RecoveryNeeds, *, confirm: bool, earlier_boot: bool
+    identity: ProcessIdentity,
+    needs: _RecoveryNeeds,
+    *,
+    confirm: bool,
+    earlier_boot: bool,
+    cleanup_recorded: bool,
 ) -> None:
     """Re-check and, when confirmed, clean the recorded runner process group.
 
@@ -390,6 +421,7 @@ def _cleanup_runner(
     :param _RecoveryNeeds needs: Decisions indicating whether runner cleanup is required.
     :param bool confirm: Enable liveness checks and any required process-group cleanup.
     :param bool earlier_boot: Whether the recorded process belongs to an earlier system boot.
+    :param bool cleanup_recorded: Prior durable recovery evidence already confirms group cleanup.
     :raises RunRecoveryError: A runner is still live or process-group cleanup remains uncertain.
     """
     # Keep the lock from this liveness check through every signal, study
@@ -400,6 +432,7 @@ def _cleanup_runner(
         needs.cleanup_needed
         and confirm
         and not earlier_boot
+        and not cleanup_recorded
         and not kill_stale_group(
             identity.pid, identity.pid_starttime, pgid=identity.pgid, grace_seconds=30.0
         )
@@ -667,19 +700,16 @@ def _persist_cleanup_recovery(
     handle: RunHandle,
     config: Experiment,
     evidence: _CleanupEvidence,
-    *,
-    emit: Callable[[str], None],
 ) -> None:
-    """Persist cleanup evidence, then retire recovered attempts and clear uncertainty.
+    """Persist cleanup evidence and retire recovered attempts before finalization.
 
-    Atomically writes the evidence record before retiring registered attempts and then clears the
-    run's cleanup-uncertain marker.
+    Atomically writes the evidence record before retiring registered attempts. The caller clears
+    the run's cleanup-uncertain marker only after terminal result recovery succeeds.
 
     :param RunStore store: Existing run store that receives the cleanup recovery record.
     :param RunHandle handle: Durable handle whose cleanup uncertainty is being cleared.
     :param Experiment config: Experiment used to retire registered active attempts.
     :param _CleanupEvidence evidence: Attributable cleanup counts, IDs, and trial locations.
-    :param Callable[[str], None] emit: Callback that receives the completed-recovery message.
     """
     run_id = handle.run_id
     payload = {
@@ -707,13 +737,6 @@ def _persist_cleanup_recovery(
     )
     for attempt_id in evidence.registered_recovery_attempt_ids:
         _retire_active_attempt(config, attempt_id)
-    store.clear_cleanup_uncertain(handle)
-    emit(
-        f"Cleared cleanup uncertainty for {run_id}; reconciled "
-        f"{evidence.registered_attempts_reconciled} registered attempt(s), reaped {evidence.reaped} "
-        f"stale trial(s), and confirmed {evidence.cleanup_recovered} cleanup-uncertain "
-        "trial(s)."
-    )
 
 
 def _finish_result_recovery(
@@ -798,7 +821,7 @@ def _finalize_stored_terminal_result_snapshot(
     confirmed_attempt_ids: set[str],
     confirmed_attempt_locations: dict[str, tuple[str, int, str]],
 ) -> None:
-    """Finalize and persist the stored snapshot already marked pending under the lock.
+    """Finalize and persist the stored snapshot without losing a completed prior view.
 
     :param RunStore store: Existing run store containing the terminal status.
     :param str run_id: Run whose stored terminal snapshot should be finalized.
@@ -813,6 +836,7 @@ def _finalize_stored_terminal_result_snapshot(
             f"run {run_id} has no immutable snapshot to finalize; refusing to read current "
             "shared state as historical evidence"
         )
+    prior_state = terminal_status.get("result_snapshot_state")
     raw_snapshot = snapshot.model_dump(mode="json")
     try:
         terminal_status["result_snapshot"] = finalize_result_snapshot(
@@ -824,10 +848,11 @@ def _finalize_stored_terminal_result_snapshot(
         write_status_file(store.status_path(run_id), terminal_status)
     except Exception as exc:  # noqa: BLE001 - report operator repair failures
         terminal_status["result_snapshot"] = raw_snapshot
-        terminal_status["result_snapshot_state"] = "pending"
-        terminal_status["result_snapshot_error"] = type(exc).__name__
-        with contextlib.suppress(Exception):
-            write_status_file(store.status_path(run_id), terminal_status)
+        terminal_status["result_snapshot_state"] = prior_state
+        if prior_state != "complete":
+            terminal_status["result_snapshot_error"] = type(exc).__name__
+            with contextlib.suppress(Exception):
+                write_status_file(store.status_path(run_id), terminal_status)
         raise RunRecoveryError(
             f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
         ) from None
