@@ -872,6 +872,43 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
         _composed_overrides(experiment, stale_child, {"depth": 16}, inherited)
 
 
+def test_correlated_promotion_outcomes_can_rejoin_through_two_parents() -> None:
+    """A diamond may reuse one promotion branch without combining both branches."""
+    experiment = make_experiment(
+        trial_command="echo {config_path}",
+        override_format="yaml_file",
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"model": {"depth": 8}}),
+            Phase(
+                name="choice",
+                n_trials=1,
+                fixed_overrides={"model.depth": 16},
+                promotion={
+                    "min_delta_vs": "base",
+                    "min_delta": 1,
+                    "on_fail": "continue_baseline",
+                },
+            ),
+            Phase(name="left", n_trials=1, inherits=["choice"], fixed_overrides={"left": 1}),
+            Phase(name="right", n_trials=1, inherits=["choice"], fixed_overrides={"right": 1}),
+            Phase(
+                name="later",
+                n_trials=1,
+                inherits=["left", "right"],
+                fixed_overrides={"lr": 0.01},
+            ),
+        ],
+    )
+
+    assert [phase.name for phase in experiment.phases] == [
+        "base",
+        "choice",
+        "left",
+        "right",
+        "later",
+    ]
+
+
 @pytest.mark.parametrize(
     ("resolution", "valid"),
     [

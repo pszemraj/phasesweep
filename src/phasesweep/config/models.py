@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import string
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -541,6 +542,86 @@ class ExecutionContext(_Frozen):
         return self
 
 
+@dataclass(frozen=True)
+class _ConcreteOverrideOutcome:
+    """One compatible concrete set of winner override keys.
+
+    :param frozenset[str] keys: Keys exposed by this outcome.
+    :param tuple[tuple[str, str], ...] origins: Producing layer for each key,
+        sorted by key. Shared origins are safe when two parents reach the same
+        inherited winner through a diamond.
+    :param tuple[tuple[str, str], ...] decisions: Promotion branch selections
+        inherited by this outcome, sorted by phase name.
+    """
+
+    keys: frozenset[str]
+    origins: tuple[tuple[str, str], ...] = ()
+    decisions: tuple[tuple[str, str], ...] = ()
+
+
+def _merge_override_outcomes(
+    outcomes: tuple[_ConcreteOverrideOutcome, ...],
+) -> _ConcreteOverrideOutcome | None:
+    """Merge compatible concrete outcomes, or return ``None`` for conflicting branches.
+
+    :param tuple[_ConcreteOverrideOutcome, ...] outcomes: Outcomes to compose.
+    :return _ConcreteOverrideOutcome | None: Their composed keys, origins, and
+        decisions, or ``None`` if one promotion is required to take two branches.
+    """
+    decisions: dict[str, str] = {}
+    keys: set[str] = set()
+    origins: dict[str, str] = {}
+    for outcome in outcomes:
+        for phase_name, branch in outcome.decisions:
+            prior_branch = decisions.get(phase_name)
+            if prior_branch is not None and prior_branch != branch:
+                return None
+            decisions[phase_name] = branch
+        keys.update(outcome.keys)
+        for key, origin in outcome.origins:
+            origins.setdefault(key, origin)
+    return _ConcreteOverrideOutcome(
+        keys=frozenset(keys),
+        origins=tuple(sorted(origins.items())),
+        decisions=tuple(sorted(decisions.items())),
+    )
+
+
+def _compatible_parent_outcome_combinations(
+    parents: list[str],
+    outcomes_by_phase: Mapping[str, tuple[_ConcreteOverrideOutcome, ...]],
+) -> list[tuple[_ConcreteOverrideOutcome, ...]]:
+    """Return direct-parent outcome combinations with consistent promotion branches.
+
+    :param list[str] parents: Ordered direct parents of the phase being checked.
+    :param Mapping[str, tuple[_ConcreteOverrideOutcome, ...]] outcomes_by_phase:
+        Concrete exposed outcomes for each prior phase.
+    :return list[tuple[_ConcreteOverrideOutcome, ...]]: Compatible selections,
+        one outcome per direct parent in ``parents`` order.
+    """
+    combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = [()]
+    for parent in parents:
+        next_combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = []
+        for combination in combinations:
+            for outcome in outcomes_by_phase[parent]:
+                candidate = (*combination, outcome)
+                if _merge_override_outcomes(candidate) is not None:
+                    next_combinations.append(candidate)
+        combinations = next_combinations
+    return combinations
+
+
+def _deduplicate_override_outcomes(
+    outcomes: list[_ConcreteOverrideOutcome],
+) -> tuple[_ConcreteOverrideOutcome, ...]:
+    """Return outcomes once each while preserving their first-seen order.
+
+    :param list[_ConcreteOverrideOutcome] outcomes: Outcomes to deduplicate.
+    :return tuple[_ConcreteOverrideOutcome, ...]: Ordered unique outcomes.
+    """
+    return tuple(dict.fromkeys(outcomes))
+
+
 class Experiment(_Frozen):
     """Top-level experiment: trial command, metric, constraints, and ordered phases."""
 
@@ -733,7 +814,8 @@ class Experiment(_Frozen):
         """
         seen: dict[str, Phase] = {}
         seen_casefolded: dict[str, str] = {}
-        locked_keys_by_phase: dict[str, set[str]] = {}
+        possible_exported_keys_by_phase: dict[str, set[str]] = {}
+        concrete_outcomes_by_phase: dict[str, tuple[_ConcreteOverrideOutcome, ...]] = {}
 
         for phase in self.phases:
             if phase.name in seen:
@@ -796,30 +878,45 @@ class Experiment(_Frozen):
                     "inside the applying phase."
                 )
 
-            # Transitive inherited locked keys + multi-parent collision detection.
-            inherited_keys: set[str] = set()
-            parent_owners: dict[str, list[str]] = {}
+            # Sampling is deliberately conservative: descendants may never
+            # re-sample any key that a parent could expose. Namespace checks
+            # below instead evaluate concrete, mutually exclusive promotion
+            # outcomes so keys from impossible branch combinations are not
+            # treated as coexisting.
+            possible_inherited_keys: set[str] = set()
             for parent in phase.inherits:
-                for key in locked_keys_by_phase[parent]:
-                    inherited_keys.add(key)
-                    parent_owners.setdefault(key, []).append(parent)
+                possible_inherited_keys.update(possible_exported_keys_by_phase[parent])
 
-            unresolved = {
-                k: owners
-                for k, owners in parent_owners.items()
-                if len(owners) > 1 and k not in phase.fixed_overrides
-            }
-            if unresolved:
-                details = ", ".join(
-                    f"{k!r} from {sorted(set(o))}" for k, o in sorted(unresolved.items())
-                )
-                raise ValueError(
-                    f"Phase {phase.name!r} inherits conflicting locked key(s) from multiple "
-                    f"parents: {details}. Resolve explicitly with phase.fixed_overrides "
-                    f"or remove one inherit."
-                )
+            parent_combinations = _compatible_parent_outcome_combinations(
+                phase.inherits, concrete_outcomes_by_phase
+            )
+            inherited_outcomes: list[_ConcreteOverrideOutcome] = []
+            for combination in parent_combinations:
+                parent_origins: dict[str, set[str]] = {}
+                for _parent, outcome in zip(phase.inherits, combination, strict=True):
+                    for key, origin in outcome.origins:
+                        parent_origins.setdefault(key, set()).add(origin)
+                unresolved = {
+                    key: origins
+                    for key, origins in parent_origins.items()
+                    if len(origins) > 1 and key not in phase.fixed_overrides
+                }
+                if unresolved:
+                    details = ", ".join(
+                        f"{key!r} from {sorted(origins)}"
+                        for key, origins in sorted(unresolved.items())
+                    )
+                    raise ValueError(
+                        f"Phase {phase.name!r} inherits conflicting locked key(s) from multiple "
+                        f"parents: {details}. Resolve explicitly with phase.fixed_overrides "
+                        "or remove one inherit."
+                    )
+                merged = _merge_override_outcomes(combination)
+                assert merged is not None  # compatible-combination invariant
+                inherited_outcomes.append(merged)
+            inherited_outcomes = list(_deduplicate_override_outcomes(inherited_outcomes))
 
-            collisions = inherited_keys & set(phase.search_space.keys())
+            collisions = possible_inherited_keys & set(phase.search_space.keys())
             if collisions:
                 raise ValueError(
                     f"Phase {phase.name!r} re-samples key(s) {sorted(collisions)} "
@@ -828,23 +925,31 @@ class Experiment(_Frozen):
                     f"or drop the inherit."
                 )
 
-            # A scalar key and one of its dotted subkeys cannot coexist in any
-            # supported render format, whether both are local or one is inherited.
-            combined_keys = (
-                inherited_keys
-                | contract_keys
-                | set(phase.fixed_overrides)
-                | set(phase.search_space)
-            )
-            inh_prefix_collisions = _find_prefix_collisions(combined_keys)
-            if inh_prefix_collisions:
-                pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in inh_prefix_collisions)
-                raise ValueError(
-                    f"Phase {phase.name!r} has dotted-key namespace collision(s) "
-                    f"across inherited and local overrides: {pairs}. "
-                    "A key and a sub-key cannot both be overridden across the "
-                    "inheritance chain."
+            local_keys = contract_keys | set(phase.fixed_overrides) | set(phase.search_space)
+            local_origins = {
+                key: f"{phase.name}:contract:{contract_key_owner[key]}" for key in contract_keys
+            }
+            local_origins.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
+            local_origins.update({key: f"{phase.name}:sampled" for key in phase.search_space})
+            candidate_outcomes = [
+                _ConcreteOverrideOutcome(
+                    keys=outcome.keys | local_keys,
+                    origins=tuple(sorted({**dict(outcome.origins), **local_origins}.items())),
+                    decisions=outcome.decisions,
                 )
+                for outcome in inherited_outcomes
+            ]
+            candidate_outcomes = list(_deduplicate_override_outcomes(candidate_outcomes))
+            for outcome in candidate_outcomes:
+                prefix_collisions = _find_prefix_collisions(set(outcome.keys))
+                if prefix_collisions:
+                    pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
+                    raise ValueError(
+                        f"Phase {phase.name!r} has dotted-key namespace collision(s) "
+                        f"across inherited and local overrides: {pairs}. "
+                        "A key and a sub-key cannot both be overridden across the "
+                        "inheritance chain."
+                    )
 
             # Sampler/search-space compatibility (review v0.5.2 / blocker 2): catch at config-load
             # so `phasesweep validate` is meaningful, not at first trial launch.
@@ -879,14 +984,18 @@ class Experiment(_Frozen):
             # where the wire form and semantic dump agree.
             _validate_cli_override_values(self, phase)
 
-            # Trial command template (v0.5.3 follow-up): render once with
-            # placeholder overrides per phase. Catches typos like `{trail_dir}`,
-            # unknown placeholders, and unbalanced braces at config-load instead
-            # of three minutes into a sweep.
-            _validate_trial_command_template(self, phase, inherited_keys)
+            # Trial command template (v0.5.3 follow-up): render every concrete
+            # inherited outcome. Catches typos like `{trail_dir}`, unknown
+            # placeholders, unbalanced braces, and namespace failures at
+            # config-load instead of three minutes into a sweep.
+            _validate_trial_command_template(
+                self,
+                phase,
+                [outcome.keys for outcome in inherited_outcomes],
+            )
 
             exported_keys = (
-                inherited_keys
+                possible_inherited_keys
                 | contract_keys
                 | set(phase.fixed_overrides)
                 | set(phase.search_space)
@@ -896,8 +1005,32 @@ class Experiment(_Frozen):
             # that either outcome can expose as inherited and immutable to
             # sampling.
             if phase.promotion is not None and phase.promotion.on_fail == "continue_baseline":
-                exported_keys |= locked_keys_by_phase[phase.promotion.min_delta_vs]
-            locked_keys_by_phase[phase.name] = exported_keys
+                baseline_outcomes = concrete_outcomes_by_phase[phase.promotion.min_delta_vs]
+                candidate_outcomes = [
+                    _ConcreteOverrideOutcome(
+                        keys=outcome.keys,
+                        origins=outcome.origins,
+                        decisions=tuple(sorted((*outcome.decisions, (phase.name, "candidate")))),
+                    )
+                    for outcome in candidate_outcomes
+                ]
+                fallback_outcomes = [
+                    _ConcreteOverrideOutcome(
+                        keys=outcome.keys,
+                        origins=outcome.origins,
+                        decisions=tuple(sorted((*outcome.decisions, (phase.name, "fallback")))),
+                    )
+                    for outcome in baseline_outcomes
+                ]
+                concrete_outcomes_by_phase[phase.name] = _deduplicate_override_outcomes(
+                    [*candidate_outcomes, *fallback_outcomes]
+                )
+                exported_keys |= possible_exported_keys_by_phase[phase.promotion.min_delta_vs]
+            else:
+                concrete_outcomes_by_phase[phase.name] = _deduplicate_override_outcomes(
+                    candidate_outcomes
+                )
+            possible_exported_keys_by_phase[phase.name] = exported_keys
             seen[phase.name] = phase
             seen_casefolded[casefolded_name] = phase.name
 
@@ -1274,7 +1407,24 @@ def _format_field_names(template: str) -> set[str]:
 
 
 def _validate_trial_command_template(
-    experiment: Experiment, phase: Phase, inherited_keys: set[str]
+    experiment: Experiment,
+    phase: Phase,
+    inherited_key_outcomes: list[frozenset[str]],
+) -> None:
+    """Preflight the trial command for each concrete inherited-key outcome.
+
+    :param Experiment experiment: Experiment containing the command template.
+    :param Phase phase: Phase whose candidate execution is being checked.
+    :param list[frozenset[str]] inherited_key_outcomes: Compatible inherited
+        key sets from concrete upstream promotion outcomes.
+    :raises ValueError: A concrete outcome cannot render or reach the trainer.
+    """
+    for inherited_keys in dict.fromkeys(inherited_key_outcomes):
+        _validate_trial_command_template_outcome(experiment, phase, inherited_keys)
+
+
+def _validate_trial_command_template_outcome(
+    experiment: Experiment, phase: Phase, inherited_keys: frozenset[str]
 ) -> None:
     """Render ``trial_command`` once per phase with placeholder overrides.
 

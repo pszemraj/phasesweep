@@ -244,6 +244,53 @@ def test_successful_promotion_keeps_independent_candidate_keys(tmp_path: Path) -
     assert decision["promoted"] is True
 
 
+@pytest.mark.parametrize("candidate_promotes", [False, True])
+def test_promotion_alternative_namespaces_are_not_combined(
+    tmp_path: Path, candidate_promotes: bool
+) -> None:
+    """A fallback mapping and candidate dotted key remain separate outcomes."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command="echo x=1 {config_path}",
+        override_format="yaml_file",
+        phases=[
+            Phase(
+                name="base",
+                n_trials=1,
+                gpu_policy="none",
+                fixed_overrides={"model": {"depth": 8}},
+            ),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                gpu_policy="none",
+                fixed_overrides={"model.depth": 16},
+                promotion={
+                    "min_delta_vs": "base",
+                    "min_delta": 0 if candidate_promotes else 1,
+                    "on_fail": "continue_baseline",
+                },
+            ),
+            Phase(
+                name="later",
+                n_trials=1,
+                gpu_policy="none",
+                inherits=["candidate"],
+                fixed_overrides={"lr": 0.01},
+            ),
+        ],
+    )
+
+    winners = run_experiment(experiment)
+
+    expected = (
+        {"model.depth": 16, "lr": 0.01}
+        if candidate_promotes
+        else {"model": {"depth": 8}, "lr": 0.01}
+    )
+    assert winners["later"].effective_overrides == expected
+
+
 def test_added_phase_can_continue_baseline_from_published_generation(tmp_path: Path) -> None:
     """A baseline clone resolves its artifact under the recorded source phase."""
     trainer = _write_score_trainer(tmp_path)
