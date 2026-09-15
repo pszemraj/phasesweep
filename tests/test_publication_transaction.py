@@ -1076,6 +1076,14 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
     assert _last_successful_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
+    pointer_path = _last_successful_generation_path(experiment)
+    pointer_bytes = pointer_path.read_bytes()
+    generations_before = set(_generation_dir(experiment, generation_id).parent.iterdir())
+    with pytest.raises(PublicationIntegrityError, match="does not match its recorded hash"):
+        run_experiment(experiment)
+    assert pointer_path.read_bytes() == pointer_bytes
+    assert set(_generation_dir(experiment, generation_id).parent.iterdir()) == generations_before
+
 
 def test_deleted_pointer_with_an_intact_namespace_reports_absent(tmp_path: Path) -> None:
     """The pointer is the publication authority; an orphaned namespace is not one."""

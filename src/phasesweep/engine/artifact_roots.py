@@ -15,6 +15,8 @@ from phasesweep.config import Experiment
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     LegacyArtifactRootMigrationRequiredError,
+    PublicationAccessError,
+    PublicationIntegrityError,
     PublishedStudyMissingError,
     StudyStorageUnavailableError,
 )
@@ -448,9 +450,15 @@ def _check_published_phase_studies(
     :param str | None from_phase: Resume point; earlier phases only load winners.
     :raises PublishedStudyMissingError: A reached published trial is absent,
         replaced, or its recorded history boundary is missing.
+    :raises PublicationAccessError: The last publication cannot be read.
+    :raises PublicationIntegrityError: The last publication no longer validates.
     :raises StudyStorageUnavailableError: A published study's trials cannot be read.
     """
     publication = _resolve_publication_pointer(experiment)
+    if publication.state == "permission_denied":
+        raise PublicationAccessError(publication.error or "Published result is unreadable.")
+    if publication.state == "failed":
+        raise PublicationIntegrityError(publication.error or "Published result is invalid.")
     published_trials = _published_phase_trial_refs(publication.summary)
     reached = from_phase is None
     for phase in experiment.phases:
