@@ -305,7 +305,9 @@ def _only_failed_trials(
         if trial.state != optuna.trial.TrialState.FAIL:
             return False
         reason = trial.user_attrs.get(FAILURE_REASON_ATTR)
-        if isinstance(reason, str) and (
+        if not isinstance(reason, str) or not reason.strip():
+            return False
+        if (
             (
                 isinstance(experiment.metric.extractor, LogRegexExtractor)
                 and reason.startswith("metric extractor")

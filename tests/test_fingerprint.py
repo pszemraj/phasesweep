@@ -700,6 +700,20 @@ def test_evaluator_revision_rejects_only_affected_legacy_fingerprints(
         )
         assert failed_only.user_attrs[PHASE_EVALUATION_SEMANTICS_ATTR] == revisions
 
+        # Without a recorded cause, FAIL alone does not prove the affected
+        # evaluator never ran under its old interpretation.
+        for unproven_reason in (None, "", 0):
+            unproven = optuna.create_study()
+            unproven.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+            failed = unproven.ask()
+            if unproven_reason is not None:
+                failed.set_user_attr(FAILURE_REASON_ATTR, unproven_reason)
+            unproven.tell(failed, state=optuna.trial.TrialState.FAIL)
+            with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
+                _verify_fingerprint(unproven, experiment, phase, {})
+            assert unproven.user_attrs["phasesweep_fingerprint"] == legacy_fingerprint
+            assert PHASE_EVALUATION_SEMANTICS_ATTR not in unproven.user_attrs
+
         # A FAIL caused by the affected evaluator records an old interpretation
         # even though it has no reusable metric value.
         failed_evaluation = optuna.create_study()
