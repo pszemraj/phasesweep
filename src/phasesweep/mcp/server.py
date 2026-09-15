@@ -2022,6 +2022,10 @@ class PhaseSweepMCP:
         :param str error_class: Operator-facing class of the original launch failure.
         """
         try:
+            # The runner can finish before the server detects its own bookkeeping
+            # failure. Its terminal result is authoritative once cleanup is done.
+            if self._runs.recorded_terminal_status(pending) is not None:
+                return
             write_status_file(
                 self._runs.status_path(pending.run_id),
                 {

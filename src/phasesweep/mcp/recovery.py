@@ -142,6 +142,11 @@ def recover_run(
                 earlier_boot=earlier_boot,
                 cleanup_recorded=store._cleanup_recovered(handle),
             )
+            # The runner may have written its terminal status after the initial
+            # read. Cleanup has now confirmed it is dead, so use its final status
+            # before deciding whether recovery must synthesize or repair one.
+            terminal_status = store.recorded_terminal_status(handle)
+            needs = _recovery_needs(store, handle, terminal_status)
             publication_action, publication_summary = _publication_recovery_action(config, needs)
             evidence = _recover_trial_evidence(store, handle, config, needs, confirm=confirm)
             if not confirm:

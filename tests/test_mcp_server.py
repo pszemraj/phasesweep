@@ -3900,6 +3900,90 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     assert captured["cmd"]
 
 
+def test_recovery_preserves_status_written_after_initial_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-status-during-recovery"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.mark_cleanup_uncertain(handle)
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    snapshot = capture_result_snapshot(experiment, generation_id=run_id)
+
+    def runner_finishes_during_cleanup(*_args: object, **_kwargs: object) -> None:
+        write_run_status(
+            store,
+            run_id,
+            returncode=0,
+            error_class=None,
+            cleanup_confirmed=True,
+            result_snapshot_state="complete",
+            result_snapshot=snapshot,
+        )
+
+    monkeypatch.setattr(mcp_recovery, "_cleanup_runner", runner_finishes_during_cleanup)
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["returncode"] == 0
+    assert terminal["result_snapshot_state"] == "complete"
+
+
+def test_launch_bookkeeping_failure_preserves_runner_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+
+    def interrupted_update(handle: RunHandle) -> None:
+        experiment = load_config(config)
+        assert isinstance(experiment, Experiment)
+        write_run_status(
+            store,
+            handle.run_id,
+            returncode=0,
+            error_class=None,
+            cleanup_confirmed=True,
+            result_snapshot_state="complete",
+            result_snapshot=capture_result_snapshot(experiment, generation_id=handle.run_id),
+        )
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(store, "update", interrupted_update)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *_args, **_kwargs: True)
+    with pytest.raises(KeyboardInterrupt):
+        app.launch("srv")
+    (handle,) = store.list_handles()
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["returncode"] == 0
+    assert terminal["result_snapshot_state"] == "complete"
+
+
 @pytest.mark.parametrize("unknown_side", ["saved", "current"])
 def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     tmp_path: Path,
