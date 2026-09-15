@@ -763,10 +763,11 @@ def _validate_suite_summary_integrity(
 
     :param str generation_id: Suite generation id, used for error text.
     :param Mapping[str, Any] summary: Parsed suite summary payload.
-    :raises PublicationAccessError: A component summary cannot be read by the current user.
+    :raises PublicationAccessError: A component summary or manifest artifact cannot be
+        read by the current user.
     :raises PublicationIntegrityError: A study record is malformed, a component summary is
-        missing, altered, or misidentified, or an exposed winner is not
-        anchored to any verified component summary.
+        missing, altered, or misidentified, its generation manifest is invalid,
+        or an exposed winner is not anchored to a verified component.
     """
 
     def _fail(reason: str) -> PublicationIntegrityError:
@@ -881,6 +882,14 @@ def _validate_suite_summary_integrity(
             # membership check below.
             legacy_component_studies.add(name)
             continue
+        try:
+            _validate_generation_manifest(target.parent, component_generation, payload)
+        except PublicationAccessError as exc:
+            raise _permission_fail(
+                f"study {name!r} component manifest cannot be validated as this user ({exc})"
+            ) from exc
+        except PublicationIntegrityError as exc:
+            raise _fail(f"study {name!r} component manifest is invalid ({exc})") from exc
         phases = payload.get("phases")
         if not isinstance(phases, list):
             raise _fail(f"study {name!r} component summary has no phase list")

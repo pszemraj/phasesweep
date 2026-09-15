@@ -1136,8 +1136,10 @@ def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
         _last_successful_generation_id(experiment, raise_on_manifest_error=True)
 
 
+@pytest.mark.parametrize("damage", ["summary", "winner"])
 def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
     tmp_path: Path,
+    damage: str,
 ) -> None:
     """The suite pointer gets the same four-state verdict as the experiment pointer."""
     suite = _stored_suite_config(tmp_path)
@@ -1153,7 +1155,11 @@ def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
 
     summary = yaml.safe_load(_suite_generation_summary_path(suite, generation_id).read_text())
     component_path = Path(summary["studies"][0]["component_summary_path"])
-    component_path.write_text(component_path.read_text() + "\n# tampered\n")
+    if damage == "summary":
+        component_path.write_text(component_path.read_text() + "\n# tampered\n")
+    else:
+        component_winner = component_path.parent / "phases" / "p" / "winner.yaml"
+        component_winner.write_text(component_winner.read_text() + "\n# tampered\n")
 
     pointer = _resolve_suite_publication_pointer(suite)
     assert pointer.state == "failed"
