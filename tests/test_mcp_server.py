@@ -87,7 +87,7 @@ from phasesweep.mcp.errors import (
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.server import (
     TOOL_AWAIT_RUN,
     TOOL_GET_RUN_RESULTS,
@@ -297,13 +297,15 @@ def _stage_stale_running_recovery_scaffold(
     kill_stale_group_stub: Callable[..., bool],
     cleanup_trial_stub: Callable[..., bool],
     monkeypatch: pytest.MonkeyPatch,
+    allow_cancel: bool = False,
 ) -> tuple[PhaseSweepMCP, RunStore, RunHandle, str, list[str]]:
     """Shared scaffold for the interrupted-recovery --confirm retry tests: a
     stale RUNNING trial, a run handle, and a terminal status with a captured
     ``result_snapshot``, with ``kill_stale_group``/``cleanup_stale_trial_process``
     stubbed to succeed. Callers monkeypatch their own fail-once target and
-    invoke the returned command twice. Returns ``(app, store, handle,
-    attempt_id, command)``.
+    invoke the returned command twice. ``allow_cancel`` permits an intervening
+    cancellation in a retry test. Returns ``(app, store, handle, attempt_id,
+    command)``.
     """
     config = _config(tmp_path)
     trial_number = _write_stale_running_trial(
@@ -322,6 +324,7 @@ def _stage_stale_running_recovery_scaffold(
         config_sha256=reg.config_sha256,
         pid=999999,
         starttime=111,
+        allow_cancel=allow_cancel,
     )
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
@@ -3543,6 +3546,76 @@ def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
     assert not store.cleanup_uncertain_path(run_id).exists()
 
 
+def test_cancel_does_not_resurrect_marker_after_operator_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    run_id = "srv-cancel-after-recovery"
+    _write_cleanup_uncertain_failed_trial(config, generation_id=run_id)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+        allow_cancel=True,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+    store.mark_cleanup_uncertain(handle)
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process", lambda _identity: True
+    )
+
+    read_running = threading.Event()
+    recovery_done = threading.Event()
+    original_state = store.state
+    first_cancel_read = True
+
+    def pause_cancel_state(saved: RunHandle) -> RunState:
+        nonlocal first_cancel_read
+        state = original_state(saved)
+        if threading.current_thread() is not threading.main_thread() and first_cancel_read:
+            first_cancel_read = False
+            read_running.set()
+            assert recovery_done.wait(timeout=10)
+        return state
+
+    monkeypatch.setattr(store, "state", pause_cancel_state)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        cancelling = pool.submit(app.cancel, run_id)
+        assert read_running.wait(timeout=10)
+        confirmed = CliRunner().invoke(
+            cli_main,
+            [
+                "mcp",
+                "recover-run",
+                "--state-dir",
+                str(registry.state_dir),
+                "--run-id",
+                run_id,
+                "--confirm",
+            ],
+        )
+        recovery_done.set()
+        assert confirmed.exit_code == 0, confirmed.output
+        result = cancelling.result(timeout=10)
+
+    assert result["state"] == "failed"
+    assert result["recovery_required"] is False
+    assert not store.cleanup_uncertain_path(run_id).exists()
+    assert store.state(handle) == "failed"
+
+
 def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4557,6 +4630,7 @@ def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_wri
         kill_stale_group_stub=lambda *_args, **_kwargs: True,
         cleanup_trial_stub=lambda *_args, **_kwargs: True,
         monkeypatch=monkeypatch,
+        allow_cancel=True,
     )
 
     def refuse_status_write(_path: Path, _payload: dict) -> None:
@@ -4578,6 +4652,11 @@ def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_wri
     assert awaited["result_source"] == "frozen_run_snapshot"
     assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
     assert store.cleanup_recovery_path(run_id).is_file()
+    assert store.cleanup_uncertain_path(run_id).is_file()
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *_args, **_kwargs: True)
+    cancelled = app.cancel(run_id)
+    assert cancelled["state"] == "running"
+    assert cancelled["recovery_required"] is True
     assert store.cleanup_uncertain_path(run_id).is_file()
     with pytest.raises(ExperimentBusyError):
         app.launch("srv")

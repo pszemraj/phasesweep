@@ -123,8 +123,9 @@ def recover_run(
     _require_dead_runner(identity, earlier_boot=earlier_boot, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
+    transition_lock = store.transition_lock(handle) if confirm else contextlib.nullcontext()
     try:
-        with recovery_lock:
+        with recovery_lock, transition_lock:
             _cleanup_runner(
                 identity,
                 needs,

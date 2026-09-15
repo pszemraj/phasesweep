@@ -26,6 +26,7 @@ from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     ensure_private_dir,
     open_directory_fd,
+    open_lock_file,
     open_private_text,
     private_atomic_write_text,
     read_private_text_at,
@@ -310,6 +311,27 @@ class RunStore:
         finally:
             if handle is not None:
                 unlock_file(handle)
+
+    @contextlib.contextmanager
+    def transition_lock(self, handle: RunHandle) -> Iterator[None]:
+        """Serialize cancellation markers with confirmed recovery for one run.
+
+        The lock is shared across MCP servers and the operator CLI. Cancellation
+        holds it only while rereading state and writing its marker; recovery
+        holds it until cleanup evidence, terminal results, and marker removal
+        have all been persisted.
+
+        :param RunHandle handle: Run whose cleanup transition is protected.
+        :return Iterator[None]: Context manager for the transition.
+        """
+        import fcntl
+
+        lock_handle = open_lock_file(self._logs_dir / f"{handle.run_id}.transition.lock")
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            yield
+        finally:
+            unlock_file(lock_handle)
 
     def new_run_id(self, experiment_id: str) -> str:
         """Mint a fresh, collision-resistant run id prefixed with the experiment id.

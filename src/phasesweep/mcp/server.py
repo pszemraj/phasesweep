@@ -1818,25 +1818,33 @@ class PhaseSweepMCP:
                 "run_state": before,
                 "recovery_required": recovery_required,
             }
-            if before == "running" and handle.launch_state == "launching":
-                # No PID/PGID is durable yet. Signalling an empty identity and
-                # returning would let the launch continue immediately after a
-                # misleading cancellation response from a second server.
-                raise RunLaunchUnsettledError(run_id)
+            if before == "running":
+                with self._runs.transition_lock(handle):
+                    # Recovery may have finalized this run after the first
+                    # state read. Only a still-running run needs a new marker.
+                    before = self._runs.state(handle)
+                    recovery_required = self._runs.recovery_required(handle)
+                    state_before = {
+                        "run_state": before,
+                        "recovery_required": recovery_required,
+                    }
+                    if before == "running" and handle.launch_state == "launching":
+                        # No PID/PGID is durable yet. Signalling an empty identity
+                        # could let launch continue after a false cancel response.
+                        raise RunLaunchUnsettledError(run_id)
+                    if before == "running":
+                        # Reserve capacity before signalling; recovery cannot
+                        # clear this marker between the reread and its write.
+                        self._runs.mark_cleanup_uncertain(handle)
             after: RunState
             if before != "running":
                 after = before
                 confirmed: bool | None = None
             else:
-                # Concurrent callers deliberately converge without a cancel
-                # lock: marker writes are idempotent, kill_stale_group verifies
-                # the persisted process identity and treats an already-gone
-                # group as confirmed, terminal status is runner-authoritative,
-                # and marker removal uses missing_ok.
-                # Keep the run live before signalling. In the force-kill/no-status
-                # case state() could otherwise briefly derive "failed" while trial
-                # descendants still hold resources.
-                self._runs.mark_cleanup_uncertain(handle)
+                # Concurrent callers still signal outside the short transition
+                # lock. kill_stale_group treats an already-gone group as confirmed,
+                # terminal status is runner-authoritative, and marker removal
+                # uses missing_ok.
                 # SIGTERM -> grace -> SIGKILL on the runner's process group. A
                 # runner-written status is useful only when it includes explicit
                 # cleanup evidence from the engine shutdown handler. If the server
@@ -1855,18 +1863,23 @@ class PhaseSweepMCP:
                     pgid=identity.pgid,
                     grace_seconds=30.0,
                 )
-                terminal_status = self._runs.recorded_terminal_status(handle)
-                confirmed = runner_group_gone and (
-                    earlier_boot
-                    or (
-                        terminal_status is not None
-                        and terminal_status.get("cleanup_confirmed") is True
+                with self._runs.transition_lock(handle):
+                    terminal_status = self._runs.recorded_terminal_status(handle)
+                    cleanup_recovered = self._runs._cleanup_recovered(handle)
+                    confirmed = runner_group_gone and (
+                        earlier_boot
+                        or (
+                            terminal_status is not None
+                            and terminal_status.get("cleanup_confirmed") is True
+                        )
+                        or cleanup_recovered
                     )
-                )
-                if confirmed:
-                    self._runs.clear_cleanup_uncertain(handle)
-                after = self._runs.state(handle)
-                recovery_required = self._runs.recovery_required(handle)
+                    if confirmed and not cleanup_recovered:
+                        # Recovery owns any remaining marker after recording
+                        # cleanup; it may still be repairing the frozen result.
+                        self._runs.clear_cleanup_uncertain(handle)
+                    after = self._runs.state(handle)
+                    recovery_required = self._runs.recovery_required(handle)
             result = {
                 "run_id": run_id,
                 "state": after,
