@@ -916,15 +916,32 @@ def test_identical_semantic_environment_resumes_persistent_study(
     experiment = _environment_cohort_experiment(
         tmp_path,
         trainer,
-        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+        ExecutionContext(
+            inherit_env=[
+                "PHASESWEEP_DATASET_REV",
+                "WANDB_RUN_ID",
+                "PHASESWEEP_TRIAL_ID",
+                "PHASESWEEP_OBJECTIVE_PATH",
+            ]
+        ),
     )
     monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    monkeypatch.setenv("WANDB_RUN_ID", "outer-run-a")
+    monkeypatch.setenv("PHASESWEEP_TRIAL_ID", "outer-trial-a")
+    monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-a.json")
 
     run_experiment(experiment)
+    monkeypatch.setenv("WANDB_RUN_ID", "outer-run-b")
+    monkeypatch.setenv("PHASESWEEP_TRIAL_ID", "outer-trial-b")
+    monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-b.json")
     run_experiment(_with_trial_target(experiment, 2))
 
     study = optuna.load_study(study_name="t::p", storage=experiment.storage)
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
+    base = _environment_identity(experiment)
+    assert not {"WANDB_RUN_ID", "PHASESWEEP_TRIAL_ID", "PHASESWEEP_OBJECTIVE_PATH"} & set(
+        base.values
+    )
 
 
 def test_passthrough_token_rotation_resumes_persistent_study(

@@ -114,6 +114,18 @@ class TrialResult:
 # list to opt its ambient value in explicitly.
 _BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
 
+_TRIAL_BOUND_ENV = (
+    "PHASESWEEP_TRIAL_DIR",
+    "PHASESWEEP_TRIAL_ID",
+    "PHASESWEEP_PHASE",
+    "PHASESWEEP_RUN_NAME",
+    "PHASESWEEP_GENERATION_ID",
+    "PHASESWEEP_ATTEMPT_ID",
+    "PHASESWEEP_OVERRIDES_SHA256",
+    "PHASESWEEP_OBJECTIVE_PATH",
+    "WANDB_RUN_ID",
+)
+
 # Warn-once keys for :func:`_warn_dropped_cuda_visibility`, so a narrowed
 # contract reports the divergence once per phase instead of once per trial.
 _DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
@@ -126,7 +138,8 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
     ``none`` starts from the minimal base; a list adds exactly the named
     semantic ambient variables on top of that base. ``passthrough_env`` adds
     credential/transport variables to either narrowed contract. Configured
-    ``experiment.env`` values always apply last (review v0.5.17 / blocker 4).
+    ``experiment.env`` values apply last, except trial-bound keys that
+    PhaseSweep assigns for each attempt.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, str]: The composed trainer environment.
@@ -141,6 +154,10 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
         names.extend(experiment.execution.passthrough_env)
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
+    # These values are assigned for each trial after the base environment is
+    # recorded. Ambient copies cannot affect the trainer or its study cohort.
+    for name in _TRIAL_BOUND_ENV:
+        env.pop(name, None)
     return env
 
 
@@ -181,7 +198,8 @@ def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
     they are credentials or transport inputs allowed to rotate between
     invocations. Every other inherited value is semantic and must remain in
     one cohort for persistent-study reuse. Configured ``experiment.env``
-    entries are always semantic even if they reuse a pass-through name.
+    entries remain semantic even if they reuse a pass-through name, except
+    trial bindings assigned by PhaseSweep, which are removed first.
 
     The digest is the SHA-256 of the compact JSON encoding of the
     ``[[name, value], ...]`` pairs sorted by name. JSON is used rather than a
