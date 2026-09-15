@@ -46,6 +46,7 @@ from phasesweep.engine.attempts import (
     _register_active_attempt,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.fingerprints import _evaluation_semantics, _phase_fingerprint
 from phasesweep.engine.guards import _preflight_existing_studies
 from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _generation_path, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
@@ -56,6 +57,8 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     PHASE_ABORT_ATTR,
+    PHASE_EVALUATION_SEMANTICS_ATTR,
+    PHASE_FINGERPRINT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
@@ -177,6 +180,19 @@ def _stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
 
 
+def _stamp_current_evaluator_revision(
+    study: optuna.Study, experiment: Experiment, phase_name: str
+) -> None:
+    """Give a fabricated current-version study its recorded evaluator revision.
+
+    :param optuna.Study study: Fabricated study standing in for a current run.
+    :param Experiment experiment: Config whose evaluator produced its trials.
+    :param str phase_name: Phase owning the study.
+    """
+    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    study.set_user_attr(PHASE_EVALUATION_SEMANTICS_ATTR, _evaluation_semantics(experiment, phase))
+
+
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     """If config changed AND a stale RUNNING trial exists, reap must happen first.
 
@@ -262,6 +278,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     )
 
     _stamp_artifact_root(study, exp)
+    _stamp_current_evaluator_revision(study, exp, "a")
     identity = _environment_identity(exp)
     t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     t.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
@@ -328,6 +345,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
         _stamp_artifact_root(study, experiment)
+        _stamp_current_evaluator_revision(study, experiment, "b")
         _validate_artifact_root_binding(experiment, claim_fresh=True)
         trial = study.ask()
         trial_dir = _trial_dir_for(
@@ -350,6 +368,10 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         )
 
         experiment = experiment.model_copy(update={"env": {"STALE_PID": str(stale.pid)}})
+        study.set_user_attr(
+            PHASE_FINGERPRINT_ATTR,
+            _phase_fingerprint(experiment, experiment.phases[1], {}),
+        )
         identity = _environment_identity(experiment)
         trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
         trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
@@ -1375,6 +1397,8 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
     study, trial_dir, stale_number = _fabricate_stale_running_trial(
         exp, "p", attempt_id="queued-attempt"
     )
+    _stamp_current_evaluator_revision(study, exp, "p")
+    study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
     write_attempt_lifecycle(trial_dir, attempt_id="queued-attempt", state="allocated")
 
     winners = run_experiment(exp)
@@ -1831,6 +1855,10 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         attempt_id="partial-attempt",
         persist_trial_attempt_id=False,
         persist_trial_generation_id=False,
+    )
+    _stamp_current_evaluator_revision(study, experiment, "p")
+    study.set_user_attr(
+        PHASE_FINGERPRINT_ATTR, _phase_fingerprint(experiment, experiment.phases[0], {})
     )
     write_attempt_lifecycle(trial_dir, attempt_id="partial-attempt", state="allocated")
 
