@@ -1204,7 +1204,19 @@ class PhaseSweepMCP:
             run_id=run_id,
             include_run=True,
         )
+        captured_snapshot = snapshot
         snapshot, result_source = self._result_snapshot_view(experiment, handle, snapshot)
+        if (
+            captured_snapshot is None
+            and snapshot is not None
+            and handle is not None
+            and run is not None
+        ):
+            # A runner can finish the pending snapshot between result selection
+            # and this second read. Pair the newly frozen facts with its latest
+            # run state; an already-captured snapshot may legitimately coexist
+            # with a running cleanup reservation.
+            run = self._run_payload(handle)
         if snapshot is not None:
             status = self._snapshot_status_payload(
                 target_id,

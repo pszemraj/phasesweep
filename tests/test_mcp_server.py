@@ -2362,26 +2362,20 @@ def test_run_scoped_snapshot_survives_artifact_tree_relocation(
 
 
 @pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
-def test_run_scoped_read_keeps_snapshot_when_recovery_begins(
+def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     read_tool: str,
 ) -> None:
-    """Recovery cannot invalidate the terminal snapshot already selected for a read."""
+    """Cleanup uncertainty reserves the run without erasing its frozen result."""
     run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, store = make_mcp_app(catalog)
     store.config_snapshot_path(run_id).unlink()
-    read_terminal_status = store.recorded_terminal_status
-
-    def begin_recovery_after_status_read(handle: RunHandle) -> dict | None:
-        terminal = read_terminal_status(handle)
-        if terminal is not None and terminal.get("result_snapshot_state") == "complete":
-            # Match recover-run's first finalization write after this read has
-            # captured the complete snapshot, before response construction.
-            write_run_status(store, **{**terminal, "result_snapshot_state": "pending"})
-        return terminal
-
-    monkeypatch.setattr(store, "recorded_terminal_status", begin_recovery_after_status_read)
+    handle = store.get(run_id)
+    assert handle is not None
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    write_run_status(store, **{**terminal, "cleanup_confirmed": False})
+    store.mark_cleanup_uncertain(handle)
 
     payload: GetRunResultsResult | GetRunStatusResult | AwaitRunResult
     if read_tool == "winners":
@@ -2395,9 +2389,58 @@ def test_run_scoped_read_keeps_snapshot_when_recovery_begins(
             else GetRunStatusResult.model_validate(app.status(run_id=run_id))
         )
         assert payload.phases[0].winner_present is True
+        assert payload.run is not None
+        assert payload.run.state == "running"
+        assert payload.run.recovery_required is True
     assert payload.result_source == "frozen_run_snapshot"
     assert payload.publication_integrity == "ok"
     assert payload.represented_generation_id == run_id
+
+
+@pytest.mark.parametrize("read_tool", ["status", "await_run"])
+def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
+) -> None:
+    """A pending-to-complete write cannot pair terminal facts with running state."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
+    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    original_run_payload = app._run_payload
+    finalized = False
+
+    def finish_after_run_payload(saved: RunHandle) -> dict[str, Any]:
+        nonlocal finalized
+        run = original_run_payload(saved)
+        if not finalized:
+            assert run["state"] == "running"
+            finalized = True
+            write_run_status(store, **complete)
+        return run
+
+    monkeypatch.setattr(app, "_run_payload", finish_after_run_payload)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = (
+        asyncio.run(app.await_run(run_id, timeout_seconds=0))
+        if read_tool == "await_run"
+        else app.status(run_id=run_id)
+    )
+
+    assert finalized
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["run"]["state"] == "succeeded"
+    assert payload["run"]["recovery_required"] is False
+    if read_tool == "status":
+        assert (
+            _status_next_action(GetRunStatusResult.model_validate(payload)) == TOOL_GET_RUN_RESULTS
+        )
+    else:
+        assert payload["reason"] == "terminal"
 
 
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
