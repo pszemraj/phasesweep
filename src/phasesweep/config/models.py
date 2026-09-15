@@ -380,19 +380,23 @@ class Phase(_Frozen):
     @field_validator("name")
     @classmethod
     def _name_is_safe(cls, v: str) -> str:
-        """Reject unsafe names and the reserved recovery directory name.
+        """Reject unsafe names and reserved experiment-root directory names.
 
         Args:
             v: The candidate phase name.
 
         Returns:
             The same name, unchanged. Raises ``ValueError`` if any character
-            is disallowed or the name is reserved for the recovery registry.
+            is disallowed or the name collides with engine-managed records.
 
         """
         v = _validate_safe_name("Phase", v)
         if v.casefold() == "attempts":
             raise ValueError("Phase name 'attempts' is reserved for the runtime recovery registry.")
+        if v.casefold() == "generations":
+            raise ValueError(
+                "Phase name 'generations' is reserved for immutable generation records."
+            )
         return v
 
     @model_validator(mode="after")
