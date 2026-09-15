@@ -327,7 +327,10 @@ def _require_mcp_stable_paths(
             "monitored across detached processes",
             suggestion=_suggest_storage(config_dir),
         )
-    if not Path(raw_path).expanduser().is_absolute():
+    storage_path = Path(raw_path)
+    if backend == "journal":
+        storage_path = storage_path.expanduser()
+    if not storage_path.is_absolute():
         raise CatalogError(
             f"{experiment_id!r}: MCP experiments must use an absolute {backend} "
             "storage path; relative storage URLs depend on the server launch "

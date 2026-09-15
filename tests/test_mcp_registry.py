@@ -340,6 +340,14 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
             id="relative-sqlite-uri",
         ),
         pytest.param(
+            '"sqlite:///~/literal.db"', "absolute .*storage path", id="literal-tilde-sqlite"
+        ),
+        pytest.param(
+            '"sqlite:///file:~/literal.db?mode=rwc&uri=true"',
+            "absolute .*storage path",
+            id="literal-tilde-sqlite-uri",
+        ),
+        pytest.param(
             '"journal:///relative.journal"',
             "absolute .*storage path",
             id="relative-journal",
@@ -378,6 +386,25 @@ def test_nonpersistent_storage_rejected_for_mcp(
 
     with pytest.raises(CatalogError, match=error_match):
         Registry.load(_catalog(tmp_path, config))
+
+
+def test_home_expanded_journal_storage_is_accepted_for_mcp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Journal paths retain their established home-directory expansion."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    config = _write(
+        tmp_path / "exp.yaml",
+        _experiment_yaml(tmp_path).replace(
+            f"sqlite:///{tmp_path}/reg_ok.db", '"journal:///~/reg_ok.journal"'
+        ),
+    )
+
+    registry = Registry.load(_catalog(tmp_path, config))
+
+    assert registry.get("reg_ok").experiment.resolved_storage == "journal:///~/reg_ok.journal"
 
 
 def test_config_hash_and_model_come_from_same_startup_snapshot(
