@@ -1231,6 +1231,26 @@ def test_suite_pointer_anchors_the_exact_summary_bytes(tmp_path: Path) -> None:
     assert payload["summary_sha256"] == hashlib.sha256(summary).hexdigest()
 
 
+@pytest.mark.parametrize("exposed", ["yes", None])
+def test_suite_pointer_rejects_nonboolean_exposure(tmp_path: Path, exposed: object) -> None:
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    assert pointer.generation_id is not None
+    summary_path = _suite_generation_summary_path(suite, pointer.generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    phase = summary["studies"][0]["phases"][0]
+    phase["exposed"] = exposed
+    phase["metric"] = 999.0
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_suite_generation_path(suite), summary_path)
+
+    assert _resolve_suite_publication_pointer(suite).state == "failed"
+    with pytest.raises(PublicationIntegrityError):
+        _show_suite_winners(suite)
+
+
 @pytest.mark.parametrize("tamper", ["generation_id", "summary_path"])
 def test_suite_component_map_is_pointer_anchored_and_cross_checked(
     tmp_path: Path,

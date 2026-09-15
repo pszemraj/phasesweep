@@ -948,6 +948,8 @@ def _validate_suite_summary_integrity(
         for item in phases:
             if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
                 raise _fail(f"study {name!r} has a malformed phase entry")
+            if type(item.get("exposed")) is not bool:
+                raise _fail(f"study {name!r} phase {item['name']!r} has no valid exposed flag")
             if item.get("exposed") is not True:
                 continue
             source = item.get("winner_source")
