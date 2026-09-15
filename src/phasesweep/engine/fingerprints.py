@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
 )
 from phasesweep.engine.state import (
+    FAILURE_REASON_ATTR,
     PHASE_EVALUATION_SEMANTICS_ATTR,
     PHASE_FINGERPRINT_ATTR,
     Winner,
@@ -288,15 +290,38 @@ def _phase_fingerprint(
     return _semantic_payload_digest(payload)
 
 
-def _only_failed_trials(study: optuna.Study) -> bool:
-    """Return whether recovery left no reusable or still-running trial readings.
+def _only_failed_trials(
+    study: optuna.Study, experiment: Experiment, revisions: Mapping[str, int]
+) -> bool:
+    """Return whether failed trials cannot contain affected evaluator readings.
 
     :param optuna.Study study: Existing phase study after stale-trial reaping.
-    :return bool: ``True`` for an empty study or one containing only failed trials.
+    :param Experiment experiment: Config naming the affected metric and constraints.
+    :param Mapping[str, int] revisions: Evaluators whose semantics changed.
+    :return bool: ``True`` for an empty study or failed trials whose recorded
+        causes are independent of the affected evaluators.
     """
-    return all(
-        trial.state == optuna.trial.TrialState.FAIL for trial in study.get_trials(deepcopy=False)
-    )
+    for trial in study.get_trials(deepcopy=False):
+        if trial.state != optuna.trial.TrialState.FAIL:
+            return False
+        reason = trial.user_attrs.get(FAILURE_REASON_ATTR)
+        if isinstance(reason, str) and (
+            (
+                isinstance(experiment.metric.extractor, LogRegexExtractor)
+                and reason.startswith("metric extractor")
+            )
+            or any(
+                isinstance(constraint.extractor, LogRegexExtractor)
+                and reason.startswith(f"constraint extractor {constraint.name!r}")
+                for constraint in experiment.constraints
+            )
+            or (
+                "artifact_size directory gate" in revisions
+                and reason.startswith("evidence gates failed:")
+            )
+        ):
+            return False
+    return True
 
 
 def _verify_evaluation_semantics(
@@ -321,7 +346,7 @@ def _verify_evaluation_semantics(
     recorded = study.user_attrs.get(PHASE_EVALUATION_SEMANTICS_ATTR)
     if recorded == revisions:
         return
-    if not _only_failed_trials(study):
+    if not _only_failed_trials(study, experiment, revisions):
         evaluators = ", ".join(revisions)
         raise StudyFingerprintMismatchError(
             f"Phase {phase.name!r} study {study.study_name!r} has incompatible or "
@@ -354,8 +379,8 @@ def _verify_fingerprint(
     fp = _phase_fingerprint(experiment, phase, inherited_winners)
     existing = study.user_attrs.get(PHASE_FINGERPRINT_ATTR)
     if existing is None:
-        if not _only_failed_trials(study) and (
-            revisions := _evaluation_semantics(experiment, phase)
+        if (revisions := _evaluation_semantics(experiment, phase)) and not _only_failed_trials(
+            study, experiment, revisions
         ):
             evaluators = ", ".join(revisions)
             raise StudyFingerprintMismatchError(
@@ -381,7 +406,9 @@ def _verify_fingerprint(
             study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
             _verify_evaluation_semantics(study, experiment, phase, stamp_safe=True)
             return fp
-        if (revisions := _evaluation_semantics(experiment, phase)) and _only_failed_trials(study):
+        if (revisions := _evaluation_semantics(experiment, phase)) and _only_failed_trials(
+            study, experiment, revisions
+        ):
             legacy_payload = _phase_semantic_payload(experiment, phase, inherited_winners)
             legacy_payload.pop("evaluation_semantics", None)
             if existing == _semantic_payload_digest(legacy_payload):

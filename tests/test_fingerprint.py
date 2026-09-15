@@ -92,6 +92,7 @@ from phasesweep.engine.resume import _reject_bound_descendant_topups
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
+    FAILURE_REASON_ATTR,
     PHASE_EVALUATION_SEMANTICS_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
@@ -687,15 +688,47 @@ def test_evaluator_revision_rejects_only_affected_legacy_fingerprints(
         with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
             _verify_fingerprint(unstamped, experiment, phase, {})
 
-        # Recovery-only FAIL trials carry no objective or gate reading to mix.
-        # Rebind only when the stored identity is this exact pre-revision config.
+        # A trainer failure precedes evaluation, so this exact legacy config
+        # can recover without mixing evaluator readings.
         failed_only = optuna.create_study()
         failed_only.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
-        failed_only.tell(failed_only.ask(), state=optuna.trial.TrialState.FAIL)
+        failed_trial = failed_only.ask()
+        failed_trial.set_user_attr(FAILURE_REASON_ATTR, "non-zero exit code 1")
+        failed_only.tell(failed_trial, state=optuna.trial.TrialState.FAIL)
         assert _verify_fingerprint(failed_only, experiment, phase, {}) == _phase_fingerprint(
             experiment, phase, {}
         )
         assert failed_only.user_attrs[PHASE_EVALUATION_SEMANTICS_ATTR] == revisions
+
+        # A FAIL caused by the affected evaluator records an old interpretation
+        # even though it has no reusable metric value.
+        failed_evaluation = optuna.create_study()
+        failed_evaluation.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+        evaluated_trial = failed_evaluation.ask()
+        reason = {
+            "objective": "metric extractor: no valid log-regex match",
+            "constraint": "constraint extractor 'memory': no valid log-regex match",
+            "phase-directory": "evidence gates failed: checkpoint directory too large",
+            "contract-directory": "evidence gates failed: checkpoint directory too large",
+        }[scenario]
+        evaluated_trial.set_user_attr(FAILURE_REASON_ATTR, reason)
+        failed_evaluation.tell(evaluated_trial, state=optuna.trial.TrialState.FAIL)
+        with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
+            _verify_fingerprint(failed_evaluation, experiment, phase, {})
+        assert failed_evaluation.user_attrs["phasesweep_fingerprint"] == legacy_fingerprint
+        assert PHASE_EVALUATION_SEMANTICS_ATTR not in failed_evaluation.user_attrs
+
+        if scenario == "constraint":
+            # This study's JSON objective can fail before the affected regex
+            # constraint runs; its failed row is safe to retain.
+            unrelated_failure = optuna.create_study()
+            unrelated_failure.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+            json_trial = unrelated_failure.ask()
+            json_trial.set_user_attr(FAILURE_REASON_ATTR, "metric extractor: missing JSON result")
+            unrelated_failure.tell(json_trial, state=optuna.trial.TrialState.FAIL)
+            assert _verify_fingerprint(
+                unrelated_failure, experiment, phase, {}
+            ) == _phase_fingerprint(experiment, phase, {})
 
     current = optuna.create_study()
     current_fingerprint = _phase_fingerprint(experiment, phase, {})
