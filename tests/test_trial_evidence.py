@@ -14,7 +14,9 @@ an earlier generation must find that generation in this same tree.
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
+from copy import deepcopy
 from pathlib import Path
 
 import optuna
@@ -39,7 +41,9 @@ from phasesweep.engine.paths import (
     _phase_dir,
 )
 from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import (
+    OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
 )
 from tests.conftest import assert_published_winner_evidence_local, make_experiment, write_trainer
@@ -298,6 +302,42 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     # whose evidence was broken, and nothing published over the damaged tree.
     assert _trial_count(topup) == 1
     assert _pointer_bytes(topup) == pointer_before
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["empty", "file_without_path", "file_without_digest", "wandb_without_address"],
+)
+def test_present_incomplete_objective_provenance_blocks_selection(
+    tmp_path: Path, damage: str
+) -> None:
+    """Only absent provenance is legacy; partial current records cannot publish."""
+    experiment = _evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=experiment.storage,
+    )
+    trial = deepcopy(study.get_trials(deepcopy=False)[0])
+    record = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
+    if damage == "empty":
+        record = {}
+    elif damage == "file_without_path":
+        record["source"].pop("path")
+    elif damage == "file_without_digest":
+        record["source"].pop("sha256")
+    else:
+        record["extractor"]["kind"] = "wandb"
+        record["source"] = {"kind": "wandb"}
+    trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR] = json.dumps(record)
+    study = optuna.create_study(direction="minimize")
+    study.add_trial(trial)
+
+    with pytest.raises(TrialEvidenceMissingError, match="objective_provenance"):
+        evidence_ops._validate_selection_evidence(experiment, {"p": study})
+    with pytest.raises(TrialEvidenceMissingError, match="objective_provenance"):
+        selected = select_winner(study, experiment, phase_name="p")
+        evidence_ops._verify_winner_objective_evidence(experiment, "p", selected)
 
 
 def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:

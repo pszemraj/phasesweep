@@ -13,12 +13,12 @@ import optuna
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
 from phasesweep.engine.artifacts import _winner_common_payload, _winner_source_or_default
 from phasesweep.engine.errors import PhaseSweepError, PromotionError, TrialEvidenceMissingError
+from phasesweep.engine.evidence import _trial_objective_provenance
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
-    OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
@@ -183,25 +183,7 @@ def select_winner(
             )
         gates = parsed_gates
 
-    provenance: dict[str, Any] | None = None
-    raw_provenance = best.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR)
-    if raw_provenance is not None:
-        if not isinstance(raw_provenance, str) or not raw_provenance:
-            raise TrialEvidenceMissingError(
-                f"Winning trial {best.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
-            )
-        try:
-            parsed_provenance = json.loads(raw_provenance)
-        except json.JSONDecodeError as exc:
-            raise TrialEvidenceMissingError(
-                f"Winning trial {best.number} has corrupt "
-                f"{OBJECTIVE_PROVENANCE_ATTR!r} JSON evidence."
-            ) from exc
-        if not isinstance(parsed_provenance, dict):
-            raise TrialEvidenceMissingError(
-                f"Winning trial {best.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
-            )
-        provenance = parsed_provenance
+    provenance = _trial_objective_provenance(best)
 
     env_digest = best.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
     raw_trainer_input = best.user_attrs.get(TRAINER_INPUT_ATTR)

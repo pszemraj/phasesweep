@@ -6,7 +6,7 @@ import json
 import math
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import optuna
 
@@ -25,6 +25,7 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     Winner,
 )
+from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from phasesweep.runtime.files import (
     file_sha256,
 )
@@ -87,11 +88,11 @@ def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str,
     return generation_id, attempt_id
 
 
-def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> Mapping[str, Any] | None:
+def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, Any] | None:
     """Decode a trial's frozen objective-evidence provenance record.
 
     :param optuna.trial.FrozenTrial trial: Trial whose provenance attr is read.
-    :return Mapping[str, Any] | None: The parsed record, or ``None`` when the
+    :return dict[str, Any] | None: The parsed record, or ``None`` when the
         trial predates the record (review v0.5.17 / finding F).
     :raises TrialEvidenceMissingError: A present provenance record is corrupt
         or has an unsupported shape.
@@ -109,11 +110,77 @@ def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> Mapping[str,
         raise TrialEvidenceMissingError(
             f"Trial {trial.number} has corrupt {OBJECTIVE_PROVENANCE_ATTR!r} JSON evidence."
         ) from exc
-    if not isinstance(parsed, Mapping):
+    if not isinstance(parsed, dict):
         raise TrialEvidenceMissingError(
             f"Trial {trial.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
         )
+    _validate_objective_provenance(parsed, subject=f"Trial {trial.number}")
     return parsed
+
+
+def _valid_sha256(value: object) -> bool:
+    """Recognize a SHA-256 digest as written by PhaseSweep.
+
+    :param object value: Recorded digest candidate.
+    :return bool: Whether it is a lowercase 64-character hex digest.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: str) -> None:
+    """Require a present objective record to retain its source binding.
+
+    :param Mapping[str, Any] provenance: Parsed trial or winner provenance.
+    :param str subject: Trial or winner label for the diagnostic.
+    :raises TrialEvidenceMissingError: The record is incomplete or malformed.
+    """
+
+    def fail(reason: str) -> NoReturn:
+        raise TrialEvidenceMissingError(
+            f"{subject} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence "
+            f"({reason}). {_TRIAL_EVIDENCE_REMEDY}"
+        )
+
+    if provenance.get("schema_version") != EVIDENCE_PROVENANCE_SCHEMA_VERSION:
+        fail("unsupported schema version")
+    extractor = provenance.get("extractor")
+    if not isinstance(extractor, Mapping):
+        fail("missing extractor identity")
+    kind = extractor.get("kind")
+    if kind not in {"json", "json_envelope", "log_regex", "wandb"} or not _valid_sha256(
+        extractor.get("config_sha256")
+    ):
+        fail("invalid extractor identity")
+    if not isinstance(provenance.get("recorded_at"), str) or not provenance["recorded_at"]:
+        fail("missing capture time")
+    source = provenance.get("source")
+    if not isinstance(source, Mapping):
+        fail("missing source")
+    if kind == "wandb":
+        if source.get("kind") != "wandb" or any(
+            not isinstance(source.get(field), str) or not source[field]
+            for field in ("base_url", "entity", "project", "run_id", "retrieved_at")
+        ):
+            fail("missing W&B source address")
+        if (
+            source.get("run_state") != "finished"
+            or not isinstance(source.get("summary"), Mapping)
+            or not source["summary"]
+        ):
+            fail("missing W&B terminal summary")
+    elif (
+        source.get("kind") != "file"
+        or not isinstance(source.get("path"), str)
+        or not source["path"]
+        or type(source.get("size_bytes")) is not int
+        or source["size_bytes"] < 0
+        or not _valid_sha256(source.get("sha256"))
+    ):
+        fail("missing file source path, size, or digest")
 
 
 def _verify_objective_source_evidence(
@@ -125,10 +192,10 @@ def _verify_objective_source_evidence(
 ) -> None:
     """Require a trial's frozen objective source to still be on disk as recorded.
 
-    A missing or absent provenance record is tolerated: trials persisted before
-    the record existed simply have no source to locate (see
-    :class:`phasesweep.engine.selection.SelectedTrial`). A ``wandb`` source is
-    tolerated too - it names a remote run, not a file in this tree.
+    An absent provenance record is tolerated for trials persisted before the
+    record existed (see :class:`phasesweep.engine.selection.SelectedTrial`). A
+    present record must be complete. A valid ``wandb`` source names a remote
+    run, not a file in this tree.
 
     :param Path trial_dir: Structurally translated directory for the trial.
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
@@ -136,19 +203,17 @@ def _verify_objective_source_evidence(
     :param bool verify_digest: Also re-hash the source and compare it against
         the recorded ``sha256``. Reserved for the winner (see
         :func:`_verify_winner_objective_evidence`).
-    :raises TrialEvidenceMissingError: The recorded file source is missing,
-        unreadable, or no longer the bytes the published scalar came from.
+    :raises TrialEvidenceMissingError: A present record is malformed, or its
+        file source is missing, unreadable, or no longer the recorded bytes.
     """
     if provenance is None:
         return
-    source = provenance.get("source")
-    if not isinstance(source, Mapping) or source.get("kind") != "file":
+    _validate_objective_provenance(provenance, subject=subject)
+    source = provenance["source"]
+    assert isinstance(source, Mapping)  # required by _validate_objective_provenance
+    if source.get("kind") == "wandb":
         return
-    raw_path = source.get("path")
-    if not isinstance(raw_path, str) or not raw_path:
-        # A file source always records its path; a record that does not is not
-        # a shape any PhaseSweep build writes, so there is nothing to locate.
-        return
+    raw_path = str(source["path"])
     candidate = Path(raw_path)
     source_path = candidate if candidate.is_absolute() else trial_dir / candidate
     try:
@@ -158,9 +223,8 @@ def _verify_objective_source_evidence(
             f"{subject} recorded its objective evidence in {raw_path!r}, which is missing or "
             f"unreadable at {str(source_path)!r}. {_TRIAL_EVIDENCE_REMEDY}"
         ) from exc
-    recorded_size = source.get("size_bytes")
-    size_recorded = isinstance(recorded_size, int) and not isinstance(recorded_size, bool)
-    if size_recorded and stat_result.st_size != recorded_size:
+    recorded_size = int(source["size_bytes"])
+    if stat_result.st_size != recorded_size:
         raise TrialEvidenceMissingError(
             f"{subject} recorded its objective evidence in {raw_path!r} as "
             f"{recorded_size} bytes, but that file is now {stat_result.st_size} bytes. "
@@ -168,9 +232,7 @@ def _verify_objective_source_evidence(
         )
     if not verify_digest:
         return
-    recorded_digest = source.get("sha256")
-    if not isinstance(recorded_digest, str) or not recorded_digest:
-        return
+    recorded_digest = str(source["sha256"])
     try:
         actual_digest = file_sha256(source_path)
     except OSError as exc:
