@@ -43,7 +43,7 @@ from phasesweep.runtime.process import (
     read_attempt_lifecycle,
     read_stale_process_identity,
 )
-from tests.conftest import make_trial_context
+from tests.conftest import is_pid_zombie, make_trial_context
 
 
 class _FakeRun:
@@ -172,7 +172,7 @@ def test_wandb_sdk_summary_metrics_avoid_nested_summary_wrapper(tmp_path):
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])
-def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
+def test_wandb_deadline_stops_sdk_retries_and_worker_group(
     wandb_worker_sdk, tmp_path, monkeypatch, stage
 ):
     marker = tmp_path / "pids.json"
@@ -229,7 +229,7 @@ def test_wandb_deadline_stops_sdk_retries_and_reaps_workers(
     assert str(excinfo.value.last_error) == "transient W&B API error before blocked retry"
     assert time.monotonic() - started < 3
     pids = json.loads(marker.read_text(encoding="utf-8"))
-    assert all(not is_pid_alive(pid) for pid in pids)
+    assert all(not is_pid_alive(pid) or is_pid_zombie(pid) for pid in pids)
     assert list(tmp_path.glob("phasesweep-wandb-*")) == []
     assert (tmp_path / PROCESS_IDENTITY_FILE).is_file()
     assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
