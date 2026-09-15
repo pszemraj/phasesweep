@@ -2855,6 +2855,10 @@ def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> 
         data["phase_fingerprint"] = "0" * 64
         return "different phase config"
 
+    def malformed_fingerprint(data: dict) -> str:
+        data["phase_fingerprint"] = 7
+        return "invalid phase_fingerprint"
+
     def strip_generation_id(data: dict) -> str:
         del data["generation_id"]
         return "no valid generation_id"
@@ -2870,6 +2874,7 @@ def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> 
     cases = (
         ("missing-fingerprint", strip_fingerprint),
         ("tampered-fingerprint", tamper_fingerprint),
+        ("malformed-fingerprint", malformed_fingerprint),
         ("legacy-generation", strip_generation_id),
         ("legacy-attempt", strip_attempt_id),
         ("legacy-source", strip_winner_source),

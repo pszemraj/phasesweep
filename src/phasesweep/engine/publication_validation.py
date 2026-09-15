@@ -263,9 +263,35 @@ def _validate_generation_manifest(
                 recorded = payload.get(id_field)
                 if not isinstance(recorded, str) or not recorded:
                     raise _fail(f"winner for phase {name!r} has no valid {id_field}")
+            fingerprint = payload.get("phase_fingerprint")
+            if (
+                not isinstance(fingerprint, str)
+                or len(fingerprint) != 64
+                or any(char not in "0123456789abcdef" for char in fingerprint)
+            ):
+                raise _fail(f"winner for phase {name!r} has no valid phase_fingerprint")
             source = payload.get("winner_source")
             if not isinstance(source, Mapping):
                 raise _fail(f"winner for phase {name!r} has no valid winner_source")
+            if source.get("kind") not in ("phase_trial", "promotion_baseline", "suite_baseline"):
+                raise _fail(f"winner for phase {name!r} has no valid winner_source kind")
+            source_phase = source.get("phase")
+            if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
+                raise _fail(f"winner for phase {name!r} has no valid winner_source phase")
+            if source.get("kind") == "phase_trial" and source_phase != name:
+                raise _fail(f"winner for phase {name!r} names another winner_source phase")
+            source_trial = source.get("trial_number")
+            if (
+                not isinstance(source_trial, int)
+                or isinstance(source_trial, bool)
+                or source_trial != payload.get("trial_number")
+            ):
+                raise _fail(f"winner for phase {name!r} has no valid winner_source trial_number")
+            source_study = source.get("study")
+            if source_study is not None and (not isinstance(source_study, str) or not source_study):
+                raise _fail(f"winner for phase {name!r} has no valid winner_source study")
+            if source.get("kind") == "suite_baseline" and not source_study:
+                raise _fail(f"winner for phase {name!r} has no valid winner_source study")
             for id_field in ("generation_id", "attempt_id"):
                 if source.get(id_field) != payload.get(id_field):
                     raise _fail(
@@ -276,7 +302,7 @@ def _validate_generation_manifest(
                 generation_dir,
                 generation_id,
                 name,
-                source.get("phase"),
+                source_phase,
                 payload,
                 _fail,
                 _permission_fail,

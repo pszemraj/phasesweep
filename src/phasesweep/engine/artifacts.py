@@ -396,6 +396,9 @@ def _load_winner(
             f"file and re-run to regenerate it with a fingerprint."
         )
 
+    if not isinstance(stored_fp, str):
+        raise WinnerIntegrityError(f"Winner file {path} has an invalid phase_fingerprint.")
+
     if stored_fp != current_fp:
         if revisions := fingerprint_ops._evaluation_semantics(experiment, phase):
             evaluators = ", ".join(revisions)

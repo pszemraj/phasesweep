@@ -786,6 +786,45 @@ def test_manifest_rejects_winner_source_identity_disagreement(
     assert read_winner(experiment, "p") is None
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kind", "unknown_source"),
+        ("phase", "../other"),
+        ("phase", "other"),
+        ("trial_number", 999),
+        ("study", 999),
+        ("phase_fingerprint", 999),
+    ],
+)
+def test_manifest_rejects_malformed_reanchored_winner_provenance(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner = yaml.safe_load(winner_path.read_text())
+    if field == "phase_fingerprint":
+        winner[field] = value
+    else:
+        winner["winner_source"][field] = value
+    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    artifact = next(
+        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
+    )
+    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+    assert _resolve_publication_pointer(experiment).state == "failed"
+    assert read_status(experiment)["publication_integrity"] == "failed"
+    assert read_winner(experiment, "p") is None
+
+
 def test_read_side_accepts_legacy_summary_without_manifest(tmp_path: Path) -> None:
     """A pre-manifest summary (no schema_version) keeps the identity-only gate."""
     experiment = _stored_experiment(tmp_path)
