@@ -219,6 +219,7 @@ def make_run_handle(
         launch_state=launch_state,
         allow_cancel=allow_cancel,
         visible_params_at_launch=visible_params_at_launch,
+        boot_id=read_boot_id() if launch_state == "spawned" else None,
     )
 
 

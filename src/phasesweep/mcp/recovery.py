@@ -37,7 +37,6 @@ from phasesweep.mcp.runs import (
     ProcessIdentity,
     RunHandle,
     RunStore,
-    identity_from_earlier_boot,
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (
@@ -47,7 +46,7 @@ from phasesweep.mcp.snapshots import (
     parse_result_snapshot,
 )
 from phasesweep.runtime.files import private_atomic_write_text
-from phasesweep.runtime.process import is_same_live_process, kill_stale_group
+from phasesweep.runtime.process import is_same_live_process, kill_stale_group, read_boot_id
 from phasesweep.runtime.time import utc_now_iso
 
 
@@ -119,7 +118,17 @@ def recover_run(
         return
 
     identity = store.cleanup_identity(handle)
-    earlier_boot = identity_from_earlier_boot(identity.boot_id)
+    current_boot = read_boot_id()
+    if needs.cleanup_needed and (identity.boot_id is None or current_boot is None):
+        raise RunRecoveryError(
+            "runner boot id is unavailable; refusing automated process-group cleanup "
+            "because PID reuse after reboot cannot be ruled out"
+        )
+    earlier_boot = (
+        identity.boot_id is not None
+        and current_boot is not None
+        and identity.boot_id != current_boot
+    )
     _require_dead_runner(identity, earlier_boot=earlier_boot, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()

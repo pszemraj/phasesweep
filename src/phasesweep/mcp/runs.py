@@ -174,8 +174,9 @@ def identity_from_earlier_boot(boot_id: str | None) -> bool:
     earlier boot survived it, so the process and every descendant it ever had
     are conclusively gone and cleanup needs no signal. An unknown boot id on
     either side (a handle written before boot ids were recorded, or a host
-    without ``/proc/sys/kernel/random/boot_id``) yields ``False``, leaving the
-    caller's conservative same-boot behavior unchanged.
+    without ``/proc/sys/kernel/random/boot_id``) yields ``False``. Callers
+    performing cleanup must separately refuse to signal when either boot id
+    is unknown.
 
     :param str | None boot_id: Boot identity recorded when the process launched.
     :return bool: Whether both boot ids are known and differ.

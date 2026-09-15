@@ -665,9 +665,9 @@ def _persist_spawned_handle(
     :param str config_sha256: Hash of the config snapshot this runner executes.
     :param str started_at: ISO-8601 UTC launch timestamp recorded by the server.
     :param bool allow_cancel: Cancel permission frozen at launch time.
-    :raises RuntimeError: If Linux ``/proc`` start time is unavailable, so the
-        handle could not be made PID-reuse safe, or the server never created a
-        pending handle for ``run_id``.
+    :raises RuntimeError: If Linux ``/proc`` start time or boot id is unavailable,
+        so the handle could not be made PID-reuse safe, or the server never
+        created a pending handle for ``run_id``.
     """
     store = RunStore(state_dir)
     pid = os.getpid()
@@ -677,6 +677,11 @@ def _persist_spawned_handle(
         raise RuntimeError(
             "cannot persist a PID-reuse-safe MCP runner handle because Linux "
             "/proc start time is unavailable"
+        )
+    boot_id = read_boot_id()
+    if boot_id is None:
+        raise RuntimeError(
+            "cannot persist a PID-reuse-safe MCP runner handle because Linux boot id is unavailable"
         )
     pending = store.get(run_id)
     if pending is None:
@@ -696,7 +701,7 @@ def _persist_spawned_handle(
             # Binds pid/pid_starttime to this boot: after a reboot the pair can
             # name an unrelated process, and a reader that knows the boot
             # differs can rule the runner dead without signalling anything.
-            boot_id=read_boot_id(),
+            boot_id=boot_id,
         )
     )
 

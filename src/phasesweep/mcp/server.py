@@ -71,7 +71,6 @@ from phasesweep.mcp.runs import (
     RunHandle,
     RunState,
     RunStore,
-    identity_from_earlier_boot,
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (
@@ -1863,16 +1862,23 @@ class PhaseSweepMCP:
                 # uncertainty, child trial PGIDs may still live, so keep the run
                 # counted as live and fail closed.
                 identity = self._runs.cleanup_identity(handle)
-                # A recorded boot id from an earlier boot proves the runner and
-                # its trial descendants cannot exist, so signalling the saved
-                # PGID would only reach whatever inherited those numbers after
-                # the reboot. Skip the signal and treat cleanup as confirmed.
-                earlier_boot = identity_from_earlier_boot(identity.boot_id)
-                runner_group_gone = earlier_boot or kill_stale_group(
-                    identity.pid,
-                    identity.pid_starttime,
-                    pgid=identity.pgid,
-                    grace_seconds=30.0,
+                current_boot = read_boot_id()
+                same_boot = identity.boot_id is not None and identity.boot_id == current_boot
+                earlier_boot = (
+                    identity.boot_id is not None
+                    and current_boot is not None
+                    and identity.boot_id != current_boot
+                )
+                # A prior boot proves cleanup without a signal. An unknown boot
+                # cannot make saved PID/starttime safe to signal after reboot.
+                runner_group_gone = earlier_boot or (
+                    same_boot
+                    and kill_stale_group(
+                        identity.pid,
+                        identity.pid_starttime,
+                        pgid=identity.pgid,
+                        grace_seconds=30.0,
+                    )
                 )
                 with self._runs.transition_lock(handle):
                     terminal_status = self._runs.recorded_terminal_status(handle)
@@ -2218,6 +2224,11 @@ class PhaseSweepMCP:
                     raise RuntimeError(
                         "spawned runner has no Linux /proc start time; refused launch because "
                         "later cancellation could not distinguish PID reuse"
+                    )
+                if handle.boot_id is None:
+                    raise RuntimeError(
+                        "spawned runner has no Linux boot id; refused launch because later "
+                        "cancellation could not distinguish PID reuse after reboot"
                     )
                 readable, _, _ = select.select(
                     [ready_read],

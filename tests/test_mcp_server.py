@@ -23,6 +23,8 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import phasesweep.mcp.recovery as mcp_recovery
+import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.server as mcp_server
 from phasesweep.cli import cli as cli_main
@@ -1370,6 +1372,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         pid=999999,
         pgid=999999,
         pid_starttime=111,
+        boot_id=read_boot_id(),
     )
     original_state = store.state
     first_read = True
@@ -1749,6 +1752,54 @@ def test_launch_records_the_current_boot_id_in_the_spawned_handle(
     assert handle.boot_id == read_boot_id()
 
 
+def test_launch_refuses_a_runner_receipt_without_boot_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    monkeypatch.setattr(mcp_server, "read_boot_id", lambda: None)
+    monkeypatch.setattr("tests.mcp_helpers.read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(RuntimeError, match="boot id"):
+        app.launch("srv")
+
+    (pending,) = store.list_handles()
+    assert store.state(pending) == "failed"
+
+
+def test_runner_does_not_persist_a_receipt_without_boot_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run_id = "srv-no-boot"
+    started_at = "2026-06-24T00:00:00Z"
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256="0" * 64,
+        started_at=started_at,
+    )
+    monkeypatch.setattr(mcp_runner, "read_boot_id", lambda: None)
+
+    with pytest.raises(RuntimeError, match="boot id"):
+        mcp_runner._persist_spawned_handle(
+            state_dir=tmp_path / "state",
+            run_id=run_id,
+            experiment_id="srv",
+            config_sha256="0" * 64,
+            started_at=started_at,
+            allow_cancel=False,
+        )
+
+    pending = store.get(run_id)
+    assert pending is not None
+    assert pending.launch_state == "launching"
+
+
 def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1790,6 +1841,47 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
     assert result["cleanup_confirmed"] is True
     # The orphaned pending snapshot is a separate operator concern from process
     # cleanup, so it still asks for recovery.
+    assert result["recovery_required"] is True
+
+
+@pytest.mark.parametrize("unknown_side", ["saved", "current"])
+def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unknown_side: str,
+) -> None:
+    current_boot = read_boot_id()
+    if current_boot is None:
+        pytest.skip("boot id unavailable on this platform")
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    handle = replace(
+        make_run_handle(
+            run_id="srv-unknown-boot",
+            experiment_id="srv",
+            pid=999999,
+            starttime=111,
+            allow_cancel=True,
+        ),
+        boot_id=None if unknown_side == "saved" else current_boot,
+    )
+    store.create(handle)
+    if unknown_side == "current":
+        monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
+        monkeypatch.setattr(mcp_server, "read_boot_id", lambda: None)
+    signalled: list[object] = []
+
+    def record_signal(*args: object, **kwargs: object) -> bool:
+        signalled.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(mcp_server, "kill_stale_group", record_signal)
+
+    result = app.cancel(handle.run_id)
+
+    assert signalled == []
+    assert result["state"] == "running"
+    assert result["cleanup_confirmed"] is False
     assert result["recovery_required"] is True
 
 
@@ -3806,6 +3898,62 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     launched = app.launch("srv")
     assert launched["state"] == "running"
     assert captured["cmd"]
+
+
+@pytest.mark.parametrize("unknown_side", ["saved", "current"])
+def test_operator_recovery_refuses_unknown_boot_process_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unknown_side: str,
+) -> None:
+    current_boot = read_boot_id()
+    if current_boot is None:
+        pytest.skip("boot id unavailable on this platform")
+    config = _config(tmp_path)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-recovery-unknown-boot"
+    handle = replace(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+            pid=999999,
+            starttime=111,
+        ),
+        boot_id=None if unknown_side == "saved" else current_boot,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.mark_cleanup_uncertain(handle)
+    if unknown_side == "current":
+        monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
+        monkeypatch.setattr(mcp_recovery, "read_boot_id", lambda: None, raising=False)
+    signalled: list[object] = []
+
+    def record_signal(*args: object, **kwargs: object) -> bool:
+        signalled.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(mcp_recovery, "kill_stale_group", record_signal)
+
+    for confirmed in (False, True):
+        command = [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+        ]
+        if confirmed:
+            command.append("--confirm")
+        result = CliRunner().invoke(cli_main, command)
+        assert result.exit_code != 0
+        assert "boot id" in f"{result.output} {result.exception}".lower()
+
+    assert signalled == []
+    assert store.cleanup_uncertain_path(run_id).is_file()
 
 
 def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
