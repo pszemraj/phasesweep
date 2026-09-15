@@ -385,8 +385,8 @@ def _validate_winner_source_generation(
         a permission-specific validation error.
     :raises PublicationAccessError: The source winner cannot be read by the current user.
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when the cited source
-        generation is unsafely named, absent from this tree, or published a
-        winner record for this phase that disagrees with the carried winner.
+        generation is unsafely named, absent from this tree, has a damaged
+        published manifest, or recorded a different winning result.
     """
     source_generation = payload["generation_id"]
     if source_generation == generation_id:
@@ -442,6 +442,31 @@ def _validate_winner_source_generation(
             f"source generation {source_generation!r} winner artifact for phase "
             f"{source_phase!r} is not a mapping"
         )
+    source_summary_path = source_dir / GENERATION_SUMMARY_FILENAME
+    if source_summary_path.is_file():
+        try:
+            source_summary = yaml.safe_load(source_summary_path.read_bytes())
+        except PermissionError as exc:
+            raise permission_fail(
+                _unreadable_artifact_permission_detail(
+                    f"source generation {source_generation!r} summary"
+                )
+            ) from exc
+        except (OSError, yaml.YAMLError) as exc:
+            raise fail(
+                f"source generation {source_generation!r} summary is unreadable or invalid"
+            ) from exc
+        if not isinstance(source_summary, Mapping):
+            raise fail(f"source generation {source_generation!r} summary is not a mapping")
+        if "schema_version" in source_summary:
+            try:
+                _validate_generation_manifest(source_dir, source_generation, source_summary)
+            except PublicationAccessError as exc:
+                raise permission_fail(str(exc)) from exc
+            except PublicationIntegrityError as exc:
+                raise fail(
+                    f"source generation {source_generation!r} does not validate: {exc}"
+                ) from exc
     expected = {
         "phase": source_phase,
         "trial_number": payload.get("trial_number"),
@@ -452,6 +477,24 @@ def _validate_winner_source_generation(
         if source_payload.get(field_name) != expected_value:
             raise fail(
                 f"winner for phase {phase_name!r} disagrees with the winner recorded by its "
+                f"source generation {source_generation!r} on {field_name}"
+            )
+    # Completion, promotion, and phase fingerprint belong to the exposing
+    # phase; the fields below come from the cited source trial.
+    for field_name in (
+        "metric",
+        "params",
+        "effective_overrides",
+        "constraints",
+        "gates",
+        "objective_provenance",
+        "trainer_input",
+        "trainer_env_digest",
+        "trainer_inherit_env",
+    ):
+        if source_payload.get(field_name) != payload.get(field_name):
+            raise fail(
+                f"winner for phase {phase_name!r} disagrees with the result recorded by its "
                 f"source generation {source_generation!r} on {field_name}"
             )
 

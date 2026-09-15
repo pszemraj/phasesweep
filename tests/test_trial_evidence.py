@@ -574,20 +574,41 @@ def test_deleting_a_carried_winners_source_generation_fails_read_and_write(
     assert _last_successful_generation_id(experiment) is None
 
 
-def test_published_source_generation_missing_its_winner_record_fails_integrity(
-    tmp_path: Path,
-) -> None:
-    """A source that published must still hold the winner record it published."""
+@pytest.mark.parametrize("damage", ["missing", "edited", "coherently_changed"])
+def test_published_source_generation_damage_fails_integrity(tmp_path: Path, damage: str) -> None:
+    """A carried result cannot outlive or contradict its published source."""
     experiment, source_generation, _ = _tree_with_a_carried_winner(tmp_path)
     source_dir = _generations_dir(experiment) / source_generation
-    (source_dir / "phases" / "p" / "winner.yaml").unlink()
+    winner_path = source_dir / "phases" / "p" / "winner.yaml"
+    if damage == "missing":
+        winner_path.unlink()
+        diagnostic = "published but holds no winner record"
+    else:
+        winner = yaml.safe_load(winner_path.read_text())
+        winner["metric"][experiment.metric.name] = 0.9
+        winner["params"]["x"] = -1
+        winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+        if damage == "coherently_changed":
+            summary_path = source_dir / "summary.yaml"
+            summary = yaml.safe_load(summary_path.read_text())
+            summary["phases"][0]["metric"] = 0.9
+            artifact = next(
+                item
+                for item in summary["artifacts"]
+                if item.get("kind") == "winner" and item.get("phase") == "p"
+            )
+            artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+            summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+            diagnostic = "disagrees with the result recorded"
+        else:
+            diagnostic = "source generation"
     assert (source_dir / "summary.yaml").is_file()
 
     status = read_status(experiment)
     assert status["publication_integrity"] == "failed"
-    assert "published but holds no winner record" in str(status["publication_error"])
+    assert diagnostic in str(status["publication_error"])
 
-    with pytest.raises(RuntimeError, match="published but holds no winner record"):
+    with pytest.raises(RuntimeError, match=diagnostic):
         run_experiment(_evidence_experiment(tmp_path))
 
 
