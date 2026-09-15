@@ -262,6 +262,15 @@ def test_validate_accepts_divisible_grid_float(tmp_path: Path) -> None:
     }
 
 
+def test_grid_float_rejects_an_upper_bound_off_the_step_lattice() -> None:
+    """A close float ratio must not omit the configured upper bound."""
+    with pytest.raises(ValueError, match="must be an integer"):
+        grid_search_space(
+            {"x": FloatParam(type="float", low=0.0, high=100.00000001, step=1.0)},
+            phase_name="p",
+        )
+
+
 def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
     """Partial grid phases are allowed only when explicitly requested."""
     p = write_yaml(

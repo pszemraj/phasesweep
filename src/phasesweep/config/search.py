@@ -312,12 +312,12 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             )
 
 
-def _validate_float_grid_divides(phase_name: str, param_name: str, param: FloatParam) -> None:
-    """Require ``(high - low) / step`` to be (very nearly) an integer.
+def _validate_float_grid_divides(phase_name: str, param_name: str, param: FloatParam) -> int:
+    """Return the exact number of steps between a float grid's bounds.
 
-    Without this check, naive grid enumeration ``[low + i*step for i in range(n+1)]``
-    emits values above ``high`` whenever the interval isn't an exact multiple of step
-    (review v0.5.2 / blocker 4). Example: ``low=0, high=1, step=0.6`` -> ``[0, 0.6, 1.2]``.
+    Without this check, grid enumeration can emit a point above ``high`` or
+    silently omit ``high`` when the interval is not an exact multiple of ``step``.
+    For example, ``low=0, high=1, step=0.6`` would emit ``1.2``.
 
     Args:
         phase_name: Phase containing the offending parameter; quoted in the error.
@@ -325,20 +325,22 @@ def _validate_float_grid_divides(phase_name: str, param_name: str, param: FloatP
         param: The :class:`FloatParam`; ``param.step`` must be non-``None`` (caller guarded).
 
     Raises:
-        ValueError: ``(high - low) / step`` is not within ``1e-9`` of an integer.
+        ValueError: ``(high - low) / step`` is not an integer.
+
+    Returns:
+        Number of steps in the complete grid.
 
     """
     assert param.step is not None  # guarded by caller
-    span = param.high - param.low
-    ratio = span / param.step
-    nearest = round(ratio)
-    if not math.isclose(ratio, nearest, rel_tol=1e-9, abs_tol=1e-9):
+    ratio = (Fraction(str(param.high)) - Fraction(str(param.low))) / Fraction(str(param.step))
+    if ratio.denominator != 1:
         raise ValueError(
             f"Phase {phase_name!r}: grid float param {param_name!r}: "
             f"(high - low) / step must be an integer. "
             f"Got low={param.low}, high={param.high}, step={param.step} "
             f"(ratio={ratio}). Pick a step that evenly divides the interval."
         )
+    return ratio.numerator
 
 
 def grid_search_space(
@@ -374,8 +376,7 @@ def grid_search_space(
                 raise ValueError(
                     f"Phase {phase_name!r}: grid sampler requires 'step' for float param {name!r}."
                 )
-            _validate_float_grid_divides(phase_name, name, param)
-            n_steps = int(round((param.high - param.low) / param.step))
+            n_steps = _validate_float_grid_divides(phase_name, name, param)
             values = [round(param.low + i * param.step, 12) for i in range(n_steps + 1)]
             # Post-canonicalization collapse (review v0.5.17 / finding C): the
             # round(..., 12) above maps adjacent points onto the same float once
