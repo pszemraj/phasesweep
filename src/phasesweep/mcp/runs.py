@@ -856,7 +856,7 @@ class RunStore:
                 return None
         return handle
 
-    def state(self, handle: RunHandle) -> RunState:
+    def state(self, handle: RunHandle, *, transition_locked: bool = False) -> RunState:
         """Derive the current state from status.json and a live PID check.
 
         A finalized status.json (written by the runner on every exit) is
@@ -881,6 +881,7 @@ class RunStore:
 
         Args:
             handle: The run handle to evaluate.
+            transition_locked: The caller already holds this run's transition lock.
 
         Returns:
             One of ``running`` / ``succeeded`` / ``failed`` / ``cancelled``.
@@ -918,8 +919,7 @@ class RunStore:
         if handle.pid_starttime is None:
             if self._cleanup_recovered(handle):
                 return "failed"
-            self.mark_cleanup_uncertain(handle)
-            return "running"
+            return self._settle_dead_runner(handle, transition_locked=transition_locked)
         # No status.json: the run is live only if its process is genuinely alive.
         # A zombie (exited without recording a cause - SIGKILL/OOM, or an early
         # SIGTERM before the engine installed its handlers) still answers
@@ -934,8 +934,31 @@ class RunStore:
             return self._state_from_status(handle, status)
         if self._cleanup_recovered(handle):
             return "failed"
-        self.mark_cleanup_uncertain(handle)
-        return "running"
+        return self._settle_dead_runner(handle, transition_locked=transition_locked)
+
+    def _settle_dead_runner(self, handle: RunHandle, *, transition_locked: bool) -> RunState:
+        """Reserve uncertain cleanup only after rechecking under the recovery transition lock.
+
+        :param RunHandle handle: Dead runner whose status and cleanup evidence may change.
+        :param bool transition_locked: Whether the caller already holds the transition lock.
+        :return RunState: Latest terminal state or a reserved running state.
+        """
+        lock = contextlib.nullcontext() if transition_locked else self.transition_lock(handle)
+        with lock:
+            status = self._read_status(handle)
+            if self.cleanup_uncertain(handle):
+                if (
+                    status is not None and status.get("cleanup_confirmed") is True
+                ) or self.from_earlier_boot(handle):
+                    self.clear_cleanup_uncertain(handle)
+                else:
+                    return "running"
+            if status is not None:
+                return self._state_from_status(handle, status)
+            if self._cleanup_recovered(handle):
+                return "failed"
+            self.mark_cleanup_uncertain(handle)
+            return "running"
 
     def _state_from_status(self, handle: RunHandle, status: Mapping[str, object]) -> RunState:
         """Classify a recorded status after the run's cleanup marker is considered.

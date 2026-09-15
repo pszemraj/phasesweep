@@ -719,6 +719,47 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
     assert store.state(handle) == "failed"
 
 
+def test_state_does_not_restore_cleanup_marker_after_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    store.create(handle)
+    original_recovered = store._cleanup_recovered
+    first_read = True
+
+    def recovery_between_check_and_marker(saved: object) -> bool:
+        nonlocal first_read
+        if first_read:
+            first_read = False
+            with store.transition_lock(handle):
+                write_run_status(
+                    store,
+                    handle.run_id,
+                    returncode=1,
+                    error_class="UnsafeProcessCleanupError",
+                    cleanup_confirmed=False,
+                )
+                store.cleanup_recovery_path(handle.run_id).write_text(
+                    json.dumps(
+                        {
+                            "run_id": handle.run_id,
+                            "config_sha256": handle.config_sha256,
+                            "cleanup_confirmed": True,
+                        }
+                    )
+                )
+                store.clear_cleanup_uncertain(handle)
+            return False  # The state read already saw the old, unrecovered evidence.
+        return original_recovered(saved)
+
+    monkeypatch.setattr(store, "_cleanup_recovered", recovery_between_check_and_marker)
+
+    assert store.state(handle) == "failed"
+    assert not store.cleanup_uncertain(handle)
+    assert not store.cleanup_recovery_required(handle)
+
+
 @pytest.mark.parametrize(
     "payload",
     [

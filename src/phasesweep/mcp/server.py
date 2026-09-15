@@ -1834,7 +1834,7 @@ class PhaseSweepMCP:
                     if refreshed is None:
                         raise UnknownRunError(run_id)
                     handle = refreshed
-                    before = self._runs.state(handle)
+                    before = self._runs.state(handle, transition_locked=True)
                     recovery_required = self._runs.recovery_required(handle)
                     state_before = {
                         "run_state": before,
@@ -1897,7 +1897,7 @@ class PhaseSweepMCP:
                         # Recovery owns any remaining marker after recording
                         # cleanup; it may still be repairing the frozen result.
                         self._runs.clear_cleanup_uncertain(handle)
-                    after = self._runs.state(handle)
+                    after = self._runs.state(handle, transition_locked=True)
                     recovery_required = self._runs.recovery_required(handle)
             result = {
                 "run_id": run_id,
