@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from fractions import Fraction
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
@@ -389,6 +390,18 @@ def grid_search_space(
                     f"to 12 decimal places (low={param.low}, high={param.high}, "
                     f"step={param.step}). Rescale the parameter — sweep an exponent or "
                     "a multiplier — so adjacent grid points differ by more than 1e-12."
+                )
+            origin = Fraction(str(param.low))
+            spacing = Fraction(str(param.step))
+            if any(
+                not (param.low <= value <= param.high)
+                or Fraction(str(value)) != origin + index * spacing
+                for index, value in enumerate(values)
+            ):
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid float param {name!r} cannot preserve its "
+                    "configured bounds and step after rounding to 12 decimal places. "
+                    "Rescale the parameter or use explicit categorical choices."
                 )
             grid[name] = values
     return grid

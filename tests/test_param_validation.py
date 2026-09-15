@@ -27,6 +27,7 @@ from phasesweep.config import (
     check_bounds,
 )
 from phasesweep.config.common import _find_prefix_collisions
+from phasesweep.config.search import grid_search_space
 from phasesweep.engine.optuna import _build_sampler
 from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
 
@@ -192,6 +193,18 @@ def test_validate_rejects_invalid_grid_configs(tmp_path: Path) -> None:
             "must be an integer",
         ),
         (
+            "rounded_below_low",
+            "eps: { type: float, low: 1.0e-13, high: 1.1e-12, step: 1.0e-12 }",
+            2,
+            "cannot preserve its configured bounds and step",
+        ),
+        (
+            "rounded_above_high",
+            "eps: { type: float, low: 6.0e-13, high: 1.6e-12, step: 1.0e-12 }",
+            2,
+            "cannot preserve its configured bounds and step",
+        ),
+        (
             "partial_matrix",
             "x: { type: categorical, choices: [1, 2, 3] }",
             2,
@@ -241,9 +254,12 @@ def test_schema_rejects_non_finite_bounds() -> None:
 
 def test_validate_accepts_divisible_grid_float(tmp_path: Path) -> None:
     """low=0, high=1, step=0.25 -> exactly [0, 0.25, 0.5, 0.75, 1.0]."""
-    load_experiment(
+    experiment = load_experiment(
         _grid_yaml(tmp_path, "x: { type: float, low: 0.0, high: 1.0, step: 0.25 }", n_trials=5)
     )
+    assert grid_search_space(experiment.phases[0].search_space, phase_name="p") == {
+        "x": [0.0, 0.25, 0.5, 0.75, 1.0]
+    }
 
 
 def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
