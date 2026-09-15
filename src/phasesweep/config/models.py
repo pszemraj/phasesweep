@@ -50,6 +50,19 @@ class Metric(_Frozen):
     goal: Literal["minimize", "maximize"] = "minimize"
     extractor: ObjectiveExtractor = Field(discriminator="type")
 
+    @field_validator("name")
+    @classmethod
+    def _reject_reserved_name(cls, value: str) -> str:
+        """Reject the winner direction metadata key as a metric name.
+
+        :param str value: Configured metric name.
+        :raises ValueError: The name is reserved by the winner artifact schema.
+        :return str: The validated metric name.
+        """
+        if value == "goal":
+            raise ValueError("Metric name 'goal' is reserved for winner direction metadata.")
+        return value
+
 
 def _metric_semantics_payload(metric: Metric) -> dict[str, Any]:
     """Return the persisted and agent-visible semantics of one metric.

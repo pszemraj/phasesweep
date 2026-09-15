@@ -54,7 +54,7 @@
 # metric: Metric (required)
 # Metric object keys:
 #   name: str = "objective"
-#   Must be distinct from every constraints[].name.
+#   Must be distinct from every constraints[].name and cannot be `goal`, which is reserved for the optimization direction in published winner records.
 #   goal: Literal["minimize", "maximize"] = "minimize"
 #   Sets Optuna direction and the sign used by promotion.min_delta.
 #   extractor: ObjectiveExtractor (required)

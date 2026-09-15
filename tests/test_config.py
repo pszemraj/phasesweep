@@ -90,6 +90,25 @@ phases:
             "distinct",
             id="metric-constraint-name-collision",
         ),
+        pytest.param(
+            """
+experiment: t
+storage: ":memory:"
+provenance: {revision: test-fixture-v1}
+trial_command: "echo {overrides}"
+override_format: argparse
+metric:
+  name: goal
+  goal: minimize
+  extractor: { type: json_envelope, objective_name: goal, split: test, policy: test }
+phases:
+  - name: a
+    n_trials: 1
+    search_space: { x: { type: float, low: 0, high: 1 } }
+""",
+            "reserved for winner direction metadata",
+            id="metric-name-goal-is-reserved",
+        ),
     ],
 )
 def test_invalid_experiment_relationships(
