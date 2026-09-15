@@ -1328,8 +1328,8 @@ def sqlite_database_path(storage: str) -> Path | None:
     database = file_url_path(storage)
     if _sqlite_uri_filename_enabled(storage, database):
         uri_path = sqlite_uri_filename_path(storage)
-        return Path(uri_path).expanduser() if uri_path is not None else None
-    return Path(database).expanduser()
+        return Path(uri_path) if uri_path is not None else None
+    return Path(database)
 
 
 def sqlite_readonly_uri(storage: str) -> str | None:
@@ -1356,7 +1356,7 @@ def sqlite_readonly_uri(storage: str) -> str | None:
         params.append(("mode", "ro"))
         return f"{database}?{urlencode(params)}"
 
-    path = Path(database).expanduser().resolve()
+    path = Path(database).resolve()
     return f"file:{quote(str(path), safe='/')}?mode=ro"
 
 
@@ -1393,9 +1393,9 @@ def storage_recovery_locator(storage: str | None) -> str | None:
         if uri_path is None:
             # A non-local ``file:`` authority is not cwd-relative.
             return storage
-        frozen_database = "file:" + quote(str(Path(uri_path).expanduser().resolve()), safe="/")
+        frozen_database = "file:" + quote(str(Path(uri_path).resolve()), safe="/")
     else:
-        frozen_database = str(Path(database).expanduser().resolve())
+        frozen_database = str(Path(database).resolve())
     return url.set(database=frozen_database).render_as_string(hide_password=False)
 
 
@@ -1776,7 +1776,7 @@ def canonical_storage_identity(storage: str | None) -> str | None:
             database = uri_path
         if database in ("", ":memory:"):
             return "sqlite:///:memory:"
-        return "sqlite:///" + str(Path(database).expanduser().resolve())
+        return "sqlite:///" + str(Path(database).resolve())
 
     if backend == "journal":
         path = file_url_path(storage)

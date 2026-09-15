@@ -512,6 +512,46 @@ def test_literal_hash_sqlite_path_survives_status_resume_and_recovery(
     assert len(study.trials) == 2
 
 
+def test_literal_tilde_sqlite_path_survives_status_resume_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit SQLite filenames keep SQLAlchemy's literal tilde semantics."""
+    import optuna
+
+    invocation = tmp_path / "invocation"
+    home = tmp_path / "home"
+    invocation.mkdir()
+    home.mkdir()
+    (invocation / "~").mkdir()
+    monkeypatch.chdir(invocation)
+    monkeypatch.setenv("HOME", str(home))
+    storage = "sqlite:///~/study.db"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+
+    run_experiment(exp)
+
+    database = invocation / "~" / "study.db"
+    assert database.is_file()
+    assert not (home / "study.db").exists()
+    assert sqlite_database_path(storage) == Path("~/study.db")
+    assert read_status(exp)["phases"][0]["trials"] == {"COMPLETE": 1}
+
+    topup = exp.model_copy(update={"phases": [exp.phases[0].model_copy(update={"n_trials": 2})]})
+    run_experiment(topup)
+    locator = storage_recovery_locator(storage)
+    assert locator is not None
+    assert canonical_storage_identity(locator) == canonical_storage_identity(storage)
+
+    monkeypatch.chdir(tmp_path)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(locator))
+    assert len(study.trials) == 2
+
+
 def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
     """The validation error must not reintroduce the 'for multi-host' claim."""
     with pytest.raises(ValueError, match="single phasesweep orchestrator") as exc_info:
