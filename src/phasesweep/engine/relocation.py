@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -44,7 +44,10 @@ from phasesweep.engine.paths import (
     _phase_dir,
     _suite_dir,
 )
-from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _resolve_suite_publication_pointer,
+)
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     TRAINER_INPUT_ATTR,
@@ -626,9 +629,9 @@ def _validate_suite_artifact_root_rebind(
     the component generation summary it derives from, and validation re-reads
     that exact path, so a relocated suite publication is reported as corrupt by
     the read surfaces the moment it is rebound (re-review v0.5.19 / blocker
-    B2). Component-level rebinds still proceed for a suite that never published
-    one: those studies carry only per-experiment state, which this command does
-    validate.
+    B2). In-place adoption is safe when the validated suite summary still
+    names the destination roots and no study is bound to a different root.
+    Component-level rebinds also proceed for a suite that never published one.
 
     Conservative in the same way :func:`_validate_artifact_root_destination`
     is: when every declared study records a completed trial, the suite may well
@@ -637,12 +640,28 @@ def _validate_suite_artifact_root_rebind(
 
     :param Suite suite: Suite config naming the destination suite namespace.
     :param Sequence[_ArtifactRootRebindPlan] plans: Validated per-study plans.
-    :raises ArtifactRootRebindError: The destination holds a suite publication,
-        or every declared study completed a trial while the destination holds
-        no suite publication at all.
+    :raises ArtifactRootRebindError: A suite publication would refer to another
+        tree after rebinding, or every declared study completed a trial while
+        the destination holds no suite publication at all.
     """
     pointer = _last_successful_suite_generation_path(suite)
     if pointer.exists():
+        publication = _resolve_suite_publication_pointer(suite)
+        summary = publication.summary
+        records = summary.get("studies") if isinstance(summary, Mapping) else None
+        if publication.state == "ok" and isinstance(records, list):
+            roots = {
+                record.get("experiment"): str(Path(record["component_summary_path"]).parents[2])
+                for record in records
+                if isinstance(record, Mapping)
+                and isinstance(record.get("component_summary_path"), str)
+            }
+            if len(roots) == len(plans) and all(
+                roots.get(plan.experiment.experiment) == plan.destination
+                and all(entry.previous in (None, plan.destination) for entry in plan.entries)
+                for plan in plans
+            ):
+                return
         raise ArtifactRootRebindError(
             f"Suite {suite.suite!r} records a published suite generation at {str(pointer)!r}. "
             "A published suite summary pins each study to the absolute path of the component "

@@ -1564,6 +1564,26 @@ def test_rebind_workdir_refuses_a_suite_that_published_a_suite_generation(
     )
 
 
+def test_rebind_workdir_adopts_published_suite_at_original_tree(tmp_path: Path) -> None:
+    config_a, _config_b, _workdir_a, _workdir_b = _movable_suite_configs(
+        tmp_path, study_names=("only",)
+    )
+    suite = load_config(config_a)
+    assert isinstance(suite, Suite)
+    run_suite(suite)
+    component = suite.experiment_for_study(suite.studies[0])
+    assert component.storage is not None
+    drop_artifact_root_binding(component.storage, "s__only::p")
+    assert _resolve_suite_publication_pointer(suite).state == "ok"
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_a)])
+
+    assert result.exit_code == 0, result.output
+    study = optuna.load_study(study_name="s__only::p", storage=component.storage)
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(component))
+    assert _resolve_suite_publication_pointer(suite).state == "ok"
+
+
 def test_rebind_workdir_adopts_a_populated_study_that_predates_the_binding(
     tmp_path: Path,
 ) -> None:

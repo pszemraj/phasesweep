@@ -765,7 +765,7 @@ def status(config_path: Path) -> None:
         "you have already moved the experiment's complete artifact tree there. Verifies at the "
         "destination that every trial in the study ledger still has its evidence directory, "
         "that no trial is RUNNING and no attempt is unresolved, and that any recorded "
-        "publication validates; refuses relocating a published suite. Also the migration path "
+        "publication validates; refuses moving a published suite. Also the migration path "
         "for a study that predates artifact-root binding: point the config at that study's "
         "original tree - there, an interrupted RUNNING trial whose persisted paths already "
         "lie under that tree is allowed through, and the next ordinary run recovers it. "
@@ -796,8 +796,8 @@ def rebind_workdir(config_path: Path) -> None:
     trial is ``RUNNING`` and no attempt registry entry is unresolved, because
     recovery follows the absolute paths those attempts persisted; and, when the
     studies record completed trials, the recorded publication validates. A
-    suite that published a suite generation is refused outright - suite
-    summaries record absolute component paths that do not survive relocation.
+    suite that published a suite generation cannot be moved - suite summaries
+    record absolute component paths. Adopting it at its original tree is allowed.
 
     The one ``RUNNING`` exception is adoption in place: when a pre-binding
     study's interrupted trial persisted paths that already resolve exactly
