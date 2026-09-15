@@ -3984,6 +3984,48 @@ def test_launch_bookkeeping_failure_preserves_runner_status(
     assert terminal["result_snapshot_state"] == "complete"
 
 
+def test_launch_failure_cannot_replace_status_published_during_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    pending = make_run_handle(
+        run_id="srv-racing-terminal",
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+    )
+    store.create(pending)
+    runner_status = {
+        "run_id": pending.run_id,
+        "returncode": 0,
+        "cleanup_confirmed": True,
+        "result_snapshot_state": "failed",
+        "ended_at": mcp_server.utc_now_iso(),
+    }
+    original_write = mcp_runs.write_status_file
+    original_link = mcp_runs.os.link
+
+    def racing_write(path: Path, payload: dict) -> None:
+        original_write(path, runner_status)
+        original_write(path, payload)
+
+    def racing_link(src: str, dst: str, **kwargs: object) -> None:
+        if dst == store.status_path(pending.run_id).name:
+            original_write(store.status_path(pending.run_id), runner_status)
+        original_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(mcp_server, "write_status_file", racing_write, raising=False)
+    monkeypatch.setattr(mcp_runs.os, "link", racing_link)
+    app._record_launch_failure(pending, cleanup_confirmed=True, error_class="Injected")
+
+    terminal = store.recorded_terminal_status(pending)
+    assert terminal is not None
+    assert terminal["returncode"] == 0
+    assert terminal.get("error_class") != "Injected"
+
+
 @pytest.mark.parametrize("unknown_side", ["saved", "current"])
 def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     tmp_path: Path,

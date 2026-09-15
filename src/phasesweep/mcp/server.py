@@ -71,7 +71,7 @@ from phasesweep.mcp.runs import (
     RunHandle,
     RunState,
     RunStore,
-    write_status_file,
+    write_status_file_if_absent,
 )
 from phasesweep.mcp.snapshots import (
     McpPublicationState,
@@ -2026,7 +2026,7 @@ class PhaseSweepMCP:
             # failure. Its terminal result is authoritative once cleanup is done.
             if self._runs.recorded_terminal_status(pending) is not None:
                 return
-            write_status_file(
+            write_status_file_if_absent(
                 self._runs.status_path(pending.run_id),
                 {
                     "run_id": pending.run_id,
