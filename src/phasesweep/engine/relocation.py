@@ -30,10 +30,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     TrialEvidenceMissingError,
 )
-from phasesweep.engine.evidence import (
-    _selection_candidate_identity,
-    _verify_trainer_input_evidence,
-)
+from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.optuna import (
     _load_existing_phase_study,
 )
@@ -50,7 +47,6 @@ from phasesweep.engine.publication import (
 )
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
-    TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
@@ -243,7 +239,8 @@ def _validate_relocated_trial_evidence(
     :raises ArtifactRootRebindError: A study holds a RUNNING trial that cannot
         be recovered at this destination, records a malformed trial directory,
         names a trial directory that does not exist under the destination tree,
-        or a selection candidate's recorded trainer input is missing or altered.
+        or a selection candidate's audit, trainer input, or objective evidence
+        is missing or altered.
     """
     offered = _artifact_root_identity(experiment)
     for entry in entries:
@@ -283,22 +280,14 @@ def _validate_relocated_trial_evidence(
                     "is a stale copy taken before that trial ran. Move the complete artifact "
                     "tree, then rebind. Nothing was written."
                 )
-            if _selection_candidate_identity(trial) is not None:
-                try:
-                    _verify_trainer_input_evidence(
-                        translated,
-                        trial.user_attrs.get(TRAINER_INPUT_ATTR),
-                        subject=(
-                            f"Destination trial {trial.number} of study {entry.study.study_name!r}"
-                        ),
-                    )
-                except TrialEvidenceMissingError as exc:
-                    raise ArtifactRootRebindError(
-                        f"Destination artifact root {str(_experiment_dir(experiment))!r} "
-                        f"does not retain the recorded generated trainer input for trial "
-                        f"{trial.number} of study {entry.study.study_name!r}: {exc} "
-                        "Move the complete artifact tree, then rebind. Nothing was written."
-                    ) from exc
+        try:
+            _validate_selection_evidence(experiment, {entry.phase_name: entry.study})
+        except TrialEvidenceMissingError as exc:
+            raise ArtifactRootRebindError(
+                f"Destination artifact root {str(_experiment_dir(experiment))!r} does not "
+                f"retain the selection evidence for study {entry.study.study_name!r}: {exc} "
+                "Move the complete artifact tree, then rebind. Nothing was written."
+            ) from exc
 
 
 def _attempt_entry_recoverable_in_place(

@@ -1173,7 +1173,7 @@ def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> No
     result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config)])
     assert result.exit_code != 0
     expected = {
-        "trainer_input": "generated trainer input",
+        "trainer_input": "overrides_resolved.json",
         "running": "RUNNING",
         "foreign_ledger": "another storage",
     }[damage]
@@ -1464,34 +1464,36 @@ def test_rebind_workdir_refuses_unsafe_copied_tree(
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
 
 
-def test_rebind_workdir_refuses_a_copy_missing_generated_trainer_input(
+@pytest.mark.parametrize("missing_file", ["trainer_config.yaml", "stdout.log"])
+def test_rebind_workdir_refuses_a_copy_missing_candidate_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    missing_file: str,
 ) -> None:
-    """A copied tree must retain the exact generated input of every candidate."""
+    """A copied tree must retain the evidence behind every selection candidate."""
     config_a, config_b, workdir_a, workdir_b = _movable_experiment_configs(tmp_path)
-    for config in (config_a, config_b):
-        config.write_text(
-            config.read_text()
-            .replace("{overrides}", "--config {config_path}")
-            .replace("override_format: argparse", "override_format: yaml_file")
-        )
+    if missing_file == "trainer_config.yaml":
+        for config in (config_a, config_b):
+            config.write_text(
+                config.read_text()
+                .replace("{overrides}", "--config {config_path}")
+                .replace("override_format: argparse", "override_format: yaml_file")
+            )
     experiment_a = load_experiment(config_a)
     run_experiment(experiment_a)
     shutil.copytree(workdir_a, workdir_b)
     copied = load_experiment(config_b)
     copied_trial_dirs = sorted(_phase_dir(copied, "p").glob("trial_*"))
     assert len(copied_trial_dirs) == 1
-    (copied_trial_dirs[0] / "trainer_config.yaml").unlink()
+    (copied_trial_dirs[0] / missing_file).unlink()
 
     exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
     assert "Traceback" not in captured.err
-    assert "trainer_config.yaml" in captured.err
-    assert "recorded generated trainer input" in captured.err
+    assert missing_file in captured.err
     study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
 
