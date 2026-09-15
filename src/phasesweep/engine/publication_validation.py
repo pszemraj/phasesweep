@@ -785,8 +785,8 @@ def _validate_suite_summary_integrity(
             raise _fail("summary contains an invalid winner payload") from exc
         return phase_name, encoded
 
-    component_full_winners: set[tuple[str, str]] = set()
-    component_evidence_winners: set[tuple[str, str]] = set()
+    component_full_winners: set[tuple[str, str, str]] = set()
+    component_evidence_winners: set[tuple[str, str, str]] = set()
     legacy_component_studies: set[str] = set()
     for record in records:
         if not isinstance(record, Mapping) or not isinstance(record.get("name"), str):
@@ -846,10 +846,16 @@ def _validate_suite_summary_integrity(
                 raise _fail(f"study {name!r} component summary has a malformed phase entry")
             phase_name = str(item["name"])
             component_full_winners.add(
-                _winner_key(item, phase_name=phase_name, include_exposure_metadata=True)
+                (
+                    name,
+                    *_winner_key(item, phase_name=phase_name, include_exposure_metadata=True),
+                )
             )
             component_evidence_winners.add(
-                _winner_key(item, phase_name=phase_name, include_exposure_metadata=False)
+                (
+                    name,
+                    *_winner_key(item, phase_name=phase_name, include_exposure_metadata=False),
+                )
             )
 
     for record in records:
@@ -872,6 +878,12 @@ def _validate_suite_summary_integrity(
                         f"study {name!r} exposed winner for phase {item['name']!r} "
                         "has no baseline source phase"
                     )
+                source_study = source.get("study")
+                if not isinstance(source_study, str) or not source_study:
+                    raise _fail(
+                        f"study {name!r} exposed winner for phase {item['name']!r} "
+                        "has no baseline source study"
+                    )
                 for identity_field in (
                     "trial_number",
                     "generation_id",
@@ -884,17 +896,23 @@ def _validate_suite_summary_integrity(
                             f"study {name!r} exposed winner for phase {item['name']!r} "
                             "does not match its baseline source identity"
                         )
-                key = _winner_key(
-                    item,
-                    phase_name=source_phase,
-                    include_exposure_metadata=False,
+                key = (
+                    source_study,
+                    *_winner_key(
+                        item,
+                        phase_name=source_phase,
+                        include_exposure_metadata=False,
+                    ),
                 )
                 anchored = key in component_evidence_winners
             else:
-                key = _winner_key(
-                    item,
-                    phase_name=str(item["name"]),
-                    include_exposure_metadata=True,
+                key = (
+                    name,
+                    *_winner_key(
+                        item,
+                        phase_name=str(item["name"]),
+                        include_exposure_metadata=True,
+                    ),
                 )
                 anchored = key in component_full_winners
             if not anchored:

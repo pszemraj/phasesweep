@@ -205,6 +205,45 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     assert summary["phases"][1]["promotion"] == decision
 
 
+def test_successful_promotion_keeps_independent_candidate_keys(tmp_path: Path) -> None:
+    """Promotion does not turn an un-inherited baseline key into a candidate lock."""
+    trainer = _write_score_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        phases=[
+            Phase(
+                name="baseline",
+                n_trials=1,
+                fixed_overrides={"score": 1.0},
+                search_space={"depth": IntParam(type="int", low=8, high=8)},
+            ),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                fixed_overrides={"score": 0.5},
+                search_space={"depth": IntParam(type="int", low=16, high=16)},
+                promotion={
+                    "min_delta_vs": "baseline",
+                    "min_delta": 0.1,
+                    "on_fail": "continue_baseline",
+                },
+            ),
+        ],
+    )
+
+    winners = run_experiment(experiment)
+
+    assert winners["candidate"].effective_overrides["depth"] == 16
+    assert winners["candidate"].source is not None
+    assert winners["candidate"].source.kind == "phase_trial"
+    decision = yaml.safe_load(
+        (tmp_path / "runs" / "t" / "candidate" / "promotion.yaml").read_text()
+    )
+    assert decision["promoted"] is True
+
+
 def test_added_phase_can_continue_baseline_from_published_generation(tmp_path: Path) -> None:
     """A baseline clone resolves its artifact under the recorded source phase."""
     trainer = _write_score_trainer(tmp_path)
@@ -512,6 +551,88 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
         generation_id=second_decision["candidate_generation_id"],
         attempt_id=second_decision["candidate_attempt_id"],
     ).is_dir()
+
+
+def test_chained_suite_fallback_preserves_concrete_source_study(tmp_path: Path) -> None:
+    """Suite fallback keeps the original study identity through a fallback chain."""
+    trainer = _write_score_trainer(tmp_path)
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            f"""
+            suite: chained_promotion
+            defaults:
+              workdir: {tmp_path}/runs
+              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              override_format: argparse
+              metric:
+                name: x
+                goal: minimize
+                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+            studies:
+              - name: a
+                phases:
+                  - name: base
+                    n_trials: 1
+                    fixed_overrides: {{ score: 1.0 }}
+                    search_space: {{}}
+                  - name: exposure
+                    n_trials: 1
+                    fixed_overrides: {{ score: 0.95 }}
+                    search_space: {{}}
+                    promotion:
+                      min_delta_vs: base
+                      min_delta: 0.1
+                      on_fail: continue_baseline
+              - name: b
+                depends_on: [a]
+                promotion:
+                  min_delta_vs: a.exposure
+                  min_delta: 0.1
+                  on_fail: continue_baseline
+                phases:
+                  - name: b_eval
+                    n_trials: 1
+                    fixed_overrides: {{ score: 0.95 }}
+                    search_space: {{}}
+              - name: c
+                depends_on: [b]
+                promotion:
+                  min_delta_vs: b.b_eval
+                  min_delta: 0.1
+                  on_fail: continue_baseline
+                phases:
+                  - name: c_eval
+                    n_trials: 1
+                    fixed_overrides: {{ score: 0.95 }}
+                    search_space: {{}}
+            """,
+        )
+    )
+    assert isinstance(config, Suite)
+
+    winners = run_config(config)
+
+    exposed = winners["c"]["c_eval"]
+    assert exposed.source is not None
+    assert exposed.source.study == "a"
+    assert exposed.source.phase == "base"
+
+    summary = yaml.safe_load(
+        (tmp_path / "runs" / "chained_promotion" / "suite_summary.yaml").read_text()
+    )
+    c_record = next(record for record in summary["studies"] if record["name"] == "c")
+    c_winner = next(phase for phase in c_record["phases"] if phase.get("exposed"))
+    assert c_winner["winner_source"]["study"] == "a"
+
+    tampered = yaml.safe_load(yaml.safe_dump(summary))
+    tampered_c = next(record for record in tampered["studies"] if record["name"] == "c")
+    tampered_winner = next(phase for phase in tampered_c["phases"] if phase.get("exposed"))
+    tampered_winner["winner_source"]["study"] = "b"
+    with pytest.raises(
+        PublicationIntegrityError, match="does not match any verified component summary"
+    ):
+        validation_ops._validate_suite_summary_integrity("test-suite-generation", tampered)
 
 
 def test_suite_dependency_on_skipped_promotion_is_an_expected_failure(tmp_path: Path) -> None:

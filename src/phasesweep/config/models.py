@@ -872,12 +872,19 @@ class Experiment(_Frozen):
             # of three minutes into a sweep.
             _validate_trial_command_template(self, phase, inherited_keys)
 
-            locked_keys_by_phase[phase.name] = (
+            exported_keys = (
                 inherited_keys
                 | contract_keys
                 | set(phase.fixed_overrides)
                 | set(phase.search_space)
             )
+            # A failing promotion can expose its comparison baseline rather
+            # than this phase's candidate. Descendants must treat every key
+            # that either outcome can expose as inherited and immutable to
+            # sampling.
+            if phase.promotion is not None and phase.promotion.on_fail == "continue_baseline":
+                exported_keys |= locked_keys_by_phase[phase.promotion.min_delta_vs]
+            locked_keys_by_phase[phase.name] = exported_keys
             seen[phase.name] = phase
             seen_casefolded[casefolded_name] = phase.name
 

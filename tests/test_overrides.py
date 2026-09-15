@@ -10,6 +10,7 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment, run_experiment
+from phasesweep.config import Phase
 from phasesweep.runtime.commands import (
     compose_trainer_config,
     dump_overrides_json,
@@ -723,6 +724,152 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
     )
     with pytest.raises(ValidationError, match="re-samples key"):
         load_experiment(p)
+
+
+def test_promotion_fallback_key_cannot_be_resampled_by_descendant(tmp_path: Path) -> None:
+    """Fallback exports make the baseline's keys immutable to descendants."""
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        override_format: argparse
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases:
+          - name: depth
+            n_trials: 1
+            search_space:
+              depth: {{ type: int, low: 8, high: 8 }}
+          - name: learning_rate
+            n_trials: 1
+            search_space:
+              lr: {{ type: int, low: 3, high: 3 }}
+            promotion:
+              min_delta_vs: depth
+              min_delta: 1
+              on_fail: continue_baseline
+          - name: regularization
+            inherits: [learning_rate]
+            n_trials: 1
+            search_space:
+              depth: {{ type: int, low: 16, high: 16 }}
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="re-samples key"):
+        load_experiment(p)
+
+
+@pytest.mark.parametrize(
+    ("phases", "match"),
+    [
+        pytest.param(
+            """
+              - name: base
+                n_trials: 1
+                fixed_overrides: { depth: 8 }
+              - name: first
+                n_trials: 1
+                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
+              - name: second
+                n_trials: 1
+                promotion: { min_delta_vs: first, min_delta: 1, on_fail: continue_baseline }
+              - name: child
+                inherits: [second]
+                n_trials: 1
+                search_space: { depth: { type: int, low: 16, high: 16 } }
+            """,
+            "re-samples key",
+            id="transitive-fallback",
+        ),
+        pytest.param(
+            """
+              - name: base
+                n_trials: 1
+                fixed_overrides: { depth: 8 }
+              - name: fallback
+                n_trials: 1
+                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
+              - name: other
+                n_trials: 1
+                fixed_overrides: { depth: 16 }
+              - name: child
+                inherits: [fallback, other]
+                n_trials: 1
+            """,
+            "conflicting locked key",
+            id="multi-parent-conflict",
+        ),
+        pytest.param(
+            """
+              - name: base
+                n_trials: 1
+                fixed_overrides: { model: base }
+              - name: fallback
+                n_trials: 1
+                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
+              - name: child
+                inherits: [fallback]
+                n_trials: 1
+                search_space: { model.depth: { type: int, low: 8, high: 8 } }
+            """,
+            "dotted-key namespace collision",
+            id="dotted-key-collision",
+        ),
+    ],
+)
+def test_promotion_fallback_keys_reach_all_descendant_validators(
+    tmp_path: Path, phases: str, match: str
+) -> None:
+    """Possible fallback exports participate in every descendant key check."""
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        override_format: argparse
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases:
+        {phases}
+        """,
+    )
+
+    with pytest.raises(ValidationError, match=match):
+        load_experiment(p)
+
+
+def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
+    """The runtime keeps malformed or stale configs from replacing inherited winners."""
+    from phasesweep.engine.phase import _composed_overrides
+    from phasesweep.engine.state import Winner
+
+    experiment = make_experiment(
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(name="base", n_trials=1),
+            Phase(name="child", n_trials=1, inherits=["base"]),
+        ],
+    )
+    stale_child = experiment.phases[1].model_copy(update={"search_space": {"depth": object()}})
+    inherited = {
+        "base": Winner(
+            trial_number=0,
+            params={"depth": 8},
+            effective_overrides={"depth": 8},
+            metric=1.0,
+        )
+    }
+
+    with pytest.raises(ValueError, match="re-samples inherited winner key"):
+        _composed_overrides(experiment, stale_child, {"depth": 16}, inherited)
 
 
 @pytest.mark.parametrize(

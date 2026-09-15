@@ -333,7 +333,7 @@ def _clone_winner_from_baseline(
             trial_number=baseline_source.trial_number,
             generation_id=baseline_source.generation_id,
             attempt_id=baseline_source.attempt_id,
-            study=source_study or baseline_source.study,
+            study=baseline_source.study or source_study,
         ),
     )
 

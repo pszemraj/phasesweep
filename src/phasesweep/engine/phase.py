@@ -226,9 +226,15 @@ def _composed_overrides(
         Later layers (later keys in the merge order) overwrite earlier ones.
 
     """
-    out: dict[str, Any] = {}
+    inherited_overrides: dict[str, Any] = {}
     for parent in phase.inherits:
-        out.update(inherited_winners[parent].effective_overrides)
+        inherited_overrides.update(inherited_winners[parent].effective_overrides)
+    resampled = set(inherited_overrides) & set(sampled)
+    if resampled:
+        raise ValueError(
+            f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)}."
+        )
+    out = dict(inherited_overrides)
     for _origin, fixed_overrides in _iter_fixed_override_layers(experiment, phase):
         out.update(fixed_overrides)
     out.update(sampled)
