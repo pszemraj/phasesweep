@@ -365,6 +365,12 @@ def grid_search_space(
                     f"Phase {phase_name!r}: grid sampler does not support "
                     f"log-scale int param {name!r}."
                 )
+            if (param.high - param.low) % param.step:
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid int param {name!r}: step={param.step} "
+                    f"must evenly divide high-low={param.high - param.low} so the "
+                    f"configured high={param.high} is included."
+                )
             grid[name] = list(range(param.low, param.high + 1, param.step))
         else:
             if param.log:

@@ -271,6 +271,15 @@ def test_grid_float_rejects_an_upper_bound_off_the_step_lattice() -> None:
         )
 
 
+def test_grid_int_rejects_an_upper_bound_off_the_step_lattice() -> None:
+    """A complete stepped grid must include its configured upper bound."""
+    with pytest.raises(ValueError, match="must evenly divide"):
+        grid_search_space(
+            {"depth": IntParam(type="int", low=0, high=5, step=2)},
+            phase_name="p",
+        )
+
+
 def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
     """Partial grid phases are allowed only when explicitly requested."""
     p = write_yaml(
