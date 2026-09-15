@@ -1477,7 +1477,9 @@ def test_launch_terminates_spawned_runner_when_handle_update_fails(
     pending = store.get(spawned.run_id)
     assert pending is not None
     assert pending.launch_state == "spawned"
-    assert store.state(pending) == "failed"
+    assert store.state(pending) == "running"
+    assert store.recovery_required(pending)
+    assert store.cleanup_uncertain(pending)
 
 
 def test_launch_interrupt_during_handle_update_terminates_runner(
@@ -1511,9 +1513,10 @@ def test_launch_interrupt_during_handle_update_terminates_runner(
     (pending,) = store.list_handles()
     terminal = store.recorded_terminal_status(pending)
     assert terminal is not None
-    assert terminal["cleanup_confirmed"] is True
+    assert terminal["cleanup_confirmed"] is False
     assert terminal["error_class"] == "KeyboardInterrupt"
-    assert store.state(pending) == "failed"
+    assert store.state(pending) == "running"
+    assert store.recovery_required(pending)
     assert terminated and terminated[0][1] is not None
 
 
@@ -1548,11 +1551,11 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
     assert "cleanup uncertain after failed runner launch bookkeeping" in caplog.text
 
 
-def test_launch_retains_recovery_reservation_when_cleanup_marker_cannot_clear(
+def test_post_ack_launch_failure_does_not_clear_reservation_from_runner_group_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Confirmed process death is not enough when its uncertainty marker cannot clear."""
+    """A dead runner group does not prove separate trial groups have stopped."""
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
@@ -1560,11 +1563,14 @@ def test_launch_retains_recovery_reservation_when_cleanup_marker_cannot_clear(
     def fail_update(_handle: RunHandle) -> None:
         raise OSError("runs directory is not writable")
 
-    def fail_clear(_handle: RunHandle) -> None:
+    clear_calls: list[RunHandle] = []
+
+    def track_clear(handle: RunHandle) -> None:
+        clear_calls.append(handle)
         raise OSError("cleanup marker cannot be removed")
 
     monkeypatch.setattr(store, "update", fail_update)
-    monkeypatch.setattr(store, "clear_cleanup_uncertain", fail_clear)
+    monkeypatch.setattr(store, "clear_cleanup_uncertain", track_clear)
     monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *args, **kwargs: True)
 
     with pytest.raises(OSError, match="runs directory"):
@@ -1577,6 +1583,7 @@ def test_launch_retains_recovery_reservation_when_cleanup_marker_cannot_clear(
     assert store.cleanup_uncertain(pending)
     assert store.state(pending) == "running"
     assert store.recovery_required(pending)
+    assert clear_calls == []
 
 
 def _launch_with_poison_project(

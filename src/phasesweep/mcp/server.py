@@ -1756,7 +1756,9 @@ class PhaseSweepMCP:
                     raise spawn_exc.original_error from None
                 except BaseException as launch_exc:
                     cleanup_confirmed = (
-                        True if handle is None else self._terminate_failed_spawn(handle, launch_exc)
+                        True
+                        if handle is None
+                        else self._terminate_failed_spawn(handle, launch_exc, acknowledged=True)
                     )
                     self._record_launch_failure(
                         pending,
@@ -2057,12 +2059,15 @@ class PhaseSweepMCP:
         self,
         handle: RunHandle,
         original_error: BaseException,
+        *,
+        acknowledged: bool = False,
     ) -> bool:
         """Terminate a spawned runner whose durable bookkeeping failed.
 
         :param RunHandle handle: Spawned runner identity available in memory.
         :param BaseException original_error: Launch failure preserved for diagnostics.
-        :return bool: Whether the runner process group is confirmed gone.
+        :param bool acknowledged: Whether the runner may already have launched trials.
+        :return bool: Whether runner and possible trial groups are confirmed gone.
         """
         marker_written = False
         try:
@@ -2092,6 +2097,12 @@ class PhaseSweepMCP:
                 handle.pgid,
             )
             return False
+        if cleanup_confirmed and acknowledged:
+            # After acknowledgement the runner can start trials in separate
+            # process groups. Its own terminal cleanup report is the only
+            # evidence that those groups were also stopped.
+            terminal = self._runs.recorded_terminal_status(handle)
+            cleanup_confirmed = terminal is not None and terminal.get("cleanup_confirmed") is True
         if cleanup_confirmed:
             if marker_written:
                 try:
