@@ -34,6 +34,7 @@ import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.run as run_engine
 import phasesweep.engine.suite as suite_ops
 from phasesweep import load_config, run_experiment
+from phasesweep.cli import _show_suite_winners
 from phasesweep.config import Experiment, IntParam, Phase, Sampler, Suite
 from phasesweep.engine import (
     NoFeasibleTrialError,
@@ -1085,7 +1086,10 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
     assert set(_generation_dir(experiment, generation_id).parent.iterdir()) == generations_before
 
 
-def test_deleted_pointer_with_an_intact_namespace_reports_absent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("delete_current_pointer", [False, True])
+def test_deleted_pointer_with_an_intact_namespace_reports_absent(
+    tmp_path: Path, delete_current_pointer: bool
+) -> None:
     """The pointer is the publication authority; an orphaned namespace is not one."""
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
@@ -1093,12 +1097,18 @@ def test_deleted_pointer_with_an_intact_namespace_reports_absent(tmp_path: Path)
     assert generation_id is not None
 
     _last_successful_generation_path(experiment).unlink()
+    if delete_current_pointer:
+        _generation_path(experiment).unlink()
     assert _generation_summary_path(experiment, generation_id).is_file()
 
     assert _resolve_publication_pointer(experiment) == PublicationPointer(
         state="absent", generation_id=None, error=None
     )
-    assert read_status(experiment)["publication_integrity"] == "absent"
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "absent"
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+    assert read_winner(experiment, "p") is None
 
 
 def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path) -> None:
@@ -1223,6 +1233,20 @@ def test_suite_publication_pointer_reports_absent_before_anything_publishes(
     assert _resolve_suite_publication_pointer(suite) == PublicationPointer(
         state="absent", generation_id=None, error=None
     )
+
+
+def test_suite_deleted_pointers_do_not_expose_compatibility_summary(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    assert _suite_summary_path(suite).is_file()
+    _last_successful_suite_generation_path(suite).unlink()
+    _suite_generation_path(suite).unlink()
+
+    assert _resolve_suite_publication_pointer(suite).state == "absent"
+    _show_suite_winners(suite)
+    assert capsys.readouterr().out.strip() == "(no successful suite result yet)"
 
 
 # --------------------------------------------------------------------------

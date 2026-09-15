@@ -73,6 +73,7 @@ from phasesweep.engine.paths import (
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
+    _generations_dir,
     _last_successful_generation_path,
     _phase_dir,
     _summary_path,
@@ -2888,6 +2889,7 @@ def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> 
         # manifest before this record-level validation is reached.
         _last_successful_generation_path(exp).unlink()
         _generation_path(exp).unlink()
+        shutil.rmtree(_generations_dir(exp))
 
         arch_winner_path = _published_winner_path(exp, "arch")
         assert arch_winner_path is not None

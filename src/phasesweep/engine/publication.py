@@ -245,12 +245,12 @@ def _published_winner_path_for(
     :param str phase_name: Phase name whose published winner path is requested.
     :return Path | None: The generation-scoped winner path when
         ``published_generation_id`` is given; the legacy compatibility winner
-        path when no generation has ever been published; ``None`` when a
-        generation exists but none has completed successfully yet.
+        path for a pre-generation layout; ``None`` when modern generation records
+        exist without a successful publication pointer.
     """
     if published_generation_id is not None:
         return path_ops._generation_winner_path(experiment, published_generation_id, phase_name)
-    if path_ops._generation_path(experiment).is_file():
+    if _has_generation_layout(experiment):
         return None
     return path_ops._winner_path(experiment, phase_name)
 
@@ -259,16 +259,14 @@ def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | No
     """Return the authoritative last-success winner, with legacy fallback.
 
     Compatibility projections are used only for layouts that predate generation
-    metadata. Once a generation has been published as current, the absence of a
-    last-success pointer means no result has been published yet; a partially
-    copied compatibility file must not become authoritative.
+    metadata. Once modern generation records exist, the absence of a last-success
+    pointer means no result is published; a compatibility file is not authoritative.
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param str phase_name: Phase name whose published winner path is requested.
     :return Path | None: The generation-scoped winner path when a last-success
-        pointer exists; the legacy compatibility winner path when no generation
-        has ever been published; ``None`` when a generation exists but none has
-        completed successfully yet.
+        pointer exists; the legacy compatibility winner path for a pre-generation
+        layout; ``None`` when modern records exist without a successful pointer.
     """
     return _published_winner_path_for(
         experiment, _last_successful_generation_id(experiment), phase_name
@@ -282,9 +280,9 @@ def _published_summary_path_for(
     """Resolve the authoritative summary path from an already-captured published id.
 
     Resolves to the generation-scoped summary path once a generation has
-    published, falls back to the legacy compatibility summary path when none
-    ever has, and returns ``None`` when a generation exists but none has
-    completed successfully yet -- takes the caller's already-resolved
+    published, falls back to the legacy compatibility summary path for a
+    pre-generation layout, and returns ``None`` when modern records exist without
+    a successful pointer -- takes the caller's already-resolved
     last-success id instead of re-reading the pointer (review v0.5.15 /
     blocker 3).
 
@@ -294,18 +292,18 @@ def _published_summary_path_for(
         :func:`_last_successful_generation_id` result (or ``None``).
     :return Path | None: The generation-scoped summary path when
         ``published_generation_id`` is given; the legacy compatibility summary
-        path when no generation has ever been published; ``None`` when a
-        generation exists but none has completed successfully yet.
+        path for a pre-generation layout; ``None`` when modern generation records
+        exist without a successful publication pointer.
     """
     if isinstance(config, Suite):
         if published_generation_id is not None:
             return path_ops._suite_generation_summary_path(config, published_generation_id)
-        if path_ops._suite_generation_path(config).is_file():
+        if _has_generation_layout(config):
             return None
         return path_ops._suite_summary_path(config)
     if published_generation_id is not None:
         return path_ops._generation_summary_path(config, published_generation_id)
-    if path_ops._generation_path(config).is_file():
+    if _has_generation_layout(config):
         return None
     return path_ops._summary_path(config)
 
@@ -319,16 +317,29 @@ def _published_promotion_decision_path(
     :param Experiment experiment: Experiment config with artifact root details.
     :param str phase_name: Phase name whose published promotion-decision path is requested.
     :return Path | None: The generation-scoped promotion-decision path when a
-        last-success pointer exists; the legacy compatibility path when no
-        generation has ever been published; ``None`` when a generation exists
-        but none has completed successfully yet.
+        last-success pointer exists; the legacy compatibility path for a
+        pre-generation layout; ``None`` when modern records exist without a pointer.
     """
     generation_id = _last_successful_generation_id(experiment)
     if generation_id is not None:
         return path_ops._generation_promotion_decision_path(experiment, generation_id, phase_name)
-    if path_ops._generation_path(experiment).is_file():
+    if _has_generation_layout(experiment):
         return None
     return path_ops._promotion_decision_path(experiment, phase_name)
+
+
+def _has_generation_layout(config: Experiment | Suite) -> bool:
+    """Return whether modern generation records exist without a publication pointer.
+
+    :param Experiment | Suite config: Experiment or suite artifact root.
+    :return bool: Whether a current generation record or immutable generation root exists.
+    """
+    if isinstance(config, Suite):
+        return (
+            path_ops._suite_generation_path(config).exists()
+            or path_ops._suite_generations_dir(config).exists()
+        )
+    return path_ops._generation_path(config).exists() or path_ops._generations_dir(config).exists()
 
 
 def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:

@@ -455,8 +455,8 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
 def _legacy_publication_present(experiment: Experiment) -> bool:
     """Whether a pre-generation workdir already holds a published winner.
 
-    Layouts written before generation metadata existed have no
-    ``generation.yaml`` and so no last-success pointer to validate: their
+    Layouts written before generation metadata existed have no current record or
+    immutable generation directory and so no last-success pointer to validate: their
     per-phase ``winner.yaml`` *is* the publication. The pointer-identity
     comparison that decides ``is_published`` everywhere else has nothing to
     compare there and used to report "never published" beside a real winner
@@ -467,7 +467,7 @@ def _legacy_publication_present(experiment: Experiment) -> bool:
     :param Experiment experiment: Experiment whose legacy winner files are probed.
     :return bool: ``True`` when the legacy fallback resolves at least one
         existing ``winner.yaml``; ``False`` for an untouched workdir and for
-        every workdir that has a ``generation.yaml`` (there the pointer, not
+    every workdir with modern generation records (there the pointer, not
         the compatibility projection, is authoritative, so an unpublished
         generation stays unpublished).
     """
