@@ -506,6 +506,8 @@ def _plan_artifact_root_rebinds(
                 _validate_artifact_root_binding_for_rebind(plan)
             else:
                 _validate_artifact_root_binding(plan.experiment, claim_fresh=False, rebind=True)
+            if has_studies_to_rebind and plan.entries:
+                _validate_artifact_root_destination(plan.experiment, plan.entries)
             _check_published_phase_studies(
                 plan.experiment, {entry.phase_name: entry.study for entry in plan.entries}
             )
@@ -515,8 +517,6 @@ def _plan_artifact_root_rebinds(
             StudyStorageUnavailableError,
         ) as exc:
             raise ArtifactRootRebindError(str(exc)) from exc
-        if has_studies_to_rebind and plan.entries:
-            _validate_artifact_root_destination(plan.experiment, plan.entries)
     if not has_studies_to_rebind:
         raise ArtifactRootRebindError(
             "No phase study in this storage is bound to an artifact root, and none holds a "
