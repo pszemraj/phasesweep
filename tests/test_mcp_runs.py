@@ -836,7 +836,7 @@ def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path:
     # Same identity as the boot-mismatch case minus the boot id: an older
     # persisted handle cannot rule out PID reuse, so it must still fail closed.
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    handle = replace(make_run_handle(run_id="exp-1", pid=999999, starttime=111), boot_id=None)
     assert handle.boot_id is None
     store.create(handle)
 
