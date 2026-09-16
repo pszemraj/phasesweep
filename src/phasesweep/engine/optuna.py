@@ -36,6 +36,7 @@ from phasesweep.runtime.files import (
     sqlite_database_path,
     sqlite_readonly_uri,
     storage_backend,
+    storage_is_in_memory,
 )
 
 
@@ -626,19 +627,16 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> op
         could not be read, so whether the study exists cannot be determined;
         callers on mutating paths must abort rather than treat this as absence.
     """
-    if experiment.resolved_storage is None:
+    storage = experiment.resolved_storage
+    if storage_is_in_memory(storage):
         return None
-    backend = storage_backend(experiment.resolved_storage)
+    assert storage is not None
+    backend = storage_backend(storage)
     if backend == "sqlite":
         if not _sqlite_study_exists(experiment, phase):
             return None
     elif backend == "journal":
-        if (
-            _load_journal_study_snapshot(
-                experiment.resolved_storage, _phase_study_name(experiment, phase)
-            )
-            is None
-        ):
+        if _load_journal_study_snapshot(storage, _phase_study_name(experiment, phase)) is None:
             return None
         # Preflight verified a complete snapshot. Mutating callers still use
         # Optuna's normal backend, including its concurrent-append semantics.

@@ -197,6 +197,22 @@ def test_resolve_storage_urls(tmp_path: Path) -> None:
             assert optuna.create_study(storage=result).trials == [], case
 
 
+def test_bare_in_memory_storage_runs_without_persistent_preflight(tmp_path: Path) -> None:
+    """The documented bare sentinel must reach a fresh in-memory study."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=":memory:",
+        trial_command="echo x=1 {overrides}",
+        n_trials=1,
+        gpu_policy="none",
+    )
+
+    outcome = run_experiment(experiment)
+
+    assert set(outcome) == {"p"}
+    assert outcome["p"].trial_number == 0
+
+
 def _storage_policy_config(
     tmp_path: Path,
     *,
