@@ -1227,8 +1227,10 @@ class PhaseSweepMCP:
                         target_id, completed, result_source=completed_source
                     )
                     result_source = completed_source
-                    if run is not None:
-                        run = self._run_payload(handle)
+                # The final probe can also reserve cleanup or discover an
+                # orphaned pending snapshot without producing a result view.
+                if run is not None:
+                    run = self._run_payload(handle)
         return target_id, status, run, handle, result_source
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:

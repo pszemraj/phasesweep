@@ -2544,30 +2544,51 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
         assert payload["reason"] == "terminal"
 
 
-@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+@pytest.mark.parametrize(
+    ("read_tool", "transition"),
+    [
+        ("status", "complete"),
+        ("winners", "complete"),
+        ("await_run", "complete"),
+        ("status", "pending_runner_exit"),
+        ("await_run", "pending_runner_exit"),
+        ("status", "no_status_runner_exit"),
+        ("await_run", "no_status_runner_exit"),
+    ],
+)
 def test_run_scoped_live_read_uses_snapshot_completed_during_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str, transition: str
 ) -> None:
-    """A live storage read cannot outlive the frozen result that replaced it."""
+    """A live read follows final snapshot or recovery state recorded during it."""
     run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, store = make_mcp_app(catalog)
     handle = store.get(run_id)
     assert handle is not None
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
-    write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    if transition == "no_status_runner_exit":
+        store.status_path(run_id).unlink()
+    else:
+        write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
+    runner_live = True
+    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: runner_live)
+    monkeypatch.setattr(
+        "phasesweep.mcp.runs.is_same_live_process", lambda _pid, _starttime: runner_live
+    )
     original_live = app._live_status_payload
     finalized = False
 
     def finish_during_live_read(
         experiment_id: str, experiment: Experiment, saved: RunHandle | None
     ) -> dict[str, Any]:
-        nonlocal finalized
+        nonlocal finalized, runner_live
         status = original_live(experiment_id, experiment, saved)
         if not finalized:
             finalized = True
-            write_run_status(store, **complete)
+            if transition == "complete":
+                write_run_status(store, **complete)
+            else:
+                runner_live = False
         return status
 
     monkeypatch.setattr(app, "_live_status_payload", finish_during_live_read)
@@ -2584,14 +2605,20 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     )
 
     assert finalized
-    assert payload["result_source"] == "frozen_run_snapshot"
-    assert payload["represented_generation_id"] == run_id
-    if read_tool == "winners":
-        assert payload["winner_count"] == 1
+    if transition == "complete":
+        assert payload["result_source"] == "frozen_run_snapshot"
+        assert payload["represented_generation_id"] == run_id
+        if read_tool == "winners":
+            assert payload["winner_count"] == 1
+        else:
+            assert payload["run"]["state"] == "succeeded"
+            if read_tool == "await_run":
+                assert payload["reason"] == "terminal"
     else:
-        assert payload["run"]["state"] == "succeeded"
+        assert payload["run"]["recovery_required"] is True
+        assert store.recovery_required(handle)
         if read_tool == "await_run":
-            assert payload["reason"] == "terminal"
+            assert payload["reason"] == "recovery_required"
 
 
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])
