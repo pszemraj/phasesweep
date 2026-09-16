@@ -3036,7 +3036,9 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
     import phasesweep.engine.phase as phase_mod
 
     real_now = time.monotonic()
-    calls = iter([real_now, real_now, real_now + 1_000.0])
+    # Deadline creation and both prelaunch checks stay in budget. The next
+    # observation occurs after the ordinary trainer failure is terminal.
+    calls = iter([real_now, real_now, real_now, real_now + 1_000.0])
     monkeypatch.setattr(
         phase_mod,
         "time",
