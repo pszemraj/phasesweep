@@ -978,6 +978,18 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
         {"run_id": "exp-1", "cleanup_confirmed": False, "pid": "123"},
         {"run_id": "exp-1", "cleanup_confirmed": False, "pgid": 0},
         {"run_id": "exp-1", "cleanup_confirmed": False, "pid_starttime": True},
+        {"run_id": "exp-1", "cleanup_confirmed": False, "pgid": 4242},
+        {
+            "run_id": "exp-1",
+            "cleanup_confirmed": False,
+            "pid_starttime": 123,
+        },
+        {
+            "run_id": "exp-1",
+            "cleanup_confirmed": False,
+            "pid": 4242,
+            "pid_starttime": 123,
+        },
     ],
 )
 def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: object) -> None:

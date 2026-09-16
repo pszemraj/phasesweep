@@ -1479,6 +1479,11 @@ class RunStore:
             return None
         if not _valid_optional_boot_id(boot_id):
             return None
+        if pid is None:
+            if pgid is not None or pid_starttime is not None:
+                return None
+        elif pgid is None:
+            return None
 
         identity = ProcessIdentity(
             pid=pid,
