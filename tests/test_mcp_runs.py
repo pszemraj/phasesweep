@@ -454,6 +454,7 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
     store.status_path("exp-orphan").write_text("{}\n")
     store.status_path("exp-dangling").symlink_to("missing-status.json")
     store.log_path("exp-directory").mkdir()
+    (tmp_path / "state" / "logs" / "exp-transition.transition.lock").write_text("")
 
     handles, unreadable_records = store.launch_inventory()
 
@@ -463,9 +464,11 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
         "run:exp-dangling",
         "run:exp-directory",
         "run:exp-orphan",
+        "run:exp-transition",
     }
     assert store.run_evidence_exists("exp-dangling")
     assert store.run_evidence_exists("exp-directory")
+    assert store.run_evidence_exists("exp-transition")
 
 
 def test_get_skips_malformed_handle(tmp_path: Path) -> None:

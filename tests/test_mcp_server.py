@@ -3110,6 +3110,7 @@ def test_corrupt_run_handle_fails_closed_for_experiment_scoped_winners(tmp_path:
         "log_path",
         "cleanup_uncertain_path",
         "cleanup_recovery_path",
+        "transition_lock",
     ],
 )
 def test_deleted_run_handle_with_surviving_run_evidence_fails_closed(
@@ -3128,7 +3129,11 @@ def test_deleted_run_handle_with_surviving_run_evidence_fails_closed(
     _represent_legacy_generation(reg.experiment, run_id)
     # No handle file at all -- deleted after the run -- but one sibling
     # per-run file under the same state dir survives it.
-    evidence = getattr(store, surviving)(run_id)
+    evidence = (
+        store._logs_dir / f"{run_id}.transition.lock"
+        if surviving == "transition_lock"
+        else getattr(store, surviving)(run_id)
+    )
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.write_text("orphaned\n")
 

@@ -68,6 +68,7 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".cleanup_uncertain.json",
     ".cleanup_recovery.json",
     ".launch.lock",
+    ".transition.lock",
 )
 
 
