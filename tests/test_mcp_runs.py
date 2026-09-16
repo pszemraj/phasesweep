@@ -266,6 +266,27 @@ def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
     assert not store.run_evidence_exists(handle.run_id)
 
 
+def test_free_launch_lease_cannot_override_missing_handle_with_runner_log(
+    tmp_path: Path,
+) -> None:
+    """A stale lease cannot erase the remaining evidence of a spawned runner."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-stale-lease", launch_state="launching")
+    preparation = store.prepare_launch(handle, b"experiment: exp\n")
+    preparation.close()
+    handle_path = tmp_path / "state" / "runs" / f"{handle.run_id}.json"
+    mcp_runs._strict_unlink(handle_path)
+    store.log_path(handle.run_id).write_text("runner may still be active\n")
+
+    assert not store.is_pre_spawn_orphan(handle.run_id)
+    with pytest.raises(ValueError, match="not a provably abandoned preparation"):
+        store.clear_pre_spawn_orphan(handle.run_id)
+
+    assert store.launch_lease_path(handle.run_id).is_file()
+    assert store.config_snapshot_path(handle.run_id).is_file()
+    assert store.log_path(handle.run_id).is_file()
+
+
 def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     pending = make_run_handle(run_id="exp-1", launch_state="launching")

@@ -753,6 +753,12 @@ class RunStore:
         invalid = any(path.exists() or path.is_symlink() for path in terminal_evidence)
         if handle_path.exists() or handle_path.is_symlink():
             invalid = invalid or handle is None or handle.launch_state != "launching"
+        elif self.log_path(run_id).exists() or self.log_path(run_id).is_symlink():
+            # A runner opens its log before Popen and releases the inherited
+            # lease after persisting its spawned handle. If that handle is
+            # later lost, the log prevents a stale free lease from proving
+            # this was an abandoned preparation.
+            invalid = True
         if invalid:
             lease.close()
             return None
