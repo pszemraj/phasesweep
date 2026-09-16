@@ -1188,6 +1188,35 @@ def test_supervised_deadline_uses_remaining_budget(
     assert not marker.exists()
 
 
+def test_payload_delivery_consumes_total_trial_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow payload write cannot turn post-deadline execution into success."""
+    import phasesweep.runtime.process as process
+
+    real_write_all = process._write_all
+
+    def slow_payload_write(fd: int, data: bytes) -> None:
+        real_write_all(fd, data)
+        time.sleep(0.2)
+
+    monkeypatch.setattr(process, "_write_all", slow_payload_write)
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    result = _run_supervised(
+        trial_dir,
+        "exec sleep 30",
+        timeout=0.05,
+        attempt_id="payload-deadline-attempt",
+    )
+
+    assert result.timed_out
+    assert result.cleanup_confirmed
+    assert result.failure_reason == "timeout after 0.05s"
+
+
 def test_supervisor_ready_wait_is_capped_by_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

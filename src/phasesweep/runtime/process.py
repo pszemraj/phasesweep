@@ -1585,7 +1585,12 @@ def run_supervised(
 
     try:
         root_status: bytes | None
-        if deadline is None:
+        if deadline is not None and time.monotonic() >= deadline:
+            # Payload delivery itself consumes the total trial budget. Do not
+            # let an immediately available exit byte turn post-deadline work
+            # into an in-budget success.
+            root_status = None
+        elif deadline is None:
             root_status = os.read(status_read, 1)
         else:
             root_status = _read_pipe_frame(status_read, 1, deadline=deadline)
