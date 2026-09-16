@@ -1281,11 +1281,11 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
     assert app.launch("srv")["state"] == "running"
 
 
-def test_acknowledgement_write_failure_terminates_receipted_runner(
+def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A durable receipt alone cannot let the child cross the work boundary."""
+    """An interrupted ACK write cannot prove the child stayed behind the barrier."""
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
@@ -1315,8 +1315,53 @@ def test_acknowledgement_write_failure_terminates_receipted_runner(
     (handle,) = store.list_handles()
     assert handle.launch_state == "spawned"
     assert cleanup_calls == [(handle.pid, handle.pid_starttime, handle.pgid)]
-    assert store.state(handle) == "failed"
+    assert store.state(handle) == "running"
+    assert store.cleanup_uncertain(handle)
+    assert store.recovery_required(handle)
+    status = store.recorded_terminal_status(handle)
+    assert status is not None
+    assert status["cleanup_confirmed"] is False
     assert not store.launch_lease_path(handle.run_id).exists()
+
+
+def test_interruption_after_ack_keeps_spawn_cleanup_reserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+    real_write = os.write
+
+    def interrupt_after_ack(fd: int, data: bytes) -> int:
+        written = real_write(fd, data)
+        if data == b"A":
+            raise KeyboardInterrupt
+        return written
+
+    def confirm_runner_group_cleanup(
+        pid: int | None,
+        starttime: int | None,
+        *,
+        pgid: int | None = None,
+    ) -> bool:
+        cleanup_calls.append((pid, starttime, pgid))
+        return True
+
+    monkeypatch.setattr(mcp_server.os, "write", interrupt_after_ack)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", confirm_runner_group_cleanup)
+
+    with pytest.raises(KeyboardInterrupt):
+        app.launch("srv")
+
+    (handle,) = store.list_handles()
+    assert cleanup_calls == [(handle.pid, handle.pid_starttime, handle.pgid)]
+    assert store.cleanup_uncertain(handle)
+    assert store.recovery_required(handle)
+    status = store.recorded_terminal_status(handle)
+    assert status is not None
+    assert status["cleanup_confirmed"] is False
 
 
 def test_completed_lease_cleanup_failure_cannot_replace_launch_success(

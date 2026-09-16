@@ -2239,6 +2239,7 @@ class PhaseSweepMCP:
         handle: RunHandle | None = None
         pid_starttime: int | None = None
         boot_id: str | None = None
+        runner_acknowledged = False
         try:
             with open_private_text(log_path, "w") as log_file:
                 proc = subprocess.Popen(  # noqa: S603 - argv list, no shell, server-controlled
@@ -2300,6 +2301,10 @@ class PhaseSweepMCP:
                 persisted = self._runs.get(run_id)
                 if persisted != handle:
                     raise RuntimeError("detached runner launch receipt did not match its process")
+            # An asynchronous exception may arrive after the byte reaches the
+            # runner but before os.write returns. From this point onward,
+            # cleanup must assume separately-sessioned trials could start.
+            runner_acknowledged = True
             if os.write(ack_write, _RUNNER_ACK_BYTE) != len(_RUNNER_ACK_BYTE):
                 raise RuntimeError("could not acknowledge the detached runner launch")
             acknowledged_fd = ack_write
@@ -2323,7 +2328,9 @@ class PhaseSweepMCP:
                 visible_params_at_launch=pending.visible_params_at_launch,
                 boot_id=boot_id,
             )
-            cleanup_confirmed = self._terminate_failed_spawn(cleanup_handle, exc)
+            cleanup_confirmed = self._terminate_failed_spawn(
+                cleanup_handle, exc, acknowledged=runner_acknowledged
+            )
             raise _SpawnBookkeepingError(
                 exc,
                 cleanup_confirmed=cleanup_confirmed,
