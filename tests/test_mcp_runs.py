@@ -13,6 +13,7 @@ import sys
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 
@@ -758,6 +759,31 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
     assert store.state(handle) == "failed"
     assert not store.cleanup_uncertain(handle)
     assert not store.cleanup_recovery_required(handle)
+
+
+def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    store.create(handle)
+    started = Event()
+    finished = Event()
+    observed: list[str] = []
+
+    def read_state() -> None:
+        started.set()
+        observed.append(store.state(handle))
+        finished.set()
+
+    with store.transition_lock(handle):
+        reader = Thread(target=read_state)
+        reader.start()
+        assert started.wait(1)
+        completed_while_locked = finished.wait(0.5)
+    reader.join(timeout=2)
+
+    assert completed_while_locked
+    assert observed == ["running"]
+    assert not store.cleanup_uncertain(handle)
 
 
 @pytest.mark.parametrize(

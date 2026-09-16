@@ -351,7 +351,7 @@ class RunStore:
                 unlock_file(handle)
 
     @contextlib.contextmanager
-    def transition_lock(self, handle: RunHandle) -> Iterator[None]:
+    def transition_lock(self, handle: RunHandle, *, blocking: bool = True) -> Iterator[bool]:
         """Serialize cancellation markers with confirmed recovery for one run.
 
         The lock is shared across MCP servers and the operator CLI. Cancellation
@@ -360,16 +360,20 @@ class RunStore:
         have all been persisted.
 
         :param RunHandle handle: Run whose cleanup transition is protected.
-        :return Iterator[None]: Context manager for the transition.
+        :param bool blocking: Wait for the lock, or return without acquiring it.
+        :return Iterator[bool]: Whether the transition lock was acquired.
         """
-        import fcntl
-
-        lock_handle = open_lock_file(self._logs_dir / f"{handle.run_id}.transition.lock")
+        lock_path = self._logs_dir / f"{handle.run_id}.transition.lock"
+        lock_handle = open_lock_file(lock_path) if blocking else try_lock_file(lock_path)
         try:
-            fcntl.flock(lock_handle, fcntl.LOCK_EX)
-            yield
+            if lock_handle is not None and blocking:
+                import fcntl
+
+                fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            yield lock_handle is not None
         finally:
-            unlock_file(lock_handle)
+            if lock_handle is not None:
+                unlock_file(lock_handle)
 
     def new_run_id(self, experiment_id: str) -> str:
         """Mint a fresh, collision-resistant run id prefixed with the experiment id.
@@ -943,8 +947,16 @@ class RunStore:
         :param bool transition_locked: Whether the caller already holds the transition lock.
         :return RunState: Latest terminal state or a reserved running state.
         """
-        lock = contextlib.nullcontext() if transition_locked else self.transition_lock(handle)
-        with lock:
+        lock = (
+            contextlib.nullcontext(True)
+            if transition_locked
+            else self.transition_lock(handle, blocking=False)
+        )
+        with lock as acquired:
+            if not acquired:
+                # Recovery already owns the transition; it will publish the
+                # terminal state or cleanup marker before releasing the lock.
+                return "running"
             status = self._read_status(handle)
             if self.cleanup_uncertain(handle):
                 if (
