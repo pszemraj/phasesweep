@@ -1334,6 +1334,23 @@ def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(
     assert current_path.read_bytes() == current
 
 
+def test_surviving_pointer_prevents_legacy_fallback_after_generation_loss(
+    tmp_path: Path,
+) -> None:
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    _generation_path(experiment).unlink()
+    generations = _generations_dir(experiment)
+    generations.rename(generations.with_name(f"saved-{generations.name}"))
+
+    assert _resolve_publication_pointer(experiment).state == "failed"
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "failed"
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+    assert read_winner(experiment, "p") is None
+
+
 def test_dangling_generation_root_does_not_enable_legacy_winner(tmp_path: Path) -> None:
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)

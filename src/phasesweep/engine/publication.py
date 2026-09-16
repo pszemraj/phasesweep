@@ -347,11 +347,15 @@ def _has_generation_layout(config: Experiment | Suite) -> bool:
         return True
 
     if isinstance(config, Suite):
-        return entry_present(path_ops._suite_generation_path(config)) or entry_present(
-            path_ops._suite_generations_dir(config)
+        return (
+            entry_present(path_ops._last_successful_suite_generation_path(config))
+            or entry_present(path_ops._suite_generation_path(config))
+            or entry_present(path_ops._suite_generations_dir(config))
         )
-    return entry_present(path_ops._generation_path(config)) or entry_present(
-        path_ops._generations_dir(config)
+    return (
+        entry_present(path_ops._last_successful_generation_path(config))
+        or entry_present(path_ops._generation_path(config))
+        or entry_present(path_ops._generations_dir(config))
     )
 
 
