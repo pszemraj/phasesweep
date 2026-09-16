@@ -611,6 +611,7 @@ def launch_trial(
         run_name=run_name,
         return_code=proc_result.return_code,
         duration_seconds=proc_result.duration_seconds,
+        wandb_environment=dict(env),
     )
 
     return ExecutedTrial(

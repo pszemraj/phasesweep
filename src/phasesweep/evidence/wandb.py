@@ -8,7 +8,7 @@ import os
 import shlex
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from math import ceil
 from pathlib import Path
@@ -166,6 +166,7 @@ def poll_wandb_summary(
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
     wait_for_keys: bool = True,
+    environment: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Poll W&B after the trial's previous subprocess has been confirmed gone.
 
@@ -182,6 +183,10 @@ def poll_wandb_summary(
         initialization, requests, and retries. Process cleanup may finish afterward.
     :param Iterable[str] required_keys: Summary keys that must be present.
     :param bool wait_for_keys: Whether to wait for all required keys before returning.
+    :param Mapping[str, str] | None environment: Environment composed for the
+        trainer, reused by the polling worker so both processes resolve the
+        same configured W&B credentials and transport settings. Direct callers
+        default to the current process environment.
     :raises WandbSetupError: If the first API client fails for a non-transport
         reason such as bad credentials or settings, or a run lookup reports HTTP
         401 or 403. Connection and timeout failures are retried within the polling
@@ -237,7 +242,7 @@ def poll_wandb_summary(
                         str(response_path),
                     ]
                 ),
-                env=dict(os.environ),
+                env=dict(os.environ if environment is None else environment),
                 stdout=stdout,
                 stderr=stderr,
                 timeout=max(0.0, deadline - time.monotonic()),

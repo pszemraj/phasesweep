@@ -7,8 +7,8 @@ import json
 import math
 import os
 import stat
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +151,11 @@ class TrialContext:
     run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
     duration_seconds: float
+    wandb_environment: Mapping[str, str] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def _extract_json(
@@ -430,6 +435,7 @@ def _extract_wandb(
             poll_seconds=cfg.poll_seconds,
             timeout_seconds=cfg.timeout_seconds,
             required_keys=[cfg.metric_key],
+            environment=ctx.wandb_environment,
         )
     except ImportError as exc:
         raise ExtractorError(
@@ -770,6 +776,7 @@ def _wandb_summary_required(
             poll_seconds=gate.poll_seconds,
             timeout_seconds=gate.timeout_seconds,
             wait_for_keys=False,
+            environment=ctx.wandb_environment,
         )
     except ImportError:
         return GateResult(gate.type, False, "wandb package is not installed")

@@ -65,7 +65,7 @@ class _FakeApi:
 def fake_wandb(monkeypatch: pytest.MonkeyPatch):
     """Run polling-loop unit tests inline with a fake W&B API and controllable clock."""
 
-    def poll_inline(*, trial_dir, **kwargs):
+    def poll_inline(*, trial_dir, environment=None, **kwargs):
         return _poll_wandb_summary(**kwargs)
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll_inline)
@@ -987,6 +987,38 @@ def test_wandb_extractor_finds_metric(fake_wandb, tmp_path):
     assert run_extractor(ctx, cfg) == pytest.approx(0.123)
     assert paths == ["me/proj/attempt-test"]
     assert timeouts == [1]
+
+
+def test_wandb_evidence_reuses_the_composed_trainer_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extractor and gate workers use the same W&B settings as the trainer."""
+    environments: list[dict[str, str] | None] = []
+
+    def poll_summary(*, environment=None, **_kwargs):  # noqa: ANN001, ANN202
+        environments.append(None if environment is None else dict(environment))
+        return {"eval/loss": 0.123, "required": True}
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", poll_summary)
+    environment = {"WANDB_API_KEY": "configured-token", "WANDB_MODE": "online"}
+    ctx = replace(make_trial_context(tmp_path), wandb_environment=environment)
+    extractor = WandbExtractor(
+        type="wandb",
+        entity="me",
+        project="proj",
+        metric_key="eval/loss",
+    )
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required",
+        entity="me",
+        project="proj",
+        keys=["required"],
+    )
+
+    assert run_extractor(ctx, extractor) == pytest.approx(0.123)
+    assert evaluate_gates(ctx, [gate])[0].passed is True
+    assert environments == [environment, environment]
+    assert "configured-token" not in repr(ctx)
 
 
 def test_wandb_extractor_uses_explicit_normalized_endpoint(fake_wandb, tmp_path) -> None:
