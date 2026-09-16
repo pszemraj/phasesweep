@@ -174,13 +174,15 @@ def test_auto_backend_change_refuses_existing_tree(
 
 
 def test_resolve_storage_urls(tmp_path: Path) -> None:
-    """Only journal:/// is translated; other URLs pass through to Optuna."""
+    """Translate in-memory sentinels and journals while preserving RDB URLs."""
+    import optuna
     from optuna.storages import JournalStorage
 
     cases = [
         ("sqlite_passthrough", "sqlite:///./runs/phases.db", "passthrough"),
         ("rdb_passthrough", "postgresql://user:pass@host/db", "passthrough"),
         ("in_memory", None, "none"),
+        ("in_memory_sentinel", ":memory:", "none"),
         ("journal", f"journal:///{tmp_path}/phases.journal", "journal"),
     ]
 
@@ -192,6 +194,7 @@ def test_resolve_storage_urls(tmp_path: Path) -> None:
             assert isinstance(result, JournalStorage), case
         else:
             assert result is None, case
+            assert optuna.create_study(storage=result).trials == [], case
 
 
 def _storage_policy_config(
