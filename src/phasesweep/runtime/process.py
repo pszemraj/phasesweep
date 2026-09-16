@@ -1156,16 +1156,46 @@ def _encode_launch_payload(cmd: str, env: dict[str, str], cwd: str | None = None
     return f"{len(body):0{_supervisor._HEADER_LEN}d}".encode("ascii") + body
 
 
-def _write_all(fd: int, data: bytes) -> None:
-    """Write every byte of ``data`` to ``fd``, looping past partial pipe writes.
+def _write_all(
+    fd: int,
+    data: bytes,
+    *,
+    deadline: float | None = None,
+    pid: int = -1,
+) -> None:
+    """Write every byte of ``data`` without exceeding a launch deadline.
 
     :param int fd: Open file descriptor to write to.
     :param bytes data: Bytes to write in full.
+    :param float | None deadline: Optional absolute ``time.monotonic`` deadline.
+    :param int pid: Supervisor PID reported when ``deadline`` expires.
+    :raises _LaunchDeadlineExpired: If the pipe cannot accept the payload before
+        ``deadline``.
     :raises OSError: If the underlying ``os.write`` call fails.
     """
+    import time
+
     view = memoryview(data)
+    if deadline is not None:
+        os.set_blocking(fd, False)
     while view:
-        written = os.write(fd, view)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _LaunchDeadlineExpired(
+                    "trial launch deadline expired while delivering the trainer payload",
+                    pid=pid,
+                )
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if not writable or time.monotonic() >= deadline:
+                raise _LaunchDeadlineExpired(
+                    "trial launch deadline expired while delivering the trainer payload",
+                    pid=pid,
+                )
+        try:
+            written = os.write(fd, view)
+        except BlockingIOError:
+            continue
         view = view[written:]
 
 
@@ -1473,7 +1503,12 @@ def run_supervised(
             # Only now does the trainer command and full trainer environment
             # cross into the supervisor — after identity is durable, over the
             # ack pipe as a framed JSON payload (review v0.5.15 / blocker 1).
-            _write_all(ack_write, _encode_launch_payload(cmd, env, cwd))
+            _write_all(
+                ack_write,
+                _encode_launch_payload(cmd, env, cwd),
+                deadline=deadline,
+                pid=pgid,
+            )
             os.close(ack_write)
             ack_write = None
     except _LaunchDeadlineExpired as exc:

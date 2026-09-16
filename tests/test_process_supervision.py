@@ -413,8 +413,14 @@ def test_payload_delivery_interrupt_cleans_registered_trainer_group(
 
     real_write_all = process._write_all
 
-    def deliver_then_interrupt(fd: int, data: bytes) -> None:
-        real_write_all(fd, data)
+    def deliver_then_interrupt(
+        fd: int,
+        data: bytes,
+        *,
+        deadline: float | None = None,
+        pid: int = -1,
+    ) -> None:
+        real_write_all(fd, data, deadline=deadline, pid=pid)
         raise KeyboardInterrupt
 
     real_abort = process._abort_launch
@@ -1197,8 +1203,14 @@ def test_payload_delivery_consumes_total_trial_budget(
 
     real_write_all = process._write_all
 
-    def slow_payload_write(fd: int, data: bytes) -> None:
-        real_write_all(fd, data)
+    def slow_payload_write(
+        fd: int,
+        data: bytes,
+        *,
+        deadline: float | None = None,
+        pid: int = -1,
+    ) -> None:
+        real_write_all(fd, data, deadline=deadline, pid=pid)
         time.sleep(0.2)
 
     monkeypatch.setattr(process, "_write_all", slow_payload_write)
@@ -1215,6 +1227,73 @@ def test_payload_delivery_consumes_total_trial_budget(
     assert result.timed_out
     assert result.cleanup_confirmed
     assert result.failure_reason == "timeout after 0.05s"
+
+
+def test_payload_write_timeout_covers_a_nonreading_supervisor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked ACK-pipe write must expire the launch deadline."""
+    import threading
+
+    import phasesweep.runtime.process as process
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    pid_file = tmp_path / "supervisor.pid"
+    stopped_supervisor = tmp_path / "stopped_supervisor.py"
+    stopped_supervisor.write_text(
+        "import os, signal, sys\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "os.write(int(sys.argv[1]), b'R' + f'{os.getpid():010d}'.encode('ascii'))\n"
+        "os.kill(os.getpid(), signal.SIGSTOP)\n"
+    )
+    monkeypatch.setattr(process, "_SUPERVISOR_SCRIPT_PATH", str(stopped_supervisor))
+
+    payload_write_started = threading.Event()
+    real_write_all = process._write_all
+
+    def record_payload_write(
+        fd: int,
+        data: bytes,
+        *,
+        deadline: float | None = None,
+        pid: int = -1,
+    ) -> None:
+        payload_write_started.set()
+        real_write_all(fd, data, deadline=deadline, pid=pid)
+
+    monkeypatch.setattr(process, "_write_all", record_payload_write)
+
+    def kill_stopped_supervisor() -> None:
+        deadline = time.monotonic() + 1.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+
+    killer = threading.Timer(0.35, kill_stopped_supervisor)
+    killer.start()
+    try:
+        result = _run_supervised(
+            trial_dir,
+            "true",
+            env={"X": "x" * 1_000_000},
+            timeout=0.05,
+            attempt_id="ack-write-deadline",
+        )
+    finally:
+        killer.cancel()
+        if pid_file.exists():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(int(pid_file.read_text()), signal.SIGKILL)
+        killer.join()
+
+    assert payload_write_started.is_set()
+    assert result.timed_out
+    assert result.cleanup_confirmed
+    assert result.failure_reason == "timeout after 0.05s before trainer launch"
 
 
 def test_supervisor_ready_wait_is_capped_by_deadline(
