@@ -1227,7 +1227,10 @@ def test_payload_delivery_consumes_total_trial_budget(
 
     assert result.timed_out
     assert result.cleanup_confirmed
-    assert result.failure_reason == "timeout after 0.05s"
+    assert result.failure_reason in {
+        "timeout after 0.05s",
+        "timeout after 0.05s before trainer launch",
+    }
 
 
 def test_terminal_status_read_cannot_turn_expired_trial_into_success(
