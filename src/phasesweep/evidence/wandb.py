@@ -166,6 +166,25 @@ def _is_nonretryable_authorization_error(exc: Exception) -> bool:
     return False
 
 
+def _poll_worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
+    """Combine trainer W&B settings with the orchestrator's Python settings.
+
+    :param Mapping[str, str] | None environment: Composed trainer environment,
+        or ``None`` to reuse the current process environment.
+    :return dict[str, str]: Worker environment safe for the orchestrator's
+        Python interpreter.
+    """
+    worker_environment = dict(os.environ if environment is None else environment)
+    for name in set(worker_environment) | set(os.environ):
+        if not name.startswith("PYTHON"):
+            continue
+        if name in os.environ:
+            worker_environment[name] = os.environ[name]
+        else:
+            worker_environment.pop(name, None)
+    return worker_environment
+
+
 def poll_wandb_summary(
     *,
     base_url: str,
@@ -195,9 +214,9 @@ def poll_wandb_summary(
     :param Iterable[str] required_keys: Summary keys that must be present.
     :param bool wait_for_keys: Whether to wait for all required keys before returning.
     :param Mapping[str, str] | None environment: Environment composed for the
-        trainer, reused by the polling worker so both processes resolve the
-        same configured W&B credentials and transport settings. Direct callers
-        default to the current process environment.
+        trainer. The worker reuses its W&B credentials and transport settings
+        while retaining the orchestrator's Python bootstrap settings. Direct
+        callers default to the current process environment.
     :raises WandbSetupError: If the first API client fails for a non-transport
         reason such as bad credentials or settings, or a run lookup reports HTTP
         401 or 403. Connection failures, timeouts, rate limits, and transient
@@ -253,7 +272,7 @@ def poll_wandb_summary(
                         str(response_path),
                     ]
                 ),
-                env=dict(os.environ if environment is None else environment),
+                env=_poll_worker_environment(environment),
                 stdout=stdout,
                 stderr=stderr,
                 timeout=max(0.0, deadline - time.monotonic()),

@@ -157,6 +157,54 @@ def test_wandb_worker_returns_raw_sdk_summary_metrics(wandb_worker_sdk, tmp_path
     assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
 
 
+def test_wandb_worker_restores_orchestrator_python_environment(
+    wandb_worker_sdk, tmp_path, monkeypatch
+):
+    """Trainer Python bootstrap settings cannot alter the evidence worker."""
+    for name in ("PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE", "PYTHONPLATLIBDIR"):
+        monkeypatch.delenv(name, raising=False)
+    orchestrator_pythonpath = os.environ["PYTHONPATH"]
+    wandb_worker_sdk(
+        """
+        import os
+
+        class Api:
+            def __init__(self, **kwargs):
+                assert os.environ["WANDB_API_KEY"] == "configured-token"
+                assert os.environ["PYTHONPATH"] == os.environ["EXPECTED_PYTHONPATH"]
+                for name in ("PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE", "PYTHONPLATLIBDIR"):
+                    assert name not in os.environ
+
+            def run(self, path):
+                return type("Run", (), {"state": "finished", "summary_metrics": {"loss": 0.25}})()
+        """
+    )
+    trainer_environment = dict(os.environ)
+    trainer_environment.update(
+        {
+            "EXPECTED_PYTHONPATH": orchestrator_pythonpath,
+            "PYTHONEXECUTABLE": "/trainer/python",
+            "PYTHONHOME": "/definitely/not/a/python/home",
+            "PYTHONPATH": str(tmp_path / "trainer-modules"),
+            "PYTHONPLATLIBDIR": "trainer-lib",
+            "PYTHONSTARTUP": str(tmp_path / "trainer-startup.py"),
+            "WANDB_API_KEY": "configured-token",
+        }
+    )
+
+    assert poll_wandb_summary(
+        base_url="https://example.test",
+        entity="entity",
+        project="project",
+        run_id="attempt",
+        trial_dir=tmp_path,
+        poll_seconds=0.01,
+        timeout_seconds=5,
+        required_keys=["loss"],
+        environment=trainer_environment,
+    ) == {"loss": 0.25}
+
+
 def test_wandb_sdk_summary_metrics_avoid_nested_summary_wrapper(tmp_path):
     """Current W&B's raw summary avoids its nested mapping wrapper."""
     summary_module = pytest.importorskip("wandb.apis.public.summary")
