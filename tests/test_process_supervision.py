@@ -256,6 +256,39 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
             os.kill(result.pid, 0)
 
 
+def test_pre_spawn_failure_records_confirmed_terminal_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed spawn cannot strand a childless attempt in ``launching``."""
+    import phasesweep.runtime.process as process
+
+    def fail_before_spawn(**_kwargs: object) -> None:
+        raise OSError("injected pre-spawn failure")
+
+    monkeypatch.setattr(process, "_spawn_blocked_supervisor", fail_before_spawn)
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    with pytest.raises(OSError, match="injected pre-spawn failure"):
+        _run_supervised(
+            trial_dir,
+            "true",
+            timeout=None,
+            attempt_id="pre-spawn-failure",
+        )
+
+    lifecycle = read_attempt_lifecycle(
+        trial_dir,
+        expected_attempt_id="pre-spawn-failure",
+    )
+    assert lifecycle is not None
+    assert lifecycle.state == "exited"
+    assert lifecycle.return_code is None
+    assert lifecycle.cleanup_confirmed is True
+    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+
+
 def test_identity_write_failure_marks_launch_before_popen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

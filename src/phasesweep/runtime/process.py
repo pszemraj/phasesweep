@@ -1084,18 +1084,20 @@ def _record_attempt_exited(
     trial_dir: Path,
     *,
     attempt_id: str,
-    return_code: int,
+    return_code: int | None,
 ) -> None:
     """Best-effort durable transition to the ``exited`` lifecycle state.
 
-    Called only after the supervised group is confirmed gone. A write failure
-    must not fail the trial: the retained identity file still lets recovery
-    verify the (now dead) process the slow way.
+    Called after the supervised group is confirmed gone or a spawn fails before
+    creating any child. A write failure must not replace the primary trial
+    outcome; when a child existed, its retained identity still lets recovery
+    verify the process the slow way.
 
     Args:
         trial_dir: Per-trial directory holding the lifecycle record.
         attempt_id: Immutable attempt identity binding the record.
-        return_code: Root process return code observed by the supervisor wait.
+        return_code: Root process return code observed by the supervisor wait,
+            or ``None`` when no child was created.
 
     """
     try:
@@ -1507,6 +1509,11 @@ def run_supervised(
             os.close(status_read)
             status_read = None
         if proc is None:
+            _record_attempt_exited(
+                trial_dir,
+                attempt_id=attempt_id,
+                return_code=None,
+            )
             raise
         target_pgid = pgid if pgid is not None else proc.pid
         # Covers both a failed identity write and a failed payload delivery;
