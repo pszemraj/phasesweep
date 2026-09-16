@@ -1098,8 +1098,10 @@ class RunStore:
         :return ProcessIdentity: Marker identity when stronger, otherwise handle identity.
         """
         marker_identity = self._read_cleanup_identity(handle)
-        if marker_identity is not None and (
-            marker_identity.pid is not None or marker_identity.pgid is not None
+        if (
+            handle.launch_state == "launching"
+            and marker_identity is not None
+            and (marker_identity.pid is not None or marker_identity.pgid is not None)
         ):
             return marker_identity
         return ProcessIdentity(
@@ -1474,12 +1476,39 @@ class RunStore:
         if not _valid_optional_boot_id(boot_id):
             return None
 
-        return ProcessIdentity(
+        identity = ProcessIdentity(
             pid=pid,
             pgid=pgid,
             pid_starttime=pid_starttime,
             boot_id=boot_id,
         )
+        if handle.launch_state == "spawned":
+            durable_identity = ProcessIdentity(
+                pid=handle.pid,
+                pgid=handle.pgid,
+                pid_starttime=handle.pid_starttime,
+                boot_id=handle.boot_id,
+            )
+            if any(
+                marker_value is not None and marker_value != durable_value
+                for marker_value, durable_value in zip(
+                    (
+                        identity.pid,
+                        identity.pgid,
+                        identity.pid_starttime,
+                        identity.boot_id,
+                    ),
+                    (
+                        durable_identity.pid,
+                        durable_identity.pgid,
+                        durable_identity.pid_starttime,
+                        durable_identity.boot_id,
+                    ),
+                    strict=True,
+                )
+            ):
+                return None
+        return identity
 
 
 def _valid_positive_optional_int(value: object) -> bool:

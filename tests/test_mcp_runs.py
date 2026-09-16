@@ -970,6 +970,33 @@ def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) ->
     assert store.cleanup_identity(loaded).boot_id == boot_id
 
 
+def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) -> None:
+    """A conflicting marker cannot declare a live spawned runner to be from an old boot."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64)
+    store.create(handle)
+    private_atomic_write_text(
+        store.cleanup_uncertain_path(handle.run_id),
+        json.dumps(
+            {
+                "run_id": handle.run_id,
+                "config_sha256": handle.config_sha256,
+                "pid": handle.pid,
+                "pgid": handle.pgid,
+                "pid_starttime": handle.pid_starttime,
+                "boot_id": _earlier_boot_id(),
+                "cleanup_confirmed": False,
+            }
+        ),
+    )
+
+    assert store._runner_is_live(handle)
+    assert not store.cleanup_uncertain(handle)
+    assert store.cleanup_identity(handle).boot_id == handle.boot_id
+    assert store.state(handle) == "running"
+    assert not store.recovery_required(handle)
+
+
 @pytest.mark.parametrize("boot_id", ["", "malformed", 12345, True])
 def test_cleanup_marker_with_invalid_boot_id_is_rejected(tmp_path: Path, boot_id: object) -> None:
     store = RunStore(tmp_path / "state")
