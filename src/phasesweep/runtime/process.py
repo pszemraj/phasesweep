@@ -1530,8 +1530,14 @@ def run_supervised(
                 cleanup_confirmed=True,
             )
             raise
-        if not isinstance(exc, Exception):
+        if isinstance(exc, PhaseSweepShutdown):
+            # The installed handler already made the authoritative cleanup
+            # attempt. Remove its now-settled registry entry before preserving
+            # the structured shutdown evidence unchanged.
+            if pgid is not None:
+                _unregister(pgid)
             raise
+        control_flow_exception = not isinstance(exc, Exception)
         target_pgid = pgid if pgid is not None else proc.pid
         # Covers both a failed identity write and a failed payload delivery;
         # the substring "failed to persist process identity" is kept stable
@@ -1552,6 +1558,13 @@ def run_supervised(
                 attempt_id=attempt_id,
                 return_code=proc.returncode if proc.returncode is not None else -9,
             )
+        if control_flow_exception:
+            if not cleanup_confirmed:
+                raise UnsafeProcessCleanupError(
+                    f"Trial launch was interrupted after starting process group "
+                    f"{target_pgid}, and cleanup could not be confirmed."
+                ) from exc
+            raise
         duration = time.monotonic() - started
         return ProcessResult(
             return_code=proc.returncode if proc.returncode is not None else -9,

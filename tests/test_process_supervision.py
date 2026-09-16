@@ -402,6 +402,56 @@ def test_spawn_interrupt_after_popen_preserves_cleanup_evidence(
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 
+@pytest.mark.parametrize("cleanup_confirmed", [True, False])
+def test_payload_delivery_interrupt_cleans_registered_trainer_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_confirmed: bool,
+) -> None:
+    """An interrupt after payload delivery cannot leave training alive."""
+    import phasesweep.runtime.process as process
+
+    real_write_all = process._write_all
+
+    def deliver_then_interrupt(fd: int, data: bytes) -> None:
+        real_write_all(fd, data)
+        raise KeyboardInterrupt
+
+    real_abort = process._abort_launch
+
+    def abort_with_verdict(proc: subprocess.Popen, pgid: int | None) -> bool:
+        real_abort(proc, pgid)
+        return cleanup_confirmed
+
+    monkeypatch.setattr(process, "_write_all", deliver_then_interrupt)
+    monkeypatch.setattr(process, "_abort_launch", abort_with_verdict)
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    expected = KeyboardInterrupt if cleanup_confirmed else UnsafeProcessCleanupError
+    with pytest.raises(expected):
+        _run_supervised(
+            trial_dir,
+            "exec sleep 30",
+            timeout=None,
+            attempt_id="interrupted-payload-delivery",
+        )
+
+    identity = read_stale_process_identity(
+        trial_dir,
+        expected_attempt_id="interrupted-payload-delivery",
+    )
+    assert not process._process_group_alive(identity.pgid)
+    with process._lock:
+        assert identity.pgid not in process._active_children
+    lifecycle = read_attempt_lifecycle(
+        trial_dir,
+        expected_attempt_id="interrupted-payload-delivery",
+    )
+    assert lifecycle is not None
+    assert lifecycle.state == ("exited" if cleanup_confirmed else "launching")
+
+
 def test_identity_write_failure_marks_launch_before_popen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
