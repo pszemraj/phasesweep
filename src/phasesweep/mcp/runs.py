@@ -352,7 +352,12 @@ class RunStore:
                 unlock_file(handle)
 
     @contextlib.contextmanager
-    def transition_lock(self, handle: RunHandle, *, blocking: bool = True) -> Iterator[bool]:
+    def transition_lock(
+        self,
+        handle: RunHandle | str,
+        *,
+        blocking: bool = True,
+    ) -> Iterator[bool]:
         """Serialize cancellation markers with confirmed recovery for one run.
 
         The lock is shared across MCP servers and the operator CLI. Cancellation
@@ -360,11 +365,12 @@ class RunStore:
         holds it until cleanup evidence, terminal results, and marker removal
         have all been persisted.
 
-        :param RunHandle handle: Run whose cleanup transition is protected.
+        :param RunHandle | str handle: Run or run id whose cleanup transition is protected.
         :param bool blocking: Wait for the lock, or return without acquiring it.
         :return Iterator[bool]: Whether the transition lock was acquired.
         """
-        lock_path = self._logs_dir / f"{handle.run_id}.transition.lock"
+        run_id = handle if isinstance(handle, str) else handle.run_id
+        lock_path = self._logs_dir / f"{run_id}.transition.lock"
         lock_handle = open_lock_file(lock_path) if blocking else try_lock_file(lock_path)
         try:
             if lock_handle is not None and blocking:
@@ -776,48 +782,54 @@ class RunStore:
         :return Path | None: Preserved runner log path, including an archive from an
             interrupted recovery, or None when no log existed.
         """
-        lease: IO[str] | None = None
-        if self.launch_lease_path(run_id).is_file():
-            lease = self._claim_abandoned_launch_lease(run_id)
-            if lease is None:
-                raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
-        elif not self.is_pre_spawn_orphan(run_id):
-            raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
-        paths = (
-            self._runs_dir / f"{run_id}.json",
-            self.config_snapshot_path(run_id),
-            self.launch_lease_path(run_id),
-        )
         recovered_log: Path | None = None
-        try:
-            log_path = self.log_path(run_id)
-            archive_path = log_path.with_suffix(".log.recovered")
-            if log_path.exists() or log_path.is_symlink():
-                recovered_log = archive_path
-                # A child can fail before recording its identity. Keep its only
-                # diagnostic outside the active-run evidence namespace, and
-                # make the rename durable before removing the launch reservation.
-                # Run IDs include a fresh UUID and are never reused by the server;
-                # this rename is not an exclusive archive operation for reused IDs.
-                directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
-                try:
-                    os.rename(
-                        log_path.name,
-                        recovered_log.name,
-                        src_dir_fd=directory_fd,
-                        dst_dir_fd=directory_fd,
+        with self.transition_lock(run_id):
+            lease: IO[str] | None = None
+            try:
+                if self.launch_lease_path(run_id).is_file():
+                    lease = self._claim_abandoned_launch_lease(run_id)
+                    if lease is None:
+                        raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
+                elif not self.is_pre_spawn_orphan(run_id):
+                    raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
+                log_path = self.log_path(run_id)
+                archive_path = log_path.with_suffix(".log.recovered")
+                if log_path.exists() or log_path.is_symlink():
+                    recovered_log = archive_path
+                    # A child can fail before recording its identity. Keep its only
+                    # diagnostic outside the active-run evidence namespace, and
+                    # make the rename durable before removing the launch reservation.
+                    # Run IDs include a fresh UUID and are never reused by the server;
+                    # this rename is not an exclusive archive operation for reused IDs.
+                    directory_fd = open_directory_fd(
+                        self._logs_dir,
+                        create=False,
+                        private_final=True,
                     )
-                    os.fsync(directory_fd)
-                finally:
-                    os.close(directory_fd)
-            elif archive_path.exists() or archive_path.is_symlink():
-                recovered_log = archive_path
-            for path in paths:
-                with contextlib.suppress(FileNotFoundError):
-                    _strict_unlink(path)
-        finally:
-            if lease is not None:
-                lease.close()
+                    try:
+                        os.rename(
+                            log_path.name,
+                            recovered_log.name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                        )
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                elif archive_path.exists() or archive_path.is_symlink():
+                    recovered_log = archive_path
+                paths = (
+                    self._runs_dir / f"{run_id}.json",
+                    self._logs_dir / f"{run_id}.transition.lock",
+                    self.config_snapshot_path(run_id),
+                    self.launch_lease_path(run_id),
+                )
+                for path in paths:
+                    with contextlib.suppress(FileNotFoundError):
+                        _strict_unlink(path)
+            finally:
+                if lease is not None:
+                    lease.close()
         return recovered_log
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:

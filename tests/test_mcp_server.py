@@ -628,7 +628,6 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(
     """A free launch lease makes a persisted launch recoverable without losing its log."""
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    del app
     reg = registry.get("srv")
     run_id = "srv-abandoned-preparation"
     pending = make_run_handle(
@@ -636,8 +635,11 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
         launch_state="launching",
+        allow_cancel=True,
     )
     preparation = store.prepare_launch(pending, config.read_bytes())
+    with pytest.raises(RunLaunchUnsettledError, match="verified runner identity"):
+        app.cancel(run_id)
     log_path = store.log_path(run_id)
     recovered_log = log_path.with_suffix(".log.recovered")
     log_bytes = b"runner failed before persisting its process identity\n"
@@ -646,6 +648,7 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(
         registry.state_dir / "runs" / f"{run_id}.json",
         store.config_snapshot_path(run_id),
         store.launch_lease_path(run_id),
+        store._logs_dir / f"{run_id}.transition.lock",
         log_path,
     )
     original = {path: path.read_bytes() for path in artifacts}
