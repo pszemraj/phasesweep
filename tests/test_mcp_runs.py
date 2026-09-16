@@ -720,6 +720,30 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
     assert store.state(handle) == "failed"
 
 
+def test_clear_cleanup_uncertain_uses_durable_idempotent_unlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    store.mark_cleanup_uncertain(handle)
+    marker = store.cleanup_uncertain_path(handle.run_id)
+    real_unlink = mcp_runs._strict_unlink
+    unlinked: list[Path] = []
+
+    def track_unlink(path: Path) -> None:
+        unlinked.append(path)
+        real_unlink(path)
+
+    monkeypatch.setattr(mcp_runs, "_strict_unlink", track_unlink)
+
+    store.clear_cleanup_uncertain(handle)
+    store.clear_cleanup_uncertain(handle)
+
+    assert unlinked == [marker, marker]
+    assert not marker.exists()
+
+
 def test_state_does_not_restore_cleanup_marker_after_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

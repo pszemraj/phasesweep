@@ -1038,7 +1038,8 @@ class RunStore:
 
         :param RunHandle handle: Run handle whose process group is now confirmed gone.
         """
-        self.cleanup_uncertain_path(handle.run_id).unlink(missing_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            _strict_unlink(self.cleanup_uncertain_path(handle.run_id))
 
     def cleanup_uncertain(self, handle: RunHandle) -> bool:
         """Return whether a valid cleanup uncertainty marker exists for ``handle``.
