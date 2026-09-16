@@ -15,6 +15,28 @@ if TYPE_CHECKING:
     from phasesweep.config.models import Phase
 
 
+_OPTUNA_EXACT_INT_LIMIT = 1 << 53
+
+
+def _validate_optuna_integer_domain(low: int, high: int) -> None:
+    """Reject integer bounds that cannot round-trip through Optuna numeric storage.
+
+    :param int low: Inclusive lower bound.
+    :param int high: Inclusive upper bound.
+    :raises ValueError: If the bounds are reversed or exceed the exact integer
+        range of Optuna's floating-point internal representation.
+    """
+    if low > high:
+        raise ValueError(f"int param: low ({low}) > high ({high})")
+    if low < -_OPTUNA_EXACT_INT_LIMIT or high > _OPTUNA_EXACT_INT_LIMIT:
+        raise ValueError(
+            "numeric integer search bounds must stay within "
+            f"[{-_OPTUNA_EXACT_INT_LIMIT}, {_OPTUNA_EXACT_INT_LIMIT}] so every "
+            "value can round-trip exactly through Optuna; use categorical choices "
+            "for larger integers"
+        )
+
+
 class FloatParam(_Frozen):
     """Continuous float search parameter with optional log-scale and step."""
 
@@ -63,19 +85,19 @@ class IntParam(_Frozen):
 
     @model_validator(mode="after")
     def _validate(self) -> IntParam:
-        """Reject ``low > high``, log+nonpositive, non-positive step, log+step!=1.
+        """Reject unsafe bounds, log+nonpositive, non-positive step, and log+step!=1.
 
         Returns:
             Self, unchanged. Pydantic ``mode='after'`` validator protocol.
 
         Raises:
-            ValueError: ``low > high``, ``log`` is set with ``low <= 0``,
-                ``step <= 0``, or ``log`` is combined with ``step != 1`` (which
-                Optuna's ``IntDistribution`` rejects at construction time).
+            ValueError: Bounds cannot round-trip exactly through Optuna,
+                ``log`` is set with ``low <= 0``, ``step <= 0``, or ``log`` is
+                combined with ``step != 1`` (which Optuna's
+                ``IntDistribution`` rejects at construction time).
 
         """
-        if self.low > self.high:
-            raise ValueError(f"int param: low ({self.low}) > high ({self.high})")
+        _validate_optuna_integer_domain(self.low, self.high)
         if self.log and self.low <= 0:
             raise ValueError("log-scale int param requires low > 0")
         if self.step <= 0:

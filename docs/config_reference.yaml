@@ -210,11 +210,11 @@
 # log: true requires low > 0 and forbids step. Grid rejects log and requires step to divide high - low evenly.
 
 # type: Literal["int"] (required)
-# low: int (required)
-# high: int (required; >= low)
+# low: int (required; >= -2**53)
+# high: int (required; >= low and <= 2**53)
 # log: bool = false
 # step: int = 1 (> 0)
-# log: true requires low > 0 and step: 1. Grid rejects log.
+# Numeric bounds outside Optuna's exactly representable integer range are rejected; use categorical choices for larger discrete values. log: true requires low > 0 and step: 1. Grid rejects log.
 
 # type: Literal["categorical"] (required)
 # choices: list[None | bool | int | finite float | str] (required; min length 1)

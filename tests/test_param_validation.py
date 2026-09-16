@@ -107,6 +107,29 @@ def test_param_constructors_reject_invalid_scalar_settings() -> None:
             model(**kwargs)
 
 
+@pytest.mark.parametrize(
+    ("low", "high"),
+    [(-(2**53) - 1, 0), (0, 2**53 + 1)],
+)
+def test_int_param_rejects_bounds_optuna_cannot_round_trip(low: int, high: int) -> None:
+    """Numeric integer domains must survive Optuna's float representation."""
+    with pytest.raises(ValidationError, match="round-trip exactly through Optuna"):
+        IntParam(type="int", low=low, high=high)
+
+
+def test_int_param_accepts_exact_boundaries_and_large_categorical_choices() -> None:
+    """The exact numeric boundary and categorical 64-bit values remain available."""
+    assert IntParam(type="int", low=-(2**53), high=2**53).model_dump() == {
+        "type": "int",
+        "low": -(2**53),
+        "high": 2**53,
+        "log": False,
+        "step": 1,
+    }
+    choices = [2**63 - 2, 2**63 - 1]
+    assert CategoricalParam(type="categorical", choices=choices).choices == choices
+
+
 def test_check_bounds_rejects_non_finite_values():
     """NaN/inf are always out of bounds."""
     assert check_bounds(50.0, min_value=0.0, max_value=100.0) is True
