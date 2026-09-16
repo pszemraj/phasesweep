@@ -653,7 +653,8 @@ def _validate_suite_artifact_root_rebind(
     that exact path, so a relocated suite publication is reported as corrupt by
     the read surfaces the moment it is rebound (re-review v0.5.19 / blocker
     B2). In-place adoption is safe when the validated suite summary still
-    names the destination roots and no study is bound to a different root.
+    names the destination roots for persistent studies and none is bound to a
+    different root. In-memory studies have component records but no rebind plan.
     Component-level rebinds also proceed for a suite that never published one.
 
     Conservative in the same way :func:`_validate_artifact_root_destination`
@@ -679,7 +680,7 @@ def _validate_suite_artifact_root_rebind(
                 if isinstance(record, Mapping)
                 and isinstance(record.get("component_summary_path"), str)
             }
-            if len(roots) == len(plans) and all(
+            if all(
                 roots.get(plan.experiment.experiment) == plan.destination
                 and all(entry.previous in (None, plan.destination) for entry in plan.entries)
                 for plan in plans

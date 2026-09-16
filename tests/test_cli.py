@@ -1592,12 +1592,21 @@ def test_rebind_workdir_refuses_a_suite_that_published_a_suite_generation(
     )
 
 
-def test_rebind_workdir_adopts_published_suite_at_original_tree(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mixed_storage", [False, True])
+def test_rebind_workdir_adopts_published_suite_at_original_tree(
+    tmp_path: Path, mixed_storage: bool
+) -> None:
     config_a, _config_b, _workdir_a, _workdir_b = _movable_suite_configs(
         tmp_path, study_names=("only",)
     )
+    if mixed_storage:
+        payload = yaml.safe_load(config_a.read_text())
+        payload["studies"].append({**payload["studies"][0], "name": "memory", "storage": None})
+        config_a.write_text(yaml.safe_dump(payload, sort_keys=False))
     suite = load_config(config_a)
     assert isinstance(suite, Suite)
+    if mixed_storage:
+        assert suite.experiment_for_study(suite.studies[1]).storage is None
     run_suite(suite)
     component = suite.experiment_for_study(suite.studies[0])
     assert component.storage is not None
