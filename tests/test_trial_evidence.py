@@ -35,12 +35,19 @@ from phasesweep.engine import (
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import (
     _experiment_dir,
+    _generation_config_snapshot_path,
     _generation_path,
+    _generation_reproducibility_path,
+    _generation_summary_path,
+    _generation_winner_path,
     _generations_dir,
     _last_successful_generation_path,
     _phase_dir,
 )
-from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _resolve_publication_pointer,
+)
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
@@ -632,6 +639,7 @@ def test_published_source_generation_damage_fails_integrity(tmp_path: Path, dama
             summary_path = source_dir / "summary.yaml"
             summary = yaml.safe_load(summary_path.read_text())
             summary["phases"][0]["metric"] = 0.9
+            summary["phases"][0]["params"] = {"x": -1}
             artifact = next(
                 item
                 for item in summary["artifacts"]
@@ -650,6 +658,46 @@ def test_published_source_generation_damage_fails_integrity(tmp_path: Path, dama
 
     with pytest.raises(RuntimeError, match=diagnostic):
         run_experiment(_evidence_experiment(tmp_path))
+
+
+@pytest.mark.parametrize("identity_field", ["experiment", "generation_id"])
+def test_carried_winner_rejects_reidentified_source_summary(
+    tmp_path: Path,
+    identity_field: str,
+) -> None:
+    """A carried winner's source must retain its experiment and generation identity."""
+    experiment, source_generation, carrying_generation = _tree_with_a_carried_winner(tmp_path)
+    carried = yaml.safe_load(
+        _generation_winner_path(experiment, carrying_generation, "p").read_text()
+    )
+    assert carried["generation_id"] == source_generation
+
+    summary_path = _generation_summary_path(experiment, source_generation)
+    summary = yaml.safe_load(summary_path.read_text())
+    snapshot_path = _generation_config_snapshot_path(experiment, source_generation)
+    snapshot = yaml.safe_load(snapshot_path.read_text())
+    record_path = _generation_reproducibility_path(experiment, source_generation)
+    record = json.loads(record_path.read_text())
+    forged = f"forged-{identity_field}"
+
+    summary[identity_field] = forged
+    record[identity_field] = forged
+    if identity_field == "experiment":
+        snapshot["experiment"] = forged
+        snapshot_path.write_text(yaml.safe_dump(snapshot, sort_keys=False))
+        record["config_snapshot"]["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    record_path.write_text(json.dumps(record))
+    for entry in summary["artifacts"]:
+        if entry.get("path") == "config.snapshot.yaml":
+            entry["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+        elif entry.get("path") == "reproducibility.json":
+            entry["sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert f"names a different {identity_field.removesuffix('_id')}" in pointer.error
 
 
 def test_winner_carried_from_a_generation_that_crashed_before_publication_publishes(

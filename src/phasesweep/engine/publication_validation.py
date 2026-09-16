@@ -359,6 +359,7 @@ def _validate_generation_manifest(
                 generation_id,
                 name,
                 source_phase,
+                summary.get("experiment"),
                 payload,
                 _fail,
                 _permission_fail,
@@ -427,6 +428,7 @@ def _validate_winner_source_generation(
     generation_id: str,
     phase_name: str,
     source_phase: object,
+    expected_experiment: object,
     payload: Mapping[str, Any],
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
@@ -459,6 +461,7 @@ def _validate_winner_source_generation(
     :param str generation_id: The publishing generation's own id.
     :param str phase_name: Phase exposing the winner being validated.
     :param object source_phase: Recorded phase that owns the source winner artifact.
+    :param object expected_experiment: Experiment identity the source summary must retain.
     :param Mapping[str, Any] payload: Parsed winner artifact, whose
         ``generation_id``/``attempt_id``/``trial_number`` the caller has
         already checked for well-formedness and internal agreement.
@@ -544,6 +547,14 @@ def _validate_winner_source_generation(
             ) from exc
         if not isinstance(source_summary, Mapping):
             raise fail(f"source generation {source_generation!r} summary is not a mapping")
+        if source_summary.get("experiment") != expected_experiment:
+            raise fail(
+                f"source generation {source_generation!r} summary names a different experiment"
+            )
+        if source_summary.get("generation_id") != source_generation:
+            raise fail(
+                f"source generation {source_generation!r} summary names a different generation"
+            )
         if "schema_version" in source_summary:
             try:
                 _validate_generation_manifest(source_dir, source_generation, source_summary)
