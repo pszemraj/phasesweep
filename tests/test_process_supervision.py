@@ -1376,6 +1376,37 @@ def test_phase_deadline_expiring_during_launch_fails_as_timeout(
     assert not trial_dir_marker.exists(), "trainer started after the phase deadline expired"
 
 
+def test_phase_deadline_expiring_during_input_preparation_prevents_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Input preparation cannot start a trainer after the phase budget expires."""
+    trial_dir_marker = tmp_path / "trainer_ran.txt"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"touch {trial_dir_marker} && echo x=1.0 {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+        timeout_seconds_per_phase=0.2,
+    )
+
+    import phasesweep.engine.phase as phase_mod
+
+    real_prepare = phase_mod.prepare_trainer_input
+
+    def slow_prepare(**kwargs):  # noqa: ANN003, ANN202
+        prepared = real_prepare(**kwargs)
+        time.sleep(0.5)
+        return prepared
+
+    monkeypatch.setattr(phase_mod, "prepare_trainer_input", slow_prepare)
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        run_experiment(experiment)
+
+    assert not trial_dir_marker.exists(), "trainer started after input preparation used the budget"
+
+
 def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:
     """Root exits 0 while a child ignores SIGTERM.
 

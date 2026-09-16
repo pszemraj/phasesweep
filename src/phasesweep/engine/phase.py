@@ -891,6 +891,16 @@ def _run_phase(
                 # started. If this ledger write fails, no subprocess consumes
                 # evidence that the study cannot later verify.
                 trial.set_user_attr(TRAINER_INPUT_ATTR, prepared_input.record())
+                if optimize_deadline is not None:
+                    remaining_wallclock = optimize_deadline - time.monotonic()
+                    if remaining_wallclock <= 0.0:
+                        _stop_for_deadline()
+                        raise _DeadlineTrialExecutionError(
+                            f"{timeout_source or 'wallclock'} deadline reached before trial launch."
+                        )
+                    if timeout_seconds is None or remaining_wallclock < timeout_seconds:
+                        timeout_seconds = remaining_wallclock
+                        timeout_capped_by_wallclock = True
                 executed = launch_trial(
                     experiment=experiment,
                     phase_name=phase.name,
