@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,7 +28,45 @@ from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PUBLICATION_POINTER_SCHEMA_VERSION,
 )
-from phasesweep.runtime.files import file_sha256
+from phasesweep.runtime.files import file_sha256, nofollow_flag
+
+
+def _read_unlinked_bytes(path: Path, *, root: Path) -> bytes:
+    """Read a file only when no path component below ``root`` is a symlink.
+
+    :param Path path: File to read.
+    :param Path root: Artifact-tree directory that must lexically contain ``path``.
+    :raises OSError: If ``path`` escapes ``root``, any traversed component is a
+        symlink, or the file cannot be read.
+    :return bytes: Exact file contents.
+    """
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise OSError(f"artifact {path} is outside {root}") from exc
+    if not relative.parts or any(part in {".", ".."} for part in relative.parts):
+        raise OSError(f"artifact {path} is not a file below {root}")
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | nofollow_flag()
+    directory_fd = os.open(root, directory_flags)
+    file_fd = -1
+    try:
+        for part in relative.parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(
+            relative.parts[-1],
+            os.O_RDONLY | os.O_CLOEXEC | nofollow_flag(),
+            dir_fd=directory_fd,
+        )
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise OSError(f"artifact {path} is not a regular file")
+        with os.fdopen(file_fd, "rb", closefd=False) as artifact:
+            return artifact.read()
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+        os.close(directory_fd)
 
 
 def _generation_artifact_manifest(
@@ -229,7 +269,7 @@ def _validate_generation_manifest(
     for (kind, name), entry in listed.items():
         artifact_path = generation_dir / "phases" / name / _ARTIFACT_FILENAMES[kind]
         try:
-            content = artifact_path.read_bytes()
+            content = _read_unlinked_bytes(artifact_path, root=generation_dir.parent)
         except PermissionError as exc:
             raise _permission_fail(
                 _unreadable_artifact_permission_detail(f"{kind} artifact for phase {name!r}")
@@ -335,7 +375,9 @@ def _validate_generation_manifest(
                 / _ARTIFACT_FILENAMES["promotion"]
             )
             try:
-                source_payload = yaml.safe_load(source_path.read_bytes())
+                source_payload = yaml.safe_load(
+                    _read_unlinked_bytes(source_path, root=generation_dir.parent)
+                )
             except PermissionError as exc:
                 raise _permission_fail(
                     _unreadable_artifact_permission_detail(
@@ -429,7 +471,7 @@ def _validate_winner_source_generation(
             f"{source_generation!r}, which is not a valid generation name"
         )
     source_dir = generation_dir if same_generation else generation_dir.parent / source_generation
-    if not source_dir.is_dir():
+    if source_dir.is_symlink() or not source_dir.is_dir():
         raise fail(
             f"winner for phase {phase_name!r} cites source generation "
             f"{source_generation!r} which does not exist in this tree"
@@ -445,7 +487,7 @@ def _validate_winner_source_generation(
         # Unpublished source namespace: the crash-recovery case above.
         return
     try:
-        content = source_winner_path.read_bytes()
+        content = _read_unlinked_bytes(source_winner_path, root=generation_dir.parent)
     except PermissionError as exc:
         raise permission_fail(
             _unreadable_artifact_permission_detail(
@@ -473,7 +515,9 @@ def _validate_winner_source_generation(
     source_summary_path = source_dir / GENERATION_SUMMARY_FILENAME
     if source_summary_path.is_file() and not same_generation:
         try:
-            source_summary = yaml.safe_load(source_summary_path.read_bytes())
+            source_summary = yaml.safe_load(
+                _read_unlinked_bytes(source_summary_path, root=generation_dir.parent)
+            )
         except PermissionError as exc:
             raise permission_fail(
                 _unreadable_artifact_permission_detail(
@@ -578,7 +622,10 @@ def _validate_generation_provenance_files(
     digests: dict[str, str] = {}
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         try:
-            content = (generation_dir / filename).read_bytes()
+            content = _read_unlinked_bytes(
+                generation_dir / filename,
+                root=generation_dir.parent,
+            )
         except PermissionError as exc:
             raise permission_fail(
                 _unreadable_artifact_permission_detail(f"{kind} artifact")
@@ -668,12 +715,14 @@ def _read_pointer_target(
     :raises PublicationAccessError: The pointer cannot be read by the current user.
     """
     try:
-        payload = yaml.safe_load(pointer_path.read_text())
+        payload = yaml.safe_load(
+            _read_unlinked_bytes(pointer_path, root=pointer_path.parent).decode("utf-8")
+        )
     except PermissionError as exc:
         raise PublicationAccessError(
             _unreadable_artifact_permission_detail("last-success pointer")
         ) from exc
-    except (OSError, yaml.YAMLError):
+    except (OSError, UnicodeError, yaml.YAMLError):
         return None
     if (
         not isinstance(payload, dict)
@@ -738,7 +787,7 @@ def _read_pointer_target_summary(
     :raises PublicationIntegrityError: The summary bytes disagree with either pointer anchor.
     """
     try:
-        content = summary_path.read_bytes()
+        content = _read_unlinked_bytes(summary_path, root=summary_path.parent.parent)
     except PermissionError as exc:
         raise PublicationAccessError(
             _unreadable_artifact_permission_detail("generation summary")
@@ -883,7 +932,7 @@ def _validate_suite_summary_integrity(
                 "recorded generation namespace"
             )
         try:
-            content = target.read_bytes()
+            content = _read_unlinked_bytes(target, root=target.parent.parent)
         except PermissionError as exc:
             raise _permission_fail(
                 _unreadable_artifact_permission_detail(f"study {name!r} component summary")

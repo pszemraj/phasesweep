@@ -1282,6 +1282,7 @@ def test_rebind_workdir_cannot_replace_another_storage_ledgers_root(
     [
         ("drop_pointer", "holds no valid published generation"),
         ("tamper_winner", "does not match its recorded hash"),
+        ("linked_winner", "missing or unreadable"),
     ],
 )
 def test_rebind_workdir_refuses_a_destination_without_the_recorded_publication(
@@ -1308,7 +1309,12 @@ def test_rebind_workdir_refuses_a_destination_without_the_recorded_publication(
         _last_successful_generation_path(experiment_b).unlink()
     else:
         winner = _generation_winner_path(experiment_b, published, "p")
-        winner.write_text(winner.read_text() + "\n# edited after publication\n")
+        if damage == "linked_winner":
+            source_winner = _generation_winner_path(experiment_a, published, "p")
+            winner.unlink()
+            winner.symlink_to(source_winner)
+        else:
+            winner.write_text(winner.read_text() + "\n# edited after publication\n")
 
     exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
 
