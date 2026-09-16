@@ -154,6 +154,8 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         "generation.yaml",
         "generations",
         "last_successful_generation.yaml",
+        "study.db",
+        "study.journal",
         "summary.yaml",
         *(phase.name.casefold() for phase in experiment.phases),
     }

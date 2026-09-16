@@ -1633,7 +1633,10 @@ def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
     assert _artifact_root_binding_path(experiment).is_file()
 
 
-@pytest.mark.parametrize("entry", ["generations", "attempts", "Attempts", "P"])
+@pytest.mark.parametrize(
+    "entry",
+    ["generations", "attempts", "Attempts", "P", "study.db", "study.journal"],
+)
 def test_unbound_known_phasesweep_state_names_the_blocking_entry(
     tmp_path: Path, entry: str
 ) -> None:
@@ -1642,7 +1645,12 @@ def test_unbound_known_phasesweep_state_names_the_blocking_entry(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
     )
-    (_experiment_dir(experiment) / entry).mkdir(parents=True)
+    state_entry = _experiment_dir(experiment) / entry
+    state_entry.parent.mkdir(parents=True, exist_ok=True)
+    if entry in {"study.db", "study.journal"}:
+        state_entry.write_text("legacy ledger\n")
+    else:
+        state_entry.mkdir()
 
     with pytest.raises(LegacyArtifactRootMigrationRequiredError, match=repr(entry)):
         _validate_artifact_root_binding(experiment, claim_fresh=True)
