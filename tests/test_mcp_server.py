@@ -2600,7 +2600,9 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
         ("await_run", "pending_runner_exit"),
         ("status", "no_status_runner_exit"),
         ("winners", "no_status_runner_exit"),
+        ("status", "no_status_runner_exit_with_recovery_lock"),
         ("winners", "no_status_runner_exit_with_recovery_lock"),
+        ("await_run", "no_status_runner_exit_with_recovery_lock"),
         ("await_run", "no_status_runner_exit"),
     ],
 )

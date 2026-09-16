@@ -1133,8 +1133,16 @@ class RunStore:
         """
         status = self._read_status(handle)
         launch_outcome_unknown = handle.launch_state == "launching" and status is None
+        dead_spawned_without_status = (
+            handle.launch_state == "spawned"
+            and status is None
+            and not self.from_earlier_boot(handle)
+            and not self._runner_is_live(handle)
+            and self._read_status(handle) is None
+        )
         return (
             launch_outcome_unknown
+            or dead_spawned_without_status
             or self.cleanup_recovery_required(handle)
             or self.snapshot_recovery_required(handle)
         )
