@@ -1050,6 +1050,38 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     assert app.launch("srv")["state"] == "running"
 
 
+def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed status write cannot erase proof that Popen never succeeded."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+
+    with monkeypatch.context() as faults:
+
+        def fail_popen(*args: object, **kwargs: object) -> None:
+            raise OSError("runner executable is unavailable")
+
+        def fail_status(*args: object, **kwargs: object) -> None:
+            raise OSError("status directory is unavailable")
+
+        faults.setattr(mcp_server.subprocess, "Popen", fail_popen)
+        faults.setattr(mcp_server, "write_status_file_if_absent", fail_status)
+
+        with pytest.raises(OSError, match="runner executable"):
+            app.launch("srv")
+
+    (pending,) = store.list_handles()
+    assert store.recorded_terminal_status(pending) is None
+    assert store.launch_lease_path(pending.run_id).is_file()
+    assert store.is_pre_spawn_orphan(pending.run_id)
+
+    patch_popen_capture(monkeypatch)
+    assert app.launch("srv")["state"] == "running"
+    assert store.get(pending.run_id) is None
+
+
 def test_launch_terminates_real_runner_when_log_context_exit_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

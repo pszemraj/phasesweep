@@ -486,7 +486,7 @@ class RunStore:
             raise
 
     def finish_launch_preparation(self, preparation: PreparedRun) -> None:
-        """Best-effort remove a launch lease after the spawn outcome is durable.
+        """Release a preparation and remove its lease after a durable outcome.
 
         :param PreparedRun preparation: Preparation returned by :meth:`prepare_launch`.
         """
@@ -498,6 +498,14 @@ class RunStore:
                 preparation.handle.run_id,
                 exc_info=True,
             )
+        handle = self.get(preparation.handle.run_id)
+        if handle is None:
+            return
+        if handle.launch_state != "spawned" and self.recorded_terminal_status(handle) is None:
+            # A free sidecar is the remaining proof that Popen never crossed
+            # the preparation boundary. Keep it when terminal bookkeeping also
+            # failed so orphan recovery can release the capacity reservation.
+            return
         self.remove_launch_lease(preparation.handle.run_id)
 
     def remove_launch_lease(self, run_id: str) -> None:
