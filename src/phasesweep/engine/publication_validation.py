@@ -258,6 +258,8 @@ def _validate_generation_manifest(
         if not isinstance(decision, Mapping) or not isinstance(decision.get("phase"), str):
             raise _fail("summary promotion decision entry is malformed")
         name = str(decision["phase"])
+        if name in decision_items:
+            raise _fail(f"duplicate promotion decision entry {name!r}")
         decision_items[name] = decision
         if ("promotion", name) not in listed:
             raise _fail(f"phase {name!r} promotion decision is not listed in the artifact manifest")
@@ -296,6 +298,20 @@ def _validate_generation_manifest(
             value = metric_block.get(metric["name"])
             if not isinstance(value, (int, float)) or float(value) != item.get("metric"):
                 raise _fail(f"winner for phase {name!r} disagrees with the summary metric value")
+            for field in (
+                "params",
+                "effective_overrides",
+                "constraints",
+                "gates",
+                "completion",
+                "generation_id",
+                "attempt_id",
+                "winner_source",
+                "trainer_input",
+                "promotion",
+            ):
+                if (field in payload) != (field in item) or payload.get(field) != item.get(field):
+                    raise _fail(f"winner for phase {name!r} disagrees with the summary {field}")
             # A winner is legitimately carried forward from an earlier
             # generation, so its own generation_id may name that earlier
             # generation — the check is well-formedness, not equality.
@@ -350,10 +366,8 @@ def _validate_generation_manifest(
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
         elif name in decision_items:
-            if payload.get("action") != decision_items[name].get("action"):
-                raise _fail(
-                    f"promotion decision for phase {name!r} disagrees with the summary action"
-                )
+            if payload != decision_items[name]:
+                raise _fail(f"promotion decision for phase {name!r} disagrees with the summary")
         else:
             # Older schema-2 resumes listed projected promotions only in the
             # manifest. Accept only a copy of the named earlier generation's

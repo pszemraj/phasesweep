@@ -35,7 +35,7 @@ import phasesweep.engine.run as run_engine
 import phasesweep.engine.suite as suite_ops
 from phasesweep import load_config, run_experiment
 from phasesweep.cli import _show_suite_winners
-from phasesweep.config import Experiment, IntParam, Phase, Sampler, Suite
+from phasesweep.config import Experiment, IntParam, Phase, Promotion, Sampler, Suite
 from phasesweep.engine import (
     NoFeasibleTrialError,
     PublicationCommitError,
@@ -1014,7 +1014,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
 
 @pytest.mark.parametrize(
     "tamper",
-    ["phase_plan", "metric_goal", "objective_evidence", "config_fingerprint"],
+    ["phase_plan", "metric_goal", "objective_evidence", "config_fingerprint", "completion"],
 )
 def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     tmp_path: Path,
@@ -1039,9 +1039,13 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
         flag = next(key for key, value in evidence.items() if type(value) is bool)
         evidence[flag] = not evidence[flag]
         semantic_error = "metric semantics"
-    else:
+    elif tamper == "config_fingerprint":
         summary["config_fingerprint"] = "0" * 64
         semantic_error = "config fingerprint"
+    else:
+        summary["phases"][0]["completion"]["finished_trials"] = 0
+        summary["phases"][0]["completion"]["completed_trials"] = 0
+        semantic_error = "completion"
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
 
     pointer = _resolve_publication_pointer(experiment)
@@ -1054,6 +1058,55 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     assert pointer.state == "failed"
     assert pointer.error is not None
     assert semantic_error in pointer.error
+
+
+@pytest.mark.parametrize("tamper", ["completion", "duplicate"])
+def test_summary_promotion_decisions_match_hashed_artifacts(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    """A re-anchored summary cannot change or duplicate a promotion decision."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        trial_command="echo x=-{trial_id}",
+        phases=[
+            Phase(
+                name=name,
+                n_trials=1,
+                allow_no_gpu_isolation=True,
+                sampler=Sampler(type="random", seed=0),
+                promotion=(
+                    Promotion(min_delta_vs="base", min_delta=100, on_fail="skip")
+                    if name == "candidate"
+                    else None
+                ),
+            )
+            for name in ("base", "candidate")
+        ],
+    )
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    decisions = summary["promotion_decisions"]
+    assert len(decisions) == 1
+    if tamper == "completion":
+        decisions[0]["candidate_completion"]["finished_trials"] = 0
+        decisions[0]["candidate_completion"]["completed_trials"] = 0
+        expected_error = "disagrees with the summary"
+    else:
+        decisions.append(dict(decisions[0]))
+        expected_error = "duplicate promotion decision"
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert expected_error in pointer.error
 
 
 def test_publication_pointer_reports_absent_before_anything_publishes(tmp_path: Path) -> None:
