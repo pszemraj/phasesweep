@@ -11,6 +11,7 @@ from pathlib import Path
 import optuna
 
 from phasesweep.config import Experiment, Suite
+from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _artifact_root_binding_applies,
@@ -117,8 +118,8 @@ def _artifact_root_rebind_entries(
     :param Experiment experiment: Parsed experiment whose phase studies are read.
     :return tuple[_ArtifactRootRebindEntry, ...]: Each represented study with its
         phase name and recorded binding (``None`` when unbound).
-    :raises ArtifactRootRebindError: A phase study exists but cannot be read, so
-        what it is bound to is unknown and a rebind cannot be safe.
+    :raises ArtifactRootRebindError: A phase study cannot be read, or a retained
+        study suffix is not a safe phase name, so rebind cannot inspect its root.
     """
     entries: list[_ArtifactRootRebindEntry] = []
     names = [phase.name for phase in experiment.phases]
@@ -132,13 +133,23 @@ def _artifact_root_rebind_entries(
         )
         names.extend(_published_phase_trial_refs(summary))
     try:
-        names.extend(_existing_phase_study_names(experiment))
+        retained_names = _existing_phase_study_names(experiment)
     except StudyStorageUnavailableError as exc:
         raise ArtifactRootRebindError(
             f"Cannot list the persistent phase studies of experiment "
             f"{experiment.experiment!r}. Refusing to rebind while any study's artifact root "
             "or trial evidence may be omitted. Nothing was written."
         ) from exc
+    for phase_name in retained_names:
+        try:
+            _validate_safe_name("Phase", phase_name)
+        except ValueError as exc:
+            raise ArtifactRootRebindError(
+                f"Persistent study of experiment {experiment.experiment!r} has unsafe "
+                f"phase name {phase_name!r}. Refusing to rebind it as an artifact path. "
+                "Nothing was written."
+            ) from exc
+    names.extend(retained_names)
     for phase_name in dict.fromkeys(names):
         try:
             study = _load_existing_phase_study(experiment, phase_name)

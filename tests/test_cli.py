@@ -1721,6 +1721,23 @@ def test_rebind_workdir_refuses_when_one_phase_study_is_transiently_unreadable(
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
 
 
+def test_rebind_workdir_refuses_unsafe_retained_study_name(tmp_path: Path) -> None:
+    config_a, _config_b, _workdir_a, _workdir_b = _movable_experiment_configs(tmp_path)
+    experiment = load_experiment(config_a)
+    run_experiment(experiment)
+    assert experiment.storage is not None
+    foreign = optuna.create_study(study_name="t::../foreign", storage=experiment.storage)
+    binding = _artifact_root_binding_path(experiment).read_bytes()
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_a)])
+
+    assert result.exit_code != 0
+    assert "../foreign" in str(result.exception)
+    refreshed = optuna.load_study(study_name=foreign.study_name, storage=experiment.storage)
+    assert ARTIFACT_ROOT_ATTR not in refreshed.user_attrs
+    assert _artifact_root_binding_path(experiment).read_bytes() == binding
+
+
 def test_rebind_workdir_adopts_a_legacy_study_with_an_interrupted_attempt(
     tmp_path: Path,
 ) -> None:
