@@ -22,7 +22,7 @@ from typing import Any, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from phasesweep.config import Experiment, Suite
-from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.paths import _experiment_dir
@@ -142,7 +142,7 @@ class _Catalog(_CatalogModel):
     # Cap on simultaneously-running sweeps across ALL experiments. Defaults to 1
     # because the common deployment is a single GPU, where a second concurrent
     # sweep would contend for the device. Raise it on multi-GPU hosts.
-    max_concurrent_runs: int = Field(default=1, ge=1)
+    max_concurrent_runs: ConfigInt = Field(default=1, ge=1)
     experiments: list[_Entry] = Field(min_length=1)
 
 

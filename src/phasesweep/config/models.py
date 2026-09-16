@@ -12,6 +12,8 @@ from typing import Any, Literal
 from pydantic import Field, field_validator, model_validator
 
 from phasesweep.config.common import (
+    ConfigFloat,
+    ConfigInt,
     _find_prefix_collisions,
     _Frozen,
     _require_finite,
@@ -83,8 +85,8 @@ class Constraint(_Frozen):
 
     name: str
     extractor: Extractor = Field(discriminator="type")
-    max: float | None = None
-    min: float | None = None
+    max: ConfigFloat | None = None
+    min: ConfigFloat | None = None
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> Constraint:
@@ -124,7 +126,7 @@ class Promotion(_Frozen):
     """Conditional phase promotion against a previously-computed baseline winner."""
 
     min_delta_vs: str
-    min_delta: float = 0.0
+    min_delta: ConfigFloat = 0.0
     requires_gates: bool = True
     on_fail: Literal["stop", "skip", "continue_baseline"] = "stop"
 
@@ -172,8 +174,8 @@ class Phase(_Frozen):
         default_factory=dict,
         description="Map of override-key -> sampling spec. Supports dotted keys.",
     )
-    n_trials: int = Field(ge=1)
-    n_jobs: int = Field(
+    n_trials: ConfigInt = Field(ge=1)
+    n_jobs: ConfigInt = Field(
         default=1,
         ge=1,
         description=(
@@ -191,7 +193,7 @@ class Phase(_Frozen):
             "locks."
         ),
     )
-    gpu_ids: list[int] | None = Field(
+    gpu_ids: list[ConfigInt] | None = Field(
         default=None,
         description=(
             "Explicit list of CUDA device indices to partition across parallel trials. "
@@ -325,7 +327,7 @@ class Phase(_Frozen):
                 )
         return self
 
-    max_consecutive_failures: int = Field(
+    max_consecutive_failures: ConfigInt = Field(
         default=5,
         ge=1,
         description=(
@@ -343,7 +345,7 @@ class Phase(_Frozen):
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
-    timeout_seconds_per_trial: float | None = Field(default=86400.0, ge=0)
+    timeout_seconds_per_trial: ConfigFloat | None = Field(default=86400.0, ge=0)
     allow_unbounded_trials: bool = Field(
         default=False,
         description=(
@@ -351,7 +353,7 @@ class Phase(_Frozen):
             "Otherwise timeout_seconds_per_trial must be finite."
         ),
     )
-    timeout_seconds_per_phase: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_phase: ConfigFloat | None = Field(default=None, ge=0)
     allow_incomplete_on_timeout: bool = Field(
         default=False,
         description=(
@@ -694,7 +696,7 @@ class Experiment(_Frozen):
             "environment-inheritance contract (review v0.5.17 / blocker 4)."
         ),
     )
-    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
 
     @property
     def resolved_storage(self) -> str | None:
@@ -1592,7 +1594,7 @@ class SuiteDefaults(_Frozen):
     contracts: dict[str, Contract] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
     execution: ExecutionContext = Field(default_factory=ExecutionContext)
-    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
 
 
 def _validate_suite_component_name(kind: str, value: str) -> str:
@@ -1631,7 +1633,7 @@ class StudySpec(_Frozen):
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] | None = None
     execution: ExecutionContext | None = None
-    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
     promotion: Promotion | None = None
 
     @field_validator("name")

@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import math
 import re
+from typing import Annotated, TypeAlias
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, BeforeValidator, ConfigDict
 
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _reject_boolean_number(value: object) -> object:
+    """Reject YAML booleans before Pydantic coerces them to zero or one.
+
+    :param object value: Raw numeric config value.
+    :raises ValueError: If the value is a boolean.
+    :return object: The unchanged non-boolean value.
+    """
+    if isinstance(value, bool):
+        raise ValueError("numeric config values must be numbers, not booleans")
+    return value
+
+
+ConfigInt: TypeAlias = Annotated[int, BeforeValidator(_reject_boolean_number)]
+ConfigFloat: TypeAlias = Annotated[float, BeforeValidator(_reject_boolean_number)]
 
 
 class _Frozen(BaseModel):

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from phasesweep.config.common import _Frozen, _require_finite
+from phasesweep.config.common import ConfigFloat, ConfigInt, _Frozen, _require_finite
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -41,10 +41,10 @@ class FloatParam(_Frozen):
     """Continuous float search parameter with optional log-scale and step."""
 
     type: Literal["float"]
-    low: float
-    high: float
+    low: ConfigFloat
+    high: ConfigFloat
     log: bool = False
-    step: float | None = None
+    step: ConfigFloat | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> FloatParam:
@@ -78,10 +78,10 @@ class IntParam(_Frozen):
     """Integer search parameter with optional log-scale and step."""
 
     type: Literal["int"]
-    low: int
-    high: int
+    low: ConfigInt
+    high: ConfigInt
     log: bool = False
-    step: int = 1
+    step: ConfigInt = 1
 
     @model_validator(mode="after")
     def _validate(self) -> IntParam:
@@ -206,8 +206,8 @@ class Sampler(_Frozen):
     """Optuna sampler configuration."""
 
     type: Literal["tpe", "random", "grid", "cmaes"] = "tpe"
-    seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
-    n_startup_trials: int = Field(default=10, ge=0)  # tpe only
+    seed: ConfigInt | None = Field(default=None, ge=0, le=2**32 - 1)
+    n_startup_trials: ConfigInt = Field(default=10, ge=0)  # tpe only
     acknowledge_nonresumable: bool = Field(
         default=False,
         description=(

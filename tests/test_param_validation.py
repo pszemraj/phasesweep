@@ -108,6 +108,22 @@ def test_param_constructors_reject_invalid_scalar_settings() -> None:
 
 
 @pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (Phase, {"name": "p", "n_trials": True}),
+        (FloatParam, {"type": "float", "low": False, "high": 1.0}),
+        (IntParam, {"type": "int", "low": 0, "high": True}),
+    ],
+)
+def test_numeric_config_fields_reject_yaml_booleans(
+    model: type, payload: dict[str, object]
+) -> None:
+    """Boolean YAML scalars must not become numeric sweep controls."""
+    with pytest.raises(ValidationError, match="numbers, not booleans"):
+        model.model_validate(payload)
+
+
+@pytest.mark.parametrize(
     ("low", "high"),
     [(-(2**53) - 1, 0), (0, 2**53 + 1)],
 )

@@ -17,7 +17,13 @@ from pydantic import (
     model_validator,
 )
 
-from phasesweep.config.common import _Frozen, _require_finite, _validate_optional_bounds
+from phasesweep.config.common import (
+    ConfigFloat,
+    ConfigInt,
+    _Frozen,
+    _require_finite,
+    _validate_optional_bounds,
+)
 
 StrictJsonScalar = StrictBool | StrictInt | StrictFloat | StrictStr | None
 """The exact set of values a JSON document can hold at a leaf position.
@@ -140,7 +146,7 @@ class JsonEnvelopeExtractor(_TrialFilePathModel):
     split: str = Field(min_length=1)
     policy: str = Field(min_length=1)
     checkpoint: str | None = Field(default=None, min_length=1)
-    expected_step: int | None = Field(default=None, ge=0)
+    expected_step: ConfigInt | None = Field(default=None, ge=0)
 
 
 class LogRegexExtractor(_TrialFilePathModel):
@@ -186,8 +192,8 @@ class _WandbSummarySource(_Frozen):
     base_url: str = Field(default="https://api.wandb.ai", min_length=1)
     entity: str = Field(min_length=1, pattern=r"^[^/]+$")
     project: str = Field(min_length=1, pattern=r"^[^/]+$")
-    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
-    timeout_seconds: float = Field(
+    poll_seconds: ConfigFloat = Field(default=2.0, gt=0.0, allow_inf_nan=False)
+    timeout_seconds: ConfigFloat = Field(
         default=120.0,
         ge=1.0,
         allow_inf_nan=False,
@@ -410,8 +416,8 @@ class JsonScalarBoundGate(_TrialFilePathModel, _JsonKeyModel):
     type: Literal["json_scalar_bound"]
     path: str
     key: str
-    min: float | None = None
-    max: float | None = None
+    min: ConfigFloat | None = None
+    max: ConfigFloat | None = None
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> JsonScalarBoundGate:
@@ -438,8 +444,8 @@ class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
     source: Literal["file", "directory", "json"]
     path: str
     key: str | None = None
-    min_bytes: int | None = Field(default=None, ge=0)
-    max_bytes: int | None = Field(default=None, ge=0)
+    min_bytes: ConfigInt | None = Field(default=None, ge=0)
+    max_bytes: ConfigInt | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _validate_source_and_bounds(self) -> ArtifactSizeGate:
