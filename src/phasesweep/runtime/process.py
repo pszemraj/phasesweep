@@ -1213,7 +1213,7 @@ def _read_pipe_frame(fd: int, size: int, *, deadline: float) -> bytes | None:
     remaining = size
     while remaining:
         readable, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
-        if not readable:
+        if not readable or time.monotonic() >= deadline:
             return None
         chunk = os.read(fd, remaining)
         if not chunk:
