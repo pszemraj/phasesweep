@@ -669,8 +669,8 @@ def _validate_suite_artifact_root_rebind(
         the destination holds no suite publication at all.
     """
     pointer = _last_successful_suite_generation_path(suite)
-    if pointer.exists():
-        publication = _resolve_suite_publication_pointer(suite)
+    publication = _resolve_suite_publication_pointer(suite)
+    if publication.state != "absent":
         summary = publication.summary
         records = summary.get("studies") if isinstance(summary, Mapping) else None
         if publication.state == "ok" and isinstance(records, list):
@@ -687,7 +687,8 @@ def _validate_suite_artifact_root_rebind(
             ):
                 return
         raise ArtifactRootRebindError(
-            f"Suite {suite.suite!r} records a published suite generation at {str(pointer)!r}. "
+            f"Suite {suite.suite!r} records a published suite generation or damaged "
+            f"publication entry at {str(pointer)!r}. "
             "A published suite summary pins each study to the absolute path of the component "
             "summary it derives from, and those paths do not survive relocation: the rebound "
             "tree would report a corrupt suite publication instead of a result. Keep the suite "

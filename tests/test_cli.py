@@ -49,6 +49,7 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
+    _last_successful_suite_generation_path,
     _phase_dir,
     _suite_generation_summary_path,
     _winner_path,
@@ -1619,6 +1620,31 @@ def test_rebind_workdir_adopts_published_suite_at_original_tree(
     study = optuna.load_study(study_name="s__only::p", storage=component.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(component))
     assert _resolve_suite_publication_pointer(suite).state == "ok"
+
+
+def test_rebind_workdir_refuses_dangling_mixed_suite_pointer(tmp_path: Path) -> None:
+    config_a, _config_b, _workdir_a, _workdir_b = _movable_suite_configs(
+        tmp_path, study_names=("only",)
+    )
+    payload = yaml.safe_load(config_a.read_text())
+    payload["studies"].append({**payload["studies"][0], "name": "memory", "storage": None})
+    config_a.write_text(yaml.safe_dump(payload, sort_keys=False))
+    suite = load_config(config_a)
+    assert isinstance(suite, Suite)
+    run_suite(suite)
+    component = suite.experiment_for_study(suite.studies[0])
+    assert component.storage is not None
+    drop_artifact_root_binding(component.storage, "s__only::p")
+    pointer = _last_successful_suite_generation_path(suite)
+    pointer.unlink()
+    pointer.symlink_to("missing-target.yaml")
+
+    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_a)])
+
+    assert result.exit_code != 0
+    assert _resolve_suite_publication_pointer(suite).state == "failed"
+    study = optuna.load_study(study_name="s__only::p", storage=component.storage)
+    assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
 
 def test_rebind_workdir_adopts_a_populated_study_that_predates_the_binding(
