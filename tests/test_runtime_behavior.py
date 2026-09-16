@@ -3014,14 +3014,11 @@ def test_trainer_timeout_attribution_follows_wallclock_cap(
             pid=123,
             duration_seconds=0.1,
             failure_reason=failure,
+            timeout_capped_by_wallclock=capped_by_deadline,
         ),
     )
 
-    result = extract_trial_result(
-        experiment=experiment,
-        executed=executed,
-        trainer_timeout_is_deadline=capped_by_deadline,
-    )
+    result = extract_trial_result(experiment=experiment, executed=executed)
 
     assert result.failure_reason == failure
     assert result.deadline_exhausted is expected

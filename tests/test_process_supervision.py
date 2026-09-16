@@ -20,6 +20,7 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
+from phasesweep.config import ExecutionContext
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.state import ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR
 from phasesweep.engine.trial import UnsafeProcessCleanupError
@@ -1440,6 +1441,46 @@ def test_phase_deadline_expiring_during_input_preparation_prevents_launch(
         run_experiment(experiment)
 
     assert not trial_dir_marker.exists(), "trainer started after input preparation used the budget"
+
+
+@pytest.mark.parametrize("scope", ["phase", "run"])
+@pytest.mark.parametrize("trial_limit", [30.0, 0.5])
+def test_deadline_expiring_during_launch_preparation_prevents_trainer_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scope: str,
+    trial_limit: float,
+) -> None:
+    """Launch preparation consumes the original phase/run deadline."""
+    import phasesweep.engine.trial as trial_module
+
+    marker = tmp_path / "trainer_ran"
+    budget = 1.0
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"touch {shlex.quote(str(marker))} && echo x=1.0 {{overrides}}",
+        override_format="argparse",
+        execution=ExecutionContext(record_env=True),
+        n_trials=1,
+        timeout_seconds_per_phase=budget if scope == "phase" else None,
+        timeout_seconds_per_trial=trial_limit,
+        gpu_policy="none",
+    )
+    if scope == "run":
+        experiment = experiment.model_copy(update={"timeout_seconds_per_run": budget})
+
+    real_record = trial_module._record_trainer_environment
+
+    def delayed_record(*args: object, **kwargs: object) -> None:
+        real_record(*args, **kwargs)
+        time.sleep(budget + 0.2)
+
+    monkeypatch.setattr(trial_module, "_record_trainer_environment", delayed_record)
+
+    with pytest.raises(TimeoutError, match="deadline"):
+        run_experiment(experiment)
+
+    assert not marker.exists()
 
 
 def test_normal_root_exit_kills_background_descendant(tmp_path: Path) -> None:

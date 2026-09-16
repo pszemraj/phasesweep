@@ -43,6 +43,7 @@ def _capture_launch_env(
         timeout: float | None,
         trial_dir: Path,
         attempt_id: str,
+        wallclock_deadline: float | None = None,
         cwd: str | None = None,
         gpu_lease_fds: tuple[int, ...] = (),
     ) -> ProcessResult:

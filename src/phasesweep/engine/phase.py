@@ -867,7 +867,6 @@ def _run_phase(
                     raise optuna.TrialPruned("phase aborted")
 
                 timeout_seconds = phase.timeout_seconds_per_trial
-                timeout_capped_by_wallclock = False
                 if optimize_deadline is not None:
                     remaining_wallclock = optimize_deadline - time.monotonic()
                     if remaining_wallclock <= 0.0:
@@ -875,9 +874,6 @@ def _run_phase(
                         raise _DeadlineTrialExecutionError(
                             f"{timeout_source or 'wallclock'} deadline reached before trial launch."
                         )
-                    if timeout_seconds is None or remaining_wallclock < timeout_seconds:
-                        timeout_seconds = remaining_wallclock
-                        timeout_capped_by_wallclock = True
 
                 prepared_input = prepare_trainer_input(
                     experiment=experiment,
@@ -898,9 +894,6 @@ def _run_phase(
                         raise _DeadlineTrialExecutionError(
                             f"{timeout_source or 'wallclock'} deadline reached before trial launch."
                         )
-                    if timeout_seconds is None or remaining_wallclock < timeout_seconds:
-                        timeout_seconds = remaining_wallclock
-                        timeout_capped_by_wallclock = True
                 executed = launch_trial(
                     experiment=experiment,
                     phase_name=phase.name,
@@ -910,6 +903,7 @@ def _run_phase(
                     trial_dir=trial_dir,
                     overrides=overrides,
                     timeout_seconds=timeout_seconds,
+                    wallclock_deadline=optimize_deadline,
                     gpu_id=gpu_assignment.visible_devices,
                     gpu_lease_fds=gpu_assignment.lease_fds,
                     prepared_input=prepared_input,
@@ -958,7 +952,6 @@ def _run_phase(
             gates=_phase_gates(experiment, phase),
             enforce_gates=phase.promotion is None or phase.promotion.requires_gates,
             deadline=optimize_deadline,
-            trainer_timeout_is_deadline=timeout_capped_by_wallclock,
         )
         if result.deadline_exhausted:
             # Preserve causal attribution carried by the result: a trainer

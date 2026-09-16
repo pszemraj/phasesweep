@@ -454,6 +454,7 @@ def launch_trial(
     trial_dir: Path,
     overrides: dict[str, Any],
     timeout_seconds: float | None,
+    wallclock_deadline: float | None = None,
     gpu_id: int | str | None = None,
     gpu_lease_fds: tuple[int, ...] = (),
     prepared_input: PreparedTrainerInput | None = None,
@@ -475,12 +476,12 @@ def launch_trial(
         attempt_id: Immutable identity of this subprocess attempt.
         trial_dir: Resolved per-trial directory; created if missing.
         overrides: Composed overrides (inherited + fixed + sampled) for this trial.
-        timeout_seconds: Total wall-clock budget passed to
-            :func:`run_supervised`, or ``None`` for no timeout. The budget
-            covers the whole supervised launch (supervisor startup, identity
-            persistence, payload delivery) as well as trainer execution, so
-            an already-expired phase/run deadline can never start new
-            trainer work (review v0.5.16 / blocker 6).
+        timeout_seconds: Per-trial wall-clock budget passed to
+            :func:`run_supervised`, or ``None`` for no per-trial timeout.
+        wallclock_deadline: Optional absolute phase/run deadline. Passing the
+            original deadline preserves time consumed by command rendering,
+            artifact writes, environment recording, cwd resolution, and log
+            opening before supervision begins.
         gpu_id: CUDA device token from the pool, or ``None`` for inactive pool;
             written into ``CUDA_VISIBLE_DEVICES`` if not ``None``.
         gpu_lease_fds: Host GPU-lock descriptors inherited by the trusted
@@ -594,6 +595,7 @@ def launch_trial(
             timeout=timeout_seconds,
             trial_dir=workdir,
             attempt_id=attempt_id,
+            wallclock_deadline=wallclock_deadline,
             cwd=None if trainer_cwd is None else str(trainer_cwd),
             gpu_lease_fds=gpu_lease_fds,
         )
@@ -625,7 +627,6 @@ def extract_trial_result(
     gates: list[Gate] | None = None,
     enforce_gates: bool = True,
     deadline: float | None = None,
-    trainer_timeout_is_deadline: bool = False,
 ) -> TrialResult:
     """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
 
@@ -661,10 +662,6 @@ def extract_trial_result(
             a single blocking local stage can overrun by at most its own
             duration; W&B polling additionally caps its request budget to the
             remainder.
-        trainer_timeout_is_deadline: ``True`` when the caller capped the
-            trainer's wallclock budget to the remaining phase/run deadline, so
-            a trainer timeout is recorded as ``deadline_exhausted`` instead of
-            an ordinary per-trial limit.
 
     Returns:
         :class:`TrialResult` with either a finite metric and feasibility flag,
@@ -709,7 +706,9 @@ def extract_trial_result(
             rc=rc,
             duration=duration,
             failure_reason=failure_reason,
-            deadline_exhausted=trainer_timeout_is_deadline and executed.process.timed_out,
+            deadline_exhausted=(
+                executed.process.timeout_capped_by_wallclock and executed.process.timed_out
+            ),
         )
 
     expired = _deadline_failure("metric extraction")

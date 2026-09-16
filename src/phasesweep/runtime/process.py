@@ -850,6 +850,29 @@ class ProcessResult:
     duration_seconds: float
     failure_reason: str | None = None
     cleanup_confirmed: bool = True
+    timeout_capped_by_wallclock: bool = False
+
+
+def _choose_process_deadline(
+    *,
+    started: float,
+    timeout: float | None,
+    wallclock_deadline: float | None,
+) -> tuple[float | None, bool]:
+    """Choose the earlier subprocess or phase/run deadline.
+
+    :param float started: Monotonic timestamp at supervised-launch entry.
+    :param float | None timeout: Relative per-trial subprocess limit.
+    :param float | None wallclock_deadline: Absolute phase/run deadline.
+    :return tuple[float | None, bool]: Effective absolute deadline and whether
+        the phase/run deadline limits it.
+    """
+    trial_deadline = None if timeout is None else started + timeout
+    if wallclock_deadline is not None and (
+        trial_deadline is None or wallclock_deadline <= trial_deadline
+    ):
+        return wallclock_deadline, True
+    return trial_deadline, False
 
 
 class _LaunchDeadlineExpired(Exception):
@@ -1366,6 +1389,7 @@ def run_supervised(
     timeout: float | None,
     trial_dir: Path,
     attempt_id: str,
+    wallclock_deadline: float | None = None,
     cwd: str | None = None,
     gpu_lease_fds: Collection[int] = (),
 ) -> ProcessResult:
@@ -1390,16 +1414,17 @@ def run_supervised(
 
     On timeout: SIGTERM -> grace -> SIGKILL on the entire group.
 
-    ``timeout`` is the total launch-plus-execution budget, converted to an
+    ``timeout`` is the per-trial launch-plus-execution budget, converted to an
     absolute ``time.monotonic()`` deadline at entry (review v0.5.16 /
-    blocker 6). Every stage consumes it: the supervisor readiness wait is
-    capped to the remaining budget, the deadline is re-checked after
-    identity persistence and *before* the trainer payload crosses the ack
-    pipe — an expired deadline aborts the blocked supervisor and returns a
-    timeout without ever starting the trainer — and the wait for the trainer
-    root uses the recomputed remainder, never the original duration. Cleanup
-    grace after a timeout or an in-budget root exit is explicitly
-    post-deadline time.
+    blocker 6). ``wallclock_deadline`` carries the already-running phase/run
+    budget through work performed before this function. The earlier deadline
+    wins. Every supervised stage consumes it: the supervisor readiness wait
+    is capped to the remainder, the deadline is re-checked after identity
+    persistence and *before* the trainer payload crosses the ack pipe — an
+    expired deadline aborts the blocked supervisor and returns a timeout
+    without ever starting the trainer — and the wait for the trainer root
+    uses the recomputed remainder. Cleanup grace after a timeout or an
+    in-budget root exit is explicitly post-deadline time.
 
     Once the supervisor is spawned, launch failures — an expired deadline, a
     failed identity write, a failed payload delivery — never propagate: the
@@ -1415,6 +1440,8 @@ def run_supervised(
             entry (launch overhead included), or ``None`` for no timeout.
         trial_dir: Per-trial directory where ``process_identity.json`` is written.
         attempt_id: Immutable attempt identity already persisted in Optuna.
+        wallclock_deadline: Optional absolute ``time.monotonic()`` phase/run
+            deadline. Work before this call has already consumed it.
         cwd: Optional working directory the supervisor changes into before
             exec'ing the trainer, delivered over the ack pipe with the rest
             of the launch payload (review v0.5.17 / blocker 4). ``None``
@@ -1444,7 +1471,16 @@ def run_supervised(
     import time
 
     started = time.monotonic()
-    deadline = None if timeout is None else started + timeout
+    deadline, timeout_capped_by_wallclock = _choose_process_deadline(
+        started=started,
+        timeout=timeout,
+        wallclock_deadline=wallclock_deadline,
+    )
+    timeout_reason = (
+        "phase/run wallclock deadline exceeded"
+        if timeout_capped_by_wallclock
+        else f"timeout after {timeout}s"
+    )
 
     # The launch + register + identity write must be atomic from the
     # signal handler's perspective. Signal deferral MUST come first so that
@@ -1539,8 +1575,9 @@ def run_supervised(
             timed_out=True,
             pid=pid,
             duration_seconds=time.monotonic() - started,
-            failure_reason=f"timeout after {timeout}s before trainer launch",
+            failure_reason=f"{timeout_reason} before trainer launch",
             cleanup_confirmed=cleanup_confirmed,
+            timeout_capped_by_wallclock=timeout_capped_by_wallclock,
         )
     except BaseException as exc:
         if ack_write is not None:
@@ -1608,6 +1645,7 @@ def run_supervised(
             duration_seconds=duration,
             failure_reason=launch_failure_reason,
             cleanup_confirmed=cleanup_confirmed,
+            timeout_capped_by_wallclock=timeout_capped_by_wallclock,
         )
 
     assert proc is not None
@@ -1631,7 +1669,7 @@ def run_supervised(
             root_status = _read_pipe_frame(status_read, 1, deadline=deadline)
         if root_status is None and deadline is not None and time.monotonic() >= deadline:
             timed_out = True
-            failure_reason = f"timeout after {timeout}s"
+            failure_reason = timeout_reason
             log.warning("Trial PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
@@ -1754,6 +1792,7 @@ def run_supervised(
         duration_seconds=duration,
         failure_reason=failure_reason,
         cleanup_confirmed=cleanup_confirmed,
+        timeout_capped_by_wallclock=timeout_capped_by_wallclock,
     )
 
 
