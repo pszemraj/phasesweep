@@ -314,7 +314,7 @@ def runner_argv(
 
 
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
-    full_payload = {"run_id": run_id, **payload}
+    full_payload = {"run_id": run_id, "cleanup_confirmed": True, **payload}
     write_status_file(store.status_path(run_id), full_payload)
 
 

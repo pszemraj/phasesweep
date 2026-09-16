@@ -1296,7 +1296,7 @@ class RunStore:
         if type(payload.get("returncode")) is not int:
             return None
         cleanup_confirmed = payload.get("cleanup_confirmed")
-        if cleanup_confirmed is not None and type(cleanup_confirmed) is not bool:
+        if type(cleanup_confirmed) is not bool:
             return None
         error_class = payload.get("error_class")
         if error_class is not None and not isinstance(error_class, str):

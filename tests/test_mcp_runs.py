@@ -620,6 +620,8 @@ def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) 
         {"run_id": "other", "returncode": 0},
         {"run_id": "exp-1", "returncode": "0"},
         {"run_id": "exp-1", "returncode": True},
+        {"run_id": "exp-1", "returncode": 0},
+        {"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": None},
         {"run_id": "exp-1", "returncode": 0, "cleanup_confirmed": "yes"},
         {"run_id": "exp-1", "returncode": 0, "error_class": 3},
         {"run_id": "exp-1", "returncode": 0, "result_snapshot_state": "unknown"},
