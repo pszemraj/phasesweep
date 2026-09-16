@@ -355,7 +355,10 @@ def test_legacy_handle_missing_launch_authority_loads_fail_closed(tmp_path: Path
     )
     payload.pop("allow_cancel")
     payload.pop("visible_params_at_launch")
-    (tmp_path / "state" / "runs" / "exp-legacy.json").write_text(json.dumps(payload))
+    private_atomic_write_text(
+        tmp_path / "state" / "runs" / "exp-legacy.json",
+        json.dumps(payload),
+    )
 
     loaded = store.get("exp-legacy")
 
@@ -441,14 +444,14 @@ def test_list_handles_skips_malformed(tmp_path: Path) -> None:
     store.create(make_run_handle(run_id="exp-1"))
     store.create(make_run_handle(run_id="exp-2"))
     # A torn/partial handle file must not crash a read.
-    (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
+    private_atomic_write_text(tmp_path / "state" / "runs" / "broken.json", "{not valid json")
     assert {h.run_id for h in store.list_handles()} == {"exp-1", "exp-2"}
 
 
 def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     store.create(make_run_handle(run_id="exp-valid"))
-    (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
+    private_atomic_write_text(tmp_path / "state" / "runs" / "broken.json", "{not valid json")
     store.log_path("broken").write_text("runner may still exist\n")
     store.config_snapshot_path("exp-orphan").write_text("experiment: orphan\n")
     store.status_path("exp-orphan").write_text("{}\n")
@@ -473,7 +476,7 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
 
 def test_get_skips_malformed_handle(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
+    private_atomic_write_text(tmp_path / "state" / "runs" / "broken.json", "{not valid json")
     assert store.get("broken") is None
 
 
@@ -487,10 +490,69 @@ def test_dangling_handle_still_reserves_launch_authority(tmp_path: Path) -> None
     assert store.launch_inventory() == ([], {"run:dangling"})
 
 
+@pytest.mark.parametrize(
+    "record_kind",
+    ["handle", "status", "cleanup_uncertain", "cleanup_recovery"],
+)
+def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: str) -> None:
+    """A symlink cannot make external JSON authoritative run state."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64)
+    store.create(handle)
+    target = tmp_path / f"external-{record_kind}.json"
+
+    if record_kind == "handle":
+        path = store._runs_dir / f"{handle.run_id}.json"
+        payload = asdict(handle)
+        path.unlink()
+    elif record_kind == "status":
+        path = store.status_path(handle.run_id)
+        payload = {
+            "run_id": handle.run_id,
+            "returncode": 0,
+            "cleanup_confirmed": True,
+        }
+    elif record_kind == "cleanup_uncertain":
+        path = store.cleanup_uncertain_path(handle.run_id)
+        payload = {
+            "run_id": handle.run_id,
+            "config_sha256": handle.config_sha256,
+            "pid": handle.pid,
+            "pgid": handle.pgid,
+            "pid_starttime": handle.pid_starttime,
+            "boot_id": handle.boot_id,
+            "cleanup_confirmed": False,
+        }
+    else:
+        path = store.cleanup_recovery_path(handle.run_id)
+        payload = {
+            "run_id": handle.run_id,
+            "config_sha256": handle.config_sha256,
+            "cleanup_confirmed": True,
+        }
+    target.write_text(json.dumps(payload))
+    target.chmod(0o600)
+    path.symlink_to(target)
+
+    if record_kind == "handle":
+        assert store.get(handle.run_id) is None
+        assert store.handle_exists(handle.run_id)
+    elif record_kind == "status":
+        assert store.recorded_terminal_status(handle) is None
+        assert store.state(handle) == "running"
+    elif record_kind == "cleanup_uncertain":
+        assert not store.cleanup_uncertain(handle)
+    else:
+        assert not store._cleanup_recovered(handle)
+
+
 def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     payload = asdict(make_run_handle(run_id="other"))
-    (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
+    private_atomic_write_text(
+        tmp_path / "state" / "runs" / "exp-1.json",
+        json.dumps(payload),
+    )
 
     assert store.get("exp-1") is None
     assert store.list_handles() == []
@@ -527,7 +589,10 @@ def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: obj
     store = RunStore(tmp_path / "state")
     payload = asdict(make_run_handle(run_id="exp-1"))
     payload[field] = value
-    (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
+    private_atomic_write_text(
+        tmp_path / "state" / "runs" / "exp-1.json",
+        json.dumps(payload),
+    )
 
     assert store.get("exp-1") is None
     assert store.list_handles() == []
@@ -547,7 +612,10 @@ def test_launching_handle_cannot_have_process_identity(
     store = RunStore(tmp_path / "state")
     payload = asdict(make_run_handle(run_id="exp-1", launch_state="launching"))
     payload[field] = value
-    (tmp_path / "state" / "runs" / "exp-1.json").write_text(json.dumps(payload))
+    private_atomic_write_text(
+        tmp_path / "state" / "runs" / "exp-1.json",
+        json.dumps(payload),
+    )
 
     assert store.get("exp-1") is None
     assert store.list_handles() == []
@@ -727,7 +795,7 @@ def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) 
 def test_status_payload_shape_is_validated(tmp_path: Path, payload: object) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1")
-    store.status_path("exp-1").write_text(json.dumps(payload), encoding="utf-8")
+    private_atomic_write_text(store.status_path("exp-1"), json.dumps(payload))
 
     assert store.recorded_terminal_status(handle) is None
     assert store.state(handle) == "running"
@@ -742,19 +810,20 @@ def test_status_read_failures_do_not_break_state_scans(
     store.create(handle)
 
     store.status_path("exp-1").write_bytes(b"\xff")
+    store.status_path("exp-1").chmod(0o600)
     assert store.recorded_terminal_status(handle) is None
     assert store.state(handle) == "running"
     assert store.live_runs() == [handle]
 
-    store.status_path("exp-1").write_text('{"returncode": 0}', encoding="utf-8")
-    real_read_text = Path.read_text
+    private_atomic_write_text(store.status_path("exp-1"), '{"returncode": 0}')
+    real_read_text = mcp_runs.read_private_text_at
 
-    def fail_status_read(path: Path, *args: object, **kwargs: object) -> str:
+    def fail_status_read(parent_fd: int, leaf: str, path: Path) -> str:
         if path == store.status_path("exp-1"):
             raise OSError("status file temporarily unreadable")
-        return real_read_text(path, *args, **kwargs)
+        return real_read_text(parent_fd, leaf, path)
 
-    monkeypatch.setattr(Path, "read_text", fail_status_read)
+    monkeypatch.setattr(mcp_runs, "read_private_text_at", fail_status_read)
 
     assert store.recorded_terminal_status(handle) is None
     assert store.state(handle) == "running"
@@ -793,14 +862,15 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
     assert store.cleanup_uncertain(handle)
     assert store.live_runs() == [handle]
 
-    store.cleanup_recovery_path("exp-1").write_text(
+    private_atomic_write_text(
+        store.cleanup_recovery_path("exp-1"),
         json.dumps(
             {
                 "run_id": "exp-1",
                 "config_sha256": handle.config_sha256,
                 "cleanup_confirmed": True,
             }
-        )
+        ),
     )
     store.clear_cleanup_uncertain(handle)
 
@@ -852,14 +922,15 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
                     error_class="UnsafeProcessCleanupError",
                     cleanup_confirmed=False,
                 )
-                store.cleanup_recovery_path(handle.run_id).write_text(
+                private_atomic_write_text(
+                    store.cleanup_recovery_path(handle.run_id),
                     json.dumps(
                         {
                             "run_id": handle.run_id,
                             "config_sha256": handle.config_sha256,
                             "cleanup_confirmed": True,
                         }
-                    )
+                    ),
                 )
                 store.clear_cleanup_uncertain(handle)
             return False  # The state read already saw the old, unrecovered evidence.
@@ -1176,14 +1247,15 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     assert store.live_runs() == [handle]
     assert store.live_run_for("exp") == handle
 
-    store.cleanup_recovery_path("exp-1").write_text(
+    private_atomic_write_text(
+        store.cleanup_recovery_path("exp-1"),
         json.dumps(
             {
                 "run_id": "exp-1",
                 "config_sha256": "a" * 64,
                 "cleanup_confirmed": True,
             }
-        )
+        ),
     )
 
     assert store.state(handle) == "failed"
@@ -1207,14 +1279,15 @@ def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> Non
         error_class="UnsafeProcessCleanupError",
         cleanup_confirmed=False,
     )
-    store.cleanup_recovery_path("exp-1").write_text(
+    private_atomic_write_text(
+        store.cleanup_recovery_path("exp-1"),
         json.dumps(
             {
                 "run_id": "exp-1",
                 "config_sha256": "b" * 64,
                 "cleanup_confirmed": True,
             }
-        )
+        ),
     )
 
     assert store.state(handle) == "running"
@@ -1237,7 +1310,8 @@ def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
             "runner-other": "other-run",
         },
     )
-    store.cleanup_recovery_path(handle.run_id).write_text(
+    private_atomic_write_text(
+        store.cleanup_recovery_path(handle.run_id),
         json.dumps(
             {
                 "run_id": handle.run_id,
@@ -1257,7 +1331,7 @@ def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
                     },
                 },
             }
-        )
+        ),
     )
 
     attempt_ids, locations = store.cleanup_recovered_attempt_evidence(handle)

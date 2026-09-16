@@ -147,12 +147,16 @@ def _read_json_object(path: Path) -> dict | None:
     :param Path path: JSON file to read.
     :return dict | None: Parsed object, or ``None`` when unavailable or invalid.
     """
-    if not path.is_file():
-        return None
+    directory_fd = -1
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        directory_fd = open_directory_fd(path.parent, create=False, private_final=True)
+        raw = read_private_text_at(directory_fd, path.name, path)
+        payload = json.loads(raw)
+    except (OSError, UnsafePrivatePathError, UnicodeError, ValueError):
         return None
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
     return payload if isinstance(payload, dict) else None
 
 
