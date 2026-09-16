@@ -602,7 +602,8 @@ class RunStore:
         """
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
-        return (self._runs_dir / f"{run_id}.json").is_file()
+        path = self._runs_dir / f"{run_id}.json"
+        return path.exists() or path.is_symlink()
 
     def run_evidence_exists(self, run_id: str) -> bool:
         """Return whether any durable per-run file besides the handle survives.
@@ -621,9 +622,11 @@ class RunStore:
         """
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
-        return any(
-            (self._logs_dir / f"{run_id}{suffix}").is_file() for suffix in _RUN_EVIDENCE_SUFFIXES
-        )
+        for suffix in _RUN_EVIDENCE_SUFFIXES:
+            path = self._logs_dir / f"{run_id}{suffix}"
+            if path.exists() or path.is_symlink():
+                return True
+        return False
 
     def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
         """Load persisted handles and identify malformed handle records.
@@ -671,8 +674,6 @@ class RunStore:
         readable_ids = {handle.run_id for handle in handles}
 
         for path in self._logs_dir.iterdir():
-            if not path.is_file():
-                continue
             for suffix in _RUN_EVIDENCE_SUFFIXES:
                 if not path.name.endswith(suffix):
                     continue

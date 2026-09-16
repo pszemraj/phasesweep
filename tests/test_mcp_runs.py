@@ -419,17 +419,36 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
     store.log_path("broken").write_text("runner may still exist\n")
     store.config_snapshot_path("exp-orphan").write_text("experiment: orphan\n")
     store.status_path("exp-orphan").write_text("{}\n")
+    store.status_path("exp-dangling").symlink_to("missing-status.json")
+    store.log_path("exp-directory").mkdir()
 
     handles, unreadable_records = store.launch_inventory()
 
     assert [handle.run_id for handle in handles] == ["exp-valid"]
-    assert unreadable_records == {"run:broken", "run:exp-orphan"}
+    assert unreadable_records == {
+        "run:broken",
+        "run:exp-dangling",
+        "run:exp-directory",
+        "run:exp-orphan",
+    }
+    assert store.run_evidence_exists("exp-dangling")
+    assert store.run_evidence_exists("exp-directory")
 
 
 def test_get_skips_malformed_handle(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     (tmp_path / "state" / "runs" / "broken.json").write_text("{not valid json")
     assert store.get("broken") is None
+
+
+def test_dangling_handle_still_reserves_launch_authority(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    handle_path = tmp_path / "state" / "runs" / "dangling.json"
+    handle_path.symlink_to("missing-handle.json")
+
+    assert store.get("dangling") is None
+    assert store.handle_exists("dangling")
+    assert store.launch_inventory() == ([], {"run:dangling"})
 
 
 def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
