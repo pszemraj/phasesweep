@@ -1751,12 +1751,16 @@ def test_unreadable_artifact_root_binding_never_recommends_rebind(
     assert generation_id is not None
     snapshot = _generation_summary_path(experiment, generation_id).parent / "config.snapshot.yaml"
 
-    patch_path_method_failure(
-        monkeypatch,
-        snapshot,
-        "read_bytes",
-        PermissionError("permission denied"),
-    )
+    import phasesweep.engine.publication_validation as validation_ops
+
+    original_read_unlinked_bytes = validation_ops._read_unlinked_bytes
+
+    def deny_snapshot(path: Path, *, root: Path) -> bytes:
+        if path == snapshot:
+            raise PermissionError("permission denied")
+        return original_read_unlinked_bytes(path, root=root)
+
+    monkeypatch.setattr(validation_ops, "_read_unlinked_bytes", deny_snapshot)
     with pytest.raises(ArtifactRootRebindError) as publication_info:
         _validate_artifact_root_destination(
             experiment,
