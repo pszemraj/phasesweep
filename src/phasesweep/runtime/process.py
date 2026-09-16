@@ -1247,6 +1247,8 @@ def _spawn_blocked_supervisor(
         RuntimeError: If the supervisor does not signal readiness within
             ``_SUPERVISOR_READY_TIMEOUT_SECONDS``, or signals something other
             than ``b"R"``.
+        UnsafeProcessCleanupError: A supervisor was spawned, launch failed or
+            was interrupted, and terminating that process could not be confirmed.
 
     """
     import time
@@ -1304,7 +1306,7 @@ def _spawn_blocked_supervisor(
         status_read = ready_read
         ready_read = -1
         return proc, pgid, ack_write, status_read
-    except Exception as exc:
+    except BaseException as exc:
         if ack_write >= 0:
             closed_fd = ack_write
             ack_write = -1
@@ -1313,6 +1315,11 @@ def _spawn_blocked_supervisor(
             confirmed = _abort_launch(proc, pgid)
             if isinstance(exc, _LaunchDeadlineExpired):
                 exc.cleanup_confirmed = confirmed
+            elif not confirmed:
+                raise UnsafeProcessCleanupError(
+                    "Trial supervisor launch was interrupted after Popen, and cleanup "
+                    "could not be confirmed."
+                ) from exc
         raise
     finally:
         for fd in (ready_read, ready_write, ack_read):
@@ -1507,6 +1514,11 @@ def run_supervised(
             os.close(status_read)
             status_read = None
         if proc is None:
+            if isinstance(exc, UnsafeProcessCleanupError):
+                # The spawn helper owned a child before it could return the
+                # Popen handle. Its failed cleanup is intentionally not
+                # rewritten as a childless terminal attempt.
+                raise
             # No child identity exists to support the best-effort fallback used
             # after a spawned group exits. This transition is the sole durable
             # proof that recovery may settle the childless attempt.

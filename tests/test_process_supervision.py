@@ -349,6 +349,59 @@ def test_pre_spawn_failure_requires_terminal_lifecycle_write(
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 
+@pytest.mark.parametrize("cleanup_confirmed", [True, False])
+def test_spawn_interrupt_after_popen_preserves_cleanup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_confirmed: bool,
+) -> None:
+    """A control-flow interrupt cannot turn a spawned guardian into no child."""
+    import phasesweep.runtime.process as process
+
+    real_popen = subprocess.Popen
+    spawned: list[subprocess.Popen] = []
+
+    def capture_popen(argv: list[str], **kwargs: object) -> subprocess.Popen:
+        proc = real_popen(argv, **kwargs)  # type: ignore[arg-type]
+        spawned.append(proc)
+        return proc
+
+    def interrupt_read(_fd: int, _size: int, *, deadline: float) -> bytes:
+        del deadline
+        raise KeyboardInterrupt
+
+    real_abort = process._abort_launch
+
+    def abort_with_verdict(proc: subprocess.Popen, pgid: int | None) -> bool:
+        real_abort(proc, pgid)
+        return cleanup_confirmed
+
+    monkeypatch.setattr(process.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(process, "_read_pipe_frame", interrupt_read)
+    monkeypatch.setattr(process, "_abort_launch", abort_with_verdict)
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    expected = KeyboardInterrupt if cleanup_confirmed else UnsafeProcessCleanupError
+    with pytest.raises(expected):
+        _run_supervised(
+            trial_dir,
+            "true",
+            timeout=None,
+            attempt_id="interrupted-supervisor-spawn",
+        )
+
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
+    lifecycle = read_attempt_lifecycle(
+        trial_dir,
+        expected_attempt_id="interrupted-supervisor-spawn",
+    )
+    assert lifecycle is not None
+    assert lifecycle.state == ("exited" if cleanup_confirmed else "launching")
+    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+
+
 def test_identity_write_failure_marks_launch_before_popen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
