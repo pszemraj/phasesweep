@@ -1512,6 +1512,19 @@ class PhaseSweepMCP:
                         else completed.winner_views()
                     )
                     result_source = completed_source
+                elif self._runs.recovery_required(handle) or not self._runs._runner_is_live(handle):
+                    # No frozen result is available after the runner stopped
+                    # or cleanup became uncertain. A recovery transition may
+                    # not have written its marker yet, so do not reuse the
+                    # mutable winner view captured before the final probe.
+                    unavailable = RunResultSnapshot.model_validate(
+                        capture_pre_generation_result_snapshot(experiment)
+                    )
+                    status = self._snapshot_status_payload(
+                        target_id, unavailable, result_source="terminal_snapshot_unavailable"
+                    )
+                    winner_views = []
+                    result_source = "terminal_snapshot_unavailable"
         represented_generation_id: str | None = status["represented_generation_id"]
         publication_integrity: McpPublicationState = status["publication_integrity"]
         authority_handle = handle

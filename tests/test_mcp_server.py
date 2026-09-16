@@ -2551,8 +2551,11 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
         ("winners", "complete"),
         ("await_run", "complete"),
         ("status", "pending_runner_exit"),
+        ("winners", "pending_runner_exit"),
         ("await_run", "pending_runner_exit"),
         ("status", "no_status_runner_exit"),
+        ("winners", "no_status_runner_exit"),
+        ("winners", "no_status_runner_exit_with_recovery_lock"),
         ("await_run", "no_status_runner_exit"),
     ],
 )
@@ -2566,7 +2569,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     assert handle is not None
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
-    if transition == "no_status_runner_exit":
+    if transition.startswith("no_status_runner_exit"):
         store.status_path(run_id).unlink()
     else:
         write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
@@ -2594,15 +2597,24 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     monkeypatch.setattr(app, "_live_status_payload", finish_during_live_read)
     monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
-    payload = (
-        app.winners(run_id=run_id)
-        if read_tool == "winners"
-        else (
-            asyncio.run(app.await_run(run_id, timeout_seconds=0))
-            if read_tool == "await_run"
-            else app.status(run_id=run_id)
-        )
+    lock = (
+        store.transition_lock(handle)
+        if transition == "no_status_runner_exit_with_recovery_lock"
+        else contextlib.nullcontext()
     )
+    with lock:
+        payload = (
+            app.winners(run_id=run_id)
+            if read_tool == "winners"
+            else (
+                asyncio.run(app.await_run(run_id, timeout_seconds=0))
+                if read_tool == "await_run"
+                else app.status(run_id=run_id)
+            )
+        )
+    if transition == "no_status_runner_exit_with_recovery_lock":
+        assert not store.cleanup_uncertain(handle)
+        assert store.state(handle) == "running"
 
     assert finalized
     if transition == "complete":
@@ -2615,7 +2627,13 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
             if read_tool == "await_run":
                 assert payload["reason"] == "terminal"
     else:
-        assert payload["run"]["recovery_required"] is True
+        if read_tool == "winners":
+            assert payload["result_source"] == "terminal_snapshot_unavailable"
+            assert payload["publication_integrity"] == "unknown"
+            assert payload["winner_count"] == 0
+            assert payload["represented_generation_id"] is None
+        else:
+            assert payload["run"]["recovery_required"] is True
         assert store.recovery_required(handle)
         if read_tool == "await_run":
             assert payload["reason"] == "recovery_required"
@@ -4374,7 +4392,9 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
         assert payload["result_source"] == "current_shared_study"
         assert payload["run"]["state"] == "running"
         assert payload["run"]["recovery_required"] is True
-    assert winners["result_source"] == "current_shared_study"
+    assert winners["result_source"] == "terminal_snapshot_unavailable"
+    assert winners["publication_integrity"] == "unknown"
+    assert winners["winner_count"] == 0
     assert awaited["reason"] == "recovery_required"
     preflight = CliRunner().invoke(
         cli_main,
