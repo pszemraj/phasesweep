@@ -1249,6 +1249,14 @@ def test_suite_pointer_rejects_nonboolean_exposure(tmp_path: Path, exposed: obje
     assert _resolve_suite_publication_pointer(suite).state == "failed"
     with pytest.raises(PublicationIntegrityError):
         _show_suite_winners(suite)
+    previous_success = _last_successful_suite_generation_path(suite).read_bytes()
+    previous_current = _suite_generation_path(suite).read_bytes()
+
+    with pytest.raises(PublicationIntegrityError):
+        run_suite(suite)
+
+    assert _last_successful_suite_generation_path(suite).read_bytes() == previous_success
+    assert _suite_generation_path(suite).read_bytes() == previous_current
 
 
 @pytest.mark.parametrize("tamper", ["generation_id", "summary_path"])

@@ -12,6 +12,7 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.locking as locking_ops
 import phasesweep.engine.paths as path_ops
+import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.run as run_engine
 from phasesweep._metadata import __version__
@@ -48,9 +49,11 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
     :return dict[str, dict[str, Winner]]: Winners keyed by study name, then phase name.
     :raises PromotionError: A study declares a dependency that exposed no
         winners, so the suite refuses to start it.
-    :raises BaseException: Whatever a component run or the publication
-        transaction raised, re-raised after the suite generation is durably
-        recorded as ``failed`` (or ``publication_failed``).
+    :raises PublicationAccessError: The prior suite publication cannot be read.
+    :raises PublicationIntegrityError: The prior suite publication no longer validates.
+    :raises BaseException: Once a generation is claimed, whatever a component
+        run or the publication transaction raised, re-raised after that suite
+        generation is durably recorded as ``failed`` (or ``publication_failed``).
     """
     results: dict[str, dict[str, Winner]] = {}
     promotion_decisions: dict[str, dict[str, Any]] = {}
@@ -71,6 +74,11 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
         locking_ops._suite_lock(suite),
         artifact_io._file_log_handler(path_ops._suite_log_path(suite)),
     ):
+        prior = publication_ops._resolve_suite_publication_pointer(suite)
+        if prior.state == "permission_denied":
+            raise PublicationAccessError(prior.error or "Published suite result is unreadable.")
+        if prior.state == "failed":
+            raise PublicationIntegrityError(prior.error or "Published suite result is invalid.")
         generation_id = _claim_suite_generation(suite)
         started_at = utc_now_iso()
         _write_suite_generation_state(
