@@ -63,7 +63,7 @@ def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPo
         when it otherwise exists but cannot be resolved.
     """
     try:
-        pointer_path.stat()
+        pointer_path.lstat()
     except FileNotFoundError:
         return PublicationPointer(state="absent", generation_id=None, error=None)
     except PermissionError:

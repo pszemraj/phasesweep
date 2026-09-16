@@ -1076,7 +1076,7 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
     patch_path_method_failure(
         monkeypatch,
         pointer,
-        "stat",
+        "lstat",
         PermissionError("permission denied"),
     )
 
@@ -1300,6 +1300,36 @@ def test_suite_publication_pointer_reports_absent_before_anything_publishes(
     assert _resolve_suite_publication_pointer(suite) == PublicationPointer(
         state="absent", generation_id=None, error=None
     )
+
+
+@pytest.mark.parametrize("suite_owner", [False, True])
+def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(
+    tmp_path: Path, suite_owner: bool
+) -> None:
+    if suite_owner:
+        owner = _stored_suite_config(tmp_path)
+        run = run_suite
+        pointer_path = _last_successful_suite_generation_path(owner)
+        current_path = _suite_generation_path(owner)
+        resolve = _resolve_suite_publication_pointer
+    else:
+        owner = _stored_experiment(tmp_path)
+        run = run_experiment
+        pointer_path = _last_successful_generation_path(owner)
+        current_path = _generation_path(owner)
+        resolve = _resolve_publication_pointer
+    run(owner)
+    current = current_path.read_bytes()
+    pointer_path.unlink()
+    pointer_path.symlink_to("missing-target.yaml")
+    assert pointer_path.is_symlink() and not pointer_path.exists()
+
+    assert resolve(owner).state == "failed"
+    with pytest.raises(PublicationIntegrityError):
+        run(owner)
+
+    assert pointer_path.is_symlink()
+    assert current_path.read_bytes() == current
 
 
 def test_suite_deleted_pointers_do_not_expose_compatibility_summary(
