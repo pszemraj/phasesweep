@@ -5115,6 +5115,22 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert recovered_status["terminal_trials_before_run"] == 0
     assert recovered_status["target_already_satisfied"] is False
 
+    final_status = store.status_path(run_id).read_bytes()
+
+    def forbid_redundant_finalization(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("completed recovery must not finalize again")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "phasesweep.mcp.recovery.finalize_result_snapshot", forbid_redundant_finalization
+        )
+        repeat = runner.invoke(cli_main, command)
+
+    assert repeat.exit_code == 0, repeat.output
+    assert "No cleanup uncertainty or terminal result repair" in repeat.output
+    assert store.status_path(run_id).read_bytes() == final_status
+    assert not store.recovery_required(handle)
+
 
 def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_written(
     tmp_path: Path,

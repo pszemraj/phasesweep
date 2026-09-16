@@ -349,7 +349,13 @@ def _recovery_needs(
         terminal_status is not None and stored_snapshot is None
     ) or runner_without_status
     snapshot_finalize_needed = stored_snapshot is not None and (
-        terminal_cleanup_uncertain or cleanup_already_recovered or snapshot_recovery_required
+        terminal_cleanup_uncertain
+        or (
+            cleanup_already_recovered
+            and terminal_status is not None
+            and terminal_status.get("result_snapshot_state") != "complete"
+        )
+        or snapshot_recovery_required
     )
     if not cleanup_needed and snapshot_unavailable and not snapshot_recovery_required:
         raise RunRecoveryError(
