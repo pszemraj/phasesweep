@@ -334,12 +334,25 @@ def _has_generation_layout(config: Experiment | Suite) -> bool:
     :param Experiment | Suite config: Experiment or suite artifact root.
     :return bool: Whether a current generation record or immutable generation root exists.
     """
+
+    def entry_present(path: Path) -> bool:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            # An unreadable or otherwise uninspectable modern entry must not
+            # enable unvalidated legacy compatibility artifacts.
+            return True
+        return True
+
     if isinstance(config, Suite):
-        return (
-            path_ops._suite_generation_path(config).exists()
-            or path_ops._suite_generations_dir(config).exists()
+        return entry_present(path_ops._suite_generation_path(config)) or entry_present(
+            path_ops._suite_generations_dir(config)
         )
-    return path_ops._generation_path(config).exists() or path_ops._generations_dir(config).exists()
+    return entry_present(path_ops._generation_path(config)) or entry_present(
+        path_ops._generations_dir(config)
+    )
 
 
 def _resolve_suite_publication_pointer(suite: Suite) -> PublicationPointer:

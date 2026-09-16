@@ -52,11 +52,13 @@ from phasesweep.engine.paths import (
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
+    _generations_dir,
     _last_successful_generation_path,
     _last_successful_suite_generation_path,
     _suite_generation_path,
     _suite_generation_record_path,
     _suite_generation_summary_path,
+    _suite_generations_dir,
     _suite_summary_path,
 )
 from phasesweep.engine.publication import (
@@ -1332,14 +1334,53 @@ def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(
     assert current_path.read_bytes() == current
 
 
+def test_dangling_generation_root_does_not_enable_legacy_winner(tmp_path: Path) -> None:
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    assert read_winner(experiment, "p") is not None
+    _last_successful_generation_path(experiment).unlink()
+    _generation_path(experiment).unlink()
+    generations = _generations_dir(experiment)
+    generations.rename(generations.with_name("saved-generations"))
+    generations.symlink_to("missing-generations", target_is_directory=True)
+    assert generations.is_symlink() and not generations.exists()
+
+    status = read_status(experiment)
+
+    assert status["publication_integrity"] == "absent"
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+    assert read_winner(experiment, "p") is None
+
+
 def test_suite_deleted_pointers_do_not_expose_compatibility_summary(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     suite = _stored_suite_config(tmp_path)
     run_suite(suite)
     assert _suite_summary_path(suite).is_file()
     _last_successful_suite_generation_path(suite).unlink()
     _suite_generation_path(suite).unlink()
+
+    assert _resolve_suite_publication_pointer(suite).state == "absent"
+    _show_suite_winners(suite)
+    assert capsys.readouterr().out.strip() == "(no successful suite result yet)"
+
+
+def test_dangling_suite_generation_root_does_not_enable_legacy_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    assert _suite_summary_path(suite).is_file()
+    _last_successful_suite_generation_path(suite).unlink()
+    _suite_generation_path(suite).unlink()
+    generations = _suite_generations_dir(suite)
+    generations.rename(generations.with_name("saved-suite-generations"))
+    generations.symlink_to("missing-suite-generations", target_is_directory=True)
+    assert generations.is_symlink() and not generations.exists()
 
     assert _resolve_suite_publication_pointer(suite).state == "absent"
     _show_suite_winners(suite)
