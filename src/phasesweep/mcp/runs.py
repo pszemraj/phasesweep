@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.mcp.time import parse_utc_iso
@@ -835,7 +835,15 @@ class RunStore:
             return None
         if handle.run_id != expected_run_id:
             return None
-        if not SAFE_NAME_PATTERN.fullmatch(handle.experiment_id):
+        if not isinstance(handle.experiment_id, str) or not SAFE_NAME_PATTERN.fullmatch(
+            handle.experiment_id
+        ):
+            return None
+        if (
+            type(handle.config_sha256) is not str
+            or len(handle.config_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in handle.config_sha256)
+        ):
             return None
         if type(handle.allow_cancel) is not bool:
             return None
@@ -1469,9 +1477,16 @@ def _valid_positive_optional_int(value: object) -> bool:
 
 
 def _valid_optional_boot_id(value: object) -> bool:
-    """Return whether ``value`` is ``None`` or a non-empty ``str`` boot id.
+    """Return whether ``value`` is ``None`` or a canonical Linux boot UUID.
 
     :param object value: Value to validate.
-    :return bool: Whether the value is ``None`` or a non-empty string.
+    :return bool: Whether the value is ``None`` or canonical lowercase UUID text.
     """
-    return value is None or (type(value) is str and bool(value))
+    if value is None:
+        return True
+    if type(value) is not str:
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False

@@ -320,9 +320,9 @@ def _stage_stale_running_recovery_scaffold(
         current_boot_id = read_boot_id()
         if current_boot_id is None:
             pytest.skip("boot id unavailable on this platform")
-        recorded_boot_id = "0" * len(current_boot_id)
+        recorded_boot_id = "00000000-0000-0000-0000-000000000000"
         if recorded_boot_id == current_boot_id:
-            recorded_boot_id = "1" * len(current_boot_id)
+            recorded_boot_id = "11111111-1111-1111-1111-111111111111"
     trial_number = _write_stale_running_trial(
         config,
         cleanup_confirmed=False,
@@ -1924,7 +1924,11 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
             starttime=111,
             allow_cancel=True,
         ),
-        boot_id="0" * len(current_boot) if current_boot != "0" * len(current_boot) else "1",
+        boot_id=(
+            "00000000-0000-0000-0000-000000000000"
+            if current_boot != "00000000-0000-0000-0000-000000000000"
+            else "11111111-1111-1111-1111-111111111111"
+        ),
     )
     store.create(handle)
     write_run_status(store, "srv-boot", returncode=0, result_snapshot_state="pending")
@@ -4356,9 +4360,9 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-earlier-boot-no-status"
-    earlier_boot = "0" * len(current_boot)
+    earlier_boot = "00000000-0000-0000-0000-000000000000"
     if earlier_boot == current_boot:
-        earlier_boot = "1" * len(current_boot)
+        earlier_boot = "11111111-1111-1111-1111-111111111111"
     handle = replace(
         make_run_handle(
             run_id=run_id,

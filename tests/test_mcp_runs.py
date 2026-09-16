@@ -33,8 +33,8 @@ def _earlier_boot_id() -> str:
     current = read_boot_id()
     if current is None:
         pytest.skip("boot id unavailable on this platform")
-    other = "0" * len(current)
-    return other if other != current else "1" * len(current)
+    other = "00000000-0000-0000-0000-000000000000"
+    return other if other != current else "11111111-1111-1111-1111-111111111111"
 
 
 def test_create_get_roundtrip(tmp_path: Path) -> None:
@@ -464,6 +464,10 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
     "field,value",
     [
         ("experiment_id", "../bad"),
+        ("experiment_id", 7),
+        ("config_sha256", []),
+        ("config_sha256", "a" * 63),
+        ("config_sha256", "A" * 64),
         ("pid", 0),
         ("pid", "123"),
         ("pgid", 0),
@@ -474,6 +478,7 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
         ("started_at", "not-a-timestamp"),
         ("started_at", "2026-07-17T12:00:00"),
         ("boot_id", ""),
+        ("boot_id", "malformed"),
         ("boot_id", 12345),
         ("visible_params_at_launch", "some"),
         ("visible_params_at_launch", [""]),
@@ -494,7 +499,11 @@ def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: obj
 
 @pytest.mark.parametrize(
     "field,value",
-    [("pid", os.getpid()), ("pgid", os.getpid()), ("boot_id", "a-boot-id")],
+    [
+        ("pid", os.getpid()),
+        ("pgid", os.getpid()),
+        ("boot_id", "11111111-1111-1111-1111-111111111111"),
+    ],
 )
 def test_launching_handle_cannot_have_process_identity(
     tmp_path: Path, field: str, value: object
@@ -910,7 +919,9 @@ def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
 
 def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    boot_id = read_boot_id() or "test-boot-id"
+    boot_id = read_boot_id()
+    if boot_id is None:
+        pytest.skip("boot id unavailable on this platform")
     handle = replace(make_run_handle(run_id="exp-1", pid=4242, starttime=111), boot_id=boot_id)
 
     store.create(handle)
@@ -923,7 +934,7 @@ def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) ->
     assert store.cleanup_identity(loaded).boot_id == boot_id
 
 
-@pytest.mark.parametrize("boot_id", ["", 12345, True])
+@pytest.mark.parametrize("boot_id", ["", "malformed", 12345, True])
 def test_cleanup_marker_with_invalid_boot_id_is_rejected(tmp_path: Path, boot_id: object) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64, pid=999999, starttime=111)
