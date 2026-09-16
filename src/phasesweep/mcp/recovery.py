@@ -183,8 +183,10 @@ def recover_run(
                 needs.snapshot_finalize_needed
                 and terminal_status.get("result_snapshot_state") == "complete"
             )
-            if repairing_complete_snapshot and not earlier_boot:
+            if repairing_complete_snapshot:
                 # Keep the recovery reservation while the prior frozen result stays readable.
+                # Reboot proves processes dead, but this marker must still survive until
+                # their trial evidence is reflected in the immutable snapshot.
                 store.mark_cleanup_uncertain(handle)
             if needs.cleanup_needed:
                 _persist_cleanup_recovery(store, handle, config, evidence)

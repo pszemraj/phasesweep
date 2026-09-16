@@ -167,6 +167,7 @@ def _write_trial_process_identity(
     attempt_id: str,
     pid: int,
     starttime: int,
+    boot_id: str | None = None,
 ) -> None:
     _write_process_identity(
         trial_dir / PROCESS_IDENTITY_FILE,
@@ -176,7 +177,7 @@ def _write_trial_process_identity(
             pid=pid,
             pgid=pid,
             proc_starttime=starttime,
-            boot_id=read_boot_id(),
+            boot_id=read_boot_id() if boot_id is None else boot_id,
         ),
     )
 
@@ -223,6 +224,7 @@ def _write_stale_running_trial(
     cleanup_confirmed: bool | None = None,
     generation_id: str = "stale-generation",
     persist_trial_attrs: bool = True,
+    boot_id: str | None = None,
 ) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
@@ -248,6 +250,7 @@ def _write_stale_running_trial(
         attempt_id=attempt_id,
         pid=4343,
         starttime=222,
+        boot_id=boot_id,
     )
     if persist_trial_attrs:
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
@@ -300,20 +303,31 @@ def _stage_stale_running_recovery_scaffold(
     cleanup_trial_stub: Callable[..., bool],
     monkeypatch: pytest.MonkeyPatch,
     allow_cancel: bool = False,
+    earlier_boot: bool = False,
 ) -> tuple[PhaseSweepMCP, RunStore, RunHandle, str, list[str]]:
     """Shared scaffold for the interrupted-recovery --confirm retry tests: a
     stale RUNNING trial, a run handle, and a terminal status with a captured
     ``result_snapshot``, with ``kill_stale_group``/``cleanup_stale_trial_process``
     stubbed to succeed. Callers monkeypatch their own fail-once target and
     invoke the returned command twice. ``allow_cancel`` permits an intervening
-    cancellation in a retry test. Returns ``(app, store, handle, attempt_id,
-    command)``.
+    cancellation in a retry test. ``earlier_boot`` records both runner and
+    trial identities under a different boot ID. Returns ``(app, store, handle,
+    attempt_id, command)``.
     """
     config = _config(tmp_path)
+    recorded_boot_id = None
+    if earlier_boot:
+        current_boot_id = read_boot_id()
+        if current_boot_id is None:
+            pytest.skip("boot id unavailable on this platform")
+        recorded_boot_id = "0" * len(current_boot_id)
+        if recorded_boot_id == current_boot_id:
+            recorded_boot_id = "1" * len(current_boot_id)
     trial_number = _write_stale_running_trial(
         config,
         cleanup_confirmed=False,
         generation_id=run_id,
+        boot_id=recorded_boot_id,
     )
     attempt_id = f"stale-attempt-{trial_number}"
     experiment = load_config(config)
@@ -328,6 +342,8 @@ def _stage_stale_running_recovery_scaffold(
         starttime=111,
         allow_cancel=allow_cancel,
     )
+    if recorded_boot_id is not None:
+        handle = replace(handle, boot_id=recorded_boot_id)
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     if include_generation_record:
@@ -5079,9 +5095,11 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     assert captured["cmd"]
 
 
+@pytest.mark.parametrize("earlier_boot", [False, True])
 def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    earlier_boot: bool,
 ) -> None:
     """Pins that a --confirm retry after an interrupted
     ``finalize_result_snapshot`` call reuses the cleanup-recovery evidence
@@ -5102,7 +5120,10 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         kill_stale_group_stub=_counting_success_callback(runner_cleanup_calls),
         cleanup_trial_stub=_counting_success_callback(trial_cleanup_calls),
         monkeypatch=monkeypatch,
+        earlier_boot=earlier_boot,
     )
+    assert store.state(handle) == ("failed" if earlier_boot else "running")
+    assert store.recovery_required(handle)
 
     snapshot_calls = 0
     snapshot_attempt_ids: list[set[str]] = []
@@ -5139,14 +5160,14 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     frozen_status = app.status(run_id=run_id)
     assert frozen_status["result_source"] == "frozen_run_snapshot"
     assert frozen_status["phases"][0]["trials"]["RUNNING"] == 1
-    assert len(runner_cleanup_calls) == 1
+    assert len(runner_cleanup_calls) == (0 if earlier_boot else 1)
     assert len(trial_cleanup_calls) == 1
 
     retry = runner.invoke(cli_main, command)
 
     assert retry.exit_code == 0, retry.output
     assert "Finalized stored terminal result snapshot" in retry.output
-    assert len(runner_cleanup_calls) == 1
+    assert len(runner_cleanup_calls) == (0 if earlier_boot else 1)
     assert len(trial_cleanup_calls) == 1
     assert snapshot_calls == 2
     assert snapshot_attempt_ids == [{attempt_id}, {attempt_id}]

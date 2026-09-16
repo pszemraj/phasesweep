@@ -949,7 +949,9 @@ def test_earlier_boot_clears_a_persisted_cleanup_uncertainty_marker(tmp_path: Pa
     assert not store.cleanup_uncertain_path("exp-1").exists()
 
 
-def test_earlier_boot_resolves_terminal_cleanup_uncertain_status(tmp_path: Path) -> None:
+def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
+    tmp_path: Path,
+) -> None:
     store = RunStore(tmp_path / "state")
     handle = replace(
         make_run_handle(run_id="exp-1", experiment_id="exp", pid=999999, starttime=111),
@@ -965,7 +967,8 @@ def test_earlier_boot_resolves_terminal_cleanup_uncertain_status(tmp_path: Path)
     )
 
     assert store.state(handle) == "failed"
-    assert not store.cleanup_recovery_required(handle)
+    assert store.cleanup_recovery_required(handle)
+    assert store.recovery_required(handle)
     assert store.live_run_for("exp") is None
 
 

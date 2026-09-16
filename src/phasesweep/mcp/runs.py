@@ -901,10 +901,12 @@ class RunStore:
         # marker is part of the strongest identity this run has.
         earlier_boot = self.from_earlier_boot(handle)
         if self.cleanup_uncertain(handle):
-            if (status is not None and status.get("cleanup_confirmed") is True) or earlier_boot:
+            if (status is not None and status.get("cleanup_confirmed") is True) or (
+                earlier_boot and (status is None or status.get("cleanup_confirmed") is not False)
+            ):
                 with contextlib.suppress(OSError):
                     self.clear_cleanup_uncertain(handle)
-            else:
+            elif not earlier_boot:
                 return "running"
         if status is not None:
             return self._state_from_status(handle, status)
@@ -1148,17 +1150,19 @@ class RunStore:
         )
 
     def cleanup_recovery_required(self, handle: RunHandle) -> bool:
-        """Return whether process cleanup still requires operator recovery.
+        """Return whether cleanup evidence still requires operator recovery.
 
         :param RunHandle handle: Persisted run whose cleanup evidence is checked.
-        :return bool: True when a server marker or terminal runner status still
-            records cleanup uncertainty without matching recovery evidence, and
-            the recorded identity does not already predate the current boot.
+        :return bool: True when a server marker still reserves same-boot process
+            cleanup or terminal runner status still needs trial reconciliation.
+            A prior boot proves processes dead but does not update their durable
+            trial rows or an already-frozen result snapshot.
         """
-        if self.cleanup_uncertain(handle) and not self.from_earlier_boot(handle):
-            return True
         status = self._read_status(handle)
-        return status is not None and self._terminal_cleanup_uncertain(handle, status)
+        terminal_cleanup_uncertain = status is not None and status.get("cleanup_confirmed") is False
+        if self.cleanup_uncertain(handle):
+            return not self.from_earlier_boot(handle) or terminal_cleanup_uncertain
+        return terminal_cleanup_uncertain and not self._cleanup_recovered(handle)
 
     def cleanup_recovered_attempt_evidence(
         self,
