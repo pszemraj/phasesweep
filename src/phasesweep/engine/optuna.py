@@ -378,10 +378,13 @@ def _load_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Stud
     :param Phase | str phase: Phase or historical phase name whose study is loaded.
     :return optuna.Study: Existing Optuna study for the phase.
     """
-    return optuna.load_study(
-        study_name=_phase_study_name(experiment, phase),
-        storage=_resolve_storage(experiment.resolved_storage),
+    assert experiment.resolved_storage is not None
+    storage = (
+        _resolve_storage(experiment.resolved_storage)
+        if storage_backend(experiment.resolved_storage) == "journal"
+        else optuna.storages.RDBStorage(experiment.resolved_storage, skip_table_creation=True)
     )
+    return optuna.load_study(study_name=_phase_study_name(experiment, phase), storage=storage)
 
 
 def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
@@ -490,17 +493,16 @@ class _JournalSnapshot(BaseJournalBackend):
         raise RuntimeError("A journal snapshot is read-only.")
 
 
-def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.Study | None:
-    """Replay a complete journal snapshot before deciding whether a study exists.
+def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | None:
+    """Capture a complete journal as a read-only in-memory storage.
 
     Optuna tolerates an undecodable final record while another writer appends.
     Such a snapshot is incomplete, so inspection cannot claim known counts or
-    confirmed absence. Replay also must finish before a missing-study KeyError
-    can be distinguished from a malformed journal operation.
+    confirmed absence.
 
     :param str storage_url: Journal storage URL to inspect.
-    :param str study_name: Named study to load from the captured records.
-    :return optuna.Study | None: Read-only snapshot study, or confirmed absence.
+    :param str label: Study or experiment named in an inspection failure.
+    :return JournalStorage | None: Snapshot storage, or ``None`` when absent.
     :raises StudyStorageUnavailableError: The snapshot is unreadable or incomplete.
     """
     path = Path(file_url_path(storage_url)).expanduser()
@@ -516,16 +518,97 @@ def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.St
         if data and not data.endswith(b"\n"):
             raise ValueError("The journal ends with an incomplete record.")
         records = [json.loads(line) for line in data.split(b"\n")[:-1]]
-        storage = JournalStorage(_JournalSnapshot(records))
+        return JournalStorage(_JournalSnapshot(records))
     except Exception as exc:
         raise StudyStorageUnavailableError(
-            f"Journal storage {path} could not be completely read while checking for "
-            f"study {study_name!r}."
+            f"Journal storage {path} could not be completely read while checking for {label}."
         ) from exc
+
+
+def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.Study | None:
+    """Replay a complete journal snapshot before deciding whether a study exists.
+
+    Replay must finish before a missing-study KeyError can be distinguished
+    from a malformed journal operation.
+
+    :param str storage_url: Journal storage URL to inspect.
+    :param str study_name: Named study to load from the captured records.
+    :return optuna.Study | None: Read-only snapshot study, or confirmed absence.
+    :raises StudyStorageUnavailableError: The snapshot is unreadable or incomplete.
+    """
+    storage = _journal_snapshot_storage(storage_url, f"study {study_name!r}")
+    if storage is None:
+        return None
     try:
         return optuna.load_study(study_name=study_name, storage=storage)
     except KeyError:
         return None
+
+
+def _existing_phase_study_names(experiment: Experiment) -> tuple[str, ...]:
+    """List this experiment's retained phase studies without creating storage.
+
+    :param Experiment experiment: Persistent experiment whose study namespace is read.
+    :return tuple[str, ...]: Sorted phase-name suffixes of existing studies.
+    :raises StudyStorageUnavailableError: Existing storage cannot be inspected.
+    """
+    assert experiment.resolved_storage is not None
+    backend = storage_backend(experiment.resolved_storage)
+    names: list[str]
+    if backend == "sqlite":
+        uri = sqlite_readonly_uri(experiment.resolved_storage)
+        database = sqlite_database_path(experiment.resolved_storage)
+        if uri is None or database is None or not database.exists():
+            return ()
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=0.1)
+            try:
+                names = [row[0] for row in conn.execute("SELECT study_name FROM studies")]
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return ()
+            raise StudyStorageUnavailableError(
+                f"SQLite storage {database} could not be read while listing phase studies."
+            ) from exc
+        except sqlite3.Error as exc:
+            raise StudyStorageUnavailableError(
+                f"SQLite storage {database} could not be read while listing phase studies."
+            ) from exc
+    elif backend == "journal":
+        storage = _journal_snapshot_storage(
+            experiment.resolved_storage, f"experiment {experiment.experiment!r}"
+        )
+        if storage is None:
+            return ()
+        try:
+            names = [study.study_name for study in storage.get_all_studies()]
+        except Exception as exc:
+            raise StudyStorageUnavailableError(
+                "Journal storage could not be replayed while listing phase studies."
+            ) from exc
+    else:
+        try:
+            engine = sqlalchemy.create_engine(experiment.resolved_storage)
+            try:
+                if not sqlalchemy.inspect(engine).has_table("studies"):
+                    return ()
+                with engine.connect() as connection:
+                    names = [
+                        row[0]
+                        for row in connection.execute(
+                            sqlalchemy.text("SELECT study_name FROM studies")
+                        )
+                    ]
+            finally:
+                engine.dispose()
+        except Exception as exc:  # noqa: BLE001 - rebind planning cannot guess omitted studies
+            raise StudyStorageUnavailableError(
+                "External RDB storage could not be read while listing phase studies."
+            ) from exc
+    prefix = f"{experiment.experiment}::"
+    return tuple(sorted(name[len(prefix) :] for name in names if name.startswith(prefix)))
 
 
 def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study | None:

@@ -1119,6 +1119,8 @@ def test_auto_storage_rebind_moves_ledger_with_artifacts(
         update={"phases": [original.phases[0], original.phases[0].model_copy(update={"name": "q"})]}
     )
     run_experiment(original)
+    if drop_published_phase:
+        run_experiment(original.model_copy(update={"phases": original.phases[:1]}))
     old_workdir.rename(new_workdir)
     moved = original.model_copy(update={"workdir": str(new_workdir)})
     if drop_published_phase:
@@ -1151,7 +1153,8 @@ def test_auto_storage_rebind_moves_ledger_with_artifacts(
 
 
 @pytest.mark.parametrize(
-    "damage", ["trainer_input", "running", "foreign_ledger", "removed_phase_trial"]
+    "damage",
+    ["trainer_input", "running", "foreign_ledger", "removed_phase_trial", "older_phase_trial"],
 )
 def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> None:
     original = make_experiment(
@@ -1161,7 +1164,7 @@ def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> No
         trial_command="echo x=0.5 {overrides}",
         execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
     )
-    if damage == "removed_phase_trial":
+    if damage in {"removed_phase_trial", "older_phase_trial"}:
         original = original.model_copy(
             update={
                 "phases": [
@@ -1171,10 +1174,12 @@ def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> No
             }
         )
     run_experiment(original)
+    if damage == "older_phase_trial":
+        run_experiment(original.model_copy(update={"phases": original.phases[:1]}))
     new_workdir = tmp_path / "new"
     Path(original.workdir).rename(new_workdir)
     moved = original.model_copy(update={"workdir": str(new_workdir)})
-    if damage == "removed_phase_trial":
+    if damage in {"removed_phase_trial", "older_phase_trial"}:
         moved = moved.model_copy(update={"phases": moved.phases[:1]})
     if damage == "trainer_input":
         next(_experiment_dir(moved).glob("p/trial_*/overrides_resolved.json")).unlink()
@@ -1196,6 +1201,7 @@ def test_auto_storage_rebind_retains_refusals(tmp_path: Path, damage: str) -> No
         "running": "RUNNING",
         "foreign_ledger": "another storage",
         "removed_phase_trial": "q",
+        "older_phase_trial": "q",
     }[damage]
     assert expected in str(result.exception), result.exception
     assert _artifact_root_binding_path(moved).read_bytes() == binding

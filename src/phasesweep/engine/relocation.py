@@ -32,6 +32,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.evidence import _validate_selection_evidence
 from phasesweep.engine.optuna import (
+    _existing_phase_study_names,
     _load_existing_phase_study,
     _published_phase_trial_refs,
 )
@@ -130,6 +131,14 @@ def _artifact_root_rebind_entries(
             if isinstance(item, Mapping) and isinstance(item.get("name"), str)
         )
         names.extend(_published_phase_trial_refs(summary))
+    try:
+        names.extend(_existing_phase_study_names(experiment))
+    except StudyStorageUnavailableError as exc:
+        raise ArtifactRootRebindError(
+            f"Cannot list the persistent phase studies of experiment "
+            f"{experiment.experiment!r}. Refusing to rebind while any study's artifact root "
+            "or trial evidence may be omitted. Nothing was written."
+        ) from exc
     for phase_name in dict.fromkeys(names):
         try:
             study = _load_existing_phase_study(experiment, phase_name)
