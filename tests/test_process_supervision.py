@@ -256,21 +256,29 @@ def test_run_supervised_terminates_child_when_identity_write_fails(
             os.kill(result.pid, 0)
 
 
+@pytest.mark.parametrize("shutdown", [False, True], ids=["spawn-error", "shutdown"])
 def test_pre_spawn_failure_records_confirmed_terminal_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    shutdown: bool,
 ) -> None:
-    """A failed spawn cannot strand a childless attempt in ``launching``."""
+    """A failed or interrupted spawn cannot strand a childless attempt."""
     import phasesweep.runtime.process as process
 
     def fail_before_spawn(**_kwargs: object) -> None:
+        if shutdown:
+            raise PhaseSweepShutdown(
+                signal.SIGTERM,
+                process.ShutdownCleanupReport(signal.SIGTERM, True, ()),
+            )
         raise OSError("injected pre-spawn failure")
 
     monkeypatch.setattr(process, "_spawn_blocked_supervisor", fail_before_spawn)
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
 
-    with pytest.raises(OSError, match="injected pre-spawn failure"):
+    expected = PhaseSweepShutdown if shutdown else OSError
+    with pytest.raises(expected, match=None if shutdown else "injected pre-spawn failure"):
         _run_supervised(
             trial_dir,
             "true",
@@ -286,6 +294,58 @@ def test_pre_spawn_failure_records_confirmed_terminal_lifecycle(
     assert lifecycle.state == "exited"
     assert lifecycle.return_code is None
     assert lifecycle.cleanup_confirmed is True
+    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+
+
+def test_pre_spawn_failure_requires_terminal_lifecycle_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A childless attempt cannot hide loss of its only terminal evidence."""
+    import phasesweep.runtime.process as process
+
+    real_write = process.write_attempt_lifecycle
+
+    def fail_terminal_write(
+        trial_dir: Path,
+        *,
+        attempt_id: str,
+        state: str,
+        return_code: int | None = None,
+        cleanup_confirmed: bool | None = None,
+    ) -> None:
+        if state == "exited":
+            raise OSError("injected terminal lifecycle write failure")
+        real_write(
+            trial_dir,
+            attempt_id=attempt_id,
+            state=state,
+            return_code=return_code,
+            cleanup_confirmed=cleanup_confirmed,
+        )
+
+    def fail_before_spawn(**_kwargs: object) -> None:
+        raise OSError("injected pre-spawn failure")
+
+    monkeypatch.setattr(process, "write_attempt_lifecycle", fail_terminal_write)
+    monkeypatch.setattr(process, "_spawn_blocked_supervisor", fail_before_spawn)
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    with pytest.raises(OSError, match="terminal lifecycle write failure"):
+        _run_supervised(
+            trial_dir,
+            "true",
+            timeout=None,
+            attempt_id="pre-spawn-terminal-write-failure",
+        )
+
+    lifecycle = read_attempt_lifecycle(
+        trial_dir,
+        expected_attempt_id="pre-spawn-terminal-write-failure",
+    )
+    assert lifecycle is not None
+    assert lifecycle.state == "launching"
     assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
 
 

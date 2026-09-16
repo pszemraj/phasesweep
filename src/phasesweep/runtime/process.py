@@ -1088,16 +1088,14 @@ def _record_attempt_exited(
 ) -> None:
     """Best-effort durable transition to the ``exited`` lifecycle state.
 
-    Called after the supervised group is confirmed gone or a spawn fails before
-    creating any child. A write failure must not replace the primary trial
-    outcome; when a child existed, its retained identity still lets recovery
-    verify the process the slow way.
+    Called after the supervised group is confirmed gone. A write failure must
+    not replace the primary trial outcome because the retained process identity
+    still lets recovery verify the process the slow way.
 
     Args:
         trial_dir: Per-trial directory holding the lifecycle record.
         attempt_id: Immutable attempt identity binding the record.
-        return_code: Root process return code observed by the supervisor wait,
-            or ``None`` when no child was created.
+        return_code: Root process return code observed by the supervisor wait.
 
     """
     try:
@@ -1502,18 +1500,25 @@ def run_supervised(
             failure_reason=f"timeout after {timeout}s before trainer launch",
             cleanup_confirmed=cleanup_confirmed,
         )
-    except Exception as exc:
+    except BaseException as exc:
         if ack_write is not None:
             os.close(ack_write)
         if status_read is not None:
             os.close(status_read)
             status_read = None
         if proc is None:
-            _record_attempt_exited(
+            # No child identity exists to support the best-effort fallback used
+            # after a spawned group exits. This transition is the sole durable
+            # proof that recovery may settle the childless attempt.
+            write_attempt_lifecycle(
                 trial_dir,
                 attempt_id=attempt_id,
+                state="exited",
                 return_code=None,
+                cleanup_confirmed=True,
             )
+            raise
+        if not isinstance(exc, Exception):
             raise
         target_pgid = pgid if pgid is not None else proc.pid
         # Covers both a failed identity write and a failed payload delivery;
