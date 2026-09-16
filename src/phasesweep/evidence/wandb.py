@@ -15,6 +15,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
 
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+
 
 @dataclass(frozen=True)
 class WandbPollTimeout(TimeoutError):
@@ -40,8 +42,9 @@ class WandbSetupError(RuntimeError):
     A non-transport failure to construct the first client is classified this
     way because bad credentials or broken settings will not improve by retrying.
     W&B verifies credentials over the network during construction, so connection
-    and timeout failures — including ones wrapped by ``AuthenticationError`` —
-    remain polling errors and are retried within the existing deadline.
+    failures, rate limits, and transient server errors — including ones wrapped
+    by ``AuthenticationError`` — remain polling errors and are retried within
+    the existing deadline.
     HTTP 401 and 403 run-lookup failures are also setup errors.
     """
 
@@ -49,23 +52,26 @@ class WandbSetupError(RuntimeError):
     cause: str
 
 
-def _is_transient_transport_error(exc: Exception) -> bool:
-    """Return whether the active exception chain contains a transport failure.
+def _is_retryable_setup_error(exc: Exception) -> bool:
+    """Return whether the active exception chain contains a retryable failure.
 
     Follow explicit causes and unsuppressed implicit contexts. W&B suppresses
     a sidecar timeout when it raises ``WandbApiFailedError``, so recognize its
     no-response and timeout status markers directly.
 
     :param Exception exc: W&B client-construction failure to classify.
-    :return bool: Whether the failure is a connection or timeout error.
+    :return bool: Whether the failure should consume the bounded polling budget.
     """
     try:
         from requests.exceptions import ConnectionError as RequestsConnectionError
+        from requests.exceptions import HTTPError as RequestsHTTPError
         from requests.exceptions import Timeout as RequestsTimeout
     except ImportError:  # pragma: no cover - installed W&B depends on requests
         request_errors: tuple[type[BaseException], ...] = ()
+        request_http_errors: tuple[type[BaseException], ...] = ()
     else:
         request_errors = (RequestsConnectionError, RequestsTimeout)
+        request_http_errors = (RequestsHTTPError,)
 
     try:
         from wandb.errors import CommError
@@ -96,7 +102,12 @@ def _is_transient_transport_error(exc: Exception) -> bool:
             # Missing/zero status can also mean a core initialization failure.
             # The SDK does not distinguish it from a lost response here, so
             # ambiguous sidecar errors consume the bounded polling budget.
-            if status in (None, 0, 408, 504):
+            if status in (None, 0) or status in _RETRYABLE_HTTP_STATUSES:
+                return True
+        elif isinstance(current, request_http_errors):
+            response = cast(Any, current).response
+            status = response.status_code if response is not None else None
+            if status in _RETRYABLE_HTTP_STATUSES:
                 return True
         if current.__cause__ is not None:
             current = current.__cause__
@@ -189,8 +200,8 @@ def poll_wandb_summary(
         default to the current process environment.
     :raises WandbSetupError: If the first API client fails for a non-transport
         reason such as bad credentials or settings, or a run lookup reports HTTP
-        401 or 403. Connection and timeout failures are retried within the polling
-        budget.
+        401 or 403. Connection failures, timeouts, rate limits, and transient
+        server errors are retried within the polling budget.
     :raises WandbRunTerminalError: If the run crashes, fails, is killed, or is preempted.
     :raises WandbPollTimeout: If the run summary is not ready before timeout.
     :raises UnsafeProcessCleanupError: If the worker's cleanup is uncertain.
@@ -341,7 +352,7 @@ def _poll_wandb_summary(
                 timeout=max(1, ceil(remaining)),
             )
         except Exception as exc:  # noqa: BLE001 - classified into the typed error model
-            if not api_constructed and not _is_transient_transport_error(exc):
+            if not api_constructed and not _is_retryable_setup_error(exc):
                 raise WandbSetupError(run_id, str(exc)) from exc
             last_err = exc
             # The parent may terminate this worker before ``main`` serializes ``last_err``.

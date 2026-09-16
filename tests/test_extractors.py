@@ -1338,6 +1338,69 @@ def test_wandb_first_constructor_retries_severed_sidecar_timeout(monkeypatch, tm
     assert constructions["count"] == 2
 
 
+@pytest.mark.parametrize(
+    ("status", "retryable"),
+    [
+        (401, False),
+        (403, False),
+        (408, True),
+        (429, True),
+        (500, True),
+        (502, True),
+        (503, True),
+        (504, True),
+    ],
+)
+@pytest.mark.parametrize("wrapper", ["service", "requests"])
+def test_wandb_first_constructor_classifies_actual_http_status(
+    monkeypatch, status, retryable, wrapper
+):
+    """Initial credential verification retries only transient HTTP failures."""
+    public_api = pytest.importorskip("wandb.apis.public")
+    authentication_error = pytest.importorskip("wandb.errors").AuthenticationError
+    if wrapper == "service":
+        service = pytest.importorskip("wandb.sdk.lib.service.service_connection")
+        api_proto = pytest.importorskip("wandb.proto.wandb_api_pb2")
+        cause = service.WandbApiFailedError(
+            f"HTTP {status}", api_proto.ApiErrorResponse(http_status=status)
+        )
+    else:
+        requests = pytest.importorskip("requests")
+        response = requests.Response()
+        response.status_code = status
+        cause = requests.exceptions.HTTPError(f"HTTP {status}", response=response)
+    constructions = {"count": 0}
+
+    class Api:
+        def __init__(self, **kwargs):
+            constructions["count"] += 1
+            if constructions["count"] == 1:
+                raise authentication_error("could not verify API key") from cause
+
+        def run(self, path):
+            return _FakeRun(state="finished", summary={"eval/loss": 0.123})
+
+    monkeypatch.setattr(public_api, "Api", Api)
+
+    def poll():
+        return _poll_wandb_summary(
+            base_url="https://example.test",
+            entity="me",
+            project="proj",
+            run_id="attempt",
+            poll_seconds=0.01,
+            timeout_seconds=1.0,
+        )
+
+    if retryable:
+        assert poll() == {"eval/loss": 0.123}
+        assert constructions["count"] == 2
+    else:
+        with pytest.raises(WandbSetupError, match="could not verify API key"):
+            poll()
+        assert constructions["count"] == 1
+
+
 @pytest.mark.parametrize("status", [401, 403])
 @pytest.mark.parametrize("wrapper", ["service", "requests"])
 def test_wandb_lookup_fails_fast_for_actual_wrapped_authorization_status(
