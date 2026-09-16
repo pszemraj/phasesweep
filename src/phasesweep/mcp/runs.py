@@ -699,7 +699,9 @@ class RunStore:
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
         lease_path = self.launch_lease_path(run_id)
-        if lease_path.is_file() and not lease_path.is_symlink():
+        if lease_path.exists() or lease_path.is_symlink():
+            if not lease_path.is_file() or lease_path.is_symlink():
+                return False
             lease = self._claim_abandoned_launch_lease(run_id)
             if lease is None:
                 return False

@@ -287,6 +287,39 @@ def test_free_launch_lease_cannot_override_missing_handle_with_runner_log(
     assert store.log_path(handle.run_id).is_file()
 
 
+@pytest.mark.parametrize(
+    "lease_kind",
+    ["directory", "fifo", "live_symlink", "dangling_symlink"],
+)
+def test_malformed_launch_lease_cannot_enable_legacy_orphan_recovery(
+    tmp_path: Path,
+    lease_kind: str,
+) -> None:
+    """A malformed lease entry cannot authorize deletion of a config snapshot."""
+    store = RunStore(tmp_path / "state")
+    run_id = f"exp-{lease_kind.replace('_', '-')}"
+    snapshot = store.config_snapshot_path(run_id)
+    snapshot.write_text("experiment: exp\n")
+    lease = store.launch_lease_path(run_id)
+    if lease_kind == "directory":
+        lease.mkdir()
+    elif lease_kind == "fifo":
+        os.mkfifo(lease)
+    elif lease_kind == "live_symlink":
+        target = lease.with_name("lease-target")
+        target.write_text("")
+        lease.symlink_to(target.name)
+    else:
+        lease.symlink_to("missing-lease-target")
+
+    assert not store.is_pre_spawn_orphan(run_id)
+    with pytest.raises(ValueError, match="not a provably abandoned preparation"):
+        store.clear_pre_spawn_orphan(run_id)
+
+    assert snapshot.is_file()
+    assert lease.exists() or lease.is_symlink()
+
+
 def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     pending = make_run_handle(run_id="exp-1", launch_state="launching")
