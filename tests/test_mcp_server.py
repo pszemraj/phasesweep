@@ -2544,6 +2544,56 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
         assert payload["reason"] == "terminal"
 
 
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+def test_run_scoped_live_read_uses_snapshot_completed_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
+) -> None:
+    """A live storage read cannot outlive the frozen result that replaced it."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
+    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    original_live = app._live_status_payload
+    finalized = False
+
+    def finish_during_live_read(
+        experiment_id: str, experiment: Experiment, saved: RunHandle | None
+    ) -> dict[str, Any]:
+        nonlocal finalized
+        status = original_live(experiment_id, experiment, saved)
+        if not finalized:
+            finalized = True
+            write_run_status(store, **complete)
+        return status
+
+    monkeypatch.setattr(app, "_live_status_payload", finish_during_live_read)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = (
+        app.winners(run_id=run_id)
+        if read_tool == "winners"
+        else (
+            asyncio.run(app.await_run(run_id, timeout_seconds=0))
+            if read_tool == "await_run"
+            else app.status(run_id=run_id)
+        )
+    )
+
+    assert finalized
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["represented_generation_id"] == run_id
+    if read_tool == "winners":
+        assert payload["winner_count"] == 1
+    else:
+        assert payload["run"]["state"] == "succeeded"
+        if read_tool == "await_run":
+            assert payload["reason"] == "terminal"
+
+
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])
 def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str

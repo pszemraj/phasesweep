@@ -1218,6 +1218,17 @@ class PhaseSweepMCP:
         else:
             assert experiment is not None
             status = self._live_status_payload(target_id, experiment, handle)
+            if handle is not None:
+                # A runner can finish freezing its results during the live
+                # storage read. Discard that view once its snapshot is durable.
+                completed, completed_source = self._result_snapshot_view(experiment, handle, None)
+                if completed is not None:
+                    status = self._snapshot_status_payload(
+                        target_id, completed, result_source=completed_source
+                    )
+                    result_source = completed_source
+                    if run is not None:
+                        run = self._run_payload(handle)
         return target_id, status, run, handle, result_source
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
@@ -1484,6 +1495,21 @@ class PhaseSweepMCP:
             )
             if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
                 winner_views = []
+            if handle is not None:
+                # The live read may span the runner's final snapshot write.
+                # Results for that run now come from its frozen publication.
+                completed, completed_source = self._result_snapshot_view(experiment, handle, None)
+                if completed is not None:
+                    status = self._snapshot_status_payload(
+                        target_id, completed, result_source=completed_source
+                    )
+                    winner_views = (
+                        []
+                        if status["publication_integrity"]
+                        in {"failed", "permission_denied", "unknown"}
+                        else completed.winner_views()
+                    )
+                    result_source = completed_source
         represented_generation_id: str | None = status["represented_generation_id"]
         publication_integrity: McpPublicationState = status["publication_integrity"]
         authority_handle = handle
