@@ -55,6 +55,11 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
         run or the publication transaction raised, re-raised after that suite
         generation is durably recorded as ``failed`` (or ``publication_failed``).
     """
+    # Match run_experiment's public boundary: model_copy(update=...) does not
+    # validate, so rebuild a programmatically supplied suite before any writes.
+    suite = Suite.model_validate(
+        suite.model_dump(mode="python", round_trip=True, warnings=False, exclude_unset=True)
+    )
     results: dict[str, dict[str, Winner]] = {}
     promotion_decisions: dict[str, dict[str, Any]] = {}
     if dry_run:
