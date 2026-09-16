@@ -1428,6 +1428,12 @@ class RunStore:
             and payload.get("cleanup_confirmed") is True
         ):
             return None
+        reaped_attempt_ids = payload.get("reaped_attempt_ids")
+        if reaped_attempt_ids is not None and (
+            not isinstance(reaped_attempt_ids, list)
+            or any(not isinstance(value, str) or not value for value in reaped_attempt_ids)
+        ):
+            return None
         locations = payload.get("reaped_attempt_locations")
         if locations is not None and (
             not isinstance(locations, dict)

@@ -1305,6 +1305,44 @@ def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> Non
     assert store.state(handle) == "running"
 
 
+@pytest.mark.parametrize("reaped_attempt_ids", ["not-a-list", [""], [1], {}])
+def test_cleanup_recovery_rejects_malformed_reaped_attempt_ids(
+    tmp_path: Path,
+    reaped_attempt_ids: object,
+) -> None:
+    """Malformed recovery details cannot release a cleanup reservation."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(
+        run_id="exp-1",
+        config_sha256="a" * 64,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+    private_atomic_write_text(
+        store.cleanup_recovery_path(handle.run_id),
+        json.dumps(
+            {
+                "run_id": handle.run_id,
+                "config_sha256": handle.config_sha256,
+                "cleanup_confirmed": True,
+                "reaped_attempt_ids": reaped_attempt_ids,
+            }
+        ),
+    )
+
+    assert not store._cleanup_recovered(handle)
+    assert store.state(handle) == "running"
+    assert store.recovery_required(handle)
+
+
 def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
     tmp_path: Path,
 ) -> None:
