@@ -1041,12 +1041,15 @@ class PhaseSweepMCP:
         handle: RunHandle,
         *,
         state: RunState | None = None,
+        force_snapshot_unavailable: bool = False,
     ) -> dict[str, Any] | None:
         """Return a validated safe terminal failure, never the raw exception text.
 
         :param RunHandle handle: Run handle whose recorded terminal status
             should be inspected.
         :param RunState | None state: Already-derived run state, when available.
+        :param bool force_snapshot_unavailable: The result response has already
+            refused a non-finalized or missing snapshot even if run state stays live.
         :return dict[str, Any] | None: The run's ``failure`` payload validated
             against :class:`FailurePayload` and dumped to JSON-safe types. A
             terminal run with no usable result snapshot receives a generated
@@ -1063,9 +1066,10 @@ class PhaseSweepMCP:
                 )
         except ValidationError:
             pass
-        if (
-            state if state is not None else self._runs.state(handle)
-        ) != "running" and parse_result_snapshot(terminal) is None:
+        if force_snapshot_unavailable or (
+            (state if state is not None else self._runs.state(handle)) != "running"
+            and parse_result_snapshot(terminal) is None
+        ):
             failure: dict[str, Any] = {
                 "code": "result_snapshot_unavailable",
                 "stage": "cleanup",
@@ -1564,7 +1568,14 @@ class PhaseSweepMCP:
             result_context=status["result_context"],
             published_config_matches_current=status["published_config_matches_current"],
         )
-        result["failure"] = self._run_failure_payload(handle) if handle is not None else None
+        result["failure"] = (
+            self._run_failure_payload(
+                handle,
+                force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
+            )
+            if handle is not None
+            else None
+        )
         return result
 
     def _effective_visible_params(

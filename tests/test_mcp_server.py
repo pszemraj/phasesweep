@@ -2679,6 +2679,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
             assert payload["publication_integrity"] == "unknown"
             assert payload["winner_count"] == 0
             assert payload["represented_generation_id"] is None
+            assert payload["failure"]["code"] == "result_snapshot_unavailable"
         else:
             assert payload["run"]["recovery_required"] is True
         assert store.recovery_required(handle)
