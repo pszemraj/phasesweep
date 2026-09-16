@@ -12,6 +12,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -2248,6 +2249,81 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
         for identity_file in phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"):
             with _contextlib.suppress(Exception):
                 os.killpg(json.loads(identity_file.read_text())["pgid"], signal.SIGKILL)
+
+
+def test_uncertain_cleanup_cancels_queued_host_gpu_lease_wait(tmp_path: Path) -> None:
+    """A guardian-held GPU flock cannot strand a queued parallel objective."""
+    script = textwrap.dedent(
+        f"""
+        import os
+        import time
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        import phasesweep.engine.phase as phase_module
+        from phasesweep import run_experiment
+        from phasesweep.engine.trial import UnsafeProcessCleanupError
+        from phasesweep.runtime.gpu import GpuDevice, GpuPool
+        from phasesweep.runtime.process import ProcessResult
+        from tests.conftest import make_experiment
+
+        root = Path({str(tmp_path)!r})
+        lock_dir = root / "locks"
+        lock_dir.mkdir(mode=0o700)
+        lock_dir.chmod(0o700)
+        os.environ["PHASESWEEP_LOCK_DIR"] = str(lock_dir)
+        held_fds = []
+        phase_module.GpuPool = SimpleNamespace(
+            create=lambda **kwargs: GpuPool([GpuDevice("0", "GPU-test")])
+        )
+
+        def fake_launch_trial(**kwargs):
+            held_fds.append(os.dup(kwargs["gpu_lease_fds"][0]))
+            time.sleep(0.5)
+            return SimpleNamespace(
+                process=ProcessResult(
+                    return_code=-9,
+                    timed_out=True,
+                    pid=12345,
+                    duration_seconds=0.5,
+                    failure_reason="injected cleanup uncertainty",
+                    cleanup_confirmed=False,
+                )
+            )
+
+        phase_module.launch_trial = fake_launch_trial
+        experiment = make_experiment(
+            workdir=root / "runs",
+            n_trials=2,
+            n_jobs=2,
+            gpu_ids=[0],
+            timeout_seconds_per_trial=1.0,
+            max_consecutive_failures=100,
+            trial_command="echo {{overrides}}",
+        )
+        try:
+            try:
+                run_experiment(experiment)
+            except UnsafeProcessCleanupError:
+                print(f"unsafe:{{len(held_fds)}}", flush=True)
+            else:
+                raise AssertionError("unsafe cleanup unexpectedly succeeded")
+        finally:
+            for fd in held_fds:
+                os.close(fd)
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "unsafe:1"
 
 
 def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(

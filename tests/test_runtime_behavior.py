@@ -2331,6 +2331,9 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
         def __init__(self) -> None:
             self.calls = 0
 
+        def cancel_waiters(self) -> None:
+            pass
+
         @contextlib.contextmanager
         def acquire(self, *, deadline: float | None = None):
             self.calls += 1

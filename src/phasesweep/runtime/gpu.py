@@ -49,6 +49,10 @@ class GpuLeaseTimeoutError(TimeoutError):
     """Raised only when a GPU lease wait exhausts its wallclock deadline."""
 
 
+class GpuLeaseCancelledError(RuntimeError):
+    """Raised when the owning phase cancels queued GPU lease waits."""
+
+
 @dataclass(frozen=True)
 class GpuDevice:
     """A CUDA_VISIBLE_DEVICES token with a host-lock-safe file stem.
@@ -510,6 +514,7 @@ class GpuPool:
         self._whole_node_in_use = False
         self._available: list[GpuDevice] = []
         self._condition = threading.Condition()
+        self._cancelled = threading.Event()
         self._pinned_visible_devices = pinned_visible_devices
 
         if devices:
@@ -707,12 +712,32 @@ class GpuPool:
         :raises GpuLeaseTimeoutError: The deadline has already passed, so
             waiting further would overrun the phase/run wallclock budget.
         """
+        if self._cancelled.is_set():
+            raise GpuLeaseCancelledError("GPU lease wait cancelled by phase abort.")
         if deadline is None:
             return None
         remaining = deadline - time.monotonic()
         if remaining <= 0.0:
             raise GpuLeaseTimeoutError("Wallclock deadline reached while waiting for a GPU lease.")
         return remaining
+
+    def _wait_for_retry(self, deadline: float | None) -> None:
+        """Wait briefly before retrying a host lock, interruptible by abort.
+
+        :param float | None deadline: Optional wallclock deadline for the lease wait.
+        :raises GpuLeaseTimeoutError: The wallclock deadline expires.
+        :raises GpuLeaseCancelledError: The owning phase cancels queued waits.
+        """
+        remaining_seconds = self._remaining_seconds(deadline)
+        retry_seconds = 0.2 if remaining_seconds is None else min(0.2, remaining_seconds)
+        if self._cancelled.wait(timeout=retry_seconds):
+            raise GpuLeaseCancelledError("GPU lease wait cancelled by phase abort.")
+
+    def cancel_waiters(self) -> None:
+        """Cancel current and future lease waits and wake local-slot waiters."""
+        self._cancelled.set()
+        with self._condition:
+            self._condition.notify_all()
 
     def _acquire_single(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
         """Block until a local slot and host-wide GPU lease are available.
@@ -764,8 +789,7 @@ class GpuPool:
                     self._condition.notify_all()
             if acquired is not None:
                 return acquired
-            remaining_seconds = self._remaining_seconds(deadline)
-            time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
+            self._wait_for_retry(deadline)
 
     def _acquire_whole_node(self, *, deadline: float | None = None) -> _GpuAcquisition | None:
         """Acquire every configured device token as one assignment.
@@ -808,8 +832,7 @@ class GpuPool:
                 with self._condition:
                     self._whole_node_in_use = False
                     self._condition.notify_all()
-                remaining_seconds = self._remaining_seconds(deadline)
-                time.sleep(0.2 if remaining_seconds is None else min(0.2, remaining_seconds))
+                self._wait_for_retry(deadline)
                 continue
 
             visible_devices = ",".join(device.visible_token for device in self._devices)
@@ -868,6 +891,7 @@ class GpuPool:
 
         Raises:
             GpuLeaseTimeoutError: ``deadline`` expired before a GPU could be leased.
+            GpuLeaseCancelledError: The owning phase cancelled queued lease waits.
 
         """
         acquired = self._acquire(deadline=deadline)

@@ -83,7 +83,7 @@ from phasesweep.engine.trial import (
     prepare_trainer_input,
 )
 from phasesweep.runtime.commands import render_command
-from phasesweep.runtime.gpu import GpuLeaseTimeoutError, GpuPool
+from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.process import PhaseSweepShutdown, write_attempt_lifecycle
 
 log = logging.getLogger("phasesweep.engine.phase")
@@ -595,6 +595,7 @@ def _run_phase(
                 error,
             )
         abort["flag"] = True
+        gpu_pool.cancel_waiters()
         with contextlib.suppress(Exception):
             study.stop()
 
@@ -711,6 +712,7 @@ def _run_phase(
                 if not threshold_tripped and not fatal_tripped:
                     return
                 abort["flag"] = True
+                gpu_pool.cancel_waiters()
                 if abort_recorded["flag"]:
                     return
                 if fatal_tripped:
@@ -942,6 +944,8 @@ def _run_phase(
         except GpuLeaseTimeoutError as exc:
             _stop_for_deadline()
             raise _DeadlineTrialExecutionError(str(exc)) from exc
+        except GpuLeaseCancelledError as exc:
+            raise optuna.TrialPruned("phase aborted") from exc
 
         # Extraction happens outside GPU lease but INSIDE the phase/run
         # wallclock budget: the configured timeouts bound the whole trial,
