@@ -593,6 +593,24 @@ def _merge_override_outcomes(
     )
 
 
+def _consume_outcome_expansions(phase_name: str, count: int, remaining_expansions: int) -> int:
+    """Charge parent combinations or baseline fallbacks before their allocation.
+
+    :param str phase_name: Phase named in complexity errors.
+    :param int count: Candidate outcomes about to be expanded.
+    :param int remaining_expansions: Unspent experiment-wide candidate budget.
+    :raises ValueError: The expansion would exceed the validation budget.
+    :return int: Remaining candidate budget.
+    """
+    if count > remaining_expansions:
+        raise ValueError(
+            f"Phase {phase_name!r} exceeds supported validation complexity: "
+            "at most 4,096 candidate outcome expansions per experiment. "
+            "Reduce conditional promotion branching or parent combinations."
+        )
+    return remaining_expansions - count
+
+
 def _compatible_parent_outcome_combinations(
     parents: list[str],
     outcomes_by_phase: Mapping[str, tuple[_ConcreteOverrideOutcome, ...]],
@@ -615,13 +633,9 @@ def _compatible_parent_outcome_combinations(
         # Charge every candidate before allocating the next layer, including
         # combinations that will be rejected for incompatible decisions.
         candidates = len(combinations) * len(outcomes_by_phase[parent])
-        if candidates > remaining_expansions:
-            raise ValueError(
-                f"Phase {phase_name!r} exceeds supported validation complexity: "
-                "at most 4,096 candidate outcome expansions per experiment. "
-                "Reduce conditional promotion branching or parent combinations."
-            )
-        remaining_expansions -= candidates
+        remaining_expansions = _consume_outcome_expansions(
+            phase_name, candidates, remaining_expansions
+        )
         next_combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = []
         for combination in combinations:
             for outcome in outcomes_by_phase[parent]:
@@ -1032,6 +1046,11 @@ class Experiment(_Frozen):
             # sampling.
             if phase.promotion is not None and phase.promotion.on_fail == "continue_baseline":
                 baseline_outcomes = concrete_outcomes_by_phase[phase.promotion.min_delta_vs]
+                # The baseline need not be an inherited parent. Copying its
+                # outcomes is another expansion, even for a parentless phase.
+                remaining_expansions = _consume_outcome_expansions(
+                    phase.name, len(baseline_outcomes), remaining_expansions
+                )
                 candidate_outcomes = [
                     _ConcreteOverrideOutcome(
                         keys=outcome.keys,

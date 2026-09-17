@@ -53,17 +53,17 @@ def _branching_phases(width: int) -> list[Phase]:
 def test_promotion_validation_has_an_experiment_wide_work_bound(monkeypatch) -> None:
     import phasesweep.config.models as models
 
-    original = models._compatible_parent_outcome_combinations
+    original = models._consume_outcome_expansions
     spent = 0
 
-    def counted(parents, outcomes_by_phase, **kwargs):
+    def counted(phase_name, count, remaining_expansions):
         nonlocal spent
-        combinations, remaining = original(parents, outcomes_by_phase, **kwargs)
-        spent += kwargs["remaining_expansions"] - remaining
+        remaining = original(phase_name, count, remaining_expansions)
+        spent += count
         assert spent <= 4096
-        return combinations, remaining
+        return remaining
 
-    monkeypatch.setattr(models, "_compatible_parent_outcome_combinations", counted)
+    monkeypatch.setattr(models, "_consume_outcome_expansions", counted)
     make_experiment(phases=_branching_phases(3))
     spent = 0
     with pytest.raises(
@@ -76,14 +76,36 @@ def test_promotion_validation_has_an_experiment_wide_work_bound(monkeypatch) -> 
     spent = 0
     phases = _branching_phases(10)
     parents = phases[-1].inherits
-    phases.extend(
-        [
-            Phase(name="join2", n_trials=1, inherits=parents),
-            Phase(name="join3", n_trials=1, inherits=parents),
-        ]
-    )
-    with pytest.raises(ValidationError, match="Phase 'join3'.*supported validation complexity"):
+    phases.append(Phase(name="join2", n_trials=1, inherits=parents))
+    with pytest.raises(ValidationError, match="Phase 'join2'.*supported validation complexity"):
         make_experiment(phases=phases)
+
+    # Baseline-only promotions can copy the join's large outcome set without
+    # any parent combinations of their own. They must spend the same budget.
+    spent = 0
+    phases = _branching_phases(10)
+    phases.extend(
+        Phase(
+            name=f"fallback{i}",
+            n_trials=1,
+            promotion={"min_delta_vs": "join", "on_fail": "continue_baseline"},
+        )
+        for i in (1, 2)
+    )
+    original_outcome = models._ConcreteOverrideOutcome
+    fallback_allocations = {"fallback1": 0, "fallback2": 0}
+
+    def track_fallback_allocation(**kwargs):
+        for name, branch in kwargs.get("decisions", ()):
+            if name in fallback_allocations and branch == "fallback":
+                fallback_allocations[name] += 1
+        return original_outcome(**kwargs)
+
+    monkeypatch.setattr(models, "_ConcreteOverrideOutcome", track_fallback_allocation)
+    with pytest.raises(ValidationError, match="Phase 'fallback2'.*supported validation complexity"):
+        make_experiment(phases=phases)
+    assert spent == 3080  # 10 base fallbacks + 2,046 parent candidates + 1,024 fallbacks.
+    assert fallback_allocations == {"fallback1": 1024, "fallback2": 0}
 
 
 def test_promotion_validation_charges_rejected_combinations(monkeypatch) -> None:
