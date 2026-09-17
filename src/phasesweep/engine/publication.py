@@ -336,6 +336,11 @@ def _has_generation_layout(config: Experiment | Suite) -> bool:
     """
 
     def entry_present(path: Path) -> bool:
+        """Return whether a generation-layout entry exists or is uninspectable.
+
+        :param Path path: Generation-layout path to inspect.
+        :return bool: Whether the entry exists or cannot be inspected.
+        """
         try:
             path.lstat()
         except FileNotFoundError:
