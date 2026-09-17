@@ -2644,6 +2644,52 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
         assert payload["reason"] == "terminal"
 
 
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
+) -> None:
+    """A runner's final write during its exit probe remains readable."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
+    store.config_snapshot_path(run_id).unlink()
+    finalized = False
+
+    def finish_before_reporting_exit(_handle: RunHandle) -> bool:
+        nonlocal finalized
+        assert not finalized
+        finalized = True
+        write_run_status(store, **complete)
+        return False
+
+    monkeypatch.setattr(store, "_runner_is_live", finish_before_reporting_exit)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = (
+        app.winners(run_id=run_id)
+        if read_tool == "winners"
+        else (
+            asyncio.run(app.await_run(run_id, timeout_seconds=0))
+            if read_tool == "await_run"
+            else app.status(run_id=run_id)
+        )
+    )
+
+    assert finalized
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["represented_generation_id"] == run_id
+    if read_tool == "winners":
+        assert payload["winner_count"] == 1
+    else:
+        assert payload["run"]["state"] == "succeeded"
+        if read_tool == "await_run":
+            assert payload["reason"] == "terminal"
+
+
 @pytest.mark.parametrize(
     ("read_tool", "transition"),
     [

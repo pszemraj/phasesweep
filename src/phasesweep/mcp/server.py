@@ -1676,7 +1676,13 @@ class PhaseSweepMCP:
         if terminal_status.get("result_snapshot_state") == "pending":
             if self._runs._runner_is_live(handle):
                 return None
-            raise RunResultSnapshotUnavailableError(handle.run_id, "pending")
+            # The runner can publish the complete snapshot and exit between
+            # the status read and its liveness probe. Re-read before treating
+            # the pending state as orphaned.
+            latest_status = self._runs.recorded_terminal_status(handle)
+            if latest_status is None or latest_status.get("result_snapshot_state") == "pending":
+                raise RunResultSnapshotUnavailableError(handle.run_id, "pending")
+            terminal_status = latest_status
         snapshot = parse_result_snapshot(terminal_status)
         if snapshot is not None:
             return snapshot
