@@ -294,12 +294,10 @@ def run_experiment(
             no persisted ``winner.yaml``.
 
     """
-    # Pydantic's model_copy(update=...) deliberately skips validation. Rebuild
-    # the public API input once before inspecting it or writing state so a
-    # programmatically copied config obeys the same contract as loaded YAML.
-    experiment = Experiment.model_validate(
-        experiment.model_dump(mode="python", round_trip=True, warnings=False, exclude_unset=True)
-    )
+    # Pydantic's model_copy(update=...) deliberately skips validation. Revalidate
+    # the instance directly so mutable default collections and field-set state
+    # survive while copied unknown or invalid values are still rejected.
+    experiment = Experiment.model_validate(experiment)
     if from_phase is not None and from_phase not in {phase.name for phase in experiment.phases}:
         raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
     if dry_run:

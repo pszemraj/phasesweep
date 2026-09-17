@@ -33,7 +33,12 @@ class _Frozen(BaseModel):
     # Config values can contain storage credentials and environment secrets.
     # Pydantic normally repeats the rejected input in ValidationError text,
     # which would leak those values through CLI diagnostics.
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
 
 
 def _require_finite(label: str, value: float) -> None:
