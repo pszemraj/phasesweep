@@ -6,6 +6,8 @@ import os
 import pwd
 import signal
 import stat
+import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,12 +15,22 @@ from urllib.parse import quote_plus
 
 import pytest
 
-from phasesweep.config import Experiment, FloatParam, IntParam, Phase, Sampler
+from phasesweep.config import (
+    Experiment,
+    FloatParam,
+    IntParam,
+    Phase,
+    Sampler,
+    StudySpec,
+    Suite,
+    SuiteDefaults,
+)
 from phasesweep.engine import run_experiment
 from phasesweep.engine.errors import ExperimentLockBusyError
 from phasesweep.engine.locking import (
     _experiment_lock,
     _run_lock_paths,
+    _suite_lock,
 )
 from phasesweep.errors import LockBusyError, PhaseSweepError
 from phasesweep.runtime import files as runtime_files
@@ -887,7 +899,8 @@ def test_in_memory_run_lock_is_keyed_by_workdir(
         assert set(paths_a).isdisjoint(paths_b)
 
 
-def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
+@pytest.mark.parametrize("owner", ["experiment", "suite"])
+def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path, owner: str) -> None:
     """A symlinked experiment leaf must share the target's output lock.
 
     ``_experiment_dir`` resolves only the workdir prefix before appending the
@@ -905,6 +918,58 @@ def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
     exp_alias = make_experiment(workdir=str(runs)).model_copy(update={"experiment": "alias"})
 
     assert set(_run_lock_paths(exp_real)) == set(_run_lock_paths(exp_alias))
+
+    if owner == "suite":
+        real = Suite(
+            suite="real",
+            defaults=SuiteDefaults(workdir=str(runs)),
+            studies=[StudySpec(name="s", phases=[Phase(name="p", n_trials=1)])],
+        )
+        alias = real.model_copy(update={"suite": "alias"})
+        distinct = real.model_copy(update={"suite": "distinct"})
+        lock = _suite_lock
+    else:
+        real, alias = exp_real, exp_alias
+        distinct = real.model_copy(update={"experiment": "distinct"})
+        lock = _experiment_lock
+    (runs / "distinct").mkdir()
+
+    def contender(config):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import sys
+from phasesweep.config import Experiment, Suite
+from phasesweep.engine.locking import _experiment_lock, _suite_lock
+from phasesweep.engine.errors import ExperimentLockBusyError
+from phasesweep.errors import LockBusyError
+model, lock = (Suite, _suite_lock) if sys.argv[1] == "suite" else (Experiment, _experiment_lock)
+try:
+    with lock(model.model_validate_json(sys.argv[2])):
+        print("acquired")
+except (ExperimentLockBusyError, LockBusyError):
+    print("busy")
+    sys.exit(2)
+""",
+                owner,
+                config.model_dump_json(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    with lock(real):
+        lock_inodes = {path: path.stat().st_ino for path in runtime_files.lock_dir().glob("*.lock")}
+        blocked = contender(alias)
+        assert (blocked.returncode, blocked.stdout.strip()) == (2, "busy"), blocked.stderr
+        control = contender(distinct)
+        assert (control.returncode, control.stdout.strip()) == (0, "acquired"), control.stderr
+    released = contender(alias)
+    assert (released.returncode, released.stdout.strip()) == (0, "acquired"), released.stderr
+    assert all(path.stat().st_ino == inode for path, inode in lock_inodes.items())
 
 
 def test_in_memory_url_spellings_take_no_storage_lock(tmp_path: Path) -> None:

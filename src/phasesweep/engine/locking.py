@@ -190,8 +190,11 @@ def _suite_lock(suite: Suite) -> Iterator[None]:
     :param Suite suite: Parsed suite config whose output directory names the lock.
     :return Iterator[None]: Context manager yielding ``None`` while the suite lock is held.
     """
-    material = {"kind": "suite", "suite_dir": str(_suite_dir(suite))}
-    path = _lock_dir() / f"{suite.suite}__suite__{_lock_digest(material)}.lock"
+    # Resolve the leaf as well as the workdir, just like experiment output
+    # ownership. Both the digest and filename prefix must agree for aliases.
+    directory = _suite_dir(suite).resolve()
+    material = {"kind": "suite", "suite_dir": str(directory)}
+    path = _lock_path_from_material(directory.name, material, "suite")
     with exclusive_lock(
         path,
         busy_message=(
