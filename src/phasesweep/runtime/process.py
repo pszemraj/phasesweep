@@ -1594,13 +1594,16 @@ def run_supervised(
             # No child identity exists to support the best-effort fallback used
             # after a spawned group exits. This transition is the sole durable
             # proof that recovery may settle the childless attempt.
-            write_attempt_lifecycle(
-                trial_dir,
-                attempt_id=attempt_id,
-                state="exited",
-                return_code=None,
-                cleanup_confirmed=True,
-            )
+            try:
+                write_attempt_lifecycle(
+                    trial_dir,
+                    attempt_id=attempt_id,
+                    state="exited",
+                    return_code=None,
+                    cleanup_confirmed=True,
+                )
+            except OSError as write_error:
+                raise write_error from exc
             raise
         if isinstance(exc, PhaseSweepShutdown):
             # The installed handler already made the authoritative cleanup

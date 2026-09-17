@@ -319,6 +319,64 @@ def test_grid_int_rejects_an_upper_bound_off_the_step_lattice() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "search_space",
+    [
+        pytest.param(
+            {"x": IntParam(type="int", low=0, high=4_096)},
+            id="int-range",
+        ),
+        pytest.param(
+            {"x": FloatParam(type="float", low=0.0, high=4_096.0, step=1.0)},
+            id="float-range",
+        ),
+        pytest.param(
+            {
+                "left": CategoricalParam(type="categorical", choices=list(range(65))),
+                "right": CategoricalParam(type="categorical", choices=list(range(64))),
+            },
+            id="product-of-small-dimensions",
+        ),
+    ],
+)
+def test_grid_rejects_oversized_cardinality_before_materializing_values(
+    search_space: dict[str, IntParam | FloatParam | CategoricalParam],
+) -> None:
+    """Grid validation bounds ranges and products before expanding values."""
+    with pytest.raises(ValidationError, match="combinations.*maximum of 4,096"):
+        make_experiment(
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=1,
+                    sampler=Sampler(type="grid"),
+                    search_space=search_space,
+                )
+            ]
+        )
+
+
+def test_grid_accepts_maximum_cardinality() -> None:
+    """The configured grid ceiling itself remains a valid full matrix."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="p",
+                n_trials=4_096,
+                sampler=Sampler(type="grid"),
+                search_space={
+                    "left": CategoricalParam(type="categorical", choices=list(range(64))),
+                    "right": CategoricalParam(type="categorical", choices=list(range(64))),
+                },
+            )
+        ]
+    )
+    assert grid_search_space(experiment.phases[0].search_space, phase_name="p") == {
+        "left": list(range(64)),
+        "right": list(range(64)),
+    }
+
+
 @pytest.mark.parametrize("sampler", ["random", "tpe", "cmaes"])
 @pytest.mark.parametrize(
     "param",

@@ -1453,6 +1453,59 @@ def test_rebind_workdir_rebinds_every_compiled_suite_study(tmp_path: Path) -> No
     assert not _artifact_root_binding_path(untouched).exists()
 
 
+def test_rebind_workdir_suite_retry_converges_after_apply_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A suite retry completes a rebind that stopped between component writes."""
+    from phasesweep.engine.relocation import _apply_artifact_root_rebind
+
+    config_a, config_b, workdir_a, workdir_b = _movable_suite_configs(
+        tmp_path, study_names=("first", "second", "untouched")
+    )
+    suite_a = load_config(config_a)
+    suite_b = load_config(config_b)
+    assert isinstance(suite_a, Suite)
+    assert isinstance(suite_b, Suite)
+    # The suite is incomplete and has only component publications, so it
+    # remains movable without rewriting a suite publication.
+    for study_config in suite_a.studies[:2]:
+        run_experiment(suite_a.experiment_for_study(study_config))
+    shutil.copytree(workdir_a, workdir_b)
+    calls = 0
+
+    def fail_second_apply(plan):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second component rebind failure")
+        return _apply_artifact_root_rebind(plan)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("phasesweep.cli._apply_artifact_root_rebind", fail_second_apply)
+        failed = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_b)])
+    assert isinstance(failed.exception, OSError)
+    assert calls == 2
+
+    def roots() -> list[str]:
+        return [
+            optuna.load_study(
+                study_name=f"s__{study.name}::p", storage=f"sqlite:///{tmp_path}/suite.db"
+            ).user_attrs[ARTIFACT_ROOT_ATTR]
+            for study in suite_b.studies[:2]
+        ]
+
+    destinations = [
+        str(_experiment_dir(suite_b.experiment_for_study(study))) for study in suite_b.studies[:2]
+    ]
+    assert roots() == [
+        destinations[0],
+        str(_experiment_dir(suite_a.experiment_for_study(suite_a.studies[1]))),
+    ]
+    retried = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_b)])
+    assert retried.exit_code == 0, retried.output
+    assert roots() == destinations
+
+
 @pytest.mark.parametrize(
     "refusal_case",
     [

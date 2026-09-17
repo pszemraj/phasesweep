@@ -73,7 +73,12 @@ class PhaseStatusSnapshot(_SnapshotModel):
     generation_trials: dict[str, NonNegativeInt]
     winner_present: bool
     trial_data_available: bool
-    published_study_unavailable: bool = False
+    published_study_unavailable: bool | None = None
+    """Whether the published study was unavailable at capture time.
+
+    ``None`` means availability was not checked, as in older frozen snapshots
+    or pre-generation placeholders. It is not evidence of study availability.
+    """
     running_attempts: list[RunningAttemptSnapshot] | None = None
     """RUNNING rows the frozen counts describe, or ``None`` when unknown.
 

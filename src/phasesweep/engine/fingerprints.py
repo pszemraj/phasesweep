@@ -170,7 +170,7 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
 
 
 def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
-    """Return one phase's model dump reduced to its semantic fields.
+    """Return one phase's model dump reduced to execution and output semantics.
 
     ``gpu_ids``/``gpu_devices`` are run-control (which card runs a trial does
     not change its meaning) — except under ``whole_node``, where the configured
@@ -183,6 +183,11 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     :param Phase phase: Phase whose semantic payload is being built.
     :return dict[str, Any]: JSON-serializable semantic phase payload.
     """
+    # Promotion runs after a phase's individual trials, but is still semantic:
+    # it determines the phase output persisted for this candidate (or whether
+    # it is replaced by a baseline or omitted) and therefore the overrides
+    # downstream phases inherit. A populated study must not replay that
+    # transition under edited promotion rules.
     dump = {k: v for k, v in phase.model_dump(mode="json").items() if k not in _RUN_CONTROL_KEYS}
     # acknowledge_nonresumable is run-control, not semantics: it never changes
     # what a trial samples or means (on persistent storage its legal value is

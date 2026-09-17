@@ -17,6 +17,7 @@ import yaml
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication as publication_ops
+import phasesweep.engine.publication_validation as publication_validation_ops
 from phasesweep.config import Experiment, Phase
 from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
 from phasesweep.engine.state import (
@@ -369,12 +370,24 @@ def _load_winner(
         raise FileNotFoundError(
             f"Winner file missing for phase {phase.name!r}: no generation has completed."
         )
-    if not path.is_file():
-        raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
-
     try:
-        data = yaml.safe_load(path.read_text())
-    except (OSError, yaml.YAMLError) as exc:
+        content = publication_validation_ops._read_unlinked_bytes(
+            path,
+            root=(
+                path_ops._generations_dir(experiment)
+                if published_generation_id is not None
+                else path_ops._experiment_dir(experiment)
+            ),
+        )
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}") from exc
+    except OSError as exc:
+        raise WinnerIntegrityError(
+            f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
+        ) from exc
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
         raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc

@@ -306,7 +306,8 @@ def _resolve_storage(url: str | None) -> Any:
     """Translate a storage URL into an Optuna storage object or pass through.
 
     Recognized schemes:
-      * ``None`` or ``":memory:"`` -> in-memory study (not resumable).
+      * Any URL recognized by :func:`storage_is_in_memory` -> in-memory study
+        (not resumable).
       * ``journal:///path.journal`` -> Optuna ``JournalStorage(JournalFileBackend(path))``.
         Safe for parallel ``n_jobs`` on a single host.
       * Anything else (``sqlite:///``, ``postgresql://``, ``mysql://``, ...) -> passed to
@@ -326,7 +327,7 @@ def _resolve_storage(url: str | None) -> Any:
         through to Optuna's RDB-aware loader).
 
     """
-    if url is None or url == ":memory:":
+    if url is None or storage_is_in_memory(url):
         return None
     if storage_backend(url) == "journal":
         path = Path(file_url_path(url)).expanduser()

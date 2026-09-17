@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 
 _OPTUNA_EXACT_INT_LIMIT = 1 << 53
+_MAX_GRID_CARDINALITY = 4_096
 
 
 def _float_step_count(low: float, high: float, step: float) -> int:
@@ -360,22 +361,22 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             )
 
 
-def grid_search_space(
-    search_space: dict[str, SearchParam],
+def _grid_value_counts(
+    search_space: Mapping[str, SearchParam],
     *,
-    phase_name: str = "<direct>",
-) -> dict[str, list[Any]]:
-    """Build Optuna ``GridSampler`` values and validate grid-only constraints.
+    phase_name: str,
+) -> dict[str, int]:
+    """Return GridSampler value counts before materializing parameter lists.
 
-    :param dict[str, SearchParam] search_space: Search-space specification to enumerate.
+    :param Mapping[str, SearchParam] search_space: Search-space specification to inspect.
     :param str phase_name: Phase name included in validation errors.
     :raises ValueError: If a parameter cannot be represented as a grid.
-    :return dict[str, list[Any]]: Concrete grid values keyed by parameter name.
+    :return dict[str, int]: Number of concrete values for each parameter.
     """
-    grid: dict[str, list[Any]] = {}
+    counts: dict[str, int] = {}
     for name, param in search_space.items():
         if isinstance(param, CategoricalParam):
-            grid[name] = list(param.choices)
+            counts[name] = len(param.choices)
         elif isinstance(param, IntParam):
             if param.log:
                 raise ValueError(
@@ -388,7 +389,7 @@ def grid_search_space(
                     f"must evenly divide high-low={param.high - param.low} so the "
                     f"configured high={param.high} is included."
                 )
-            grid[name] = list(range(param.low, param.high + 1, param.step))
+            counts[name] = (param.high - param.low) // param.step + 1
         else:
             if param.log:
                 raise ValueError(
@@ -399,8 +400,41 @@ def grid_search_space(
                 raise ValueError(
                     f"Phase {phase_name!r}: grid sampler requires 'step' for float param {name!r}."
                 )
-            n_steps = _float_step_count(param.low, param.high, param.step)
-            values = [round(param.low + i * param.step, 12) for i in range(n_steps + 1)]
+            counts[name] = _float_step_count(param.low, param.high, param.step) + 1
+    return counts
+
+
+def grid_search_space(
+    search_space: dict[str, SearchParam],
+    *,
+    phase_name: str = "<direct>",
+) -> dict[str, list[Any]]:
+    """Build Optuna ``GridSampler`` values and validate grid-only constraints.
+
+    :param dict[str, SearchParam] search_space: Search-space specification to enumerate.
+    :param str phase_name: Phase name included in validation errors.
+    :raises ValueError: If a parameter cannot be represented as a grid or the
+        concrete matrix exceeds the supported cardinality.
+    :return dict[str, list[Any]]: Concrete grid values keyed by parameter name.
+    """
+    counts = _grid_value_counts(search_space, phase_name=phase_name)
+    cardinality = math.prod(counts.values())
+    if cardinality > _MAX_GRID_CARDINALITY:
+        raise ValueError(
+            f"Phase {phase_name!r}: grid sampler has {cardinality:,} combinations, "
+            f"which exceeds the supported maximum of {_MAX_GRID_CARDINALITY:,}. "
+            "Reduce the search space or use a stochastic sampler."
+        )
+
+    grid: dict[str, list[Any]] = {}
+    for name, param in search_space.items():
+        if isinstance(param, CategoricalParam):
+            grid[name] = list(param.choices)
+        elif isinstance(param, IntParam):
+            grid[name] = list(range(param.low, param.high + 1, param.step))
+        else:
+            assert param.step is not None
+            values = [round(param.low + i * param.step, 12) for i in range(counts[name])]
             # Post-canonicalization collapse (review v0.5.17 / finding C): the
             # round(..., 12) above maps adjacent points onto the same float once
             # the step drops below ~1e-12, so the grid would publish fewer unique

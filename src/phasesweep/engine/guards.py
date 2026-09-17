@@ -19,7 +19,6 @@ from phasesweep.engine.cleanup import (
 )
 from phasesweep.engine.errors import (
     PhaseSweepError,
-    PublishedStudyMissingError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -88,10 +87,11 @@ def _preflight_existing_studies(
     if preloaded_studies is None:
         try:
             loaded = _load_and_check_artifact_roots(experiment, from_phase=from_phase)
-        except (StudyStorageUnavailableError, PublishedStudyMissingError) as exc:
+        except Exception as exc:
             # This discovery also runs during post-execution reconciliation.
-            # A lost ledger then aborts recovery before the attempt registry
-            # can be inspected, so cleanup cannot be reported as confirmed.
+            # Any discovery failure (including unreadable or conflicting roots)
+            # aborts before the attempt registry can be inspected, so cleanup
+            # cannot be reported as confirmed. Post-reap validation is separate.
             report.mark_uncertain(exc)
             raise
     else:

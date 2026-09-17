@@ -528,7 +528,7 @@ class PhaseStatusPayload(_ToolPayload):
         description="Whether pre-run terminal history already met the configured target."
     )
     winner_present: bool = Field(description="Whether this phase has a winner artifact.")
-    published_study_unavailable: bool = Field(
+    published_study_unavailable: bool | None = Field(
         description=(
             "Whether a current published phase's local trial identity could not be matched. When "
             "trial_data_available is true, its published trial is confirmed missing or replaced: "
@@ -536,7 +536,8 @@ class PhaseStatusPayload(_ToolPayload):
             "earlier phases may load validated saved winners via from_phase. When "
             "trial_data_available is false, inspection failed: a run can report "
             "cleanup_uncertain and require operator "
-            "recovery before further MCP launches."
+            "recovery before further MCP launches. Null means availability was not checked, "
+            "including older snapshots and pre-generation placeholders."
         )
     )
     trial_data_available: bool = Field(

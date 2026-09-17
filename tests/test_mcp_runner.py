@@ -29,7 +29,9 @@ from phasesweep.cli import cli as cli_main
 from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
     ActiveAttemptPersistenceError,
+    ArtifactRootConflictError,
     ExperimentLockBusyError,
+    LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     PublishedStudyMissingError,
@@ -746,6 +748,9 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     assert snapshot["status"]["published_generation_id"] is None
     assert snapshot["winners"] == []
     assert all(phase["trial_data_available"] is False for phase in snapshot["status"]["phases"])
+    assert all(
+        phase["published_study_unavailable"] is None for phase in snapshot["status"]["phases"]
+    )
 
 
 def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path: Path) -> None:
@@ -1494,6 +1499,50 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
     assert isinstance(report.primary_error, NoFeasibleTrialError)
     assert report.cleanup_confirmed is False
     assert report.cleanup_error is cleanup_error
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [OSError, ArtifactRootConflictError, LegacyArtifactRootMigrationRequiredError],
+)
+def test_terminal_report_marks_failed_root_discovery_uncertain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    """Discovery failure during reconciliation cannot attest to unscanned attempts."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    cleanup_error = error_type("artifact root cannot be inspected")
+    registry_scans = 0
+
+    def fail_discovery(*args: object, **kwargs: object) -> None:
+        raise cleanup_error
+
+    def scan_registry(*args: object, **kwargs: object) -> None:
+        nonlocal registry_scans
+        registry_scans += 1
+
+    def fail_run(*args: object, **kwargs: object) -> None:
+        # Initial discovery and preflight succeeded. Only reconciliation loses
+        # access to the root, before it can perform a second registry scan.
+        monkeypatch.setattr(
+            "phasesweep.engine.guards._load_and_check_artifact_roots", fail_discovery
+        )
+        raise NoFeasibleTrialError("trainer failed")
+
+    captured: list[TerminalReport] = []
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_active_attempts", scan_registry)
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
+
+    with pytest.raises(ProcessCleanupUncertainError) as exc_info:
+        run_experiment(experiment, terminal_callback=captured.append)
+
+    assert isinstance(exc_info.value.__cause__, NoFeasibleTrialError)
+    assert registry_scans == 1
+    assert len(captured) == 1
+    assert isinstance(captured[0].primary_error, NoFeasibleTrialError)
+    assert captured[0].cleanup_confirmed is False
+    assert captured[0].cleanup_error is cleanup_error
 
 
 def test_cleanup_uncertainty_outer_failure_controls_a_cancelled_cause() -> None:

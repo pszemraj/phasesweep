@@ -277,6 +277,7 @@ def test_wandb_deadline_stops_sdk_retries_and_worker_group(
     assert str(excinfo.value.last_error) == "transient W&B API error before blocked retry"
     assert time.monotonic() - started < 3
     pids = json.loads(marker.read_text(encoding="utf-8"))
+    # Orphan zombies have stopped; their final reaping belongs to the host's PID 1.
     assert all(not is_pid_alive(pid) or is_pid_zombie(pid) for pid in pids)
     assert list(tmp_path.glob("phasesweep-wandb-*")) == []
     assert (tmp_path / PROCESS_IDENTITY_FILE).is_file()

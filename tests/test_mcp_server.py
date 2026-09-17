@@ -2396,6 +2396,35 @@ def _record_published_run_snapshot(
     return run_id, trainer, config, catalog
 
 
+def test_frozen_legacy_snapshot_reports_published_study_check_as_unknown(tmp_path: Path) -> None:
+    """A snapshot that predates the check must not assert study availability."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    snapshot = terminal["result_snapshot"]
+    assert isinstance(snapshot, dict)
+    phase = snapshot["status"]["phases"][0]
+    assert isinstance(phase, dict)
+    phase.pop("published_study_unavailable")
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="complete",
+        result_snapshot=snapshot,
+    )
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+
+    assert status.result_source == "frozen_run_snapshot"
+    assert status.phases[0].published_study_unavailable is None
+
+
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     tmp_path: Path,
 ) -> None:
@@ -5184,6 +5213,33 @@ def test_operator_recovery_clears_cleanup_uncertainty(
             "FAIL": 1,
         }
         assert recovered_status["phases"][0]["running_trials_total"] == 0
+
+    final_status = store.status_path(run_id).read_bytes()
+    final_recovery = store.cleanup_recovery_path(run_id).read_bytes()
+    repeat = runner.invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+    if expect_running_before_confirm:
+        assert repeat.exit_code == 0, repeat.output
+        assert "No cleanup uncertainty or terminal result repair" in repeat.output
+    else:
+        # Cleanup is settled, but an absent historical snapshot remains an
+        # explicit refusal; retry must not repeat process cleanup to repair it.
+        assert repeat.exit_code == 1, repeat.output
+        assert "no immutable terminal result snapshot" in repeat.output
+    assert store.status_path(run_id).read_bytes() == final_status
+    assert store.cleanup_recovery_path(run_id).read_bytes() == final_recovery
+    assert runner_cleanup_calls == [(999999, 111, 999999)]
+    assert trial_cleanup_calls == [expected_identity]
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")

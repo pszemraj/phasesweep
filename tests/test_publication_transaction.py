@@ -42,6 +42,7 @@ from phasesweep.engine import (
     PublicationIntegrityError,
     TerminalReport,
     Winner,
+    WinnerIntegrityError,
     generation_id_source,
     read_status,
     read_winner,
@@ -843,6 +844,29 @@ def test_read_side_accepts_legacy_summary_without_manifest(tmp_path: Path) -> No
 
     assert _last_successful_generation_id(experiment) == generation_id
     assert read_winner(experiment, "p") is not None
+
+
+def test_load_winner_rejects_linked_winner_with_legacy_summary(tmp_path: Path) -> None:
+    """Strict resume rejects a linked winner even when legacy summaries lack a manifest."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
+        summary.pop(key, None)
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    preserved_winner_path = winner_path.with_name("winner.original.yaml")
+    winner_path.rename(preserved_winner_path)
+    winner_path.symlink_to(preserved_winner_path.name)
+
+    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
+        artifact_io._load_winner(experiment, experiment.phases[0], {})
 
 
 def test_suite_publication_refuses_broken_component_manifest(
@@ -1958,6 +1982,20 @@ def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> Non
     record_path = _generation_dir(experiment, "launcher-granted-1") / _REPRODUCIBILITY_NAME
     record_path.write_text(json.dumps(record))
     assert generation_id_source(experiment, "launcher-granted-1") is None
+
+
+def test_generation_id_source_rejects_linked_provenance_record(tmp_path: Path) -> None:
+    """A source claim is not trusted through a linked reproducibility record."""
+    experiment = _stored_experiment(tmp_path)
+    generation_id = "launcher-granted-1"
+    run_experiment(experiment, generation_id=generation_id)
+
+    record_path = _generation_dir(experiment, generation_id) / _REPRODUCIBILITY_NAME
+    preserved_record_path = record_path.with_name("reproducibility.original.json")
+    record_path.rename(preserved_record_path)
+    record_path.symlink_to(preserved_record_path.name)
+
+    assert generation_id_source(experiment, generation_id) is None
 
 
 def test_generation_manifest_covers_the_provenance_files(tmp_path: Path) -> None:

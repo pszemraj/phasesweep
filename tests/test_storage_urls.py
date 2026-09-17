@@ -184,6 +184,13 @@ def test_resolve_storage_urls(tmp_path: Path) -> None:
         ("rdb_passthrough", "postgresql://user:pass@host/db", "passthrough"),
         ("in_memory", None, "none"),
         ("in_memory_sentinel", ":memory:", "none"),
+        ("in_memory_sqlite", "sqlite:///:memory:", "none"),
+        ("in_memory_sqlite_empty", "sqlite://", "none"),
+        (
+            "in_memory_sqlite_uri",
+            "sqlite:///file:phasesweep-memory?mode=memory&cache=shared&uri=true",
+            "none",
+        ),
         ("journal", f"journal:///{tmp_path}/phases.journal", "journal"),
     ]
 

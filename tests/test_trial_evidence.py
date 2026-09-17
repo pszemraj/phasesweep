@@ -313,7 +313,14 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
 
 @pytest.mark.parametrize(
     "damage",
-    ["empty", "file_without_path", "file_without_digest", "wandb_without_address"],
+    [
+        "empty",
+        "file_without_path",
+        "file_without_digest",
+        "file_with_parent_path",
+        "file_with_absolute_path",
+        "wandb_without_address",
+    ],
 )
 def test_present_incomplete_objective_provenance_blocks_selection(
     tmp_path: Path, damage: str
@@ -333,6 +340,10 @@ def test_present_incomplete_objective_provenance_blocks_selection(
         record["source"].pop("path")
     elif damage == "file_without_digest":
         record["source"].pop("sha256")
+    elif damage == "file_with_parent_path":
+        record["source"]["path"] = "../not-a-trial-file"
+    elif damage == "file_with_absolute_path":
+        record["source"]["path"] = "/not-a-trial-file"
     else:
         record["extractor"]["kind"] = "wandb"
         record["source"] = {"kind": "wandb"}

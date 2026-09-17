@@ -11,6 +11,7 @@ import yaml
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
+import phasesweep.engine.publication_validation as publication_validation_ops
 from phasesweep._metadata import __version__
 from phasesweep.config import Experiment, Phase
 from phasesweep.config.common import SAFE_NAME_PATTERN
@@ -145,9 +146,9 @@ def generation_id_source(experiment: Experiment, generation_id: str) -> Generati
     reproducibility file (generations claimed before the file existed), a
     pre-version-2 record without the field, or an unreadable/malformed file.
     ``None`` deliberately does not fail closed -- absence is the normal state
-    of every legacy tree, and tampering with the file inside the artifact tree
-    is already surfaced as a failed publication by the manifest check (and a
-    writer there could read the winner files directly anyway).
+    of every legacy tree. Versioned publication validation separately detects
+    regular-file edits through the manifest; this lookup also refuses a path
+    that traverses a symlink before recognizing either recorded source.
 
     :param Experiment experiment: Experiment whose artifact tree holds the generation.
     :param str generation_id: Generation namespace identifier to look up.
@@ -158,11 +159,12 @@ def generation_id_source(experiment: Experiment, generation_id: str) -> Generati
         return None
     try:
         payload = json.loads(
-            path_ops._generation_reproducibility_path(experiment, generation_id).read_text(
-                encoding="utf-8"
-            )
+            publication_validation_ops._read_unlinked_bytes(
+                path_ops._generation_reproducibility_path(experiment, generation_id),
+                root=path_ops._experiment_dir(experiment),
+            ).decode("utf-8")
         )
-    except (OSError, ValueError):
+    except (OSError, UnicodeError, ValueError):
         return None
     if not isinstance(payload, Mapping):
         return None

@@ -26,6 +26,7 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
+from phasesweep.evidence.models import _validate_trial_file_path
 from phasesweep.runtime.files import (
     file_sha256,
 )
@@ -182,6 +183,11 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         or not _valid_sha256(source.get("sha256"))
     ):
         fail("missing file source path, size, or digest")
+    else:
+        try:
+            _validate_trial_file_path(source["path"])
+        except ValueError:
+            fail("invalid file source path")
 
 
 def _verify_objective_source_evidence(

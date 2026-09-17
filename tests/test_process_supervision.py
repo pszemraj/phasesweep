@@ -326,21 +326,25 @@ def test_pre_spawn_failure_requires_terminal_lifecycle_write(
             cleanup_confirmed=cleanup_confirmed,
         )
 
+    spawn_error = RuntimeError("injected pre-spawn failure")
+
     def fail_before_spawn(**_kwargs: object) -> None:
-        raise OSError("injected pre-spawn failure")
+        raise spawn_error
 
     monkeypatch.setattr(process, "write_attempt_lifecycle", fail_terminal_write)
     monkeypatch.setattr(process, "_spawn_blocked_supervisor", fail_before_spawn)
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
 
-    with pytest.raises(OSError, match="terminal lifecycle write failure"):
+    with pytest.raises(OSError, match="terminal lifecycle write failure") as exc_info:
         _run_supervised(
             trial_dir,
             "true",
             timeout=None,
             attempt_id="pre-spawn-terminal-write-failure",
         )
+
+    assert exc_info.value.__cause__ is spawn_error
 
     lifecycle = read_attempt_lifecycle(
         trial_dir,
@@ -1339,7 +1343,7 @@ def test_payload_write_timeout_covers_a_nonreading_supervisor(
 def test_supervisor_ready_wait_is_capped_by_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A slow supervisor startup cannot outlive the trial's own budget.
+    """A delayed real trainer child cannot outlive the trial's own budget.
 
     The readiness wait used to be a fixed ``_SUPERVISOR_READY_TIMEOUT_SECONDS``
     regardless of the remaining budget; with a 10s allowance a 0.15s trial
@@ -1349,16 +1353,22 @@ def test_supervisor_ready_wait_is_capped_by_deadline(
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
     marker = tmp_path / "trainer_ran.txt"
+    child_pid_path = tmp_path / "trainer_child.pid"
 
     slow_supervisor = tmp_path / "slow_supervisor.py"
+    source = Path(supervisor.__file__).read_text()
+    ready_frame = '    ready_frame = b"R" + f"{os.getpid():0{_READY_PID_WIDTH}d}".encode("ascii")\n'
+    assert ready_frame in source
     slow_supervisor.write_text(
-        "import os, signal, sys, time\n"
-        # Mirror the real supervisor's mask reset: the parent's launch window
-        # blocks shutdown signals and the mask survives exec.
-        "signal.pthread_sigmask(signal.SIG_SETMASK, set())\n"
-        "time.sleep(1.0)\n"
-        "os.write(int(sys.argv[1]), b'R')\n"
-        "time.sleep(30)\n"
+        source.replace(
+            ready_frame,
+            (
+                f"    with open({str(child_pid_path)!r}, 'w', encoding='utf-8') as child_file:\n"
+                "        child_file.write(str(os.getpid()))\n"
+                "    time.sleep(1.0)\n" + ready_frame
+            ),
+            1,
+        )
     )
     monkeypatch.setattr("phasesweep.runtime.process._SUPERVISOR_SCRIPT_PATH", str(slow_supervisor))
 
@@ -1377,6 +1387,19 @@ def test_supervisor_ready_wait_is_capped_by_deadline(
     # Bounded by the budget plus kill/reap grace — nowhere near the slow
     # supervisor's 1s startup + fixed 10s readiness allowance.
     assert elapsed < 5.0
+    assert not marker.exists()
+    assert child_pid_path.exists(), "real supervisor never forked the trainer child"
+    child_pid = int(child_pid_path.read_text())
+
+    child_deadline = time.monotonic() + 5.0
+    while time.monotonic() < child_deadline:
+        if not is_pid_alive(child_pid) or is_pid_zombie(child_pid):
+            break
+        time.sleep(0.05)
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(child_pid, signal.SIGKILL)
+        pytest.fail("deadline abort left the pre-ACK trainer child running")
     assert not marker.exists()
 
 

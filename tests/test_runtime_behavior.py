@@ -1744,8 +1744,9 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     assert states == ["COMPLETE", "FAIL", "FAIL"]
 
 
-def test_parallel_unexpected_objective_error_is_phase_fatal_and_durable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_unexpected_objective_error_is_phase_fatal_and_durable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_jobs: int
 ) -> None:
     """A worker bug cannot be swallowed by Optuna or published on retry."""
     trainer = write_trainer(tmp_path / "trainer.py", 'print("x=0.5")')
@@ -1756,7 +1757,7 @@ def test_parallel_unexpected_objective_error_is_phase_fatal_and_durable(
         trial_command=f"python {trainer} {{overrides}}",
         override_format="argparse",
         n_trials=2,
-        n_jobs=2,
+        n_jobs=n_jobs,
         gpu_policy="none",
         allow_no_gpu_isolation=True,
         sampler={"type": "random", "seed": 7},
@@ -1789,6 +1790,7 @@ def test_parallel_unexpected_objective_error_is_phase_fatal_and_durable(
     assert fatal["cause"] == "RuntimeError: injected objective implementation bug"
     assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unexpected_objective_exception"
     assert not _last_successful_generation_path(exp).exists()
+    assert list(_attempts_dir(exp).glob("*.json")) == []
 
     monkeypatch.setattr(
         "phasesweep.engine.phase.extract_trial_result",

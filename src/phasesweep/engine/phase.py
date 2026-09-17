@@ -1120,6 +1120,8 @@ def _run_phase(
         # Terminal state alone is insufficient for an unsafe-cleanup trial: its
         # registry entry is the cross-phase/storage recovery locator and must
         # survive until preflight durably consumes cleanup evidence.
+        # Optuna skips callbacks for uncaught objective errors; the enclosing
+        # run's reconciliation retires those attempts after checking cleanup.
         finished_attempt = _trial.user_attrs.get(ATTEMPT_ID_ATTR)
         if (
             isinstance(finished_attempt, str)
