@@ -16,9 +16,114 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
+    StudySpec,
     Suite,
 )
 from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
+
+
+def test_suite_study_names_are_unique_case_insensitively() -> None:
+    phase = Phase(name="p", n_trials=1)
+    with pytest.raises(ValidationError, match="'Foo' and 'foo'.*case-insensitively"):
+        Suite(suite="s", studies=[StudySpec(name=name, phases=[phase]) for name in ("Foo", "foo")])
+    suite = Suite(
+        suite="s", studies=[StudySpec(name=name, phases=[phase]) for name in ("Foo", "Bar")]
+    )
+    assert [study.name for study in suite.studies] == ["Foo", "Bar"]
+
+
+def _branching_phases(width: int) -> list[Phase]:
+    return [
+        Phase(name="base", n_trials=1),
+        *[
+            Phase(
+                name=f"branch{i}",
+                n_trials=1,
+                promotion={
+                    "min_delta_vs": "base",
+                    "on_fail": "continue_baseline",
+                },
+            )
+            for i in range(width)
+        ],
+        Phase(name="join", n_trials=1, inherits=[f"branch{i}" for i in range(width)]),
+    ]
+
+
+def test_promotion_validation_has_an_experiment_wide_work_bound(monkeypatch) -> None:
+    import phasesweep.config.models as models
+
+    original = models._compatible_parent_outcome_combinations
+    spent = 0
+
+    def counted(parents, outcomes_by_phase, **kwargs):
+        nonlocal spent
+        combinations, remaining = original(parents, outcomes_by_phase, **kwargs)
+        spent += kwargs["remaining_expansions"] - remaining
+        assert spent <= 4096
+        return combinations, remaining
+
+    monkeypatch.setattr(models, "_compatible_parent_outcome_combinations", counted)
+    make_experiment(phases=_branching_phases(3))
+    spent = 0
+    with pytest.raises(
+        ValidationError, match="Phase 'join'.*supported validation complexity.*4,096"
+    ):
+        make_experiment(phases=_branching_phases(13))
+    # A fresh validation gets its own budget; a prior failure cannot poison it.
+    spent = 0
+    make_experiment(phases=_branching_phases(3))
+    spent = 0
+    phases = _branching_phases(10)
+    parents = phases[-1].inherits
+    phases.extend(
+        [
+            Phase(name="join2", n_trials=1, inherits=parents),
+            Phase(name="join3", n_trials=1, inherits=parents),
+        ]
+    )
+    with pytest.raises(ValidationError, match="Phase 'join3'.*supported validation complexity"):
+        make_experiment(phases=phases)
+
+
+def test_promotion_validation_charges_rejected_combinations(monkeypatch) -> None:
+    import phasesweep.config.models as models
+
+    # Only 64 of the 64*64 pairs are compatible. The rejected pairs still cost
+    # work, so the second expansion cannot fit after spending 64 on the first.
+    outcomes = tuple(
+        models._ConcreteOverrideOutcome(
+            keys=frozenset(),
+            decisions=(("choice", str(i)),),
+        )
+        for i in range(64)
+    )
+    original = models._merge_override_outcomes
+    attempts = 0
+
+    def counted(candidate):
+        nonlocal attempts
+        attempts += 1
+        return original(candidate)
+
+    monkeypatch.setattr(models, "_merge_override_outcomes", counted)
+    with pytest.raises(ValueError, match="Phase 'join'.*supported validation complexity"):
+        models._compatible_parent_outcome_combinations(
+            ["left", "right"],
+            {"left": outcomes, "right": outcomes},
+            phase_name="join",
+            remaining_expansions=4096,
+        )
+    assert attempts == 64  # Refused before allocating/evaluating the next layer.
+    phases = _branching_phases(6)
+    phases.extend(
+        [
+            Phase(name="copy", n_trials=1, inherits=["join"]),
+            Phase(name="rejoin", n_trials=1, inherits=["join", "copy"]),
+        ]
+    )
+    with pytest.raises(ValidationError, match="Phase 'rejoin'.*supported validation complexity"):
+        make_experiment(phases=phases)
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,25 @@ if TYPE_CHECKING:
 _OPTUNA_EXACT_INT_LIMIT = 1 << 53
 
 
+def _float_step_count(low: float, high: float, step: float) -> int:
+    """Return the exact decimal-string step count, rejecting off-lattice bounds.
+
+    :param float low: Inclusive lower bound.
+    :param float high: Inclusive upper bound.
+    :param float step: Positive finite spacing.
+    :raises ValueError: The configured high is not on the step lattice.
+    :return int: Number of steps between the bounds, without enumeration.
+    """
+    ratio = (Fraction(str(high)) - Fraction(str(low))) / Fraction(str(step))
+    if ratio.denominator != 1:
+        raise ValueError(
+            "float param: (high - low) / step must be an integer. "
+            f"Got low={low}, high={high}, step={step} (ratio={ratio}). "
+            "Pick a step that evenly divides the interval."
+        )
+    return ratio.numerator
+
+
 def _validate_optuna_integer_domain(low: int, high: int) -> None:
     """Reject integer bounds that cannot round-trip through Optuna numeric storage.
 
@@ -56,7 +75,8 @@ class FloatParam(_Frozen):
         Raises:
             ValueError: ``low`` or ``high`` is non-finite, ``low > high``,
                 ``log`` is set with ``low <= 0``, ``step`` is non-finite or
-                ``<= 0``, or ``log`` and ``step`` are combined.
+                ``<= 0``, ``log`` and ``step`` are combined, or the stepped
+                interval does not include the configured high bound.
 
         """
         _require_finite("float param low", self.low)
@@ -71,6 +91,8 @@ class FloatParam(_Frozen):
                 raise ValueError("float param step must be > 0")
         if self.log and self.step is not None:
             raise ValueError("float param cannot use both log=true and step")
+        if self.step is not None:
+            _float_step_count(self.low, self.high, self.step)
         return self
 
 
@@ -94,7 +116,8 @@ class IntParam(_Frozen):
             ValueError: Bounds cannot round-trip exactly through Optuna,
                 ``log`` is set with ``low <= 0``, ``step <= 0``, or ``log`` is
                 combined with ``step != 1`` (which Optuna's
-                ``IntDistribution`` rejects at construction time).
+                ``IntDistribution`` rejects at construction time), or the
+                stepped interval does not include the configured high bound.
 
         """
         _validate_optuna_integer_domain(self.low, self.high)
@@ -106,6 +129,11 @@ class IntParam(_Frozen):
             # Optuna's IntDistribution rejects this at construction time.
             # Catch it here so config-load fails instead of trial-launch.
             raise ValueError("int param cannot use log=true with step != 1")
+        if (self.high - self.low) % self.step:
+            raise ValueError(
+                f"int param: step={self.step} must evenly divide "
+                f"high-low={self.high - self.low} so the configured high={self.high} is included."
+            )
         return self
 
 
@@ -278,8 +306,6 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     * Grid sampler with log-scale floats or ints — Optuna's ``GridSampler`` does
       not enumerate log-spaced values.
     * Grid sampler with float param missing ``step``.
-    * Grid sampler with float ``(high - low)`` not an integer multiple of ``step`` —
-      naive enumeration emits values above ``high`` (review v0.5.2 / blocker 4).
     * Grid sampler with a float param whose enumerated points collapse under the
       12-decimal canonical rounding, which would make the cardinality below
       overcount the distinct configurations (review v0.5.17 / finding C).
@@ -334,37 +360,6 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             )
 
 
-def _validate_float_grid_divides(phase_name: str, param_name: str, param: FloatParam) -> int:
-    """Return the exact number of steps between a float grid's bounds.
-
-    Without this check, grid enumeration can emit a point above ``high`` or
-    silently omit ``high`` when the interval is not an exact multiple of ``step``.
-    For example, ``low=0, high=1, step=0.6`` would emit ``1.2``.
-
-    Args:
-        phase_name: Phase containing the offending parameter; quoted in the error.
-        param_name: Parameter name; quoted in the error.
-        param: The :class:`FloatParam`; ``param.step`` must be non-``None`` (caller guarded).
-
-    Raises:
-        ValueError: ``(high - low) / step`` is not an integer.
-
-    Returns:
-        Number of steps in the complete grid.
-
-    """
-    assert param.step is not None  # guarded by caller
-    ratio = (Fraction(str(param.high)) - Fraction(str(param.low))) / Fraction(str(param.step))
-    if ratio.denominator != 1:
-        raise ValueError(
-            f"Phase {phase_name!r}: grid float param {param_name!r}: "
-            f"(high - low) / step must be an integer. "
-            f"Got low={param.low}, high={param.high}, step={param.step} "
-            f"(ratio={ratio}). Pick a step that evenly divides the interval."
-        )
-    return ratio.numerator
-
-
 def grid_search_space(
     search_space: dict[str, SearchParam],
     *,
@@ -404,7 +399,7 @@ def grid_search_space(
                 raise ValueError(
                     f"Phase {phase_name!r}: grid sampler requires 'step' for float param {name!r}."
                 )
-            n_steps = _validate_float_grid_divides(phase_name, name, param)
+            n_steps = _float_step_count(param.low, param.high, param.step)
             values = [round(param.low + i * param.step, 12) for i in range(n_steps + 1)]
             # Post-canonicalization collapse (review v0.5.17 / finding C): the
             # round(..., 12) above maps adjacent points onto the same float once

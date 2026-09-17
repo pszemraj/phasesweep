@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment
@@ -405,10 +406,9 @@ def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path
     study's Experiment exactly like ``storage`` and other defaulted fields
     (see ``Suite.experiment_for_study``); a study can still opt out and hit
     the same Experiment-level rejection as a standalone config."""
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            """
+    path = write_yaml(
+        tmp_path,
+        """
             suite: external_rdb_suite
             defaults:
               storage: postgresql://user:pass@host/db
@@ -427,9 +427,11 @@ def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path
                 allow_external_rdb_single_host: false
                 phases: [{name: p, n_trials: 1, sampler: {type: random, seed: 0}}]
             """,
-        )
     )
 
+    with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
+        load_config(path)
+    config = Suite.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     assert isinstance(config, Suite)
     inherited_study, opted_out_study = config.studies
 

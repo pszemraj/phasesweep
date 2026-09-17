@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
@@ -16,8 +17,9 @@ import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.run as run_engine
 from phasesweep._metadata import __version__
-from phasesweep.config import Suite
+from phasesweep.config import Experiment, Suite
 from phasesweep.config.common import _validate_safe_name
+from phasesweep.config.models import _compile_suite_experiments
 from phasesweep.engine.errors import (
     PromotionError,
     PublicationAccessError,
@@ -47,6 +49,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
     :param Suite suite: Parsed suite config.
     :param bool dry_run: If ``True``, preview each study without launching subprocesses.
     :return dict[str, dict[str, Winner]]: Winners keyed by study name, then phase name.
+    :raises ValueError: Revalidation or study resolution fails, before execution artifacts.
     :raises PromotionError: A study declares a dependency that exposed no
         winners, so the suite refuses to start it.
     :raises PublicationAccessError: The prior suite publication cannot be read.
@@ -58,11 +61,12 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
     # Match run_experiment's public boundary: revalidate the instance directly
     # without losing mutable defaults or omission-versus-explicit-reset state.
     suite = Suite.model_validate(suite)
+    experiments = _compile_suite_experiments(suite)
     results: dict[str, dict[str, Winner]] = {}
     promotion_decisions: dict[str, dict[str, Any]] = {}
     if dry_run:
         for study_spec in suite.studies:
-            experiment = suite.experiment_for_study(study_spec)
+            experiment = experiments[study_spec.name]
             results[study_spec.name] = run_engine.run_experiment(experiment, dry_run=True)
         return results
 
@@ -86,6 +90,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
         started_at = utc_now_iso()
         _write_suite_generation_state(
             suite,
+            experiments=experiments,
             generation_id=generation_id,
             state="running",
             started_at=started_at,
@@ -103,7 +108,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                         raise PromotionError(
                             f"Study {study_spec.name!r} dependency {dep!r} did not complete."
                         )
-                experiment = suite.experiment_for_study(study_spec)
+                experiment = experiments[study_spec.name]
                 log.info("suite=%s study=%s START", suite.suite, study_spec.name)
                 # The outcome binds winners to the generation that published
                 # them while the component's experiment lock is held. Reading
@@ -143,6 +148,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
             ended_at = utc_now_iso()
             summary = _suite_summary_payload(
                 suite,
+                experiments=experiments,
                 generation_id=generation_id,
                 started_at=started_at,
                 ended_at=ended_at,
@@ -163,7 +169,9 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
             # committed suite publication.
             with absorb_shutdown_signals() as absorbed:
                 try:
-                    summary_bytes = _validate_suite_generation_publishable(suite, generation_id)
+                    summary_bytes = _validate_suite_generation_publishable(
+                        suite, generation_id, experiments=experiments
+                    )
                     artifact_io._write_yaml_atomic(
                         path_ops._last_successful_suite_generation_path(suite),
                         {
@@ -179,6 +187,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     generation_ops._persist_terminal_failure(
                         lambda: _write_suite_generation_state(
                             suite,
+                            experiments=experiments,
                             generation_id=generation_id,
                             state="publication_failed",
                             started_at=started_at,
@@ -193,6 +202,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     """Step 4: write the immutable suite record once, state ``published``."""
                     _write_suite_generation_state(
                         suite,
+                        experiments=experiments,
                         generation_id=generation_id,
                         state="published",
                         started_at=started_at,
@@ -210,6 +220,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                     """Step 5: drive the pointer to ``published``, refresh the cache (best-effort)."""
                     _write_suite_generation_state(
                         suite,
+                        experiments=experiments,
                         generation_id=generation_id,
                         state="published",
                         started_at=started_at,
@@ -246,6 +257,7 @@ def run_suite(suite: Suite, *, dry_run: bool = False) -> dict[str, dict[str, Win
                 path_ops._suite_generation_record_path(suite, generation_id),
                 lambda: _write_suite_generation_state(
                     suite,
+                    experiments=experiments,
                     generation_id=generation_id,
                     state="failed",
                     started_at=started_at,
@@ -278,7 +290,9 @@ def _claim_suite_generation(suite: Suite) -> str:
     raise RuntimeError("Could not mint an unused suite generation id after 10 attempts.")
 
 
-def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> bytes:
+def _validate_suite_generation_publishable(
+    suite: Suite, generation_id: str, *, experiments: Mapping[str, Experiment] | None = None
+) -> bytes:
     """Validate a suite generation's summary and component references before its commit.
 
     Suite mirror of :func:`phasesweep.engine.generation._validate_generation_publishable` (review v0.5.16
@@ -293,6 +307,8 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
 
     :param Suite suite: Suite whose generation is being published.
     :param str generation_id: Immutable suite-generation namespace to validate.
+    :param Mapping[str, Experiment] | None experiments: Precompiled components
+        from this invocation; standalone checks may resolve them on demand.
     :raises PublicationCommitError: The suite summary cannot be read back or
         does not name this suite generation.
     :raises PublicationAccessError: A component artifact cannot be read as the current user.
@@ -331,7 +347,11 @@ def _validate_suite_generation_publishable(suite: Suite, generation_id: str) -> 
         if name in seen or name not in studies_by_name:
             raise _fail(f"summary study record {name!r} is duplicated or unknown")
         seen.add(name)
-        component = suite.experiment_for_study(studies_by_name[name])
+        component = (
+            suite.experiment_for_study(studies_by_name[name])
+            if experiments is None
+            else experiments[name]
+        )
         if record.get("experiment") != component.experiment:
             raise _fail(f"study {name!r} names a different component experiment")
         component_generation = record.get("experiment_generation_id")
@@ -389,6 +409,7 @@ def _write_suite_generation_state(
     error_class: str | None = None,
     publish_current: bool = True,
     write_record: bool = True,
+    experiments: Mapping[str, Experiment] | None = None,
 ) -> None:
     """Write one suite generation's current-pointer projection and/or immutable record.
 
@@ -412,12 +433,14 @@ def _write_suite_generation_state(
     :param bool write_record: If ``False``, skip the write-once record even
         for a terminal state -- see :func:`phasesweep.engine.generation._write_generation_state`
         for why the post-commit pointer refresh needs this.
+    :param Mapping[str, Experiment] | None experiments: Precompiled components
+        used to fingerprint this invocation.
     """
     payload = {
         "schema_version": 1,
         "suite": suite.suite,
         "suite_generation_id": generation_id,
-        "suite_fingerprint": fingerprint_ops._suite_fingerprint(suite),
+        "suite_fingerprint": fingerprint_ops._suite_fingerprint(suite, experiments),
         "state": state,
         "started_at": started_at,
         "ended_at": ended_at,
@@ -439,6 +462,7 @@ def _write_suite_generation_state(
 def _suite_summary_payload(
     suite: Suite,
     *,
+    experiments: Mapping[str, Experiment],
     generation_id: str,
     started_at: str,
     ended_at: str,
@@ -450,6 +474,7 @@ def _suite_summary_payload(
 
     :param Suite suite: Compiled suite plan whose studies are iterated in
         declaration order.
+    :param Mapping[str, Experiment] experiments: Precompiled component experiments.
     :param str generation_id: Immutable suite-generation namespace this summary belongs to.
     :param str started_at: ISO timestamp when the suite invocation started.
     :param str ended_at: ISO timestamp when the suite invocation ended.
@@ -465,7 +490,7 @@ def _suite_summary_payload(
     """
     studies: list[dict[str, Any]] = []
     for study_spec in suite.studies:
-        experiment = suite.experiment_for_study(study_spec)
+        experiment = experiments[study_spec.name]
         exposed = results.get(study_spec.name, {})
         phases = []
         for phase in experiment.phases:
@@ -494,7 +519,7 @@ def _suite_summary_payload(
                 "phases": phases,
             }
         )
-    fingerprint = fingerprint_ops._suite_fingerprint(suite)
+    fingerprint = fingerprint_ops._suite_fingerprint(suite, experiments)
     return {
         "schema_version": SUITE_SUMMARY_SCHEMA_VERSION,
         "suite": suite.suite,

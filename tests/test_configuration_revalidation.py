@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import NoFeasibleTrialError, run_experiment, run_suite
+from phasesweep.cli import main
 from phasesweep.config import (
     Constraint,
     ExecutionContext,
@@ -22,6 +25,7 @@ from phasesweep.config import (
     Suite,
     SuiteDefaults,
 )
+from phasesweep.config.io import load_config, load_config_bytes
 
 
 def _metric() -> Metric:
@@ -207,9 +211,111 @@ def test_suite_revalidation_preserves_defaults_and_explicit_null(
         ],
     )
 
+    compiled = []
+    original_compile = Suite.experiment_for_study
+
+    def compile_once(self, study):
+        compiled.append(study.name)
+        return original_compile(self, study)
+
+    monkeypatch.setattr(Suite, "experiment_for_study", compile_once)
     results = run_suite(suite)
 
+    assert compiled == ["inherited", "reset"]
     assert results["inherited"]["p"].metric == 0
     assert results["reset"]["p"].metric == 7
     assert suite.experiment_for_study(suite.studies[0]).resolved_storage is not None
     assert suite.experiment_for_study(suite.studies[1]).resolved_storage is None
+
+
+@pytest.mark.parametrize("field", ["trial_command", "metric"])
+@pytest.mark.parametrize("invalid_index", [0, 1])
+@pytest.mark.parametrize("entrypoint", ["bytes", "path", "direct", "cli-validate", "cli-run"])
+def test_suite_resolves_all_studies_before_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    invalid_index: int,
+    entrypoint: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A missing required resolved field fails before directories or trainer launch."""
+    import phasesweep.engine.run as run_engine
+
+    monkeypatch.setattr(
+        run_engine,
+        "_run_experiment_outcome",
+        lambda *args, **kwargs: pytest.fail("invalid suite reached component execution"),
+    )
+    defaults = {
+        "workdir": str(tmp_path / "runs"),
+        "storage": None,
+        "trial_command": "echo x=1 {overrides}",
+        "override_format": "argparse",
+        "metric": _metric().model_dump(mode="json"),
+    }
+    studies = [
+        {"name": name, "phases": [{"name": "p", "n_trials": 1, "sampler": {"type": "grid"}}]}
+        for name in ("first", "second")
+    ]
+    # Cover absent defaults and explicit null overriding a valid default.
+    if invalid_index == 0:
+        del defaults[field]
+    else:
+        studies[invalid_index][field] = None
+    payload = {"suite": "invalid", "defaults": defaults, "studies": studies}
+    data = yaml.safe_dump(payload).encode()
+    path = tmp_path / "suite.yaml"
+    path.write_bytes(data)
+    if entrypoint.startswith("cli-"):
+        monkeypatch.setattr(sys, "argv", ["phasesweep", entrypoint.removeprefix("cli-"), str(path)])
+        with pytest.raises(SystemExit) as exc:
+            main()
+        assert exc.value.code == 2
+        output = capsys.readouterr().err
+        assert f"must define '{field}'" in output
+        assert "Traceback" not in output
+    else:
+        with pytest.raises(ValueError, match=f"must define '{field}'"):
+            if entrypoint == "direct":
+                run_suite(Suite.model_validate(payload))
+            elif entrypoint == "bytes":
+                load_config_bytes(data)
+            else:
+                load_config(path)
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize("mutation", ["phase", "defaults", "study"])
+def test_suite_revalidates_nested_mutations_before_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    import phasesweep.engine.run as run_engine
+
+    suite = Suite(
+        suite="mutated",
+        defaults=SuiteDefaults(
+            workdir=str(tmp_path / "runs"),
+            storage=None,
+            trial_command="echo x=1 {overrides}",
+            override_format="argparse",
+            metric=_metric(),
+        ),
+        studies=[StudySpec(name="s", phases=[_phase()])],
+    )
+    if mutation == "phase":
+        suite.studies[0].phases[0].search_space["bad"] = {"type": "int", "low": 5, "high": 0}
+    elif mutation == "defaults":
+        suite.defaults.env["BAD"] = ["not", "a", "string"]
+    else:
+        suite.studies[0].phases.append(_phase())
+    monkeypatch.setattr(
+        run_engine,
+        "_run_experiment_outcome",
+        lambda *args, **kwargs: pytest.fail("invalid suite reached component execution"),
+    )
+    with pytest.raises(ValueError):
+        run_suite(suite)
+    assert not (tmp_path / "runs").exists()

@@ -855,11 +855,11 @@ def test_suite_publication_refuses_broken_component_manifest(
 
     original = suite_ops._validate_suite_generation_publishable
 
-    def break_component_then_validate(suite_arg, generation_id: str) -> None:  # noqa: ANN001
+    def break_component_then_validate(suite_arg, generation_id: str, **kwargs) -> None:  # noqa: ANN001
         component_generation = _last_successful_generation_id(component)
         assert component_generation is not None
         _generation_winner_path(component, component_generation, "p").unlink()
-        original(suite_arg, generation_id)
+        original(suite_arg, generation_id, **kwargs)
 
     monkeypatch.setattr(
         suite_ops, "_validate_suite_generation_publishable", break_component_then_validate

@@ -319,6 +319,69 @@ def test_grid_int_rejects_an_upper_bound_off_the_step_lattice() -> None:
         )
 
 
+@pytest.mark.parametrize("sampler", ["random", "tpe", "cmaes"])
+@pytest.mark.parametrize(
+    "param",
+    [
+        {"type": "int", "low": 0, "high": 5, "step": 2},
+        {"type": "float", "low": 0, "high": 1, "step": 0.3},
+        {"type": "float", "low": -0.4, "high": 0.5, "step": 0.2},
+    ],
+)
+def test_non_grid_samplers_reject_off_lattice_endpoints(sampler, param) -> None:
+    with pytest.raises(ValidationError, match="evenly divid"):
+        make_experiment(
+            phases=[
+                {
+                    "name": "p",
+                    "n_trials": 1,
+                    "sampler": {"type": sampler, "seed": 0},
+                    "search_space": {"x": param},
+                }
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "param",
+    [
+        IntParam(type="int", low=0, high=6, step=2),
+        IntParam(type="int", low=-5, high=1, step=2),
+        IntParam(type="int", low=3, high=3, step=7),
+        FloatParam(type="float", low=0, high=1, step=0.1),
+        FloatParam(type="float", low=-0.3, high=0.3, step=0.2),
+        FloatParam(type="float", low=0.1, high=0.7, step=0.3),
+        FloatParam(type="float", low=-0.2, high=-0.2, step=0.3),
+        FloatParam(type="float", low=0, high=1e-12, step=1e-13),
+        FloatParam(type="float", low=-0.7, high=1.13),
+    ],
+)
+def test_non_grid_distributions_retain_configured_endpoints(param) -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": param},
+            )
+        ]
+    )
+    retained = experiment.phases[0].search_space["x"]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        distribution = (
+            optuna.distributions.IntDistribution(retained.low, retained.high, step=retained.step)
+            if isinstance(retained, IntParam)
+            else optuna.distributions.FloatDistribution(
+                retained.low, retained.high, step=retained.step
+            )
+        )
+    assert distribution.high == param.high
+    assert retained.model_dump() == param.model_dump()
+    assert not caught
+
+
 def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
     """Partial grid phases are allowed only when explicitly requested."""
     p = write_yaml(

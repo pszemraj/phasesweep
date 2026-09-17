@@ -10,7 +10,7 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment, run_experiment
-from phasesweep.config import Phase
+from phasesweep.config import Phase, Suite
 from phasesweep.runtime.commands import (
     compose_trainer_config,
     dump_overrides_json,
@@ -584,11 +584,10 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
 
 def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_path):
     """A contract shared between a json_file study and an argparse study is only
-    legal for the json_file one; the argparse study fails when it is compiled."""
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            """
+    legal for the json_file one; loading rejects the whole invalid suite."""
+    path = write_yaml(
+        tmp_path,
+        """
             suite: mixed_formats
             defaults:
               trial_command: "echo {overrides}"
@@ -610,9 +609,11 @@ def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_pat
                 override_format: argparse
                 phases: [{name: p, n_trials: 1, contracts: [frozen]}]
             """,
-        )
     )
 
+    with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):
+        load_config(path)
+    config = Suite.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     structured, flat = config.studies
     config.experiment_for_study(structured)
     with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):

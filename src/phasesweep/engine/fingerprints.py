@@ -194,16 +194,20 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     return dump
 
 
-def _suite_fingerprint(suite: Suite) -> str:
+def _suite_fingerprint(suite: Suite, experiments: Mapping[str, Experiment] | None = None) -> str:
     """Hash the fully compiled suite plan, including historical annotations.
 
     :param Suite suite: Suite whose study names, dependency edges, promotion
         rules, and resolved experiments contribute to the digest.
+    :param Mapping[str, Experiment] | None experiments: Already resolved studies,
+        when called during suite execution.
     :return str: SHA-256 of the canonical suite payload.
     """
     studies = []
     for study in suite.studies:
-        experiment = suite.experiment_for_study(study)
+        experiment = (
+            suite.experiment_for_study(study) if experiments is None else experiments[study.name]
+        )
         item = {
             "name": study.name,
             "depends_on": study.depends_on,

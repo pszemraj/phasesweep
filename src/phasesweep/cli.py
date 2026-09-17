@@ -162,11 +162,7 @@ def _load_cli_config(path: Path) -> Experiment | Suite:
     from pydantic import ValidationError
 
     try:
-        config = load_config(path)
-        if isinstance(config, Suite):
-            for study in config.studies:
-                config.experiment_for_study(study)
-        return config
+        return load_config(path)
     except ConfigError:
         raise
     except (ValidationError, ValueError) as exc:

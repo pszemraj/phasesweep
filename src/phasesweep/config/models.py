@@ -596,17 +596,32 @@ def _merge_override_outcomes(
 def _compatible_parent_outcome_combinations(
     parents: list[str],
     outcomes_by_phase: Mapping[str, tuple[_ConcreteOverrideOutcome, ...]],
-) -> list[tuple[_ConcreteOverrideOutcome, ...]]:
+    *,
+    phase_name: str,
+    remaining_expansions: int,
+) -> tuple[list[tuple[_ConcreteOverrideOutcome, ...]], int]:
     """Return direct-parent outcome combinations with consistent promotion branches.
 
     :param list[str] parents: Ordered direct parents of the phase being checked.
     :param Mapping[str, tuple[_ConcreteOverrideOutcome, ...]] outcomes_by_phase:
         Concrete exposed outcomes for each prior phase.
-    :return list[tuple[_ConcreteOverrideOutcome, ...]]: Compatible selections,
-        one outcome per direct parent in ``parents`` order.
+    :param str phase_name: Phase named in complexity errors.
+    :param int remaining_expansions: Unspent experiment-wide candidate budget.
+    :raises ValueError: The next expansion would exceed the validation budget.
+    :return tuple: Compatible selections and the remaining candidate budget.
     """
     combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = [()]
     for parent in parents:
+        # Charge every candidate before allocating the next layer, including
+        # combinations that will be rejected for incompatible decisions.
+        candidates = len(combinations) * len(outcomes_by_phase[parent])
+        if candidates > remaining_expansions:
+            raise ValueError(
+                f"Phase {phase_name!r} exceeds supported validation complexity: "
+                "at most 4,096 candidate outcome expansions per experiment. "
+                "Reduce conditional promotion branching or parent combinations."
+            )
+        remaining_expansions -= candidates
         next_combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = []
         for combination in combinations:
             for outcome in outcomes_by_phase[parent]:
@@ -614,7 +629,7 @@ def _compatible_parent_outcome_combinations(
                 if _merge_override_outcomes(candidate) is not None:
                     next_combinations.append(candidate)
         combinations = next_combinations
-    return combinations
+    return combinations, remaining_expansions
 
 
 def _deduplicate_override_outcomes(
@@ -797,7 +812,7 @@ class Experiment(_Frozen):
           * transitive inherited locked-key collisions (review v0.5.2 / item 4)
           * unresolved multi-parent locked-key collisions (review v0.5.2 / item 5)
           * sampler / search-space compatibility (review v0.5.2 / blocker 2)
-          * grid divisibility for float params (review v0.5.2 / blocker 4)
+          * bounded parent-outcome enumeration across the complete experiment
           * SQLite + parallel n_jobs (review v0.5.2 / blocker 6)
           * sampler seed / non-resumable acknowledgement on persistent storage
             (review v0.5.18 / finding F7)
@@ -815,13 +830,15 @@ class Experiment(_Frozen):
                 distinct; or any of the delegated per-phase checks (sampler/search
                 space, storage policy, sampler seed and non-resumable
                 acknowledgement, JSON-file override encodability, trial command
-                template) rejects the phase.
+                template) rejects the phase, or parent-outcome expansion exceeds
+                the experiment-wide validation complexity ceiling.
 
         """
         seen: dict[str, Phase] = {}
         seen_casefolded: dict[str, str] = {}
         possible_exported_keys_by_phase: dict[str, set[str]] = {}
         concrete_outcomes_by_phase: dict[str, tuple[_ConcreteOverrideOutcome, ...]] = {}
+        remaining_expansions = 4096
 
         for phase in self.phases:
             if phase.name in seen:
@@ -893,8 +910,11 @@ class Experiment(_Frozen):
             for parent in phase.inherits:
                 possible_inherited_keys.update(possible_exported_keys_by_phase[parent])
 
-            parent_combinations = _compatible_parent_outcome_combinations(
-                phase.inherits, concrete_outcomes_by_phase
+            parent_combinations, remaining_expansions = _compatible_parent_outcome_combinations(
+                phase.inherits,
+                concrete_outcomes_by_phase,
+                phase_name=phase.name,
+                remaining_expansions=remaining_expansions,
             )
             inherited_outcomes: list[_ConcreteOverrideOutcome] = []
             for combination in parent_combinations:
@@ -1670,16 +1690,24 @@ class Suite(_Frozen):
     def _validate_study_graph(self) -> Suite:
         """Require prior-only dependencies and comparable promotion metrics.
 
-        :raises ValueError: If study names duplicate, dependencies point forward,
+        :raises ValueError: If study names duplicate case-insensitively, dependencies point forward,
             or a promotion compares different resolved metric contracts.
         :return Suite: Self, unchanged.
         """
         seen: set[str] = set()
+        seen_casefolded: dict[str, str] = {}
         phases_by_study: dict[str, set[str]] = {}
         metrics_by_study: dict[str, Metric | None] = {}
         for study in self.studies:
             if study.name in seen:
                 raise ValueError(f"Duplicate study name {study.name!r}.")
+            folded = study.name.casefold()
+            if folded in seen_casefolded:
+                raise ValueError(
+                    f"Study names {seen_casefolded[folded]!r} and "
+                    f"{study.name!r} must be unique case-insensitively."
+                )
+            seen_casefolded[folded] = study.name
             resolved_metric = (
                 study.metric if "metric" in study.model_fields_set else self.defaults.metric
             )
@@ -1772,6 +1800,16 @@ class Suite(_Frozen):
             execution=value("execution") or ExecutionContext(),
             timeout_seconds_per_run=value("timeout_seconds_per_run"),
         )
+
+
+def _compile_suite_experiments(suite: Suite) -> dict[str, Experiment]:
+    """Resolve every study before any component execution can begin.
+
+    :param Suite suite: Validated suite whose defaults are resolved by its compiler.
+    :raises ValueError: A study cannot resolve to a valid experiment.
+    :return dict[str, Experiment]: Experiments keyed by case-preserving study name.
+    """
+    return {study.name: suite.experiment_for_study(study) for study in suite.studies}
 
 
 Config = Experiment | Suite

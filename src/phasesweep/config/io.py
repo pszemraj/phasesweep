@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from phasesweep.config.models import Config, Experiment, Suite
+from phasesweep.config.models import Config, Experiment, Suite, _compile_suite_experiments
 
 
 class ConfigError(ValueError):
@@ -130,6 +130,7 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
 
     Returns:
         :class:`Experiment` or :class:`Suite` parsed from exactly ``data``.
+        Every suite study has also been resolved and validated as an experiment.
 
     Raises:
         ConfigError: ``data`` is not UTF-8 text, the YAML cannot be parsed (including
@@ -137,6 +138,7 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
             is not a mapping.
         pydantic.ValidationError: The parsed mapping fails :class:`Suite` or
             :class:`Experiment` model validation.
+        ValueError: A suite study cannot resolve its required fields or defaults.
 
     """
     try:
@@ -145,7 +147,9 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
         raise ConfigError(f"{source}: config must be UTF-8 text: {exc}") from exc
     parsed = _load_yaml_mapping_from_text(text, source)
     if "suite" in parsed:
-        return Suite.model_validate(parsed)
+        suite = Suite.model_validate(parsed)
+        _compile_suite_experiments(suite)
+        return suite
     return Experiment.model_validate(parsed)
 
 
@@ -165,6 +169,7 @@ def load_config(path: str | Path) -> Config:
             (including duplicate mapping keys), or the top level is not a mapping.
         pydantic.ValidationError: The parsed mapping fails :class:`Suite` or
             :class:`Experiment` model validation.
+        ValueError: A suite study cannot resolve its required fields or defaults.
 
     """
     path_obj = Path(path)
