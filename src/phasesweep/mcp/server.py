@@ -1235,6 +1235,16 @@ class PhaseSweepMCP:
                 # orphaned pending snapshot without producing a result view.
                 if run is not None:
                     run = self._run_payload(handle)
+        if (
+            handle is not None
+            and run is not None
+            and result_source == "terminal_snapshot_unavailable"
+        ):
+            run["failure"] = self._run_failure_payload(
+                handle,
+                state=run["state"],
+                force_snapshot_unavailable=True,
+            )
         return target_id, status, run, handle, result_source
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
@@ -1654,13 +1664,19 @@ class PhaseSweepMCP:
             # mutable shared study a historical result for that run. Re-read
             # after deriving state: the runner may have completed its status
             # write between the first read and the state check.
-            if self._runs.state(handle) == "running":
+            if self._runs._runner_is_live(handle):
                 return None
+            # Reserve cleanup for a dead runner before this read fails closed.
+            # A concurrent recovery may own the transition lock, but that never
+            # makes mutable shared state historical evidence for this run ID.
+            self._runs.state(handle)
             terminal_status = self._runs.recorded_terminal_status(handle)
             if terminal_status is None:
                 raise RunResultSnapshotUnavailableError(handle.run_id)
         if terminal_status.get("result_snapshot_state") == "pending":
-            return None
+            if self._runs._runner_is_live(handle):
+                return None
+            raise RunResultSnapshotUnavailableError(handle.run_id, "pending")
         snapshot = parse_result_snapshot(terminal_status)
         if snapshot is not None:
             return snapshot

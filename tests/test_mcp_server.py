@@ -2729,14 +2729,17 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
             if read_tool == "await_run":
                 assert payload["reason"] == "terminal"
     else:
+        assert payload["result_source"] == "terminal_snapshot_unavailable"
+        assert payload["publication_integrity"] == "unknown"
+        assert payload["represented_generation_id"] is None
         if read_tool == "winners":
-            assert payload["result_source"] == "terminal_snapshot_unavailable"
-            assert payload["publication_integrity"] == "unknown"
             assert payload["winner_count"] == 0
-            assert payload["represented_generation_id"] is None
             assert payload["failure"]["code"] == "result_snapshot_unavailable"
         else:
+            assert payload["phases"][0]["trial_data_available"] is False
+            assert payload["phases"][0]["winner_present"] is False
             assert payload["run"]["recovery_required"] is True
+            assert payload["run"]["failure"]["code"] == "result_snapshot_unavailable"
         assert store.recovery_required(handle)
         if read_tool == "await_run":
             assert payload["reason"] == "recovery_required"
@@ -4497,9 +4500,12 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     awaited = asyncio.run(app.await_run(run_id))
 
     for payload in (status, awaited):
-        assert payload["result_source"] == "current_shared_study"
+        assert payload["result_source"] == "terminal_snapshot_unavailable"
+        assert payload["publication_integrity"] == "unknown"
+        assert payload["represented_generation_id"] is None
         assert payload["run"]["state"] == "running"
         assert payload["run"]["recovery_required"] is True
+        assert payload["run"]["failure"]["code"] == "result_snapshot_unavailable"
     assert winners["result_source"] == "terminal_snapshot_unavailable"
     assert winners["publication_integrity"] == "unknown"
     assert winners["winner_count"] == 0
