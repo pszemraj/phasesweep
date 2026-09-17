@@ -30,6 +30,8 @@ mkdir -p "$wheel_dir" "$install_root" "$project_dir" \
 # under the same temporary root so the EXIT trap removes every smoke artifact.
 unset PHASESWEEP_HOME
 export XDG_STATE_HOME="$smoke_root/state"
+mkdir -m 700 "$smoke_root/locks" || fail "could not create temporary lock directory"
+export PHASESWEEP_LOCK_DIR="$smoke_root/locks"
 
 command -v git >/dev/null || fail "git is not on PATH"
 command -v pip >/dev/null || fail "pip is not on PATH; activate the project environment first"
@@ -118,7 +120,27 @@ site_packages="$(find "$install_root/lib" -type d -name site-packages -print -qu
   || fail "installed wheel did not create a site-packages directory under $install_root/lib"
 
 export PATH="$install_root/bin:$PATH"
-export PYTHONPATH="$site_packages${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$site_packages"
+# A prefix install does not supply an interpreter. Give the starter's `python`
+# command a temporary launcher into that prefix so inherit_env: none can drop
+# ambient PYTHONPATH without falling back to an editable source installation.
+# Dependencies still come from the active interpreter; PhaseSweep comes only
+# from this wheel. No virtual environment or source-tree PYTHONPATH is used.
+python - "$install_root/bin/python" "$site_packages" <<'PY' \
+  || fail "could not create the temporary prefix interpreter launcher"
+import shlex
+import sys
+from pathlib import Path
+
+launcher = Path(sys.argv[1])
+launcher.write_text(
+    "#!/bin/sh\n"
+    f"export PYTHONPATH={shlex.quote(sys.argv[2])}\n"
+    f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+    encoding="utf-8",
+)
+launcher.chmod(0o755)
+PY
 cd "$project_dir" || fail "could not enter the scratch project directory $project_dir"
 
 # Read the version back from the installed distribution rather than the wheel
@@ -150,6 +172,8 @@ fi
 
 python -c 'import phasesweep, pathlib, sys; sys.exit(0 if pathlib.Path(phasesweep.__file__).is_relative_to(pathlib.Path(sys.argv[1])) else 1)' "$site_packages" \
   || fail "imported phasesweep from outside $site_packages; the smoke would be testing the checkout, not the wheel"
+env -u PYTHONPATH python -c 'import phasesweep, pathlib, sys; sys.exit(0 if pathlib.Path(phasesweep.__file__).is_relative_to(pathlib.Path(sys.argv[1])) else 1)' "$site_packages" \
+  || fail "trainer interpreter without ambient PYTHONPATH does not resolve the installed wheel"
 python -c 'import phasesweep.examples.fake_train' \
   || fail "installed wheel cannot import phasesweep.examples.fake_train"
 
@@ -171,6 +195,54 @@ phasesweep init || fail "'phasesweep init' failed in $project_dir"
 test -f experiment.yaml || fail "'phasesweep init' did not write $project_dir/experiment.yaml"
 phasesweep validate experiment.yaml || fail "'phasesweep validate experiment.yaml' failed"
 phasesweep run experiment.yaml --dry-run || fail "'phasesweep run experiment.yaml --dry-run' failed"
+phasesweep run experiment.yaml || fail "installed starter execution failed"
+phasesweep show-winners experiment.yaml || fail "installed starter winners could not be read"
+
+# Inspect the actual durable studies and trainer inputs before and after replay.
+# The snapshot stays inside the temporary project and is deleted by the EXIT trap.
+check_starter() {
+  python - "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+import optuna
+import yaml
+
+from phasesweep import load_experiment
+
+experiment = load_experiment("experiment.yaml")
+assert experiment.execution.inherit_env == "none"
+root = Path(experiment.workdir) / experiment.experiment
+counts = {}
+for phase in ("depth", "learning_rate"):
+    study = optuna.load_study(
+        study_name=f"{experiment.experiment}::{phase}",
+        storage=experiment.resolved_storage,
+    )
+    trials = study.get_trials()
+    counts[phase] = len(trials)
+    assert len(trials) == 2, (phase, len(trials))
+    assert all(trial.state == optuna.trial.TrialState.COMPLETE for trial in trials)
+    winner = yaml.safe_load((root / phase / "winner.yaml").read_text(encoding="utf-8"))
+    assert winner["effective_overrides"]["model.n_layers"] == 8, winner
+configs = sorted((root / "learning_rate").glob("trial_*/trainer_config.yaml"))
+assert len(configs) == 2, configs
+for path in configs:
+    trainer = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert trainer["model"]["n_layers"] == 8, (path, trainer)
+snapshot = Path("starter-counts.json")
+if sys.argv[1] == "before":
+    snapshot.write_text(json.dumps(counts), encoding="utf-8")
+else:
+    assert counts == json.loads(snapshot.read_text(encoding="utf-8")), counts
+print(f"Installed starter {sys.argv[1]} replay: {counts}; downstream depth=8.")
+PY
+}
+check_starter before || fail "installed starter results failed acceptance"
+phasesweep run experiment.yaml --from-phase learning_rate \
+  || fail "installed starter replay from learning_rate failed"
+check_starter after || fail "installed starter replay changed persistent counts or trainer inputs"
 phasesweep mcp init-catalog --from experiment.yaml -o catalog.yaml \
   || fail "'phasesweep mcp init-catalog' failed"
 test -f catalog.yaml || fail "'phasesweep mcp init-catalog' did not write $project_dir/catalog.yaml"
