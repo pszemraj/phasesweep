@@ -2,7 +2,7 @@
 
 `phasesweep-mcp` and `phasesweep mcp serve` expose a human-curated experiment catalog to an AI agent over the [Model Context Protocol](https://modelcontextprotocol.io) using the [supported MCP runtime](runtime.md#platform-support). See [Tools](#tools) for available requests and [Security model](#security-model) for the authority boundary.
 
-For installation and client setup, use [MCP agent setup](mcp_setup.md).
+For client-owned setup, use [MCP agent setup](mcp_setup.md).
 
 ## The catalog
 
@@ -23,7 +23,7 @@ components. Empty overrides are unset; relative `XDG_STATE_HOME` values use the
 home-directory fallback. Each researcher keeps private state; teams coordinating
 GPUs on one node use the existing [shared lock directory](runtime.md#concurrency-model).
 
-- `state_dir: path` (required): operator-owned directory for run handles, runner logs, config snapshots, and `audit.jsonl`. A catalog load that reaches state preparation creates missing directories with mode `0700`, validates existing directories without changing them, then probes each directory with a temporary file. Server startup, `mcp check`, `mcp init-catalog`, and MCP integration preflight for `mcp install` all load the catalog; even a dry run or a cancelled install can therefore create the private state layout. An unsafe existing mode fails with its observed owner/mode and a concrete `chmod 700 ...` remediation when ownership is already correct.
+- `state_dir: path` (required): operator-owned directory for run handles, runner logs, config snapshots, and `audit.jsonl`. A catalog load that reaches state preparation creates missing directories with mode `0700`, validates existing directories without changing them, then probes each directory with a temporary file. Server startup, `mcp check`, and `mcp init-catalog` all load the catalog. An unsafe existing mode fails with its observed owner/mode and a concrete `chmod 700 ...` remediation when ownership is already correct.
 - `max_concurrent_runs: int = 1` (minimum `1`): live-sweep cap across all catalog entries; see [concurrency and single-GPU hosts](#concurrency-and-single-gpu-hosts).
 - `experiments: list` (required; at least one item): allowlisted experiment entries. Entry IDs must be unique.
 - `experiments[].id: str` (required): agent-visible ID matching nonempty `[A-Za-z0-9_-]+`.
@@ -149,7 +149,7 @@ Clients that support MCP resources can attach `phasesweep://catalog`. It returns
 
 The server supplies the packaged [agent instructions](../src/phasesweep/mcp/agent_prompt.md) during initialization. Clients that support MCP prompts can also request them as `phasesweep_run_and_monitor`.
 
-The installer can place the same instructions in supported project instruction files; see [what the installer changes](mcp_setup.md#what-the-installer-changes).
+Clients may independently use the same packaged instructions, but PhaseSweep does not edit client-owned instruction or configuration files.
 
 ## Security model
 

@@ -4,7 +4,7 @@
 
 Non-dry-run execution requires a POSIX platform such as Linux or macOS. PhaseSweep uses POSIX process groups for subprocess cleanup and `fcntl.flock` for same-host locks. Config validation and `--dry-run` do not launch subprocesses and do not take those locks, but real runs fail early on unsupported platforms.
 
-MCP operations that validate a catalog, start the server, install an MCP client entry, or recover a run require Linux with readable `/proc` process start times. Detached runner launch also requires a readable boot ID; cancellation and recovery refuse to signal a saved process group when either boot ID is unknown. Together these identities make cancellation and crash recovery PID-reuse-safe across reboots. Instruction-only client installation does not load a catalog and remains available without the MCP runtime. The core CLI remains available on supported POSIX platforms.
+MCP operations that validate a catalog, start the server, or recover a run require Linux with readable `/proc` process start times. Detached runner launch also requires a readable boot ID; cancellation and recovery refuse to signal a saved process group when either boot ID is unknown. Together these identities make cancellation and crash recovery PID-reuse-safe across reboots. The core CLI remains available on supported POSIX platforms.
 
 ## Output layout
 

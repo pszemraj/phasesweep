@@ -37,7 +37,7 @@ The package is organized by behavior:
 - `phasesweep.evidence`: metric extractors, post-trial evidence gates, and W&B polling.
 - `phasesweep.reporting`: the trainer-side objective-envelope writer.
 - `phasesweep.runtime`: subprocess, GPU, lock, storage URL, and override helpers.
-- `phasesweep.mcp`: stdio MCP server, catalog registry, detached runner, run-handle store, operator recovery, and the client-config installer (`phasesweep.mcp.install`).
+- `phasesweep.mcp`: stdio MCP server, catalog registry, detached runner, run-handle store, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
 Common package-root calls are `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, `runtime`, or `mcp`.
@@ -94,7 +94,7 @@ Tests are organized by behavior:
 - `tests/test_filesystem_layout.py`: output namespace layout and experiment-name validation.
 - `tests/test_param_validation.py`: search-space validation, override keys, sampler compatibility, grids, seeds, template placeholders.
 - `tests/test_runtime_behavior.py`, `tests/test_protocol.py`, `tests/test_engine_read.py`, `tests/test_engine_status_shape.py`, `tests/test_publication_transaction.py`, `tests/test_trial_evidence.py`: timeout policy, contracts, evidence gates, promotion, suites, publication transactions, evidence-integrity guards, and read-only engine views.
-- `tests/test_mcp_*.py`: MCP catalog validation, preflight, and scaffolding; redaction; status timing and await_run; run handles; detached runner; server logic; the install/uninstall client-config flow; and e2e flow.
+- `tests/test_mcp_*.py`: MCP catalog validation, preflight, and scaffolding; redaction; status timing and await_run; run handles; detached runner; server logic; and e2e flow.
 - `tests/test_init.py`: starter creation, validation, dry-run, catalog scaffolding, output placement, and overwrite refusal.
 - `tests/test_reporting.py`: summary rendering, winner manifests, and report serialization.
 - `tests/test_tiny_decoder_example.py`: adapter composition, attempt-scoped final-checkpoint result envelopes, zero-seed handling, and empty-validation rejection.

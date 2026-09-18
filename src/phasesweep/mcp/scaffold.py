@@ -115,7 +115,8 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. After reviewing the
 # descriptions, paths, visibility, and permissions below, run:
 #   phasesweep mcp check --catalog {catalog_arg}
-#   phasesweep mcp install --catalog {catalog_arg} --dry-run
+# Then configure your MCP client to run the absolute `phasesweep-mcp` executable
+# with `--catalog` and this absolute catalog path.
 #
 # The agent only ever sends an experiment `id`. It cannot pass a path, author a
 # config, or reach trial_command / env / storage / workdir. You curate which

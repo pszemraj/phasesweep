@@ -93,10 +93,8 @@ Run the full sweep through [`catalog.yaml`](catalog.yaml), which registers [`mcp
 
 ```bash
 phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
-phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml --dry-run
-phasesweep mcp install --catalog examples/tiny_decoder_enwik8/catalog.yaml
 ```
 
-After installation, follow the [client restart and verification step](../../docs/mcp_setup.md#4-restart-and-verify).
+Configure your client with the absolute `phasesweep-mcp` executable and this catalog's absolute path, then verify the read-only catalog operation as described in [MCP setup](../../docs/mcp_setup.md#3-configure-your-client).
 
 The MCP variant uses scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`.
