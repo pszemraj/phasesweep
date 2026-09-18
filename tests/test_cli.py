@@ -94,6 +94,8 @@ def test_help_registers_commands_and_options() -> None:
 
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
+    assert "Manage the optional MCP server, catalog, and operator recovery." in mcp_help.output
+    assert "integrations" not in mcp_help.output
     for command in ("check", "init-catalog", "recover-run", "serve"):
         assert command in mcp_help.output
     for command in ("check-install", "install", "uninstall"):

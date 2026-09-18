@@ -597,7 +597,7 @@ def status(config_path: Path) -> None:
 
 @cli.group(
     context_settings=CONTEXT_SETTINGS,
-    help="Manage the optional MCP server and coding-agent integrations.",
+    help="Manage the optional MCP server, catalog, and operator recovery.",
     short_help="Manage the MCP server and agent integrations.",
 )
 def mcp() -> None:
