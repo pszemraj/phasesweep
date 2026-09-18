@@ -11,7 +11,7 @@ from typing import Any
 
 import optuna
 
-from phasesweep.config import Experiment, Phase, Suite
+from phasesweep.config import Experiment, Phase
 from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
 )
@@ -49,9 +49,9 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_seed_search",
     }
 )
-# v5 / v4 / v4: the embedded complete trainer_config is now part of the core
-# experiment contract and contributes to experiment, suite, and phase identity.
-# v4 / v3 / v3: an omitted execution.cwd contributes its effective
+# v6 / v5: the retained configuration surface changed. v5 / v4: the embedded
+# complete trainer_config is part of the core experiment and phase identity.
+# v4 / v3: an omitted execution.cwd contributes its effective
 # invocation directory instead of an unbound null. The earlier execution
 # contract work covered only configured cwd values, which still let identical
 # persistent-study identities launch different relative commands from two
@@ -59,15 +59,14 @@ _RUN_CONTROL_KEYS = frozenset(
 # configured device-set size — the trainer's world size.
 # Existing populated studies from earlier schemas fail the fingerprint check
 # on resume; see docs/config.md's upgrade section.
-FINGERPRINT_SCHEMA_VERSION = 5
-SUITE_FINGERPRINT_SCHEMA_VERSION = 4
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 4
+FINGERPRINT_SCHEMA_VERSION = 6
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 5
 
 
 def _evaluation_semantics(experiment: Experiment, phase: Phase | None = None) -> dict[str, int]:
     """Return revisions only for evaluators that can affect these results.
 
-    :param Experiment experiment: Config supplying objectives, constraints, and contracts.
+    :param Experiment experiment: Config supplying objectives and constraints.
     :param Phase | None phase: One phase, or all phases for a publication identity.
     :return dict[str, int]: Active evaluator kinds and their semantic revisions.
     """
@@ -78,10 +77,10 @@ def _evaluation_semantics(experiment: Experiment, phase: Phase | None = None) ->
         revisions["log_regex extractor"] = LOG_REGEX_EVALUATION_REVISION
     phases = experiment.phases if phase is None else [phase]
     for candidate in phases:
-        gates = list(candidate.gates)
-        for contract_name in candidate.contracts:
-            gates.extend(experiment.contracts[contract_name].gates)
-        if any(isinstance(gate, ArtifactSizeGate) and gate.source == "directory" for gate in gates):
+        if any(
+            isinstance(gate, ArtifactSizeGate) and gate.source == "directory"
+            for gate in candidate.gates
+        ):
             revisions["artifact_size directory gate"] = DIRECTORY_SIZE_EVALUATION_REVISION
     return revisions
 
@@ -156,10 +155,6 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
         "provenance": dict(sorted(experiment.provenance.items())),
         "metric": experiment.metric.model_dump(mode="json"),
         "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
-        "contracts": {
-            name: contract.model_dump(mode="json")
-            for name, contract in sorted(experiment.contracts.items())
-        },
         "phases": [
             {"name": phase.name, **_semantic_phase_dump(phase)} for phase in experiment.phases
         ],
@@ -183,11 +178,6 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     :param Phase phase: Phase whose semantic payload is being built.
     :return dict[str, Any]: JSON-serializable semantic phase payload.
     """
-    # Promotion runs after a phase's individual trials, but is still semantic:
-    # it determines the phase output persisted for this candidate (or whether
-    # it is replaced by a baseline or omitted) and therefore the overrides
-    # downstream phases inherit. A populated study must not replay that
-    # transition under edited promotion rules.
     dump = {k: v for k, v in phase.model_dump(mode="json").items() if k not in _RUN_CONTROL_KEYS}
     # acknowledge_nonresumable is run-control, not semantics: it never changes
     # what a trial samples or means (on persistent storage its legal value is
@@ -197,41 +187,6 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
         tokens = phase.gpu_ids if phase.gpu_ids is not None else phase.gpu_devices
         dump["whole_node_device_count"] = len(tokens or [])
     return dump
-
-
-def _suite_fingerprint(suite: Suite, experiments: Mapping[str, Experiment] | None = None) -> str:
-    """Hash the fully compiled suite plan, including historical annotations.
-
-    :param Suite suite: Suite whose study names, dependency edges, promotion
-        rules, and resolved experiments contribute to the digest.
-    :param Mapping[str, Experiment] | None experiments: Already resolved studies,
-        when called during suite execution.
-    :return str: SHA-256 of the canonical suite payload.
-    """
-    studies = []
-    for study in suite.studies:
-        experiment = (
-            suite.experiment_for_study(study) if experiments is None else experiments[study.name]
-        )
-        item = {
-            "name": study.name,
-            "depends_on": study.depends_on,
-            "promotion": (
-                None if study.promotion is None else study.promotion.model_dump(mode="json")
-            ),
-            "experiment": experiment.model_dump(mode="json"),
-            "execution_identity": _execution_identity(experiment),
-        }
-        if revisions := _evaluation_semantics(experiment):
-            item["evaluation_semantics"] = revisions
-        studies.append(item)
-    payload = {
-        "fingerprint_schema_version": SUITE_FINGERPRINT_SCHEMA_VERSION,
-        "suite": suite.suite,
-        "studies": studies,
-    }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _phase_semantic_payload(
@@ -264,9 +219,6 @@ def _phase_semantic_payload(
         "execution": _execution_identity(experiment),
         "metric": experiment.metric.model_dump(mode="json"),
         "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
-        "contracts": {
-            name: experiment.contracts[name].model_dump(mode="json") for name in phase.contracts
-        },
         "phase": semantic_phase,
         "inherited_effective_overrides": {
             parent: inherited_winners[parent].effective_overrides for parent in phase.inherits
@@ -346,7 +298,7 @@ def _verify_evaluation_semantics(
 
     :param optuna.Study study: Existing or newly created phase study.
     :param Experiment experiment: Current evidence configuration.
-    :param Phase phase: Phase whose direct and contract gates contribute.
+    :param Phase phase: Phase whose local gates contribute.
     :param bool stamp_safe: Record the revision after a safe fingerprint check.
     :raises StudyFingerprintMismatchError: Reusable or running trials have no
         matching evaluator revision.

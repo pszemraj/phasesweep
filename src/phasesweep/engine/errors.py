@@ -47,9 +47,8 @@ class ArtifactRootRebindError(PhaseSweepError):
     Covers every refusal of that command: nothing is bound to move, storage is
     in-memory so no binding exists, or the destination cannot be validated as
     the experiment's relocated artifact tree. Validation refusals precede
-    writes; an apply-time failure in a multi-study suite can follow an earlier
-    plan that was already applied, because suite rebind is intentionally not
-    one cross-storage transaction.
+    writes; an apply-time failure can follow an earlier binding update because
+    a rebind is not a cross-storage transaction.
     """
 
 
@@ -81,16 +80,6 @@ class PublicationCommitError(PhaseSweepError):
     its newly written summary cannot be read back or does not identify the
     generation being committed. It is distinct from read-side integrity and
     access verdicts about a previously published result.
-    """
-
-
-class PromotionError(PhaseSweepError):
-    """Raised when a configured promotion decision cannot expose a winner.
-
-    Covers an unavailable prior suite result (for example, one deliberately
-    omitted by an earlier ``on_fail: skip`` decision) and a failed promotion
-    whose configured action is ``on_fail: stop``. Both are ordinary run
-    outcomes selected by the suite policy, not PhaseSweep implementation bugs.
     """
 
 

@@ -24,6 +24,7 @@ from phasesweep.engine.optuna import (
     _load_existing_phase_study,
     _published_phase_trial_refs,
     _published_trial_matches,
+    _validate_local_storage_format,
 )
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.publication import _resolve_publication_pointer
@@ -65,11 +66,11 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
     )
 
 
-ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 2
+ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 3
 
 
-def _artifact_root_storage_key(experiment: Experiment) -> str:
-    """Return an opaque comparison key for one persistent storage ledger.
+def _artifact_root_storage_key(experiment: Experiment) -> str | None:
+    """Return an opaque comparison key, or an explicit in-memory identity.
 
     The canonical identity is credential-free but may contain other target
     selectors from a query or nested connection string. The artifact tree is
@@ -77,18 +78,20 @@ def _artifact_root_storage_key(experiment: Experiment) -> str:
     recovery state retains the operational URL.
 
     :param Experiment experiment: Experiment whose persistent ledger is identified.
-    :return str: Full SHA-256 hex digest of the canonical storage identity.
+    :return str | None: Full SHA-256 hex digest of the canonical persistent
+        storage identity, or ``None`` for deliberate no-ledger execution.
     """
     storage_identity = canonical_storage_identity(experiment.resolved_storage)
-    assert storage_identity is not None
+    if storage_identity is None or storage_is_in_memory(experiment.resolved_storage):
+        return None
     return hashlib.sha256(storage_identity.encode("utf-8")).hexdigest()
 
 
 def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
-    """Build the reverse ownership record for one persistent artifact root.
+    """Build the format and ownership record for one artifact root.
 
     :param Experiment experiment: Experiment whose artifact root is bound.
-    :return dict[str, Any]: Versioned experiment, root, and storage identity record.
+    :return dict[str, Any]: Versioned experiment, root, and optional storage identity record.
     """
     return {
         "schema_version": ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
@@ -206,21 +209,6 @@ def _validate_artifact_root_binding(
         the reverse binding and requires explicit adoption.
     """
     path = _artifact_root_binding_path(experiment)
-    if not _artifact_root_binding_applies(experiment):
-        try:
-            path.stat()
-        except FileNotFoundError:
-            return
-        except OSError as exc:
-            raise ArtifactRootConflictError(
-                f"Cannot inspect artifact-root binding {path}: {exc}."
-            ) from exc
-        raise ArtifactRootConflictError(
-            f"Artifact root {_artifact_root_identity(experiment)!r} already records a "
-            "persistent storage binding. An in-memory configuration cannot reuse this "
-            "tree. Restore its persistent storage setting, or use a new experiment name "
-            "or workdir for an in-memory run. Nothing was written."
-        )
     expected = _artifact_root_binding_payload(experiment)
     try:
         raw = strict_json_loads(path.read_text(encoding="utf-8"))
@@ -237,13 +225,13 @@ def _validate_artifact_root_binding(
                     "or convert storage ledgers. Nothing was written."
                 ) from None
             raise LegacyArtifactRootMigrationRequiredError(
-                f"Artifact root {expected['artifact_root']!r} contains PhaseSweep state "
-                f"entry {durable_entry!r} but records no storage-ledger binding. An "
-                "ordinary run or read cannot infer "
-                "which database owns this publication. Run 'phasesweep rebind-workdir "
-                "<config>' with a config naming this complete tree to adopt it explicitly. "
-                "No trial ran and nothing was published."
+                f"Artifact root {expected['artifact_root']!r} contains pre-cutover "
+                f"PhaseSweep state entry {durable_entry!r} but no supported format marker. "
+                "Use a fresh artifact root and fresh local storage with this PhaseSweep "
+                "release, or use the preserved PhaseSweep 0.3.1 environment to operate "
+                "the existing state. Nothing was written."
             ) from None
+        _validate_local_storage_format(experiment)
         if claim_fresh:
             try:
                 atomic_write_text(path, json.dumps(expected, sort_keys=True) + "\n")
@@ -265,6 +253,13 @@ def _validate_artifact_root_binding(
             f"Artifact-root binding {path} is unreadable or malformed: {exc}. Refusing "
             "to combine this tree with an unverified storage ledger."
         ) from exc
+    if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
+        raise ArtifactRootConflictError(
+            f"Artifact root {expected['artifact_root']!r} uses unsupported pre-cutover "
+            f"PhaseSweep format {raw.get('schema_version')!r}. Use a fresh artifact root "
+            "and fresh local storage with this PhaseSweep release, or use the preserved "
+            "PhaseSweep 0.3.1 environment to operate the existing state. Nothing was written."
+        )
     if raw != expected:
         backend_conflict = _auto_storage_backend_conflict(experiment, raw)
         if backend_conflict is not None:
@@ -280,10 +275,12 @@ def _validate_artifact_root_binding(
             )
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
-            f"ledger or experiment than {experiment.experiment!r}. "
-            "Use the config that owns this tree, or move the complete tree and run "
-            "'phasesweep rebind-workdir <config>'. No trial ran and nothing was published."
+            f"ledger or experiment than {experiment.experiment!r}. Use the config that owns "
+            "this current-format tree, or use a fresh artifact root and local storage. "
+            "Nothing was written."
         )
+    if claim_fresh:
+        _validate_local_storage_format(experiment)
 
 
 def _claim_study_artifact_root(study: optuna.Study, offered: str) -> None:
@@ -422,12 +419,12 @@ def _load_and_check_artifact_roots(
             raise unavailable from exc
         if study is not None:
             loaded[phase.name] = study
-    if not _artifact_root_binding_applies(experiment):
-        return loaded
-    _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
-    claimable = [
-        study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
-    ]
+    claimable: list[optuna.Study] = []
+    if _artifact_root_binding_applies(experiment):
+        _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
+        claimable = [
+            study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
+        ]
     # Both directions are now known-compatible. Claim the tree first, then
     # empty studies: a crash cannot leave a study pointing at a tree that does
     # not itself name the same ledger. Crucially, neither claim occurs when a

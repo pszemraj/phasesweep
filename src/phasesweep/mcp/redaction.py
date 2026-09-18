@@ -131,7 +131,6 @@ def winners_payload(
             "kind": source.kind,
             "phase": source.phase,
             "trial_number": source.trial_number,
-            "study": source.study,
         }
         source_generation_id = source.generation_id
         winner_generation = (
@@ -141,27 +140,11 @@ def winners_payload(
             if source_generation_id == represented_generation_id
             else "prior_generation"
         )
-        promotion = None
-        if view.promotion is not None and view.promotion.get("action") in (
-            "promote",
-            "continue_baseline",
-        ):
-            promotion = {
-                "action": view.promotion["action"],
-                "baseline_phase": view.promotion["baseline"],
-                "candidate_trial_number": view.promotion["candidate_trial_number"],
-                "candidate_metric": view.promotion["candidate_metric"],
-                "baseline_trial_number": view.promotion["baseline_trial_number"],
-                "baseline_metric": view.promotion["baseline_metric"],
-                "min_delta": view.promotion["min_delta"],
-                "improvement": view.promotion["improvement"],
-            }
         phases.append(
             {
                 "phase": view.phase,
                 "winner_source": winner_source,
                 "winner_generation": winner_generation,
-                "promotion": promotion,
                 "metric": view.metric,
                 "params": params,
                 "params_redacted": redacted,

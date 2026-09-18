@@ -10,11 +10,11 @@ from pathlib import Path
 
 import optuna
 import pytest
-import yaml
 
 from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.optuna import _phase_study_name
-from phasesweep.engine.paths import _generation_winner_path, _winner_path
+from phasesweep.engine.paths import _generation_winner_path
+from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION, Winner
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
@@ -41,9 +41,16 @@ def _complete_trials(experiment, *, n: int) -> None:
         storage=experiment.storage,
         direction="minimize",
     )
+    _mark_current_study(experiment, study)
     for i in range(n):
         trial = study.ask()
         study.tell(trial, float(i))
+
+
+def _mark_current_study(experiment, study: optuna.Study) -> None:
+    """Mark a manually constructed study/root as current-format test state."""
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
 def _handle(run_id: str, *, started_at: str) -> RunHandle:
@@ -185,26 +192,13 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         storage=experiment.storage,
     )
     study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
-    winner_path = _winner_path(experiment, "p")
-    winner_path.parent.mkdir(parents=True, exist_ok=True)
-    winner_path.write_text(
-        yaml.safe_dump(
-            {
-                "trial_number": 1,
-                "metric": {"loss": 0.25},
-                "params": {"lr": 0.00025},
-                "effective_overrides": {"lr": 0.00025},
-                "winner_source": {
-                    "kind": "phase_trial",
-                    "phase": "p",
-                    "trial_number": 1,
-                    "generation_id": "prior-generation",
-                    "attempt_id": "attempt-1",
-                    "study": None,
-                },
-            }
-        )
+    winner = Winner(
+        trial_number=1,
+        metric=0.25,
+        params={"lr": 0.00025},
+        effective_overrides={"lr": 0.00025},
+        generation_id="prior-generation",
+        attempt_id="attempt-1",
     )
     write_run_status(
         store,
@@ -212,26 +206,9 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
         returncode=0,
         error_class=None,
         cleanup_confirmed=True,
-        result_snapshot=capture_result_snapshot(experiment),
+        result_snapshot=capture_result_snapshot(experiment, engine_winners={"p": winner}),
     )
-    winner_path.write_text(
-        yaml.safe_dump(
-            {
-                "trial_number": 9,
-                "metric": {"loss": 9.9},
-                "params": {"lr": 0.009},
-                "effective_overrides": {"lr": 0.009},
-                "winner_source": {
-                    "kind": "phase_trial",
-                    "phase": "p",
-                    "trial_number": 9,
-                    "generation_id": "later-generation",
-                    "attempt_id": "attempt-9",
-                    "study": None,
-                },
-            }
-        )
-    )
+    study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
 
     run_status = app.status(run_id="r1")
     assert run_status["phases"][0]["trials"] == {
@@ -251,7 +228,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
     assert app.winners(run_id="r1")["phases"][0]["metric"] == 0.25
 
     # Experiment-id reads remain the current shared-storage view.
-    assert app.winners(experiment_id="srv")["phases"][0]["metric"] == 9.9
+    assert app.status(experiment_id="srv")["phases"][0]["trials"]["FAIL"] == 2
 
 
 def _app_with_run(tmp_path: Path, run_id: str = "r1"):
@@ -353,6 +330,7 @@ def test_await_run_reports_failed_trial_progress_at_timeout(
             storage=experiment.storage,
             direction="minimize",
         )
+        _mark_current_study(experiment, study)
         study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
 
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])

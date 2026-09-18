@@ -26,7 +26,7 @@ import yaml
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.evidence as evidence_ops
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Phase, Promotion, Sampler
+from phasesweep.config import Experiment, IntParam, Phase, Sampler
 from phasesweep.engine import (
     NoFeasibleTrialError,
     TrialEvidenceMissingError,
@@ -530,43 +530,6 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     resumed = run_experiment(experiment, from_phase="q")
 
     assert resumed["p"].trial_number == 0
-
-
-def test_from_phase_promotion_uses_the_baseline_source_evidence(tmp_path: Path) -> None:
-    """A promoted skipped winner resolves evidence from its baseline, not exposure phase."""
-    trainer = write_trainer(tmp_path / "promotion_trainer.py", _CONSTANT_TRAINER)
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        phases=[
-            Phase(name="base", n_trials=1, sampler=Sampler(type="random", seed=0)),
-            Phase(
-                name="candidate",
-                n_trials=1,
-                sampler=Sampler(type="random", seed=1),
-                promotion=Promotion(
-                    min_delta_vs="base", min_delta=1.0, on_fail="continue_baseline"
-                ),
-            ),
-            Phase(name="later", n_trials=1, sampler=Sampler(type="random", seed=2)),
-        ],
-    )
-    winners = run_experiment(experiment)
-    assert winners["candidate"].source is not None
-    assert winners["candidate"].source.phase == "base"
-    candidate_dir = _phase_dir(experiment, "candidate")
-    for trial_dir in candidate_dir.glob("trial_*"):
-        shutil.rmtree(trial_dir)
-    optuna.delete_study(
-        study_name=_phase_study_name(experiment, experiment.phases[1]),
-        storage=experiment.storage,
-    )
-
-    resumed = run_experiment(experiment, from_phase="later")
-
-    assert resumed["candidate"].source is not None
-    assert resumed["candidate"].source.phase == "base"
 
 
 def test_skipped_winner_evidence_uses_the_relocated_artifact_tree(tmp_path: Path) -> None:

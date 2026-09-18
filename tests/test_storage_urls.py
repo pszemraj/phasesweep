@@ -5,10 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-import yaml
 from pydantic import ValidationError
 
-from phasesweep import load_config, load_experiment
+from phasesweep import load_experiment
 from phasesweep.config import (
     ExecutionContext,
     Experiment,
@@ -17,7 +16,6 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
-    Suite,
 )
 from phasesweep.engine import read_status, run_experiment
 from phasesweep.engine.locking import _run_lock_paths
@@ -68,35 +66,6 @@ def test_auto_storage_requires_persistent_contract(invalid: str) -> None:
         ).model_dump()
     with pytest.raises(ValidationError, match="provenance|seed|acknowledge_nonresumable"):
         Experiment.model_validate(payload)
-
-
-def test_suite_auto_storage_uses_compiled_names_and_overrides(tmp_path: Path) -> None:
-    exp = make_experiment(workdir=tmp_path / "runs", storage="auto")
-    defaults = exp.model_dump(mode="json")
-    defaults.pop("experiment")
-    phases = defaults.pop("phases")
-    parallel = [{**phases[0], "name": "parallel", "n_jobs": 2, "allow_no_gpu_isolation": True}]
-    suite = Suite.model_validate(
-        {
-            "suite": "suite",
-            "defaults": defaults,
-            "studies": [
-                {"name": "first", "phases": phases},
-                {"name": "second", "phases": phases + parallel},
-                {"name": "memory", "phases": phases, "storage": None},
-            ],
-        }
-    )
-    first, second, memory = [suite.experiment_for_study(study) for study in suite.studies]
-    assert (
-        sqlite_database_path(first.resolved_storage)
-        == tmp_path / "runs" / "suite__first" / "study.db"
-    )
-    assert file_url_path(second.resolved_storage) == str(
-        tmp_path / "runs" / "suite__second" / "study.journal"
-    )
-    assert memory.resolved_storage is None
-    assert not (tmp_path / "runs").exists()
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
@@ -406,48 +375,6 @@ def test_rdb_query_credentials_never_appear_in_config_validation_errors(
 
     assert secret not in str(policy_info.value)
     assert secret not in str(sampler_info.value)
-
-
-def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path) -> None:
-    """``allow_external_rdb_single_host`` flows from Suite defaults into each compiled
-    study's Experiment exactly like ``storage`` and other defaulted fields
-    (see ``Suite.experiment_for_study``); a study can still opt out and hit
-    the same Experiment-level rejection as a standalone config."""
-    path = write_yaml(
-        tmp_path,
-        """
-            suite: external_rdb_suite
-            defaults:
-              storage: postgresql://user:pass@host/db
-              allow_external_rdb_single_host: true
-              trial_command: "echo"
-              override_format: argparse
-              provenance: {revision: default-v1}
-              metric:
-                name: x
-                goal: minimize
-                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
-            studies:
-              - name: inherited
-                phases: [{name: p, n_trials: 1, sampler: {type: random, seed: 0}}]
-              - name: opted_out
-                allow_external_rdb_single_host: false
-                phases: [{name: p, n_trials: 1, sampler: {type: random, seed: 0}}]
-            """,
-    )
-
-    with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
-        load_config(path)
-    config = Suite.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
-    assert isinstance(config, Suite)
-    inherited_study, opted_out_study = config.studies
-
-    inherited = config.experiment_for_study(inherited_study)
-    assert inherited.storage == "postgresql://user:pass@host/db"
-    assert inherited.allow_external_rdb_single_host is True
-
-    with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
-        config.experiment_for_study(opted_out_study)
 
 
 def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:

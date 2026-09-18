@@ -37,6 +37,23 @@ def _earlier_boot_id() -> str:
     return other if other != current else "11111111-1111-1111-1111-111111111111"
 
 
+def _state_tree_snapshot(state_dir: Path) -> dict[Path, tuple[int, bytes | None]]:
+    """Capture durable state entries so refusal tests can prove no mutation.
+
+    :param Path state_dir: MCP state root to snapshot.
+    :return dict[Path, tuple[int, bytes | None]]: Relative path, mode, and file bytes.
+    """
+    snapshot: dict[Path, tuple[int, bytes | None]] = {}
+    for path in (state_dir, *sorted(state_dir.rglob("*"))):
+        info = path.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        snapshot[path.relative_to(state_dir)] = (
+            mode,
+            path.read_bytes() if stat.S_ISREG(info.st_mode) else None,
+        )
+    return snapshot
+
+
 def test_create_get_roundtrip(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(
@@ -392,6 +409,7 @@ def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> N
     assert file_mode(tmp_path / "state") == 0o700
     assert file_mode(tmp_path / "state" / "runs") == 0o700
     assert file_mode(tmp_path / "state" / "logs") == 0o700
+    assert file_mode(tmp_path / "state" / ".phasesweep-format.json") == 0o600
     assert file_mode(tmp_path / "state" / "runs" / "exp-1.json") == 0o600
     assert file_mode(tmp_path / "state" / "logs" / "exp-1.status.json") == 0o600
     assert file_mode(tmp_path / "state" / "logs" / "exp-1.cleanup_uncertain.json") == 0o600
@@ -416,6 +434,99 @@ def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: 
     assert {
         path: file_mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
     } == before_modes
+
+
+def test_run_store_marks_fresh_scaffolded_state(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o700)
+    private_atomic_write_text(state_dir / "origin", "catalog.yaml\n")
+
+    RunStore(state_dir)
+
+    marker = state_dir / ".phasesweep-format.json"
+    assert json.loads(marker.read_text()) == {"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION}
+    assert file_mode(marker) == 0o600
+    assert (state_dir / "origin").read_text() == "catalog.yaml\n"
+    assert (state_dir / "runs").is_dir()
+    assert (state_dir / "logs").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("marker_text", "match"),
+    [
+        ("not json\n", "malformed or unsupported"),
+        ('{"schema_version": 0}\n', "malformed or unsupported"),
+        ('{"schema_version": 1, "unexpected": true}\n', "malformed or unsupported"),
+    ],
+)
+def test_run_store_rejects_invalid_format_marker_without_mutation(
+    tmp_path: Path,
+    marker_text: str,
+    match: str,
+) -> None:
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    marker = state_dir / ".phasesweep-format.json"
+    private_atomic_write_text(marker, marker_text)
+    before = _state_tree_snapshot(state_dir)
+
+    with pytest.raises(ValueError, match=match):
+        RunStore(state_dir)
+
+    assert _state_tree_snapshot(state_dir) == before
+
+
+@pytest.mark.parametrize("evidence_kind", ["handle", "status", "log", "lease", "audit"])
+def test_run_store_refuses_unmarked_durable_state_before_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence_kind: str,
+) -> None:
+    state_dir = tmp_path / "state"
+    store = RunStore(state_dir)
+    run_id = "exp-1"
+    if evidence_kind == "handle":
+        store.create(make_run_handle(run_id=run_id))
+    elif evidence_kind == "status":
+        write_status_file(store.status_path(run_id), {"run_id": run_id, "returncode": 0})
+    elif evidence_kind == "log":
+        private_atomic_write_text(store.log_path(run_id), "runner output\n")
+    elif evidence_kind == "lease":
+        private_atomic_write_text(store.launch_lease_path(run_id), "")
+    else:
+        private_atomic_write_text(state_dir / "audit.jsonl", '{"tool":"launch_run"}\n')
+    marker = state_dir / ".phasesweep-format.json"
+    marker.unlink()
+    before = _state_tree_snapshot(state_dir)
+    initialized: list[Path] = []
+
+    def fail_if_initialized(path: Path) -> None:
+        initialized.append(path)
+        raise AssertionError("unmarked durable state must not be initialized")
+
+    monkeypatch.setattr(mcp_runs, "ensure_private_dir", fail_if_initialized)
+
+    with pytest.raises(ValueError, match="no format marker.*fresh MCP state directory.*0.3.1"):
+        RunStore(state_dir)
+
+    assert initialized == []
+    assert _state_tree_snapshot(state_dir) == before
+
+
+def test_open_existing_requires_supported_format_marker_without_mutation(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    marker = state_dir / ".phasesweep-format.json"
+    marker.unlink()
+    before = _state_tree_snapshot(state_dir)
+
+    with pytest.raises(
+        ValueError, match="malformed or unsupported.*fresh MCP state directory.*0.3.1"
+    ):
+        RunStore.open_existing(state_dir)
+
+    assert _state_tree_snapshot(state_dir) == before
 
 
 @pytest.mark.parametrize(

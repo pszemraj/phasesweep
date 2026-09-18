@@ -70,6 +70,9 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".launch.lock",
     ".transition.lock",
 )
+MCP_STATE_FORMAT_VERSION = 1
+_STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
+_STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 
 
 def _strict_fsync_directory(path: Path) -> None:
@@ -291,9 +294,12 @@ class RunStore:
         :param Path state_dir: Root directory for runs, logs, config snapshots, and launch lock.
         """
         self._set_paths(state_dir)
+        needs_marker = self._inspect_format_boundary()
         ensure_private_dir(state_dir)
         ensure_private_dir(self._runs_dir)
         ensure_private_dir(self._logs_dir)
+        if needs_marker:
+            self._create_format_marker()
 
     @classmethod
     def open_existing(cls, state_dir: Path) -> RunStore:
@@ -322,6 +328,7 @@ class RunStore:
                 "not an existing MCP state directory; expected directories are missing: "
                 + ", ".join(missing)
             )
+        store._require_supported_format_marker()
         return store
 
     def _set_paths(self, state_dir: Path) -> None:
@@ -332,6 +339,110 @@ class RunStore:
         self._runs_dir = state_dir / "runs"
         self._logs_dir = state_dir / "logs"
         self._launch_lock_path = state_dir / ".launch.lock"
+        self._format_marker_path = state_dir / _STATE_FORMAT_MARKER_NAME
+
+    def _inspect_format_boundary(self) -> bool:
+        """Inspect an existing namespace before initialization can mutate it.
+
+        A marker is written only for a namespace with no durable run-store
+        evidence. A pre-marker state that already contains handles, logs,
+        leases, or audit records belongs to the preserved 0.3.1 runtime and
+        must never be adopted by this release.
+
+        :return bool: Whether this fresh namespace needs its first marker.
+        :raises ValueError: The namespace contains unsupported or unmarked
+            durable state.
+        :raises UnsafePrivatePathError: An existing state path is unsafe.
+        """
+        try:
+            self._format_marker_path.parent.lstat()
+        except FileNotFoundError:
+            return True
+
+        validate_private_dir(self._format_marker_path.parent)
+        if self._path_entry_exists(self._format_marker_path):
+            self._require_supported_format_marker()
+            return False
+        if self._has_durable_state_evidence():
+            raise self._format_refusal("durable run data has no format marker")
+        return True
+
+    @staticmethod
+    def _path_entry_exists(path: Path) -> bool:
+        """Return whether a path entry exists without ignoring dangling links.
+
+        :param Path path: Entry to inspect without following it.
+        :return bool: Whether any filesystem entry is present at ``path``.
+        """
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _has_durable_state_evidence(self) -> bool:
+        """Return whether an unmarked namespace contains run-store evidence.
+
+        Empty ``runs/`` and ``logs/`` directories, as well as the catalog
+        scaffolder's root-level ``origin`` record, remain fresh. Any entry
+        below the run or log directories is durable evidence: interrupted
+        writes and unfamiliar legacy records must fail closed rather than be
+        treated as an empty namespace.
+
+        :return bool: Whether durable pre-marker run-store evidence is present.
+        :raises UnsafePrivatePathError: A present run-store directory is unsafe.
+        """
+        if self._path_entry_exists(self._format_marker_path.parent / "audit.jsonl"):
+            return True
+        for directory in (self._runs_dir, self._logs_dir):
+            if not self._path_entry_exists(directory):
+                continue
+            validate_private_dir(directory)
+            try:
+                with os.scandir(directory) as entries:
+                    if next(entries, None) is not None:
+                        return True
+            except OSError as exc:
+                raise self._format_refusal("durable run data could not be inspected") from exc
+        return False
+
+    def _require_supported_format_marker(self) -> None:
+        """Require the exact current private namespace marker without writing it.
+
+        :raises ValueError: The marker is malformed or declares another format.
+        """
+        payload = _read_json_object(self._format_marker_path)
+        if (
+            payload is None
+            or set(payload) != {"schema_version"}
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != MCP_STATE_FORMAT_VERSION
+        ):
+            raise self._format_refusal("format marker is malformed or unsupported")
+
+    def _create_format_marker(self) -> None:
+        """Atomically claim the current format for a verified fresh namespace.
+
+        A concurrent fresh initializer can win the exclusive create; in that
+        case its marker is re-read and must be the exact supported record.
+        """
+        payload = json.dumps(_STATE_FORMAT_MARKER_PAYLOAD) + "\n"
+        try:
+            _strict_atomic_create_text(self._format_marker_path, payload)
+        except FileExistsError:
+            self._require_supported_format_marker()
+
+    def _format_refusal(self, detail: str) -> ValueError:
+        """Build the actionable refusal for pre-cutover MCP state.
+
+        :param str detail: Specific format-boundary failure observed.
+        :return ValueError: Refusal that directs the operator to a safe path.
+        """
+        return ValueError(
+            f"MCP state directory {self._format_marker_path.parent} {detail}; "
+            "use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime "
+            "for existing state."
+        )
 
     @contextlib.contextmanager
     def launch_lock(self) -> Iterator[bool]:

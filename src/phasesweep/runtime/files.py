@@ -34,7 +34,7 @@ SHARED_FILE_MODE = 0o660
 def ensure_artifact_dir(path: Path) -> None:
     """Create a self-ignoring artifact namespace without replacing its ignore file.
 
-    :param Path path: Managed experiment or suite directory, not its shared workdir.
+    :param Path path: Managed experiment directory, not its shared workdir.
     """
     path.mkdir(parents=True, exist_ok=True)
     try:

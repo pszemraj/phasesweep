@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib
 import json
-import logging
 import shutil
 import sqlite3
 from pathlib import Path
@@ -19,7 +18,6 @@ from phasesweep.config import (
     ArtifactSizeGate,
     CategoricalParam,
     Constraint,
-    Contract,
     ExecutionContext,
     Experiment,
     FloatParam,
@@ -29,11 +27,7 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
-    Promotion,
     Sampler,
-    StudySpec,
-    Suite,
-    SuiteDefaults,
     WandbExtractor,
 )
 from phasesweep.engine import (
@@ -48,12 +42,14 @@ from phasesweep.engine import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrialTargetRegressionError,
-    WinnerIntegrityError,
     read_status,
     read_winner,
     read_winners,
 )
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.artifact_roots import (
+    ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
+    _validate_artifact_root_binding,
+)
 from phasesweep.engine.artifacts import _load_winner, _save_winner
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.fingerprints import (
@@ -73,7 +69,6 @@ from phasesweep.engine.paths import (
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
-    _generations_dir,
     _last_successful_generation_path,
     _phase_dir,
     _summary_path,
@@ -95,6 +90,8 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FAILURE_REASON_ATTR,
     PHASE_EVALUATION_SEMANTICS_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
@@ -160,57 +157,6 @@ def _two_phase_experiment(
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         override_format="argparse",
         phases=phases,
-    )
-
-
-def _promotion_chain_experiment(
-    *,
-    workdir: Path,
-    trainer: Path,
-    storage: str,
-    on_fail: str,
-    arch_n_trials: int = 1,
-) -> Experiment:
-    """Build an arch --promotion baseline--> mid experiment with no inheritance edge.
-
-    ``mid`` depends on ``arch`` only through ``promotion.min_delta_vs``, which
-    config validation requires to name a *prior* phase rather than an inherited
-    one. The constant trainer makes the delta exactly zero, so the first run
-    promotes (``improvement >= min_delta``) and both phases publish a winner.
-
-    :param Path workdir: Artifact root for the experiment.
-    :param Path trainer: Trainer script invoked by every trial.
-    :param str storage: Optuna storage URL; persistent so studies outlive a run.
-    :param str on_fail: Promotion ``on_fail`` policy for ``mid``.
-    :param int arch_n_trials: Trial target for ``arch``; raise it to request a top-up.
-    :return Experiment: Two-phase experiment linked by a promotion baseline.
-    """
-    return make_experiment(
-        workdir=str(workdir),
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=[
-            Phase(
-                name="arch",
-                n_trials=arch_n_trials,
-                sampler=Sampler(type="random", seed=0),
-                search_space={"depth": IntParam(type="int", low=1, high=4)},
-            ),
-            Phase(
-                name="mid",
-                n_trials=1,
-                sampler=Sampler(type="random", seed=1),
-                search_space={},
-                fixed_overrides={"width": 8},
-                promotion=Promotion(
-                    min_delta_vs="arch",
-                    min_delta=0.0,
-                    requires_gates=False,
-                    on_fail=on_fail,  # type: ignore[arg-type]
-                ),
-            ),
-        ],
     )
 
 
@@ -592,10 +538,8 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
         ("objective", "log_regex extractor"),
         ("constraint", "log_regex extractor"),
         ("phase-directory", "artifact_size directory gate"),
-        ("contract-directory", "artifact_size directory gate"),
         ("json-envelope", None),
         ("file-size", None),
-        ("unused-contract-directory", None),
     ],
 )
 def test_evaluator_revision_rejects_only_affected_legacy_fingerprints(
@@ -622,12 +566,6 @@ def test_evaluator_revision_rejects_only_affected_legacy_fingerprints(
         ]
     elif scenario == "phase-directory":
         config["phases"][0]["gates"] = [directory_gate.model_dump(mode="json")]
-    elif scenario in {"contract-directory", "unused-contract-directory"}:
-        config["contracts"] = {
-            "checkpoint_limit": Contract(gates=[directory_gate]).model_dump(mode="json")
-        }
-        if scenario == "contract-directory":
-            config["phases"][0]["contracts"] = ["checkpoint_limit"]
     elif scenario == "file-size":
         config["phases"][0]["gates"] = [
             ArtifactSizeGate(
@@ -647,30 +585,15 @@ def test_evaluator_revision_rejects_only_affected_legacy_fingerprints(
         evaluator is not None
     )
 
-    # Publication identities apply the same conditional revision, including
-    # each compiled study in a suite, without perturbing unaffected histories.
+    # The experiment identity applies the same conditional revision without
+    # perturbing unaffected histories.
     from phasesweep.engine import fingerprints as fingerprint_ops
 
-    suite = Suite(
-        suite="evaluation_revision",
-        defaults=SuiteDefaults(
-            workdir=experiment.workdir,
-            trial_command=experiment.trial_command,
-            override_format=experiment.override_format,
-            metric=experiment.metric,
-            constraints=experiment.constraints,
-            contracts=experiment.contracts,
-        ),
-        studies=[StudySpec(name="study", phases=experiment.phases)],
-    )
     current_experiment_fp = fingerprint_ops._experiment_semantic_fingerprint(experiment)
-    current_suite_fp = fingerprint_ops._suite_fingerprint(suite)
     with monkeypatch.context() as patch:
         patch.setattr(fingerprint_ops, "_evaluation_semantics", lambda _experiment, _phase=None: {})
         legacy_experiment_fp = fingerprint_ops._experiment_semantic_fingerprint(experiment)
-        legacy_suite_fp = fingerprint_ops._suite_fingerprint(suite)
     assert (current_experiment_fp != legacy_experiment_fp) is (evaluator is not None)
-    assert (current_suite_fp != legacy_suite_fp) is (evaluator is not None)
 
     study = optuna.create_study()
     study.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
@@ -724,7 +647,6 @@ def test_evaluator_revision_rejects_only_affected_legacy_fingerprints(
             "objective": "metric extractor: no valid log-regex match",
             "constraint": "constraint extractor 'memory': no valid log-regex match",
             "phase-directory": "evidence gates failed: checkpoint directory too large",
-            "contract-directory": "evidence gates failed: checkpoint directory too large",
         }[scenario]
         evaluated_trial.set_user_attr(FAILURE_REASON_ATTR, reason)
         failed_evaluation.tell(evaluated_trial, state=optuna.trial.TrialState.FAIL)
@@ -1033,36 +955,6 @@ def test_wandb_base_endpoint_change_rejects_topup_before_allocation(
     assert calls == ["https://wandb-a.example.test"]
 
 
-def test_suite_fingerprint_includes_effective_invocation_cwd(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A suite cannot compile the same relative trainer command from two code trees."""
-    base = make_experiment()
-    suite = Suite(
-        suite="identity",
-        defaults=SuiteDefaults(
-            workdir=base.workdir,
-            trial_command=base.trial_command,
-            override_format=base.override_format,
-            metric=base.metric,
-        ),
-        studies=[StudySpec(name="study", phases=base.phases)],
-    )
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    first.mkdir()
-    second.mkdir()
-
-    from phasesweep.engine.fingerprints import _suite_fingerprint
-
-    monkeypatch.chdir(first)
-    first_fingerprint = _suite_fingerprint(suite)
-    monkeypatch.chdir(second)
-
-    assert _suite_fingerprint(suite) != first_fingerprint
-
-
 def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
     """Toggling the acknowledgement must not move the phase fingerprint.
 
@@ -1345,65 +1237,6 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
     assert {path: path.read_bytes() for path in protected_paths} == before
 
 
-@pytest.mark.parametrize("on_fail", ["skip", "stop", "continue_baseline"])
-def test_promotion_baseline_top_up_is_rejected_before_bound_chain_mutation(
-    tmp_path: Path, on_fail: str
-) -> None:
-    """A bound promotion dependent makes an upstream top-up a preflight refusal.
-
-    Unguarded, every ``on_fail`` policy mutated ``arch`` first and then failed
-    differently against the new baseline winner: ``stop`` raised mid-run,
-    ``continue_baseline`` republished the baseline's overrides under ``mid``
-    (breaking any bound study inheriting it), and ``skip`` - the worst - still
-    *succeeded*, publishing a generation containing only ``arch`` and advancing
-    the last-success pointer past the previously published ``mid`` winner
-    (PR #5 review / reviewer 2 pass 2, blocker 2). The refusal must land before
-    any of that, and it is unconditional - the guard refuses the top-up rather
-    than predicting whether the new baseline would flip the decision - so a
-    constant trainer pins it.
-    """
-    trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
-    experiment = _promotion_chain_experiment(
-        workdir=tmp_path / "runs",
-        trainer=trainer,
-        storage=storage,
-        on_fail=on_fail,
-    )
-    winners = run_experiment(experiment)
-    assert set(winners) == {"arch", "mid"}
-    published = _last_successful_generation_id(experiment)
-    assert published is not None
-    protected_paths = [
-        _summary_path(experiment),
-        _last_successful_generation_path(experiment),
-        _generation_summary_path(experiment, published),
-        _generation_record_path(experiment, published),
-        *(_winner_path(experiment, phase.name) for phase in experiment.phases),
-        *(
-            _generation_winner_path(experiment, published, phase.name)
-            for phase in experiment.phases
-        ),
-    ]
-    before = {path: path.read_bytes() for path in protected_paths}
-    parent_before = optuna.load_study(study_name="t::arch", storage=storage).trials
-
-    topped_up = _promotion_chain_experiment(
-        workdir=tmp_path / "runs",
-        trainer=trainer,
-        storage=storage,
-        on_fail=on_fail,
-        arch_n_trials=4,
-    )
-    with pytest.raises(RuntimeError, match="promotion baseline.*new experiment name"):
-        run_experiment(topped_up)
-
-    parent_after = optuna.load_study(study_name="t::arch", storage=storage).trials
-    assert len(parent_after) == len(parent_before) == 1
-    assert _last_successful_generation_id(topped_up) == published
-    assert {path: path.read_bytes() for path in protected_paths} == before
-
-
 def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
     """A grandchild study binds its ancestor even when the middle study is absent."""
     experiment = make_experiment(
@@ -1429,111 +1262,6 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
             from_phase=None,
             existing_studies={"arch": parent_study, "final": grandchild_study},
         )
-
-
-def test_upstream_top_up_detects_a_bound_promotion_baseline_dependent() -> None:
-    """A promotion baseline binds its dependent study with no inheritance edge.
-
-    ``promotion.min_delta_vs`` only has to name a prior phase, so this graph is
-    legal and the dependency is invisible to an inherits-only closure
-    (PR #5 review / reviewer 2 pass 2, blocker 2).
-    """
-    experiment = make_experiment(
-        phases=[
-            Phase(
-                name="arch",
-                n_trials=2,
-                search_space={"depth": IntParam(type="int", low=1, high=2)},
-            ),
-            Phase(
-                name="mid",
-                n_trials=1,
-                search_space={},
-                fixed_overrides={"width": 8},
-                promotion=Promotion(min_delta_vs="arch", min_delta=0.0, on_fail="skip"),
-            ),
-        ]
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match=r"study/studies \['mid'\] are already bound to its published winner "
-        r"via a promotion baseline\.",
-    ):
-        _reject_bound_descendant_topups(
-            experiment,
-            from_phase=None,
-            existing_studies={
-                "arch": _fake_top_up_study(completed=1),
-                "mid": _fake_top_up_study(fingerprint="bound-mid"),
-            },
-        )
-
-
-def test_upstream_top_up_reaches_a_bound_grandchild_through_a_promotion_baseline() -> None:
-    """Mixed promotion/inheritance edges compose, even with no study in between."""
-    experiment = make_experiment(
-        phases=[
-            Phase(
-                name="arch",
-                n_trials=2,
-                search_space={"depth": IntParam(type="int", low=1, high=2)},
-            ),
-            Phase(
-                name="mid",
-                n_trials=1,
-                search_space={},
-                fixed_overrides={"width": 8},
-                promotion=Promotion(
-                    min_delta_vs="arch", min_delta=0.0, on_fail="continue_baseline"
-                ),
-            ),
-            Phase(name="final", inherits=["mid"], n_trials=1, search_space={}),
-        ]
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match=r"study/studies \['final'\] are already bound to its published winner "
-        r"via inheritance and a promotion baseline\.",
-    ):
-        _reject_bound_descendant_topups(
-            experiment,
-            from_phase=None,
-            existing_studies={
-                "arch": _fake_top_up_study(completed=1),
-                "final": _fake_top_up_study(fingerprint="bound-final"),
-            },
-        )
-
-
-def test_promotion_baseline_dependent_does_not_block_a_completed_upstream_phase() -> None:
-    """The guard still only fires for a phase that actually has top-up trials left."""
-    experiment = make_experiment(
-        phases=[
-            Phase(
-                name="arch",
-                n_trials=2,
-                search_space={"depth": IntParam(type="int", low=1, high=2)},
-            ),
-            Phase(
-                name="mid",
-                n_trials=1,
-                search_space={},
-                fixed_overrides={"width": 8},
-                promotion=Promotion(min_delta_vs="arch", min_delta=0.0, on_fail="stop"),
-            ),
-        ]
-    )
-
-    _reject_bound_descendant_topups(
-        experiment,
-        from_phase=None,
-        existing_studies={
-            "arch": _fake_top_up_study(completed=2),
-            "mid": _fake_top_up_study(fingerprint="bound-mid"),
-        },
-    )
 
 
 def _artifact_tree_bytes(root: Path) -> dict[str, bytes]:
@@ -1934,28 +1662,6 @@ def test_retargeted_experiment_symlink_is_rejected_before_claim(
     assert (original_root / "artifact_root_binding.json").read_bytes() == original_binding
 
 
-def test_preexisting_empty_study_is_adopted_on_first_contact(tmp_path: Path) -> None:
-    """An empty study is claimed by the first run that sees it: no evidence can be stranded."""
-    trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
-    optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
-    assert (
-        ARTIFACT_ROOT_ATTR not in optuna.load_study(study_name="t::p", storage=storage).user_attrs
-    )
-
-    run_experiment(experiment)
-
-    study = optuna.load_study(study_name="t::p", storage=storage)
-    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
-
-
 def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path) -> None:
     """An empty Optuna namespace cannot silently override the configured goal."""
     trainer = write_constant_trainer(tmp_path)
@@ -1971,6 +1677,7 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
         update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
     )
     study = optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
     with pytest.raises(StudySchemaMismatchError, match="config requires maximize"):
         run_experiment(experiment)
@@ -2034,11 +1741,13 @@ def _unbound_two_phase_studies(
     arch = optuna.create_study(
         study_name=f"{experiment.experiment}::arch", storage=storage, direction="minimize"
     )
+    arch.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     for _ in range(arch_trials):
         arch.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
     lr = optuna.create_study(
         study_name=f"{experiment.experiment}::lr", storage=storage, direction="minimize"
     )
+    lr.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     lr.set_user_attr(ARTIFACT_ROOT_ATTR, bound_root)
 
 
@@ -2093,7 +1802,10 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
     for phase in experiment.phases:
-        optuna.create_study(study_name=f"t::{phase.name}", storage=storage, direction="minimize")
+        study = optuna.create_study(
+            study_name=f"t::{phase.name}", storage=storage, direction="minimize"
+        )
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     real_loader = artifact_roots._load_existing_phase_study
 
     def _fail_for_lr(exp: Experiment, phase: Phase) -> optuna.Study | None:
@@ -2307,7 +2019,10 @@ def test_published_study_requirement_starts_at_from_phase(
     generation_before = _generation_path(experiment).read_bytes()
     optuna.delete_study(study_name=f"t::{missing_phase}", storage=storage)
     if replacement == "empty":
-        optuna.create_study(study_name=f"t::{missing_phase}", storage=storage, direction="minimize")
+        study = optuna.create_study(
+            study_name=f"t::{missing_phase}", storage=storage, direction="minimize"
+        )
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
     if missing_phase == "lr":
         with pytest.raises(PublishedStudyMissingError, match="phase 'lr'"):
@@ -2583,10 +2298,10 @@ def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: P
 
 
 @pytest.mark.parametrize("storage", [None, "sqlite:///:memory:"])
-def test_fresh_and_repeated_in_memory_roots_never_bind_or_conflict(
+def test_fresh_and_repeated_in_memory_roots_record_explicit_no_ledger_bindings(
     tmp_path: Path, storage: str | None
 ) -> None:
-    """In-memory runs may repeat or move because they create no durable binding."""
+    """In-memory runs record an explicit no-ledger binding for each artifact root."""
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
         workdir=tmp_path / "runs_a",
@@ -2603,8 +2318,14 @@ def test_fresh_and_repeated_in_memory_roots_never_bind_or_conflict(
 
     assert _last_successful_generation_id(experiment) is not None
     assert _last_successful_generation_id(moved) is not None
-    assert not _artifact_root_binding_path(experiment).exists()
-    assert not _artifact_root_binding_path(moved).exists()
+    for configured in (experiment, moved):
+        binding = json.loads(_artifact_root_binding_path(configured).read_text())
+        assert binding == {
+            "schema_version": ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
+            "experiment": configured.experiment,
+            "artifact_root": str(_experiment_dir(configured).resolve()),
+            "storage_key": None,
+        }
 
 
 @pytest.mark.parametrize("in_memory_storage", [None, "sqlite:///:memory:"])
@@ -2630,12 +2351,12 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(
 
     offered = owner.model_copy(update={"storage": in_memory_storage})
     with pytest.raises(
-        ArtifactRootConflictError, match="in-memory configuration cannot reuse"
+        ArtifactRootConflictError, match="bound to a different storage ledger"
     ) as excinfo:
         run_experiment(offered)
     assert str(excinfo.value).endswith("Nothing was written.")
     with pytest.raises(
-        ArtifactRootConflictError, match="in-memory configuration cannot reuse"
+        ArtifactRootConflictError, match="bound to a different storage ledger"
     ) as excinfo:
         read_status(offered)
     assert str(excinfo.value).endswith("Nothing was written.")
@@ -2856,68 +2577,6 @@ def test_fresh_run_preflight_consumes_run_deadline(
         run_experiment(experiment)
 
 
-def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> None:
-    """Legacy skipped winners still need matching fingerprints and provenance."""
-
-    def strip_fingerprint(data: dict) -> str:
-        del data["phase_fingerprint"]
-        return "no phase_fingerprint"
-
-    def tamper_fingerprint(data: dict) -> str:
-        data["phase_fingerprint"] = "0" * 64
-        return "different phase config"
-
-    def malformed_fingerprint(data: dict) -> str:
-        data["phase_fingerprint"] = 7
-        return "invalid phase_fingerprint"
-
-    def strip_generation_id(data: dict) -> str:
-        del data["generation_id"]
-        return "no valid generation_id"
-
-    def strip_attempt_id(data: dict) -> str:
-        del data["attempt_id"]
-        return "no valid attempt_id"
-
-    def strip_winner_source(data: dict) -> str:
-        del data["winner_source"]
-        return "no valid winner_source"
-
-    cases = (
-        ("missing-fingerprint", strip_fingerprint),
-        ("tampered-fingerprint", tamper_fingerprint),
-        ("malformed-fingerprint", malformed_fingerprint),
-        ("legacy-generation", strip_generation_id),
-        ("legacy-attempt", strip_attempt_id),
-        ("legacy-source", strip_winner_source),
-    )
-    for case, mutate in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        trainer = write_constant_trainer(case_dir)
-        exp = _two_phase_experiment(workdir=case_dir / "runs", trainer=trainer)
-        run_experiment(exp)
-
-        generation_id = _last_successful_generation_id(exp)
-        assert generation_id is not None
-
-        # Exercise the pre-generation compatibility reader directly. Modern
-        # pointer-backed runs authenticate the complete summary and winner
-        # manifest before this record-level validation is reached.
-        _last_successful_generation_path(exp).unlink()
-        _generation_path(exp).unlink()
-        shutil.rmtree(_generations_dir(exp))
-
-        arch_winner_path = _published_winner_path(exp, "arch")
-        assert arch_winner_path is not None
-        data = yaml.safe_load(arch_winner_path.read_text())
-        match = mutate(data)
-        arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))
-
-        with pytest.raises(RuntimeError, match=match):
-            _load_winner(exp, exp.phases[0], {})
-
-
 def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) -> None:
     """Resume names the corrupt artifact instead of claiming no run completed."""
     trainer = write_constant_trainer(tmp_path)
@@ -2937,45 +2596,6 @@ def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) ->
         "does not match its recorded hash",
     ):
         run_experiment(exp, from_phase="lr")
-
-
-def test_load_winner_normalizes_malformed_yaml_error(tmp_path: Path) -> None:
-    exp = make_experiment(workdir=tmp_path / "runs")
-    path = _winner_path(exp, "p")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"trial_number": 0, "metric": {"objective":')
-
-    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
-        _load_winner(exp, exp.phases[0], {})
-
-
-def test_load_winner_normalizes_incomplete_mapping_error(tmp_path: Path) -> None:
-    exp = make_experiment(workdir=tmp_path / "runs")
-    path = _winner_path(exp, "p")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "phase": "p",
-                "phase_fingerprint": _phase_fingerprint(exp, exp.phases[0], {}),
-                "completion": {"incomplete": False},
-                "generation_id": "generation-test",
-                "attempt_id": "attempt-test",
-                "winner_source": {
-                    "kind": "phase_trial",
-                    "phase": "p",
-                    "trial_number": 0,
-                    "generation_id": "generation-test",
-                    "attempt_id": "attempt-test",
-                    "study": None,
-                },
-            },
-            sort_keys=False,
-        )
-    )
-
-    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
-        _load_winner(exp, exp.phases[0], {})
 
 
 def test_winner_and_trial_attrs_record_trainer_environment_identity(
@@ -3014,71 +2634,6 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
     serialized = json.dumps(attrs, default=str)
     assert "config-secret" not in serialized
     assert "ambient-secret" not in serialized
-
-
-def _environment_free_winner_payload(exp: Experiment) -> dict:
-    """Build a valid winner payload that predates environment identity fields."""
-    return {
-        "phase": "p",
-        "metric": {exp.metric.name: 0.5, "goal": exp.metric.goal},
-        "trial_number": 0,
-        "params": {"x": 1},
-        "effective_overrides": {"x": 1},
-        "constraints": {},
-        "gates": [],
-        "completion": {"incomplete": False},
-        "generation_id": "generation-test",
-        "attempt_id": "attempt-test",
-        "winner_source": {
-            "kind": "phase_trial",
-            "phase": "p",
-            "trial_number": 0,
-            "generation_id": "generation-test",
-            "attempt_id": "attempt-test",
-            "study": None,
-        },
-        "phase_fingerprint": _phase_fingerprint(exp, exp.phases[0], {}),
-    }
-
-
-def test_load_winner_accepts_records_without_environment_identity(tmp_path: Path) -> None:
-    """Pre-existing artifact trees stay loadable; the new fields default to None."""
-    exp = make_experiment(workdir=tmp_path / "runs")
-    path = _winner_path(exp, "p")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(_environment_free_winner_payload(exp), sort_keys=False))
-
-    winner = _load_winner(exp, exp.phases[0], {})
-
-    assert winner.trainer_env_digest is None
-    assert winner.trainer_inherit_env is None
-
-
-@pytest.mark.parametrize("diverged", [True, False])
-def test_load_winner_warns_once_on_inherited_environment_drift(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    diverged: bool,
-) -> None:
-    """Inheriting a winner produced under a different environment is reported once."""
-    monkeypatch.setattr("phasesweep.engine.artifacts._ENVIRONMENT_DRIFT_WARNED", set())
-    exp = make_experiment(workdir=tmp_path / "runs")
-    payload = _environment_free_winner_payload(exp)
-    payload["trainer_env_digest"] = "0" * 64 if diverged else _environment_identity(exp).digest
-    payload["trainer_inherit_env"] = "all"
-    path = _winner_path(exp, "p")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(payload, sort_keys=False))
-
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.artifacts"):
-        for _ in range(2):
-            _load_winner(exp, exp.phases[0], {})
-
-    warnings = [r for r in caplog.records if "environment" in r.getMessage()]
-    assert len(warnings) == (1 if diverged else 0)
-    if warnings:
-        assert warnings[0].name == "phasesweep.engine.artifacts"
 
 
 def test_save_winner_replace_failure_preserves_existing_file(

@@ -268,7 +268,8 @@ def _validate_study_schema(study: optuna.Study) -> None:
     raise StudySchemaMismatchError(
         f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
         f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
-        "Use a new experiment name, or archive/delete the old study before running again."
+        "Use a fresh artifact root and fresh local storage with this PhaseSweep release, "
+        "or use the preserved PhaseSweep 0.3.1 environment to operate existing state."
     )
 
 

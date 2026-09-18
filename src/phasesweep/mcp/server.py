@@ -160,7 +160,7 @@ DESCRIPTION_GET_RUN_STATUS = (
     "Read-only: after launch always use run_id and follow the top-level next_action."
 )
 DESCRIPTION_GET_RUN_RESULTS = (
-    "Return terminal per-phase winners, completeness, promotion context, metrics, gates, and "
+    "Return terminal per-phase winners, completeness, metrics, gates, and "
     "policy-filtered sampled parameters. Call after a run becomes terminal; this ends the normal "
     "workflow. Read-only: treat redaction as policy and never infer trends or convergence from "
     "winner-only data."
@@ -639,20 +639,6 @@ class WinnerSourcePayload(_ToolPayload):
     kind: WinnerSourceKind
     phase: PhaseName
     trial_number: int = Field(ge=0)
-    study: str | None = None
-
-
-class PromotionOutcomePayload(_ToolPayload):
-    """Safe phase-promotion context for an exposed winner."""
-
-    action: Literal["promote", "continue_baseline"]
-    baseline_phase: PhaseName
-    candidate_trial_number: int = Field(ge=0)
-    candidate_metric: float
-    baseline_trial_number: int = Field(ge=0)
-    baseline_metric: float
-    min_delta: float
-    improvement: float | None
 
 
 class WinnerPhasePayload(_ToolPayload):
@@ -661,7 +647,6 @@ class WinnerPhasePayload(_ToolPayload):
     phase: PhaseName
     winner_source: WinnerSourcePayload
     winner_generation: Literal["current_generation", "prior_generation", "unknown"]
-    promotion: PromotionOutcomePayload | None = None
     metric: float
     params: dict[str, Any] = Field(
         description=(

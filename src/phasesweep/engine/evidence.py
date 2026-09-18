@@ -541,8 +541,7 @@ def _verify_skipped_winner_evidence(
     ``--from-phase`` has no reason to require the prior phase's Optuna study:
     the authenticated winner artifact contains the source phase, trial, generation,
     attempt, objective provenance, and (for new publications) generated-input
-    identity needed to inspect the source tree directly. This matters for a
-    promotion fallback, whose exposed phase did not run the selected trial.
+    identity needed to inspect the source tree directly.
 
     Older winner artifacts predate serialized ``trainer_input``. Their explicit
     compatibility policy is to retain structural and objective-content verification

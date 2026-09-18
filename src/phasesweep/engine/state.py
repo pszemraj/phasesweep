@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from phasesweep.engine.read import PhaseWinnerView
 
-WinnerSourceKind = Literal["phase_trial", "promotion_baseline", "suite_baseline"]
+WinnerSourceKind = Literal["phase_trial"]
 
 PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
 """Verdict on a last-success pointer, including inaccessible validation evidence."""
@@ -24,7 +24,6 @@ class WinnerSource:
     trial_number: int
     generation_id: str | None
     attempt_id: str | None
-    study: str | None = None
 
 
 def _parse_winner_source(
@@ -61,11 +60,6 @@ def _parse_winner_source(
             if isinstance(source_data.get("attempt_id"), str) and source_data["attempt_id"]
             else None
         ),
-        study=(
-            str(source_data["study"])
-            if isinstance(source_data.get("study"), str) and source_data["study"]
-            else None
-        ),
     )
 
 
@@ -91,7 +85,6 @@ class Winner:
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
     completion: dict[str, Any] = field(default_factory=dict)
-    promotion: dict[str, Any] | None = None
     phase_fingerprint: str | None = None
     generation_id: str | None = None
     attempt_id: str | None = None
@@ -118,14 +111,11 @@ class Winner:
 def _winner_source_or_default(
     winner: Winner | PhaseWinnerView,
     phase: str,
-    *,
-    study: str | None = None,
 ) -> WinnerSource:
     """Return a recorded winner source or synthesize its phase-trial identity.
 
     :param Winner | PhaseWinnerView winner: Winner carrying optional source provenance.
     :param str phase: Exposed phase used by the fallback source.
-    :param str | None study: Optional suite study used by the fallback source.
     :return WinnerSource: Explicit provenance or a complete ``phase_trial`` fallback.
     """
     return winner.source or WinnerSource(
@@ -134,7 +124,6 @@ def _winner_source_or_default(
         trial_number=winner.trial_number,
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
-        study=study,
     )
 
 
@@ -147,7 +136,7 @@ PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 # complete phase fingerprint still binds config and inherited winner semantics.
 PHASE_EVALUATION_SEMANTICS_ATTR = "phasesweep_phase_evaluation_semantics"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 2
+STUDY_SCHEMA_VERSION = 3
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one.
@@ -211,14 +200,13 @@ def constraint_attr(name: str) -> str:
     return f"{CONSTRAINT_PREFIX}{name}"
 
 
-GENERATION_SUMMARY_SCHEMA_VERSION = 2
-SUITE_SUMMARY_SCHEMA_VERSION = 3
+GENERATION_SUMMARY_SCHEMA_VERSION = 3
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
 # Provenance files frozen into every generation namespace at claim time
 # (review v0.5.18 / finding F6). The summary used to keep only the config
 # *fingerprint*, so once the operator edited or lost the YAML the digest could
 # prove a mismatch but could not reconstruct the search spaces, fixed
-# overrides, contracts, env, or trial command behind a published winner.
+# overrides, execution context, env, or trial command behind a published winner.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
 GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
 # Version 2 added ``generation_id_source`` (PR #5 review / P2 missing-handle
@@ -229,8 +217,8 @@ REPRODUCIBILITY_SCHEMA_VERSION = 2
 
 GenerationIdSource = Literal["caller", "engine"]
 """Who supplied a generation's identity: an external launcher, or the engine."""
-_MANIFEST_ARTIFACT_KINDS = frozenset({"winner", "promotion"})
-_ARTIFACT_FILENAMES = {"winner": "winner.yaml", "promotion": "promotion.yaml"}
+_MANIFEST_ARTIFACT_KINDS = frozenset({"winner"})
+_ARTIFACT_FILENAMES = {"winner": "winner.yaml"}
 # Manifest kinds that name a file in the generation namespace root rather than
 # a phase. Their entries carry ``path`` instead of ``phase``; a generation
 # published before finding F6 lists neither kind and holds neither file, which

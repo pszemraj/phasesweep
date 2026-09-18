@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import shutil
@@ -22,7 +21,7 @@ from pydantic import ValidationError
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.cli import main as cli_boundary
-from phasesweep.config import ExecutionContext, Experiment, Suite, load_config
+from phasesweep.config import ExecutionContext, Experiment
 from phasesweep.engine import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
@@ -46,29 +45,21 @@ from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_dir,
     _generation_path,
-    _generation_summary_path,
     _generation_winner_path,
     _last_successful_generation_path,
-    _last_successful_suite_generation_path,
     _phase_dir,
-    _suite_generation_summary_path,
     _winner_path,
 )
-from phasesweep.engine.publication import (
-    _last_successful_generation_id,
-    _resolve_suite_publication_pointer,
-)
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
-    PUBLICATION_POINTER_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.engine.suite import run_suite
 from phasesweep.errors import GpuConfigurationError, LockBusyError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
@@ -122,8 +113,7 @@ def test_help_registers_commands_and_options() -> None:
 
     winners_help = runner.invoke(cli_main, ["show-winners", "--help"], terminal_width=120).output
     assert "show-winners [OPTIONS] CONFIG_YAML" in winners_help
-    assert "Pass the same experiment or suite" in winners_help
-    assert "config YAML used for the run" in winners_help
+    assert "Print published experiment winners." in winners_help
 
     mcp_help = runner.invoke(cli_main, ["mcp", "--help"], terminal_width=120)
     assert mcp_help.exit_code == 0
@@ -325,23 +315,6 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     frames numerical results against intent. Also covers the no-winner-yet
     branch — the comment is still surfaced even before a phase has run."""
     workdir = tmp_path / "wd"
-    workdir.mkdir()
-    phase_dir = workdir / "t" / "depth"
-    phase_dir.mkdir(parents=True)
-    (phase_dir / "winner.yaml").write_text(
-        textwrap.dedent("""
-        phase: depth
-        trial_number: 2
-        metric:
-          x: 0.5
-          goal: minimize
-        params:
-          x: 5
-        effective_overrides:
-          x: 5
-        constraints: {}
-        """).lstrip()
-    )
 
     def make_cfg(workdir_str: str) -> Path:
         cfg = tmp_path / "exp.yaml"
@@ -349,14 +322,15 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
             textwrap.dedent(f"""
             experiment: t
             workdir: {workdir_str}
-            trial_command: "echo {{overrides}}"
+            trial_command: "echo x=0.5 {{overrides}}"
             override_format: argparse
             metric:
-              extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+              extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
             phases:
               - name: depth
                 comment: settle the depth before anything else.
                 n_trials: 1
+                sampler: {{ type: random, seed: 0 }}
                 search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
             """)
         )
@@ -365,10 +339,12 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     runner = CliRunner()
 
     # With a winner: comment must come BEFORE the winner block.
-    result_with = runner.invoke(cli_main, ["show-winners", str(make_cfg(str(workdir)))])
+    config_with = make_cfg(str(workdir))
+    run_experiment(load_experiment(config_with))
+    result_with = runner.invoke(cli_main, ["show-winners", str(config_with)])
     assert result_with.exit_code == 0
     comment_line = "# settle the depth before anything else."
-    metric_line = "trial_number: 2"
+    metric_line = "trial_number: 0"
     assert comment_line in result_with.output
     assert metric_line in result_with.output
     assert result_with.output.index(comment_line) < result_with.output.index(metric_line)
@@ -389,48 +365,28 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
         f"""
         experiment: t
         workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
+        trial_command: "echo x=0.5 {{overrides}}"
         override_format: argparse
         metric:
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
         phases:
           - name: p
             n_trials: 1
+            sampler: {{ type: random, seed: 0 }}
             search_space: {{}}
         """,
     )
     experiment = load_experiment(config_path)
-    immutable = _generation_winner_path(experiment, "successful", "p")
-    immutable.parent.mkdir(parents=True)
-    immutable.write_text("trial_number: 1\n")
+    run_experiment(experiment)
     compatibility = _winner_path(experiment, "p")
     compatibility.parent.mkdir(parents=True, exist_ok=True)
     compatibility.write_text("trial_number: 99\n")
-    # Pointer validation reads back the generation's own immutable summary,
-    # not the (post-commit, informational) lifecycle record (review v0.5.15 /
-    # blocker 3), so a matching summary is required for the pointer to
-    # resolve as published.
-    summary = _generation_summary_path(experiment, "successful")
-    summary.parent.mkdir(parents=True, exist_ok=True)
-    summary.write_text("experiment: t\ngeneration_id: successful\n")
-    summary_bytes = summary.read_bytes()
-    _last_successful_generation_path(experiment).write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
-                "experiment": "t",
-                "generation_id": "successful",
-                "summary_size_bytes": len(summary_bytes),
-                "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
-            }
-        )
-    )
     _generation_path(experiment).write_text("generation_id: interrupted\n")
 
     published = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
 
     assert published.exit_code == 0
-    assert "trial_number: 1" in published.output
+    assert "trial_number: 0" in published.output
     assert "trial_number: 99" not in published.output
 
     _last_successful_generation_path(experiment).unlink()
@@ -572,8 +528,8 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     assert status_obj["published_generation_id"] == status_obj["current_generation_id"]
 
 
-def test_status_logs_an_unreadable_journal_storage(tmp_path: Path) -> None:
-    """An unavailable journal leaves status usable but names the read failure in logs."""
+def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_path: Path) -> None:
+    """An unreadable journal cannot be classified as current-format state."""
     ledger = tmp_path / "studies.journal"
     ledger.write_text("not a journal record\n")
     experiment = make_experiment(
@@ -592,20 +548,18 @@ def test_status_logs_an_unreadable_journal_storage(tmp_path: Path) -> None:
         check=False,
     )
 
-    assert result.returncode == 0, result.stderr
-    status = yaml.safe_load(result.stdout)
-    assert status["phases"][0]["trial_data_available"] is False
+    assert result.returncode == 1
     assert str(ledger) in result.stderr
-    assert "JSONDecodeError" in result.stderr
+    assert "format boundary" in result.stderr
 
 
 def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: Path) -> None:
     """A published result keeps its own comments and is labeled historical on drift.
 
     Review v0.5.16 / blocker 4: the experiment CLI used to decorate a
-    historical winner with the *current* phase comments; it now mirrors the
-    suite CLI's historical rendering — saved annotations, plus an explicit
-    marker when the current config no longer matches the published one.
+    historical winner with the *current* phase comments; it now uses saved
+    annotations and an explicit marker when the current config no longer
+    matches the published one.
     """
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -816,162 +770,6 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     assert "only the publishing user" in captured.err
 
 
-def _suite_config(tmp_path: Path) -> Path:
-    """Write a one-study suite config over persistent storage.
-
-    :param Path tmp_path: Per-test temporary directory.
-    :return Path: Config path for a suite that has not run yet.
-    """
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        "import argparse\nparser = argparse.ArgumentParser()\n"
-        'parser.add_argument("--out")\nparser.add_argument("--x", type=int, default=0)\n'
-        'args, _ = parser.parse_known_args()\nprint(f"x={args.x}")\n',
-    )
-    return write_yaml(
-        tmp_path,
-        f"""
-        suite: integrity_suite
-        defaults:
-          workdir: {tmp_path}/runs
-          storage: sqlite:///{tmp_path}/suite.db
-          provenance: {{revision: test-fixture-v1}}
-          trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-          override_format: argparse
-          metric:
-            name: x
-            goal: minimize
-            extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        studies:
-          - name: one
-            phases:
-              - name: p
-                n_trials: 1
-                sampler: {{ type: random, seed: 0 }}
-                search_space: {{ x: {{ type: int, low: 0, high: 3 }} }}
-        """,
-    )
-
-
-def test_suite_status_fails_on_a_corrupt_component_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A suite status embeds every study, so one corrupt component fails the read.
-
-    A component-only run leaves the suite pointer ``absent`` -- a healthy state
-    for a suite that never published -- so the escalation here can only come
-    from the embedded study payload, which without this check would print the
-    corruption and still exit 0.
-    """
-    config_path = _suite_config(tmp_path)
-    suite = load_config(config_path)
-    assert isinstance(suite, Suite)
-    # config_status compiles each study independently, so publishing the one
-    # component is enough to give the suite payload a publication to corrupt.
-    component = suite.experiment_for_study(suite.studies[0])
-    run_experiment(component)
-    generation_id = _last_successful_generation_id(component)
-    assert generation_id is not None
-    winner_path = _generation_winner_path(component, generation_id, "p")
-    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
-
-    exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "Traceback" not in captured.err
-    payload = yaml.safe_load(captured.out)
-    assert payload["publication_integrity"] == "absent"
-    assert payload["published_suite_generation_id"] is None
-    assert payload["studies"][0]["status"]["publication_integrity"] == "failed"
-    assert "Do not run anything over this tree" in captured.err
-
-
-def test_suite_status_reports_the_suite_publication_verdict(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A published suite reports its own generation identity and integrity.
-
-    Re-review v0.5.19 / observation N2: the suite envelope carried no
-    publication fields at all, so ``status`` could not report the one verdict
-    ``show-winners`` resolves for the same tree.
-    """
-    config_path = _suite_config(tmp_path)
-    suite = load_config(config_path)
-    assert isinstance(suite, Suite)
-
-    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
-    fresh = yaml.safe_load(capsys.readouterr().out)
-    assert fresh["publication_integrity"] == "absent"
-    assert fresh["published_suite_generation_id"] is None
-
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    generation_id = pointer.generation_id
-    assert generation_id is not None
-
-    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
-    published = yaml.safe_load(capsys.readouterr().out)
-    assert published["publication_integrity"] == "ok"
-    assert published["published_suite_generation_id"] == generation_id
-    assert "publication_error" not in published
-    assert published["studies"][0]["status"]["publication_integrity"] == "ok"
-
-
-def test_suite_status_escalates_a_corrupt_suite_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Both reporting surfaces escalate a suite publication that stopped validating.
-
-    Re-review v0.5.19 / observation N2: the component studies still validate
-    here, so before the suite envelope carried its own verdict ``status``
-    printed ``publication_integrity: ok`` for every component and exited 0
-    while ``show-winners`` reported the same tree as corrupt.
-    """
-    config_path = _suite_config(tmp_path)
-    suite = load_config(config_path)
-    assert isinstance(suite, Suite)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    generation_id = pointer.generation_id
-    assert generation_id is not None
-
-    # Spoof a published winner fact in the suite summary alone: the component
-    # generation it names stays intact, so only the suite verdict changes.
-    summary_path = _suite_generation_summary_path(suite, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    exposed = [item for item in summary["studies"][0]["phases"] if item.get("exposed")]
-    assert exposed, "test setup: the suite must expose at least one winner"
-    exposed[0]["metric"] = exposed[0]["metric"] + 1.0
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-
-    exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "Traceback" not in captured.err
-    payload = yaml.safe_load(captured.out)
-    assert payload["publication_integrity"] == "failed"
-    assert payload["published_suite_generation_id"] is None
-    assert payload["publication_error"]
-    # The component study is untouched, so the suite level is the only escalation.
-    assert payload["studies"][0]["status"]["publication_integrity"] == "ok"
-    assert "Suite 'integrity_suite'" in captured.err
-    assert "Do not run anything over this tree" in captured.err
-
-    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 1
-    winners_captured = capsys.readouterr()
-    assert "Suite 'integrity_suite'" in winners_captured.err
-
-
 def test_status_and_show_winners_stay_successful_without_corruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1044,50 +842,6 @@ def _movable_experiment_configs(
     config_a = tmp_path / f"{stem}_a.yaml"
     config_a.write_text(config_text(workdir_a))
     config_b = tmp_path / f"{stem}_b.yaml"
-    config_b.write_text(config_text(workdir_b))
-    return config_a, config_b, workdir_a, workdir_b
-
-
-def _movable_suite_configs(
-    tmp_path: Path,
-    *,
-    study_names: tuple[str, ...],
-) -> tuple[Path, Path, Path, Path]:
-    """Write equivalent suite configs rooted at two different workdirs."""
-    trainer = write_constant_trainer(tmp_path)
-    workdir_a = tmp_path / "runs_a"
-    workdir_b = tmp_path / "runs_b"
-    study_entries = "".join(
-        f"""\
-  - name: {study_name}
-    phases:
-      - name: p
-        n_trials: 1
-        sampler: {{ type: random, seed: 0 }}
-        search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-"""
-        for study_name in study_names
-    )
-
-    def config_text(workdir: Path) -> str:
-        return f"""\
-suite: s
-defaults:
-  workdir: {workdir}
-  storage: sqlite:///{tmp_path}/suite.db
-  provenance: {{revision: test-fixture-v1}}
-  trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-  override_format: argparse
-  metric:
-    name: x
-    goal: minimize
-    extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-studies:
-{study_entries}"""
-
-    config_a = tmp_path / "suite_a.yaml"
-    config_a.write_text(config_text(workdir_a))
-    config_b = tmp_path / "suite_b.yaml"
     config_b.write_text(config_text(workdir_b))
     return config_a, config_b, workdir_a, workdir_b
 
@@ -1419,86 +1173,6 @@ def test_rebind_workdir_refuses_when_no_study_is_bound(
     assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
 
-def test_rebind_workdir_rebinds_every_compiled_suite_study(tmp_path: Path) -> None:
-    """A suite compiles to one experiment per study, each with its own artifact root."""
-    config_a, config_b, workdir_a, workdir_b = _movable_suite_configs(
-        tmp_path,
-        study_names=("ran", "untouched"),
-    )
-    suite_a = load_config(config_a)
-    assert isinstance(suite_a, Suite)
-    # Only the first study has ever run, so the second contributes no study to
-    # rebind while the first still supplies the binding that authorizes it.
-    run_experiment(suite_a.experiment_for_study(suite_a.studies[0]))
-    shutil.copytree(workdir_a, workdir_b)
-    suite_b = load_config(config_b)
-    assert isinstance(suite_b, Suite)
-
-    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_b)])
-
-    assert result.exit_code == 0, result.output
-    assert "s__ran::p" in result.output
-    study = optuna.load_study(study_name="s__ran::p", storage=f"sqlite:///{tmp_path}/suite.db")
-    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(
-        _experiment_dir(suite_b.experiment_for_study(suite_b.studies[0]))
-    )
-    untouched = suite_b.experiment_for_study(suite_b.studies[1])
-    assert not _artifact_root_binding_path(untouched).exists()
-
-
-def test_rebind_workdir_suite_retry_converges_after_apply_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A suite retry completes a rebind that stopped between component writes."""
-    from phasesweep.engine.relocation import _apply_artifact_root_rebind
-
-    config_a, config_b, workdir_a, workdir_b = _movable_suite_configs(
-        tmp_path, study_names=("first", "second", "untouched")
-    )
-    suite_a = load_config(config_a)
-    suite_b = load_config(config_b)
-    assert isinstance(suite_a, Suite)
-    assert isinstance(suite_b, Suite)
-    # The suite is incomplete and has only component publications, so it
-    # remains movable without rewriting a suite publication.
-    for study_config in suite_a.studies[:2]:
-        run_experiment(suite_a.experiment_for_study(study_config))
-    shutil.copytree(workdir_a, workdir_b)
-    calls = 0
-
-    def fail_second_apply(plan):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise OSError("injected second component rebind failure")
-        return _apply_artifact_root_rebind(plan)
-
-    with monkeypatch.context() as patch:
-        patch.setattr("phasesweep.cli._apply_artifact_root_rebind", fail_second_apply)
-        failed = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_b)])
-    assert isinstance(failed.exception, OSError)
-    assert calls == 2
-
-    def roots() -> list[str]:
-        return [
-            optuna.load_study(
-                study_name=f"s__{study.name}::p", storage=f"sqlite:///{tmp_path}/suite.db"
-            ).user_attrs[ARTIFACT_ROOT_ATTR]
-            for study in suite_b.studies[:2]
-        ]
-
-    destinations = [
-        str(_experiment_dir(suite_b.experiment_for_study(study))) for study in suite_b.studies[:2]
-    ]
-    assert roots() == [
-        destinations[0],
-        str(_experiment_dir(suite_a.experiment_for_study(suite_a.studies[1]))),
-    ]
-    retried = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_b)])
-    assert retried.exit_code == 0, retried.output
-    assert roots() == destinations
-
-
 @pytest.mark.parametrize(
     "refusal_case",
     [
@@ -1611,92 +1285,6 @@ def test_rebind_workdir_refuses_an_unresolved_attempt_at_the_destination(
     assert "unresolved attempt registry entries" in captured.err
     study = optuna.load_study(study_name="t::p", storage=experiment_a.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment_a))
-
-
-def test_rebind_workdir_refuses_a_suite_that_published_a_suite_generation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A published suite summary pins absolute component paths it cannot re-derive.
-
-    Rebinding it would produce a tree whose suite publication reports corrupt
-    on the next read, which is worse than refusing the move.
-    """
-    config_a, config_b, workdir_a, workdir_b = _movable_suite_configs(
-        tmp_path,
-        study_names=("only",),
-    )
-    suite_a = load_config(config_a)
-    assert isinstance(suite_a, Suite)
-    run_suite(suite_a)
-    assert _resolve_suite_publication_pointer(suite_a).state == "ok"
-    shutil.copytree(workdir_a, workdir_b)
-
-    exit_code = _invoke_cli_boundary(["rebind-workdir", str(config_b)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "Traceback" not in captured.err
-    assert "published suite generation" in captured.err
-    study = optuna.load_study(study_name="s__only::p", storage=f"sqlite:///{tmp_path}/suite.db")
-    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(
-        _experiment_dir(suite_a.experiment_for_study(suite_a.studies[0]))
-    )
-
-
-@pytest.mark.parametrize("mixed_storage", [False, True])
-def test_rebind_workdir_adopts_published_suite_at_original_tree(
-    tmp_path: Path, mixed_storage: bool
-) -> None:
-    config_a, _config_b, _workdir_a, _workdir_b = _movable_suite_configs(
-        tmp_path, study_names=("only",)
-    )
-    if mixed_storage:
-        payload = yaml.safe_load(config_a.read_text())
-        payload["studies"].append({**payload["studies"][0], "name": "memory", "storage": None})
-        config_a.write_text(yaml.safe_dump(payload, sort_keys=False))
-    suite = load_config(config_a)
-    assert isinstance(suite, Suite)
-    if mixed_storage:
-        assert suite.experiment_for_study(suite.studies[1]).storage is None
-    run_suite(suite)
-    component = suite.experiment_for_study(suite.studies[0])
-    assert component.storage is not None
-    drop_artifact_root_binding(component.storage, "s__only::p")
-    assert _resolve_suite_publication_pointer(suite).state == "ok"
-
-    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_a)])
-
-    assert result.exit_code == 0, result.output
-    study = optuna.load_study(study_name="s__only::p", storage=component.storage)
-    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(component))
-    assert _resolve_suite_publication_pointer(suite).state == "ok"
-
-
-def test_rebind_workdir_refuses_dangling_mixed_suite_pointer(tmp_path: Path) -> None:
-    config_a, _config_b, _workdir_a, _workdir_b = _movable_suite_configs(
-        tmp_path, study_names=("only",)
-    )
-    payload = yaml.safe_load(config_a.read_text())
-    payload["studies"].append({**payload["studies"][0], "name": "memory", "storage": None})
-    config_a.write_text(yaml.safe_dump(payload, sort_keys=False))
-    suite = load_config(config_a)
-    assert isinstance(suite, Suite)
-    run_suite(suite)
-    component = suite.experiment_for_study(suite.studies[0])
-    assert component.storage is not None
-    drop_artifact_root_binding(component.storage, "s__only::p")
-    pointer = _last_successful_suite_generation_path(suite)
-    pointer.unlink()
-    pointer.symlink_to("missing-target.yaml")
-
-    result = CliRunner().invoke(cli_main, ["rebind-workdir", str(config_a)])
-
-    assert result.exit_code != 0
-    assert _resolve_suite_publication_pointer(suite).state == "failed"
-    study = optuna.load_study(study_name="s__only::p", storage=component.storage)
-    assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
 
 def test_rebind_workdir_adopts_a_populated_study_that_predates_the_binding(
@@ -2074,79 +1662,6 @@ def test_cli_boundary_names_config_for_schema_validation_error(
     assert "Traceback" not in captured.err
 
 
-def test_cli_boundary_compiles_suite_before_validate_success_output(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """A component validation failure is bad config and never follows ``OK:``."""
-    config_path = write_yaml(
-        tmp_path,
-        """
-        suite: invalid_grid_suite
-        defaults:
-          trial_command: "echo {overrides}"
-          override_format: argparse
-          metric:
-            extractor: {type: json_envelope, objective_name: x, split: test, policy: test}
-        studies:
-          - name: demo
-            phases:
-              - name: grid
-                n_trials: 1
-                sampler: {type: grid}
-                search_space:
-                  x: {type: categorical, choices: [1, 2]}
-        """,
-    )
-
-    exit_code = _invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 2
-    assert str(config_path) in captured.err
-    assert "n_trials" in captured.err
-    assert "OK:" not in captured.out
-    assert "Traceback" not in captured.err
-    assert "internal error" not in captured.err
-
-
-@pytest.mark.parametrize("command", ["validate", "status", "run", "rebind-workdir"])
-def test_cli_boundary_rejects_uncompilable_suite_for_every_config_command(
-    command: str,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """All suite-consuming commands classify missing resolved fields as bad config."""
-    config_path = write_yaml(
-        tmp_path,
-        """
-        suite: missing_command_suite
-        defaults:
-          metric:
-            extractor: {type: json_envelope, objective_name: x, split: test, policy: test}
-        studies:
-          - name: demo
-            phases:
-              - name: phase
-                n_trials: 1
-                search_space: {}
-        """,
-    )
-    monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-
-    exit_code = _invoke_cli_boundary([command, str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 2
-    assert str(config_path) in captured.err
-    assert "trial_command" in captured.err
-    assert "Traceback" not in captured.err
-    assert "internal error" not in captured.err
-    assert "OK:" not in captured.out
-
-
 @pytest.mark.parametrize(
     ("verbose", "expects_traceback"),
     [
@@ -2183,7 +1698,7 @@ def test_cli_boundary_reports_expected_run_failure(
     "error",
     [
         UnsafeLockPathError("PHASESWEEP_LOCK_DIR must be an absolute path"),
-        LockBusyError("another suite process holds the lock"),
+        LockBusyError("another experiment process holds the lock"),
     ],
 )
 def test_cli_boundary_reports_runtime_operational_failures_without_traceback(

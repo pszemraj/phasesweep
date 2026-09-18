@@ -225,8 +225,6 @@ def _winner_common_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
         "winner_source": _winner_source_payload(winner, phase_name),
         "trainer_input": winner.trainer_input,
     }
-    if winner.promotion is not None:
-        payload["promotion"] = winner.promotion
     return payload
 
 
@@ -239,7 +237,7 @@ def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
         ``winner.source`` is unset.
     :return dict[str, Any]: JSON-serializable winner-source payload with
         ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
-        and ``study`` keys.
+        keys.
     """
     source = _winner_source_or_default(winner, phase_name)
     return {
@@ -248,33 +246,12 @@ def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
         "trial_number": source.trial_number,
         "generation_id": source.generation_id,
         "attempt_id": source.attempt_id,
-        "study": source.study,
     }
 
 
-def _save_promotion_decision(
-    experiment: Experiment,
-    phase_name: str,
-    decision: dict[str, Any],
-    *,
-    generation_id: str,
-) -> None:
-    """Persist a phase promotion decision into its immutable generation namespace.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str phase_name: Phase name whose promotion decision is being saved.
-    :param dict[str, Any] decision: Promotion decision payload to persist.
-    :param str generation_id: Immutable generation namespace to write into. The
-        legacy compatibility projection is produced separately by
-        :func:`phasesweep.engine.generation._copy_yaml_projection` once a generation is published.
-    """
-    path = path_ops._generation_promotion_decision_path(experiment, generation_id, phase_name)
-    _write_yaml_atomic(path, decision)
-
-
 # Warn-once keys for :func:`_warn_environment_drift`. A resume can load the
-# same winner twice (preflight, then the run itself) and a suite can inherit it
-# across studies; the operator needs the divergence once, not once per read.
+# same winner twice (preflight, then the run itself); the operator needs the
+# divergence once, not once per read.
 _ENVIRONMENT_DRIFT_WARNED: set[tuple[str, str, str]] = set()
 
 
@@ -458,8 +435,14 @@ def _load_winner(
             f"Winner file {path} has no valid winner_source; refusing ambiguous provenance."
         )
     source_kind = source_data.get("kind")
-    if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
+    if source_kind != "phase_trial":
         raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source kind.")
+    if set(source_data) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
+        raise WinnerIntegrityError(f"Winner file {path} has a removed winner_source field.")
+    if source_data.get("phase") != phase.name:
+        raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source phase.")
+    if "promotion" in data:
+        raise WinnerIntegrityError(f"Winner file {path} contains removed promotion data.")
 
     stored_env_digest = data.get("trainer_env_digest")
     if not isinstance(stored_env_digest, str) or not stored_env_digest:
@@ -479,7 +462,6 @@ def _load_winner(
             constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
-            promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
             phase_fingerprint=str(stored_fp),
             generation_id=generation_id,
             attempt_id=attempt_id,

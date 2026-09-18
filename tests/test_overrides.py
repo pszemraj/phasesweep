@@ -9,8 +9,8 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from phasesweep import load_config, load_experiment, run_experiment
-from phasesweep.config import Phase, Suite
+from phasesweep import load_experiment, run_experiment
+from phasesweep.config import Phase
 from phasesweep.runtime.commands import (
     compose_trainer_config,
     dump_overrides_json,
@@ -400,48 +400,6 @@ def test_validate_rejects_invalid_json_file_fixed_override(
         load_experiment(p)
 
 
-@pytest.mark.parametrize(
-    ("override_format", "body"),
-    [
-        pytest.param(
-            "json_file",
-            """
-        contracts:
-          frozen:
-            fixed_overrides:
-              cutoff: 2024-01-01
-        phases:
-          - name: p
-            n_trials: 1
-            contracts: [frozen]
-        """,
-            id="json-file",
-        ),
-        pytest.param(
-            "argparse",
-            "        contracts:\n"
-            "          frozen:\n"
-            "            fixed_overrides:\n"
-            "              knob: {1: x}\n"
-            "        phases:\n"
-            "          - name: t\n"
-            "            n_trials: 1\n"
-            "            contracts: [frozen]\n",
-            id="argparse",
-        ),
-    ],
-)
-def test_validate_rejects_unrenderable_contract_override(
-    tmp_path: Path,
-    override_format: str,
-    body: str,
-) -> None:
-    """Contract values must serialize through the selected trainer-input format."""
-    config = _override_yaml(tmp_path, override_format, body)
-    with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
-        load_experiment(config)
-
-
 # ``knob`` holds a value with no faithful argparse wire form in every case:
 # a mapping renders through str() while the fingerprint dumps JSON-normalized
 # keys, and a YAML-native date/non-finite float has no canonical rendering at
@@ -476,36 +434,21 @@ def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, 
 
 
 @pytest.mark.parametrize("literal", [".nan", ".inf", "-.inf"])
-@pytest.mark.parametrize("origin", ["phase", "contract"])
 @pytest.mark.parametrize("nested", [False, True])
 def test_validate_rejects_non_finite_hydra_fixed_override(
-    tmp_path, literal: str, origin: str, nested: bool
+    tmp_path, literal: str, nested: bool
 ) -> None:
     """Hydra wire values must remain distinguishable in semantic fingerprints."""
     value = f"[{literal}]" if nested else literal
-    if origin == "phase":
-        body = (
-            "        phases:\n"
-            "          - name: t\n"
-            "            n_trials: 1\n"
-            "            fixed_overrides:\n"
-            f"              knob: {value}\n"
-        )
-        expected = r"fixed_overrides.*'knob'"
-    else:
-        body = (
-            "        contracts:\n"
-            "          frozen:\n"
-            "            fixed_overrides:\n"
-            f"              knob: {value}\n"
-            "        phases:\n"
-            "          - name: t\n"
-            "            n_trials: 1\n"
-            "            contracts: [frozen]\n"
-        )
-        expected = r"contract 'frozen' fixed_overrides.*'knob'"
+    body = (
+        "        phases:\n"
+        "          - name: t\n"
+        "            n_trials: 1\n"
+        "            fixed_overrides:\n"
+        f"              knob: {value}\n"
+    )
 
-    with pytest.raises(ValidationError, match=expected):
+    with pytest.raises(ValidationError, match=r"fixed_overrides.*'knob'"):
         load_experiment(_override_yaml(tmp_path, "hydra", body))
 
 
@@ -580,44 +523,6 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
         fingerprints[label] = _phase_fingerprint(exp, exp.phases[0], {})
 
     assert len(set(fingerprints.values())) == len(fingerprints)
-
-
-def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_path):
-    """A contract shared between a json_file study and an argparse study is only
-    legal for the json_file one; loading rejects the whole invalid suite."""
-    path = write_yaml(
-        tmp_path,
-        """
-            suite: mixed_formats
-            defaults:
-              trial_command: "echo {overrides}"
-              override_format: argparse
-              metric:
-                name: x
-                goal: minimize
-                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
-              contracts:
-                frozen:
-                  fixed_overrides:
-                    model: {depth: 2}
-            studies:
-              - name: structured
-                override_format: json_file
-                trial_command: "echo {overrides_path}"
-                phases: [{name: p, n_trials: 1, contracts: [frozen]}]
-              - name: flat
-                override_format: argparse
-                phases: [{name: p, n_trials: 1, contracts: [frozen]}]
-            """,
-    )
-
-    with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):
-        load_config(path)
-    config = Suite.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
-    structured, flat = config.studies
-    config.experiment_for_study(structured)
-    with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):
-        config.experiment_for_study(flat)
 
 
 @pytest.mark.parametrize(
@@ -727,126 +632,6 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
         load_experiment(p)
 
 
-def test_promotion_fallback_key_cannot_be_resampled_by_descendant(tmp_path: Path) -> None:
-    """Fallback exports make the baseline's keys immutable to descendants."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: depth
-            n_trials: 1
-            search_space:
-              depth: {{ type: int, low: 8, high: 8 }}
-          - name: learning_rate
-            n_trials: 1
-            search_space:
-              lr: {{ type: int, low: 3, high: 3 }}
-            promotion:
-              min_delta_vs: depth
-              min_delta: 1
-              on_fail: continue_baseline
-          - name: regularization
-            inherits: [learning_rate]
-            n_trials: 1
-            search_space:
-              depth: {{ type: int, low: 16, high: 16 }}
-        """,
-    )
-
-    with pytest.raises(ValidationError, match="re-samples key"):
-        load_experiment(p)
-
-
-@pytest.mark.parametrize(
-    ("phases", "match"),
-    [
-        pytest.param(
-            """
-              - name: base
-                n_trials: 1
-                fixed_overrides: { depth: 8 }
-              - name: first
-                n_trials: 1
-                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
-              - name: second
-                n_trials: 1
-                promotion: { min_delta_vs: first, min_delta: 1, on_fail: continue_baseline }
-              - name: child
-                inherits: [second]
-                n_trials: 1
-                search_space: { depth: { type: int, low: 16, high: 16 } }
-            """,
-            "re-samples key",
-            id="transitive-fallback",
-        ),
-        pytest.param(
-            """
-              - name: base
-                n_trials: 1
-                fixed_overrides: { depth: 8 }
-              - name: fallback
-                n_trials: 1
-                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
-              - name: other
-                n_trials: 1
-                fixed_overrides: { depth: 16 }
-              - name: child
-                inherits: [fallback, other]
-                n_trials: 1
-            """,
-            "conflicting locked key",
-            id="multi-parent-conflict",
-        ),
-        pytest.param(
-            """
-              - name: base
-                n_trials: 1
-                fixed_overrides: { model: base }
-              - name: fallback
-                n_trials: 1
-                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
-              - name: child
-                inherits: [fallback]
-                n_trials: 1
-                search_space: { model.depth: { type: int, low: 8, high: 8 } }
-            """,
-            "dotted-key namespace collision",
-            id="dotted-key-collision",
-        ),
-    ],
-)
-def test_promotion_fallback_keys_reach_all_descendant_validators(
-    tmp_path: Path, phases: str, match: str
-) -> None:
-    """Possible fallback exports participate in every descendant key check."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-        {phases}
-        """,
-    )
-
-    with pytest.raises(ValidationError, match=match):
-        load_experiment(p)
-
-
 def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
     """The runtime keeps malformed or stale configs from replacing inherited winners."""
     from phasesweep.engine.phase import _composed_overrides
@@ -870,44 +655,7 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
     }
 
     with pytest.raises(ValueError, match="re-samples inherited winner key"):
-        _composed_overrides(experiment, stale_child, {"depth": 16}, inherited)
-
-
-def test_correlated_promotion_outcomes_can_rejoin_through_two_parents() -> None:
-    """A diamond may reuse one promotion branch without combining both branches."""
-    experiment = make_experiment(
-        trial_command="echo {config_path}",
-        override_format="yaml_file",
-        phases=[
-            Phase(name="base", n_trials=1, fixed_overrides={"model": {"depth": 8}}),
-            Phase(
-                name="choice",
-                n_trials=1,
-                fixed_overrides={"model.depth": 16},
-                promotion={
-                    "min_delta_vs": "base",
-                    "min_delta": 1,
-                    "on_fail": "continue_baseline",
-                },
-            ),
-            Phase(name="left", n_trials=1, inherits=["choice"], fixed_overrides={"left": 1}),
-            Phase(name="right", n_trials=1, inherits=["choice"], fixed_overrides={"right": 1}),
-            Phase(
-                name="later",
-                n_trials=1,
-                inherits=["left", "right"],
-                fixed_overrides={"lr": 0.01},
-            ),
-        ],
-    )
-
-    assert [phase.name for phase in experiment.phases] == [
-        "base",
-        "choice",
-        "left",
-        "right",
-        "later",
-    ]
+        _composed_overrides(stale_child, {"depth": 16}, inherited)
 
 
 @pytest.mark.parametrize(
@@ -920,7 +668,7 @@ def test_correlated_promotion_outcomes_can_rejoin_through_two_parents() -> None:
     ],
 )
 def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: str, valid: bool):
-    """A child must explicitly resolve a key locked by multiple parents."""
+    """A child must explicitly resolve a key from independent parent origins."""
     p = write_yaml(
         tmp_path,
         f"""
@@ -949,29 +697,9 @@ def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: st
         """,
     )
     if not valid:
-        with pytest.raises(ValidationError, match="conflicting locked key"):
+        with pytest.raises(ValidationError, match="conflicting key"):
             load_experiment(p)
         return
     exp = load_experiment(p)
     child = exp.phases[-1]
     assert child.fixed_overrides["lr"] == 5.0e-4
-
-    # Exercise the runtime merge too: inherited winners are the lowest layer,
-    # the explicit fixed resolution replaces both, and sampled keys remain the
-    # final layer.
-    from phasesweep.engine.phase import _composed_overrides
-    from phasesweep.engine.state import Winner
-
-    inherited = {
-        name: Winner(
-            trial_number=index,
-            params={"lr": value},
-            effective_overrides={"lr": value},
-            metric=value,
-        )
-        for index, (name, value) in enumerate((("a", 1.0e-4), ("b", 2.0e-4)))
-    }
-    assert _composed_overrides(exp, child, {"dropout": 0.25}, inherited) == {
-        "lr": 5.0e-4,
-        "dropout": 0.25,
-    }

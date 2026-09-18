@@ -27,6 +27,7 @@ import phasesweep.mcp.recovery as mcp_recovery
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.server as mcp_server
+from phasesweep._metadata import __version__
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
     ExecutionContext,
@@ -39,6 +40,7 @@ from phasesweep.config import (
     Sampler,
     load_config,
 )
+from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import (
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
@@ -49,6 +51,7 @@ from phasesweep.engine.artifact_roots import (
     _bind_study_artifact_root,
     _validate_artifact_root_binding,
 )
+from phasesweep.engine.artifacts import _save_winner, _write_yaml_atomic
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
@@ -56,7 +59,11 @@ from phasesweep.engine.fingerprints import (
     _experiment_semantic_fingerprint,
     _phase_fingerprint,
 )
-from phasesweep.engine.generation import _write_generation_state
+from phasesweep.engine.generation import (
+    _claim_generation,
+    _publish_generation,
+    _write_generation_state,
+)
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _attempts_dir,
@@ -66,17 +73,22 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _last_successful_generation_path,
     _trial_dir_for,
-    _winner_path,
 )
 from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.publication_validation import _generation_artifact_manifest
+from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
+    GENERATION_SUMMARY_SCHEMA_VERSION,
     PUBLICATION_POINTER_SCHEMA_VERSION,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
+    Winner,
 )
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.evidence.models import objective_evidence_assurance
@@ -182,6 +194,12 @@ def _write_trial_process_identity(
     )
 
 
+def _mark_current_study(experiment: Experiment, study: optuna.Study) -> None:
+    """Mark a manually constructed study/root as current-format test state."""
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
+
+
 def _write_cleanup_uncertain_failed_trial(
     config: Path, *, generation_id: str = "stale-generation"
 ) -> int:
@@ -193,7 +211,7 @@ def _write_cleanup_uncertain_failed_trial(
         storage=exp.storage,
         direction="minimize",
     )
-    _validate_artifact_root_binding(exp, claim_fresh=True)
+    _mark_current_study(exp, study)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
     trial_dir = _trial_dir_for(
@@ -234,7 +252,7 @@ def _write_stale_running_trial(
         storage=exp.storage,
         direction="minimize",
     )
-    _validate_artifact_root_binding(exp, claim_fresh=True)
+    _mark_current_study(exp, study)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
     trial_dir = _trial_dir_for(
@@ -488,33 +506,46 @@ def _write_winner_yaml(
     incomplete: bool = False,
     generation_id: str | None = None,
 ) -> None:
+    """Publish one minimal current-format winner fixture."""
     _validate_artifact_root_binding(experiment, claim_fresh=True)
-    path = (
-        _winner_path(experiment, phase_name)
-        if generation_id is None
-        else _generation_winner_path(experiment, generation_id, phase_name)
+    published_generation_id = _claim_generation(experiment, generation_id)
+    winner = Winner(
+        trial_number=0,
+        metric=0.123,
+        params={"lr": 0.001},
+        effective_overrides={"lr": 0.001},
+        completion={"incomplete": incomplete},
+        phase_fingerprint=phase_fingerprint,
+        generation_id=published_generation_id,
+        attempt_id="fixture-attempt",
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "phase": phase_name,
-                "trial_number": 0,
-                "metric": {experiment.metric.name: 0.123, "goal": experiment.metric.goal},
-                "params": {"lr": 0.001},
-                "effective_overrides": {"lr": 0.001},
-                "completion": {"incomplete": incomplete},
-                "phase_fingerprint": phase_fingerprint,
-                "winner_source": {
-                    "kind": "phase_trial",
-                    "phase": phase_name,
-                    "trial_number": 0,
-                    "generation_id": generation_id,
-                    "attempt_id": None,
-                    "study": None,
-                },
-            }
-        )
+    _save_winner(
+        experiment,
+        phase_name,
+        winner,
+        generation_id=published_generation_id,
+    )
+    summary_path = _generation_summary_path(experiment, published_generation_id)
+    summary = {
+        "schema_version": GENERATION_SUMMARY_SCHEMA_VERSION,
+        "experiment": experiment.experiment,
+        "generation_id": published_generation_id,
+        "phasesweep_version": __version__,
+        "config_fingerprint": _experiment_semantic_fingerprint(experiment),
+        "metric": _metric_semantics_payload(experiment.metric),
+        "phase_plan": [
+            {"name": phase.name, "comment": phase.comment} for phase in experiment.phases
+        ],
+        "phases": [_winner_summary_item(phase_name, winner)],
+        "artifacts": _generation_artifact_manifest(experiment, published_generation_id),
+    }
+    _write_yaml_atomic(summary_path, summary)
+    _publish_generation(
+        experiment,
+        published_generation_id,
+        from_phase=None,
+        winners={phase_name: winner},
+        publication_hook=None,
     )
 
 
@@ -3576,9 +3607,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
             storage=experiment.storage,
             direction="minimize",
         )
-        # A study a prior run left behind carries this workdir's artifact-root
-        # binding; without it the pre-binding migration refusal preempts the
-        # schema aggregation this test is about (re-review v0.5.19 / blocker B1).
+        # Two populated, unmarked studies model a pre-cutover local ledger.
         study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
         study.add_trial(
             optuna.trial.create_trial(
@@ -3598,7 +3627,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
         started_at=started_at,
     )
 
-    with pytest.raises(StudySchemaMismatchError, match="multiple unsafe studies"):
+    with pytest.raises(StudySchemaMismatchError, match="pre-cutover or unsupported"):
         runner_main(
             runner_argv(
                 store,
@@ -3755,7 +3784,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
         storage=experiment.storage,
         direction="minimize",
     )
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
+    _mark_current_study(experiment, study)
     _bind_study_artifact_root(study, experiment)
     trial = study.ask()
     attempt_id = "terminal-identity-attempt"

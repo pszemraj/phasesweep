@@ -21,7 +21,7 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from phasesweep.config import Experiment, Suite
+from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.config.models import _metric_semantics_payload
@@ -375,8 +375,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :param _Entry entry: Schema-validated catalog entry to load.
     :return RegisteredExperiment: Frozen entry with resolved paths and config hash.
     :raises CatalogError: If the config path or ``cwd`` does not exist, the
-        config cannot be parsed, it is a suite rather than an experiment, or it
-        fails the MCP path-stability rules.
+        config cannot be parsed or fails the MCP path-stability rules.
     """
     cfg_path = _resolve_catalog_relative_path(base, entry.config)
     if not cfg_path.is_file():
@@ -391,11 +390,6 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         config = load_config_bytes(config_bytes, source=cfg_path)
     except (ValueError, OSError) as exc:
         raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
-    if isinstance(config, Suite):
-        raise CatalogError(
-            f"{entry.id!r}: suite configs are not supported by the MCP layer "
-            "in this version; register single-experiment configs"
-        )
     _require_mcp_stable_paths(entry.id, config, config_dir=cfg_path.parent)
     if config.execution.cwd is None:
         # The detached runner enters the catalog entry's cwd before invoking

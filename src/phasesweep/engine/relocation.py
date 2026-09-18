@@ -10,7 +10,7 @@ from pathlib import Path
 
 import optuna
 
-from phasesweep.config import Experiment, Suite
+from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
@@ -40,14 +40,11 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _experiment_dir,
-    _last_successful_suite_generation_path,
     _phase_dir,
-    _suite_dir,
 )
 from phasesweep.engine.publication import (
     _last_successful_generation_id,
     _resolve_publication_pointer,
-    _resolve_suite_publication_pointer,
 )
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -493,8 +490,7 @@ def _plan_artifact_root_rebinds(
     is validated against the destination and rewritten to it, so re-running the
     command is idempotent.
 
-    :param Sequence[Experiment] experiments: Experiments the config compiles to;
-        one for a single experiment, one per study for a suite.
+    :param Sequence[Experiment] experiments: Experiments to rebind.
     :return list[_ArtifactRootRebindPlan]: One validated plan per experiment,
         ready to apply.
     :raises ArtifactRootRebindError: Every experiment uses in-memory storage,
@@ -640,72 +636,3 @@ def _apply_artifact_root_rebind(plan: _ArtifactRootRebindPlan) -> list[tuple[str
         entry.study.set_user_attr(ARTIFACT_ROOT_ATTR, plan.destination)
         written.append((entry.study.study_name, entry.previous, plan.destination))
     return written
-
-
-def _validate_suite_artifact_root_rebind(
-    suite: Suite,
-    plans: Sequence[_ArtifactRootRebindPlan],
-) -> None:
-    """Refuse a suite rebind whose published summaries cannot survive relocation.
-
-    A published suite summary anchors every study to the **absolute** path of
-    the component generation summary it derives from, and validation re-reads
-    that exact path, so a relocated suite publication is reported as corrupt by
-    the read surfaces the moment it is rebound (re-review v0.5.19 / blocker
-    B2). In-place adoption is safe when the validated suite summary still
-    names the destination roots for persistent studies and none is bound to a
-    different root. In-memory studies have component records but no rebind plan.
-    Component-level rebinds also proceed for a suite that never published one.
-
-    Conservative in the same way :func:`_validate_artifact_root_destination`
-    is: when every declared study records a completed trial, the suite may well
-    have published, and a destination with no suite pointer is
-    indistinguishable from one whose pointer was lost in the move.
-
-    :param Suite suite: Suite config naming the destination suite namespace.
-    :param Sequence[_ArtifactRootRebindPlan] plans: Validated per-study plans.
-    :raises ArtifactRootRebindError: A suite publication would refer to another
-        tree after rebinding, or every declared study completed a trial while
-        the destination holds no suite publication at all.
-    """
-    pointer = _last_successful_suite_generation_path(suite)
-    publication = _resolve_suite_publication_pointer(suite)
-    if publication.state != "absent":
-        summary = publication.summary
-        records = summary.get("studies") if isinstance(summary, Mapping) else None
-        if publication.state == "ok" and isinstance(records, list):
-            roots = {
-                record.get("experiment"): str(Path(record["component_summary_path"]).parents[2])
-                for record in records
-                if isinstance(record, Mapping)
-                and isinstance(record.get("component_summary_path"), str)
-            }
-            if all(
-                roots.get(plan.experiment.experiment) == plan.destination
-                and all(entry.previous in (None, plan.destination) for entry in plan.entries)
-                for plan in plans
-            ):
-                return
-        raise ArtifactRootRebindError(
-            f"Suite {suite.suite!r} records a published suite generation or damaged "
-            f"publication entry at {str(pointer)!r}. "
-            "A published suite summary pins each study to the absolute path of the component "
-            "summary it derives from, and those paths do not survive relocation: the rebound "
-            "tree would report a corrupt suite publication instead of a result. Keep the suite "
-            "at its original workdir, or use a new suite name for the relocated tree. Nothing "
-            "was written."
-        )
-    if (
-        plans
-        and len(plans) == len(suite.studies)
-        and all(plan.entries and _studies_record_publication(plan.entries) for plan in plans)
-    ):
-        raise ArtifactRootRebindError(
-            f"Every study of suite {suite.suite!r} records a completed trial, but the "
-            f"destination suite namespace {str(_suite_dir(suite))!r} holds no published suite "
-            "generation. A fully completed suite may have published one, and a missing pointer "
-            "is indistinguishable from a pointer lost in the move; a suite publication cannot "
-            "be relocated because its summaries record absolute component paths. Keep the "
-            "suite at its original workdir, or use a new suite name for the relocated tree. "
-            "Nothing was written."
-        )

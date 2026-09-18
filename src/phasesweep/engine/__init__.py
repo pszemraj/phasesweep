@@ -7,7 +7,6 @@ from phasesweep.engine.errors import (
     ExperimentLockBusyError,
     LegacyArtifactRootMigrationRequiredError,
     PhaseSweepError,
-    PromotionError,
     PublicationAccessError,
     PublicationCommitError,
     PublicationIntegrityError,
@@ -38,7 +37,6 @@ from phasesweep.engine.run import (
 )
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import Winner
-from phasesweep.engine.suite import run_suite
 from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 
 __all__ = [
@@ -51,7 +49,6 @@ __all__ = [
     "PhaseSweepError",
     "PhaseWinnerView",
     "ProcessCleanupUncertainError",
-    "PromotionError",
     "PublicationHook",
     "PublicationAccessError",
     "PublicationCommitError",
@@ -76,5 +73,4 @@ __all__ = [
     "read_winners",
     "run_config",
     "run_experiment",
-    "run_suite",
 ]

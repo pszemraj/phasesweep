@@ -156,7 +156,6 @@ class WinnerSourceSnapshot(_SnapshotModel):
     trial_number: int
     generation_id: str | None = None
     attempt_id: str | None = None
-    study: str | None = None
 
 
 class WinnerSnapshot(_SnapshotModel):
@@ -171,7 +170,6 @@ class WinnerSnapshot(_SnapshotModel):
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSourceSnapshot
-    promotion: dict[str, Any] | None = None
 
 
 def _winner_source_snapshot(
@@ -196,7 +194,6 @@ def _winner_source_snapshot(
         trial_number=source.trial_number,
         generation_id=source.generation_id,
         attempt_id=source.attempt_id,
-        study=source.study,
     )
 
 
@@ -228,7 +225,6 @@ def _winner_snapshot(
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
         source=_winner_source_snapshot(winner, phase=phase),
-        promotion=winner.promotion,
     )
 
 
@@ -287,9 +283,7 @@ class RunResultSnapshot(_SnapshotModel):
                     trial_number=winner.source.trial_number,
                     generation_id=winner.source.generation_id,
                     attempt_id=winner.source.attempt_id,
-                    study=winner.source.study,
                 ),
-                promotion=winner.promotion,
             )
             for winner in self.winners
         ]

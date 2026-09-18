@@ -29,8 +29,13 @@ from phasesweep.config import (
     SearchParam,
     grid_search_space,
 )
-from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR
+from phasesweep.engine.errors import StudySchemaMismatchError, StudyStorageUnavailableError
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+)
 from phasesweep.runtime.files import (
     file_url_path,
     sqlite_database_path,
@@ -81,45 +86,21 @@ class _PhaseTrialStats:
 def _published_phase_trial_refs(
     summary: Mapping[str, Any] | None,
 ) -> dict[str, _TrialRef | None]:
-    """Return each published phase's local winning or promotion-candidate identity.
-
-    A continued baseline belongs to an earlier phase. Its promotion record
-    identifies the local candidate whose history must survive in this phase.
-    A skipped candidate has no exposed winner; its identity is retained in
-    the summary's promotion decisions instead.
+    """Return each published phase's local winning-trial identity.
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
         their known terminal-count boundary; None when a published phase does
         not record a complete identity.
     """
-    phase_items = {
-        item["name"]: item
-        for item in (summary or {}).get("phases", ())
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    for decision in (summary or {}).get("promotion_decisions", ()):
-        if (
-            isinstance(decision, Mapping)
-            and decision.get("action") == "skip"
-            and isinstance(decision.get("phase"), str)
-        ):
-            phase_items.setdefault(
-                decision["phase"],
-                {
-                    "name": decision["phase"],
-                    "promotion": decision,
-                    "completion": decision.get("candidate_completion"),
-                },
-            )
     refs: dict[str, _TrialRef | None] = {}
-    for name, item in phase_items.items():
-        promotion = item.get("promotion")
-        source = promotion if isinstance(promotion, Mapping) else item
-        prefix = "candidate_" if isinstance(promotion, Mapping) else ""
-        number = source.get(f"{prefix}trial_number")
-        generation = source.get(f"{prefix}generation_id")
-        attempt = source.get(f"{prefix}attempt_id")
+    for item in (summary or {}).get("phases", ()):
+        if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+            continue
+        name = item["name"]
+        number = item.get("trial_number")
+        generation = item.get("generation_id")
+        attempt = item.get("attempt_id")
         completion = item.get("completion")
         finished_trials = (
             completion.get("finished_trials")
@@ -611,6 +592,110 @@ def _existing_phase_study_names(experiment: Experiment) -> tuple[str, ...]:
             ) from exc
     prefix = f"{experiment.experiment}::"
     return tuple(sorted(name[len(prefix) :] for name in names if name.startswith(prefix)))
+
+
+def _validate_local_storage_format(experiment: Experiment) -> None:
+    """Reject pre-cutover PhaseSweep studies without mutating local storage.
+
+    The check covers every PhaseSweep-shaped study in the selected local
+    ledger, not only studies belonging to the current experiment name. This
+    prevents a new experiment name or output directory from treating a
+    populated pre-cutover ledger as fresh. SQLite is opened read-only and a
+    journal is replayed from an observational snapshot before Optuna can
+    initialize, stamp, recover, or otherwise mutate the live backend.
+
+    :param Experiment experiment: Experiment whose resolved local ledger is inspected.
+    :raises StudyStorageUnavailableError: An existing local ledger cannot be
+        inspected without mutation.
+    :raises StudySchemaMismatchError: A PhaseSweep study is unmarked or uses
+        a pre-cutover/unsupported schema.
+    """
+    storage = experiment.resolved_storage
+    if storage_is_in_memory(storage):
+        return
+    assert storage is not None
+    backend = storage_backend(storage)
+    versions: list[tuple[str, object]] = []
+    if backend == "sqlite":
+        database = sqlite_database_path(storage)
+        uri = sqlite_readonly_uri(storage)
+        if database is None or uri is None or not database.exists():
+            return
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=0.1)
+            try:
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if "studies" not in tables:
+                    return
+                names = [
+                    str(row[0])
+                    for row in conn.execute("SELECT study_name FROM studies").fetchall()
+                    if "::" in str(row[0])
+                ]
+                if not names:
+                    return
+                attrs: dict[str, object] = {}
+                if "study_user_attributes" in tables:
+                    rows = conn.execute(
+                        """
+                        SELECT studies.study_name, study_user_attributes.value_json
+                        FROM studies
+                        JOIN study_user_attributes
+                          ON studies.study_id = study_user_attributes.study_id
+                        WHERE study_user_attributes.key = ?
+                        """,
+                        (STUDY_SCHEMA_ATTR,),
+                    ).fetchall()
+                    for study_name, value_json in rows:
+                        try:
+                            attrs[str(study_name)] = json.loads(value_json)
+                        except (TypeError, json.JSONDecodeError):
+                            attrs[str(study_name)] = value_json
+                versions = [(name, attrs.get(name)) for name in names]
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            raise StudyStorageUnavailableError(
+                f"SQLite storage {database} could not be inspected for its PhaseSweep "
+                "format without mutation."
+            ) from exc
+    elif backend == "journal":
+        snapshot = _journal_snapshot_storage(storage, "the PhaseSweep format boundary")
+        if snapshot is None:
+            return
+        try:
+            versions = [
+                (study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR))
+                for study in snapshot.get_all_studies()
+                if "::" in study.study_name
+            ]
+        except Exception as exc:
+            raise StudyStorageUnavailableError(
+                "Journal storage could not be replayed while checking its PhaseSweep format."
+            ) from exc
+    else:
+        # Checkpoint three removes external RDB execution. The breaking
+        # boundary deliberately stays on the existing local inspection path.
+        return
+
+    unsupported = [
+        (name, version)
+        for name, version in versions
+        if type(version) is not int or version != STUDY_SCHEMA_VERSION
+    ]
+    if unsupported:
+        detail = ", ".join(f"{name!r} ({version!r})" for name, version in unsupported)
+        raise StudySchemaMismatchError(
+            "The selected local storage ledger contains pre-cutover or unsupported "
+            f"PhaseSweep study state: {detail}. Use a fresh local storage ledger and "
+            "artifact root with this PhaseSweep release, or use the preserved PhaseSweep "
+            "0.3.1 environment to operate the existing state. Nothing was written."
+        )
 
 
 def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study | None:

@@ -42,6 +42,7 @@ from phasesweep.engine import (
     read_status,
     run_experiment,
 )
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.engine.paths import (
@@ -56,6 +57,8 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import (
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
     Winner,
 )
 from phasesweep.errors import UnsafeProcessCleanupError
@@ -90,6 +93,12 @@ pytestmark = pytest.mark.skipif(
 # Persistent storage rejects an unseeded stochastic sampler; seeded random is
 # reproducible and resumable, so it needs no non-resumable acknowledgement.
 SEEDED_RANDOM = Sampler(type="random", seed=0)
+
+
+def _mark_current_study(experiment: Experiment, study: optuna.Study) -> None:
+    """Mark a manually constructed study/root as current-format test state."""
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
 def test_in_process_runner_helper_restores_host_signal_state(
@@ -642,6 +651,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
                     study_name=f"t::{from_phase or 'p'}",
                     storage=_resolve_storage(experiment.resolved_storage),
                 )
+                study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
                 if replacement == "unrelated-trial":
                     trial = study.ask()
                     study.tell(trial, 0.5)
@@ -808,7 +818,6 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
         "trial_number": winner["trial_number"],
         "generation_id": winner["generation_id"],
         "attempt_id": winner["attempt_id"],
-        "study": None,
     }
 
 
@@ -820,8 +829,9 @@ def test_terminal_snapshot_tolerates_missing_lifecycle_record(tmp_path: Path) ->
     whenever the best-effort write had failed (review v0.5.16 / blocker 2).
     """
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     generation_path = _generation_path(experiment)
-    generation_path.parent.mkdir(parents=True)
+    generation_path.parent.mkdir(parents=True, exist_ok=True)
     generation_path.write_text("generation_id: prior-generation\n")
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -842,6 +852,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
         phases=[Phase(name="p", n_trials=1, sampler=SEEDED_RANDOM, search_space={})],
     )
     study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    _mark_current_study(experiment, study)
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "old-generation")
     trial.set_user_attr("phasesweep_attempt_id", "old-attempt")
@@ -892,6 +903,12 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     # Patched on Optuna itself, so the guard holds no matter how PhaseSweep
     # imports its own study helpers: any study load at all fails the capture.
     monkeypatch.setattr(optuna, "load_study", fail_redundant_read)
+
+    if storage_kind == "corrupt-sqlite":
+        with pytest.raises(StudyStorageUnavailableError, match="could not be inspected"):
+            mcp_runner.capture_result_snapshot(experiment)
+        assert not _experiment_dir(experiment).exists()
+        return
 
     snapshot = mcp_runner.capture_result_snapshot(experiment)
 
@@ -972,8 +989,8 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
 
 
 def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: Path) -> None:
-    """Commit covers winners, skipped candidates, carried flags, and omitted phases."""
-    phase_names = ("carried", "new", "skipped", "old-only")
+    """Commit covers winners, carried flags, and omitted phases."""
+    phase_names = ("carried", "new", "old-only")
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         phases=[
@@ -982,6 +999,7 @@ def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: 
         ],
     )
     generation_id = "candidate-generation"
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     published_summary = {
         "experiment": experiment.experiment,
         "generation_id": generation_id,
@@ -998,15 +1016,6 @@ def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: 
                 "generation_id": generation_id,
                 "attempt_id": "new-attempt",
             },
-        ],
-        "promotion_decisions": [
-            {
-                "phase": "skipped",
-                "action": "skip",
-                "candidate_trial_number": 1,
-                "candidate_generation_id": generation_id,
-                "candidate_attempt_id": "skipped-attempt",
-            }
         ],
     }
     summary_path = _generation_summary_path(experiment, generation_id)
@@ -1030,7 +1039,6 @@ def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: 
 
     committed_phases = {phase["phase"]: phase for phase in committed["status"]["phases"]}
     assert committed_phases["new"]["published_study_unavailable"] is True
-    assert committed_phases["skipped"]["published_study_unavailable"] is True
     assert committed_phases["carried"]["published_study_unavailable"] is True
     assert committed_phases["old-only"]["published_study_unavailable"] is False
 
@@ -1115,6 +1123,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
         phases=[Phase(name="p", n_trials=2, sampler=SEEDED_RANDOM, search_space={})],
     )
     study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    _mark_current_study(experiment, study)
     identified = study.ask()
     identified.set_user_attr("phasesweep_generation_id", "current-generation")
     identified.set_user_attr("phasesweep_attempt_id", "current-attempt")
@@ -1200,7 +1209,6 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
         "trial_number": 4,
         "generation_id": "engine-generation",
         "attempt_id": "engine-attempt",
-        "study": None,
     }
 
 
