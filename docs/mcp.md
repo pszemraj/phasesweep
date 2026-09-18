@@ -43,17 +43,12 @@ ledger, an absolute `workdir`, and an absolute storage path after `auto` is
 resolved. Set an absolute `execution.cwd` when it is present. In-memory and
 external-database storage are not durable detached-run targets.
 
-Create and inspect a catalog without allowing a run:
+Follow [MCP setup](mcp_setup.md) to create, review, and validate a catalog.
+To run the stdio server directly:
 
 ```bash
-phasesweep mcp init-catalog --from /absolute/path/to/experiment.yaml
-phasesweep mcp check --catalog /absolute/path/to/catalog.yaml
 phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 ```
-
-`init-catalog` writes a disabled, redacted scaffold and does not replace an
-existing file. `check` validates the catalog and its private state layout but
-does not launch a sweep.
 
 ## Fresh MCP state
 

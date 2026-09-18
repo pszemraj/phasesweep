@@ -62,11 +62,8 @@ Use `sqlite:///...` for a persistent sequential local ledger and
 `provenance` mapping. External database URLs are unsupported and rejected
 before connection or artifact creation.
 
-The root `workdir` owns generation records, phase directories, and trial
-evidence. Reuse it only with the same supported-format local ledger and
-semantic experiment. Do not try to move, rebind, adopt, or repair an older
-namespace with this release; use 0.3.1 for the old namespace and choose fresh
-state for this release.
+See [runtime behavior](runtime.md) for artifact-root binding, current-format
+state, and execution behavior.
 
 ## Phase composition
 
@@ -209,18 +206,3 @@ report_objective(
 
 `report_objective` obtains the attempt identity and output path from the
 managed environment. Do not construct those values yourself.
-
-## Review and run
-
-```bash
-phasesweep validate experiment.yaml
-phasesweep run experiment.yaml --dry-run
-phasesweep run experiment.yaml
-phasesweep status experiment.yaml
-phasesweep show-winners experiment.yaml
-```
-
-`validate`, `status`, and `show-winners` never launch trials. `--from-phase`
-can resume a supported experiment only when earlier phases already have valid
-winners. See [runtime behavior](runtime.md) for locks, storage, GPU leasing,
-publication, and recovery rules.

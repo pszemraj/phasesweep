@@ -28,20 +28,14 @@ runs.
 - Artifact relocation/rebinding and old-layout interpretation are gone. The
   current immutable generation and last-success pointer remain the result
   authority.
-- MCP status and results are run-specific. Start with an experiment ID, save
-  the returned `run_id`, and use that ID for status/results/await/cancel. After
-  reconnection, use `get_latest_run(experiment_id)` to recover the run ID.
+- MCP status and results are run-specific. Follow the [tool workflow](mcp.md#tool-workflow)
+  for launch, reconnection, reads, waiting, and cancellation.
 
 ## Fresh-state requirement
 
-Use a fresh artifact root, fresh local SQLite or Journal ledger, and fresh MCP
-state directory. The runtime performs read-only format checks before it claims
-or initializes existing PhaseSweep state. It refuses old, unmarked, malformed,
-or unsupported state without converting or repairing it.
-
-Changing only the experiment name or workdir is insufficient when it points to
-an already populated old local ledger. Use new, disposable paths for this
-release. See [runtime behavior](runtime.md#fresh-state-cutover) and [MCP fresh state](mcp.md#fresh-mcp-state) for the operational boundary.
+Use new paths for this release. Follow the [runtime cutover](runtime.md#fresh-state-cutover)
+for artifact roots and ledgers, plus [MCP fresh state](mcp.md#fresh-mcp-state)
+for detached runs.
 
 ## Retained workflow
 

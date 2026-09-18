@@ -97,20 +97,10 @@ database backends are not part of the runtime.
 
 ## Trial execution and evidence
 
-Each trial has an attempt-scoped directory and process group. PhaseSweep
-captures `stdout.log` and `stderr.log`, applies the configured `yaml_file` or
-`argparse` input boundary, and sets managed identity variables for the trial.
-The trainer should report its objective through a local JSON envelope or a
-configured local log pattern. See the [trainer contract](config.md#trainer-contract).
-
-Constraints are completed-but-ineligible scalar checks. Gates are hard local
-post-trial checks. A failed gate, missing evidence, non-finite objective,
-nonzero exit, or timeout makes that attempt fail. A phase with no feasible
-eligible winner fails rather than exposing a substitute result.
-
-The runtime preserves generic environment inheritance and pass-through values.
-For example, a trainer can use `WANDB_*` credentials or telemetry settings, but
-PhaseSweep does not poll a remote service for objective or gate evidence.
+Each trial has an attempt-scoped directory and process group. The runtime
+captures `stdout.log` and `stderr.log`, prepares the configured input, and
+supervises cleanup. See the [configuration guide](config.md) for trainer input,
+local evidence, gate, constraint, and environment definitions.
 
 ## GPU isolation
 
@@ -149,18 +139,11 @@ ambiguous.
 
 ## Inspection commands
 
-```bash
-phasesweep validate experiment.yaml
-phasesweep run experiment.yaml --dry-run
-phasesweep status experiment.yaml
-phasesweep show-winners experiment.yaml
-phasesweep run experiment.yaml --from-phase phase_name
-```
-
-The commands shown above do not launch work except an ordinary `phasesweep run`
-invocation without `--dry-run`. `status` and `show-winners` inspect the current-format local
-experiment; they do not interpret obsolete layouts. Use the exact original
-0.3.1 environment for existing 0.3.1 state.
+Use `validate`, `run --dry-run`, `status`, and `show-winners` to review an
+experiment without launching work; an ordinary `run` invocation launches
+trials. `--from-phase` requires valid earlier winners. These reads inspect only
+the current-format local experiment; use the original 0.3.1 environment for
+existing 0.3.1 state.
 
 For operator-managed detached runs, see [the MCP operator guide](mcp.md). MCP
 run results are frozen snapshots associated with a run ID; they are not a

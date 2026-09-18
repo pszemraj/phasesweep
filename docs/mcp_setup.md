@@ -28,13 +28,11 @@ installed-package starter named `experiment.yaml` without overwriting files.
 phasesweep mcp init-catalog --from ./experiment.yaml
 ```
 
-The command writes `catalog.yaml` with side effects disabled and winner values
-redacted, validates it, and provisions a fresh [private state layout](mcp.md#fresh-mcp-state).
-Before connecting a client, review every experiment description and config
-path, `visible_params`, each `allow` setting, the catalog state directory, and
-the experiment working directories. Add another `--from` for each experiment;
-use `-o` for another catalog filename. The scaffold never replaces an existing
-catalog.
+The command writes `catalog.yaml`, validates it, and provisions a fresh
+[private state layout](mcp.md#fresh-mcp-state). Review the generated file
+against [the catalog fields and permission model](mcp.md#the-catalog) before
+connecting a client. Add another `--from` for each experiment; use `-o` for
+another catalog filename. The scaffold never replaces an existing catalog.
 
 Validate the reviewed catalog with its absolute path:
 

@@ -91,20 +91,17 @@ effective_overrides:
 
 ## Use your own trainer
 
-Put your trainer's normal base configuration under `trainer_config`, point `trial_command` at its YAML entry point, and pass `{config_path}` where that entry point expects the file. Dotted search keys such as `model.depth` update the corresponding nested value; every other base setting is preserved.
+See the [configuration guide](docs/config.md) for trainer inputs, dotted
+overrides, and objective reporting. Preview one command per phase without
+launching work with `phasesweep run experiment.yaml --dry-run`.
+`phasesweep init` never overwrites an existing file; use `-o PATH` for another
+destination.
 
-Follow the [trainer contract](docs/config.md#trainer-contract) for objective reporting and the [trainer inputs](docs/config.md#trainer-inputs) for the retained YAML and command-line boundaries.
-
-Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints one sampled command per phase without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
-
-The starter keeps its database and artifacts under `<workdir>/<experiment>/` with `storage: auto`. See the [output layout](docs/runtime.md#output-layout) for storage placement and ignored artifacts. This breaking release requires a fresh artifact root and local ledger; use the preserved 0.3.1 release to operate an older namespace.
-
-```bash
-phasesweep status experiment.yaml                           # durable progress, nothing launched
-phasesweep run experiment.yaml --from-phase learning_rate   # resume after prerequisites have valid winners
-```
-
-See [runtime behavior](docs/runtime.md) for locks, process cleanup, GPU isolation, fingerprints, resume, and output layout. The [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer integration.
+The starter uses `storage: auto` under `<workdir>/<experiment>/`. See [runtime
+behavior](docs/runtime.md) for state layout, current-format requirements,
+locks, cleanup, GPU isolation, and resume. The [Tiny Decoder Enwik8
+example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer
+integration.
 
 ## Connect an agent
 
