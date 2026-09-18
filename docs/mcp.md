@@ -73,7 +73,8 @@ Catalog operations use an experiment ID:
 3. After explicit user authorization, `launch_run(experiment_id, from_phase?)`
    starts the detached run and returns its durable `run_id`.
 4. `get_latest_run(experiment_id)` is the reconnection lookup when a client
-   lost a run ID. It returns the newest handle for that catalog experiment.
+   lost a run ID. It returns the newest handle for that catalog experiment, or
+   `found: false` when no matching run exists.
 
 Run lifecycle reads use a run ID only:
 
@@ -86,9 +87,10 @@ cancel_run(run_id)
 
 Save the `run_id` returned by launch. To reconnect from another chat or after a
 client restart, call `get_latest_run(experiment_id)`, then use that returned
-`run_id` for status and results. `await_run` is bounded server-side waiting;
-use it for monitoring rather than tight status polling. Never cancel a run or
-launch a replacement automatically.
+`run_id` for status and results. If it returns `found: false`, there is no run
+to resume. `await_run` is bounded server-side waiting; use it for monitoring
+rather than tight status polling. Never cancel a run or launch a replacement
+automatically.
 
 `get_run_results` is run-specific; terminal reads use that run's frozen result
 snapshot. CLI-only experiments remain inspectable through `phasesweep status`

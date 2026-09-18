@@ -4,7 +4,9 @@ PhaseSweep owns the MCP server and its operator-reviewed catalog. Your MCP
 client owns its configuration and any client-specific instructions; PhaseSweep
 does not create, edit, inspect, or remove client files.
 
-Requirements: Python 3.11+, the [MCP runtime requirements](runtime.md), a PhaseSweep experiment that passes validation, and a client with local stdio MCP support.
+Requirements: Python 3.11+, the [MCP runtime requirements](mcp.md), a
+PhaseSweep experiment that passes validation, and a client with local stdio
+MCP support.
 
 ## Setup
 
@@ -69,8 +71,8 @@ experiments and permitted actions without launching anything. The response
 contains only catalog-approved IDs, descriptions, phase shape, metrics, and
 permitted actions.
 
-For an explicitly authorized run, follow the [tool workflow and response
-shapes](mcp.md#reading-status-responses).
+For an explicitly authorized run, follow the [tool workflow](mcp.md#tool-workflow)
+and [response shapes](mcp.md#reading-status-responses).
 
 ## Maintenance and troubleshooting
 

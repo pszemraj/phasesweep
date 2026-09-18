@@ -196,7 +196,7 @@ from phasesweep import report_objective
 # Train and evaluate using the YAML received at --config, then:
 report_objective(
     value=validation_loss,
-    objective_name="validation_loss",
+    name="validation_loss",
     split="validation",
     policy="final",
     checkpoint="final.pt",

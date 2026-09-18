@@ -53,12 +53,12 @@ def _artifact_root_identity(experiment: Experiment) -> str:
 
 
 def _artifact_root_binding_applies(experiment: Experiment) -> bool:
-    """Return whether this experiment's storage can carry an artifact-root binding.
+    """Return whether the ledger can carry the reverse artifact-root binding.
 
     :param Experiment experiment: Parsed experiment whose storage is inspected.
-    :return bool: ``True`` only for persistent storage. In-memory studies do
-        not outlive the process, so no later invocation can inherit them and
-        no second publication root can conflict with the first.
+    :return bool: ``True`` only for persistent storage. Every artifact root has
+        its own format record; only a persistent ledger also needs to record
+        the root that owns it across invocations.
     """
     return experiment.resolved_storage is not None and not storage_is_in_memory(
         experiment.resolved_storage

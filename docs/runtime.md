@@ -106,9 +106,9 @@ local evidence, gate, constraint, and environment definitions.
 
 By default, `gpu_policy: single_per_trial` leases one visible CUDA device per
 parallel trial. Explicit `gpu_ids` or `gpu_devices` define the available
-tokens; otherwise the runtime uses an explicit numeric `CUDA_VISIBLE_DEVICES`
-setting or host discovery. The lease controls visibility and same-host locking,
-not GPU memory allocation.
+tokens; otherwise the runtime uses numeric, GPU UUID, or MIG tokens from
+`CUDA_VISIBLE_DEVICES`, or falls back to host discovery. The lease controls
+visibility and same-host locking, not GPU memory allocation.
 
 `gpu_policy: whole_node` requires `n_jobs: 1` and a unique explicit device
 list. `gpu_policy: none` disables PhaseSweep's GPU isolation and cannot be
@@ -145,6 +145,6 @@ trials. `--from-phase` requires valid earlier winners. These reads inspect only
 the current-format local experiment; use the original 0.3.1 environment for
 existing 0.3.1 state.
 
-For operator-managed detached runs, see [the MCP operator guide](mcp.md). MCP
-run results are frozen snapshots associated with a run ID; they are not a
-replacement for CLI inspection of an arbitrary experiment tree.
+For operator-managed detached runs, see [the MCP operator guide](mcp.md).
+Terminal MCP run results are frozen snapshots associated with a run ID; they
+are not a replacement for CLI inspection of an arbitrary experiment tree.

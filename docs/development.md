@@ -98,9 +98,9 @@ flowchart TD
 - `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`,
   `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`:
   continuation, current-format publication, and read-only views.
-- `tests/test_storage_urls.py`, `tests/test_locking.py`, and
-  `tests/test_filesystem_layout.py`: local storage, locks, format cutover, and
-  output layout.
+- `tests/test_storage_urls.py`, `tests/test_locking.py`,
+  `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local
+  storage, locks, format cutover, and output layout.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots,
   detached launch, status, cancellation, and recovery.
 - `tests/test_init.py` and `tests/test_reporting.py`: starter creation,

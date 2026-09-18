@@ -1,6 +1,6 @@
 # PhaseSweep
 
-PhaseSweep runs phase-chained hyperparameter sweeps from one ordinary YAML file. That file contains your trainer's base configuration, the metric, and the search plan. PhaseSweep materializes a complete trainer YAML for every trial, decides what to try next, persists each phase winner, and carries selected values forward as fixed inputs to later phases.
+PhaseSweep runs phase-chained hyperparameter sweeps from one ordinary YAML file. That file contains your trainer configuration, the metric, and the search plan. PhaseSweep materializes the configured trainer input for every trial, decides what to try next, persists each phase winner, and carries selected values forward as fixed inputs to later phases.
 
 This is useful when a full joint sweep is too expensive or hard to interpret. For example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](docs/config.md#phase-composition) explains the inheritance model and its tradeoffs.
 

@@ -134,9 +134,9 @@ class ExperimentRunOutcome:
     """One published experiment invocation bound to its generation identity.
 
     The winners and the generation id that produced them are materialized
-    together while the experiment lock is still held, so consumers (suites,
-    provenance manifests) can record exact lineage without re-reading mutable
-    pointers after the lock is released — an interleaving external top-up
+    together while the experiment lock is still held, so provenance consumers
+    can record exact lineage without re-reading mutable pointers after the lock
+    is released — an interleaving external top-up
     would otherwise let a manifest name generation B while carrying winners
     from generation A (review v0.5.14 / blocker 2).
     """
