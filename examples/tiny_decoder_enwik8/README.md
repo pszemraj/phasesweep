@@ -47,8 +47,10 @@ The example sweeps only supported trainer controls. The upstream template does n
 ## MCP smoke
 
 For the same two-trial, 10-batch check through MCP, start from [`gpu_smoke.yaml`](gpu_smoke.yaml)
-instead of the full MCP experiment. From the repo root, copy it into a fresh
-scratch directory:
+instead of the full MCP experiment. Following the [runtime
+cutover](../../docs/runtime.md#fresh-state-cutover) and [fresh MCP state
+requirement](../../docs/mcp.md#fresh-mcp-state), copy it into a new scratch
+directory from the repo root:
 
 ```bash
 mkdir -p /tmp/phasesweep-tiny-decoder-mcp-smoke
@@ -97,4 +99,8 @@ phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
 
 Configure your client with the absolute `phasesweep-mcp` executable and this catalog's absolute path, then verify the read-only catalog operation as described in [MCP setup](../../docs/mcp_setup.md#3-configure-your-client).
 
-The MCP variant uses scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`.
+The MCP variant uses scratch `workdir`, storage, and state paths under
+`/tmp/phasesweep-mcp-tiny-decoder-enwik8`; choose a fresh root before the first
+run with this release as described in the [runtime
+cutover](../../docs/runtime.md#fresh-state-cutover) and [fresh MCP
+state](../../docs/mcp.md#fresh-mcp-state) sections.

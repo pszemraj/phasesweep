@@ -206,3 +206,11 @@ report_objective(
 
 `report_objective` obtains the attempt identity and output path from the
 managed environment. Do not construct those values yourself.
+
+Trainers that cannot import the Python helper can publish the same envelope
+from the managed trial environment:
+
+```bash
+phasesweep report-objective 0.123 --name validation_loss --split validation \
+  --policy final --checkpoint final.pt --step 1000
+```

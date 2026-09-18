@@ -25,6 +25,9 @@ runs.
 - PhaseSweep no longer extracts objectives or gates from W&B and no longer
   supports external RDB storage. Trainers may still receive generic `WANDB_*`
   environment settings and can report their local objective normally.
+- MCP client installers and the `mcp install`, `mcp uninstall`, and
+  `mcp check-install` commands are removed. Each client owns its connection
+  configuration and instructions.
 - Artifact relocation/rebinding and old-layout interpretation are gone. The
   current immutable generation and last-success pointer remain the result
   authority.

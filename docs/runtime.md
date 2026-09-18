@@ -11,7 +11,8 @@ information for detached-run cancellation and recovery.
 This breaking release has one current on-disk format. Start it with all of the
 following:
 
-- a fresh artifact root (`<workdir>/<experiment>`);
+- a fresh artifact root (`<workdir>/<experiment>`), including for in-memory
+  storage;
 - a fresh local SQLite or Journal ledger, if the experiment is persistent; and
 - a fresh MCP `state_dir`, if the experiment is launched through MCP.
 
