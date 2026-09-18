@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep import __version__
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.engine import generation_id_source, read_status, read_winners
+from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
@@ -138,26 +138,24 @@ DESCRIPTION_LIST_EXPERIMENTS = (
 )
 DESCRIPTION_INSPECT_EXPERIMENT = (
     "Inspect one approved experiment's metric, permissions, phases, trial targets, samplers, "
-    "inheritance, and search-space keys. Call after list_experiments and before launch_run; "
-    "next_action is always null because only the user may authorize a launch. "
+    "inheritance, and search-space keys. Call after list_experiments and before launch_run. "
     "Read-only: launch_run separately rechecks config identity and refuses catalog drift."
 )
 DESCRIPTION_GET_LATEST_RUN = (
     "Return the most recently launched run for one experiment. Call only to recover a lost "
-    "run_id; next use await_run for an active run or get_run_results for a terminal run. "
+    "run_id; then use that run_id with await_run, get_run_status, or get_run_results. "
     "Read-only: found=false never authorizes launching a replacement."
 )
 DESCRIPTION_LAUNCH_RUN = (
     "Launch one approved experiment as a detached run and return its run_id. Call only after "
-    "inspection and explicit user authorization; next call await_run with the returned run_id. "
+    "inspection and explicit user authorization; monitor with the returned run_id. "
     "Never retry permission or config-identity refusals; await named blockers before retrying a "
     "capacity refusal."
 )
 DESCRIPTION_GET_RUN_STATUS = (
-    "Read process state and per-phase progress for exactly one experiment_id or run_id. Use as a "
-    "single status check when await_run is unsuitable; next await an active run or read terminal "
-    "results. State is run.state; stop if run.recovery_required is true. "
-    "Read-only: after launch always use run_id and follow the top-level next_action."
+    "Read process state and per-phase progress for exactly one run_id. Use as a single status "
+    "check when await_run is unsuitable. State is run.state; stop if run.recovery_required is "
+    "true. Read-only: reuse the run_id returned by launch_run or get_latest_run."
 )
 DESCRIPTION_GET_RUN_RESULTS = (
     "Return terminal per-phase winners, completeness, metrics, gates, and "
@@ -174,8 +172,8 @@ DESCRIPTION_AWAIT_RUN = (
     "Wait up to timeout_seconds for a launched run to change, become terminal, or require "
     "recovery. Call after launch_run and repeat while running; omit timeout_seconds for a "
     "client-safe 20-second wait, and request longer waits only when the client permits them. "
-    "State is run.state; stop immediately if run.recovery_required is true. Follow the "
-    "top-level next_action and call get_run_results when terminal. Read-only: always reuse "
+    "State is run.state; stop immediately if run.recovery_required is true. Call "
+    "get_run_results when terminal. Read-only: always reuse "
     "the run_id, including after a client disconnect."
 )
 
@@ -186,23 +184,9 @@ ExperimentId = Annotated[
         pattern=SAFE_NAME_JSON_PATTERN,
     ),
 ]
-MaybeExperimentId = Annotated[
-    str | None,
-    Field(
-        description="Catalog experiment id. Provide exactly one of experiment_id or run_id.",
-        pattern=SAFE_NAME_JSON_PATTERN,
-    ),
-]
 RunId = Annotated[
     str,
     Field(description=f"MCP run id returned by {TOOL_LAUNCH_RUN}.", pattern=SAFE_NAME_JSON_PATTERN),
-]
-MaybeRunId = Annotated[
-    str | None,
-    Field(
-        description=f"MCP run id returned by {TOOL_LAUNCH_RUN}. Provide exactly one of experiment_id or run_id.",
-        pattern=SAFE_NAME_JSON_PATTERN,
-    ),
 ]
 PhaseName = Annotated[
     str,
@@ -286,17 +270,6 @@ AwaitTimeoutSeconds = Annotated[
         le=AWAIT_MAX_TIMEOUT_SECONDS,
     ),
 ]
-NextAction = Literal[
-    "list_experiments",
-    "inspect_experiment",
-    "get_latest_run",
-    "get_run_status",
-    "await_run",
-    "get_run_results",
-    "launch_run",
-    "cancel_run",
-]
-
 # Environment variables that make the interpreter execute code before the
 # detached runner's first statement. They are dropped from the child's
 # environment (review v0.5.17 / blocker 9); PYTHONNOUSERSITE backs up the
@@ -389,15 +362,6 @@ class _ToolPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class _ResultPayload(_ToolPayload):
-    """Top-level tool result with an optional normal workflow transition."""
-
-    next_action: NextAction | None = Field(
-        default=None,
-        description="Normal next tool for this result, or null when operator/user input is needed.",
-    )
-
-
 class ObjectiveEvidencePayload(_ToolPayload, _ObjectiveEvidenceFields):
     """Assurance properties enforced by the configured objective extractor.
 
@@ -434,7 +398,7 @@ class ExperimentSummaryPayload(_ToolPayload):
     capabilities: CapabilitiesPayload
 
 
-class ListExperimentsResult(_ResultPayload):
+class ListExperimentsResult(_ToolPayload):
     """Structured output for list_experiments."""
 
     experiments: list[ExperimentSummaryPayload]
@@ -460,7 +424,7 @@ class PhaseValidationPayload(_ToolPayload):
     search_space: list[str] = Field(description="Search-space keys only, never ranges or values.")
 
 
-class InspectExperimentResult(_ResultPayload):
+class InspectExperimentResult(_ToolPayload):
     """Structured output for inspect_experiment."""
 
     experiment_id: ExperimentId
@@ -491,7 +455,7 @@ class RunPayload(_ToolPayload):
     )
 
 
-class GetLatestRunResult(_ResultPayload):
+class GetLatestRunResult(_ToolPayload):
     """Newest durable run handle for one experiment."""
 
     experiment_id: ExperimentId
@@ -550,7 +514,7 @@ class PhaseStatusPayload(_ToolPayload):
     )
 
 
-class GetRunStatusResult(_ResultPayload):
+class GetRunStatusResult(_ToolPayload):
     """Structured output for get_run_status."""
 
     experiment_id: ExperimentId
@@ -578,8 +542,8 @@ class GetRunStatusResult(_ResultPayload):
     represented_generation_id: str | None = Field(
         description=(
             "The generation whose winner_present, summary_present, and this-run trial "
-            "counts this payload shows: normally the queried run_id when one was given, "
-            "otherwise published_generation_id. Null for a config-only unavailable placeholder."
+            "counts this payload shows: normally the queried run_id. Null for a "
+            "config-only unavailable placeholder."
         )
     )
     is_published: bool = Field(
@@ -603,11 +567,11 @@ class GetRunStatusResult(_ResultPayload):
     metric: MetricPayload
     phases: list[PhaseStatusPayload]
     summary_present: bool
-    run: RunPayload | None
+    run: RunPayload
     elapsed_seconds: int | None = Field(
         description=(
             "Seconds since launch while running; total run duration once terminal; "
-            "null when no run is associated with this query."
+            "null when the terminal endpoint is unavailable."
         )
     )
 
@@ -664,7 +628,7 @@ class WinnerPhasePayload(_ToolPayload):
     incomplete: bool = Field(description="Whether a wallclock timeout produced a partial winner.")
 
 
-class GetRunResultsResult(_ResultPayload):
+class GetRunResultsResult(_ToolPayload):
     """Structured output for get_run_results.
 
     Every result-scoped field describes the represented generation under the
@@ -676,7 +640,7 @@ class GetRunResultsResult(_ResultPayload):
     """
 
     experiment_id: ExperimentId
-    run_id: RunId | None
+    run_id: RunId
     result_source: ResultSource = Field(
         description=(
             "Where the result facts came from: the mutable shared study for a live/current "
@@ -686,9 +650,9 @@ class GetRunResultsResult(_ResultPayload):
     )
     represented_generation_id: str | None = Field(
         description=(
-            "Generation whose winners and completeness this payload represents. During a "
-            "live experiment-scoped read this may be the in-flight run generation; null when "
-            "there is no represented generation."
+            "Generation whose winners and completeness this payload represents. This is the "
+            "in-flight run generation during a live run; null when there is no represented "
+            "generation."
         )
     )
     publication_integrity: PublicationIntegrity
@@ -707,7 +671,7 @@ class GetRunResultsResult(_ResultPayload):
     failure: FailurePayload | None = None
 
 
-class LaunchRunResult(_ResultPayload):
+class LaunchRunResult(_ToolPayload):
     """Structured output for launch_run."""
 
     run_id: RunId
@@ -715,7 +679,7 @@ class LaunchRunResult(_ResultPayload):
     state: Literal["running"]
 
 
-class CancelRunResult(_ResultPayload):
+class CancelRunResult(_ToolPayload):
     """Structured output for cancel_run."""
 
     run_id: RunId
@@ -748,47 +712,6 @@ def _cursor_offset(cursor: str | None) -> int:
     if offset < 0:
         raise McpToolError("invalid cursor; use next_cursor returned by list_experiments")
     return offset
-
-
-def _run_next_action(run: RunPayload | None) -> NextAction | None:
-    """Choose the normal follow-up for a returned run handle.
-
-    :param RunPayload | None run: Agent-visible run state, when one exists.
-    :return NextAction | None: Monitoring or result tool, or null when no automatic step is safe.
-    """
-    if run is None or run.recovery_required:
-        return None
-    if run.state == "running":
-        return cast(NextAction, TOOL_AWAIT_RUN)
-    return cast(NextAction, TOOL_GET_RUN_RESULTS)
-
-
-def _status_next_action(result: GetRunStatusResult) -> NextAction | None:
-    """Choose the normal follow-up for one status read.
-
-    ``run`` is null only for an experiment-scoped read that found no live run:
-    the experiment either never ran under this server or every run of it is
-    already terminal. Deferring to :func:`_run_next_action` there would answer
-    "nothing left to do" even when finished work is on disk, so a published
-    winner steers the agent to the results tool instead. With nothing published
-    and no winner anywhere there is genuinely nothing further to read, and null
-    keeps its documented meaning.
-
-    ``is_published`` is checked beside the per-phase winners because those
-    phases are the *current* config's: after a phase rename none of them has a
-    winner while the publication the results tool would return is intact, and
-    answering "stop" there sends the agent away from a result it can read
-    (review v0.5.16 / blocker 4).
-
-    :param GetRunStatusResult result: Status payload whose transition is chosen.
-    :return NextAction | None: Monitoring or result tool, or null when no
-        automatic step is safe or useful.
-    """
-    if result.run is not None:
-        return _run_next_action(result.run)
-    if result.is_published or any(phase.winner_present for phase in result.phases):
-        return cast(NextAction, TOOL_GET_RUN_RESULTS)
-    return None
 
 
 def _run_elapsed_seconds(store: RunStore, handle: RunHandle, state: str) -> int | None:
@@ -1072,21 +995,17 @@ class PhaseSweepMCP:
         # the live recovery_required field says whether recovery is still needed.
         return persisted
 
-    def status(self, *, experiment_id: str | None = None, run_id: str | None = None) -> dict:
+    def status(self, run_id: str) -> dict[str, Any]:
         """Per-phase trial counts and winner presence plus the run process state.
 
-        Provide either ``experiment_id`` (reports the current shared studies and
-        live run, if any) or ``run_id`` (reports that specific run, using its
-        frozen result snapshot once terminal). Raises if neither is given.
+        Reads are always scoped to one persisted ``run_id``. A live run reads
+        its immutable configuration snapshot against current local storage;
+        a terminal run reads its frozen result snapshot.
 
-        :param str | None experiment_id: Optional catalog id for experiment-level status.
-        :param str | None run_id: Optional detached run id for run-specific status.
+        :param str run_id: Detached run id returned by ``launch`` or ``latest_run``.
         :return dict: Path-free status payload for the agent.
         """
-        target_id, status, run, handle, result_source = self._read_status_target(
-            experiment_id=experiment_id,
-            run_id=run_id,
-        )
+        target_id, status, run, handle, result_source = self._read_status_target(run_id=run_id)
         return self._status_result(target_id, status, run, handle, result_source)
 
     async def await_run(
@@ -1124,7 +1043,6 @@ class PhaseSweepMCP:
             read_started = time.monotonic()
             target_id, status, run, handle, result_source = await asyncio.to_thread(
                 self._read_status_target,
-                experiment_id=None,
                 run_id=run_id,
             )
             read_seconds = time.monotonic() - read_started
@@ -1170,33 +1088,30 @@ class PhaseSweepMCP:
     def _read_status_target(
         self,
         *,
-        experiment_id: str | None,
-        run_id: str | None,
+        run_id: str,
     ) -> tuple[
         str,
         dict[str, Any],
-        dict[str, Any] | None,
-        RunHandle | None,
+        dict[str, Any],
+        RunHandle,
         ResultSource,
     ]:
-        """Resolve a status target and read its current or frozen status payload.
+        """Resolve one run-specific status read to its current or frozen payload.
 
-        :param str | None experiment_id: Catalog id for a current experiment read.
-        :param str | None run_id: Persisted run id for a run-specific read.
+        :param str run_id: Persisted run id for the read.
         :return tuple: Target id, status data, optional run state and handle,
             and result provenance.
         """
         target_id, experiment, run, handle, snapshot = self._resolve_read_target(
-            experiment_id=experiment_id,
             run_id=run_id,
             include_run=True,
         )
+        assert run is not None
         snapshot, result_source = self._result_snapshot_view(experiment, handle, snapshot)
-        if handle is not None and run is not None:
-            # Keep the captured frozen results while pairing them with the
-            # latest cleanup and recovery state. Both snapshot finalization and
-            # a cleanup reservation can change the run after target resolution.
-            run = self._run_payload(handle)
+        # Keep the captured frozen results while pairing them with the latest
+        # cleanup and recovery state. Both snapshot finalization and a cleanup
+        # reservation can change the run after target resolution.
+        run = self._run_payload(handle)
         if snapshot is not None:
             status = self._snapshot_status_payload(
                 target_id,
@@ -1206,24 +1121,18 @@ class PhaseSweepMCP:
         else:
             assert experiment is not None
             status = self._live_status_payload(target_id, experiment, handle)
-            if handle is not None:
-                # A runner can finish freezing its results during the live
-                # storage read. Discard that view once its snapshot is durable.
-                completed, completed_source = self._result_snapshot_view(experiment, handle, None)
-                if completed is not None:
-                    status = self._snapshot_status_payload(
-                        target_id, completed, result_source=completed_source
-                    )
-                    result_source = completed_source
-                # The final probe can also reserve cleanup or discover an
-                # orphaned pending snapshot without producing a result view.
-                if run is not None:
-                    run = self._run_payload(handle)
-        if (
-            handle is not None
-            and run is not None
-            and result_source == "terminal_snapshot_unavailable"
-        ):
+            # A runner can finish freezing its results during the live
+            # storage read. Discard that view once its snapshot is durable.
+            completed, completed_source = self._result_snapshot_view(experiment, handle, None)
+            if completed is not None:
+                status = self._snapshot_status_payload(
+                    target_id, completed, result_source=completed_source
+                )
+                result_source = completed_source
+            # The final probe can also reserve cleanup or discover an
+            # orphaned pending snapshot without producing a result view.
+            run = self._run_payload(handle)
+        if result_source == "terminal_snapshot_unavailable":
             run["failure"] = self._run_failure_payload(
                 handle,
                 state=run["state"],
@@ -1246,7 +1155,7 @@ class PhaseSweepMCP:
         self,
         experiment_id: str,
         experiment: Experiment,
-        handle: RunHandle | None,
+        handle: RunHandle,
     ) -> dict[str, Any]:
         """Read live status and leave catalog drift unknown after decataloging.
 
@@ -1256,14 +1165,14 @@ class PhaseSweepMCP:
         current catalog config and therefore cannot support a drift verdict.
 
         :param str experiment_id: Catalog id associated with the read target.
-        :param Experiment experiment: Current catalog config or live run snapshot config.
-        :param RunHandle | None handle: Optional live run pinning the represented generation.
+        :param Experiment experiment: Live run snapshot config.
+        :param RunHandle handle: Live run pinning the represented generation.
         :return dict[str, Any]: Path-free live status payload.
         """
         comparison = self._catalog_comparison_experiment(experiment_id)
         status = read_status(
             experiment,
-            generation_id=handle.run_id if handle is not None else None,
+            generation_id=handle.run_id,
             comparison_experiment=comparison,
         )
         if comparison is None:
@@ -1309,22 +1218,20 @@ class PhaseSweepMCP:
         self,
         target_id: str,
         status: dict[str, Any],
-        run: dict[str, Any] | None,
-        handle: RunHandle | None,
+        run: dict[str, Any],
+        handle: RunHandle,
         result_source: ResultSource,
     ) -> dict[str, Any]:
         """Build the common path-free response for status and await_run.
 
         :param str target_id: Experiment id represented by ``status``.
         :param dict[str, Any] status: Current or frozen engine status payload.
-        :param dict[str, Any] | None run: Optional derived detached-run state.
-        :param RunHandle | None handle: Optional already-resolved detached-run handle.
+        :param dict[str, Any] run: Derived detached-run state.
+        :param RunHandle handle: Already-resolved detached-run handle.
         :param ResultSource result_source: Current shared state or frozen run snapshot.
         :return dict[str, Any]: Agent-safe status response.
         """
-        elapsed_seconds = None
-        if run is not None and handle is not None:
-            elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
+        elapsed_seconds = _run_elapsed_seconds(self._runs, handle, run["state"])
         return status_payload(
             target_id,
             status,
@@ -1336,59 +1243,36 @@ class PhaseSweepMCP:
     def _resolve_read_target(
         self,
         *,
-        experiment_id: str | None,
-        run_id: str | None,
+        run_id: str,
         include_run: bool,
     ) -> tuple[
         str,
         Experiment | None,
         dict[str, Any] | None,
-        RunHandle | None,
+        RunHandle,
         RunResultSnapshot | None,
     ]:
-        """Resolve status/winner reads to the catalog config or immutable run snapshot.
+        """Resolve a run read to its immutable config or terminal snapshot.
 
-        :param str | None experiment_id: Catalog id for current experiment-level reads.
-        :param str | None run_id: Persisted run id for immutable run-specific reads.
+        :param str run_id: Persisted run id for immutable run-specific reads.
         :param bool include_run: Whether to include live run state in the returned payload.
         :return tuple: Target id, parsed experiment when a live read needs it, optional run
             payload, handle, and captured terminal result snapshot.
-        :raises McpToolError: If neither or both of ``experiment_id`` and
-            ``run_id`` were provided.
         :raises UnknownRunError: If ``run_id`` names no persisted run.
-        :raises UnknownExperimentError: If ``experiment_id`` is not cataloged.
         """
-        if (experiment_id is None) == (run_id is None):
-            provided = "neither" if experiment_id is None else "both"
-            raise McpToolError(
-                f"provide exactly one of experiment_id or run_id; you provided {provided}. "
-                "After a launch, prefer the run_id."
-            )
-        if run_id is not None:
-            handle = self._runs.get(run_id)
-            if handle is None:
-                raise UnknownRunError(run_id)
-            try:
-                frozen_snapshot = self._terminal_result_snapshot(handle)
-            except RunResultSnapshotUnavailableError:
-                frozen_snapshot = None
-            # A complete terminal result snapshot contains every historical
-            # status and winner fact this read exposes. The sibling config
-            # snapshot is only needed for a live read or unavailable-result
-            # placeholder. Carry the captured result through the request:
-            # recovery may mark the stored snapshot pending again.
-            experiment = None if frozen_snapshot is not None else self._load_run_experiment(handle)
-            run = None
-            if include_run:
-                run = self._run_payload(handle)
-            return handle.experiment_id, experiment, run, handle, frozen_snapshot
-
-        assert experiment_id is not None
-        reg = self._registry.get(experiment_id)
-        live = self._runs.live_run_for(experiment_id)
-        experiment = self._load_run_experiment(live) if live is not None else reg.experiment
-        run = self._run_payload(live) if include_run and live is not None else None
-        return reg.id, experiment, run, live, None
+        handle = self._runs.get(run_id)
+        if handle is None:
+            raise UnknownRunError(run_id)
+        try:
+            frozen_snapshot = self._terminal_result_snapshot(handle)
+        except RunResultSnapshotUnavailableError:
+            frozen_snapshot = None
+        # A complete terminal result snapshot contains every historical status
+        # and winner fact this read exposes. The sibling config snapshot is
+        # needed only for a live read or unavailable-result placeholder.
+        experiment = None if frozen_snapshot is not None else self._load_run_experiment(handle)
+        run = self._run_payload(handle) if include_run else None
+        return handle.experiment_id, experiment, run, handle, frozen_snapshot
 
     def _load_run_experiment(self, handle: RunHandle) -> Experiment:
         """Load and verify the immutable config snapshot for a persisted run.
@@ -1416,15 +1300,12 @@ class PhaseSweepMCP:
             log.info("invalid config snapshot for run=%s: %s", handle.run_id, exc)
             raise RunSnapshotUnavailableError(handle.run_id) from None
 
-    def winners(
-        self, experiment_id: str | None = None, *, run_id: str | None = None
-    ) -> dict[str, Any]:
+    def winners(self, run_id: str) -> dict[str, Any]:
         """Return the winning hyperparameters per completed phase.
 
-        Provide ``experiment_id`` for the current cataloged experiment, or ``run_id``
-        to read winners from the immutable config and terminal result snapshots
-        that run recorded. Run-specific reads must not drift when the cataloged
-        config changes or a later run resumes the shared studies.
+        Reads are scoped to the immutable config and terminal result snapshots
+        recorded for ``run_id``. Live reads use only that run's saved config;
+        neither path reconstructs results from a catalog experiment.
 
         The payload carries ``publication_integrity`` so an empty winner list
         is never ambiguous: ``"absent"`` means nothing has published yet,
@@ -1445,12 +1326,10 @@ class PhaseSweepMCP:
         the one a further run would execute. Visibility is unchanged: the
         current policy still decides which historical *values* are redacted.
 
-        :param str | None experiment_id: Optional catalog experiment id whose winners should be read.
-        :param str | None run_id: Optional detached run id whose snapshot should be read.
+        :param str run_id: Detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
         """
         target_id, experiment, _run, handle, snapshot = self._resolve_read_target(
-            experiment_id=experiment_id,
             run_id=run_id,
             include_run=False,
         )
@@ -1475,10 +1354,8 @@ class PhaseSweepMCP:
             # Resolve the represented generation once via read_status, then
             # reuse that exact id for read_winners: two independent pointer
             # resolutions here could otherwise mix identities from different
-            # moments (review v0.5.15 / blocker 3). represented_generation_id
-            # is the queried run_id itself when pinned, else the captured
-            # published id -- never the live current pointer, which is what
-            # this used to (incorrectly) label winners with.
+            # moments. The represented generation id is the queried run's
+            # generation, never a later mutable pointer.
             status = self._live_status_payload(
                 target_id,
                 experiment,
@@ -1495,60 +1372,34 @@ class PhaseSweepMCP:
             )
             if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
                 winner_views = []
-            if handle is not None:
-                # The live read may span the runner's final snapshot write.
-                # Results for that run now come from its frozen publication.
-                completed, completed_source = self._result_snapshot_view(experiment, handle, None)
-                if completed is not None:
-                    status = self._snapshot_status_payload(
-                        target_id, completed, result_source=completed_source
-                    )
-                    winner_views = (
-                        []
-                        if status["publication_integrity"]
-                        in {"failed", "permission_denied", "unknown"}
-                        else completed.winner_views()
-                    )
-                    result_source = completed_source
-                elif self._runs.recovery_required(handle) or not self._runs._runner_is_live(handle):
-                    # No frozen result is available after the runner stopped
-                    # or cleanup became uncertain. A recovery transition may
-                    # not have written its marker yet, so do not reuse the
-                    # mutable winner view captured before the final probe.
-                    unavailable = RunResultSnapshot.model_validate(
-                        capture_pre_generation_result_snapshot(experiment)
-                    )
-                    status = self._snapshot_status_payload(
-                        target_id, unavailable, result_source="terminal_snapshot_unavailable"
-                    )
-                    winner_views = []
-                    result_source = "terminal_snapshot_unavailable"
+            # The live read may span the runner's final snapshot write.
+            # Results for that run now come from its frozen publication.
+            completed, completed_source = self._result_snapshot_view(experiment, handle, None)
+            if completed is not None:
+                status = self._snapshot_status_payload(
+                    target_id, completed, result_source=completed_source
+                )
+                winner_views = (
+                    []
+                    if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}
+                    else completed.winner_views()
+                )
+                result_source = completed_source
+            elif self._runs.recovery_required(handle) or not self._runs._runner_is_live(handle):
+                # No frozen result is available after the runner stopped or
+                # cleanup became uncertain. Do not reuse the mutable winner
+                # view captured before the final probe.
+                unavailable = RunResultSnapshot.model_validate(
+                    capture_pre_generation_result_snapshot(experiment)
+                )
+                status = self._snapshot_status_payload(
+                    target_id, unavailable, result_source="terminal_snapshot_unavailable"
+                )
+                winner_views = []
+                result_source = "terminal_snapshot_unavailable"
         represented_generation_id: str | None = status["represented_generation_id"]
         publication_integrity: McpPublicationState = status["publication_integrity"]
-        authority_handle = handle
-        authority_unreadable = False
-        if authority_handle is None and represented_generation_id is not None:
-            authority_handle = self._runs.get(represented_generation_id)
-            authority_unreadable = authority_handle is None and (
-                self._runs.handle_exists(represented_generation_id)
-                or self._runs.run_evidence_exists(represented_generation_id)
-                or (
-                    experiment is not None
-                    and generation_id_source(experiment, represented_generation_id) == "caller"
-                )
-            )
-        if authority_unreadable:
-            # The represented generation WAS an MCP-launched run, but its
-            # frozen launch authority cannot be read: the handle no longer
-            # decodes, or only sibling per-run files survive its deletion, or
-            # -- proof that outlives the state dir itself -- the generation's
-            # own reproducibility record says its id was caller-granted while
-            # no handle answers for it (PR #5 review / P2 missing-handle
-            # authority). Fall back to the narrowest policy instead of the
-            # current catalog's, which may be wider than the launch grant.
-            visible_params: VisibleParamsPolicy = "none"
-        else:
-            visible_params = self._effective_visible_params(target_id, authority_handle)
+        visible_params = self._effective_visible_params(target_id, handle)
         result = winners_payload(
             target_id,
             winner_views,
@@ -1562,40 +1413,34 @@ class PhaseSweepMCP:
             result_context=status["result_context"],
             published_config_matches_current=status["published_config_matches_current"],
         )
-        result["failure"] = (
-            self._run_failure_payload(
-                handle,
-                force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
-            )
-            if handle is not None
-            else None
+        result["failure"] = self._run_failure_payload(
+            handle,
+            force_snapshot_unavailable=result_source == "terminal_snapshot_unavailable",
         )
         return result
 
     def _effective_visible_params(
         self,
         experiment_id: str,
-        handle: RunHandle | None,
+        handle: RunHandle,
     ) -> VisibleParamsPolicy:
         """Resolve current or launch/current-intersected winner visibility.
 
         :param str experiment_id: Catalog id associated with the represented results.
-        :param RunHandle | None handle: MCP run whose generation is represented, if any.
+        :param RunHandle handle: MCP run whose generation is represented.
         :return VisibleParamsPolicy: Effective sampled-parameter visibility.
         """
         try:
             current_policy = self._registry.get(experiment_id).visible_params
         except UnknownExperimentError:
             return "none"
-        if handle is None:
-            return current_policy
         launch_policy = handle.visible_params_at_launch or "none"
         return intersect_visible_params(launch_policy, current_policy)
 
     def _result_snapshot_view(
         self,
         experiment: Experiment | None,
-        handle: RunHandle | None,
+        handle: RunHandle,
         snapshot: RunResultSnapshot | None,
     ) -> tuple[RunResultSnapshot | None, ResultSource]:
         """Resolve one run result without falling back to mutable terminal state.
@@ -1608,15 +1453,13 @@ class PhaseSweepMCP:
         :param Experiment | None experiment: Exact catalog or saved run configuration when a
             current-state read or unavailable-result placeholder needs one. A complete terminal
             snapshot is self-contained and does not require it.
-        :param RunHandle | None handle: Optional detached run being read.
+        :param RunHandle handle: Detached run being read.
         :param RunResultSnapshot | None snapshot: Terminal snapshot already captured during
             target resolution, reused without rereading mutable finalization state.
         :return tuple: Optional result view and its agent-visible provenance.
         """
         if snapshot is not None:
             return snapshot, "frozen_run_snapshot"
-        if handle is None:
-            return None, "current_shared_study"
         try:
             snapshot = self._terminal_result_snapshot(handle)
         except RunResultSnapshotUnavailableError:
@@ -2512,13 +2355,6 @@ def _strict_tool_inputs(mcp: Any) -> None:
         arg_model.model_rebuild(force=True)
         tool.parameters = arg_model.model_json_schema(by_alias=True)
 
-    for tool_name in (TOOL_GET_RUN_STATUS, TOOL_GET_RUN_RESULTS):
-        tool = mcp._tool_manager.get_tool(tool_name)
-        if tool is not None:
-            tool.parameters["oneOf"] = [
-                {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
-                {"required": ["run_id"], "not": {"required": ["experiment_id"]}},
-            ]
     _verify_strict_tool_inputs(mcp)
 
 
@@ -2526,13 +2362,9 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
     """Fail startup if FastMCP internals did not keep the strict schemas.
 
     :param Any mcp: Configured FastMCP server whose registered tools are inspected.
-    :raises RuntimeError: If any tool still accepts undeclared input keys, a
-        read tool is unregistered, or a read tool lost its exactly-one-of schema.
+    :raises RuntimeError: If any tool still accepts undeclared input keys or a
+        required run-scoped read tool is unregistered.
     """
-    expected_one_of = [
-        {"required": ["experiment_id"], "not": {"required": ["run_id"]}},
-        {"required": ["run_id"], "not": {"required": ["experiment_id"]}},
-    ]
     for tool in mcp._tool_manager.list_tools():
         if tool.parameters.get("additionalProperties") is not False:
             raise RuntimeError(f"MCP tool {tool.name!r} accepts undeclared input keys")
@@ -2540,8 +2372,8 @@ def _verify_strict_tool_inputs(mcp: Any) -> None:
         tool = mcp._tool_manager.get_tool(tool_name)
         if tool is None:
             raise RuntimeError(f"MCP tool {tool_name!r} was not registered")
-        if tool.parameters.get("oneOf") != expected_one_of:
-            raise RuntimeError(f"MCP tool {tool_name!r} lost its exactly-one-of schema")
+        if tool.parameters.get("required") != ["run_id"]:
+            raise RuntimeError(f"MCP tool {tool_name!r} must require run_id")
 
 
 def build_server(app: PhaseSweepMCP) -> Any:
@@ -2577,19 +2409,8 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param MaybeCursor cursor: Optional pagination cursor from a prior result.
         :return ListExperimentsResult: Structured catalog listing.
         """
-        result = ListExperimentsResult.model_validate(
+        return ListExperimentsResult.model_validate(
             app.list_experiments(limit=limit, cursor=cursor)
-        )
-        return result.model_copy(
-            update={
-                "next_action": (
-                    TOOL_LIST_EXPERIMENTS
-                    if result.next_cursor is not None
-                    else TOOL_INSPECT_EXPERIMENT
-                    if result.experiments
-                    else None
-                )
-            }
         )
 
     @mcp.tool(
@@ -2603,11 +2424,8 @@ def build_server(app: PhaseSweepMCP) -> Any:
         """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing.
 
         :param ExperimentId experiment_id: Catalog experiment id to inspect.
-        :return InspectExperimentResult: Structured inspection payload with a
-            null ``next_action``; the user, not the server, authorizes a launch.
+        :return InspectExperimentResult: Structured inspection payload.
         """
-        # next_action stays null (the field default): launching requires explicit
-        # user authorization, so the server never proposes launch_run itself.
         return InspectExperimentResult.model_validate(
             await asyncio.to_thread(app.validate, experiment_id)
         )
@@ -2625,10 +2443,9 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param ExperimentId experiment_id: Catalog experiment id whose latest run is needed.
         :return GetLatestRunResult: One computed run handle or ``found=false``.
         """
-        result = GetLatestRunResult.model_validate(
+        return GetLatestRunResult.model_validate(
             await asyncio.to_thread(app.latest_run, experiment_id)
         )
-        return result.model_copy(update={"next_action": _run_next_action(result.run)})
 
     @mcp.tool(
         name=TOOL_GET_RUN_STATUS,
@@ -2637,20 +2454,13 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    async def get_run_status(
-        experiment_id: MaybeExperimentId = None,
-        run_id: MaybeRunId = None,
-    ) -> GetRunStatusResult:
-        """Per-phase trial counts and winner presence, plus the run process state. Provide exactly one of experiment_id or run_id. Read-only.
+    async def get_run_status(run_id: RunId) -> GetRunStatusResult:
+        """Return per-phase trial counts, winner presence, and one run's process state.
 
-        :param MaybeExperimentId experiment_id: Optional catalog experiment id for experiment-level status.
-        :param MaybeRunId run_id: Optional detached run id for run-specific status.
+        :param RunId run_id: Detached run id returned by launch_run or get_latest_run.
         :return GetRunStatusResult: Structured status payload.
         """
-        result = GetRunStatusResult.model_validate(
-            await asyncio.to_thread(app.status, experiment_id=experiment_id, run_id=run_id)
-        )
-        return result.model_copy(update={"next_action": _status_next_action(result)})
+        return GetRunStatusResult.model_validate(await asyncio.to_thread(app.status, run_id))
 
     @mcp.tool(
         name=TOOL_AWAIT_RUN,
@@ -2672,14 +2482,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         result = AwaitRunResult.model_validate(
             await app.await_run(run_id, timeout_seconds=timeout_seconds)
         )
-        next_action: NextAction | None
-        if result.reason == "terminal":
-            next_action = cast(NextAction, TOOL_GET_RUN_RESULTS)
-        elif result.reason == "recovery_required":
-            next_action = None
-        else:
-            next_action = cast(NextAction, TOOL_AWAIT_RUN)
-        return result.model_copy(update={"next_action": next_action})
+        return result
 
     @mcp.tool(
         name=TOOL_GET_RUN_RESULTS,
@@ -2688,19 +2491,13 @@ def build_server(app: PhaseSweepMCP) -> Any:
         structured_output=True,
     )
     @_safe_tool
-    async def get_run_results(
-        experiment_id: MaybeExperimentId = None,
-        run_id: MaybeRunId = None,
-    ) -> GetRunResultsResult:
-        """Return policy-filtered winning sampled hyperparameters per completed phase: trial number, metric, params, gate status, and completeness. Provide exactly one of experiment_id or run_id. Read-only.
+    async def get_run_results(run_id: RunId) -> GetRunResultsResult:
+        """Return policy-filtered winning sampled hyperparameters for one run.
 
-        :param MaybeExperimentId experiment_id: Optional catalog experiment id whose winners should be read.
-        :param MaybeRunId run_id: Optional detached run id whose snapshot should be read.
+        :param RunId run_id: Detached run id returned by launch_run or get_latest_run.
         :return GetRunResultsResult: Structured results payload.
         """
-        return GetRunResultsResult.model_validate(
-            await asyncio.to_thread(app.winners, experiment_id=experiment_id, run_id=run_id)
-        )
+        return GetRunResultsResult.model_validate(await asyncio.to_thread(app.winners, run_id))
 
     @mcp.tool(
         name=TOOL_LAUNCH_RUN,
@@ -2725,10 +2522,9 @@ def build_server(app: PhaseSweepMCP) -> Any:
         :param MaybePhaseName from_phase: Optional phase to resume from.
         :return LaunchRunResult: Structured launch result.
         """
-        result = LaunchRunResult.model_validate(
+        return LaunchRunResult.model_validate(
             await asyncio.to_thread(app.launch, experiment_id, from_phase=from_phase)
         )
-        return result.model_copy(update={"next_action": TOOL_AWAIT_RUN})
 
     @mcp.tool(
         name=TOOL_CANCEL_RUN,
@@ -2750,10 +2546,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
         # MCP 1.27 invokes synchronous tool functions on the event-loop
         # thread. Cancellation may spend its 30-second grace period waiting
         # for a process group, so isolate it from concurrent await/status calls.
-        result = CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
-        return result.model_copy(
-            update={"next_action": None if result.recovery_required else TOOL_GET_RUN_RESULTS}
-        )
+        return CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
 
     @mcp.resource(
         CATALOG_RESOURCE_URI,

@@ -403,9 +403,6 @@ def test_missing_published_study_is_an_operator_preflight_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A diagnosed absent ledger needs restoration, not process recovery."""
-    from phasesweep.mcp.redaction import status_payload
-    from phasesweep.mcp.server import GetRunStatusResult
-
     monkeypatch.chdir(tmp_path)
     experiment = make_experiment(
         workdir=tmp_path / "runs",
@@ -421,14 +418,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
 
     snapshot = mcp_runner.capture_result_snapshot(experiment)
     assert snapshot["status"]["phases"][0]["published_study_unavailable"] is True
-    payload = status_payload(
-        experiment_id="t",
-        status=read_status(experiment),
-        run=None,
-        result_source="current_shared_study",
-        elapsed_seconds=None,
-    )
-    assert GetRunStatusResult.model_validate(payload).phases[0].published_study_unavailable
+    assert read_status(experiment)["phases"][0]["published_study_unavailable"] is True
 
     store = RunStore(tmp_path / "state")
     run_id = "missing-published-study"

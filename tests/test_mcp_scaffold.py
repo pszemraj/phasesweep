@@ -248,10 +248,17 @@ def test_init_catalog_losing_publish_race_preserves_other_writer(
 ) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
+    original_link = os.link
 
-    def lose_publish_race(_source: Path, destination: Path) -> None:
-        destination.write_text("other process\n")
-        raise FileExistsError(destination)
+    def lose_publish_race(
+        source: str | Path,
+        destination: str | Path,
+        **_kwargs: object,
+    ) -> None:
+        if Path(destination) == output:
+            output.write_text("other process\n")
+            raise FileExistsError(destination)
+        original_link(source, destination, **_kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr("phasesweep.cli.os.link", lose_publish_race)
 

@@ -96,6 +96,13 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
                 {"lr": 3e-4, "token": "SECRET_FIXED_OVERRIDE", "data": "/private/data"},
                 None,
                 False,
+                source=WinnerSource(
+                    kind="phase_trial",
+                    phase="p",
+                    trial_number=0,
+                    generation_id="generation-1",
+                    attempt_id="attempt-1",
+                ),
             )
         ],
     )
@@ -110,8 +117,6 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
         app.list_experiments(),
         app.validate(reg.id),
         app.latest_run(reg.id),
-        app.status(experiment_id=reg.id),
-        app.winners(experiment_id=reg.id),
     ]
     assert_no_sensitive(tool_results, sensitive)
 
@@ -221,7 +226,22 @@ def test_winners_payload_applies_visible_params_policy(
     expected: dict[str, object],
     redacted: bool,
 ) -> None:
-    view = PhaseWinnerView("p", 0, 0.1, dict(params), dict(params), None, False)
+    view = PhaseWinnerView(
+        "p",
+        0,
+        0.1,
+        dict(params),
+        dict(params),
+        None,
+        False,
+        source=WinnerSource(
+            kind="phase_trial",
+            phase="p",
+            trial_number=0,
+            generation_id="generation-1",
+            attempt_id="attempt-1",
+        ),
+    )
     phase = _winners_payload("redact_me", [view], visible_params=policy)["phases"][0]
     assert phase["params"] == expected
     assert phase["params_redacted"] is redacted

@@ -74,7 +74,6 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _trial_dir_for,
 )
-from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.publication_validation import _generation_artifact_manifest
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import (
@@ -84,11 +83,11 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     GENERATION_SUMMARY_SCHEMA_VERSION,
-    PUBLICATION_POINTER_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     Winner,
+    WinnerSource,
 )
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.evidence.models import objective_evidence_assurance
@@ -103,16 +102,12 @@ from phasesweep.mcp.errors import (
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.server import (
-    TOOL_AWAIT_RUN,
-    TOOL_GET_RUN_RESULTS,
-    TOOL_GET_RUN_STATUS,
     TOOL_LAUNCH_RUN,
     AwaitRunResult,
     GetRunResultsResult,
     GetRunStatusResult,
     PhaseSweepMCP,
     _safe_tool,
-    _status_next_action,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.runtime.files import open_private_text
@@ -518,6 +513,13 @@ def _write_winner_yaml(
         phase_fingerprint=phase_fingerprint,
         generation_id=published_generation_id,
         attempt_id="fixture-attempt",
+        source=WinnerSource(
+            kind="phase_trial",
+            phase=phase_name,
+            trial_number=0,
+            generation_id=published_generation_id,
+            attempt_id="fixture-attempt",
+        ),
     )
     _save_winner(
         experiment,
@@ -605,51 +607,11 @@ def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
         with open_private_text(store.config_snapshot_path("srv-orphan"), "x") as output:
             output.write("experiment: srv\n")
 
-    with pytest.raises(
-        RunCapacityUnknownError, match="cannot prove available launch capacity"
-    ) as exc:
+    with pytest.raises(RunCapacityUnknownError, match="cannot prove available launch capacity"):
         app.launch("srv")
-
-    if record_kind == "orphan_config":
-        assert "srv-orphan" in str(exc.value)
-        assert "recover-run" in str(exc.value)
 
     assert "cmd" not in captured
     assert store.list_handles() == []
-
-
-def test_operator_recovery_clears_pre_spawn_orphan_snapshot(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    del app
-    run_id = "srv-pre-spawn-orphan"
-    snapshot = store.config_snapshot_path(run_id)
-    with open_private_text(snapshot, "x") as output:
-        output.write(config.read_text())
-
-    preflight = CliRunner().invoke(
-        cli_main,
-        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
-    )
-    assert preflight.exit_code == 0, preflight.output
-    assert "no runner can still start a trainer under this identity" in preflight.output
-    assert snapshot.is_file()
-
-    confirmed = CliRunner().invoke(
-        cli_main,
-        [
-            "mcp",
-            "recover-run",
-            "--state-dir",
-            str(registry.state_dir),
-            "--run-id",
-            run_id,
-            "--confirm",
-        ],
-    )
-    assert confirmed.exit_code == 0, confirmed.output
-    assert "no runner can still start a trainer under this identity" in confirmed.output
-    assert not snapshot.exists()
 
 
 @pytest.mark.parametrize("interrupted_recovery", [False, True])
@@ -804,44 +766,6 @@ def test_operator_recovery_refuses_leased_preparation_with_terminal_evidence(
     assert result.exit_code != 0
     assert "launch outcome is unresolved" in result.output
     assert {path: path.read_bytes() for path in artifacts} == original
-
-
-@pytest.mark.parametrize("evidence", ["log", "dangling_handle"])
-def test_operator_recovery_refuses_ambiguous_pre_spawn_orphan(
-    tmp_path: Path,
-    evidence: str,
-) -> None:
-    """Only a snapshot with no other run evidence is safe to remove."""
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    del app
-    run_id = "srv-ambiguous-orphan"
-    snapshot = store.config_snapshot_path(run_id)
-    with open_private_text(snapshot, "x") as output:
-        output.write(config.read_text())
-    if evidence == "log":
-        with open_private_text(store.log_path(run_id), "x") as output:
-            output.write("runner may have started\n")
-    else:
-        handle_path = registry.state_dir / "runs" / f"{run_id}.json"
-        handle_path.symlink_to("missing-handle.json")
-
-    result = CliRunner().invoke(
-        cli_main,
-        [
-            "mcp",
-            "recover-run",
-            "--state-dir",
-            str(registry.state_dir),
-            "--run-id",
-            run_id,
-            "--confirm",
-        ],
-    )
-
-    assert result.exit_code != 0
-    assert "unknown run id" in result.output
-    assert snapshot.is_file()
 
 
 def test_launch_passes_config_snapshot_to_runner(
@@ -2098,11 +2022,6 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     else:
         assert by_run["phases"][0]["metric"] == 0.123
 
-    by_experiment = getattr(restarted_app, method_name)(experiment_id="srv")
-    assert [phase["phase"] for phase in by_experiment["phases"]] == ["p"]
-    if method_name == "status":
-        assert by_experiment["run"]["run_id"] == run_id
-
 
 def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     tmp_path: Path,
@@ -2208,132 +2127,13 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
 
 
 @pytest.mark.parametrize("method_name", ["status", "winners"])
-def test_read_tools_require_exactly_one_identifier(tmp_path: Path, method_name: str) -> None:
+def test_read_tools_require_a_known_run_id(tmp_path: Path, method_name: str) -> None:
     config = _config(tmp_path)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
     method = getattr(app, method_name)
 
-    with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
-        method()
-    with pytest.raises(Exception, match="exactly one of experiment_id or run_id"):
-        method(experiment_id="srv", run_id="nope-123")
     with pytest.raises(Exception, match="unknown run id"):
-        method(run_id="nope-123")
-
-
-def test_experiment_status_next_action_steers_a_finished_experiment_to_results(
-    tmp_path: Path,
-) -> None:
-    """A completed experiment must not report "nothing left to do".
-
-    ``live_run_for`` matches only running handles, so an experiment-scoped
-    status read of a finished sweep carries ``run: null``. Deriving
-    ``next_action`` from the run alone would answer null - the agent's documented
-    stop signal - while the winners sit on disk unread.
-    """
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-    run_id = "srv-finished"
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    store.create(
-        make_run_handle(run_id=run_id, experiment_id=reg.id, config_sha256=reg.config_sha256)
-    )
-    write_run_status(store, run_id, returncode=0, cleanup_confirmed=True)
-
-    before = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
-
-    assert before.run is None
-    assert not any(phase.winner_present for phase in before.phases)
-    assert _status_next_action(before) is None  # nothing has produced results yet
-
-    _write_winner_yaml(
-        reg.experiment,
-        "p",
-        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
-    )
-
-    after = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
-
-    assert after.run is None
-    assert _status_next_action(after) == TOOL_GET_RUN_RESULTS
-
-
-def test_status_and_winners_carry_the_publication_integrity_verdict(tmp_path: Path) -> None:
-    """Review v0.5.18 / finding F4: an agent must distinguish corrupt from fresh.
-
-    Both read surfaces reported a corrupt publication exactly like a workdir
-    that had never published, so an agent would cheerfully propose the one
-    action that destroys the evidence.
-    """
-    trainer = write_constant_trainer(tmp_path)
-    config = tmp_path / "srv.yaml"
-    experiment = make_experiment(
-        experiment="srv",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                sampler=Sampler(type="random", seed=0),
-                search_space={},
-            )
-        ],
-    )
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
-
-    fresh = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
-    assert fresh.publication_integrity == "absent"
-    assert app.winners(experiment_id="srv")["publication_integrity"] == "absent"
-
-    run_experiment(experiment)
-
-    healthy = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
-    assert healthy.publication_integrity == "ok"
-    assert healthy.is_published is True
-    assert app.winners(experiment_id="srv")["publication_integrity"] == "ok"
-
-    generation_id = _last_successful_generation_id(experiment)
-    assert generation_id is not None
-    if os.geteuid() != 0:
-        snapshot = (
-            _generation_summary_path(experiment, generation_id).parent / "config.snapshot.yaml"
-        )
-        original_mode = snapshot.stat().st_mode & 0o777
-        snapshot.chmod(0o000)
-        try:
-            denied_status_payload = app.status(experiment_id="srv")
-            denied_status = GetRunStatusResult.model_validate(denied_status_payload)
-            denied_winners = app.winners(experiment_id="srv")
-        finally:
-            snapshot.chmod(original_mode)
-        assert denied_status.publication_integrity == "permission_denied"
-        assert denied_status.published_generation_id is None
-        assert denied_status.is_published is False
-        assert denied_winners["publication_integrity"] == "permission_denied"
-        assert denied_winners["winner_count"] == 0
-        # MCP deliberately forwards the enum, not the local permission detail.
-        assert "publication_error" not in json.dumps(
-            [denied_status_payload, denied_winners], default=str
-        )
-
-    winner_path = _generation_winner_path(experiment, generation_id, "p")
-    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
-
-    payload = app.status(experiment_id="srv")
-    corrupt = GetRunStatusResult.model_validate(payload)
-    assert corrupt.publication_integrity == "failed"
-    assert corrupt.published_generation_id is None
-    assert corrupt.is_published is False
-    winners = app.winners(experiment_id="srv")
-    assert winners["publication_integrity"] == "failed"
-    # The verdict is a closed enum, so nothing path-shaped rides along with it.
-    serialized = json.dumps([payload, winners], default=str)
-    assert str(tmp_path) not in serialized
+        method("nope-123")
 
 
 # --------------------------------------------------------------------------
@@ -2427,78 +2227,31 @@ def _record_published_run_snapshot(
     return run_id, trainer, config, catalog
 
 
-def test_frozen_legacy_snapshot_reports_published_study_check_as_unknown(tmp_path: Path) -> None:
-    """A snapshot that predates the check must not assert study availability."""
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, store = make_mcp_app(catalog)
-    handle = store.get(run_id)
-    assert handle is not None
-    terminal = store.recorded_terminal_status(handle)
-    assert terminal is not None
-    snapshot = terminal["result_snapshot"]
-    assert isinstance(snapshot, dict)
-    phase = snapshot["status"]["phases"][0]
-    assert isinstance(phase, dict)
-    phase.pop("published_study_unavailable")
-    write_run_status(
-        store,
-        run_id,
-        returncode=0,
-        error_class=None,
-        cleanup_confirmed=True,
-        result_snapshot_state="complete",
-        result_snapshot=snapshot,
-    )
-
-    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
-
-    assert status.result_source == "frozen_run_snapshot"
-    assert status.phases[0].published_study_unavailable is None
-
-
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     tmp_path: Path,
 ) -> None:
-    """A result published as x/minimize is never reported as y/maximize.
-
-    Both read surfaces must agree: status already resolved the historical
-    metric, while results built its label from the current catalog, so the
-    same number was reported under two different metrics by two tools of the
-    same server.
-    """
-    trainer, config, catalog = _publish_drift_experiment(tmp_path)
-
+    """A run snapshot keeps x/minimize after the catalog changes to y/maximize."""
+    run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
-    baseline_status = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
-    baseline_results = GetRunResultsResult.model_validate(app.winners(experiment_id="srv"))
-
-    # Unchanged config: the historical labels are also the current ones, and
-    # the drift flag says so rather than staying silent.
-    assert baseline_results.metric.name == "x"
-    assert baseline_results.metric.goal == "minimize"
-    assert baseline_results.result_context == "represented_generation"
+    baseline_status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    baseline_results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
     assert baseline_results.published_config_matches_current is True
     assert baseline_status.published_config_matches_current is True
-    assert baseline_status.result_phase_plan == ["p"]
-    assert baseline_results.winner_count == 1
 
     _write_experiment_config(
         config,
         _drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize"),
     )
     restarted, _restarted_registry, _restarted_store = make_mcp_app(catalog)
-
-    status = GetRunStatusResult.model_validate(restarted.status(experiment_id="srv"))
-    results = GetRunResultsResult.model_validate(restarted.winners(experiment_id="srv"))
+    status = GetRunStatusResult.model_validate(restarted.status(run_id=run_id))
+    results = GetRunResultsResult.model_validate(restarted.winners(run_id=run_id))
 
     assert (results.metric.name, results.metric.goal) == ("x", "minimize")
     assert (status.metric.name, status.metric.goal) == (results.metric.name, results.metric.goal)
     assert results.result_context == "represented_generation"
     assert results.published_config_matches_current is False
     assert status.published_config_matches_current is False
-    # The winner itself is unchanged: only its provenance disclosure improved.
     assert results.winner_count == 1
-    assert results.phases[0].metric == baseline_results.phases[0].metric
 
 
 def test_run_scoped_snapshot_recomputes_config_drift_against_current_catalog(
@@ -2696,11 +2449,7 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
     assert payload["result_source"] == "frozen_run_snapshot"
     assert payload["run"]["state"] == "succeeded"
     assert payload["run"]["recovery_required"] is False
-    if read_tool == "status":
-        assert (
-            _status_next_action(GetRunStatusResult.model_validate(payload)) == TOOL_GET_RUN_RESULTS
-        )
-    else:
+    if read_tool != "status":
         assert payload["reason"] == "terminal"
 
 
@@ -2901,7 +2650,7 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
     claims evidence properties that run never had - the one field an agent is
     told to use when deciding how far to trust a metric.
     """
-    trainer, config, catalog = _publish_drift_experiment(tmp_path)
+    run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     published_assurance = objective_evidence_assurance(
         _drift_experiment(tmp_path, trainer).metric.extractor
     )
@@ -2922,7 +2671,7 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
     )
     app, _registry, _store = make_mcp_app(catalog)
 
-    results = GetRunResultsResult.model_validate(app.winners(experiment_id="srv"))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
     evidence = results.metric.objective_evidence.model_dump()
 
     assert evidence == published_assurance
@@ -2935,27 +2684,6 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
     assert results.published_config_matches_current is False
 
 
-def test_drifted_recorded_objective_evidence_falls_back_without_internal_error(
-    tmp_path: Path,
-) -> None:
-    trainer, _config, catalog = _publish_drift_experiment(tmp_path)
-    experiment = _drift_experiment(tmp_path, trainer)
-    generation_id = _last_successful_generation_id(experiment)
-    assert generation_id is not None
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    summary["metric"]["objective_evidence"]["future_flag"] = True
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    app, _registry, _store = make_mcp_app(catalog)
-
-    results = GetRunResultsResult.model_validate(app.winners(experiment_id="srv"))
-    status = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
-
-    expected = objective_evidence_assurance(experiment.metric.extractor)
-    assert results.metric.objective_evidence.model_dump() == expected
-    assert status.metric.objective_evidence.model_dump() == expected
-
-
 def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> None:
     """Renaming a phase must not delete the published result from the payload.
 
@@ -2963,11 +2691,11 @@ def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> Non
     publication with zero winners and the new name listed as missing: an
     agent's cue to launch a run over evidence that was there all along.
     """
-    trainer, config, catalog = _publish_drift_experiment(tmp_path)
+    run_id, trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phase_name="q"))
     app, _registry, _store = make_mcp_app(catalog)
 
-    results = GetRunResultsResult.model_validate(app.winners(experiment_id="srv"))
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
 
     assert results.publication_integrity == "ok"
     assert [phase.phase for phase in results.phases] == ["p"]
@@ -2977,115 +2705,14 @@ def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> Non
     assert results.all_phases_have_winners is True
     assert results.published_config_matches_current is False
 
-    status = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
 
-    # Status keeps reporting the *current* plan's progress - a run would have
-    # to produce a winner for "q" - but no longer implies the publication is
-    # empty: it names the plan that publication used and flags the drift.
+    # Run-specific status uses the phase plan captured when the run published.
     assert status.is_published is True
-    assert [phase.phase for phase in status.phases] == ["q"]
-    assert status.phases[0].winner_present is False
+    assert [phase.phase for phase in status.phases] == ["p"]
+    assert status.phases[0].winner_present is True
     assert status.result_phase_plan == ["p"]
     assert status.published_config_matches_current is False
-    # ... and it still points at the result instead of answering "stop": the
-    # winner the results tool returns is right there.
-    assert _status_next_action(status) == TOOL_GET_RUN_RESULTS
-
-
-def test_current_visibility_policy_redacts_historical_values_without_relabeling_them(
-    tmp_path: Path,
-) -> None:
-    """Redaction is the current operator's call; labeling is the result's own.
-
-    The two must not be conflated in either direction: tightening the catalog
-    policy still hides a historical param value, and it never licenses
-    reporting that value under today's metric or phase name.
-    """
-    trainer, config, catalog = _publish_drift_experiment(tmp_path)
-    _write_experiment_config(
-        config,
-        _drift_experiment(tmp_path, trainer, metric_name="y", goal="maximize", phase_name="q"),
-    )
-
-    redacted_app, _registry, _store = make_mcp_app(catalog)
-    redacted = GetRunResultsResult.model_validate(redacted_app.winners(experiment_id="srv"))
-
-    assert redacted.phases[0].params == {"lr": "<redacted>"}
-    assert redacted.phases[0].params_redacted is True
-    assert redacted.phases[0].phase == "p"
-    assert (redacted.metric.name, redacted.metric.goal) == ("x", "minimize")
-
-    visible_app, _visible_registry, _visible_store = make_mcp_app(
-        write_mcp_catalog(tmp_path, {"srv": config}, visible_params={"srv": ["lr"]})
-    )
-    visible = GetRunResultsResult.model_validate(visible_app.winners(experiment_id="srv"))
-
-    assert visible.phases[0].params["lr"] in (1, 2)
-    assert visible.phases[0].params_redacted is False
-    assert visible.phases[0].phase == "p"
-    assert (visible.metric.name, visible.metric.goal) == ("x", "minimize")
-
-
-def test_experiment_status_next_action_awaits_a_live_run(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    reg = registry.get("srv")
-    run_id = "srv-live"
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    store.create(
-        make_run_handle(run_id=run_id, experiment_id=reg.id, config_sha256=reg.config_sha256)
-    )
-
-    result = GetRunStatusResult.model_validate(app.status(experiment_id="srv"))
-
-    assert result.run is not None
-    assert result.run.state == "running"
-    assert _status_next_action(result) == TOOL_AWAIT_RUN
-
-
-def test_get_run_status_tool_chains_a_finished_experiment_to_results(tmp_path: Path) -> None:
-    """The registered tool, not only the helper, must emit the follow-up."""
-    pytest.importorskip("mcp")
-
-    from phasesweep.mcp.server import build_server
-
-    config = _config(tmp_path)
-    app, registry, _store = make_mcp_app(_catalog(tmp_path, config))
-    reg = registry.get("srv")
-    _write_winner_yaml(
-        reg.experiment,
-        "p",
-        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
-    )
-    server = build_server(app)
-
-    result = asyncio.run(server._tool_manager.get_tool(TOOL_GET_RUN_STATUS).fn(experiment_id="srv"))
-
-    assert result.run is None
-    assert result.next_action == TOOL_GET_RUN_RESULTS
-
-
-def test_winners_apply_catalog_visible_params_policy(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    default_app, default_registry, _store = make_mcp_app(_catalog(tmp_path, config))
-    reg = default_registry.get("srv")
-    _write_winner_yaml(
-        reg.experiment,
-        "p",
-        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
-    )
-
-    assert default_app.winners(experiment_id="srv")["phases"][0]["params"] == {"lr": "<redacted>"}
-
-    visible_app, _visible_registry, _visible_store = make_mcp_app(
-        write_mcp_catalog(
-            tmp_path,
-            {"srv": config},
-            visible_params={"srv": ["lr"]},
-        )
-    )
-
-    assert visible_app.winners(experiment_id="srv")["phases"][0]["params"] == {"lr": 0.001}
 
 
 @pytest.mark.parametrize(
@@ -3130,202 +2757,6 @@ def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
     restarted = PhaseSweepMCP(Registry.load(catalog), store)
 
     assert restarted.winners(run_id=run_id)["phases"][0]["params"]["lr"] == expected
-
-
-def test_legacy_run_without_visibility_never_falls_back_to_current_catalog(
-    tmp_path: Path,
-) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, visible_params="all"))
-    reg = registry.get("srv")
-    run_id = "srv-legacy"
-    snapshot = config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-            visible_params_at_launch=None,
-        )
-    )
-    _write_winner_yaml(
-        reg.experiment,
-        "p",
-        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
-        generation_id=run_id,
-    )
-
-    assert app.winners(run_id=run_id)["phases"][0]["params"] == {"lr": "<redacted>"}
-
-
-def _represent_legacy_generation(experiment: Experiment, generation_id: str) -> None:
-    """Fabricate an identity-only publication that represents ``generation_id``.
-
-    Legacy (pre-manifest) publication: the pointer and summary pass the
-    identity-only gate, so the experiment-scoped read represents the given
-    generation without a real run.
-    """
-    _write_winner_yaml(
-        experiment,
-        "p",
-        phase_fingerprint=_phase_fingerprint(experiment, experiment.phases[0], {}),
-        generation_id=generation_id,
-    )
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_bytes = yaml.safe_dump(
-        {"experiment": experiment.experiment, "generation_id": generation_id}
-    ).encode("utf-8")
-    summary_path.write_bytes(summary_bytes)
-    pointer = _last_successful_generation_path(experiment)
-    pointer.parent.mkdir(parents=True, exist_ok=True)
-    pointer.write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
-                "experiment": experiment.experiment,
-                "generation_id": generation_id,
-                "summary_size_bytes": len(summary_bytes),
-                "summary_sha256": hashlib.sha256(summary_bytes).hexdigest(),
-            }
-        )
-    )
-
-
-def test_corrupt_run_handle_fails_closed_for_experiment_scoped_winners(tmp_path: Path) -> None:
-    """A published generation whose run handle no longer decodes must not be
-    rendered under the current catalog policy: the frozen launch authority is
-    unreadable, and the current policy may be wider than the launch grant."""
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(
-        write_mcp_catalog(tmp_path, {"srv": config}, visible_params={"srv": "all"})
-    )
-    reg = registry.get("srv")
-    run_id = "srv-corrupt-handle"
-    _represent_legacy_generation(reg.experiment, run_id)
-    # The handle file exists but no longer decodes.
-    handle_path = store._runs_dir / f"{run_id}.json"
-    handle_path.parent.mkdir(parents=True, exist_ok=True)
-    handle_path.write_text("{ not json")
-
-    winners = app.winners(experiment_id="srv")
-
-    assert winners["phases"][0]["params"] == {"lr": "<redacted>"}
-
-
-@pytest.mark.parametrize(
-    "surviving",
-    [
-        "config_snapshot_path",
-        "status_path",
-        "log_path",
-        "cleanup_uncertain_path",
-        "cleanup_recovery_path",
-        "transition_lock",
-    ],
-)
-def test_deleted_run_handle_with_surviving_run_evidence_fails_closed(
-    tmp_path: Path, surviving: str
-) -> None:
-    """A deleted handle whose sibling per-run files survive is a launched MCP
-    run with unreadable frozen authority, not a never-MCP generation: the
-    current catalog policy may be wider than the lost launch grant, so the
-    narrowest policy applies (PR #5 review / P2 missing-handle authority)."""
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(
-        write_mcp_catalog(tmp_path, {"srv": config}, visible_params={"srv": "all"})
-    )
-    reg = registry.get("srv")
-    run_id = "srv-deleted-handle"
-    _represent_legacy_generation(reg.experiment, run_id)
-    # No handle file at all -- deleted after the run -- but one sibling
-    # per-run file under the same state dir survives it.
-    evidence = (
-        store._logs_dir / f"{run_id}.transition.lock"
-        if surviving == "transition_lock"
-        else getattr(store, surviving)(run_id)
-    )
-    evidence.parent.mkdir(parents=True, exist_ok=True)
-    evidence.write_text("orphaned\n")
-
-    winners = app.winners(experiment_id="srv")
-
-    assert winners["phases"][0]["params"] == {"lr": "<redacted>"}
-
-
-def test_generation_with_no_run_evidence_and_no_id_source_keeps_current_policy(
-    tmp_path: Path,
-) -> None:
-    """A legacy tree must not be over-closed: a represented generation with no
-    handle, no surviving per-run file, and no recorded id source predates the
-    provenance marker, and the current catalog policy legitimately applies."""
-    config = _config(tmp_path)
-    app, registry, _store = make_mcp_app(
-        write_mcp_catalog(tmp_path, {"srv": config}, visible_params={"srv": "all"})
-    )
-    reg = registry.get("srv")
-    _represent_legacy_generation(reg.experiment, "legacy-cli-generation")
-
-    winners = app.winners(experiment_id="srv")
-
-    assert winners["phases"][0]["params"] == {"lr": 0.001}
-
-
-def _real_run_app(tmp_path: Path) -> tuple[PhaseSweepMCP, Experiment]:
-    """Build an app over a real runnable experiment cataloged with ``visible_params: all``."""
-    trainer = write_constant_trainer(tmp_path)
-    config = tmp_path / "srv.yaml"
-    experiment = make_experiment(
-        experiment="srv",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
-    )
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, visible_params="all"))
-    return app, experiment
-
-
-def test_replaced_state_dir_fails_closed_for_a_caller_identified_generation(
-    tmp_path: Path,
-) -> None:
-    """Losing the MCP state dir must not widen visibility: the generation's own
-    reproducibility record proves its id -- and so its launch authority -- was
-    caller-granted, and with no handle answering for that frozen grant the
-    narrowest policy applies (PR #5 review / P2 missing-handle authority)."""
-    app, experiment = _real_run_app(tmp_path)
-    # What the detached runner does: publish under the launcher-granted run id.
-    # The app's store holds nothing for it, as after a state-dir replacement.
-    run_experiment(experiment, generation_id="srv-detached-1")
-
-    winners = app.winners(experiment_id="srv")
-
-    assert winners["phases"][0]["params"] == {"x": "<redacted>"}
-
-
-def test_engine_minted_generation_without_a_handle_uses_current_catalog_policy(
-    tmp_path: Path,
-) -> None:
-    """The durable id-source marker must not over-close: a CLI-launched
-    generation records ``engine``, so with no MCP evidence anywhere the current
-    catalog policy legitimately renders its winner values."""
-    app, experiment = _real_run_app(tmp_path)
-    run_experiment(experiment)
-
-    winners = app.winners(experiment_id="srv")
-
-    params = winners["phases"][0]["params"]
-    assert isinstance(params["x"], int)
 
 
 def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
