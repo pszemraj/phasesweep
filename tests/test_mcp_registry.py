@@ -549,34 +549,6 @@ def test_missing_storage_rejected(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config))
 
 
-@pytest.mark.parametrize(
-    "storage",
-    [
-        '"postgresql://user:pass@example.com/phases"',
-        '"postgresql+psycopg2://user:pass@example.com/phases"',
-        '"mysql+pymysql://user:pass@example.com/phases"',
-    ],
-)
-def test_external_rdb_storage_rejected_for_local_node_mcp(
-    tmp_path: Path,
-    storage: str,
-) -> None:
-    config = _write(
-        tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path)
-        .replace(f"sqlite:///{tmp_path}/reg_ok.db", storage)
-        # Acknowledge the config-level single-host gate so this test reaches
-        # the MCP-specific local-node rejection, which has no such escape.
-        .replace(
-            "experiment: reg_ok\n",
-            "experiment: reg_ok\nallow_external_rdb_single_host: true\n",
-        ),
-    )
-
-    with pytest.raises(CatalogError, match="local-node SQLite or JournalStorage"):
-        Registry.load(_catalog(tmp_path, config))
-
-
 def test_persistent_sqlite_uri_file_storage_allowed(tmp_path: Path) -> None:
     storage = f'"sqlite:///file:{tmp_path}/uri.db?mode=rwc&uri=true"'
     config = _write(

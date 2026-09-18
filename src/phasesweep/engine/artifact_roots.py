@@ -14,7 +14,6 @@ import optuna
 from phasesweep.config import Experiment
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
-    LegacyArtifactRootMigrationRequiredError,
     PublicationAccessError,
     PublicationIntegrityError,
     PublishedStudyMissingError,
@@ -130,7 +129,6 @@ def _auto_storage_backend_conflict(experiment: Experiment, raw: Any) -> str | No
         f"but storage: auto now selects {selected} because n_jobs changed between "
         "sequential and parallel execution. Restore the previous n_jobs setting to "
         "continue this tree, or use a new experiment name or workdir for the new backend. "
-        "'phasesweep rebind-workdir' does not convert study.db and study.journal. "
         "No trial ran and nothing was published."
     )
 
@@ -140,9 +138,9 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
 
     Arbitrary operator files do not establish storage ownership. A note,
     ``.DS_Store``, or other unrelated file may already live in a chosen output
-    directory before the first run, and treating it as a legacy PhaseSweep
-    tree makes the experiment name unusable. Only paths PhaseSweep itself
-    creates can require explicit adoption.
+    directory before the first run, and treating it as PhaseSweep state makes
+    the experiment name unusable. Only paths PhaseSweep itself creates require
+    a format-boundary refusal.
 
     :param Experiment experiment: Experiment whose artifact root is inspected.
     :raises ArtifactRootConflictError: The artifact root cannot be enumerated.
@@ -191,22 +189,18 @@ def _validate_artifact_root_binding(
     experiment: Experiment,
     *,
     claim_fresh: bool,
-    rebind: bool = False,
 ) -> None:
     """Validate or claim the storage ledger that owns an artifact tree.
 
     Study attributes bind ledger to tree. This reverse record binds tree to
     ledger, preventing a second database from combining its trial counts with
-    another database's publication. A non-empty legacy tree is adopted only by
-    the explicit ``rebind-workdir`` workflow.
+    another database's publication. Existing unmarked PhaseSweep state is
+    pre-cutover state and is refused by this release.
 
     :param Experiment experiment: Config whose root and storage must agree.
     :param bool claim_fresh: Write the record when the root has no durable state.
-    :param bool rebind: Explain empty-storage refusals for the rebind command.
     :raises ArtifactRootConflictError: The binding cannot be validated as the
         current user, or is malformed or names another owner.
-    :raises LegacyArtifactRootMigrationRequiredError: A non-empty tree predates
-        the reverse binding and requires explicit adoption.
     """
     path = _artifact_root_binding_path(experiment)
     expected = _artifact_root_binding_payload(experiment)
@@ -215,16 +209,7 @@ def _validate_artifact_root_binding(
     except FileNotFoundError:
         durable_entry = _root_durable_state_entry(experiment)
         if durable_entry is not None:
-            if rebind:
-                raise LegacyArtifactRootMigrationRequiredError(
-                    f"Artifact root {expected['artifact_root']!r} contains legacy PhaseSweep "
-                    "state, but the configured storage has no populated phase studies to "
-                    "adopt. Restore the original storage setting and complete ledger for "
-                    "this tree; keep the explicit storage setting when switching to "
-                    "storage: auto would select an empty ledger. Rebinding does not move "
-                    "or convert storage ledgers. Nothing was written."
-                ) from None
-            raise LegacyArtifactRootMigrationRequiredError(
+            raise ArtifactRootConflictError(
                 f"Artifact root {expected['artifact_root']!r} contains pre-cutover "
                 f"PhaseSweep state entry {durable_entry!r} but no supported format marker. "
                 "Use a fresh artifact root and fresh local storage with this PhaseSweep "
@@ -245,8 +230,7 @@ def _validate_artifact_root_binding(
         raise ArtifactRootConflictError(
             f"Artifact-root binding {path} cannot be validated as the current user "
             "(permission denied). Use the user that owns this artifact tree or restore "
-            "read permission; do not run rebind-workdir to change an ownership record "
-            "you could not inspect."
+            "read permission before using this artifact root."
         ) from exc
     except (OSError, ValueError) as exc:
         raise ArtifactRootConflictError(
@@ -264,15 +248,6 @@ def _validate_artifact_root_binding(
         backend_conflict = _auto_storage_backend_conflict(experiment, raw)
         if backend_conflict is not None:
             raise ArtifactRootConflictError(backend_conflict)
-        if rebind:
-            raise ArtifactRootConflictError(
-                f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
-                "ledger or experiment. The configured storage has no populated phase "
-                "studies to rebind. Restore the original experiment and storage setting "
-                "and complete ledger for this tree; keep the explicit storage setting "
-                "when switching to storage: auto would select an empty ledger. Rebinding "
-                "does not move or convert storage ledgers. Nothing was written."
-            )
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
             f"ledger or experiment than {experiment.experiment!r}. Use the config that owns "
@@ -306,8 +281,6 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
     :return bool: ``True`` when the study records no binding and holds no
         trials, so claiming the offered root is safe; ``False`` when it already
         records exactly that root.
-    :raises LegacyArtifactRootMigrationRequiredError: The study holds trials but
-        records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: The study is already bound to a different
         artifact root, or carries a binding that is not a string.
     """
@@ -315,15 +288,11 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
     if ARTIFACT_ROOT_ATTR not in study.user_attrs:
         trial_count = len(study.get_trials(deepcopy=False))
         if trial_count:
-            raise LegacyArtifactRootMigrationRequiredError(
+            raise ArtifactRootConflictError(
                 f"Study {study.study_name!r} holds {trial_count} trial(s) but records no "
-                "artifact root: it predates artifact-root binding, and an ordinary run "
-                "cannot infer which workdir owns its trial directories and publication. "
-                f"Adopting the offered root {offered!r} here would let one study back two "
-                "artifact trees. Run 'phasesweep rebind-workdir <config>' with a config "
-                "whose workdir names the original, complete artifact tree; that validates "
-                "the evidence is present there and records the binding. No trial ran and "
-                "nothing was published."
+                "artifact root and is pre-cutover state. Use a fresh artifact root and "
+                "local storage with this release, or use the preserved PhaseSweep 0.3.1 "
+                "environment to operate the existing state. Nothing was written."
             )
         return True
     bound = study.user_attrs[ARTIFACT_ROOT_ATTR]
@@ -334,24 +303,19 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
         f"config offers {offered!r}. One persistent study backs exactly one publication "
         "root; running it against a second workdir would top up trials whose artifacts "
         "live under the bound root and publish a divergent result tree. Restore the "
-        "original workdir, or - if you have already moved or copied the artifact tree "
-        "to the new location - run 'phasesweep rebind-workdir <config>' to move the "
-        "binding. No trial ran and nothing was published."
+        "original workdir, or use a fresh artifact root and local storage. No trial ran "
+        "and nothing was published."
     )
 
 
 def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
     """Claim, or re-confirm, the one artifact root a single phase study publishes into.
 
-    ``workdir`` is excluded from semantic fingerprints so artifact trees can
-    move. The shared :func:`_artifact_root_claim_needed` check permits first
-    contact only for an empty study; moving a populated study's binding
-    requires explicit ``phasesweep rebind-workdir``.
+    The shared :func:`_artifact_root_claim_needed` check permits first contact
+    only for an empty study.
 
     :param optuna.Study study: Phase study to bind.
     :param Experiment experiment: Parsed experiment supplying the artifact root.
-    :raises LegacyArtifactRootMigrationRequiredError: The study holds trials but
-        records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: The study is already bound to a different
         artifact root, or carries a binding that is not a string.
     """
@@ -372,7 +336,7 @@ def _load_and_check_artifact_roots(
     such study), *present* (loaded and returned), or *unavailable* -- and
     unavailable raises before any claim, reaping, or registry recovery runs.
     The earlier shape swallowed a read failure here and let the main preflight
-    loop re-read; a transient failure (a brief SQLite lock, an RDB reconnect)
+    loop re-read; a transient failure (for example, a brief SQLite lock)
     could then succeed on that second read, handing stale-trial reaping a
     study whose artifact-root binding was never checked -- mutation of a
     wrong-root ledger before the conflict was enforced. The returned mapping
@@ -400,13 +364,11 @@ def _load_and_check_artifact_roots(
         not be inspected.
     :raises PublishedStudyMissingError: A phase to execute has a published
         result whose local trial identity is missing from durable storage.
-    :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
-        records no artifact root, so which workdir owns its evidence is unknown.
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, or carries a binding that is not a string.
     """
-    # Reject an existing foreign/legacy root before touching storage, including
-    # an in-memory configuration offered a persistently bound root.
+    # Reject an existing foreign or pre-cutover root before touching storage,
+    # including an in-memory configuration offered a bound root.
     _validate_artifact_root_binding(experiment, claim_fresh=False)
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
@@ -441,15 +403,12 @@ def _check_published_phase_studies(
     loaded: Mapping[str, optuna.Study],
     *,
     from_phase: str | None = None,
-    include_historical_phases: bool = False,
 ) -> None:
     """Require published trial identity and history for phases that would execute.
 
     :param Experiment experiment: Experiment whose current publication is checked.
     :param Mapping[str, optuna.Study] loaded: Already-inspected persistent studies.
     :param str | None from_phase: Resume point; earlier phases only load winners.
-    :param bool include_historical_phases: Check every phase in the publication
-        during rebind, including phases removed from the current config.
     :raises PublishedStudyMissingError: A reached published trial is absent,
         replaced, or its recorded history boundary is missing.
     :raises PublicationAccessError: The last publication cannot be read.
@@ -463,12 +422,7 @@ def _check_published_phase_studies(
         raise PublicationIntegrityError(publication.error or "Published result is invalid.")
     published_trials = _published_phase_trial_refs(publication.summary)
     reached = from_phase is None
-    phase_names = (
-        published_trials
-        if include_historical_phases
-        else (phase.name for phase in experiment.phases)
-    )
-    for phase_name in phase_names:
+    for phase_name in (phase.name for phase in experiment.phases):
         if phase_name == from_phase:
             reached = True
         if not reached or phase_name not in published_trials:

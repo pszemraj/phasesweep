@@ -31,7 +31,6 @@ from phasesweep.engine import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
-    LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     PublishedStudyMissingError,
@@ -60,6 +59,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     Winner,
+    WinnerSource,
 )
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
@@ -1186,6 +1186,13 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
         completion={"incomplete": False},
         generation_id="engine-generation",
         attempt_id="engine-attempt",
+        source=WinnerSource(
+            kind="phase_trial",
+            phase="p",
+            trial_number=4,
+            generation_id="engine-generation",
+            attempt_id="engine-attempt",
+        ),
     )
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -1379,7 +1386,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     The current-generation pointer legitimately moves to this new (failed)
     invocation -- a new invocation always overwrites it starting from
     "preflighting", and every outcome path must drive it to a terminal state
-    (review v0.5.15 / blocker 3) -- but the legacy compatibility caches and,
+    (review v0.5.15 / blocker 3) -- but the convenience root projections and,
     critically, the last-success pointer stay exactly as the prior successful
     publication left them.
     """
@@ -1401,7 +1408,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     first_generation = _last_successful_generation_id(experiment)
     assert first_generation is not None
 
-    # The legacy compatibility caches must stay untouched by a failed resume;
+    # The convenience root projections must stay untouched by a failed resume;
     # the current-generation pointer is deliberately excluded here since it
     # legitimately advances even on a preflight failure (see docstring).
     protected_paths = [
@@ -1458,7 +1465,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
         for phase in captured[0]["status"]["phases"]  # type: ignore[index]
     )
     assert captured[0]["winners"] == []
-    # Legacy compatibility caches are untouched, and the published pointer
+    # Convenience root projections are untouched, and the published pointer
     # still resolves to the prior successful generation.
     assert {path: path.read_bytes() for path in protected_paths} == before
     assert _last_successful_generation_id(experiment) == first_generation
@@ -1512,7 +1519,7 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
 
 @pytest.mark.parametrize(
     "error_type",
-    [OSError, ArtifactRootConflictError, LegacyArtifactRootMigrationRequiredError],
+    [OSError, ArtifactRootConflictError],
 )
 def test_terminal_report_marks_failed_root_discovery_uncertain(
     tmp_path: Path,
@@ -2466,7 +2473,7 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
 
 
 def test_artifact_root_conflict_is_not_reported_as_fingerprint_or_internal() -> None:
-    """A workdir conflict must carry its own code with the rebind remediation.
+    """A workdir conflict must carry its own code and fresh-state remediation.
 
     Mapping it to ``fingerprint_mismatch`` would steer the operator toward a
     new experiment name or archiving a healthy study; falling through to
@@ -2481,24 +2488,4 @@ def test_artifact_root_conflict_is_not_reported_as_fingerprint_or_internal() -> 
     assert payload["code"] == "artifact_root_conflict"
     assert payload["retryable"] is False
     assert payload["actor"] == "operator"
-    assert "rebind-workdir" in str(payload["remediation"])
-
-
-def test_legacy_artifact_root_migration_reports_the_conflict_category() -> None:
-    """The pre-binding migration refusal must classify as its parent conflict.
-
-    It is the same operator problem and the same remedy surface, so it must
-    not fall through to ``internal_error``; the remediation text also has to
-    fit a study that records no root at all (re-review v0.5.19 / blocker B1).
-    """
-    from phasesweep.engine.errors import LegacyArtifactRootMigrationRequiredError
-
-    payload = mcp_runner._base_failure_payload(
-        LegacyArtifactRootMigrationRequiredError("holds 2 trial(s) but records no artifact root"),
-        stage="preflight",
-    )
-
-    assert payload["code"] == "artifact_root_conflict"
-    assert payload["actor"] == "operator"
-    assert "rebind-workdir" in str(payload["remediation"])
-    assert "bound to" not in str(payload["remediation"])
+    assert "fresh artifact root and local storage" in str(payload["remediation"])

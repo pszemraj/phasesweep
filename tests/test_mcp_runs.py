@@ -361,29 +361,6 @@ def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path
         store.update(replace(spawned, pid=os.getppid(), pgid=os.getppid()))
 
 
-def test_legacy_handle_missing_launch_authority_loads_fail_closed(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    payload = asdict(
-        make_run_handle(
-            run_id="exp-legacy",
-            allow_cancel=True,
-            visible_params_at_launch="all",
-        )
-    )
-    payload.pop("allow_cancel")
-    payload.pop("visible_params_at_launch")
-    private_atomic_write_text(
-        tmp_path / "state" / "runs" / "exp-legacy.json",
-        json.dumps(payload),
-    )
-
-    loaded = store.get("exp-legacy")
-
-    assert loaded is not None
-    assert loaded.allow_cancel is False
-    assert loaded.visible_params_at_launch is None
-
-
 def test_write_status_file_replaces_existing_status_without_temp_files(tmp_path: Path) -> None:
     status_path = tmp_path / "state" / "logs" / "exp-1.status.json"
 

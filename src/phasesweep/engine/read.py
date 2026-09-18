@@ -407,27 +407,31 @@ def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] 
     return names
 
 
-def _recorded_objective_evidence(
-    candidate: object,
-    *,
-    fallback: dict[str, str | bool],
-) -> dict[str, str | bool]:
-    """Return a complete recorded assurance payload or the current fallback.
-
-    Result summaries are durable data and may predate or drift from the current
-    assurance schema. A partial/extra key set cannot safely be combined with
-    current guarantees, so treat the whole record as absent.
+def _recorded_objective_evidence(candidate: object) -> dict[str, str | bool] | None:
+    """Return a complete current-format assurance payload, if present.
 
     :param object candidate: Summary ``objective_evidence`` value.
-    :param dict[str, str | bool] fallback: Assurance derived from the current extractor.
-    :return dict[str, str | bool]: Complete recorded flags, or ``fallback``.
+    :return dict[str, str | bool] | None: Complete recorded flags, or ``None``.
     """
-    if not isinstance(candidate, Mapping) or set(candidate) != set(fallback):
-        return fallback
-    if candidate.get("kind") not in {"json_envelope", "log_regex", "wandb"}:
-        return fallback
+    expected = {
+        "kind",
+        "attempt_location_scoped",
+        "attempt_identity_bound",
+        "source_identity_keyed",
+        "objective_name_bound",
+        "split_bound",
+        "evaluation_policy_bound",
+        "checkpoint_declared",
+        "checkpoint_value_bound",
+        "expected_step_declared",
+        "expected_step_value_bound",
+    }
+    if not isinstance(candidate, Mapping) or set(candidate) != expected:
+        return None
+    if candidate.get("kind") not in {"json_envelope", "log_regex"}:
+        return None
     if any(type(candidate[key]) is not bool for key in candidate if key != "kind"):
-        return fallback
+        return None
     return dict(candidate)
 
 
@@ -565,7 +569,7 @@ def read_status(
         ``published_generation_id`` and ``generation_trials`` scopes to the
         captured ``current_generation_id``.
     :param Experiment | None comparison_experiment: Optional current config to
-        use only for drift comparison and current-extractor evidence fallback.
+        use only for drift comparison and the no-result status semantics.
         Artifact and trial reads still use ``experiment``. This lets a frozen
         run config locate its own tree while a run-scoped MCP read compares the
         represented result with the catalog config a future run would execute.
@@ -644,7 +648,6 @@ def read_status(
     # current config describe the result.
     comparison = comparison_experiment or experiment
     metric_payload = _metric_semantics_payload(comparison.metric)
-    current_objective_evidence = metric_payload["objective_evidence"]
     result_phase_plan = [phase.name for phase in experiment.phases]
     result_context: ResultContext = "current_config"
     published_config_matches_current: bool | None = None
@@ -667,18 +670,14 @@ def read_status(
             and isinstance(stored_metric.get("name"), str)
             and stored_metric.get("goal") in ("minimize", "maximize")
         ):
-            stored_evidence = stored_metric.get("objective_evidence")
-            metric_payload = {
-                "name": stored_metric["name"],
-                "goal": stored_metric["goal"],
-                "objective_evidence": (
-                    _recorded_objective_evidence(
-                        stored_evidence,
-                        fallback=current_objective_evidence,
-                    )
-                ),
-            }
-            result_context = "represented_generation"
+            stored_evidence = _recorded_objective_evidence(stored_metric.get("objective_evidence"))
+            if stored_evidence is not None:
+                metric_payload = {
+                    "name": stored_metric["name"],
+                    "goal": stored_metric["goal"],
+                    "objective_evidence": stored_evidence,
+                }
+                result_context = "represented_generation"
         stored_fingerprint = summary_payload.get("config_fingerprint")
         if isinstance(stored_fingerprint, str) and stored_fingerprint:
             published_config_matches_current = (

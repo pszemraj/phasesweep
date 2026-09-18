@@ -29,15 +29,10 @@ from phasesweep.engine import (
 )
 from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
-from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication import (
     _published_winner_path_for,
     _resolve_publication_pointer,
-)
-from phasesweep.engine.relocation import (
-    _apply_artifact_root_rebind,
-    _plan_artifact_root_rebinds,
 )
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -81,8 +76,7 @@ def _configure_logging(verbose: bool) -> None:
     )
     # Optuna's per-trial INFO output is essentially 1:1 with phasesweep's own
     # runner.info "[phase/trial_N] <cmd>" line and adds nothing. Quiet it down
-    # by default; -v restores INFO (DEBUG would surface RDB internals which we
-    # don't want even in verbose mode).
+    # by default; -v restores INFO for trial-level diagnostics.
     import optuna  # local import: keeps `phasesweep --help` snappy
 
     optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
@@ -468,7 +462,7 @@ def _publication_access_error(subject: str, detail: str) -> PublicationAccessErr
         f"{subject} records a publication that cannot be validated as the current user: "
         f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
         "the publication as the publishing user or restore read permission before launching "
-        "another run; rebind-workdir is not a permission-repair command."
+        "another run."
     )
 
 
@@ -599,78 +593,6 @@ def status(config_path: Path) -> None:
     payload = config_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     _raise_on_failed_publication(payload)
-
-
-@cli.command(
-    name="rebind-workdir",
-    context_settings=CONTEXT_SETTINGS,
-    help=(
-        "Point this config's persistent phase studies at the workdir it now declares, after "
-        "you have already moved the experiment's complete artifact tree there. Verifies at the "
-        "destination that every trial in the study ledger still has its evidence directory, "
-        "that no trial is RUNNING and no attempt is unresolved, and that any recorded "
-        "publication validates. Also the migration path for a study that predates artifact-root "
-        "binding: point the config at that study's "
-        "original tree - there, an interrupted RUNNING trial whose persisted paths already "
-        "lie under that tree is allowed through, and the next ordinary run recovers it. "
-        "Updates both the tree-to-storage record and study-side bindings; writes nothing "
-        "unless every check passes."
-    ),
-    short_help="Rebind studies to a moved artifact tree.",
-)
-@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
-def rebind_workdir(config_path: Path) -> None:
-    """Move each phase study's artifact-root binding to the configured workdir.
-
-    Each persistent phase study is bound to the one artifact root it publishes
-    into, so an ordinary run against a different ``workdir`` is refused rather
-    than allowed to produce a second, divergent publication tree. This command
-    is the operator's explicit statement that the tree itself was relocated,
-    and the only way a study that predates the binding is adopted at all. It is
-    a rebind, never a move: PhaseSweep does not copy, delete, or verify the
-    original tree.
-
-    With auto storage, the database must have moved with the artifact tree.
-    Its recorded previous filename is recognized without converting backends
-    or moving an explicit external database into the namespace.
-
-    What it verifies at the destination, per experiment: the namespace exists;
-    every trial the study ledger holds still has its evidence directory there,
-    which is what rejects a stale copy taken before the ledger advanced; no
-    trial is ``RUNNING`` and no attempt registry entry is unresolved, because
-    recovery follows the absolute paths those attempts persisted; and, when the
-    studies record completed trials, the recorded publication validates.
-
-    The one ``RUNNING`` exception is adoption in place: when a pre-binding
-    study's interrupted trial persisted paths that already resolve exactly
-    under the offered workdir - proof the destination is the original root,
-    not a copy - the binding is written with the trial (and its registry
-    entry) left as-is, and the next ordinary run recovers it through the
-    standard stale-attempt protocol. That protocol, not a manual Optuna
-    ``tell(FAIL)``, is what records the durable failure outcome the study
-    schema requires.
-
-    The destination's reverse root-to-storage binding is updated before the
-    study attrs so an interrupted rebind converges on retry. No trial,
-    publication, or attempt metadata is rewritten, so the refusals remain
-    broader than the cases PhaseSweep can repair (re-review v0.5.19 / blocker
-    B2; see the tracked relocation TODO in ``docs/development.md``).
-
-    :param Path config_path: Path to the experiment YAML file whose ``workdir``
-        already names the artifact tree the studies own.
-    :raises ArtifactRootRebindError: Storage is in-memory, every existing study
-        is unbound and empty, a study cannot be read, or a destination fails
-        any of the checks above; validation refusals write nothing.
-    :raises ExperimentLockBusyError: Another orchestrator owns the experiment
-        consistency lock.
-    """
-    config = _load_cli_config(config_path)
-    with _experiment_lock(config):
-        plans = _plan_artifact_root_rebinds([config])
-        for plan in plans:
-            for study_name, previous, destination in _apply_artifact_root_rebind(plan):
-                origin = previous if previous is not None else "(unbound)"
-                click.echo(f"{study_name}: {origin} -> {destination}")
 
 
 @cli.group(

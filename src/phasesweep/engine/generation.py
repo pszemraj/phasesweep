@@ -253,10 +253,10 @@ def _write_generation_state(
 
 
 def _copy_yaml_projection(source: Path, destination: Path) -> None:
-    """Atomically project one immutable YAML artifact to its compatibility path.
+    """Atomically project one immutable YAML artifact to its convenience path.
 
     :param Path source: Immutable generation-scoped YAML file to read.
-    :param Path destination: Legacy compatibility path to atomically overwrite.
+    :param Path destination: Convenience projection path to atomically overwrite.
     """
     payload = yaml.safe_load(source.read_text())
     artifact_io._write_yaml_atomic(destination, payload)
@@ -391,10 +391,10 @@ def _publish_generation(
     5. Best-effort, notify the prepared sidecar that the pointer committed.
     6. Write the immutable per-generation record once, state ``"published"``.
     7. Best-effort, diagnostic-only: drive the current pointer to
-       ``"published"``, then refresh the legacy compatibility projections
+       ``"published"``, then refresh the convenience projections
        (root ``winner.yaml`` / ``summary.yaml``; review
-       v0.5.15 / item D). These are post-commit caches for humans and legacy
-       tooling only -- no reader re-derives them, and once any generation has
+       v0.5.15 / item D). These are post-commit caches for humans only -- no
+       reader derives publication authority from them, and once any generation has
        published, reads resolve the generation-scoped artifacts directly (see
        :func:`phasesweep.engine.publication._published_winner_path_for`), so a
        failure projecting them never affects what callers actually see.
@@ -480,7 +480,7 @@ def _publish_generation(
         )
 
         def _refresh_published_pointer_and_projections() -> None:
-            """Step 7: drive the pointer to ``published``, refresh legacy projections (best-effort)."""
+            """Drive the current pointer and refresh convenience projections."""
             _write_generation_state(
                 experiment,
                 generation_id=generation_id,
@@ -506,7 +506,7 @@ def _publish_generation(
 
         _log_on_failure(
             _refresh_published_pointer_and_projections,
-            "failed to refresh the current-generation pointer or compatibility caches "
+            "failed to refresh the current-generation pointer or convenience projections "
             "after publication; the published result is unaffected",
         )
 

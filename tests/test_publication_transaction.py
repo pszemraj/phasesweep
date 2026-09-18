@@ -373,7 +373,7 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A legacy compatibility-cache projection failure must not fail the run.
+    """A convenience root-projection failure must not fail the run.
 
     Flips the pre-v0.5.15 behavior (projection failures used to precede and
     block the pointer commit): projections are now a post-commit, best-effort
@@ -398,11 +398,11 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     assert second_generation != first_generation
     assert _record_state(experiment, second_generation) == "published"
     assert any(
-        "failed to refresh the current-generation pointer or compatibility caches" in r.message
+        "failed to refresh the current-generation pointer or convenience projections" in r.message
         for r in caplog.records
     )
     # Reads are unaffected: once a generation has published, they resolve the
-    # generation-scoped artifact directly rather than the stale legacy cache.
+    # generation-scoped artifact directly rather than a stale root projection.
     # The winning trial itself still belongs to the first generation (the
     # target trial count was already satisfied, so no new trial ran); what
     # matters is that the read resolves via the new last-success pointer
@@ -1090,7 +1090,7 @@ def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Pat
     assert current_path.read_bytes() == current
 
 
-def test_surviving_pointer_prevents_legacy_fallback_after_generation_loss(
+def test_surviving_pointer_prevents_root_projection_fallback_after_generation_loss(
     tmp_path: Path,
 ) -> None:
     experiment = _stored_experiment(tmp_path)
@@ -1107,7 +1107,7 @@ def test_surviving_pointer_prevents_legacy_fallback_after_generation_loss(
     assert read_winner(experiment, "p") is None
 
 
-def test_dangling_generation_root_does_not_enable_legacy_winner(tmp_path: Path) -> None:
+def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Path) -> None:
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
     assert read_winner(experiment, "p") is not None
@@ -1481,46 +1481,11 @@ def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) ->
     assert json.loads(repro_path.read_text())["generation_id"] == failed_generation
 
 
-def test_generation_published_before_provenance_files_existed_stays_valid(
-    tmp_path: Path,
-) -> None:
-    """A pre-F6 namespace -- no provenance files, no manifest entries -- still reads valid.
-
-    Replayed the way the other legacy-compat cases in this module are: publish
-    normally, then rewrite the namespace into the older shape. Dropping only
-    the manifest entries must fail (the namespace would hold unlisted
-    artifacts); dropping the files too is exactly the historical layout and
-    must publish-read cleanly.
-    """
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    generation_id = _last_successful_generation_id(experiment)
-    assert generation_id is not None
-    snapshot_path, repro_path = _provenance_paths(experiment, generation_id)
-
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    summary["artifacts"] = [item for item in summary["artifacts"] if item["kind"] == "winner"]
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
-
-    # Files present but unlisted: the manifest no longer covers the namespace.
-    assert _last_successful_generation_id(experiment) is None
-
-    snapshot_path.unlink()
-    repro_path.unlink()
-
-    # Neither listed nor present -- the pre-F6 layout, still fully valid.
-    assert _last_successful_generation_id(experiment) == generation_id
-    assert read_winner(experiment, "p") is not None
-
-
-def test_partially_dropped_provenance_record_is_not_a_legacy_namespace(tmp_path: Path) -> None:
-    """Half a provenance record is an edit, not a historical layout.
+def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_path: Path) -> None:
+    """Half a provenance record is a current-format tamper, not valid state.
 
     The two files are written together at claim time, so a namespace that
-    keeps one and drops the other must fail rather than fall through the
-    pre-F6 compatibility path.
+    keeps one and drops the other must fail closed.
     """
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)

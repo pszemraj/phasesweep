@@ -7,7 +7,6 @@ from pathlib import Path
 
 import optuna
 import pytest
-import sqlalchemy
 
 import phasesweep.engine.optuna as engine_optuna
 import phasesweep.engine.read as engine_read
@@ -21,7 +20,6 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
-    WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
@@ -30,7 +28,6 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.relocation import _plan_artifact_root_rebinds
 from phasesweep.engine.run import experiment_status
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_trainer
@@ -104,157 +101,6 @@ def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None
     assert status["phases"][0]["trials"] == {}
     assert status["phases"][0]["trial_data_available"] is False
     assert status["phases"][0]["running_attempts"] is None
-
-
-@pytest.mark.parametrize("database_state", ["uninitialized", "absent-study", "empty-study"])
-def test_external_status_does_not_initialize_or_change_schema(
-    tmp_path, monkeypatch, database_state
-):
-    storage = f"sqlite:///{tmp_path / 'status.db'}"
-    study = None
-    if database_state != "uninitialized":
-        study = optuna.create_study(
-            study_name="read_t::p" if database_state == "empty-study" else "unrelated",
-            storage=storage,
-        )
-    engine = sqlalchemy.create_engine(storage)
-    before = sqlalchemy.inspect(engine).get_table_names()
-    writes = []
-
-    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
-    def observe_sql(conn, cursor, statement, parameters, context, executemany):
-        if statement.lstrip().upper().startswith(("CREATE", "INSERT", "UPDATE", "DELETE", "ALTER")):
-            writes.append(statement)
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
-    experiment = _experiment(tmp_path).model_copy(
-        update={
-            "storage": "postgresql://localhost/status_placeholder",
-            "allow_external_rdb_single_host": True,
-        }
-    )
-    if study is not None and database_state == "empty-study":
-        _mark_current_format(experiment, study)
-
-    phase = read_status(experiment)["phases"][0]
-
-    assert phase["trials"] == {}
-    assert phase["trial_data_available"] is (database_state != "uninitialized")
-    assert sqlalchemy.inspect(engine).get_table_names() == before
-    assert writes == []
-    engine.dispose()
-
-
-@pytest.mark.parametrize("database_state", ["uninitialized", "absent-study", "present-study"])
-def test_external_preflight_checks_study_presence_without_initializing_schema(
-    tmp_path, monkeypatch, database_state
-):
-    storage = f"sqlite:///{tmp_path / 'preflight.db'}"
-    study = None
-    if database_state != "uninitialized":
-        study = optuna.create_study(
-            study_name="read_t::p" if database_state == "present-study" else "unrelated",
-            storage=storage,
-        )
-    engine = sqlalchemy.create_engine(storage)
-    before = sqlalchemy.inspect(engine).get_table_names()
-    writes = []
-    loaded = []
-
-    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
-    def observe_sql(conn, cursor, statement, parameters, context, executemany):
-        if statement.lstrip().upper().startswith(("CREATE", "INSERT", "UPDATE", "DELETE", "ALTER")):
-            writes.append(statement)
-
-    def load_local_study(experiment, phase):
-        loaded.append(phase.name)
-        return optuna.load_study(study_name="read_t::p", storage=storage)
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
-    monkeypatch.setattr(engine_optuna, "_load_phase_study", load_local_study)
-    experiment = _experiment(tmp_path).model_copy(
-        update={
-            "storage": "postgresql://localhost/preflight_placeholder",
-            "allow_external_rdb_single_host": True,
-        }
-    )
-    if study is not None and database_state == "present-study":
-        _mark_current_format(experiment, study)
-
-    study = engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
-
-    assert (study is not None) is (database_state == "present-study")
-    assert loaded == (["p"] if database_state == "present-study" else [])
-    assert sqlalchemy.inspect(engine).get_table_names() == before
-    assert writes == []
-    engine.dispose()
-
-
-def test_external_preflight_fails_closed_when_study_presence_cannot_be_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from phasesweep.engine import StudyStorageUnavailableError
-
-    experiment = _experiment(tmp_path).model_copy(
-        update={
-            "storage": "postgresql://localhost/preflight_placeholder",
-            "allow_external_rdb_single_host": True,
-        }
-    )
-
-    def unavailable_engine(*args: object, **kwargs: object):
-        raise sqlalchemy.exc.OperationalError("connect", {}, RuntimeError("unavailable"))
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", unavailable_engine)
-
-    with pytest.raises(StudyStorageUnavailableError, match="could not be read"):
-        engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
-
-
-def test_external_status_reads_counts_and_running_identities_in_one_statement(
-    tmp_path, monkeypatch
-):
-    storage = f"sqlite:///{tmp_path / 'status.db'}"
-    study = optuna.create_study(study_name="read_t::p", storage=storage)
-    completed = study.ask()
-    completed.set_user_attr("phasesweep_generation_id", "gen-1")
-    completed.set_user_attr("phasesweep_attempt_id", "completed-attempt")
-    study.tell(completed, 0.5)
-    running = study.ask()
-    running.set_user_attr("phasesweep_generation_id", "gen-1")
-    running.set_user_attr("phasesweep_attempt_id", "attempt-1")
-    study.ask()
-    engine = sqlalchemy.create_engine(storage)
-    statements = []
-
-    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
-    def observe_sql(conn, cursor, statement, parameters, context, executemany):
-        statements.append(statement)
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
-    experiment = _experiment(tmp_path).model_copy(
-        update={
-            "storage": "postgresql://localhost/status_placeholder",
-            "allow_external_rdb_single_host": True,
-        }
-    )
-    _mark_current_format(experiment, study)
-
-    stats = engine_optuna._phase_trial_stats(
-        experiment, experiment.phases[0], engine_optuna._TrialRef(0, "gen-1", "completed-attempt")
-    )
-
-    assert stats.available
-    assert stats.published_trial_available
-    assert stats.counts == {"COMPLETE": 1, "RUNNING": 2}
-    assert stats.generation_counts == {"gen-1": {"COMPLETE": 1, "RUNNING": 1}}
-    assert sorted(stats.running_attempts, key=lambda ref: ref.trial_number) == [
-        engine_optuna._TrialRef(1, "gen-1", "attempt-1"),
-        engine_optuna._TrialRef(2, None, None),
-    ]
-    assert len(statements) == 1
-    assert statements[0].lstrip().startswith("WITH")
-    engine.dispose()
 
 
 def test_read_status_uses_one_sqlite_snapshot_per_phase(
@@ -415,28 +261,6 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     assert cause in warnings[0]
 
 
-def test_external_status_warning_omits_storage_credentials(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    storage = "postgresql://private-user:private-password@example.invalid/study?token=private-token"
-    exp = _experiment(tmp_path).model_copy(
-        update={"storage": storage, "allow_external_rdb_single_host": True}
-    )
-
-    def unavailable_engine(*args: object, **kwargs: object) -> None:
-        raise sqlalchemy.exc.OperationalError("connect", {}, RuntimeError(storage))
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", unavailable_engine)
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.optuna"):
-        phase = read_status(exp)["phases"][0]
-
-    assert phase["trial_data_available"] is False
-    assert phase["running_attempts"] is None
-    assert "postgresql storage for phase p: OperationalError" in caplog.text
-    for secret in ("private-user", "private-password", "private-token", storage):
-        assert secret not in caplog.text
-
-
 @pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
 @pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
 @pytest.mark.parametrize("damage", ["garbage", "partial-json", "missing-newline", "operation"])
@@ -545,7 +369,6 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
 ) -> None:
     """The same status flags select the same remedy for both file backends."""
     from phasesweep.engine import (
-        ArtifactRootRebindError,
         ProcessCleanupUncertainError,
         PublishedStudyMissingError,
     )
@@ -609,12 +432,6 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     with pytest.raises(expected_error):
         run_experiment(experiment)
     assert _generation_path(experiment).read_bytes() == generation_before
-    if damage == "stale-ledger":
-        with pytest.raises(ArtifactRootRebindError, match="published trial identity") as excinfo:
-            _plan_artifact_root_rebinds([experiment])
-        assert str(excinfo.value).endswith("Nothing was written.")
-        assert ledger.read_bytes() == ledger_before
-        assert _generation_path(experiment).read_bytes() == generation_before
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
@@ -718,24 +535,18 @@ def test_objective_evidence_assurance_json_envelope_checkpoint_binding(
             (True, False, False),
             id="log_regex",
         ),
-        pytest.param(
-            WandbExtractor(type="wandb", entity="acme", project="proj", metric_key="eval/loss"),
-            (True, False, True),
-            id="wandb",
-        ),
     ],
 )
 def test_objective_evidence_assurance_attempt_triple_by_kind(
     tmp_path: Path,
-    extractor: JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor,
+    extractor: JsonEnvelopeExtractor | LogRegexExtractor,
     expected_triple: tuple[bool, bool, bool],
 ) -> None:
     """Each extractor kind reports its own (location, identity, source-key) triple.
 
     ``json_envelope`` structurally echoes and cross-checks the attempt
-    identity; ``wandb`` is keyed by an immutable run id that IS the attempt
-    id; ``log_regex`` is merely read from an attempt-scoped location with
-    nothing in its contents tying it to that attempt (review v0.5.15 / item C).
+    identity; ``log_regex`` is merely read from an attempt-scoped location
+    with nothing in its contents tying it to that attempt.
     """
     exp = _experiment(tmp_path)
     exp = exp.model_copy(

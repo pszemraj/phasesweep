@@ -586,9 +586,7 @@ class GetRunStatusResult(_ResultPayload):
         description=(
             "True only when represented_generation_id is not null and equals "
             "published_generation_id. A run_id whose own publication failed reports "
-            "false here while still showing that generation's own winners. For a "
-            "legacy pre-generation workdir every generation id is null and this "
-            "instead reports whether its compatibility winner artifact exists."
+            "false here while still showing that generation's own winners."
         )
     )
     publication_integrity: PublicationIntegrity
@@ -1283,8 +1281,8 @@ class PhaseSweepMCP:
 
         A terminal run snapshot is the historical read authority for that run.
         Publication pointers and integrity stay as captured: consulting the
-        live artifact tree here would make an intact snapshot unreadable after
-        relocation, and a later generation's damage could erase this run's
+        live artifact tree here would make an intact snapshot unreadable, and
+        a later generation's damage could erase this run's
         already-validated winners. Config drift is the sole live field and
         compares the frozen represented-config fingerprint with the current
         catalog.

@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, assert_never
 
 import optuna
-import sqlalchemy
 from optuna.exceptions import ExperimentalWarning
 from optuna.storages import JournalStorage
 from optuna.storages.journal import BaseJournalBackend
@@ -291,8 +290,7 @@ def _resolve_storage(url: str | None) -> Any:
         (not resumable).
       * ``journal:///path.journal`` -> Optuna ``JournalStorage(JournalFileBackend(path))``.
         Safe for parallel ``n_jobs`` on a single host.
-      * Anything else (``sqlite:///``, ``postgresql://``, ``mysql://``, ...) -> passed to
-        Optuna unchanged.
+      * ``sqlite:///path.db`` -> passed to Optuna unchanged.
 
     ``Experiment.resolved_storage`` selects the URL for ``storage: auto`` before
     this helper is called. Explicit SQLite URLs are never rewritten; validation
@@ -304,8 +302,7 @@ def _resolve_storage(url: str | None) -> Any:
 
     Returns:
         ``None`` for in-memory; a configured ``JournalStorage`` for the
-        ``journal:///`` scheme; the URL string unchanged otherwise (passed
-        through to Optuna's RDB-aware loader).
+        ``journal:///`` scheme; the SQLite URL unchanged otherwise.
 
     """
     if url is None or storage_is_in_memory(url):
@@ -362,12 +359,10 @@ def _load_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Stud
     :return optuna.Study: Existing Optuna study for the phase.
     """
     assert experiment.resolved_storage is not None
-    storage = (
-        _resolve_storage(experiment.resolved_storage)
-        if storage_backend(experiment.resolved_storage) == "journal"
-        else optuna.storages.RDBStorage(experiment.resolved_storage, skip_table_creation=True)
+    return optuna.load_study(
+        study_name=_phase_study_name(experiment, phase),
+        storage=_resolve_storage(experiment.resolved_storage),
     )
-    return optuna.load_study(study_name=_phase_study_name(experiment, phase), storage=storage)
 
 
 def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
@@ -419,36 +414,6 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
         raise StudyStorageUnavailableError(
             f"SQLite storage {database} exists but could not be read while checking for "
             f"study {_phase_study_name(experiment, phase)!r}."
-        ) from exc
-    return row is not None
-
-
-def _rdb_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
-    """Return whether external RDB storage contains a phase study.
-
-    :param Experiment experiment: Parsed experiment with external RDB storage.
-    :param Phase | str phase: Phase or historical phase name to check.
-    :return bool: ``True`` when the storage contains the named study, ``False`` when its
-        Optuna ``studies`` table does not exist or contains no matching row.
-    :raises StudyStorageUnavailableError: The storage or its study table could not be read.
-    """
-    assert experiment.resolved_storage is not None
-    try:
-        engine = sqlalchemy.create_engine(experiment.resolved_storage)
-        try:
-            if not sqlalchemy.inspect(engine).has_table("studies"):
-                return False
-            with engine.connect() as connection:
-                row = connection.execute(
-                    sqlalchemy.text("SELECT 1 FROM studies WHERE study_name = :study_name"),
-                    {"study_name": _phase_study_name(experiment, phase)},
-                ).fetchone()
-        finally:
-            engine.dispose()
-    except Exception as exc:  # noqa: BLE001 - mutating preflight must fail closed
-        raise StudyStorageUnavailableError(
-            f"External RDB storage could not be read while checking for study "
-            f"{_phase_study_name(experiment, phase)!r}."
         ) from exc
     return row is not None
 
@@ -572,24 +537,7 @@ def _existing_phase_study_names(experiment: Experiment) -> tuple[str, ...]:
                 "Journal storage could not be replayed while listing phase studies."
             ) from exc
     else:
-        try:
-            engine = sqlalchemy.create_engine(experiment.resolved_storage)
-            try:
-                if not sqlalchemy.inspect(engine).has_table("studies"):
-                    return ()
-                with engine.connect() as connection:
-                    names = [
-                        row[0]
-                        for row in connection.execute(
-                            sqlalchemy.text("SELECT study_name FROM studies")
-                        )
-                    ]
-            finally:
-                engine.dispose()
-        except Exception as exc:  # noqa: BLE001 - rebind planning cannot guess omitted studies
-            raise StudyStorageUnavailableError(
-                "External RDB storage could not be read while listing phase studies."
-            ) from exc
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     prefix = f"{experiment.experiment}::"
     return tuple(sorted(name[len(prefix) :] for name in names if name.startswith(prefix)))
 
@@ -679,9 +627,7 @@ def _validate_local_storage_format(experiment: Experiment) -> None:
                 "Journal storage could not be replayed while checking its PhaseSweep format."
             ) from exc
     else:
-        # Checkpoint three removes external RDB execution. The breaking
-        # boundary deliberately stays on the existing local inspection path.
-        return
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
 
     unsupported = [
         (name, version)
@@ -727,9 +673,8 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> op
         # Preflight verified a complete snapshot. Mutating callers still use
         # Optuna's normal backend, including its concurrent-append semantics.
         return _load_phase_study(experiment, phase)
-    elif not _rdb_study_exists(experiment, phase):
-        # Optuna initializes its schema even when load_study finds no study.
-        return None
+    else:
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     try:
         return _load_phase_study(experiment, phase)
     except KeyError:
@@ -805,9 +750,6 @@ def _unavailable_phase_trial_stats(
 ) -> _PhaseTrialStats:
     """Log a storage-read failure and return an unavailable phase-trial snapshot.
 
-    External RDB URLs and driver messages can contain credentials, so those
-    warnings report only the backend and exception type.
-
     :param Experiment experiment: Config whose storage backend or local path is reported.
     :param Phase phase: Phase whose status read failed.
     :param BaseException exc: Read exception whose direct cause is reported when present.
@@ -815,22 +757,13 @@ def _unavailable_phase_trial_stats(
         ``available=False``.
     """
     cause = exc.__cause__ or exc
-    backend = storage_backend(experiment.resolved_storage)
-    if backend in {"sqlite", "journal"}:
-        log.warning(
-            "could not read status trial data from storage %s for phase %s: %s: %s",
-            experiment.resolved_storage,
-            phase.name,
-            type(cause).__name__,
-            cause,
-        )
-    else:
-        log.warning(
-            "could not read status trial data from %s storage for phase %s: %s",
-            backend,
-            phase.name,
-            type(cause).__name__,
-        )
+    log.warning(
+        "could not read status trial data from storage %s for phase %s: %s: %s",
+        experiment.resolved_storage,
+        phase.name,
+        type(cause).__name__,
+        cause,
+    )
     return _PhaseTrialStats({}, False, {}, None)
 
 
@@ -883,34 +816,6 @@ def _sqlite_phase_trial_stats(
         finally:
             conn.close()
     except sqlite3.Error as exc:
-        return _unavailable_phase_trial_stats(experiment, phase, exc)
-    return _trial_stats_from_rows(
-        rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
-    )
-
-
-def _rdb_phase_trial_stats(
-    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
-) -> _PhaseTrialStats:
-    """Inspect external SQL storage without Optuna's schema-initializing loader.
-
-    :param Experiment experiment: Config containing the external storage URL.
-    :param Phase phase: Phase whose trial counts and running identities are read.
-    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
-    :return _PhaseTrialStats: One snapshot, or an unavailable observation on read failure.
-    """
-    assert experiment.resolved_storage is not None
-    try:
-        engine = sqlalchemy.create_engine(experiment.resolved_storage)
-        try:
-            with engine.connect() as connection:
-                rows = connection.execute(
-                    sqlalchemy.text(_PHASE_TRIAL_STATS_SQL),
-                    _phase_trial_stats_params(experiment, phase, published_trial),
-                ).fetchall()
-        finally:
-            engine.dispose()
-    except Exception as exc:  # noqa: BLE001 - status reports unavailable on any connection/read failure
         return _unavailable_phase_trial_stats(experiment, phase, exc)
     return _trial_stats_from_rows(
         rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
@@ -995,7 +900,7 @@ def _phase_trial_stats(
     if backend == "sqlite":
         return _sqlite_phase_trial_stats(experiment, phase, published_trial)
     if backend != "journal":
-        return _rdb_phase_trial_stats(experiment, phase, published_trial)
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     try:
         study = _load_journal_study_snapshot(
             experiment.resolved_storage, _phase_study_name(experiment, phase)

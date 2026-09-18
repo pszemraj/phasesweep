@@ -22,33 +22,8 @@ class ArtifactRootConflictError(PhaseSweepError):
     reuse of it: that error means one specific thing (an upstream top-up would
     invalidate a bound descendant study) and its remedy is a new experiment
     name, while this one means the offered ``workdir`` is not the publication
-    root this study already claimed and its remedy is either the original
-    ``workdir`` or an explicit ``phasesweep rebind-workdir``.
-    """
-
-
-class LegacyArtifactRootMigrationRequiredError(ArtifactRootConflictError):
-    """Raised when a populated study predates artifact-root binding.
-
-    A subclass of :class:`ArtifactRootConflictError` because it is the same
-    operator problem - the offered ``workdir`` is not provably the one that
-    owns this study's evidence - so every consumer that already classifies
-    that conflict keeps classifying this the same way. It is a distinct type
-    because the remedy differs: nothing is bound yet, so the operator names
-    the *original* tree with ``phasesweep rebind-workdir`` instead of
-    restoring a root the study already recorded (re-review v0.5.19 / blocker
-    B1).
-    """
-
-
-class ArtifactRootRebindError(PhaseSweepError):
-    """Raised when ``phasesweep rebind-workdir`` refuses to move a binding.
-
-    Covers every refusal of that command: nothing is bound to move, storage is
-    in-memory so no binding exists, or the destination cannot be validated as
-    the experiment's relocated artifact tree. Validation refusals precede
-    writes; an apply-time failure can follow an earlier binding update because
-    a rebind is not a cross-storage transaction.
+    root this study already claimed and its remedy is the original ``workdir``
+    or a fresh artifact root and local storage.
     """
 
 

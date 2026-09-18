@@ -10,10 +10,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config import Experiment
-from phasesweep.engine import (
-    LegacyArtifactRootMigrationRequiredError,
-    StudySchemaMismatchError,
-)
+from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
@@ -54,7 +51,7 @@ def test_pre_cutover_memory_output_is_refused_before_mutation(
     before = _tree_bytes(root)
 
     with pytest.raises(
-        LegacyArtifactRootMigrationRequiredError,
+        ArtifactRootConflictError,
         match=r"pre-cutover.*fresh artifact root.*0\.3\.1.*Nothing was written",
     ):
         run_experiment(experiment)

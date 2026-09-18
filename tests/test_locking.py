@@ -11,12 +11,10 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import quote_plus
 
 import pytest
 
 from phasesweep.config import (
-    Experiment,
     FloatParam,
     IntParam,
     Phase,
@@ -736,136 +734,6 @@ def test_run_lock_does_not_collide_for_distinct_experiment_names(
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
     with _experiment_lock(exp_a), _experiment_lock(exp_b):
         pass  # must not raise
-
-
-def _rdb_experiment(workdir: Path, storage: str) -> Experiment:
-    """Experiment with an external-RDB storage URL, bypassing the config ack.
-
-    ``model_copy`` skips validation, which is what we want here: the RDB policy
-    check (``allow_external_rdb_single_host``) is exercised in
-    ``tests/test_storage_urls.py``; this file only cares about the lock path
-    derived from the URL.
-    """
-    return make_experiment(workdir=str(workdir), storage="sqlite:///unused.db").model_copy(
-        update={"storage": storage}
-    )
-
-
-def _odbc_storage(connection_string: str) -> str:
-    """Encode a readable ODBC connection string as a SQLAlchemy URL."""
-    return f"mssql+pyodbc:///?odbc_connect={quote_plus(connection_string)}"
-
-
-@pytest.mark.parametrize(
-    ("left_storage", "right_storage"),
-    [
-        (
-            "postgresql://sweep:old-secret@DB.Internal/studies?a=1&b=2&application_name=x",
-            "postgresql+psycopg2://sweep:new-secret@db.internal:5432/studies?b=2&a=1",
-        ),
-        (
-            "postgresql://sweep@db.internal/studies?password=old-secret",
-            "postgresql://sweep@db.internal/studies?password=new-secret",
-        ),
-        (
-            "postgresql://sweep@db.internal/studies?access_token=old-token",
-            "postgresql://sweep@db.internal/studies?access_token=new-token",
-        ),
-        (
-            "postgresql://sweep@db.internal/studies?sslpassword=old-secret",
-            "postgresql://sweep@db.internal/studies?sslpassword=new-secret",
-        ),
-        (
-            "postgresql://sweep@db.internal/studies?client_secret=old-secret",
-            "postgresql://sweep@db.internal/studies?client_secret=new-secret",
-        ),
-        (
-            _odbc_storage("SERVER=db.internal;DATABASE=studies;PWD=old-secret"),
-            _odbc_storage("SERVER=db.internal;DATABASE=studies;PWD=new-secret"),
-        ),
-        (
-            _odbc_storage("SERVER=db.internal;DATABASE=studies;PORT=1433"),
-            _odbc_storage("PORT=1433;DATABASE=studies;SERVER=db.internal"),
-        ),
-        (
-            _odbc_storage("SERVER=db.internal;DATABASE=studies"),
-            _odbc_storage("server=db.internal;database=studies"),
-        ),
-        (
-            _odbc_storage("SERVER=db.internal;DATABASE=studies;ClientSecret=old-secret"),
-            _odbc_storage("SERVER=db.internal;DATABASE=studies;client_secret=new-secret"),
-        ),
-        (
-            _odbc_storage(
-                "DRIVER={ODBC Driver 17 for SQL Server};SERVER=db.internal;"
-                "DATABASE=studies;Encrypt=yes;TrustServerCertificate=no;"
-                "Connection Timeout=30"
-            ),
-            _odbc_storage(
-                "DRIVER={ODBC Driver 18 for SQL Server};SERVER=db.internal;"
-                "DATABASE=studies;Encrypt=no;TrustServerCertificate=yes;"
-                "Connection Timeout=60"
-            ),
-        ),
-    ],
-    ids=[
-        "authority",
-        "query-password",
-        "access-token",
-        "sslpassword",
-        "client-secret",
-        "nested-odbc-credential",
-        "nested-odbc-field-order",
-        "nested-odbc-field-case",
-        "nested-odbc-client-secret",
-        "nested-odbc-connection-options",
-    ],
-)
-def test_run_lock_collides_for_equivalent_rdb_storage_urls(
-    tmp_path: Path,
-    left_storage: str,
-    right_storage: str,
-) -> None:
-    """Equivalent external-RDB URLs must land on one storage lock.
-
-    ``allow_external_rdb_single_host: true`` promises that host-local locking
-    supplies all coordination for a shared RDB. Hashing the raw URL broke that
-    promise: a rotated password or a reordered query split the lock namespace
-    and let two orchestrators run the same study (review v0.5.17 / blocker 5).
-    Distinct workdirs keep the output locks apart, so any shared path is the
-    storage lock.
-    """
-    exp_a = _rdb_experiment(tmp_path / "runs_a", left_storage)
-    exp_b = _rdb_experiment(tmp_path / "runs_b", right_storage)
-
-    assert set(_run_lock_paths(exp_a)) & set(_run_lock_paths(exp_b))
-
-
-@pytest.mark.parametrize(
-    ("selector", "left_value", "right_value"),
-    [
-        ("SERVER", "db-a", "db-b"),
-        ("DATABASE", "studies-a", "studies-b"),
-        ("PORT", "1433", "1434"),
-        ("DSN", "studies-a", "studies-b"),
-        ("SOCKET", "/tmp/db-a", "/tmp/db-b"),
-        ("SCHEMA", "alpha", "beta"),
-    ],
-    ids=["server", "database", "port", "dsn", "socket", "schema"],
-)
-def test_run_lock_does_not_collide_for_different_rdb_targets(
-    tmp_path: Path,
-    selector: str,
-    left_value: str,
-    right_value: str,
-) -> None:
-    """Canonicalization must not over-collide distinct RDB target selectors."""
-    left_storage = _odbc_storage(f"{selector}={left_value}")
-    right_storage = _odbc_storage(f"{selector}={right_value}")
-    exp_a = _rdb_experiment(tmp_path / "runs_a", left_storage)
-    exp_b = _rdb_experiment(tmp_path / "runs_b", right_storage)
-
-    assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
 
 
 @pytest.mark.parametrize(

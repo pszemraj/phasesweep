@@ -362,11 +362,6 @@ def _run_experiment_outcome(
             # primary error, and publication on that path is covered by the
             # selection-time winner check.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
-            resume_ops._preflight_evaluation_semantics(
-                experiment,
-                from_phase=from_phase,
-                existing_studies=existing_studies,
-            )
             resume_ops._reject_bound_descendant_topups(
                 experiment,
                 from_phase=from_phase,
@@ -703,11 +698,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     * ``current_generation_id``, ``published_generation_id``,
       ``represented_generation_id``, ``is_published``: the identity split
       defined by :func:`phasesweep.engine.read.read_status` (unpinned mode, so
-      the represented generation is the published one). A pre-generation
-      legacy workdir has no generation ids to report and leaves all three
-      null, but its compatibility ``winner.yaml`` still counts as published,
-      so ``is_published`` never contradicts the ``winner`` path shown beside
-      it.
+      the represented generation is the published one). A fresh workdir with
+      no generation metadata leaves all three null; root-level winner
+      projections never establish publication authority.
     * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"``, and ``publication_error`` beside either failure
       verdict -- the one

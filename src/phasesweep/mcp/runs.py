@@ -347,7 +347,7 @@ class RunStore:
         A marker is written only for a namespace with no durable run-store
         evidence. A pre-marker state that already contains handles, logs,
         leases, or audit records belongs to the preserved 0.3.1 runtime and
-        must never be adopted by this release.
+        is refused by this release.
 
         :return bool: Whether this fresh namespace needs its first marker.
         :raises ValueError: The namespace contains unsupported or unmarked
@@ -386,7 +386,7 @@ class RunStore:
         Empty ``runs/`` and ``logs/`` directories, as well as the catalog
         scaffolder's root-level ``origin`` record, remain fresh. Any entry
         below the run or log directories is durable evidence: interrupted
-        writes and unfamiliar legacy records must fail closed rather than be
+        writes and unfamiliar records must fail closed rather than be
         treated as an empty namespace.
 
         :return bool: Whether durable pre-marker run-store evidence is present.
@@ -808,12 +808,11 @@ class RunStore:
     def is_pre_spawn_orphan(self, run_id: str) -> bool:
         """Return whether ``run_id`` is a provably abandoned preparation.
 
-        Legacy launches are recoverable only when their config snapshot is the
-        sole evidence. Transactional launches also carry a kernel lease across
-        ``Popen``. A free lease plus either no handle or a valid launching
-        handle proves that no runner can still cross the acknowledgement
-        boundary; a child that was created inherits and holds the lease until
-        it has durably replaced the handle with its process identity or exits.
+        Transactional launches carry a kernel lease across ``Popen``. A free
+        lease plus a valid launching handle proves that no runner can still
+        cross the acknowledgement boundary; a child that was created inherits
+        and holds the lease until it has durably replaced the handle with its
+        process identity or exits.
 
         :param str run_id: Candidate orphan run identity.
         :return bool: Whether the preparation is safe to remove automatically.
@@ -830,28 +829,7 @@ class RunStore:
             lease.close()
             return True
 
-        handle_path = self._runs_dir / f"{run_id}.json"
-        snapshot = self.config_snapshot_path(run_id)
-        terminal_evidence = (
-            self.status_path(run_id),
-            self.cleanup_uncertain_path(run_id),
-            self.cleanup_recovery_path(run_id),
-        )
-        if any(path.exists() or path.is_symlink() for path in terminal_evidence):
-            return False
-        if handle_path.exists() or handle_path.is_symlink():
-            return False
-        if self.log_path(run_id).exists() or self.log_path(run_id).is_symlink():
-            return False
-        directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
-        try:
-            try:
-                read_private_text_at(directory_fd, snapshot.name, snapshot)
-            except (OSError, UnsafePrivatePathError, UnicodeError):
-                return False
-        finally:
-            os.close(directory_fd)
-        return True
+        return False
 
     def _claim_abandoned_launch_lease(self, run_id: str) -> IO[str] | None:
         """Lock and revalidate one transactional pre-spawn preparation.

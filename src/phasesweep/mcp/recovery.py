@@ -221,9 +221,8 @@ def _recover_pre_spawn_orphan(
     """Inspect or remove an abandoned launch preparation.
 
     Acquires the launch lock before checking the orphan state. With confirmation,
-    clears only a confirmed pre-spawn orphan while holding that lock. The orphan
-    may be a legacy config snapshot without a handle or a transactional launch
-    whose persisted launching handle has a free inherited lease.
+    clears only a confirmed transactional pre-spawn orphan while holding that
+    lock. The persisted launching handle must retain a free inherited lease.
 
     :param RunStore store: Existing run store that owns the launch reservation.
     :param str run_id: Identity of the possible pre-spawn orphan.

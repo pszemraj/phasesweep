@@ -4,10 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal
-
-if TYPE_CHECKING:
-    from phasesweep.engine.read import PhaseWinnerView
+from typing import Any, Literal
 
 WinnerSourceKind = Literal["phase_trial"]
 
@@ -108,33 +105,10 @@ class Winner:
     trainer_inherit_env: str | list[str] | None = None
 
 
-def _winner_source_or_default(
-    winner: Winner | PhaseWinnerView,
-    phase: str,
-) -> WinnerSource:
-    """Return a recorded winner source or synthesize its phase-trial identity.
-
-    :param Winner | PhaseWinnerView winner: Winner carrying optional source provenance.
-    :param str phase: Exposed phase used by the fallback source.
-    :return WinnerSource: Explicit provenance or a complete ``phase_trial`` fallback.
-    """
-    return winner.source or WinnerSource(
-        kind="phase_trial",
-        phase=phase,
-        trial_number=winner.trial_number,
-        generation_id=winner.generation_id,
-        attempt_id=winner.attempt_id,
-    )
-
-
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
 GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
-# Evaluator revisions are recorded separately so run preflight can refuse a
-# later affected study before an unrelated earlier phase adds trial rows; its
-# complete phase fingerprint still binds config and inherited winner semantics.
-PHASE_EVALUATION_SEMANTICS_ATTR = "phasesweep_phase_evaluation_semantics"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 STUDY_SCHEMA_VERSION = 3
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
@@ -181,12 +155,10 @@ CLEANUP_CONFIRMED_ATTR = "phasesweep_cleanup_confirmed"
 CLEANUP_RECOVERED_TRIALS_ATTR = "phasesweep_cleanup_recovered_trials"
 FAILURE_REASON_ATTR = "phasesweep_failure_reason"
 # Study-level binding from a persistent study to the one artifact root it
-# publishes into: the resolved ``<workdir>/<experiment>`` namespace as a string
-# (review v0.5.19 / finding F5). ``workdir`` is deliberately outside every
-# semantic fingerprint so a tree stays movable, which without this binding let
-# one study back two divergent publication roots. Claimed on first contact and
-# moved only by ``phasesweep rebind-workdir``; the ``_v1`` suffix leaves room
-# for a future binding payload that is not a bare path string.
+# publishes into: the resolved ``<workdir>/<experiment>`` namespace as a string.
+# ``workdir`` stays outside semantic fingerprints, so this binding refuses a
+# second divergent publication root. It is claimed only on first contact; an
+# existing binding remains authoritative.
 ARTIFACT_ROOT_ATTR = "phasesweep_artifact_root_v1"
 CONSTRAINT_PREFIX = "constraint:"
 

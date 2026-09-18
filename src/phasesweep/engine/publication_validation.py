@@ -573,10 +573,8 @@ def _validate_generation_provenance_files(
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
             raise fail(f"namespace contains an unlisted {kind} artifact")
-    if not listed_files:
-        return
     if set(listed_files) != _MANIFEST_GENERATION_FILE_KINDS:
-        raise fail("summary lists only part of the generation provenance record")
+        raise fail("summary does not list the complete generation provenance record")
 
     contents: dict[str, bytes] = {}
     digests: dict[str, str] = {}

@@ -161,26 +161,6 @@ def _reject_unsupported_sampler_topups(
             study_policy_ops._validate_sampler_continuation(study, phase)
 
 
-def _preflight_evaluation_semantics(
-    experiment: Experiment,
-    *,
-    from_phase: str | None,
-    existing_studies: dict[str, optuna.Study],
-) -> None:
-    """Check evaluator revisions across reached studies before any trial top-up.
-
-    :param Experiment experiment: Current experiment and evidence configuration.
-    :param str | None from_phase: First phase the invocation will execute.
-    :param dict[str, optuna.Study] existing_studies: Discovered persistent studies.
-    :raises StudyFingerprintMismatchError: An affected populated study predates
-        the current interpretation or cannot establish its evaluator revision.
-    """
-    for _index, phase in _phases_from(experiment, from_phase):
-        study = existing_studies.get(phase.name)
-        if study is not None:
-            fingerprint_ops._verify_evaluation_semantics(study, experiment, phase, stamp_safe=False)
-
-
 def _preflight_reached_fingerprint(
     experiment: Experiment,
     *,

@@ -3,9 +3,7 @@
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
-    ArtifactRootRebindError,
     ExperimentLockBusyError,
-    LegacyArtifactRootMigrationRequiredError,
     PhaseSweepError,
     PublicationAccessError,
     PublicationCommitError,
@@ -42,9 +40,7 @@ from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessC
 __all__ = [
     "ActiveAttemptPersistenceError",
     "ArtifactRootConflictError",
-    "ArtifactRootRebindError",
     "ExperimentLockBusyError",
-    "LegacyArtifactRootMigrationRequiredError",
     "NoFeasibleTrialError",
     "PhaseSweepError",
     "PhaseWinnerView",

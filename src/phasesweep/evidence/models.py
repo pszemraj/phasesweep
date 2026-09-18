@@ -186,47 +186,7 @@ class LogRegexExtractor(_TrialFilePathModel):
         return value
 
 
-class _WandbSummarySource(_Frozen):
-    """Shared location and polling contract for one W&B run summary."""
-
-    base_url: str = Field(default="https://api.wandb.ai", min_length=1)
-    entity: str = Field(min_length=1, pattern=r"^[^/]+$")
-    project: str = Field(min_length=1, pattern=r"^[^/]+$")
-    poll_seconds: ConfigFloat = Field(default=2.0, gt=0.0, allow_inf_nan=False)
-    timeout_seconds: ConfigFloat = Field(
-        default=120.0,
-        ge=1.0,
-        allow_inf_nan=False,
-        description=(
-            "Total wall-clock budget for the polling worker. Worker startup and W&B SDK "
-            "initialization consume this budget before requests and retries. Short budgets can "
-            "expire before the first poll, even when run data is already available."
-        ),
-    )
-
-    @field_validator("base_url")
-    @classmethod
-    def _normalize_base_url(cls, value: str) -> str:
-        """Normalize the endpoint spelling used by the W&B public API.
-
-        :param str value: Configured W&B API base URL.
-        :raises ValueError: The value consists only of slashes.
-        :return str: Base URL without trailing slashes.
-        """
-        normalized = value.rstrip("/")
-        if not normalized:
-            raise ValueError("W&B base_url must contain a non-slash endpoint.")
-        return normalized
-
-
-class WandbExtractor(_WandbSummarySource):
-    """Extract a scalar from this attempt's finished W&B run summary."""
-
-    type: Literal["wandb"]
-    metric_key: str = Field(description="Key on wandb.run.summary, e.g. 'eval/loss'.")
-
-
-ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
+ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor
 Extractor = JsonExtractor | ObjectiveExtractor
 
 
@@ -248,17 +208,16 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
       (``cfg.checkpoint`` / ``cfg.expected_step`` is not ``None``). Reporting
       a coarse ``True`` regardless of whether either was declared overstates
       what is actually enforced when they are left unset.
-    - ``log_regex`` and ``wandb`` extractors have no objective_name/split/
+    - ``log_regex`` extractors have no objective_name/split/
       policy/checkpoint/expected_step concept at all, so every one of those
       flags is ``False`` for them.
     - A single coarse ``attempt_bound`` claim overstated weak extractors, so
       it is split into three precise flags (review v0.5.15 / item C):
 
       - ``attempt_location_scoped`` is ``True`` for every extractor kind:
-        each reads evidence from a location — a trial directory for
-        ``json_envelope``/``log_regex``, or a W&B run id for ``wandb`` —
-        that is uniquely scoped to this generation+attempt. Scoping alone is
-        weak: nothing in a ``log_regex`` file's *contents* identifies the
+        each reads evidence from a trial directory uniquely scoped to this
+        generation+attempt. Scoping alone is weak: nothing in a ``log_regex``
+        file's *contents* identifies the
         attempt that produced it, so a file misplaced or symlinked into the
         wrong trial directory would be read as gospel.
       - ``attempt_identity_bound`` is ``True`` only for ``json_envelope``:
@@ -266,17 +225,11 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         ``overrides_sha256`` in its own body, and
         ``_extract_json_envelope`` cross-checks those reported values
         against the runtime's own identity before accepting the result.
-        ``log_regex`` has no identity fields to check at all, and ``wandb``
-        is keyed by run id rather than by any self-reported identity inside
-        the run summary, so both are ``False``.
-      - ``source_identity_keyed`` is ``True`` only for ``wandb``: the
-        evidence source itself — the W&B run — is addressed by the
-        immutable attempt identity (``WANDB_RUN_ID=attempt_id``) rather than
-        by filesystem location, so a wrong-attempt run cannot silently
-        appear at the right path the way a misplaced log file could.
-        ``json_envelope`` and ``log_regex`` read location-addressed files,
-        so this is ``False`` for both; the envelope's stronger guarantee is
-        already captured by ``attempt_identity_bound``.
+        ``log_regex`` has no identity fields to check at all, so it is
+        ``False``.
+      - ``source_identity_keyed`` is ``False`` for both local extractor
+        kinds: their sources are location-addressed files. The envelope's
+        stronger guarantee is captured by ``attempt_identity_bound``.
 
     :param ObjectiveExtractor extractor: Configured objective extractor to describe.
     :return dict[str, str | bool]: Assurance payload with the extractor ``kind``
@@ -307,7 +260,7 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         "kind": extractor.type,
         "attempt_location_scoped": True,
         "attempt_identity_bound": False,
-        "source_identity_keyed": isinstance(extractor, WandbExtractor),
+        "source_identity_keyed": False,
         "objective_name_bound": False,
         "split_bound": False,
         "evaluation_policy_bound": False,
@@ -330,7 +283,7 @@ class _ObjectiveEvidenceFields(BaseModel):
     :func:`objective_evidence_assurance` for exactly what each flag means.
     """
 
-    kind: Literal["json_envelope", "log_regex", "wandb"]
+    kind: Literal["json_envelope", "log_regex"]
     attempt_location_scoped: bool
     attempt_identity_bound: bool
     source_identity_keyed: bool
@@ -492,19 +445,7 @@ class Sha256Gate(_TrialFilePathModel):
         return value.lower()
 
 
-class WandbSummaryRequiredGate(_WandbSummarySource):
-    """Require keys in this attempt's finished W&B run summary."""
-
-    type: Literal["wandb_summary_required"]
-    keys: list[str] = Field(min_length=1)
-
-
 Gate = Annotated[
-    RequiredFileGate
-    | JsonEqualsGate
-    | JsonScalarBoundGate
-    | ArtifactSizeGate
-    | Sha256Gate
-    | WandbSummaryRequiredGate,
+    RequiredFileGate | JsonEqualsGate | JsonScalarBoundGate | ArtifactSizeGate | Sha256Gate,
     Field(discriminator="type"),
 ]

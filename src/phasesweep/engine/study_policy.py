@@ -304,18 +304,24 @@ def _validate_study_direction(
 
 
 def _accepted_trial_target(study: optuna.Study) -> int:
-    """Return the durable target, inferring old current-schema studies from history.
+    """Return the durable target for a current-format study.
 
     :param optuna.Study study: Study whose accepted trial target is read.
-    :return int: The stored ``phasesweep_trial_target`` user attr, or the
-        number of finished trials when no target has been recorded yet.
+    :return int: The stored ``phasesweep_trial_target`` user attr, or zero for
+        a newly initialized empty study.
     :raises StudySchemaMismatchError: The stored target is not a positive int,
         or is lower than the number of already-finished trials.
     """
     finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
     stored = study.user_attrs.get(TRIAL_TARGET_ATTR)
     if stored is None:
-        return finished
+        if not study.get_trials(deepcopy=False):
+            return 0
+        raise StudySchemaMismatchError(
+            f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}. "
+            "Use a fresh local ledger and artifact root, or use the preserved PhaseSweep "
+            "0.3.1 environment to operate the existing state."
+        )
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has invalid {TRIAL_TARGET_ATTR!r}={stored!r} "
@@ -474,7 +480,7 @@ def _prelaunch_trial_environment(
     A context can cover a missing trial identity only when the trial number is
     at or after its durable pre-allocation boundary and the trial never reached
     the per-attempt metadata written before any trainer can start. This keeps
-    legacy or executed trials with missing environment provenance rejected.
+    executed trials with missing environment provenance rejected.
 
     :param optuna.Study study: Study containing the allocation context.
     :param optuna.trial.FrozenTrial trial: Trial with a missing environment attr.
@@ -516,7 +522,7 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
 
     :param optuna.Study study: Existing study whose trials define the cohort.
     :param str current_digest: Semantic environment digest for this invocation.
-    :raises StudySchemaMismatchError: A populated legacy study has a trial with
+    :raises StudySchemaMismatchError: A populated study has a trial with
         no usable environment identity.
     :raises StudyFingerprintMismatchError: Recorded trials belong to another
         semantic environment cohort.
@@ -538,10 +544,10 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
             recorded.add(environment)
     if missing:
         raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} contains populated legacy trial(s) without a "
+            f"Study {study.study_name!r} contains populated trial(s) without a "
             f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
             "which environment cohort owns those results. Use a new experiment name, or "
-            "archive/delete the legacy study before running again."
+            "use the preserved PhaseSweep 0.3.1 environment to operate the existing state."
         )
     if recorded != {current_digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))

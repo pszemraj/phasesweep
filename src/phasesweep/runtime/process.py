@@ -1059,8 +1059,8 @@ def read_attempt_lifecycle(
         expected_attempt_id: Attempt identity stored on the Optuna trial.
 
     Returns:
-        The validated record, or ``None`` when no record exists (legacy
-        attempts written before this schema).
+        The validated record, or ``None`` when no record exists. Current
+        recovery callers decide whether absence is safe for their state.
 
     Raises:
         ValueError: The record is malformed, uses an unknown schema or state,

@@ -41,7 +41,7 @@ from phasesweep.runtime.files import (
     storage_is_in_memory,
 )
 
-OverrideFormat = Literal["yaml_file", "argparse", "json_file", "hydra"]
+OverrideFormat = Literal["yaml_file", "argparse"]
 
 
 class Metric(_Frozen):
@@ -511,36 +511,20 @@ class Experiment(_Frozen):
     storage: str | None = Field(
         default=None,
         description=(
-            "Optuna storage URL, or auto for study.db inside the experiment artifact "
+            "Local Optuna storage URL, or auto for study.db inside the experiment artifact "
             "namespace (study.journal when any phase has n_jobs > 1). "
             "Use sqlite:///path.db for resumable single-job studies, "
-            "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts "
-            "(RDB backends additionally require allow_external_rdb_single_host: true; "
-            "see below). Nested odbc_connect strings must name each target selector once. "
-            "Null for non-resumable in-memory runs (not recommended). "
+            "journal:///path.journal for parallel studies, or null for non-resumable "
+            "in-memory runs. "
             "Explicit SQLite URLs are never rewritten to JournalStorage. Changing auto's "
             "backend changes storage identity and cannot resume an existing tree."
-        ),
-    )
-    # Renamed from `allow_unsafe_multihost` (review v0.5.15 / item E): the old name
-    # read as "enables multi-host operation," but the flag actually acknowledges the
-    # opposite — that this external relational-DB storage is still coordinated
-    # host-locally, with every process confined to ONE host.
-    allow_external_rdb_single_host: bool = Field(
-        default=False,
-        description=(
-            "Acknowledge the loss of PhaseSweep's host-local-filesystem-based "
-            "coordination guarantees (locks, generation pointers) when storage is a "
-            "shared relational backend (e.g. postgresql://, mysql://). Set this to true "
-            "only when every process that will ever touch this storage and workdir "
-            "runs on a single host."
         ),
     )
     workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
     trial_command: str = Field(
         description=(
             "Shell command template. Placeholders: {config_path}, {overrides}, "
-            "{overrides_path}, {trial_dir}, {trial_id}, {phase}, {run_name}."
+            "{trial_dir}, {trial_id}, {phase}, {run_name}."
         )
     )
     trainer_config: dict[str, Any] = Field(
@@ -590,15 +574,22 @@ class Experiment(_Frozen):
 
     @field_validator("storage")
     @classmethod
-    def _storage_identity_is_unambiguous(cls, value: str | None) -> str | None:
-        """Reject storage locators with ambiguous nested ODBC target fields.
+    def _storage_is_local(cls, value: str | None) -> str | None:
+        """Allow only in-memory, local SQLite, local Journal, and auto storage.
 
         :param str | None value: Configured Optuna storage locator.
-        :raises ValueError: An ``odbc_connect`` target selector appears more than once.
+        :raises ValueError: The locator selects an unsupported storage backend.
         :return str | None: The validated locator, unchanged.
         """
-        if value != "auto":
-            canonical_storage_identity(value)
+        if value == "auto" or storage_is_in_memory(value):
+            return value
+        backend = storage_backend(value)
+        if backend not in {"sqlite", "journal"}:
+            raise ValueError(
+                "storage must be in-memory, sqlite:///, journal:///, or auto; "
+                f"got backend {backend!r}."
+            )
+        canonical_storage_identity(value)
         return value
 
     @model_validator(mode="after")
@@ -749,11 +740,8 @@ class Experiment(_Frozen):
                 )
 
             _validate_sampler_search_space(phase)
-            _validate_storage_policy(
-                self.resolved_storage, phase, self.allow_external_rdb_single_host
-            )
+            _validate_storage_policy(self.resolved_storage, phase)
             _validate_sampler_resumability(self.resolved_storage, phase)
-            _validate_json_file_override_values(self, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
 
@@ -767,48 +755,12 @@ class Experiment(_Frozen):
         return self
 
 
-def _validate_storage_policy(
-    storage: str | None, phase: Phase, allow_external_rdb_single_host: bool
-) -> None:
-    """Reject SQLite+parallel storage and unacknowledged multi-host RDB storage.
+def _validate_storage_policy(storage: str | None, phase: Phase) -> None:
+    """Reject SQLite storage for parallel phases.
 
-    Two independent policies are enforced here:
-
-    1. SQLite + parallel ``n_jobs`` (review v0.5.2 / blocker 6): SQLite serializes
-       writers; concurrent Optuna trials cause ``database is locked`` errors.
-       Earlier versions auto-rewrote ``sqlite:///x.db`` to a JournalStorage path,
-       but that fragmented study identity behind a single URL — the same config
-       could point at two different studies depending on ``n_jobs``. Now we
-       require the user to pick the scheme explicitly.
-    2. Unacknowledged multi-host-capable storage (review v0.5.14 / item D): PhaseSweep's
-       coordination (locks, generation pointers) is host-local-filesystem based.
-       Pointing several hosts at one shared RDB storage (MySQL/Postgres/...)
-       silently breaks those safety guarantees, so any backend other than
-       ``sqlite``/``journal`` is rejected unless the operator explicitly sets
-       ``allow_external_rdb_single_host: true``. In-memory storage (``None`` or the
-       bare ``":memory:"``/URI-memory sentinels recognized by
-       :func:`phasesweep.runtime.files.storage_is_in_memory`) is exempt: it
-       cannot be shared across hosts in the first place.
-
-    Both checks use :func:`phasesweep.runtime.files.storage_backend` so all
-    SQLAlchemy dialects (``sqlite:///``, ``sqlite+pysqlite:///``, ...) are
-    classified consistently. Earlier versions only matched the bare
-    ``sqlite:///`` prefix and let driver-qualified URLs through unsafely
-    (review v0.5.7 / blocker 1).
-
-    Args:
-        storage: The experiment-level storage URL, or ``None`` (in-memory).
-        phase: The phase being validated; its ``n_jobs`` decides whether the
-            SQLite-parallel restriction applies.
-        allow_external_rdb_single_host: Experiment-level acknowledgement that every
-            process touching this storage and workdir runs on a single host,
-            required to use any non-file-backed (RDB) storage.
-
-    Raises:
-        ValueError: ``phase.n_jobs > 1`` AND ``storage`` resolves to SQLite, or
-            ``storage`` is not in-memory, resolves to a backend other than
-            ``sqlite``/``journal``, and ``allow_external_rdb_single_host`` is not set.
-
+    :param str | None storage: Experiment-level storage URL, or ``None`` for memory.
+    :param Phase phase: The phase whose parallelism is being validated.
+    :raises ValueError: SQLite storage is used with ``n_jobs > 1``.
     """
     if storage is None:
         return
@@ -818,26 +770,7 @@ def _validate_storage_policy(
             f"Phase {phase.name!r} has n_jobs={phase.n_jobs} with SQLite storage. "
             "SQLite serializes writers and will deadlock under "
             "parallel Optuna access. Use storage: journal:///path.journal for a "
-            "single-host parallel sweep, or an RDB URL such as "
-            "postgresql://... for durable storage and dashboard access from a "
-            "single phasesweep orchestrator."
-        )
-    if (
-        not storage_is_in_memory(storage)
-        and backend not in {"sqlite", "journal"}
-        and not allow_external_rdb_single_host
-    ):
-        raise ValueError(
-            f"The configured storage resolves to backend {backend!r}, a shared "
-            "relational store. PhaseSweep's coordination (locks, generation "
-            "pointers) is host-local-filesystem based, so pointing multiple "
-            f"hosts at one shared {backend} storage silently breaks those safety "
-            "guarantees. Set allow_external_rdb_single_host: true only when every "
-            "process that will ever touch this storage and workdir runs on a "
-            "single host — this acknowledges the storage is external, not that "
-            "coordination is distributed; otherwise use storage: "
-            "journal:///path.journal for a single-host parallel sweep, or "
-            "storage: sqlite:///path.db for sequential n_jobs: 1 studies."
+            "single-host parallel sweep."
         )
 
 
@@ -896,107 +829,6 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
         )
 
 
-_JSON_SCALARS = (str, int, float, bool, type(None))
-
-
-def _first_json_unserializable(value: Any, _seen: set[int] | None = None) -> Any | None:
-    """Return the first object inside ``value`` that strict JSON cannot represent.
-
-    Used only to turn a bare ``TypeError`` from :func:`json.dumps` into a
-    message that names the offending *type* rather than repeating the encoder's
-    generic complaint. Containers are tracked by identity so a recursive YAML
-    anchor cannot spin this into a ``RecursionError``.
-
-    :param Any value: Composed override value to inspect.
-    :param set[int] | None _seen: Internal recursion guard of container ids.
-    :return Any | None: The offending object, or ``None`` when every leaf is a
-        JSON scalar.
-    """
-    if isinstance(value, _JSON_SCALARS):
-        return None
-    seen = set() if _seen is None else _seen
-    if id(value) in seen:
-        return None
-    seen.add(id(value))
-    if isinstance(value, dict):
-        for key, item in value.items():
-            # json.dumps stringifies scalar keys but rejects anything else.
-            if not isinstance(key, _JSON_SCALARS):
-                return key
-            found = _first_json_unserializable(item, seen)
-            if found is not None:
-                return found
-        return None
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            found = _first_json_unserializable(item, seen)
-            if found is not None:
-                return found
-        return None
-    return value
-
-
-def _validate_json_file_override_values(experiment: Experiment, phase: Phase) -> None:
-    """Reject ``json_file`` override values the wire serializer cannot encode.
-
-    ``override_format: json_file`` writes the composed overrides through
-    :func:`phasesweep.runtime.commands.write_json_file`, which uses a strict
-    ``json.dumps`` with no ``default=`` fallback. Nothing else proved those
-    values encodable before the first real trial: the template preflight in
-    :func:`_validate_trial_command_template` renders with ``write_files=False``,
-    which skips ``write_json_file`` entirely. So a YAML like ``cutoff:
-    2024-01-01`` — PyYAML resolves that to :class:`datetime.date`, not to a
-    string — loaded clean, passed ``phasesweep validate``, and then killed the
-    first trial in ``json.dumps`` (review v0.5.17 / finding B).
-
-    Phase-local fixed values are checked. Sampled values need no check
-    (``CategoricalParam`` already restricts choices to Optuna scalars, which
-    are exactly the JSON scalars, and float/int params yield numbers), and
-    inherited values are themselves composed from an earlier phase's already-
-    validated local values.
-
-    :param Experiment experiment: Experiment being validated; supplies
-        ``override_format``.
-    :param Phase phase: Phase whose composed fixed values are checked.
-    :raises ValueError: A composed value cannot be encoded by the canonical
-        strict serializer.
-    """
-    if experiment.override_format != "json_file":
-        return
-
-    # Lazy import to avoid a circular config <-> runtime cycle.
-    from phasesweep.runtime.commands import dump_overrides_json
-
-    for key, value in phase.fixed_overrides.items():
-        try:
-            dump_overrides_json(value)
-        except (TypeError, ValueError) as exc:
-            offender = _first_json_unserializable(value) if isinstance(exc, TypeError) else None
-            detail = (
-                f"type {type(offender).__name__}"
-                if offender is not None
-                else f"{type(exc).__name__}: {exc}"
-            )
-            # TypeError covers YAML-native-object cases (date/datetime, etc.);
-            # ValueError here is the strict encoder's allow_nan=False rejecting
-            # a non-finite float (.inf/.nan). The two remedies are unrelated, so
-            # the hint text must not conflate them.
-            hint = (
-                "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
-                "into Python date/datetime objects; quote the value in YAML "
-                '(e.g. "2024-01-01") to keep it a JSON string.'
-                if isinstance(exc, TypeError)
-                else "JSON has no representation for non-finite floats; use a "
-                'finite value, or quote it in YAML (e.g. "inf") if the trial '
-                "command should receive it as text."
-            )
-            raise ValueError(
-                f"Phase {phase.name!r}: override_format='json_file' but fixed_overrides key "
-                f"{key!r} holds a value the overrides.json serializer cannot encode "
-                f"({detail}): {value!r}. {hint}"
-            ) from exc
-
-
 def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     """Reject scalar/list CLI override values with no faithful wire form.
 
@@ -1004,15 +836,14 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     so the accepted values cannot drift between preflight and execution. The
     supported domain is ``None``, ``bool``, ``int``, finite ``float``, ``str``,
     and lists/tuples of those. Structured trainer configuration belongs in the
-    default ``yaml_file`` mode; ``json_file`` remains an overrides-only
-    compatibility boundary.
+    default ``yaml_file`` mode.
 
     :param Experiment experiment: Experiment being validated; supplies
         ``override_format``.
     :param Phase phase: Phase whose composed fixed values are checked.
     :raises ValueError: A composed value is outside the selected CLI value contract.
     """
-    if experiment.override_format not in {"argparse", "hydra"}:
+    if experiment.override_format != "argparse":
         return
 
     from phasesweep.runtime.commands import _OverrideValueError, _render_override_value
@@ -1077,13 +908,9 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
 def _format_field_names(template: str) -> set[str]:
     """Return the *real* ``str.format`` field names referenced by ``template``.
 
-    Substring matching on ``"{overrides_path}"`` is unsafe: an escaped
-    ``{{overrides_path}}`` in the template renders as the literal string
-    ``{overrides_path}`` (see Python docs on PEP 3101 format strings) and would
-    fool a substring check into thinking the placeholder is used (review v0.5.6
-    / blocker 2). ``string.Formatter().parse()`` walks the template the same
-    way ``str.format`` does and reports only true field references, with
-    escaped braces handled correctly.
+    ``string.Formatter().parse()`` walks the template the same way
+    ``str.format`` does and reports only true field references, with escaped
+    braces handled correctly.
 
     Field expressions like ``{trial_dir!s}``, ``{m.name}``, and ``{a[0]}`` all
     have the *root* name extracted (``trial_dir``, ``m``, ``a``) so a check
@@ -1125,11 +952,8 @@ def _validate_trial_command_template(
     * Typos like ``{trail_dir}`` or any other unknown ``{placeholder}``.
     * Unbalanced braces (``{trial_dir`` -> ``str.format`` raises ``ValueError``).
     * The primary ``yaml_file`` mode missing ``{config_path}``.
-    * Phases declaring ``override_format: json_file`` but a template missing
-      ``{overrides_path}`` (rendered fine, but the trainer never sees the JSON
-      and silently runs with defaults).
-    * Phases using the explicit ``argparse`` or optional ``hydra``
-      compatibility formats with overrides but a template missing
+    * Phases using the explicit ``argparse`` compatibility format with
+      overrides but a template missing
       ``{overrides}`` — the same silent-no-op failure mode (review v0.5.6 /
       blocker 2).
 
@@ -1204,8 +1028,7 @@ def _validate_trial_command_template(
         raise ValueError(
             f"Phase {phase.name!r}: trial_command references unknown placeholder "
             f"{{{bad}}}. Supported: {{config_path}} (yaml_file only), "
-            f"{{overrides}}, {{overrides_path}} (json_file only), {{trial_dir}}, "
-            f"{{trial_id}}, {{phase}}, {{run_name}}."
+            f"{{overrides}}, {{trial_dir}}, {{trial_id}}, {{phase}}, {{run_name}}."
         ) from exc
     except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
@@ -1221,7 +1044,7 @@ def _validate_trial_command_template(
                 "the complete per-trial YAML. Add {config_path} to trial_command, or "
                 "select an explicit compatibility override_format."
             )
-        if "overrides" in fields or "overrides_path" in fields:
+        if "overrides" in fields:
             raise ValueError(
                 f"override_format='yaml_file' but phase {phase.name!r} trial_command "
                 "references an overrides-only placeholder. Use {config_path}; it names "
@@ -1242,17 +1065,7 @@ def _validate_trial_command_template(
     if not has_overrides:
         return
 
-    if experiment.override_format == "json_file" and "overrides_path" not in fields:
-        raise ValueError(
-            f"override_format='json_file' but phase {phase.name!r} has "
-            "inherited, fixed, or sampled overrides and trial_command "
-            "does not reference {overrides_path}. The trainer would "
-            "never see the override JSON. Either add {overrides_path} "
-            "to trial_command, or use the default override_format='yaml_file' "
-            "with an embedded trainer_config and {config_path}. The explicit "
-            "argparse and Hydra compatibility formats use {overrides}."
-        )
-    if experiment.override_format in ("argparse", "hydra") and "overrides" not in fields:
+    if experiment.override_format == "argparse" and "overrides" not in fields:
         raise ValueError(
             f"override_format={experiment.override_format!r} but phase "
             f"{phase.name!r} has inherited, fixed, or sampled overrides "

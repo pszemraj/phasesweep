@@ -30,8 +30,6 @@ from phasesweep.evidence.models import (
     ObjectiveExtractor,
     RequiredFileGate,
     Sha256Gate,
-    WandbExtractor,
-    WandbSummaryRequiredGate,
 )
 
 __all__ = [
@@ -58,8 +56,6 @@ __all__ = [
     "Sampler",
     "SearchParam",
     "Sha256Gate",
-    "WandbExtractor",
-    "WandbSummaryRequiredGate",
     "check_bounds",
     "grid_search_space",
     "load_config",

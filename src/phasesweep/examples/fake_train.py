@@ -13,32 +13,6 @@ import yaml
 from phasesweep import report_objective
 
 
-def _parse_kv(tokens: list[str]) -> dict[str, Any]:
-    """Parse optional ``key=value`` compatibility tokens with light type inference.
-
-    :param list[str] tokens: Extra CLI tokens such as ``lr=0.001`` or ``use_amp=true``.
-    :return dict[str, Any]: Parsed override values keyed by override name.
-    """
-    out: dict[str, Any] = {}
-    for tok in tokens:
-        if "=" not in tok:
-            continue
-        k, v = tok.split("=", 1)
-        try:
-            if "." in v or "e" in v or "E" in v:
-                out[k] = float(v)
-            else:
-                out[k] = int(v)
-        except ValueError:
-            if v.lower() == "true":
-                out[k] = True
-            elif v.lower() == "false":
-                out[k] = False
-            else:
-                out[k] = v
-    return out
-
-
 def _load_config(path: Path) -> dict[str, Any]:
     """Load the complete YAML config supplied by PhaseSweep.
 
@@ -86,10 +60,8 @@ def main() -> None:
         default=None,
         help="seconds to sleep before writing result (simulates a long trial; used by tests)",
     )
-    args, rest = p.parse_known_args()
+    args, _unknown = p.parse_known_args()
 
-    # Preserve this packaged toy's explicit argparse/Hydra compatibility so
-    # those PhaseSweep boundary modes remain independently demonstrable.
     config: dict[str, Any] = {}
     if args.config_path is not None:
         config = _load_config(Path(args.config_path))
@@ -101,8 +73,6 @@ def main() -> None:
         "dropout": args.dropout,
     }
     overrides = {k: v for k, v in overrides.items() if v is not None}
-    overrides.update(_parse_kv(rest))
-
     sleep_seconds = float(
         args.sleep if args.sleep is not None else _get(config, "runtime.sleep", 0.0)
     )

@@ -2,7 +2,7 @@
 
 Split into two phases:
   launch_trial  — needs GPU lease, runs subprocess
-  extract_trial — no GPU needed, reads result files / polls W&B
+  extract_trial — no GPU needed, reads result files
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ from phasesweep.evidence.evaluation import (
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor
 from phasesweep.runtime.commands import (
-    dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
     render_command,
 )
@@ -123,7 +122,6 @@ _TRIAL_BOUND_ENV = (
     "PHASESWEEP_ATTEMPT_ID",
     "PHASESWEEP_OVERRIDES_SHA256",
     "PHASESWEEP_OBJECTIVE_PATH",
-    "WANDB_RUN_ID",
 )
 
 # Warn-once keys for :func:`_warn_dropped_cuda_visibility`, so a narrowed
@@ -396,8 +394,8 @@ def prepare_trainer_input(
     """Atomically write and identify the exact input one trainer will consume.
 
     One serialized byte string is used for the atomic write, environment
-    digest, and durable trial record. CLI modes consume the resolved-overrides
-    audit file; file modes consume their generated YAML or JSON file.
+    digest, and durable trial record. Argparse mode consumes the resolved-
+    overrides audit file; YAML mode consumes the generated trainer config.
 
     :param Experiment experiment: Experiment supplying format and base config.
     :param str phase_name: Phase label used for runtime placeholders.
@@ -408,10 +406,7 @@ def prepare_trainer_input(
     :return PreparedTrainerInput: Materialized input bytes and historical identity.
     """
     trial_dir.mkdir(parents=True, exist_ok=True)
-    resolved_text = _json_dump_overrides(
-        overrides,
-        strict=experiment.override_format in {"json_file", "yaml_file"},
-    )
+    resolved_text = _json_dump_overrides(overrides)
     resolved_path = trial_dir / "overrides_resolved.json"
     atomic_write_text(resolved_path, resolved_text)
 
@@ -428,9 +423,6 @@ def prepare_trainer_input(
                 "{run_name}": run_name,
             },
         )
-    elif experiment.override_format == "json_file":
-        filename = "overrides.json"
-        text = dump_json_file_overrides(overrides)
     else:
         filename = "overrides_resolved.json"
         text = resolved_text
@@ -558,12 +550,11 @@ def launch_trial(
     env["PHASESWEEP_GENERATION_ID"] = generation_id
     env["PHASESWEEP_ATTEMPT_ID"] = attempt_id
     env["PHASESWEEP_OVERRIDES_SHA256"] = overrides_sha256
-    env["WANDB_RUN_ID"] = attempt_id
     if isinstance(experiment.metric.extractor, JsonEnvelopeExtractor):
         env["PHASESWEEP_OBJECTIVE_PATH"] = str(workdir / experiment.metric.extractor.path)
     else:
         # This is a reserved, extractor-dependent value. Do not let an ambient
-        # variable direct a log- or W&B-backed trial to an unrelated path.
+        # variable direct a log-backed trial to an unrelated path.
         env.pop("PHASESWEEP_OBJECTIVE_PATH", None)
 
     if gpu_id is not None:
@@ -611,7 +602,6 @@ def launch_trial(
         run_name=run_name,
         return_code=proc_result.return_code,
         duration_seconds=proc_result.duration_seconds,
-        wandb_environment=dict(env),
     )
 
     return ExecutedTrial(
@@ -857,26 +847,14 @@ def extract_trial_result(
     )
 
 
-def _json_dump_overrides(overrides: dict[str, Any], *, strict: bool) -> str:
+def _json_dump_overrides(overrides: dict[str, Any]) -> str:
     """Serialize resolved overrides to indented JSON for ``overrides_resolved.json``.
 
     Args:
         overrides: The composed (inherited + fixed + sampled) overrides dict.
-        strict: When ``True`` (``yaml_file`` or ``json_file`` format), use the
-            canonical strict serializer. This keeps the audit record in the
-            portable value domain accepted by complete trainer YAML and makes
-            it byte-faithful to the JSON compatibility wire. Load-time
-            validation guarantees this succeeds. When ``False`` (a scalar/list
-            CLI format), non-JSON scalars fall back through ``default=str``
-            (Path, etc.) — there is no JSON wire artifact for those formats to
-            diverge from.
 
     Returns:
         Trailing-newline-terminated, sorted, two-space-indented JSON.
 
     """
-    from phasesweep.runtime.commands import dump_overrides_json
-
-    if strict:
-        return dump_overrides_json(overrides) + "\n"
-    return json.dumps(overrides, indent=2, sort_keys=True, default=str) + "\n"
+    return json.dumps(overrides, indent=2, sort_keys=True, allow_nan=False) + "\n"
