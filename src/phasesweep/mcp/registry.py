@@ -313,9 +313,8 @@ def _require_mcp_stable_paths(
     backend = storage_backend(storage)
     if backend not in {"sqlite", "journal"}:
         raise CatalogError(
-            f"{experiment_id!r}: MCP experiments currently support only local-node "
-            "SQLite or JournalStorage file-backed Optuna storage; external RDB "
-            "storage is out of scope until multi-host cleanup semantics are supported",
+            f"{experiment_id!r}: MCP experiments support only local-node SQLite or "
+            "JournalStorage file-backed Optuna storage; external RDB storage is unsupported",
             suggestion=_suggest_storage(config_dir),
         )
     raw_path = sqlite_uri_filename_path(storage) if backend == "sqlite" else None
