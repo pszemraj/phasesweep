@@ -142,6 +142,14 @@ def drop_artifact_root_binding(storage: str, study_name: str) -> None:
 
 
 @pytest.fixture(autouse=True)
+def isolate_phasesweep_homes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep scaffold state and default caches inside test-owned directories."""
+    monkeypatch.delenv("PHASESWEEP_HOME", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state-home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache-home"))
+
+
+@pytest.fixture(autouse=True)
 def isolate_phasesweep_lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host-wide test locks inside each test's temp directory."""
     lock_dir = tmp_path / "phasesweep-locks"

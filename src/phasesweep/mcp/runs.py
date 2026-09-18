@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import IO, Literal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.mcp.time import parse_utc_iso
@@ -26,6 +26,7 @@ from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     ensure_private_dir,
     open_directory_fd,
+    open_lock_file,
     open_private_text,
     private_atomic_write_text,
     read_private_text_at,
@@ -61,12 +62,13 @@ log = logging.getLogger("phasesweep.mcp.runs")
 # 128+signum, so the runner records these as the "cancelled" terminal cause.
 _SIGNALLED_EXIT_CODES = frozenset({143, 130})
 _RUN_EVIDENCE_SUFFIXES = (
+    ".config.yaml",
+    ".status.json",
+    ".log",
     ".cleanup_uncertain.json",
     ".cleanup_recovery.json",
-    ".status.json",
-    ".config.yaml",
-    ".log",
     ".launch.lock",
+    ".transition.lock",
 )
 
 
@@ -145,12 +147,16 @@ def _read_json_object(path: Path) -> dict | None:
     :param Path path: JSON file to read.
     :return dict | None: Parsed object, or ``None`` when unavailable or invalid.
     """
-    if not path.is_file():
-        return None
+    directory_fd = -1
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        directory_fd = open_directory_fd(path.parent, create=False, private_final=True)
+        raw = read_private_text_at(directory_fd, path.name, path)
+        payload = json.loads(raw)
+    except (OSError, UnsafePrivatePathError, UnicodeError, ValueError):
         return None
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
     return payload if isinstance(payload, dict) else None
 
 
@@ -163,6 +169,43 @@ def write_status_file(status_path: Path, payload: dict) -> None:
     private_atomic_write_text(status_path, json.dumps(payload, indent=2) + "\n")
 
 
+def write_status_file_if_absent(status_path: Path, payload: dict) -> bool:
+    """Atomically create a server failure only while no runner status exists.
+
+    :param Path status_path: Destination ``status.json`` path for the run.
+    :param dict payload: JSON-serializable server failure payload.
+    :return bool: Whether this call created the status; ``False`` if one already exists.
+    """
+    temporary = status_path.with_name(f".{status_path.name}.{uuid4().hex}.tmp")
+    parent_fd = -1
+    try:
+        with open_private_text(temporary, "x") as output:
+            output.write(json.dumps(payload, indent=2) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        parent_fd = open_directory_fd(status_path.parent, create=False, private_final=True)
+        try:
+            os.link(
+                temporary.name,
+                status_path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            return False
+        os.fsync(parent_fd)
+        return True
+    finally:
+        if parent_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary.name, dir_fd=parent_fd)
+            os.close(parent_fd)
+        else:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+
+
 def identity_from_earlier_boot(boot_id: str | None) -> bool:
     """Return whether a recorded boot identity proves its process cannot exist.
 
@@ -173,8 +216,9 @@ def identity_from_earlier_boot(boot_id: str | None) -> bool:
     earlier boot survived it, so the process and every descendant it ever had
     are conclusively gone and cleanup needs no signal. An unknown boot id on
     either side (a handle written before boot ids were recorded, or a host
-    without ``/proc/sys/kernel/random/boot_id``) yields ``False``, leaving the
-    caller's conservative same-boot behavior unchanged.
+    without ``/proc/sys/kernel/random/boot_id``) yields ``False``. Callers
+    performing cleanup must separately refuse to signal when either boot id
+    is unknown.
 
     :param str | None boot_id: Boot identity recorded when the process launched.
     :return bool: Whether both boot ids are known and differ.
@@ -311,6 +355,37 @@ class RunStore:
             if handle is not None:
                 unlock_file(handle)
 
+    @contextlib.contextmanager
+    def transition_lock(
+        self,
+        handle: RunHandle | str,
+        *,
+        blocking: bool = True,
+    ) -> Iterator[bool]:
+        """Serialize cancellation markers with confirmed recovery for one run.
+
+        The lock is shared across MCP servers and the operator CLI. Cancellation
+        holds it only while rereading state and writing its marker; recovery
+        holds it until cleanup evidence, terminal results, and marker removal
+        have all been persisted.
+
+        :param RunHandle | str handle: Run or run id whose cleanup transition is protected.
+        :param bool blocking: Wait for the lock, or return without acquiring it.
+        :return Iterator[bool]: Whether the transition lock was acquired.
+        """
+        run_id = handle if isinstance(handle, str) else handle.run_id
+        lock_path = self._logs_dir / f"{run_id}.transition.lock"
+        lock_handle = open_lock_file(lock_path) if blocking else try_lock_file(lock_path)
+        try:
+            if lock_handle is not None and blocking:
+                import fcntl
+
+                fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            yield lock_handle is not None
+        finally:
+            if lock_handle is not None:
+                unlock_file(lock_handle)
+
     def new_run_id(self, experiment_id: str) -> str:
         """Mint a fresh, collision-resistant run id prefixed with the experiment id.
 
@@ -422,7 +497,7 @@ class RunStore:
             raise
 
     def finish_launch_preparation(self, preparation: PreparedRun) -> None:
-        """Best-effort remove a launch lease after the spawn outcome is durable.
+        """Release a preparation and remove its lease after a durable outcome.
 
         :param PreparedRun preparation: Preparation returned by :meth:`prepare_launch`.
         """
@@ -434,6 +509,14 @@ class RunStore:
                 preparation.handle.run_id,
                 exc_info=True,
             )
+        handle = self.get(preparation.handle.run_id)
+        if handle is None:
+            return
+        if handle.launch_state != "spawned" and self.recorded_terminal_status(handle) is None:
+            # A free sidecar is the remaining proof that Popen never crossed
+            # the preparation boundary. Keep it when terminal bookkeeping also
+            # failed so orphan recovery can release the capacity reservation.
+            return
         self.remove_launch_lease(preparation.handle.run_id)
 
     def remove_launch_lease(self, run_id: str) -> None:
@@ -530,7 +613,8 @@ class RunStore:
         """
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
-        return (self._runs_dir / f"{run_id}.json").is_file()
+        path = self._runs_dir / f"{run_id}.json"
+        return path.exists() or path.is_symlink()
 
     def run_evidence_exists(self, run_id: str) -> bool:
         """Return whether any durable per-run file besides the handle survives.
@@ -549,17 +633,11 @@ class RunStore:
         """
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
-        return any(
-            path.is_file()
-            for path in (
-                self.config_snapshot_path(run_id),
-                self.status_path(run_id),
-                self.log_path(run_id),
-                self.cleanup_uncertain_path(run_id),
-                self.cleanup_recovery_path(run_id),
-                self.launch_lease_path(run_id),
-            )
-        )
+        for suffix in _RUN_EVIDENCE_SUFFIXES:
+            path = self._logs_dir / f"{run_id}{suffix}"
+            if path.exists() or path.is_symlink():
+                return True
+        return False
 
     def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
         """Load persisted handles and identify malformed handle records.
@@ -607,8 +685,6 @@ class RunStore:
         readable_ids = {handle.run_id for handle in handles}
 
         for path in self._logs_dir.iterdir():
-            if not path.is_file():
-                continue
             for suffix in _RUN_EVIDENCE_SUFFIXES:
                 if not path.name.endswith(suffix):
                     continue
@@ -634,7 +710,9 @@ class RunStore:
         if not SAFE_NAME_PATTERN.fullmatch(run_id):
             return False
         lease_path = self.launch_lease_path(run_id)
-        if lease_path.is_file() and not lease_path.is_symlink():
+        if lease_path.exists() or lease_path.is_symlink():
+            if not lease_path.is_file() or lease_path.is_symlink():
+                return False
             lease = self._claim_abandoned_launch_lease(run_id)
             if lease is None:
                 return False
@@ -689,37 +767,74 @@ class RunStore:
         invalid = any(path.exists() or path.is_symlink() for path in terminal_evidence)
         if handle_path.exists() or handle_path.is_symlink():
             invalid = invalid or handle is None or handle.launch_state != "launching"
+        elif self.log_path(run_id).exists() or self.log_path(run_id).is_symlink():
+            # A runner opens its log before Popen and releases the inherited
+            # lease after persisting its spawned handle. If that handle is
+            # later lost, the log prevents a stale free lease from proving
+            # this was an abandoned preparation.
+            invalid = True
         if invalid:
             lease.close()
             return None
         return lease
 
-    def clear_pre_spawn_orphan(self, run_id: str) -> None:
-        """Remove one revalidated pre-spawn preparation durably.
+    def clear_pre_spawn_orphan(self, run_id: str) -> Path | None:
+        """Preserve any runner log and remove a revalidated preparation durably.
 
         :param str run_id: Orphan identity previously reported by launch.
         :raises ValueError: The evidence no longer has the provably pre-spawn shape.
+        :return Path | None: Preserved runner log path, including an archive from an
+            interrupted recovery, or None when no log existed.
         """
-        lease: IO[str] | None = None
-        if self.launch_lease_path(run_id).is_file():
-            lease = self._claim_abandoned_launch_lease(run_id)
-            if lease is None:
-                raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
-        elif not self.is_pre_spawn_orphan(run_id):
-            raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
-        paths = (
-            self._runs_dir / f"{run_id}.json",
-            self.config_snapshot_path(run_id),
-            self.log_path(run_id),
-            self.launch_lease_path(run_id),
-        )
-        try:
-            for path in paths:
-                with contextlib.suppress(FileNotFoundError):
-                    _strict_unlink(path)
-        finally:
-            if lease is not None:
-                lease.close()
+        recovered_log: Path | None = None
+        with self.transition_lock(run_id):
+            lease: IO[str] | None = None
+            try:
+                if self.launch_lease_path(run_id).is_file():
+                    lease = self._claim_abandoned_launch_lease(run_id)
+                    if lease is None:
+                        raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
+                elif not self.is_pre_spawn_orphan(run_id):
+                    raise ValueError(f"run {run_id!r} is not a provably abandoned preparation")
+                log_path = self.log_path(run_id)
+                archive_path = log_path.with_suffix(".log.recovered")
+                if log_path.exists() or log_path.is_symlink():
+                    recovered_log = archive_path
+                    # A child can fail before recording its identity. Keep its only
+                    # diagnostic outside the active-run evidence namespace, and
+                    # make the rename durable before removing the launch reservation.
+                    # Run IDs include a fresh UUID and are never reused by the server;
+                    # this rename is not an exclusive archive operation for reused IDs.
+                    directory_fd = open_directory_fd(
+                        self._logs_dir,
+                        create=False,
+                        private_final=True,
+                    )
+                    try:
+                        os.rename(
+                            log_path.name,
+                            recovered_log.name,
+                            src_dir_fd=directory_fd,
+                            dst_dir_fd=directory_fd,
+                        )
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                elif archive_path.exists() or archive_path.is_symlink():
+                    recovered_log = archive_path
+                paths = (
+                    self._runs_dir / f"{run_id}.json",
+                    self._logs_dir / f"{run_id}.transition.lock",
+                    self.config_snapshot_path(run_id),
+                    self.launch_lease_path(run_id),
+                )
+                for path in paths:
+                    with contextlib.suppress(FileNotFoundError):
+                        _strict_unlink(path)
+            finally:
+                if lease is not None:
+                    lease.close()
+        return recovered_log
 
     def _load_handle(self, path: Path, *, expected_run_id: str) -> RunHandle | None:
         """Load and normalize one run handle, returning ``None`` when malformed.
@@ -739,7 +854,15 @@ class RunStore:
             return None
         if handle.run_id != expected_run_id:
             return None
-        if not SAFE_NAME_PATTERN.fullmatch(handle.experiment_id):
+        if not isinstance(handle.experiment_id, str) or not SAFE_NAME_PATTERN.fullmatch(
+            handle.experiment_id
+        ):
+            return None
+        if (
+            type(handle.config_sha256) is not str
+            or len(handle.config_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in handle.config_sha256)
+        ):
             return None
         if type(handle.allow_cancel) is not bool:
             return None
@@ -779,7 +902,7 @@ class RunStore:
                 return None
         return handle
 
-    def state(self, handle: RunHandle) -> RunState:
+    def state(self, handle: RunHandle, *, transition_locked: bool = False) -> RunState:
         """Derive the current state from status.json and a live PID check.
 
         A finalized status.json (written by the runner on every exit) is
@@ -804,6 +927,7 @@ class RunStore:
 
         Args:
             handle: The run handle to evaluate.
+            transition_locked: The caller already holds this run's transition lock.
 
         Returns:
             One of ``running`` / ``succeeded`` / ``failed`` / ``cancelled``.
@@ -819,22 +943,15 @@ class RunStore:
         # marker is part of the strongest identity this run has.
         earlier_boot = self.from_earlier_boot(handle)
         if self.cleanup_uncertain(handle):
-            if (status is not None and status.get("cleanup_confirmed") is True) or earlier_boot:
+            if (status is not None and status.get("cleanup_confirmed") is True) or (
+                earlier_boot and (status is None or status.get("cleanup_confirmed") is not False)
+            ):
                 with contextlib.suppress(OSError):
                     self.clear_cleanup_uncertain(handle)
-            else:
+            elif not earlier_boot:
                 return "running"
         if status is not None:
-            if self._terminal_cleanup_uncertain(handle, status):
-                return "running"
-            if status.get("result_snapshot_state") == "pending":
-                return "running"
-            rc = status.get("returncode")
-            if rc == 0:
-                return "succeeded"
-            if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
-                return "cancelled"
-            return "failed"
+            return self._state_from_status(handle, status)
         if handle.launch_state == "launching" or handle.pid is None:
             # The launching record is durable before Popen. After a server
             # crash it cannot distinguish "not spawned" from "spawned but the
@@ -850,8 +967,7 @@ class RunStore:
         if handle.pid_starttime is None:
             if self._cleanup_recovered(handle):
                 return "failed"
-            self.mark_cleanup_uncertain(handle)
-            return "running"
+            return self._settle_dead_runner(handle, transition_locked=transition_locked)
         # No status.json: the run is live only if its process is genuinely alive.
         # A zombie (exited without recording a cause - SIGKILL/OOM, or an early
         # SIGTERM before the engine installed its handlers) still answers
@@ -859,10 +975,64 @@ class RunStore:
         # cleanup-uncertain recovery below.
         if is_same_live_process(handle.pid, handle.pid_starttime):
             return "running"
+        # A runner can publish its terminal status while the liveness probe
+        # observes its exit. Do not reserve recovery from the stale first read.
+        status = self._read_status(handle)
+        if status is not None:
+            return self._state_from_status(handle, status)
         if self._cleanup_recovered(handle):
             return "failed"
-        self.mark_cleanup_uncertain(handle)
-        return "running"
+        return self._settle_dead_runner(handle, transition_locked=transition_locked)
+
+    def _settle_dead_runner(self, handle: RunHandle, *, transition_locked: bool) -> RunState:
+        """Reserve uncertain cleanup only after rechecking under the recovery transition lock.
+
+        :param RunHandle handle: Dead runner whose status and cleanup evidence may change.
+        :param bool transition_locked: Whether the caller already holds the transition lock.
+        :return RunState: Latest terminal state or a reserved running state.
+        """
+        lock = (
+            contextlib.nullcontext(True)
+            if transition_locked
+            else self.transition_lock(handle, blocking=False)
+        )
+        with lock as acquired:
+            if not acquired:
+                # Recovery already owns the transition; it will publish the
+                # terminal state or cleanup marker before releasing the lock.
+                return "running"
+            status = self._read_status(handle)
+            if self.cleanup_uncertain(handle):
+                if (
+                    status is not None and status.get("cleanup_confirmed") is True
+                ) or self.from_earlier_boot(handle):
+                    self.clear_cleanup_uncertain(handle)
+                else:
+                    return "running"
+            if status is not None:
+                return self._state_from_status(handle, status)
+            if self._cleanup_recovered(handle):
+                return "failed"
+            self.mark_cleanup_uncertain(handle)
+            return "running"
+
+    def _state_from_status(self, handle: RunHandle, status: Mapping[str, object]) -> RunState:
+        """Classify a recorded status after the run's cleanup marker is considered.
+
+        :param RunHandle handle: Run whose terminal status was recorded.
+        :param Mapping[str, object] status: Validated status payload.
+        :return RunState: Derived running or terminal state.
+        """
+        if self._terminal_cleanup_uncertain(handle, status):
+            return "running"
+        if status.get("result_snapshot_state") == "pending":
+            return "running"
+        rc = status.get("returncode")
+        if rc == 0:
+            return "succeeded"
+        if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
+            return "cancelled"
+        return "failed"
 
     def recorded_terminal_status(self, handle: RunHandle) -> dict | None:
         """Return the runner-written terminal status payload, if readable.
@@ -910,7 +1080,8 @@ class RunStore:
 
         :param RunHandle handle: Run handle whose process group is now confirmed gone.
         """
-        self.cleanup_uncertain_path(handle.run_id).unlink(missing_ok=True)
+        with contextlib.suppress(FileNotFoundError):
+            _strict_unlink(self.cleanup_uncertain_path(handle.run_id))
 
     def cleanup_uncertain(self, handle: RunHandle) -> bool:
         """Return whether a valid cleanup uncertainty marker exists for ``handle``.
@@ -931,8 +1102,10 @@ class RunStore:
         :return ProcessIdentity: Marker identity when stronger, otherwise handle identity.
         """
         marker_identity = self._read_cleanup_identity(handle)
-        if marker_identity is not None and (
-            marker_identity.pid is not None or marker_identity.pgid is not None
+        if (
+            handle.launch_state == "launching"
+            and marker_identity is not None
+            and (marker_identity.pid is not None or marker_identity.pgid is not None)
         ):
             return marker_identity
         return ProcessIdentity(
@@ -1007,24 +1180,34 @@ class RunStore:
         """
         status = self._read_status(handle)
         launch_outcome_unknown = handle.launch_state == "launching" and status is None
+        dead_spawned_without_status = (
+            handle.launch_state == "spawned"
+            and status is None
+            and not self.from_earlier_boot(handle)
+            and not self._runner_is_live(handle)
+            and self._read_status(handle) is None
+        )
         return (
             launch_outcome_unknown
+            or dead_spawned_without_status
             or self.cleanup_recovery_required(handle)
             or self.snapshot_recovery_required(handle)
         )
 
     def cleanup_recovery_required(self, handle: RunHandle) -> bool:
-        """Return whether process cleanup still requires operator recovery.
+        """Return whether cleanup evidence still requires operator recovery.
 
         :param RunHandle handle: Persisted run whose cleanup evidence is checked.
-        :return bool: True when a server marker or terminal runner status still
-            records cleanup uncertainty without matching recovery evidence, and
-            the recorded identity does not already predate the current boot.
+        :return bool: True when a server marker still reserves same-boot process
+            cleanup or terminal runner status still needs trial reconciliation.
+            A prior boot proves processes dead but does not update their durable
+            trial rows or an already-frozen result snapshot.
         """
-        if self.cleanup_uncertain(handle) and not self.from_earlier_boot(handle):
-            return True
         status = self._read_status(handle)
-        return status is not None and self._terminal_cleanup_uncertain(handle, status)
+        terminal_cleanup_uncertain = status is not None and status.get("cleanup_confirmed") is False
+        if self.cleanup_uncertain(handle):
+            return not self.from_earlier_boot(handle) or terminal_cleanup_uncertain
+        return terminal_cleanup_uncertain and not self._cleanup_recovered(handle)
 
     def cleanup_recovered_attempt_evidence(
         self,
@@ -1143,7 +1326,7 @@ class RunStore:
         if type(payload.get("returncode")) is not int:
             return None
         cleanup_confirmed = payload.get("cleanup_confirmed")
-        if cleanup_confirmed is not None and type(cleanup_confirmed) is not bool:
+        if type(cleanup_confirmed) is not bool:
             return None
         error_class = payload.get("error_class")
         if error_class is not None and not isinstance(error_class, str):
@@ -1245,6 +1428,12 @@ class RunStore:
             and payload.get("cleanup_confirmed") is True
         ):
             return None
+        reaped_attempt_ids = payload.get("reaped_attempt_ids")
+        if reaped_attempt_ids is not None and (
+            not isinstance(reaped_attempt_ids, list)
+            or any(not isinstance(value, str) or not value for value in reaped_attempt_ids)
+        ):
+            return None
         locations = payload.get("reaped_attempt_locations")
         if locations is not None and (
             not isinstance(locations, dict)
@@ -1296,13 +1485,45 @@ class RunStore:
             return None
         if not _valid_optional_boot_id(boot_id):
             return None
+        if pid is None:
+            if pgid is not None or pid_starttime is not None:
+                return None
+        elif pgid is None:
+            return None
 
-        return ProcessIdentity(
+        identity = ProcessIdentity(
             pid=pid,
             pgid=pgid,
             pid_starttime=pid_starttime,
             boot_id=boot_id,
         )
+        if handle.launch_state == "spawned":
+            durable_identity = ProcessIdentity(
+                pid=handle.pid,
+                pgid=handle.pgid,
+                pid_starttime=handle.pid_starttime,
+                boot_id=handle.boot_id,
+            )
+            if any(
+                marker_value is not None and marker_value != durable_value
+                for marker_value, durable_value in zip(
+                    (
+                        identity.pid,
+                        identity.pgid,
+                        identity.pid_starttime,
+                        identity.boot_id,
+                    ),
+                    (
+                        durable_identity.pid,
+                        durable_identity.pgid,
+                        durable_identity.pid_starttime,
+                        durable_identity.boot_id,
+                    ),
+                    strict=True,
+                )
+            ):
+                return None
+        return identity
 
 
 def _valid_positive_optional_int(value: object) -> bool:
@@ -1315,9 +1536,16 @@ def _valid_positive_optional_int(value: object) -> bool:
 
 
 def _valid_optional_boot_id(value: object) -> bool:
-    """Return whether ``value`` is ``None`` or a non-empty ``str`` boot id.
+    """Return whether ``value`` is ``None`` or a canonical Linux boot UUID.
 
     :param object value: Value to validate.
-    :return bool: Whether the value is ``None`` or a non-empty string.
+    :return bool: Whether the value is ``None`` or canonical lowercase UUID text.
     """
-    return value is None or (type(value) is str and bool(value))
+    if value is None:
+        return True
+    if type(value) is not str:
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False

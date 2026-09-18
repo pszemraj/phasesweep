@@ -3,20 +3,34 @@
 from __future__ import annotations
 
 import os
+import pwd
 import signal
 import stat
+import subprocess
+import sys
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import quote_plus
 
 import pytest
 
-from phasesweep.config import Experiment, FloatParam, IntParam, Phase, Sampler
+from phasesweep.config import (
+    Experiment,
+    FloatParam,
+    IntParam,
+    Phase,
+    Sampler,
+    StudySpec,
+    Suite,
+    SuiteDefaults,
+)
 from phasesweep.engine import run_experiment
 from phasesweep.engine.errors import ExperimentLockBusyError
-from phasesweep.engine.guards import (
+from phasesweep.engine.locking import (
     _experiment_lock,
     _run_lock_paths,
+    _suite_lock,
 )
 from phasesweep.errors import LockBusyError, PhaseSweepError
 from phasesweep.runtime import files as runtime_files
@@ -39,23 +53,93 @@ def test_missing_nofollow_is_a_platform_capability_error(
         runtime_files.nofollow_flag()
 
 
-def test_lock_dir_default_is_independent_of_xdg_runtime_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "variable",
+    ["HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "PHASESWEEP_HOME"],
+)
+def test_default_locks_contend_across_state_and_cache_environments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, variable: str
 ) -> None:
     home = tmp_path / "home"
     home.mkdir()
-    runtime_dir = tmp_path / "runtime"
-    runtime_dir.mkdir(mode=0o700)
-    runtime_dir.chmod(0o700)
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(home)))
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir(mode=0o700)
+    second.mkdir(mode=0o700)
+    monkeypatch.setenv(variable, str(first))
 
     path = runtime_files.lock_dir()
 
     assert path == home / ".cache" / "phasesweep" / "locks"
     assert path.is_dir()
     assert stat.S_IMODE(path.stat().st_mode) == 0o700
+    experiment = make_experiment(workdir=str(tmp_path / "runs"))
+    paths = _run_lock_paths(experiment)
+    with _experiment_lock(experiment):
+        monkeypatch.setenv(variable, str(second))
+        assert runtime_files.lock_dir() == path
+        assert _run_lock_paths(experiment) == paths
+        with pytest.raises(ExperimentLockBusyError), _experiment_lock(experiment):
+            pytest.fail("a different launch environment bypassed the held lock")
+    assert not (first / "locks").exists()
+    assert not (second / "locks").exists()
+
+
+@pytest.mark.parametrize("account_home", [None, "", "relative"])
+def test_default_lock_dir_requires_an_absolute_account_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, account_home: str | None
+) -> None:
+    def account_for(uid: int) -> SimpleNamespace:
+        if account_home is None:
+            raise KeyError(uid)
+        return SimpleNamespace(pw_dir=account_home)
+
+    monkeypatch.setattr(pwd, "getpwuid", account_for)
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR")
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(runtime_files.UnsafeLockPathError, match="PHASESWEEP_LOCK_DIR"):
+        runtime_files.lock_dir()
+    assert not (tmp_path / ".cache").exists()
+    assert not (tmp_path / "relative").exists()
+
+    override = tmp_path / "provisioned-locks"
+    override.mkdir(mode=0o700)
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+    assert runtime_files.lock_dir() == override
+
+
+@pytest.mark.parametrize("invalid", ["relative", "missing", "mode", "symlink"])
+def test_home_override_requires_private_provisioned_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
+) -> None:
+    root = tmp_path / "root"
+    if invalid in {"mode", "symlink"}:
+        root.mkdir(mode=0o700)
+    if invalid == "mode":
+        root.chmod(0o755)
+    elif invalid == "symlink":
+        link = tmp_path / "link"
+        link.symlink_to(root, target_is_directory=True)
+        root = link
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative" if invalid == "relative" else str(root))
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.phasesweep_home()
+    assert not (root / "locks").exists()
+    if invalid == "mode":
+        assert stat.S_IMODE(root.stat().st_mode) == 0o755
+
+
+def test_private_home_override_selects_state_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "private-root"
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
+    assert runtime_files.phasesweep_home() == root
+    monkeypatch.setenv("PHASESWEEP_HOME", "")
+    assert runtime_files.phasesweep_home() is None
 
 
 def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -63,6 +147,7 @@ def test_lock_dir_honors_explicit_override(tmp_path: Path, monkeypatch: pytest.M
     override.mkdir(mode=0o700)
     override.chmod(0o700)
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", str(override))
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative-but-unused")
 
     path = runtime_files.lock_dir()
 
@@ -179,7 +264,8 @@ def test_default_lock_dir_rejects_symlink_without_chmodding_target(
     target.chmod(0o755)
     (namespace / "locks").symlink_to(target, target_is_directory=True)
     monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(home)))
 
     with pytest.raises(runtime_files.UnsafeLockPathError, match="unsafe"):
         runtime_files.lock_dir()
@@ -813,7 +899,8 @@ def test_in_memory_run_lock_is_keyed_by_workdir(
         assert set(paths_a).isdisjoint(paths_b)
 
 
-def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
+@pytest.mark.parametrize("owner", ["experiment", "suite"])
+def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path, owner: str) -> None:
     """A symlinked experiment leaf must share the target's output lock.
 
     ``_experiment_dir`` resolves only the workdir prefix before appending the
@@ -831,6 +918,58 @@ def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
     exp_alias = make_experiment(workdir=str(runs)).model_copy(update={"experiment": "alias"})
 
     assert set(_run_lock_paths(exp_real)) == set(_run_lock_paths(exp_alias))
+
+    if owner == "suite":
+        real = Suite(
+            suite="real",
+            defaults=SuiteDefaults(workdir=str(runs)),
+            studies=[StudySpec(name="s", phases=[Phase(name="p", n_trials=1)])],
+        )
+        alias = real.model_copy(update={"suite": "alias"})
+        distinct = real.model_copy(update={"suite": "distinct"})
+        lock = _suite_lock
+    else:
+        real, alias = exp_real, exp_alias
+        distinct = real.model_copy(update={"experiment": "distinct"})
+        lock = _experiment_lock
+    (runs / "distinct").mkdir()
+
+    def contender(config):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                """
+import sys
+from phasesweep.config import Experiment, Suite
+from phasesweep.engine.locking import _experiment_lock, _suite_lock
+from phasesweep.engine.errors import ExperimentLockBusyError
+from phasesweep.errors import LockBusyError
+model, lock = (Suite, _suite_lock) if sys.argv[1] == "suite" else (Experiment, _experiment_lock)
+try:
+    with lock(model.model_validate_json(sys.argv[2])):
+        print("acquired")
+except (ExperimentLockBusyError, LockBusyError):
+    print("busy")
+    sys.exit(2)
+""",
+                owner,
+                config.model_dump_json(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+
+    with lock(real):
+        lock_inodes = {path: path.stat().st_ino for path in runtime_files.lock_dir().glob("*.lock")}
+        blocked = contender(alias)
+        assert (blocked.returncode, blocked.stdout.strip()) == (2, "busy"), blocked.stderr
+        control = contender(distinct)
+        assert (control.returncode, control.stdout.strip()) == (0, "acquired"), control.stderr
+    released = contender(alias)
+    assert (released.returncode, released.stdout.strip()) == (0, "acquired"), released.stderr
+    assert all(path.stat().st_ino == inode for path, inode in lock_inodes.items())
 
 
 def test_in_memory_url_spellings_take_no_storage_lock(tmp_path: Path) -> None:

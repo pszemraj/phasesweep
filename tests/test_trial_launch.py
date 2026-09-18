@@ -43,6 +43,7 @@ def _capture_launch_env(
         timeout: float | None,
         trial_dir: Path,
         attempt_id: str,
+        wallclock_deadline: float | None = None,
         cwd: str | None = None,
         gpu_lease_fds: tuple[int, ...] = (),
     ) -> ProcessResult:
@@ -78,6 +79,7 @@ def _capture_launch_env(
         gpu_lease_fds=gpu_lease_fds,
     )
     captured["trainer_input"] = executed.trainer_input
+    captured["wandb_environment"] = dict(executed.ctx.wandb_environment or {})
     return captured
 
 
@@ -545,6 +547,22 @@ def test_passthrough_value_rotation_preserves_semantic_environment_digest(
     assert first.digest == second.digest
     assert first.values["WANDB_API_KEY"] == "first-secret"
     assert second.values["WANDB_API_KEY"] == "rotated-secret"
+
+
+def test_launch_trial_carries_composed_environment_to_wandb_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The post-trainer poll worker receives configured and pass-through settings."""
+    monkeypatch.setenv("WANDB_API_KEY", "ambient-token")
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        experiment_env={"WANDB_MODE": "online"},
+        execution=ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"]),
+    )
+
+    assert captured["wandb_environment"]["WANDB_API_KEY"] == "ambient-token"
+    assert captured["wandb_environment"]["WANDB_MODE"] == "online"
 
 
 def test_configured_env_value_cannot_be_exempted_as_passthrough() -> None:

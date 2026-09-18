@@ -5,12 +5,15 @@ from __future__ import annotations
 import copy
 import string
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
 from phasesweep.config.common import (
+    ConfigFloat,
+    ConfigInt,
     _find_prefix_collisions,
     _Frozen,
     _require_finite,
@@ -35,6 +38,7 @@ from phasesweep.evidence.models import (
 )
 from phasesweep.runtime.files import (
     canonical_storage_identity,
+    local_storage_url,
     storage_backend,
     storage_is_in_memory,
 )
@@ -48,6 +52,19 @@ class Metric(_Frozen):
     name: str = "objective"
     goal: Literal["minimize", "maximize"] = "minimize"
     extractor: ObjectiveExtractor = Field(discriminator="type")
+
+    @field_validator("name")
+    @classmethod
+    def _reject_reserved_name(cls, value: str) -> str:
+        """Reject the winner direction metadata key as a metric name.
+
+        :param str value: Configured metric name.
+        :raises ValueError: The name is reserved by the winner artifact schema.
+        :return str: The validated metric name.
+        """
+        if value == "goal":
+            raise ValueError("Metric name 'goal' is reserved for winner direction metadata.")
+        return value
 
 
 def _metric_semantics_payload(metric: Metric) -> dict[str, Any]:
@@ -68,8 +85,8 @@ class Constraint(_Frozen):
 
     name: str
     extractor: Extractor = Field(discriminator="type")
-    max: float | None = None
-    min: float | None = None
+    max: ConfigFloat | None = None
+    min: ConfigFloat | None = None
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> Constraint:
@@ -109,7 +126,7 @@ class Promotion(_Frozen):
     """Conditional phase promotion against a previously-computed baseline winner."""
 
     min_delta_vs: str
-    min_delta: float = 0.0
+    min_delta: ConfigFloat = 0.0
     requires_gates: bool = True
     on_fail: Literal["stop", "skip", "continue_baseline"] = "stop"
 
@@ -157,8 +174,8 @@ class Phase(_Frozen):
         default_factory=dict,
         description="Map of override-key -> sampling spec. Supports dotted keys.",
     )
-    n_trials: int = Field(ge=1)
-    n_jobs: int = Field(
+    n_trials: ConfigInt = Field(ge=1)
+    n_jobs: ConfigInt = Field(
         default=1,
         ge=1,
         description=(
@@ -176,7 +193,7 @@ class Phase(_Frozen):
             "locks."
         ),
     )
-    gpu_ids: list[int] | None = Field(
+    gpu_ids: list[ConfigInt] | None = Field(
         default=None,
         description=(
             "Explicit list of CUDA device indices to partition across parallel trials. "
@@ -310,7 +327,7 @@ class Phase(_Frozen):
                 )
         return self
 
-    max_consecutive_failures: int = Field(
+    max_consecutive_failures: ConfigInt = Field(
         default=5,
         ge=1,
         description=(
@@ -328,7 +345,7 @@ class Phase(_Frozen):
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
-    timeout_seconds_per_trial: float | None = Field(default=86400.0, ge=0)
+    timeout_seconds_per_trial: ConfigFloat | None = Field(default=86400.0, ge=0)
     allow_unbounded_trials: bool = Field(
         default=False,
         description=(
@@ -336,7 +353,7 @@ class Phase(_Frozen):
             "Otherwise timeout_seconds_per_trial must be finite."
         ),
     )
-    timeout_seconds_per_phase: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_phase: ConfigFloat | None = Field(default=None, ge=0)
     allow_incomplete_on_timeout: bool = Field(
         default=False,
         description=(
@@ -365,17 +382,24 @@ class Phase(_Frozen):
     @field_validator("name")
     @classmethod
     def _name_is_safe(cls, v: str) -> str:
-        """Reject empty names and any character outside ``[A-Za-z0-9_-]``.
+        """Reject unsafe names and reserved experiment-root directory names.
 
         Args:
             v: The candidate phase name.
 
         Returns:
             The same name, unchanged. Raises ``ValueError`` if any character
-            is disallowed (the name is used as a filesystem path component).
+            is disallowed or the name collides with engine-managed records.
 
         """
-        return _validate_safe_name("Phase", v)
+        v = _validate_safe_name("Phase", v)
+        if v.casefold() == "attempts":
+            raise ValueError("Phase name 'attempts' is reserved for the runtime recovery registry.")
+        if v.casefold() == "generations":
+            raise ValueError(
+                "Phase name 'generations' is reserved for immutable generation records."
+            )
+        return v
 
     @model_validator(mode="after")
     def _validate_override_key_syntax(self) -> Phase:
@@ -524,6 +548,115 @@ class ExecutionContext(_Frozen):
         return self
 
 
+@dataclass(frozen=True)
+class _ConcreteOverrideOutcome:
+    """One compatible concrete set of winner override keys.
+
+    :param frozenset[str] keys: Keys exposed by this outcome.
+    :param tuple[tuple[str, str], ...] origins: Producing layer for each key,
+        sorted by key. Shared origins are safe when two parents reach the same
+        inherited winner through a diamond.
+    :param tuple[tuple[str, str], ...] decisions: Promotion branch selections
+        inherited by this outcome, sorted by phase name.
+    """
+
+    keys: frozenset[str]
+    origins: tuple[tuple[str, str], ...] = ()
+    decisions: tuple[tuple[str, str], ...] = ()
+
+
+def _merge_override_outcomes(
+    outcomes: tuple[_ConcreteOverrideOutcome, ...],
+) -> _ConcreteOverrideOutcome | None:
+    """Merge compatible concrete outcomes, or return ``None`` for conflicting branches.
+
+    :param tuple[_ConcreteOverrideOutcome, ...] outcomes: Outcomes to compose.
+    :return _ConcreteOverrideOutcome | None: Their composed keys, origins, and
+        decisions, or ``None`` if one promotion is required to take two branches.
+    """
+    decisions: dict[str, str] = {}
+    keys: set[str] = set()
+    origins: dict[str, str] = {}
+    for outcome in outcomes:
+        for phase_name, branch in outcome.decisions:
+            prior_branch = decisions.get(phase_name)
+            if prior_branch is not None and prior_branch != branch:
+                return None
+            decisions[phase_name] = branch
+        keys.update(outcome.keys)
+        for key, origin in outcome.origins:
+            origins.setdefault(key, origin)
+    return _ConcreteOverrideOutcome(
+        keys=frozenset(keys),
+        origins=tuple(sorted(origins.items())),
+        decisions=tuple(sorted(decisions.items())),
+    )
+
+
+def _consume_outcome_expansions(phase_name: str, count: int, remaining_expansions: int) -> int:
+    """Charge parent combinations or baseline fallbacks before their allocation.
+
+    :param str phase_name: Phase named in complexity errors.
+    :param int count: Candidate outcomes about to be expanded.
+    :param int remaining_expansions: Unspent experiment-wide candidate budget.
+    :raises ValueError: The expansion would exceed the validation budget.
+    :return int: Remaining candidate budget.
+    """
+    if count > remaining_expansions:
+        raise ValueError(
+            f"Phase {phase_name!r} exceeds supported validation complexity: "
+            "at most 4,096 candidate outcome expansions per experiment. "
+            "Reduce conditional promotion branching or parent combinations."
+        )
+    return remaining_expansions - count
+
+
+def _compatible_parent_outcome_combinations(
+    parents: list[str],
+    outcomes_by_phase: Mapping[str, tuple[_ConcreteOverrideOutcome, ...]],
+    *,
+    phase_name: str,
+    remaining_expansions: int,
+) -> tuple[list[tuple[_ConcreteOverrideOutcome, ...]], int]:
+    """Return direct-parent outcome combinations with consistent promotion branches.
+
+    :param list[str] parents: Ordered direct parents of the phase being checked.
+    :param Mapping[str, tuple[_ConcreteOverrideOutcome, ...]] outcomes_by_phase:
+        Concrete exposed outcomes for each prior phase.
+    :param str phase_name: Phase named in complexity errors.
+    :param int remaining_expansions: Unspent experiment-wide candidate budget.
+    :raises ValueError: The next expansion would exceed the validation budget.
+    :return tuple: Compatible selections and the remaining candidate budget.
+    """
+    combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = [()]
+    for parent in parents:
+        # Charge every candidate before allocating the next layer, including
+        # combinations that will be rejected for incompatible decisions.
+        candidates = len(combinations) * len(outcomes_by_phase[parent])
+        remaining_expansions = _consume_outcome_expansions(
+            phase_name, candidates, remaining_expansions
+        )
+        next_combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = []
+        for combination in combinations:
+            for outcome in outcomes_by_phase[parent]:
+                candidate = (*combination, outcome)
+                if _merge_override_outcomes(candidate) is not None:
+                    next_combinations.append(candidate)
+        combinations = next_combinations
+    return combinations, remaining_expansions
+
+
+def _deduplicate_override_outcomes(
+    outcomes: list[_ConcreteOverrideOutcome],
+) -> tuple[_ConcreteOverrideOutcome, ...]:
+    """Return outcomes once each while preserving their first-seen order.
+
+    :param list[_ConcreteOverrideOutcome] outcomes: Outcomes to deduplicate.
+    :return tuple[_ConcreteOverrideOutcome, ...]: Ordered unique outcomes.
+    """
+    return tuple(dict.fromkeys(outcomes))
+
+
 class Experiment(_Frozen):
     """Top-level experiment: trial command, metric, constraints, and ordered phases."""
 
@@ -531,13 +664,15 @@ class Experiment(_Frozen):
     storage: str | None = Field(
         default=None,
         description=(
-            "Optuna storage URL. Use sqlite:///path.db for resumable single-job studies, "
+            "Optuna storage URL, or auto for study.db inside the experiment artifact "
+            "namespace (study.journal when any phase has n_jobs > 1). "
+            "Use sqlite:///path.db for resumable single-job studies, "
             "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts "
             "(RDB backends additionally require allow_external_rdb_single_host: true; "
             "see below). Nested odbc_connect strings must name each target selector once. "
             "Null for non-resumable in-memory runs (not recommended). "
-            "phasesweep does NOT silently rewrite SQLite to JournalStorage; choose the "
-            "scheme intentionally so study identity stays stable across n_jobs changes."
+            "Explicit SQLite URLs are never rewritten to JournalStorage. Changing auto's "
+            "backend changes storage identity and cannot resume an existing tree."
         ),
     )
     # Renamed from `allow_unsafe_multihost` (review v0.5.15 / item E): the old name
@@ -590,7 +725,22 @@ class Experiment(_Frozen):
             "environment-inheritance contract (review v0.5.17 / blocker 4)."
         ),
     )
-    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
+
+    @property
+    def resolved_storage(self) -> str | None:
+        """Resolve auto storage within this experiment's artifact namespace.
+
+        :return str | None: Absolute auto URL, or the explicit storage unchanged.
+        """
+        if self.storage != "auto":
+            return self.storage
+        root = Path(self.workdir).expanduser().resolve() / self.experiment
+        parallel = any(phase.n_jobs > 1 for phase in self.phases)
+        return local_storage_url(
+            root / ("study.journal" if parallel else "study.db"),
+            "journal" if parallel else "sqlite",
+        )
 
     @field_validator("storage")
     @classmethod
@@ -601,7 +751,8 @@ class Experiment(_Frozen):
         :raises ValueError: An ``odbc_connect`` target selector appears more than once.
         :return str | None: The validated locator, unchanged.
         """
-        canonical_storage_identity(value)
+        if value != "auto":
+            canonical_storage_identity(value)
         return value
 
     @model_validator(mode="after")
@@ -617,7 +768,7 @@ class Experiment(_Frozen):
         ]
         if invalid:
             raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
-        if not storage_is_in_memory(self.storage) and not self.provenance:
+        if not storage_is_in_memory(self.resolved_storage) and not self.provenance:
             raise ValueError(
                 "Persistent storage requires a nonempty provenance mapping that identifies "
                 "the trainer, data, and dependency revision used by this experiment."
@@ -675,7 +826,7 @@ class Experiment(_Frozen):
           * transitive inherited locked-key collisions (review v0.5.2 / item 4)
           * unresolved multi-parent locked-key collisions (review v0.5.2 / item 5)
           * sampler / search-space compatibility (review v0.5.2 / blocker 2)
-          * grid divisibility for float params (review v0.5.2 / blocker 4)
+          * bounded parent-outcome enumeration across the complete experiment
           * SQLite + parallel n_jobs (review v0.5.2 / blocker 6)
           * sampler seed / non-resumable acknowledgement on persistent storage
             (review v0.5.18 / finding F7)
@@ -693,15 +844,25 @@ class Experiment(_Frozen):
                 distinct; or any of the delegated per-phase checks (sampler/search
                 space, storage policy, sampler seed and non-resumable
                 acknowledgement, JSON-file override encodability, trial command
-                template) rejects the phase.
+                template) rejects the phase, or parent-outcome expansion exceeds
+                the experiment-wide validation complexity ceiling.
 
         """
         seen: dict[str, Phase] = {}
-        locked_keys_by_phase: dict[str, set[str]] = {}
+        seen_casefolded: dict[str, str] = {}
+        possible_exported_keys_by_phase: dict[str, set[str]] = {}
+        concrete_outcomes_by_phase: dict[str, tuple[_ConcreteOverrideOutcome, ...]] = {}
+        remaining_expansions = 4096
 
         for phase in self.phases:
             if phase.name in seen:
                 raise ValueError(f"Duplicate phase name {phase.name!r}.")
+            casefolded_name = phase.name.casefold()
+            if casefolded_name in seen_casefolded:
+                raise ValueError(
+                    f"Phase names {seen_casefolded[casefolded_name]!r} and "
+                    f"{phase.name!r} must be unique case-insensitively."
+                )
             for contract_name in phase.contracts:
                 if contract_name not in self.contracts:
                     raise ValueError(
@@ -754,30 +915,48 @@ class Experiment(_Frozen):
                     "inside the applying phase."
                 )
 
-            # Transitive inherited locked keys + multi-parent collision detection.
-            inherited_keys: set[str] = set()
-            parent_owners: dict[str, list[str]] = {}
+            # Sampling is deliberately conservative: descendants may never
+            # re-sample any key that a parent could expose. Namespace checks
+            # below instead evaluate concrete, mutually exclusive promotion
+            # outcomes so keys from impossible branch combinations are not
+            # treated as coexisting.
+            possible_inherited_keys: set[str] = set()
             for parent in phase.inherits:
-                for key in locked_keys_by_phase[parent]:
-                    inherited_keys.add(key)
-                    parent_owners.setdefault(key, []).append(parent)
+                possible_inherited_keys.update(possible_exported_keys_by_phase[parent])
 
-            unresolved = {
-                k: owners
-                for k, owners in parent_owners.items()
-                if len(owners) > 1 and k not in phase.fixed_overrides
-            }
-            if unresolved:
-                details = ", ".join(
-                    f"{k!r} from {sorted(set(o))}" for k, o in sorted(unresolved.items())
-                )
-                raise ValueError(
-                    f"Phase {phase.name!r} inherits conflicting locked key(s) from multiple "
-                    f"parents: {details}. Resolve explicitly with phase.fixed_overrides "
-                    f"or remove one inherit."
-                )
+            parent_combinations, remaining_expansions = _compatible_parent_outcome_combinations(
+                phase.inherits,
+                concrete_outcomes_by_phase,
+                phase_name=phase.name,
+                remaining_expansions=remaining_expansions,
+            )
+            inherited_outcomes: list[_ConcreteOverrideOutcome] = []
+            for combination in parent_combinations:
+                parent_origins: dict[str, set[str]] = {}
+                for _parent, outcome in zip(phase.inherits, combination, strict=True):
+                    for key, origin in outcome.origins:
+                        parent_origins.setdefault(key, set()).add(origin)
+                unresolved = {
+                    key: origins
+                    for key, origins in parent_origins.items()
+                    if len(origins) > 1 and key not in phase.fixed_overrides
+                }
+                if unresolved:
+                    details = ", ".join(
+                        f"{key!r} from {sorted(origins)}"
+                        for key, origins in sorted(unresolved.items())
+                    )
+                    raise ValueError(
+                        f"Phase {phase.name!r} inherits conflicting locked key(s) from multiple "
+                        f"parents: {details}. Resolve explicitly with phase.fixed_overrides "
+                        "or remove one inherit."
+                    )
+                merged = _merge_override_outcomes(combination)
+                assert merged is not None  # compatible-combination invariant
+                inherited_outcomes.append(merged)
+            inherited_outcomes = list(_deduplicate_override_outcomes(inherited_outcomes))
 
-            collisions = inherited_keys & set(phase.search_space.keys())
+            collisions = possible_inherited_keys & set(phase.search_space.keys())
             if collisions:
                 raise ValueError(
                     f"Phase {phase.name!r} re-samples key(s) {sorted(collisions)} "
@@ -786,23 +965,31 @@ class Experiment(_Frozen):
                     f"or drop the inherit."
                 )
 
-            # A scalar key and one of its dotted subkeys cannot coexist in any
-            # supported render format, whether both are local or one is inherited.
-            combined_keys = (
-                inherited_keys
-                | contract_keys
-                | set(phase.fixed_overrides)
-                | set(phase.search_space)
-            )
-            inh_prefix_collisions = _find_prefix_collisions(combined_keys)
-            if inh_prefix_collisions:
-                pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in inh_prefix_collisions)
-                raise ValueError(
-                    f"Phase {phase.name!r} has dotted-key namespace collision(s) "
-                    f"across inherited and local overrides: {pairs}. "
-                    "A key and a sub-key cannot both be overridden across the "
-                    "inheritance chain."
+            local_keys = contract_keys | set(phase.fixed_overrides) | set(phase.search_space)
+            local_origins = {
+                key: f"{phase.name}:contract:{contract_key_owner[key]}" for key in contract_keys
+            }
+            local_origins.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
+            local_origins.update({key: f"{phase.name}:sampled" for key in phase.search_space})
+            candidate_outcomes = [
+                _ConcreteOverrideOutcome(
+                    keys=outcome.keys | local_keys,
+                    origins=tuple(sorted({**dict(outcome.origins), **local_origins}.items())),
+                    decisions=outcome.decisions,
                 )
+                for outcome in inherited_outcomes
+            ]
+            candidate_outcomes = list(_deduplicate_override_outcomes(candidate_outcomes))
+            for outcome in candidate_outcomes:
+                prefix_collisions = _find_prefix_collisions(set(outcome.keys))
+                if prefix_collisions:
+                    pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
+                    raise ValueError(
+                        f"Phase {phase.name!r} has dotted-key namespace collision(s) "
+                        f"across inherited and local overrides: {pairs}. "
+                        "A key and a sub-key cannot both be overridden across the "
+                        "inheritance chain."
+                    )
 
             # Sampler/search-space compatibility (review v0.5.2 / blocker 2): catch at config-load
             # so `phasesweep validate` is meaningful, not at first trial launch.
@@ -813,14 +1000,16 @@ class Experiment(_Frozen):
             # Also enforces the single-host coordination boundary (review v0.5.14 / item D):
             # shared RDB storage across hosts silently breaks lock/generation-pointer
             # safety unless explicitly acknowledged.
-            _validate_storage_policy(self.storage, phase, self.allow_external_rdb_single_host)
+            _validate_storage_policy(
+                self.resolved_storage, phase, self.allow_external_rdb_single_host
+            )
 
             # Sampler reproducibility/resumability contract (review v0.5.18 /
             # finding F7): a durable study outlives the process that created
             # it, so an unseeded or non-resumable sampler is a config-level
             # decision the operator must make before the first trial, not a
             # surprise the runtime guard springs on them mid-target.
-            _validate_sampler_resumability(self.storage, phase)
+            _validate_sampler_resumability(self.resolved_storage, phase)
 
             # JSON wire serializability (review v0.5.17 / finding B): the
             # template preflight below renders with write_files=False, so it
@@ -835,19 +1024,60 @@ class Experiment(_Frozen):
             # where the wire form and semantic dump agree.
             _validate_cli_override_values(self, phase)
 
-            # Trial command template (v0.5.3 follow-up): render once with
-            # placeholder overrides per phase. Catches typos like `{trail_dir}`,
-            # unknown placeholders, and unbalanced braces at config-load instead
-            # of three minutes into a sweep.
-            _validate_trial_command_template(self, phase, inherited_keys)
+            # Trial command template (v0.5.3 follow-up): render every concrete
+            # inherited outcome. Catches typos like `{trail_dir}`, unknown
+            # placeholders, unbalanced braces, and namespace failures at
+            # config-load instead of three minutes into a sweep.
+            _validate_trial_command_template(
+                self,
+                phase,
+                [outcome.keys for outcome in inherited_outcomes],
+            )
 
-            locked_keys_by_phase[phase.name] = (
-                inherited_keys
+            exported_keys = (
+                possible_inherited_keys
                 | contract_keys
                 | set(phase.fixed_overrides)
                 | set(phase.search_space)
             )
+            # A failing promotion can expose its comparison baseline rather
+            # than this phase's candidate. Descendants must treat every key
+            # that either outcome can expose as inherited and immutable to
+            # sampling.
+            if phase.promotion is not None and phase.promotion.on_fail == "continue_baseline":
+                baseline_outcomes = concrete_outcomes_by_phase[phase.promotion.min_delta_vs]
+                # The baseline need not be an inherited parent. Copying its
+                # outcomes is another expansion, even for a parentless phase.
+                remaining_expansions = _consume_outcome_expansions(
+                    phase.name, len(baseline_outcomes), remaining_expansions
+                )
+                candidate_outcomes = [
+                    _ConcreteOverrideOutcome(
+                        keys=outcome.keys,
+                        origins=outcome.origins,
+                        decisions=tuple(sorted((*outcome.decisions, (phase.name, "candidate")))),
+                    )
+                    for outcome in candidate_outcomes
+                ]
+                fallback_outcomes = [
+                    _ConcreteOverrideOutcome(
+                        keys=outcome.keys,
+                        origins=outcome.origins,
+                        decisions=tuple(sorted((*outcome.decisions, (phase.name, "fallback")))),
+                    )
+                    for outcome in baseline_outcomes
+                ]
+                concrete_outcomes_by_phase[phase.name] = _deduplicate_override_outcomes(
+                    [*candidate_outcomes, *fallback_outcomes]
+                )
+                exported_keys |= possible_exported_keys_by_phase[phase.promotion.min_delta_vs]
+            else:
+                concrete_outcomes_by_phase[phase.name] = _deduplicate_override_outcomes(
+                    candidate_outcomes
+                )
+            possible_exported_keys_by_phase[phase.name] = exported_keys
             seen[phase.name] = phase
+            seen_casefolded[casefolded_name] = phase.name
 
         names = {self.metric.name} | {c.name for c in self.constraints}
         if len(names) != 1 + len(self.constraints):
@@ -941,7 +1171,7 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
        accumulates cannot be reproduced or explained afterwards.
     2. Resumability. ``tpe`` and ``cmaes`` suggestions depend on process-local
        RNG/optimizer state Optuna storage does not persist, so
-       :func:`phasesweep.engine.guards._validate_sampler_continuation` hard-rejects
+       :func:`phasesweep.engine.study_policy._validate_sampler_continuation` hard-rejects
        resuming such a phase mid-target. That guard fires only *after* the
        operator has been interrupted; requiring ``acknowledge_nonresumable``
        here puts the run-the-target-in-one-invocation contract in front of them
@@ -1222,7 +1452,24 @@ def _format_field_names(template: str) -> set[str]:
 
 
 def _validate_trial_command_template(
-    experiment: Experiment, phase: Phase, inherited_keys: set[str]
+    experiment: Experiment,
+    phase: Phase,
+    inherited_key_outcomes: list[frozenset[str]],
+) -> None:
+    """Preflight the trial command for each concrete inherited-key outcome.
+
+    :param Experiment experiment: Experiment containing the command template.
+    :param Phase phase: Phase whose candidate execution is being checked.
+    :param list[frozenset[str]] inherited_key_outcomes: Compatible inherited
+        key sets from concrete upstream promotion outcomes.
+    :raises ValueError: A concrete outcome cannot render or reach the trainer.
+    """
+    for inherited_keys in dict.fromkeys(inherited_key_outcomes):
+        _validate_trial_command_template_outcome(experiment, phase, inherited_keys)
+
+
+def _validate_trial_command_template_outcome(
+    experiment: Experiment, phase: Phase, inherited_keys: frozenset[str]
 ) -> None:
     """Render ``trial_command`` once per phase with placeholder overrides.
 
@@ -1386,7 +1633,7 @@ class SuiteDefaults(_Frozen):
     contracts: dict[str, Contract] = Field(default_factory=dict)
     env: dict[str, str] = Field(default_factory=dict)
     execution: ExecutionContext = Field(default_factory=ExecutionContext)
-    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
 
 
 def _validate_suite_component_name(kind: str, value: str) -> str:
@@ -1425,7 +1672,7 @@ class StudySpec(_Frozen):
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] | None = None
     execution: ExecutionContext | None = None
-    timeout_seconds_per_run: float | None = Field(default=None, ge=0)
+    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
     promotion: Promotion | None = None
 
     @field_validator("name")
@@ -1462,16 +1709,24 @@ class Suite(_Frozen):
     def _validate_study_graph(self) -> Suite:
         """Require prior-only dependencies and comparable promotion metrics.
 
-        :raises ValueError: If study names duplicate, dependencies point forward,
+        :raises ValueError: If study names duplicate case-insensitively, dependencies point forward,
             or a promotion compares different resolved metric contracts.
         :return Suite: Self, unchanged.
         """
         seen: set[str] = set()
+        seen_casefolded: dict[str, str] = {}
         phases_by_study: dict[str, set[str]] = {}
         metrics_by_study: dict[str, Metric | None] = {}
         for study in self.studies:
             if study.name in seen:
                 raise ValueError(f"Duplicate study name {study.name!r}.")
+            folded = study.name.casefold()
+            if folded in seen_casefolded:
+                raise ValueError(
+                    f"Study names {seen_casefolded[folded]!r} and "
+                    f"{study.name!r} must be unique case-insensitively."
+                )
+            seen_casefolded[folded] = study.name
             resolved_metric = (
                 study.metric if "metric" in study.model_fields_set else self.defaults.metric
             )
@@ -1564,6 +1819,16 @@ class Suite(_Frozen):
             execution=value("execution") or ExecutionContext(),
             timeout_seconds_per_run=value("timeout_seconds_per_run"),
         )
+
+
+def _compile_suite_experiments(suite: Suite) -> dict[str, Experiment]:
+    """Resolve every study before any component execution can begin.
+
+    :param Suite suite: Validated suite whose defaults are resolved by its compiler.
+    :raises ValueError: A study cannot resolve to a valid experiment.
+    :return dict[str, Experiment]: Experiments keyed by case-preserving study name.
+    """
+    return {study.name: suite.experiment_for_study(study) for study in suite.studies}
 
 
 Config = Experiment | Suite

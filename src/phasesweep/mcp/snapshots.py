@@ -12,15 +12,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
-from phasesweep.engine.guards import _experiment_semantic_fingerprint
+from phasesweep.engine.artifacts import _winner_source_or_default
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.optuna import _published_phase_trial_refs
+from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import (
     PublicationState,
     Winner,
     WinnerSource,
     WinnerSourceKind,
-    _generation_record_path,
-    _winner_source_or_default,
 )
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
 
@@ -72,6 +73,12 @@ class PhaseStatusSnapshot(_SnapshotModel):
     generation_trials: dict[str, NonNegativeInt]
     winner_present: bool
     trial_data_available: bool
+    published_study_unavailable: bool | None = None
+    """Whether the published study was unavailable at capture time.
+
+    ``None`` means availability was not checked, as in older frozen snapshots
+    or pre-generation placeholders. It is not evidence of study availability.
+    """
     running_attempts: list[RunningAttemptSnapshot] | None = None
     """RUNNING rows the frozen counts describe, or ``None`` when unknown.
 
@@ -79,8 +86,8 @@ class PhaseStatusSnapshot(_SnapshotModel):
     pairs with ``trial_data_available: false`` -- an empty list would assert
     there are no RUNNING rows. Snapshots frozen before this field existed also
     parse as ``None``, which is the truthful reading: they recorded no
-    identities. A phase with readable trial data always carries a list, empty
-    when nothing is RUNNING.
+    identities. A phase with known trial counts always carries a list, empty
+    when nothing is RUNNING, including a confirmed absent study.
     """
 
 
@@ -459,16 +466,20 @@ def mark_result_snapshot_published(
     snapshot: Mapping[str, object],
     *,
     generation_id: str,
+    published_summary: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Bind a prepared result snapshot to its completed publication commit.
 
     Detached MCP runs capture and persist their exact generation before the
     engine advances the last-success pointer. Once that pointer commits, this
-    transition updates only the frozen publication relationship; it never
+    transition updates the frozen publication relationship and rebinds each
+    phase's storage-availability verdict to the committed summary. It never
     rereads shared study state or reconstructs winner facts.
 
     :param Mapping[str, object] snapshot: Snapshot prepared under the experiment lock.
     :param str generation_id: Generation whose last-success pointer just committed.
+    :param Mapping[str, Any] published_summary: Already-validated summary committed by
+        that pointer.
     :return dict[str, Any]: Validated snapshot recording the committed publication.
     :raises RuntimeError: If the snapshot represents another generation or was
         captured without that generation's summary.
@@ -480,6 +491,16 @@ def mark_result_snapshot_published(
         raise RuntimeError("prepared result snapshot represents a different generation")
     if not status.summary_present:
         raise RuntimeError("prepared result snapshot has no generation summary")
+    published_phases = set(_published_phase_trial_refs(published_summary))
+    for phase in status.phases:
+        # The prepared snapshot describes the old pointer. Clear phases the new
+        # summary did not publish, flag every selected phase whose one capture
+        # read was unavailable, and retain a readable carried phase's prior
+        # unavailability verdict.
+        if phase.phase not in published_phases:
+            phase.published_study_unavailable = False
+        elif not phase.trial_data_available:
+            phase.published_study_unavailable = True
     status.published_generation_id = generation_id
     status.is_published = True
     status.publication_integrity = "ok"

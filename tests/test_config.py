@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment
@@ -15,9 +16,136 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
+    StudySpec,
     Suite,
 )
-from tests.conftest import assert_invalid_experiment_yaml, write_yaml
+from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
+
+
+def test_suite_study_names_are_unique_case_insensitively() -> None:
+    phase = Phase(name="p", n_trials=1)
+    with pytest.raises(ValidationError, match="'Foo' and 'foo'.*case-insensitively"):
+        Suite(suite="s", studies=[StudySpec(name=name, phases=[phase]) for name in ("Foo", "foo")])
+    suite = Suite(
+        suite="s", studies=[StudySpec(name=name, phases=[phase]) for name in ("Foo", "Bar")]
+    )
+    assert [study.name for study in suite.studies] == ["Foo", "Bar"]
+
+
+def _branching_phases(width: int) -> list[Phase]:
+    return [
+        Phase(name="base", n_trials=1),
+        *[
+            Phase(
+                name=f"branch{i}",
+                n_trials=1,
+                promotion={
+                    "min_delta_vs": "base",
+                    "on_fail": "continue_baseline",
+                },
+            )
+            for i in range(width)
+        ],
+        Phase(name="join", n_trials=1, inherits=[f"branch{i}" for i in range(width)]),
+    ]
+
+
+def test_promotion_validation_has_an_experiment_wide_work_bound(monkeypatch) -> None:
+    import phasesweep.config.models as models
+
+    original = models._consume_outcome_expansions
+    spent = 0
+
+    def counted(phase_name, count, remaining_expansions):
+        nonlocal spent
+        remaining = original(phase_name, count, remaining_expansions)
+        spent += count
+        assert spent <= 4096
+        return remaining
+
+    monkeypatch.setattr(models, "_consume_outcome_expansions", counted)
+    make_experiment(phases=_branching_phases(3))
+    spent = 0
+    with pytest.raises(
+        ValidationError, match="Phase 'join'.*supported validation complexity.*4,096"
+    ):
+        make_experiment(phases=_branching_phases(13))
+    # A fresh validation gets its own budget; a prior failure cannot poison it.
+    spent = 0
+    make_experiment(phases=_branching_phases(3))
+    spent = 0
+    phases = _branching_phases(10)
+    parents = phases[-1].inherits
+    phases.append(Phase(name="join2", n_trials=1, inherits=parents))
+    with pytest.raises(ValidationError, match="Phase 'join2'.*supported validation complexity"):
+        make_experiment(phases=phases)
+
+    # Baseline-only promotions can copy the join's large outcome set without
+    # any parent combinations of their own. They must spend the same budget.
+    spent = 0
+    phases = _branching_phases(10)
+    phases.extend(
+        Phase(
+            name=f"fallback{i}",
+            n_trials=1,
+            promotion={"min_delta_vs": "join", "on_fail": "continue_baseline"},
+        )
+        for i in (1, 2)
+    )
+    original_outcome = models._ConcreteOverrideOutcome
+    fallback_allocations = {"fallback1": 0, "fallback2": 0}
+
+    def track_fallback_allocation(**kwargs):
+        for name, branch in kwargs.get("decisions", ()):
+            if name in fallback_allocations and branch == "fallback":
+                fallback_allocations[name] += 1
+        return original_outcome(**kwargs)
+
+    monkeypatch.setattr(models, "_ConcreteOverrideOutcome", track_fallback_allocation)
+    with pytest.raises(ValidationError, match="Phase 'fallback2'.*supported validation complexity"):
+        make_experiment(phases=phases)
+    assert spent == 3080  # 10 base fallbacks + 2,046 parent candidates + 1,024 fallbacks.
+    assert fallback_allocations == {"fallback1": 1024, "fallback2": 0}
+
+
+def test_promotion_validation_charges_rejected_combinations(monkeypatch) -> None:
+    import phasesweep.config.models as models
+
+    # Only 64 of the 64*64 pairs are compatible. The rejected pairs still cost
+    # work, so the second expansion cannot fit after spending 64 on the first.
+    outcomes = tuple(
+        models._ConcreteOverrideOutcome(
+            keys=frozenset(),
+            decisions=(("choice", str(i)),),
+        )
+        for i in range(64)
+    )
+    original = models._merge_override_outcomes
+    attempts = 0
+
+    def counted(candidate):
+        nonlocal attempts
+        attempts += 1
+        return original(candidate)
+
+    monkeypatch.setattr(models, "_merge_override_outcomes", counted)
+    with pytest.raises(ValueError, match="Phase 'join'.*supported validation complexity"):
+        models._compatible_parent_outcome_combinations(
+            ["left", "right"],
+            {"left": outcomes, "right": outcomes},
+            phase_name="join",
+            remaining_expansions=4096,
+        )
+    assert attempts == 64  # Refused before allocating/evaluating the next layer.
+    phases = _branching_phases(6)
+    phases.extend(
+        [
+            Phase(name="copy", n_trials=1, inherits=["join"]),
+            Phase(name="rejoin", n_trials=1, inherits=["join", "copy"]),
+        ]
+    )
+    with pytest.raises(ValidationError, match="Phase 'rejoin'.*supported validation complexity"):
+        make_experiment(phases=phases)
 
 
 @pytest.mark.parametrize(
@@ -89,6 +217,25 @@ phases:
             "distinct",
             id="metric-constraint-name-collision",
         ),
+        pytest.param(
+            """
+experiment: t
+storage: ":memory:"
+provenance: {revision: test-fixture-v1}
+trial_command: "echo {overrides}"
+override_format: argparse
+metric:
+  name: goal
+  goal: minimize
+  extractor: { type: json_envelope, objective_name: goal, split: test, policy: test }
+phases:
+  - name: a
+    n_trials: 1
+    search_space: { x: { type: float, low: 0, high: 1 } }
+""",
+            "reserved for winner direction metadata",
+            id="metric-name-goal-is-reserved",
+        ),
     ],
 )
 def test_invalid_experiment_relationships(
@@ -103,6 +250,72 @@ def test_invalid_experiment_relationships(
 def test_phase_name_validation(name: str) -> None:
     with pytest.raises(ValidationError):
         Phase(name=name, n_trials=1, search_space={})
+
+
+def test_phase_names_reject_casefold_equivalent_spellings() -> None:
+    phases = [
+        Phase(name="Foo", n_trials=1),
+        Phase(name="foo", n_trials=1),
+    ]
+
+    with pytest.raises(
+        ValidationError,
+        match=r"Phase names 'Foo' and 'foo' must be unique case-insensitively",
+    ):
+        make_experiment(trial_command="echo", phases=phases)
+
+
+def test_phase_names_preserve_authored_case_for_inherit_selectors() -> None:
+    phases = [
+        Phase(name="Foo", n_trials=1),
+        Phase(name="next", n_trials=1, inherits=["Foo"]),
+    ]
+
+    experiment = make_experiment(trial_command="echo", phases=phases)
+
+    assert [phase.name for phase in experiment.phases] == ["Foo", "next"]
+    assert experiment.phases[1].inherits == ["Foo"]
+
+    phases[1] = Phase(name="next", n_trials=1, inherits=["foo"])
+    with pytest.raises(ValidationError, match="inherits from 'foo', which is not a prior phase"):
+        make_experiment(trial_command="echo", phases=phases)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "match"),
+    [("(", "Invalid metric regex"), (r"loss=(?P<loss>\S+)", "requires a named")],
+)
+def test_config_rejects_invalid_metric_regex_before_creating_workdir(tmp_path, pattern, match):
+    payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
+    payload["metric"]["extractor"] = {"type": "log_regex", "pattern": pattern}
+    path = write_yaml(tmp_path, yaml.safe_dump(payload))
+
+    with pytest.raises(ValueError, match=match):
+        load_experiment(path)
+
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "match"),
+    [
+        ("attempts", "reserved for the runtime recovery registry"),
+        ("Attempts", "reserved for the runtime recovery registry"),
+        ("generations", "reserved for immutable generation records"),
+        ("Generations", "reserved for immutable generation records"),
+    ],
+)
+def test_config_rejects_reserved_phase_name_before_creating_workdir(
+    tmp_path, name: str, match: str
+):
+    payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
+    payload["phases"][0]["name"] = name
+    path = write_yaml(tmp_path, yaml.safe_dump(payload))
+
+    with pytest.raises(ValueError, match=match):
+        load_experiment(path)
+
+    assert not (tmp_path / "work").exists()
 
 
 @pytest.mark.parametrize(

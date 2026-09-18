@@ -14,29 +14,44 @@ an earlier generation must find that generation in this same tree.
 from __future__ import annotations
 
 import hashlib
+import json
 import shutil
+from copy import deepcopy
 from pathlib import Path
 
 import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.artifacts as artifact_io
+import phasesweep.engine.evidence as evidence_ops
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Phase, Sampler
+from phasesweep.config import Experiment, IntParam, Phase, Promotion, Sampler
 from phasesweep.engine import (
     NoFeasibleTrialError,
     TrialEvidenceMissingError,
     read_status,
 )
 from phasesweep.engine.optuna import _phase_study_name
-from phasesweep.engine.state import (
-    TRAINER_INPUT_ATTR,
+from phasesweep.engine.paths import (
     _experiment_dir,
+    _generation_config_snapshot_path,
     _generation_path,
+    _generation_reproducibility_path,
+    _generation_summary_path,
+    _generation_winner_path,
     _generations_dir,
-    _last_successful_generation_id,
     _last_successful_generation_path,
     _phase_dir,
+)
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _resolve_publication_pointer,
+)
+from phasesweep.engine.selection import select_winner
+from phasesweep.engine.state import (
+    OBJECTIVE_PROVENANCE_ATTR,
+    TRAINER_INPUT_ATTR,
 )
 from tests.conftest import assert_published_winner_evidence_local, make_experiment, write_trainer
 
@@ -134,6 +149,54 @@ def _trial_count(experiment: Experiment) -> int:
         storage=experiment.storage,
     )
     return len(study.get_trials(deepcopy=False))
+
+
+def _phase_trial_count(experiment: Experiment, phase_name: str) -> int:
+    """Return the durable trial count for one named phase."""
+    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, phase),
+        storage=experiment.storage,
+    )
+    return len(study.get_trials(deepcopy=False))
+
+
+_MARKED_TRAINER = """
+import argparse
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument("--out")
+parser.add_argument("--phase_marker", default="")
+args, _ = parser.parse_known_args()
+if args.phase_marker:
+    Path(args.phase_marker).write_text("launched\\n")
+print("x=0.5")
+"""
+
+
+def _from_phase_evidence_experiment(
+    tmp_path: Path,
+    *,
+    resumed_trials: int = 1,
+) -> tuple[Experiment, Path]:
+    """Build a two-phase experiment whose resumed trainer leaves a marker."""
+    marker = tmp_path / "resumed-trainer-ran"
+    trainer = write_trainer(tmp_path / "from_phase_trainer.py", _MARKED_TRAINER)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(name="p", n_trials=1, sampler=Sampler(type="random", seed=0)),
+            Phase(
+                name="q",
+                n_trials=resumed_trials,
+                sampler=Sampler(type="random", seed=1),
+                fixed_overrides={"phase_marker": str(marker)},
+            ),
+        ],
+    )
+    return experiment, marker
 
 
 def _pointer_bytes(experiment: Experiment) -> bytes:
@@ -248,6 +311,53 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     assert _pointer_bytes(topup) == pointer_before
 
 
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "empty",
+        "file_without_path",
+        "file_without_digest",
+        "file_with_parent_path",
+        "file_with_absolute_path",
+        "wandb_without_address",
+    ],
+)
+def test_present_incomplete_objective_provenance_blocks_selection(
+    tmp_path: Path, damage: str
+) -> None:
+    """Only absent provenance is legacy; partial current records cannot publish."""
+    experiment = _evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=experiment.storage,
+    )
+    trial = deepcopy(study.get_trials(deepcopy=False)[0])
+    record = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
+    if damage == "empty":
+        record = {}
+    elif damage == "file_without_path":
+        record["source"].pop("path")
+    elif damage == "file_without_digest":
+        record["source"].pop("sha256")
+    elif damage == "file_with_parent_path":
+        record["source"]["path"] = "../not-a-trial-file"
+    elif damage == "file_with_absolute_path":
+        record["source"]["path"] = "/not-a-trial-file"
+    else:
+        record["extractor"]["kind"] = "wandb"
+        record["source"] = {"kind": "wandb"}
+    trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR] = json.dumps(record)
+    study = optuna.create_study(direction="minimize")
+    study.add_trial(trial)
+
+    with pytest.raises(TrialEvidenceMissingError, match="objective_provenance"):
+        evidence_ops._validate_selection_evidence(experiment, {"p": study})
+    with pytest.raises(TrialEvidenceMissingError, match="objective_provenance"):
+        selected = select_winner(study, experiment, phase_name="p")
+        evidence_ops._verify_winner_objective_evidence(experiment, "p", selected)
+
+
 def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     """Positive control: the guard costs an intact tree nothing."""
     experiment = _evidence_experiment(tmp_path)
@@ -352,6 +462,126 @@ def test_republishing_refuses_a_winner_whose_objective_bytes_changed(tmp_path: P
 
 
 # --------------------------------------------------------------------------
+# --from-phase preflight: skipped winners are verified against their source
+# trial before downstream work can begin, without needing the prior ledger.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    [
+        pytest.param("changed", "bytes behind the published metric", id="same-size-edit"),
+        pytest.param(
+            "missing", "objective evidence in 'stdout.log', which is missing", id="missing"
+        ),
+    ],
+)
+def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
+    tmp_path: Path,
+    damage: str,
+    expected: str,
+) -> None:
+    """A carried winner's source must verify before the resumed phase can run."""
+    original, marker = _from_phase_evidence_experiment(tmp_path)
+    run_experiment(original)
+    marker.unlink()
+    source = _sole_trial_dir(original)
+    pointer_before = _pointer_bytes(original)
+    if damage == "changed":
+        original_bytes = (source / "stdout.log").read_bytes()
+        (source / "stdout.log").write_bytes(b"y" + original_bytes[1:])
+        assert (source / "stdout.log").stat().st_size == len(original_bytes)
+    else:
+        (source / "stdout.log").unlink()
+
+    resumed, _ = _from_phase_evidence_experiment(tmp_path, resumed_trials=2)
+    with pytest.raises(TrialEvidenceMissingError, match=expected):
+        run_experiment(resumed, from_phase="q")
+
+    assert _phase_trial_count(resumed, "q") == 1
+    assert not marker.exists()
+    assert _pointer_bytes(resumed) == pointer_before
+
+
+def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    """Winner serialization supplies enough evidence identity to skip a missing study."""
+    experiment, _marker = _from_phase_evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    payload = yaml.safe_load(
+        (_generations_dir(experiment) / generation_id / "phases" / "p" / "winner.yaml").read_text()
+    )
+    p_study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=experiment.storage,
+    )
+    assert (
+        payload["trainer_input"]
+        == p_study.get_trials(deepcopy=False)[0].user_attrs[TRAINER_INPUT_ATTR]
+    )
+    optuna.delete_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=experiment.storage,
+    )
+
+    resumed = run_experiment(experiment, from_phase="q")
+
+    assert resumed["p"].trial_number == 0
+
+
+def test_from_phase_promotion_uses_the_baseline_source_evidence(tmp_path: Path) -> None:
+    """A promoted skipped winner resolves evidence from its baseline, not exposure phase."""
+    trainer = write_trainer(tmp_path / "promotion_trainer.py", _CONSTANT_TRAINER)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        phases=[
+            Phase(name="base", n_trials=1, sampler=Sampler(type="random", seed=0)),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=1),
+                promotion=Promotion(
+                    min_delta_vs="base", min_delta=1.0, on_fail="continue_baseline"
+                ),
+            ),
+            Phase(name="later", n_trials=1, sampler=Sampler(type="random", seed=2)),
+        ],
+    )
+    winners = run_experiment(experiment)
+    assert winners["candidate"].source is not None
+    assert winners["candidate"].source.phase == "base"
+    candidate_dir = _phase_dir(experiment, "candidate")
+    for trial_dir in candidate_dir.glob("trial_*"):
+        shutil.rmtree(trial_dir)
+    optuna.delete_study(
+        study_name=_phase_study_name(experiment, experiment.phases[1]),
+        storage=experiment.storage,
+    )
+
+    resumed = run_experiment(experiment, from_phase="later")
+
+    assert resumed["candidate"].source is not None
+    assert resumed["candidate"].source.phase == "base"
+
+
+def test_skipped_winner_evidence_uses_the_relocated_artifact_tree(tmp_path: Path) -> None:
+    """Historical evidence is reconstructed under the current relocated workdir."""
+    experiment, _marker = _from_phase_evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    moved_workdir = tmp_path / "moved-runs"
+    Path(experiment.workdir).rename(moved_workdir)
+    moved = experiment.model_copy(update={"workdir": str(moved_workdir)})
+
+    winner = artifact_io._load_winner(moved, moved.phases[0], {})
+    evidence_ops._verify_skipped_winner_evidence(moved, moved.phases[0], winner)
+
+
+# --------------------------------------------------------------------------
 # Manifest rule: a winner carried from an earlier generation must find that
 # generation here. Fires pre-commit on the publish path and on every read.
 # --------------------------------------------------------------------------
@@ -402,21 +632,83 @@ def test_deleting_a_carried_winners_source_generation_fails_read_and_write(
     assert _last_successful_generation_id(experiment) is None
 
 
-def test_published_source_generation_missing_its_winner_record_fails_integrity(
-    tmp_path: Path,
-) -> None:
-    """A source that published must still hold the winner record it published."""
+@pytest.mark.parametrize("damage", ["missing", "edited", "coherently_changed"])
+def test_published_source_generation_damage_fails_integrity(tmp_path: Path, damage: str) -> None:
+    """A carried result cannot outlive or contradict its published source."""
     experiment, source_generation, _ = _tree_with_a_carried_winner(tmp_path)
     source_dir = _generations_dir(experiment) / source_generation
-    (source_dir / "phases" / "p" / "winner.yaml").unlink()
+    winner_path = source_dir / "phases" / "p" / "winner.yaml"
+    if damage == "missing":
+        winner_path.unlink()
+        diagnostic = "published but holds no winner record"
+    else:
+        winner = yaml.safe_load(winner_path.read_text())
+        winner["metric"][experiment.metric.name] = 0.9
+        winner["params"]["x"] = -1
+        winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+        if damage == "coherently_changed":
+            summary_path = source_dir / "summary.yaml"
+            summary = yaml.safe_load(summary_path.read_text())
+            summary["phases"][0]["metric"] = 0.9
+            summary["phases"][0]["params"] = {"x": -1}
+            artifact = next(
+                item
+                for item in summary["artifacts"]
+                if item.get("kind") == "winner" and item.get("phase") == "p"
+            )
+            artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+            summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+            diagnostic = "disagrees with the result recorded"
+        else:
+            diagnostic = "source generation"
     assert (source_dir / "summary.yaml").is_file()
 
     status = read_status(experiment)
     assert status["publication_integrity"] == "failed"
-    assert "published but holds no winner record" in str(status["publication_error"])
+    assert diagnostic in str(status["publication_error"])
 
-    with pytest.raises(RuntimeError, match="published but holds no winner record"):
+    with pytest.raises(RuntimeError, match=diagnostic):
         run_experiment(_evidence_experiment(tmp_path))
+
+
+@pytest.mark.parametrize("identity_field", ["experiment", "generation_id"])
+def test_carried_winner_rejects_reidentified_source_summary(
+    tmp_path: Path,
+    identity_field: str,
+) -> None:
+    """A carried winner's source must retain its experiment and generation identity."""
+    experiment, source_generation, carrying_generation = _tree_with_a_carried_winner(tmp_path)
+    carried = yaml.safe_load(
+        _generation_winner_path(experiment, carrying_generation, "p").read_text()
+    )
+    assert carried["generation_id"] == source_generation
+
+    summary_path = _generation_summary_path(experiment, source_generation)
+    summary = yaml.safe_load(summary_path.read_text())
+    snapshot_path = _generation_config_snapshot_path(experiment, source_generation)
+    snapshot = yaml.safe_load(snapshot_path.read_text())
+    record_path = _generation_reproducibility_path(experiment, source_generation)
+    record = json.loads(record_path.read_text())
+    forged = f"forged-{identity_field}"
+
+    summary[identity_field] = forged
+    record[identity_field] = forged
+    if identity_field == "experiment":
+        snapshot["experiment"] = forged
+        snapshot_path.write_text(yaml.safe_dump(snapshot, sort_keys=False))
+        record["config_snapshot"]["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+    record_path.write_text(json.dumps(record))
+    for entry in summary["artifacts"]:
+        if entry.get("path") == "config.snapshot.yaml":
+            entry["sha256"] = hashlib.sha256(snapshot_path.read_bytes()).hexdigest()
+        elif entry.get("path") == "reproducibility.json":
+            entry["sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert f"names a different {identity_field.removesuffix('_id')}" in pointer.error
 
 
 def test_winner_carried_from_a_generation_that_crashed_before_publication_publishes(

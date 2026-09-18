@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable
-from dataclasses import dataclass
+import os
+import stat
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -37,19 +39,28 @@ from phasesweep.runtime.time import utc_now_iso
 # Version of the objective evidence provenance payload frozen alongside a
 # metric at extraction time (review v0.5.17 / finding F).
 EVIDENCE_PROVENANCE_SCHEMA_VERSION = 1
+# Bump only evaluators whose interpretation changed. These revisions are
+# semantic inputs to study, winner, and publication fingerprints; package
+# versions alone do not determine whether old trial readings can be reused.
+LOG_REGEX_EVALUATION_REVISION = 2
+DIRECTORY_SIZE_EVALUATION_REVISION = 2
 
 
 def extractor_config_fingerprint(cfg: Extractor) -> str:
-    """Return the SHA-256 identity of an extractor's exact configuration.
+    """Return the SHA-256 identity of an extractor's evaluation contract.
 
     Frozen into evidence provenance so a forensic review can prove which
     extractor contract produced a published scalar even after the experiment
     config changes (review v0.5.17 / finding F).
 
     :param Extractor cfg: Concrete extractor config to fingerprint.
-    :return str: Hex SHA-256 of the extractor's canonical JSON dump.
+    :return str: Hex SHA-256 of the canonical configuration and, for log-regex,
+        its evaluation revision.
     """
-    dumped = json.dumps(cfg.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    payload = cfg.model_dump(mode="json")
+    if isinstance(cfg, LogRegexExtractor):
+        payload["evaluation_revision"] = LOG_REGEX_EVALUATION_REVISION
+    dumped = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
 
 
@@ -140,6 +151,11 @@ class TrialContext:
     run_name: str  # "{experiment}-{phase}-{trial_id}-{attempt_id}"
     return_code: int
     duration_seconds: float
+    wandb_environment: Mapping[str, str] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def _extract_json(
@@ -310,8 +326,7 @@ def _extract_log_regex(
         The selected numeric value across all matches.
 
     Raises:
-        ExtractorError: Log file missing, invalid regex, missing ``value``
-            group, or no lines matched.
+        ExtractorError: Log file missing or unreadable, or no numeric matches.
 
     """
     import re
@@ -320,19 +335,13 @@ def _extract_log_regex(
     if not target.is_file():
         raise ExtractorError(f"Log file not found: {target}")
 
-    try:
-        pattern = re.compile(cfg.pattern)
-    except re.error as exc:
-        raise ExtractorError(f"Invalid regex {cfg.pattern!r}: {exc}") from exc
+    pattern = re.compile(cfg.pattern)
 
-    if "value" not in pattern.groupindex:
-        raise ExtractorError(f"Regex {cfg.pattern!r} must contain a named group 'value'.")
-
-    # Stream line-by-line to avoid 500 MB RSS on large training logs. Binary
-    # iteration feeds the evidence digest with the exact on-disk bytes; regex
-    # matching then runs on logical lines split with text-mode universal
-    # newline semantics (lone "\r" is a boundary too — tqdm-style progress
-    # logs separate updates with bare carriage returns).
+    # Stream with universal-newline boundaries while retaining each original
+    # terminator. ``surrogateescape`` lets us round-trip the exact source bytes
+    # into the evidence digest; lines that are still eligible for matching are
+    # then decoded strictly so invalid UTF-8 remains an evidence failure. This
+    # keeps CR-only tqdm progress output bounded to one logical line at a time.
     hasher = hashlib.sha256()
     size_bytes = 0
     result: float | None = None
@@ -340,27 +349,24 @@ def _extract_log_regex(
     count = 0
     line_no = 0
     try:
-        with target.open("rb") as fh:
-            for raw_line in fh:
+        with target.open("r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
+            for raw_text in fh:
+                raw_line = raw_text.encode("utf-8", errors="surrogateescape")
                 hasher.update(raw_line)
                 size_bytes += len(raw_line)
                 if cfg.select == "first" and result is not None:
                     # Value already selected; keep reading only to finish the
                     # whole-file digest.
                     continue
-                text = raw_line.decode("utf-8")
-                if text.endswith("\r\n"):
-                    text = text[:-2] + "\n"
-                elif text.endswith("\r"):
-                    text = text[:-1] + "\n"
-                parts = text.split("\r")
-                for line in [part + "\n" for part in parts[:-1]] + parts[-1:]:
-                    line_no += 1
-                    m = pattern.search(line)
-                    if m is None:
-                        continue
+                line = raw_line.decode("utf-8")
+                if line.endswith("\r\n"):
+                    line = line[:-2] + "\n"
+                elif line.endswith("\r"):
+                    line = line[:-1] + "\n"
+                line_no += 1
+                for match in pattern.finditer(line):
                     try:
-                        v = float(m.group("value"))
+                        v = float(match.group("value"))
                     except (TypeError, ValueError):
                         continue
                     count += 1
@@ -425,9 +431,11 @@ def _extract_wandb(
             entity=cfg.entity,
             project=cfg.project,
             run_id=ctx.attempt_id,
+            trial_dir=ctx.trial_dir,
             poll_seconds=cfg.poll_seconds,
             timeout_seconds=cfg.timeout_seconds,
             required_keys=[cfg.metric_key],
+            environment=ctx.wandb_environment,
         )
     except ImportError as exc:
         raise ExtractorError(
@@ -670,11 +678,40 @@ def _artifact_size(ctx: TrialContext, gate: ArtifactSizeGate) -> GateResult:
         label = f"{gate.path} file size"
     elif gate.source == "directory":
         try:
-            if not path.is_dir():
-                return GateResult(gate.type, False, f"{gate.path} is not a directory")
-            size = sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+            root = path.stat(follow_symlinks=False)
         except OSError as exc:
-            return GateResult(gate.type, False, f"could not inspect {gate.path}: {exc}")
+            return GateResult(gate.type, False, f"could not inspect {gate.path}: {path}: {exc}")
+        if not stat.S_ISDIR(root.st_mode):
+            return GateResult(gate.type, False, f"{gate.path} is not a directory")
+        directories = [path]
+        size = 0
+        while directories:
+            directory = directories.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        entry_path = Path(entry.path)
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                directories.append(entry_path)
+                            # Preserve Path.rglob's file-link behavior: file
+                            # symlinks contribute their target size, while the
+                            # non-following directory check above prevents a
+                            # linked directory from being traversed.
+                            elif entry.is_file():
+                                size += entry_path.stat().st_size
+                        except OSError as exc:
+                            return GateResult(
+                                gate.type,
+                                False,
+                                f"could not inspect {gate.path}: {entry_path}: {exc}",
+                            )
+            except OSError as exc:
+                return GateResult(
+                    gate.type,
+                    False,
+                    f"could not inspect {gate.path}: {directory}: {exc}",
+                )
         label = f"{gate.path} directory size"
     else:
         assert gate.key is not None
@@ -735,9 +772,11 @@ def _wandb_summary_required(
             entity=gate.entity,
             project=gate.project,
             run_id=ctx.attempt_id,
+            trial_dir=ctx.trial_dir,
             poll_seconds=gate.poll_seconds,
             timeout_seconds=gate.timeout_seconds,
             wait_for_keys=False,
+            environment=ctx.wandb_environment,
         )
     except ImportError:
         return GateResult(gate.type, False, "wandb package is not installed")

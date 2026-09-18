@@ -16,11 +16,15 @@ import yaml
 
 from phasesweep import __version__, load_experiment, run_experiment
 from phasesweep.config import (
+    ArtifactSizeGate,
     CategoricalParam,
+    Constraint,
+    Contract,
     ExecutionContext,
     Experiment,
     FloatParam,
     IntParam,
+    JsonEnvelopeExtractor,
     JsonEqualsGate,
     LogRegexExtractor,
     Metric,
@@ -37,6 +41,7 @@ from phasesweep.engine import (
     ArtifactRootRebindError,
     LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
+    PublishedStudyMissingError,
     RunRequestError,
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
@@ -48,26 +53,19 @@ from phasesweep.engine import (
     read_winner,
     read_winners,
 )
-from phasesweep.engine.guards import (
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.artifacts import _load_winner, _save_winner
+from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
-    _artifact_root_rebind_entries,
-    _ArtifactRootRebindPlan,
+    _evaluation_semantics,
     _phase_fingerprint,
-    _register_active_attempt,
-    _validate_artifact_root_binding,
-    _validate_artifact_root_binding_for_rebind,
-    _validate_artifact_root_destination,
+    _phase_semantic_payload,
+    _semantic_payload_digest,
+    _verify_fingerprint,
 )
 from phasesweep.engine.optuna import _sqlite_study_exists
-from phasesweep.engine.run import _reject_bound_descendant_topups
-from phasesweep.engine.state import (
-    ARTIFACT_ROOT_ATTR,
-    ATTEMPT_ID_ATTR,
-    TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
-    TRIAL_DIR_ATTR,
-    TRIAL_TARGET_ATTR,
-    Winner,
+from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
     _experiment_dir,
@@ -75,17 +73,41 @@ from phasesweep.engine.state import (
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
-    _last_successful_generation_id,
+    _generations_dir,
     _last_successful_generation_path,
-    _load_winner,
     _phase_dir,
-    _published_winner_path,
-    _save_winner,
     _summary_path,
     _winner_path,
 )
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _published_winner_path,
+)
+from phasesweep.engine.relocation import (
+    _artifact_root_rebind_entries,
+    _ArtifactRootRebindPlan,
+    _validate_artifact_root_binding_for_rebind,
+    _validate_artifact_root_destination,
+)
+from phasesweep.engine.resume import _reject_bound_descendant_topups
+from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
+    ATTEMPT_ID_ATTR,
+    FAILURE_REASON_ATTR,
+    PHASE_EVALUATION_SEMANTICS_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
+    TRIAL_DIR_ATTR,
+    TRIAL_TARGET_ATTR,
+    Winner,
+)
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
-from phasesweep.runtime.files import atomic_text_writer
+from phasesweep.runtime.files import (
+    atomic_text_writer,
+    file_url_path,
+    sqlite_database_path,
+    storage_backend,
+)
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
@@ -314,8 +336,8 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     """
     trainer = write_constant_trainer(tmp_path)
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer)
-    run_module = importlib.import_module("phasesweep.engine.run")
-    real_copy = run_module._copy_yaml_projection
+    generation_ops = importlib.import_module("phasesweep.engine.generation")
+    real_copy = generation_ops._copy_yaml_projection
     copied = 0
 
     def interrupt_after_first_projection(source: Path, destination: Path) -> None:
@@ -325,7 +347,7 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
         real_copy(source, destination)
         copied += 1
 
-    monkeypatch.setattr(run_module, "_copy_yaml_projection", interrupt_after_first_projection)
+    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", interrupt_after_first_projection)
 
     winners = run_experiment(experiment)
 
@@ -564,6 +586,211 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             assert fp_a != fp_b, case
 
 
+@pytest.mark.parametrize(
+    ("scenario", "evaluator"),
+    [
+        ("objective", "log_regex extractor"),
+        ("constraint", "log_regex extractor"),
+        ("phase-directory", "artifact_size directory gate"),
+        ("contract-directory", "artifact_size directory gate"),
+        ("json-envelope", None),
+        ("file-size", None),
+        ("unused-contract-directory", None),
+    ],
+)
+def test_evaluator_revision_rejects_only_affected_legacy_fingerprints(
+    scenario: str, evaluator: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A populated study must not reuse old readings, but unaffected digests stay stable."""
+    envelope = Metric(
+        extractor=JsonEnvelopeExtractor(
+            type="json_envelope", objective_name="loss", split="validation", policy="final"
+        )
+    )
+    experiment = make_experiment(n_trials=1, metric=None if scenario == "objective" else envelope)
+    config = experiment.model_dump(mode="json")
+    directory_gate = ArtifactSizeGate(
+        type="artifact_size", source="directory", path="checkpoint", max_bytes=1024
+    )
+    if scenario == "constraint":
+        config["constraints"] = [
+            Constraint(
+                name="memory",
+                max=10,
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"memory=(?P<value>[0-9.]+)"),
+            ).model_dump(mode="json")
+        ]
+    elif scenario == "phase-directory":
+        config["phases"][0]["gates"] = [directory_gate.model_dump(mode="json")]
+    elif scenario in {"contract-directory", "unused-contract-directory"}:
+        config["contracts"] = {
+            "checkpoint_limit": Contract(gates=[directory_gate]).model_dump(mode="json")
+        }
+        if scenario == "contract-directory":
+            config["phases"][0]["contracts"] = ["checkpoint_limit"]
+    elif scenario == "file-size":
+        config["phases"][0]["gates"] = [
+            ArtifactSizeGate(
+                type="artifact_size", source="file", path="checkpoint.bin", max_bytes=1024
+            ).model_dump(mode="json")
+        ]
+    experiment = Experiment.model_validate(config)
+    phase = experiment.phases[0]
+    revisions = _evaluation_semantics(experiment, phase)
+    assert (evaluator in revisions) if evaluator is not None else not revisions
+
+    current_payload = _phase_semantic_payload(experiment, phase, {})
+    legacy_payload = dict(current_payload)
+    legacy_payload.pop("evaluation_semantics", None)
+    legacy_fingerprint = _semantic_payload_digest(legacy_payload)
+    assert (_phase_fingerprint(experiment, phase, {}) != legacy_fingerprint) is (
+        evaluator is not None
+    )
+
+    # Publication identities apply the same conditional revision, including
+    # each compiled study in a suite, without perturbing unaffected histories.
+    from phasesweep.engine import fingerprints as fingerprint_ops
+
+    suite = Suite(
+        suite="evaluation_revision",
+        defaults=SuiteDefaults(
+            workdir=experiment.workdir,
+            trial_command=experiment.trial_command,
+            override_format=experiment.override_format,
+            metric=experiment.metric,
+            constraints=experiment.constraints,
+            contracts=experiment.contracts,
+        ),
+        studies=[StudySpec(name="study", phases=experiment.phases)],
+    )
+    current_experiment_fp = fingerprint_ops._experiment_semantic_fingerprint(experiment)
+    current_suite_fp = fingerprint_ops._suite_fingerprint(suite)
+    with monkeypatch.context() as patch:
+        patch.setattr(fingerprint_ops, "_evaluation_semantics", lambda _experiment, _phase=None: {})
+        legacy_experiment_fp = fingerprint_ops._experiment_semantic_fingerprint(experiment)
+        legacy_suite_fp = fingerprint_ops._suite_fingerprint(suite)
+    assert (current_experiment_fp != legacy_experiment_fp) is (evaluator is not None)
+    assert (current_suite_fp != legacy_suite_fp) is (evaluator is not None)
+
+    study = optuna.create_study()
+    study.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+    study.tell(study.ask(), 1.0)
+    if evaluator is None:
+        assert _verify_fingerprint(study, experiment, phase, {}) == legacy_fingerprint
+    else:
+        with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
+            _verify_fingerprint(study, experiment, phase, {})
+
+    unstamped = optuna.create_study()
+    unstamped.tell(unstamped.ask(), 1.0)
+    if evaluator is None:
+        assert _verify_fingerprint(unstamped, experiment, phase, {}) == legacy_fingerprint
+    else:
+        with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
+            _verify_fingerprint(unstamped, experiment, phase, {})
+
+        # A trainer failure precedes evaluation, so this exact legacy config
+        # can recover without mixing evaluator readings.
+        failed_only = optuna.create_study()
+        failed_only.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+        failed_trial = failed_only.ask()
+        failed_trial.set_user_attr(FAILURE_REASON_ATTR, "non-zero exit code 1")
+        failed_only.tell(failed_trial, state=optuna.trial.TrialState.FAIL)
+        assert _verify_fingerprint(failed_only, experiment, phase, {}) == _phase_fingerprint(
+            experiment, phase, {}
+        )
+        assert failed_only.user_attrs[PHASE_EVALUATION_SEMANTICS_ATTR] == revisions
+
+        # Without a recorded cause, FAIL alone does not prove the affected
+        # evaluator never ran under its old interpretation.
+        for unproven_reason in (None, "", 0):
+            unproven = optuna.create_study()
+            unproven.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+            failed = unproven.ask()
+            if unproven_reason is not None:
+                failed.set_user_attr(FAILURE_REASON_ATTR, unproven_reason)
+            unproven.tell(failed, state=optuna.trial.TrialState.FAIL)
+            with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
+                _verify_fingerprint(unproven, experiment, phase, {})
+            assert unproven.user_attrs["phasesweep_fingerprint"] == legacy_fingerprint
+            assert PHASE_EVALUATION_SEMANTICS_ATTR not in unproven.user_attrs
+
+        # A FAIL caused by the affected evaluator records an old interpretation
+        # even though it has no reusable metric value.
+        failed_evaluation = optuna.create_study()
+        failed_evaluation.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+        evaluated_trial = failed_evaluation.ask()
+        reason = {
+            "objective": "metric extractor: no valid log-regex match",
+            "constraint": "constraint extractor 'memory': no valid log-regex match",
+            "phase-directory": "evidence gates failed: checkpoint directory too large",
+            "contract-directory": "evidence gates failed: checkpoint directory too large",
+        }[scenario]
+        evaluated_trial.set_user_attr(FAILURE_REASON_ATTR, reason)
+        failed_evaluation.tell(evaluated_trial, state=optuna.trial.TrialState.FAIL)
+        with pytest.raises(StudyFingerprintMismatchError, match=evaluator):
+            _verify_fingerprint(failed_evaluation, experiment, phase, {})
+        assert failed_evaluation.user_attrs["phasesweep_fingerprint"] == legacy_fingerprint
+        assert PHASE_EVALUATION_SEMANTICS_ATTR not in failed_evaluation.user_attrs
+
+        if scenario == "constraint":
+            # This study's JSON objective can fail before the affected regex
+            # constraint runs; its failed row is safe to retain.
+            unrelated_failure = optuna.create_study()
+            unrelated_failure.set_user_attr("phasesweep_fingerprint", legacy_fingerprint)
+            json_trial = unrelated_failure.ask()
+            json_trial.set_user_attr(FAILURE_REASON_ATTR, "metric extractor: missing JSON result")
+            unrelated_failure.tell(json_trial, state=optuna.trial.TrialState.FAIL)
+            assert _verify_fingerprint(
+                unrelated_failure, experiment, phase, {}
+            ) == _phase_fingerprint(experiment, phase, {})
+
+    current = optuna.create_study()
+    current_fingerprint = _phase_fingerprint(experiment, phase, {})
+    assert _verify_fingerprint(current, experiment, phase, {}) == current_fingerprint
+    if evaluator is not None:
+        assert current.user_attrs[PHASE_EVALUATION_SEMANTICS_ATTR] == revisions
+    current.tell(current.ask(), 1.0)
+    assert _verify_fingerprint(current, experiment, phase, {}) == current_fingerprint
+
+
+def test_evaluator_revision_preflight_checks_later_independent_studies() -> None:
+    """A late old gate must be refused before an earlier phase can top up."""
+    from phasesweep.engine.resume import _preflight_evaluation_semantics
+
+    experiment = make_experiment(
+        metric=Metric(
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope", objective_name="loss", split="validation", policy="final"
+            )
+        ),
+        phases=[
+            Phase(name="first", n_trials=2),
+            Phase(
+                name="second",
+                n_trials=1,
+                gates=[
+                    ArtifactSizeGate(
+                        type="artifact_size", source="directory", path="checkpoint", max_bytes=1024
+                    )
+                ],
+            ),
+        ],
+    )
+    first = optuna.create_study()
+    second = optuna.create_study()
+    first.tell(first.ask(), 1.0)
+    second.tell(second.ask(), 1.0)
+    before = [trial.number for trial in first.get_trials(deepcopy=False)]
+    with pytest.raises(StudyFingerprintMismatchError, match="Phase 'second'.*directory gate"):
+        _preflight_evaluation_semantics(
+            experiment,
+            from_phase=None,
+            existing_studies={"first": first, "second": second},
+        )
+    assert [trial.number for trial in first.get_trials(deepcopy=False)] == before
+
+
 def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -576,7 +803,10 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     changes, and must not move when the operator merely spells out the
     default block.
     """
-    from phasesweep.engine.guards import _experiment_semantic_fingerprint, _phase_semantic_payload
+    from phasesweep.engine.fingerprints import (
+        _experiment_semantic_fingerprint,
+        _phase_semantic_payload,
+    )
 
     invocation_a = tmp_path / "invocation-a"
     invocation_b = tmp_path / "invocation-b"
@@ -687,15 +917,32 @@ def test_identical_semantic_environment_resumes_persistent_study(
     experiment = _environment_cohort_experiment(
         tmp_path,
         trainer,
-        ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"]),
+        ExecutionContext(
+            inherit_env=[
+                "PHASESWEEP_DATASET_REV",
+                "WANDB_RUN_ID",
+                "PHASESWEEP_TRIAL_ID",
+                "PHASESWEEP_OBJECTIVE_PATH",
+            ]
+        ),
     )
     monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    monkeypatch.setenv("WANDB_RUN_ID", "outer-run-a")
+    monkeypatch.setenv("PHASESWEEP_TRIAL_ID", "outer-trial-a")
+    monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-a.json")
 
     run_experiment(experiment)
+    monkeypatch.setenv("WANDB_RUN_ID", "outer-run-b")
+    monkeypatch.setenv("PHASESWEEP_TRIAL_ID", "outer-trial-b")
+    monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-b.json")
     run_experiment(_with_trial_target(experiment, 2))
 
     study = optuna.load_study(study_name="t::p", storage=experiment.storage)
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
+    base = _environment_identity(experiment)
+    assert not {"WANDB_RUN_ID", "PHASESWEEP_TRIAL_ID", "PHASESWEEP_OBJECTIVE_PATH"} & set(
+        base.values
+    )
 
 
 def test_passthrough_token_rotation_resumes_persistent_study(
@@ -807,7 +1054,7 @@ def test_suite_fingerprint_includes_effective_invocation_cwd(
     first.mkdir()
     second.mkdir()
 
-    from phasesweep.engine.guards import _suite_fingerprint
+    from phasesweep.engine.fingerprints import _suite_fingerprint
 
     monkeypatch.chdir(first)
     first_fingerprint = _suite_fingerprint(suite)
@@ -824,7 +1071,7 @@ def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
     acknowledging an existing study's sampler (review v0.5.18 / finding F7)
     must not invalidate that study.
     """
-    from phasesweep.engine.guards import _phase_semantic_payload
+    from phasesweep.engine.fingerprints import _phase_semantic_payload
 
     plain = make_experiment(sampler=Sampler(type="tpe", seed=0))
     acknowledged = make_experiment(
@@ -1386,15 +1633,26 @@ def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
     assert _artifact_root_binding_path(experiment).is_file()
 
 
-def test_unbound_known_phasesweep_state_names_the_blocking_entry(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "entry",
+    ["generations", "attempts", "Attempts", "P", "study.db", "study.journal"],
+)
+def test_unbound_known_phasesweep_state_names_the_blocking_entry(
+    tmp_path: Path, entry: str
+) -> None:
     """Known engine state still requires explicit adoption and is identifiable."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'studies.db'}",
     )
-    (_experiment_dir(experiment) / "generations").mkdir(parents=True)
+    state_entry = _experiment_dir(experiment) / entry
+    state_entry.parent.mkdir(parents=True, exist_ok=True)
+    if entry in {"study.db", "study.journal"}:
+        state_entry.write_text("legacy ledger\n")
+    else:
+        state_entry.mkdir()
 
-    with pytest.raises(LegacyArtifactRootMigrationRequiredError, match="'generations'"):
+    with pytest.raises(LegacyArtifactRootMigrationRequiredError, match=repr(entry)):
         _validate_artifact_root_binding(experiment, claim_fresh=True)
 
     assert not _artifact_root_binding_path(experiment).exists()
@@ -1493,12 +1751,16 @@ def test_unreadable_artifact_root_binding_never_recommends_rebind(
     assert generation_id is not None
     snapshot = _generation_summary_path(experiment, generation_id).parent / "config.snapshot.yaml"
 
-    patch_path_method_failure(
-        monkeypatch,
-        snapshot,
-        "read_bytes",
-        PermissionError("permission denied"),
-    )
+    import phasesweep.engine.publication_validation as validation_ops
+
+    original_read_unlinked_bytes = validation_ops._read_unlinked_bytes
+
+    def deny_snapshot(path: Path, *, root: Path) -> bytes:
+        if path == snapshot:
+            raise PermissionError("permission denied")
+        return original_read_unlinked_bytes(path, root=root)
+
+    monkeypatch.setattr(validation_ops, "_read_unlinked_bytes", deny_snapshot)
     with pytest.raises(ArtifactRootRebindError) as publication_info:
         _validate_artifact_root_destination(
             experiment,
@@ -1825,21 +2087,22 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     studies would invent a binding for an invocation that never ran a trial
     (re-review v0.5.19 / blocker B3).
     """
-    import phasesweep.engine.guards as guards
+    import phasesweep.engine.artifact_roots as artifact_roots
 
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
     for phase in experiment.phases:
         optuna.create_study(study_name=f"t::{phase.name}", storage=storage, direction="minimize")
-    real_loader = guards._load_existing_phase_study
+    real_loader = artifact_roots._load_existing_phase_study
 
     def _fail_for_lr(exp: Experiment, phase: Phase) -> optuna.Study | None:
         if phase.name == "lr":
             raise RuntimeError("storage went away")
         return real_loader(exp, phase)
 
-    monkeypatch.setattr(guards, "_load_existing_phase_study", _fail_for_lr)
+    monkeypatch.setattr(artifact_roots, "_load_existing_phase_study", _fail_for_lr)
+    monkeypatch.setattr("phasesweep.engine.relocation._load_existing_phase_study", _fail_for_lr)
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)
@@ -1849,6 +2112,280 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     for phase in experiment.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
         assert ARTIFACT_ROOT_ATTR not in study.user_attrs
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal", "auto"])
+def test_published_phase_rejects_a_missing_storage_ledger(
+    tmp_path: Path,
+    backend: str,
+) -> None:
+    """A lost published ledger cannot be mistaken for a never-run phase."""
+    trainer = write_constant_trainer(tmp_path)
+    suffix = "db" if backend == "sqlite" else "journal"
+    configured_storage = (
+        "auto" if backend == "auto" else f"{backend}:///{tmp_path / f'studies.{suffix}'}"
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=configured_storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    assert experiment.resolved_storage is not None
+    if storage_backend(experiment.resolved_storage) == "sqlite":
+        ledger = sqlite_database_path(experiment.resolved_storage)
+        assert ledger is not None
+    else:
+        ledger = Path(file_url_path(experiment.resolved_storage))
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    ledger.unlink()
+
+    with pytest.raises(PublishedStudyMissingError) as excinfo:
+        run_experiment(experiment)
+
+    assert "records a selected trial for phase 'p'" in str(excinfo.value)
+    assert "persistent study is missing" in str(excinfo.value)
+    assert "Cleanup state is therefore unknown" not in str(excinfo.value)
+    assert "Restore the original complete storage ledger and study" in str(excinfo.value)
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_id(experiment) == published
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+    assert not ledger.exists()
+
+
+@pytest.mark.parametrize("replacement", ["absent", "empty"])
+def test_published_phase_rejects_a_missing_or_empty_named_study(
+    tmp_path: Path,
+    replacement: str,
+) -> None:
+    """Deleting or replacing one published study cannot restart trial zero."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    optuna.delete_study(study_name="t::p", storage=storage)
+    if replacement == "empty":
+        optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
+
+    with pytest.raises(PublishedStudyMissingError) as excinfo:
+        run_experiment(experiment)
+
+    expected = "is missing" if replacement == "absent" else "contains no trials"
+    assert expected in str(excinfo.value)
+    assert "continuing could reuse incomplete or unrelated trials" in str(excinfo.value)
+    assert "Cleanup state is therefore unknown" not in str(excinfo.value)
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_id(experiment) == published
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+
+
+def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> None:
+    """A retained winner row alone cannot authorize replacement trials."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=3,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    with sqlite3.connect(tmp_path / "studies.db") as connection:
+        trial_ids = connection.execute("SELECT trial_id FROM trials WHERE number > 0").fetchall()
+        assert len(trial_ids) == 2
+        for statement in (
+            "DELETE FROM trial_heartbeats WHERE trial_id = ?",
+            "DELETE FROM trial_intermediate_values WHERE trial_id = ?",
+            "DELETE FROM trial_params WHERE trial_id = ?",
+            "DELETE FROM trial_system_attributes WHERE trial_id = ?",
+            "DELETE FROM trial_user_attributes WHERE trial_id = ?",
+            "DELETE FROM trial_values WHERE trial_id = ?",
+            "DELETE FROM trials WHERE trial_id = ?",
+        ):
+            connection.executemany(statement, trial_ids)
+
+    status = read_status(experiment)
+    assert status["phases"][0]["published_study_unavailable"] is True
+    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+
+    with pytest.raises(PublishedStudyMissingError, match="published completion boundary"):
+        run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_id(experiment) == published
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+
+
+def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The published-phase existence read keeps strict storage-error semantics."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    def fail_trial_read(*_args: object, **_kwargs: object) -> list[optuna.trial.FrozenTrial]:
+        raise RuntimeError("storage went away during trial read")
+
+    monkeypatch.setattr(optuna.Study, "get_trials", fail_trial_read)
+
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        run_experiment(experiment)
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, StudyStorageUnavailableError)
+    assert "published phase 'p'" in str(cause)
+    assert isinstance(cause.__cause__, RuntimeError)
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+
+
+@pytest.mark.parametrize("replacement", ["absent", "empty"])
+@pytest.mark.parametrize("missing_phase", ["arch", "lr"])
+def test_published_study_requirement_starts_at_from_phase(
+    tmp_path: Path, replacement: str, missing_phase: str
+) -> None:
+    """Skipped winners survive ledger loss; phases that execute still need history."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
+    original = run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    generation_before = _generation_path(experiment).read_bytes()
+    optuna.delete_study(study_name=f"t::{missing_phase}", storage=storage)
+    if replacement == "empty":
+        optuna.create_study(study_name=f"t::{missing_phase}", storage=storage, direction="minimize")
+
+    if missing_phase == "lr":
+        with pytest.raises(PublishedStudyMissingError, match="phase 'lr'"):
+            run_experiment(experiment, from_phase="lr")
+        assert _generation_path(experiment).read_bytes() == generation_before
+        assert _last_successful_generation_id(experiment) == published
+    else:
+        winners = run_experiment(experiment, from_phase="lr")
+        assert winners["arch"].params == original["arch"].params
+        assert winners["arch"].trial_number == original["arch"].trial_number
+        assert _last_successful_generation_id(experiment) != published
+        if replacement == "absent":
+            assert "t::arch" not in optuna.get_all_study_names(storage=storage)
+        else:
+            assert not optuna.load_study(study_name="t::arch", storage=storage).trials
+        assert len(optuna.load_study(study_name="t::lr", storage=storage).trials) == 1
+
+
+@pytest.mark.parametrize("tree_state", ["fresh", "published", "missing-ledger"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_invalid_from_phase_is_rejected_before_state_writes(
+    tmp_path: Path, tree_state: str, dry_run: bool
+) -> None:
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    if tree_state != "fresh":
+        run_experiment(experiment)
+        if tree_state == "missing-ledger":
+            (_experiment_dir(experiment) / "study.db").unlink()
+    pointer = _generation_path(experiment)
+    pointer_before = pointer.read_bytes() if pointer.exists() else None
+    generations = _experiment_dir(experiment) / "generations"
+    generations_before = set(generations.iterdir()) if generations.exists() else set()
+
+    with pytest.raises(ValueError, match="Unknown --from-phase value 'bogus'"):
+        run_experiment(experiment, from_phase="bogus", dry_run=dry_run)
+
+    assert (pointer.read_bytes() if pointer.exists() else None) == pointer_before
+    assert (set(generations.iterdir()) if generations.exists() else set()) == generations_before
+    if tree_state == "fresh":
+        assert not Path(experiment.workdir).exists()
+    elif tree_state == "missing-ledger":
+        assert not (_experiment_dir(experiment) / "study.db").exists()
+
+
+def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing study is only a static refusal when execution has not started."""
+    import phasesweep.engine.run as engine_run
+
+    trainer = write_constant_trainer(tmp_path)
+    ledger = tmp_path / "studies.db"
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{ledger}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+
+    def lose_ledger(*_args: object, **_kwargs: object) -> None:
+        ledger.unlink()
+        raise RuntimeError("execution failed after the ledger disappeared")
+
+    monkeypatch.setattr(engine_run, "_run_experiment_inner", lose_ledger)
+    reports = []
+    with pytest.raises(ProcessCleanupUncertainError) as excinfo:
+        run_experiment(experiment, terminal_callback=reports.append)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert reports[0].cleanup_confirmed is False
+    assert _last_successful_generation_id(experiment) == published
 
 
 def _exception_chain(error: BaseException) -> list[BaseException]:
@@ -1923,7 +2460,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     unpatched second invocation pins the same refusal for the ordinary
     wrong-root case: it conflicts before the registry scan can reap anything.
     """
-    import phasesweep.engine.guards as guards
+    import phasesweep.engine.artifact_roots as artifact_roots
 
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
@@ -1942,7 +2479,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     assert entry_path.is_file()
 
     experiment_b = experiment_a.model_copy(update={"workdir": str(tmp_path / "runs_b")})
-    real_loader = guards._load_existing_phase_study
+    real_loader = artifact_roots._load_existing_phase_study
     calls = {"count": 0}
 
     def _fail_first_read(exp: Experiment, phase: Phase) -> optuna.Study | None:
@@ -1952,7 +2489,8 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
         return real_loader(exp, phase)
 
     with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(guards, "_load_existing_phase_study", _fail_first_read)
+        patched.setattr(artifact_roots, "_load_existing_phase_study", _fail_first_read)
+        patched.setattr("phasesweep.engine.relocation._load_existing_phase_study", _fail_first_read)
         with pytest.raises(ProcessCleanupUncertainError) as excinfo:
             run_experiment(experiment_b)
 
@@ -2044,21 +2582,67 @@ def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: P
     assert _sqlite_study_exists(schemaless, schemaless.phases[0]) is False
 
 
-def test_in_memory_storage_never_binds_or_conflicts(tmp_path: Path) -> None:
-    """Nothing persists to conflict, so an in-memory run stays workdir-mobile."""
+@pytest.mark.parametrize("storage", [None, "sqlite:///:memory:"])
+def test_fresh_and_repeated_in_memory_roots_never_bind_or_conflict(
+    tmp_path: Path, storage: str | None
+) -> None:
+    """In-memory runs may repeat or move because they create no durable binding."""
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
         workdir=tmp_path / "runs_a",
+        storage=storage,
         trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
         override_format="argparse",
         n_trials=1,
     )
     run_experiment(experiment)
+    run_experiment(experiment)
     moved = experiment.model_copy(update={"workdir": str(tmp_path / "runs_b")})
+    run_experiment(moved)
     run_experiment(moved)
 
     assert _last_successful_generation_id(experiment) is not None
     assert _last_successful_generation_id(moved) is not None
+    assert not _artifact_root_binding_path(experiment).exists()
+    assert not _artifact_root_binding_path(moved).exists()
+
+
+@pytest.mark.parametrize("in_memory_storage", [None, "sqlite:///:memory:"])
+def test_persistent_bound_root_rejects_an_in_memory_configuration(
+    tmp_path: Path, in_memory_storage: str | None
+) -> None:
+    """A durable publication tree cannot be reused with an ephemeral ledger."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    owner = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+    )
+    run_experiment(owner)
+    pointer_before = _generation_path(owner).read_bytes()
+    ledger_before = sqlite_database_path(storage)
+    assert ledger_before is not None
+    ledger_bytes_before = ledger_before.read_bytes()
+    status_before = read_status(owner)
+
+    offered = owner.model_copy(update={"storage": in_memory_storage})
+    with pytest.raises(
+        ArtifactRootConflictError, match="in-memory configuration cannot reuse"
+    ) as excinfo:
+        run_experiment(offered)
+    assert str(excinfo.value).endswith("Nothing was written.")
+    with pytest.raises(
+        ArtifactRootConflictError, match="in-memory configuration cannot reuse"
+    ) as excinfo:
+        read_status(offered)
+    assert str(excinfo.value).endswith("Nothing was written.")
+
+    assert _generation_path(owner).read_bytes() == pointer_before
+    assert ledger_before.read_bytes() == ledger_bytes_before
+    assert read_status(owner) == status_before
 
 
 def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: Path) -> None:
@@ -2096,7 +2680,7 @@ def test_version_audit_metadata_is_separate_from_fingerprint_schema() -> None:
     """
     from importlib.metadata import version as pkg_version
 
-    from phasesweep.engine.guards import _phase_semantic_payload
+    from phasesweep.engine.fingerprints import _phase_semantic_payload
 
     assert __version__ == pkg_version("phasesweep")
 
@@ -2218,8 +2802,10 @@ def test_from_phase_preflight_consumes_run_deadline(
     resumed = experiment.model_copy(update={"timeout_seconds_per_run": 1.0})
 
     run_module = importlib.import_module("phasesweep.engine.run")
+    resume_ops = importlib.import_module("phasesweep.engine.resume")
+    artifact_io = importlib.import_module("phasesweep.engine.artifacts")
     clock = {"now": 100.0}
-    original_load_winner = run_module._load_winner
+    original_load_winner = artifact_io._load_winner
 
     def delayed_load_winner(*args: object, **kwargs: object) -> Winner:
         winner = original_load_winner(*args, **kwargs)
@@ -2231,7 +2817,8 @@ def test_from_phase_preflight_consumes_run_deadline(
         "time",
         SimpleNamespace(monotonic=lambda: clock["now"]),
     )
-    monkeypatch.setattr(run_module, "_load_winner", delayed_load_winner)
+    monkeypatch.setattr(resume_ops, "time", run_module.time)
+    monkeypatch.setattr(artifact_io, "_load_winner", delayed_load_winner)
 
     with pytest.raises(TimeoutError, match="before phase 'lr' could start"):
         run_experiment(resumed, from_phase="lr")
@@ -2263,7 +2850,7 @@ def test_fresh_run_preflight_consumes_run_deadline(
         "time",
         SimpleNamespace(monotonic=lambda: clock["now"]),
     )
-    monkeypatch.setattr(run_module, "_preflight_existing_studies", delayed_preflight)
+    monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", delayed_preflight)
 
     with pytest.raises(TimeoutError, match="before phase 'p' could start"):
         run_experiment(experiment)
@@ -2280,6 +2867,10 @@ def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> 
         data["phase_fingerprint"] = "0" * 64
         return "different phase config"
 
+    def malformed_fingerprint(data: dict) -> str:
+        data["phase_fingerprint"] = 7
+        return "invalid phase_fingerprint"
+
     def strip_generation_id(data: dict) -> str:
         del data["generation_id"]
         return "no valid generation_id"
@@ -2295,6 +2886,7 @@ def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> 
     cases = (
         ("missing-fingerprint", strip_fingerprint),
         ("tampered-fingerprint", tamper_fingerprint),
+        ("malformed-fingerprint", malformed_fingerprint),
         ("legacy-generation", strip_generation_id),
         ("legacy-attempt", strip_attempt_id),
         ("legacy-source", strip_winner_source),
@@ -2314,6 +2906,7 @@ def test_load_winner_refuses_incompatible_legacy_winner_yaml(tmp_path: Path) -> 
         # manifest before this record-level validation is reached.
         _last_successful_generation_path(exp).unlink()
         _generation_path(exp).unlink()
+        shutil.rmtree(_generations_dir(exp))
 
         arch_winner_path = _published_winner_path(exp, "arch")
         assert arch_winner_path is not None
@@ -2469,7 +3062,7 @@ def test_load_winner_warns_once_on_inherited_environment_drift(
     diverged: bool,
 ) -> None:
     """Inheriting a winner produced under a different environment is reported once."""
-    monkeypatch.setattr("phasesweep.engine.state._ENVIRONMENT_DRIFT_WARNED", set())
+    monkeypatch.setattr("phasesweep.engine.artifacts._ENVIRONMENT_DRIFT_WARNED", set())
     exp = make_experiment(workdir=tmp_path / "runs")
     payload = _environment_free_winner_payload(exp)
     payload["trainer_env_digest"] = "0" * 64 if diverged else _environment_identity(exp).digest
@@ -2478,12 +3071,14 @@ def test_load_winner_warns_once_on_inherited_environment_drift(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
 
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.state"):
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.artifacts"):
         for _ in range(2):
             _load_winner(exp, exp.phases[0], {})
 
     warnings = [r for r in caplog.records if "environment" in r.getMessage()]
     assert len(warnings) == (1 if diverged else 0)
+    if warnings:
+        assert warnings[0].name == "phasesweep.engine.artifacts"
 
 
 def test_save_winner_replace_failure_preserves_existing_file(

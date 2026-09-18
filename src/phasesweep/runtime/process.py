@@ -42,6 +42,7 @@ from pathlib import Path
 from types import FrameType
 from typing import IO, Any
 
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import strict_json_loads
@@ -808,18 +809,17 @@ def _wait_for_guardian_exit(proc: subprocess.Popen) -> bool:
 
 
 def _abort_launch(proc: subprocess.Popen, pgid: int | None) -> bool:
-    """Kill and unregister a subprocess whose launch failed before hand-off.
+    """Kill and unregister a subprocess after launch or supervision fails.
 
-    Shared by both launch-failure paths — the readiness-wait failure in
-    :func:`_spawn_blocked_supervisor` and the identity/payload-delivery
-    failure in :func:`run_supervised` — which otherwise ran this identical
-    three-step sequence independently. Resolves the target process group
-    (the registered ``pgid``, or the bare PID when registration never
-    happened), kills it, and unregisters it from the global registry if it
-    was registered.
+    Shared by the readiness-wait failure in
+    :func:`_spawn_blocked_supervisor` and the identity, payload-delivery, and
+    post-launch wait failures in :func:`run_supervised`. Resolves the target
+    process group (the registered ``pgid``, or the bare PID when registration
+    never happened), kills it, and unregisters it from the global registry if
+    it was registered.
 
     Args:
-        proc: The subprocess whose launch is being aborted.
+        proc: The subprocess whose launch or supervision is being aborted.
         pgid: The process-group ID it was registered under, or ``None`` if
             registration never completed.
 
@@ -850,6 +850,29 @@ class ProcessResult:
     duration_seconds: float
     failure_reason: str | None = None
     cleanup_confirmed: bool = True
+    timeout_capped_by_wallclock: bool = False
+
+
+def _choose_process_deadline(
+    *,
+    started: float,
+    timeout: float | None,
+    wallclock_deadline: float | None,
+) -> tuple[float | None, bool]:
+    """Choose the earlier subprocess or phase/run deadline.
+
+    :param float started: Monotonic timestamp at supervised-launch entry.
+    :param float | None timeout: Relative per-trial subprocess limit.
+    :param float | None wallclock_deadline: Absolute phase/run deadline.
+    :return tuple[float | None, bool]: Effective absolute deadline and whether
+        the phase/run deadline limits it.
+    """
+    trial_deadline = None if timeout is None else started + timeout
+    if wallclock_deadline is not None and (
+        trial_deadline is None or wallclock_deadline <= trial_deadline
+    ):
+        return wallclock_deadline, True
+    return trial_deadline, False
 
 
 class _LaunchDeadlineExpired(Exception):
@@ -1084,13 +1107,13 @@ def _record_attempt_exited(
     trial_dir: Path,
     *,
     attempt_id: str,
-    return_code: int,
+    return_code: int | None,
 ) -> None:
     """Best-effort durable transition to the ``exited`` lifecycle state.
 
-    Called only after the supervised group is confirmed gone. A write failure
-    must not fail the trial: the retained identity file still lets recovery
-    verify the (now dead) process the slow way.
+    Called after the supervised group is confirmed gone. A write failure must
+    not replace the primary trial outcome because the retained process identity
+    still lets recovery verify the process the slow way.
 
     Args:
         trial_dir: Per-trial directory holding the lifecycle record.
@@ -1156,16 +1179,46 @@ def _encode_launch_payload(cmd: str, env: dict[str, str], cwd: str | None = None
     return f"{len(body):0{_supervisor._HEADER_LEN}d}".encode("ascii") + body
 
 
-def _write_all(fd: int, data: bytes) -> None:
-    """Write every byte of ``data`` to ``fd``, looping past partial pipe writes.
+def _write_all(
+    fd: int,
+    data: bytes,
+    *,
+    deadline: float | None = None,
+    pid: int = -1,
+) -> None:
+    """Write every byte of ``data`` without exceeding a launch deadline.
 
     :param int fd: Open file descriptor to write to.
     :param bytes data: Bytes to write in full.
+    :param float | None deadline: Optional absolute ``time.monotonic`` deadline.
+    :param int pid: Supervisor PID reported when ``deadline`` expires.
+    :raises _LaunchDeadlineExpired: If the pipe cannot accept the payload before
+        ``deadline``.
     :raises OSError: If the underlying ``os.write`` call fails.
     """
+    import time
+
     view = memoryview(data)
+    if deadline is not None:
+        os.set_blocking(fd, False)
     while view:
-        written = os.write(fd, view)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _LaunchDeadlineExpired(
+                    "trial launch deadline expired while delivering the trainer payload",
+                    pid=pid,
+                )
+            _, writable, _ = select.select([], [fd], [], remaining)
+            if not writable or time.monotonic() >= deadline:
+                raise _LaunchDeadlineExpired(
+                    "trial launch deadline expired while delivering the trainer payload",
+                    pid=pid,
+                )
+        try:
+            written = os.write(fd, view)
+        except BlockingIOError:
+            continue
         view = view[written:]
 
 
@@ -1183,7 +1236,7 @@ def _read_pipe_frame(fd: int, size: int, *, deadline: float) -> bytes | None:
     remaining = size
     while remaining:
         readable, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
-        if not readable:
+        if not readable or time.monotonic() >= deadline:
             return None
         chunk = os.read(fd, remaining)
         if not chunk:
@@ -1247,6 +1300,8 @@ def _spawn_blocked_supervisor(
         RuntimeError: If the supervisor does not signal readiness within
             ``_SUPERVISOR_READY_TIMEOUT_SECONDS``, or signals something other
             than ``b"R"``.
+        UnsafeProcessCleanupError: A supervisor was spawned, launch failed or
+            was interrupted, and terminating that process could not be confirmed.
 
     """
     import time
@@ -1304,7 +1359,7 @@ def _spawn_blocked_supervisor(
         status_read = ready_read
         ready_read = -1
         return proc, pgid, ack_write, status_read
-    except Exception as exc:
+    except BaseException as exc:
         if ack_write >= 0:
             closed_fd = ack_write
             ack_write = -1
@@ -1313,6 +1368,11 @@ def _spawn_blocked_supervisor(
             confirmed = _abort_launch(proc, pgid)
             if isinstance(exc, _LaunchDeadlineExpired):
                 exc.cleanup_confirmed = confirmed
+            elif not confirmed:
+                raise UnsafeProcessCleanupError(
+                    "Trial supervisor launch was interrupted after Popen, and cleanup "
+                    "could not be confirmed."
+                ) from exc
         raise
     finally:
         for fd in (ready_read, ready_write, ack_read):
@@ -1329,6 +1389,7 @@ def run_supervised(
     timeout: float | None,
     trial_dir: Path,
     attempt_id: str,
+    wallclock_deadline: float | None = None,
     cwd: str | None = None,
     gpu_lease_fds: Collection[int] = (),
 ) -> ProcessResult:
@@ -1353,16 +1414,17 @@ def run_supervised(
 
     On timeout: SIGTERM -> grace -> SIGKILL on the entire group.
 
-    ``timeout`` is the total launch-plus-execution budget, converted to an
+    ``timeout`` is the per-trial launch-plus-execution budget, converted to an
     absolute ``time.monotonic()`` deadline at entry (review v0.5.16 /
-    blocker 6). Every stage consumes it: the supervisor readiness wait is
-    capped to the remaining budget, the deadline is re-checked after
-    identity persistence and *before* the trainer payload crosses the ack
-    pipe — an expired deadline aborts the blocked supervisor and returns a
-    timeout without ever starting the trainer — and the wait for the trainer
-    root uses the recomputed remainder, never the original duration. Cleanup
-    grace after a timeout or an in-budget root exit is explicitly
-    post-deadline time.
+    blocker 6). ``wallclock_deadline`` carries the already-running phase/run
+    budget through work performed before this function. The earlier deadline
+    wins. Every supervised stage consumes it: the supervisor readiness wait
+    is capped to the remainder, the deadline is re-checked after identity
+    persistence and *before* the trainer payload crosses the ack pipe — an
+    expired deadline aborts the blocked supervisor and returns a timeout
+    without ever starting the trainer — and the wait for the trainer root
+    uses the recomputed remainder. Cleanup grace after a timeout or an
+    in-budget root exit is explicitly post-deadline time.
 
     Once the supervisor is spawned, launch failures — an expired deadline, a
     failed identity write, a failed payload delivery — never propagate: the
@@ -1378,6 +1440,8 @@ def run_supervised(
             entry (launch overhead included), or ``None`` for no timeout.
         trial_dir: Per-trial directory where ``process_identity.json`` is written.
         attempt_id: Immutable attempt identity already persisted in Optuna.
+        wallclock_deadline: Optional absolute ``time.monotonic()`` phase/run
+            deadline. Work before this call has already consumed it.
         cwd: Optional working directory the supervisor changes into before
             exec'ing the trainer, delivered over the ack pipe with the rest
             of the launch payload (review v0.5.17 / blocker 4). ``None``
@@ -1397,13 +1461,26 @@ def run_supervised(
     Raises:
         RuntimeError: The supervisor never signalled readiness, or signalled an
             unexpected byte, so no process group was ever created.
-        OSError: The supervisor process or its pipes could not be created.
+        OSError: The supervisor process or its pipes could not be created, or
+            an unexpected post-launch I/O failure occurred after its process
+            group was cleaned and reaped.
+        UnsafeProcessCleanupError: An unexpected failure after launch occurred
+            and cleanup of the trainer process group could not be confirmed.
 
     """
     import time
 
     started = time.monotonic()
-    deadline = None if timeout is None else started + timeout
+    deadline, timeout_capped_by_wallclock = _choose_process_deadline(
+        started=started,
+        timeout=timeout,
+        wallclock_deadline=wallclock_deadline,
+    )
+    timeout_reason = (
+        "phase/run wallclock deadline exceeded"
+        if timeout_capped_by_wallclock
+        else f"timeout after {timeout}s"
+    )
 
     # The launch + register + identity write must be atomic from the
     # signal handler's perspective. Signal deferral MUST come first so that
@@ -1462,7 +1539,12 @@ def run_supervised(
             # Only now does the trainer command and full trainer environment
             # cross into the supervisor — after identity is durable, over the
             # ack pipe as a framed JSON payload (review v0.5.15 / blocker 1).
-            _write_all(ack_write, _encode_launch_payload(cmd, env, cwd))
+            _write_all(
+                ack_write,
+                _encode_launch_payload(cmd, env, cwd),
+                deadline=deadline,
+                pid=pgid,
+            )
             os.close(ack_write)
             ack_write = None
     except _LaunchDeadlineExpired as exc:
@@ -1493,17 +1575,44 @@ def run_supervised(
             timed_out=True,
             pid=pid,
             duration_seconds=time.monotonic() - started,
-            failure_reason=f"timeout after {timeout}s before trainer launch",
+            failure_reason=f"{timeout_reason} before trainer launch",
             cleanup_confirmed=cleanup_confirmed,
+            timeout_capped_by_wallclock=timeout_capped_by_wallclock,
         )
-    except Exception as exc:
+    except BaseException as exc:
         if ack_write is not None:
             os.close(ack_write)
         if status_read is not None:
             os.close(status_read)
             status_read = None
         if proc is None:
+            if isinstance(exc, UnsafeProcessCleanupError):
+                # The spawn helper owned a child before it could return the
+                # Popen handle. Its failed cleanup is intentionally not
+                # rewritten as a childless terminal attempt.
+                raise
+            # No child identity exists to support the best-effort fallback used
+            # after a spawned group exits. This transition is the sole durable
+            # proof that recovery may settle the childless attempt.
+            try:
+                write_attempt_lifecycle(
+                    trial_dir,
+                    attempt_id=attempt_id,
+                    state="exited",
+                    return_code=None,
+                    cleanup_confirmed=True,
+                )
+            except OSError as write_error:
+                raise write_error from exc
             raise
+        if isinstance(exc, PhaseSweepShutdown):
+            # The installed handler already made the authoritative cleanup
+            # attempt. Remove its now-settled registry entry before preserving
+            # the structured shutdown evidence unchanged.
+            if pgid is not None:
+                _unregister(pgid)
+            raise
+        control_flow_exception = not isinstance(exc, Exception)
         target_pgid = pgid if pgid is not None else proc.pid
         # Covers both a failed identity write and a failed payload delivery;
         # the substring "failed to persist process identity" is kept stable
@@ -1524,6 +1633,13 @@ def run_supervised(
                 attempt_id=attempt_id,
                 return_code=proc.returncode if proc.returncode is not None else -9,
             )
+        if control_flow_exception:
+            if not cleanup_confirmed:
+                raise UnsafeProcessCleanupError(
+                    f"Trial launch was interrupted after starting process group "
+                    f"{target_pgid}, and cleanup could not be confirmed."
+                ) from exc
+            raise
         duration = time.monotonic() - started
         return ProcessResult(
             return_code=proc.returncode if proc.returncode is not None else -9,
@@ -1532,6 +1648,7 @@ def run_supervised(
             duration_seconds=duration,
             failure_reason=launch_failure_reason,
             cleanup_confirmed=cleanup_confirmed,
+            timeout_capped_by_wallclock=timeout_capped_by_wallclock,
         )
 
     assert proc is not None
@@ -1544,13 +1661,18 @@ def run_supervised(
 
     try:
         root_status: bytes | None
-        if deadline is None:
+        if deadline is not None and time.monotonic() >= deadline:
+            # Payload delivery itself consumes the total trial budget. Do not
+            # let an immediately available exit byte turn post-deadline work
+            # into an in-budget success.
+            root_status = None
+        elif deadline is None:
             root_status = os.read(status_read, 1)
         else:
             root_status = _read_pipe_frame(status_read, 1, deadline=deadline)
         if root_status is None and deadline is not None and time.monotonic() >= deadline:
             timed_out = True
-            failure_reason = f"timeout after {timeout}s"
+            failure_reason = timeout_reason
             log.warning("Trial PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
@@ -1603,18 +1725,61 @@ def run_supervised(
                 )
                 cleanup_confirmed = _kill_group(pgid, proc)
 
+    except PhaseSweepShutdown:
+        # The signal handler already made the authoritative cleanup attempt and
+        # attached its evidence to this control-flow exception. Preserve it
+        # unchanged; the engine uses that report when recording cancellation.
+        raise
+    except BaseException as exc:
+        # Once the trainer payload crossed the pipe, every exit from this wait
+        # owns a live process group until cleanup proves otherwise. An I/O or
+        # runtime failure must not unregister the group and let it continue
+        # outside both normal supervision and shutdown-handler tracking.
+        try:
+            cleanup_confirmed = _abort_launch(proc, pgid)
+        except PhaseSweepShutdown:
+            raise
+        except BaseException:
+            log.exception(
+                "Unexpected failure while waiting for trial process group %d, followed by "
+                "an exception during cleanup",
+                pgid,
+            )
+            raise UnsafeProcessCleanupError(
+                f"Unexpected failure while waiting for trial process group {pgid}; "
+                "cleanup could not be confirmed."
+            ) from exc
+        if not cleanup_confirmed:
+            raise UnsafeProcessCleanupError(
+                f"Unexpected failure while waiting for trial process group {pgid}; "
+                "cleanup could not be confirmed."
+            ) from exc
+        try:
+            _record_attempt_exited(
+                trial_dir,
+                attempt_id=attempt_id,
+                return_code=proc.returncode if proc.returncode is not None else -9,
+            )
+        except Exception:
+            log.exception(
+                "Trial process group %d was cleaned after an unexpected wait failure, but "
+                "its exited lifecycle could not be persisted",
+                pgid,
+            )
+        raise
     finally:
         if status_read is not None:
-            os.close(status_read)
+            with contextlib.suppress(OSError):
+                os.close(status_read)
         _unregister(pgid)
 
     # The identity record is deliberately RETAINED on clean exit (review
     # v0.5.17 / blocker 2 gap B): the orchestrator can still die between
     # here and the Optuna terminal commit (evidence extraction, gates), and
     # recovery must be able to distinguish "safely exited" from "identity
-    # missing". The durable 'exited' transition records that the whole group
-    # is confirmed gone; it is only written outside the exception paths
-    # above, so an interrupted wait can never claim a confirmed exit.
+    # missing". Both this normal path and the failed-wait cleanup path above
+    # write the durable 'exited' transition only after confirming that the
+    # whole group is gone; a wait exception alone is never proof of exit.
     if cleanup_confirmed:
         _record_attempt_exited(
             trial_dir,
@@ -1630,6 +1795,7 @@ def run_supervised(
         duration_seconds=duration,
         failure_reason=failure_reason,
         cleanup_confirmed=cleanup_confirmed,
+        timeout_capped_by_wallclock=timeout_capped_by_wallclock,
     )
 
 

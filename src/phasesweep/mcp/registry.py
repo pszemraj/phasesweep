@@ -22,10 +22,10 @@ from typing import Any, Literal, TypeAlias
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from phasesweep.config import Experiment, Suite
-from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine.state import _experiment_dir
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import (
@@ -142,7 +142,7 @@ class _Catalog(_CatalogModel):
     # Cap on simultaneously-running sweeps across ALL experiments. Defaults to 1
     # because the common deployment is a single GPU, where a second concurrent
     # sweep would contend for the device. Raise it on multi-GPU hosts.
-    max_concurrent_runs: int = Field(default=1, ge=1)
+    max_concurrent_runs: ConfigInt = Field(default=1, ge=1)
     experiments: list[_Entry] = Field(min_length=1)
 
 
@@ -277,7 +277,7 @@ def _require_mcp_stable_paths(
         ``execution.cwd`` is relative, the storage backend is not local SQLite
         or JournalStorage, or its file path is empty or relative.
     """
-    storage = experiment.storage
+    storage = experiment.resolved_storage
     if storage is None or storage_is_in_memory(storage):
         raise CatalogError(
             f"{experiment_id!r}: storage must be persistent; "
@@ -327,7 +327,10 @@ def _require_mcp_stable_paths(
             "monitored across detached processes",
             suggestion=_suggest_storage(config_dir),
         )
-    if not Path(raw_path).expanduser().is_absolute():
+    storage_path = Path(raw_path)
+    if backend == "journal":
+        storage_path = storage_path.expanduser()
+    if not storage_path.is_absolute():
         raise CatalogError(
             f"{experiment_id!r}: MCP experiments must use an absolute {backend} "
             "storage path; relative storage URLs depend on the server launch "
@@ -439,7 +442,7 @@ def _claim_catalog_entry_identity(
         )
     namespace_owners[namespace] = loaded.id
 
-    storage_identity = canonical_storage_identity(loaded.experiment.storage)
+    storage_identity = canonical_storage_identity(loaded.experiment.resolved_storage)
     if storage_identity is None:
         return
     storage_key = f"{storage_identity}::{loaded.experiment.experiment}"

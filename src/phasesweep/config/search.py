@@ -4,24 +4,67 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from fractions import Fraction
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from phasesweep.config.common import _Frozen, _require_finite
+from phasesweep.config.common import ConfigFloat, ConfigInt, _Frozen, _require_finite
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
+
+
+_OPTUNA_EXACT_INT_LIMIT = 1 << 53
+_MAX_GRID_CARDINALITY = 4_096
+
+
+def _float_step_count(low: float, high: float, step: float) -> int:
+    """Return the exact decimal-string step count, rejecting off-lattice bounds.
+
+    :param float low: Inclusive lower bound.
+    :param float high: Inclusive upper bound.
+    :param float step: Positive finite spacing.
+    :raises ValueError: The configured high is not on the step lattice.
+    :return int: Number of steps between the bounds, without enumeration.
+    """
+    ratio = (Fraction(str(high)) - Fraction(str(low))) / Fraction(str(step))
+    if ratio.denominator != 1:
+        raise ValueError(
+            "float param: (high - low) / step must be an integer. "
+            f"Got low={low}, high={high}, step={step} (ratio={ratio}). "
+            "Pick a step that evenly divides the interval."
+        )
+    return ratio.numerator
+
+
+def _validate_optuna_integer_domain(low: int, high: int) -> None:
+    """Reject integer bounds that cannot round-trip through Optuna numeric storage.
+
+    :param int low: Inclusive lower bound.
+    :param int high: Inclusive upper bound.
+    :raises ValueError: If the bounds are reversed or exceed the exact integer
+        range of Optuna's floating-point internal representation.
+    """
+    if low > high:
+        raise ValueError(f"int param: low ({low}) > high ({high})")
+    if low < -_OPTUNA_EXACT_INT_LIMIT or high > _OPTUNA_EXACT_INT_LIMIT:
+        raise ValueError(
+            "numeric integer search bounds must stay within "
+            f"[{-_OPTUNA_EXACT_INT_LIMIT}, {_OPTUNA_EXACT_INT_LIMIT}] so every "
+            "value can round-trip exactly through Optuna; use categorical choices "
+            "for larger integers"
+        )
 
 
 class FloatParam(_Frozen):
     """Continuous float search parameter with optional log-scale and step."""
 
     type: Literal["float"]
-    low: float
-    high: float
+    low: ConfigFloat
+    high: ConfigFloat
     log: bool = False
-    step: float | None = None
+    step: ConfigFloat | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> FloatParam:
@@ -33,7 +76,8 @@ class FloatParam(_Frozen):
         Raises:
             ValueError: ``low`` or ``high`` is non-finite, ``low > high``,
                 ``log`` is set with ``low <= 0``, ``step`` is non-finite or
-                ``<= 0``, or ``log`` and ``step`` are combined.
+                ``<= 0``, ``log`` and ``step`` are combined, or the stepped
+                interval does not include the configured high bound.
 
         """
         _require_finite("float param low", self.low)
@@ -48,6 +92,8 @@ class FloatParam(_Frozen):
                 raise ValueError("float param step must be > 0")
         if self.log and self.step is not None:
             raise ValueError("float param cannot use both log=true and step")
+        if self.step is not None:
+            _float_step_count(self.low, self.high, self.step)
         return self
 
 
@@ -55,26 +101,27 @@ class IntParam(_Frozen):
     """Integer search parameter with optional log-scale and step."""
 
     type: Literal["int"]
-    low: int
-    high: int
+    low: ConfigInt
+    high: ConfigInt
     log: bool = False
-    step: int = 1
+    step: ConfigInt = 1
 
     @model_validator(mode="after")
     def _validate(self) -> IntParam:
-        """Reject ``low > high``, log+nonpositive, non-positive step, log+step!=1.
+        """Reject unsafe bounds, log+nonpositive, non-positive step, and log+step!=1.
 
         Returns:
             Self, unchanged. Pydantic ``mode='after'`` validator protocol.
 
         Raises:
-            ValueError: ``low > high``, ``log`` is set with ``low <= 0``,
-                ``step <= 0``, or ``log`` is combined with ``step != 1`` (which
-                Optuna's ``IntDistribution`` rejects at construction time).
+            ValueError: Bounds cannot round-trip exactly through Optuna,
+                ``log`` is set with ``low <= 0``, ``step <= 0``, or ``log`` is
+                combined with ``step != 1`` (which Optuna's
+                ``IntDistribution`` rejects at construction time), or the
+                stepped interval does not include the configured high bound.
 
         """
-        if self.low > self.high:
-            raise ValueError(f"int param: low ({self.low}) > high ({self.high})")
+        _validate_optuna_integer_domain(self.low, self.high)
         if self.log and self.low <= 0:
             raise ValueError("log-scale int param requires low > 0")
         if self.step <= 0:
@@ -83,6 +130,11 @@ class IntParam(_Frozen):
             # Optuna's IntDistribution rejects this at construction time.
             # Catch it here so config-load fails instead of trial-launch.
             raise ValueError("int param cannot use log=true with step != 1")
+        if (self.high - self.low) % self.step:
+            raise ValueError(
+                f"int param: step={self.step} must evenly divide "
+                f"high-low={self.high - self.low} so the configured high={self.high} is included."
+            )
         return self
 
 
@@ -170,7 +222,7 @@ SearchParam = Annotated[
 
 
 # Samplers whose suggestions depend on process-local RNG/optimizer state that
-# Optuna storage does not persist. `phasesweep.engine.guards.
+# Optuna storage does not persist. `phasesweep.engine.study_policy.
 # _validate_sampler_continuation` refuses to resume one of these mid-target, so
 # each trial target must be run in a single invocation.
 NON_RESUMABLE_SAMPLERS = frozenset({"tpe", "cmaes"})
@@ -183,8 +235,8 @@ class Sampler(_Frozen):
     """Optuna sampler configuration."""
 
     type: Literal["tpe", "random", "grid", "cmaes"] = "tpe"
-    seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
-    n_startup_trials: int = Field(default=10, ge=0)  # tpe only
+    seed: ConfigInt | None = Field(default=None, ge=0, le=2**32 - 1)
+    n_startup_trials: ConfigInt = Field(default=10, ge=0)  # tpe only
     acknowledge_nonresumable: bool = Field(
         default=False,
         description=(
@@ -255,8 +307,6 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     * Grid sampler with log-scale floats or ints — Optuna's ``GridSampler`` does
       not enumerate log-spaced values.
     * Grid sampler with float param missing ``step``.
-    * Grid sampler with float ``(high - low)`` not an integer multiple of ``step`` —
-      naive enumeration emits values above ``high`` (review v0.5.2 / blocker 4).
     * Grid sampler with a float param whose enumerated points collapse under the
       12-decimal canonical rounding, which would make the cardinality below
       overcount the distinct configurations (review v0.5.17 / finding C).
@@ -311,33 +361,47 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             )
 
 
-def _validate_float_grid_divides(phase_name: str, param_name: str, param: FloatParam) -> None:
-    """Require ``(high - low) / step`` to be (very nearly) an integer.
+def _grid_value_counts(
+    search_space: Mapping[str, SearchParam],
+    *,
+    phase_name: str,
+) -> dict[str, int]:
+    """Return GridSampler value counts before materializing parameter lists.
 
-    Without this check, naive grid enumeration ``[low + i*step for i in range(n+1)]``
-    emits values above ``high`` whenever the interval isn't an exact multiple of step
-    (review v0.5.2 / blocker 4). Example: ``low=0, high=1, step=0.6`` -> ``[0, 0.6, 1.2]``.
-
-    Args:
-        phase_name: Phase containing the offending parameter; quoted in the error.
-        param_name: Parameter name; quoted in the error.
-        param: The :class:`FloatParam`; ``param.step`` must be non-``None`` (caller guarded).
-
-    Raises:
-        ValueError: ``(high - low) / step`` is not within ``1e-9`` of an integer.
-
+    :param Mapping[str, SearchParam] search_space: Search-space specification to inspect.
+    :param str phase_name: Phase name included in validation errors.
+    :raises ValueError: If a parameter cannot be represented as a grid.
+    :return dict[str, int]: Number of concrete values for each parameter.
     """
-    assert param.step is not None  # guarded by caller
-    span = param.high - param.low
-    ratio = span / param.step
-    nearest = round(ratio)
-    if not math.isclose(ratio, nearest, rel_tol=1e-9, abs_tol=1e-9):
-        raise ValueError(
-            f"Phase {phase_name!r}: grid float param {param_name!r}: "
-            f"(high - low) / step must be an integer. "
-            f"Got low={param.low}, high={param.high}, step={param.step} "
-            f"(ratio={ratio}). Pick a step that evenly divides the interval."
-        )
+    counts: dict[str, int] = {}
+    for name, param in search_space.items():
+        if isinstance(param, CategoricalParam):
+            counts[name] = len(param.choices)
+        elif isinstance(param, IntParam):
+            if param.log:
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid sampler does not support "
+                    f"log-scale int param {name!r}."
+                )
+            if (param.high - param.low) % param.step:
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid int param {name!r}: step={param.step} "
+                    f"must evenly divide high-low={param.high - param.low} so the "
+                    f"configured high={param.high} is included."
+                )
+            counts[name] = (param.high - param.low) // param.step + 1
+        else:
+            if param.log:
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid sampler does not support "
+                    f"log-scale float param {name!r}."
+                )
+            if param.step is None:
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid sampler requires 'step' for float param {name!r}."
+                )
+            counts[name] = _float_step_count(param.low, param.high, param.step) + 1
+    return counts
 
 
 def grid_search_space(
@@ -349,33 +413,28 @@ def grid_search_space(
 
     :param dict[str, SearchParam] search_space: Search-space specification to enumerate.
     :param str phase_name: Phase name included in validation errors.
-    :raises ValueError: If a parameter cannot be represented as a grid.
+    :raises ValueError: If a parameter cannot be represented as a grid or the
+        concrete matrix exceeds the supported cardinality.
     :return dict[str, list[Any]]: Concrete grid values keyed by parameter name.
     """
+    counts = _grid_value_counts(search_space, phase_name=phase_name)
+    cardinality = math.prod(counts.values())
+    if cardinality > _MAX_GRID_CARDINALITY:
+        raise ValueError(
+            f"Phase {phase_name!r}: grid sampler has {cardinality:,} combinations, "
+            f"which exceeds the supported maximum of {_MAX_GRID_CARDINALITY:,}. "
+            "Reduce the search space or use a stochastic sampler."
+        )
+
     grid: dict[str, list[Any]] = {}
     for name, param in search_space.items():
         if isinstance(param, CategoricalParam):
             grid[name] = list(param.choices)
         elif isinstance(param, IntParam):
-            if param.log:
-                raise ValueError(
-                    f"Phase {phase_name!r}: grid sampler does not support "
-                    f"log-scale int param {name!r}."
-                )
             grid[name] = list(range(param.low, param.high + 1, param.step))
         else:
-            if param.log:
-                raise ValueError(
-                    f"Phase {phase_name!r}: grid sampler does not support "
-                    f"log-scale float param {name!r}."
-                )
-            if param.step is None:
-                raise ValueError(
-                    f"Phase {phase_name!r}: grid sampler requires 'step' for float param {name!r}."
-                )
-            _validate_float_grid_divides(phase_name, name, param)
-            n_steps = int(round((param.high - param.low) / param.step))
-            values = [round(param.low + i * param.step, 12) for i in range(n_steps + 1)]
+            assert param.step is not None
+            values = [round(param.low + i * param.step, 12) for i in range(counts[name])]
             # Post-canonicalization collapse (review v0.5.17 / finding C): the
             # round(..., 12) above maps adjacent points onto the same float once
             # the step drops below ~1e-12, so the grid would publish fewer unique
@@ -389,6 +448,18 @@ def grid_search_space(
                     f"to 12 decimal places (low={param.low}, high={param.high}, "
                     f"step={param.step}). Rescale the parameter — sweep an exponent or "
                     "a multiplier — so adjacent grid points differ by more than 1e-12."
+                )
+            origin = Fraction(str(param.low))
+            spacing = Fraction(str(param.step))
+            if any(
+                not (param.low <= value <= param.high)
+                or Fraction(str(value)) != origin + index * spacing
+                for index, value in enumerate(values)
+            ):
+                raise ValueError(
+                    f"Phase {phase_name!r}: grid float param {name!r} cannot preserve its "
+                    "configured bounds and step after rounding to 12 decimal places. "
+                    "Rescale the parameter or use explicit categorical choices."
                 )
             grid[name] = values
     return grid

@@ -1,13 +1,14 @@
 """Catalog scaffolding for ``phasesweep mcp init-catalog``.
 
 Builds an annotated MCP catalog from existing experiment
-configs: absolute ``state_dir`` next to the catalog, one read-only entry per
+configs: absolute ``state_dir`` outside the project, one read-only entry per
 config, ``visible_params: none``, and no ``allow`` block - side effects stay a
 deliberate operator edit. Operator-facing: rendered output contains real paths.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shlex
 from collections.abc import Sequence
@@ -16,6 +17,7 @@ from pathlib import Path
 import yaml
 
 from phasesweep.mcp.errors import CatalogError
+from phasesweep.runtime.files import UnsafePrivatePathError, phasesweep_home, xdg_home
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]+")
 
@@ -69,7 +71,8 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
         absolute ``state_dir`` and the relative ``config:`` paths.
     :param Sequence[Path] configs: Experiment configs, one catalog entry each.
     :return str: Complete catalog YAML with explanatory comments.
-    :raises CatalogError: If two configs derive the same experiment id.
+    :raises CatalogError: Two configs derive the same experiment id, or
+        ``PHASESWEEP_HOME`` is not a usable private root.
     """
     catalog_dir = output.parent.resolve()
     seen: dict[str, Path] = {}
@@ -99,7 +102,14 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     #   from_phase: true
 """
         )
-    state_dir = catalog_dir / "runs" / ".mcp"
+    digest = hashlib.sha256(str(output.resolve()).encode("utf-8")).hexdigest()[:12]
+    try:
+        root = phasesweep_home()
+    except (OSError, UnsafePrivatePathError) as exc:
+        raise CatalogError(str(exc)) from exc
+    if root is None:
+        root = xdg_home("XDG_STATE_HOME", Path.home() / ".local" / "state") / "phasesweep"
+    state_dir = root / "mcp" / digest
     catalog_arg = shlex.quote(str(output.resolve()))
     header = f"""\
 # MCP catalog scaffolded by `phasesweep mcp init-catalog`. After reviewing the

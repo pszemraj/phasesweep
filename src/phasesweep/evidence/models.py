@@ -17,7 +17,13 @@ from pydantic import (
     model_validator,
 )
 
-from phasesweep.config.common import _Frozen, _require_finite, _validate_optional_bounds
+from phasesweep.config.common import (
+    ConfigFloat,
+    ConfigInt,
+    _Frozen,
+    _require_finite,
+    _validate_optional_bounds,
+)
 
 StrictJsonScalar = StrictBool | StrictInt | StrictFloat | StrictStr | None
 """The exact set of values a JSON document can hold at a leaf position.
@@ -140,7 +146,7 @@ class JsonEnvelopeExtractor(_TrialFilePathModel):
     split: str = Field(min_length=1)
     policy: str = Field(min_length=1)
     checkpoint: str | None = Field(default=None, min_length=1)
-    expected_step: int | None = Field(default=None, ge=0)
+    expected_step: ConfigInt | None = Field(default=None, ge=0)
 
 
 class LogRegexExtractor(_TrialFilePathModel):
@@ -162,6 +168,23 @@ class LogRegexExtractor(_TrialFilePathModel):
     )
     select: Literal["last", "first", "min", "max"] = "last"
 
+    @field_validator("pattern")
+    @classmethod
+    def _valid_pattern(cls, value: str) -> str:
+        """Require a compilable regex with the metric's named capture group.
+
+        :param str value: Configured Python regex.
+        :raises ValueError: The regex is invalid or lacks a named ``value`` group.
+        :return str: Validated pattern, unchanged.
+        """
+        try:
+            pattern = re.compile(value)
+        except re.error as exc:
+            raise ValueError(f"Invalid metric regex: {exc}") from exc
+        if "value" not in pattern.groupindex:
+            raise ValueError("Metric regex requires a named (?P<value>...) group.")
+        return value
+
 
 class _WandbSummarySource(_Frozen):
     """Shared location and polling contract for one W&B run summary."""
@@ -169,8 +192,17 @@ class _WandbSummarySource(_Frozen):
     base_url: str = Field(default="https://api.wandb.ai", min_length=1)
     entity: str = Field(min_length=1, pattern=r"^[^/]+$")
     project: str = Field(min_length=1, pattern=r"^[^/]+$")
-    poll_seconds: float = Field(default=2.0, gt=0.0, allow_inf_nan=False)
-    timeout_seconds: float = Field(default=120.0, ge=1.0, allow_inf_nan=False)
+    poll_seconds: ConfigFloat = Field(default=2.0, gt=0.0, allow_inf_nan=False)
+    timeout_seconds: ConfigFloat = Field(
+        default=120.0,
+        ge=1.0,
+        allow_inf_nan=False,
+        description=(
+            "Total wall-clock budget for the polling worker. Worker startup and W&B SDK "
+            "initialization consume this budget before requests and retries. Short budgets can "
+            "expire before the first poll, even when run data is already available."
+        ),
+    )
 
     @field_validator("base_url")
     @classmethod
@@ -384,8 +416,8 @@ class JsonScalarBoundGate(_TrialFilePathModel, _JsonKeyModel):
     type: Literal["json_scalar_bound"]
     path: str
     key: str
-    min: float | None = None
-    max: float | None = None
+    min: ConfigFloat | None = None
+    max: ConfigFloat | None = None
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> JsonScalarBoundGate:
@@ -402,14 +434,18 @@ class JsonScalarBoundGate(_TrialFilePathModel, _JsonKeyModel):
 
 
 class ArtifactSizeGate(_TrialPathModel, _JsonKeyModel):
-    """Require artifact bytes to fall inside optional bounds."""
+    """Require artifact bytes to fall inside optional bounds.
+
+    Directory sources recursively count regular files and file-symlink targets,
+    but do not traverse directory symlinks.
+    """
 
     type: Literal["artifact_size"]
     source: Literal["file", "directory", "json"]
     path: str
     key: str | None = None
-    min_bytes: int | None = Field(default=None, ge=0)
-    max_bytes: int | None = Field(default=None, ge=0)
+    min_bytes: ConfigInt | None = Field(default=None, ge=0)
+    max_bytes: ConfigInt | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def _validate_source_and_bounds(self) -> ArtifactSizeGate:

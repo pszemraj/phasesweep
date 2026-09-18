@@ -5,14 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import warnings
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, assert_never
 
 import optuna
+import sqlalchemy
 from optuna.exceptions import ExperimentalWarning
+from optuna.storages import JournalStorage
+from optuna.storages.journal import BaseJournalBackend
 
 from phasesweep.config import (
     CategoricalParam,
@@ -31,22 +36,27 @@ from phasesweep.runtime.files import (
     sqlite_database_path,
     sqlite_readonly_uri,
     storage_backend,
+    storage_is_in_memory,
 )
 
 
 @dataclass(frozen=True)
-class _RunningTrialRef:
-    """Identity of one RUNNING trial observed in a storage snapshot.
+class _TrialRef:
+    """Identity of one trial recorded in a publication or storage snapshot.
 
-    Carries exactly the identity a caller needs to reconcile a RUNNING row
-    against external cleanup evidence: which trial it is, and which
-    generation/attempt claimed it. Values are ``None`` when the trial never
-    recorded that attribute (e.g. a row written by an older PhaseSweep).
+    Reconciles a row against published evidence or external cleanup evidence:
+    which trial it is, and which generation/attempt claimed it.
+    Values are ``None`` when the trial never recorded that attribute (e.g. a
+    row written by an older PhaseSweep). Published references additionally
+    carry their terminal and complete count boundary. Those count fields are
+    not part of a trial-row identity comparison.
     """
 
     trial_number: int
     generation_id: str | None
     attempt_id: str | None
+    finished_trials: int | None = field(default=None, compare=False)
+    completed_trials: int | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -55,14 +65,122 @@ class _PhaseTrialStats:
 
     ``running_attempts`` is part of the *same* snapshot as ``counts``, not a
     second read: it lists the RUNNING trials those counts describe, and is
-    ``None`` exactly when ``available`` is ``False`` (nothing was read, so
-    an empty list would claim knowledge this snapshot does not have).
+    ``None`` exactly when ``available`` is ``False`` (the counts are unknown).
+    A confirmed absent study has known zero counts and an empty attempt list.
+    ``published_trial_available`` checks the requested published trial identity
+    in that same snapshot; false also covers unreadable or absent storage.
     """
 
     counts: dict[str, int]
     available: bool
     generation_counts: dict[str, dict[str, int]]
-    running_attempts: list[_RunningTrialRef] | None
+    running_attempts: list[_TrialRef] | None
+    published_trial_available: bool = False
+
+
+def _published_phase_trial_refs(
+    summary: Mapping[str, Any] | None,
+) -> dict[str, _TrialRef | None]:
+    """Return each published phase's local winning or promotion-candidate identity.
+
+    A continued baseline belongs to an earlier phase. Its promotion record
+    identifies the local candidate whose history must survive in this phase.
+    A skipped candidate has no exposed winner; its identity is retained in
+    the summary's promotion decisions instead.
+
+    :param Mapping[str, Any] | None summary: Already-resolved publication summary.
+    :return dict[str, _TrialRef | None]: Local trial identities by phase, with
+        their known terminal-count boundary; None when a published phase does
+        not record a complete identity.
+    """
+    phase_items = {
+        item["name"]: item
+        for item in (summary or {}).get("phases", ())
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+    for decision in (summary or {}).get("promotion_decisions", ()):
+        if (
+            isinstance(decision, Mapping)
+            and decision.get("action") == "skip"
+            and isinstance(decision.get("phase"), str)
+        ):
+            phase_items.setdefault(
+                decision["phase"],
+                {
+                    "name": decision["phase"],
+                    "promotion": decision,
+                    "completion": decision.get("candidate_completion"),
+                },
+            )
+    refs: dict[str, _TrialRef | None] = {}
+    for name, item in phase_items.items():
+        promotion = item.get("promotion")
+        source = promotion if isinstance(promotion, Mapping) else item
+        prefix = "candidate_" if isinstance(promotion, Mapping) else ""
+        number = source.get(f"{prefix}trial_number")
+        generation = source.get(f"{prefix}generation_id")
+        attempt = source.get(f"{prefix}attempt_id")
+        completion = item.get("completion")
+        finished_trials = (
+            completion.get("finished_trials")
+            if isinstance(completion, Mapping)
+            and type(completion.get("finished_trials")) is int
+            and completion["finished_trials"] >= 0
+            else None
+        )
+        completed_trials = (
+            completion.get("completed_trials")
+            if isinstance(completion, Mapping)
+            and type(completion.get("completed_trials")) is int
+            and completion["completed_trials"] >= 0
+            else None
+        )
+        refs[name] = (
+            _TrialRef(number, generation, attempt, finished_trials, completed_trials)
+            if isinstance(number, int)
+            and not isinstance(number, bool)
+            and isinstance(generation, str)
+            and generation
+            and isinstance(attempt, str)
+            and attempt
+            else None
+        )
+    return refs
+
+
+def _published_trial_history_available(
+    stats: _PhaseTrialStats, published_trial: _TrialRef | None
+) -> bool:
+    """Return whether one storage snapshot retains a published trial history.
+
+    :param _PhaseTrialStats stats: Counts and identity result from one storage read.
+    :param _TrialRef | None published_trial: Published trial and count boundary.
+    :return bool: ``True`` when identity and every recorded count boundary survive.
+    """
+    if not stats.available or not stats.published_trial_available or published_trial is None:
+        return False
+    finished = sum(stats.counts.get(state, 0) for state in ("COMPLETE", "PRUNED", "FAIL"))
+    completed = stats.counts.get("COMPLETE", 0)
+    return (
+        published_trial.finished_trials is None or finished >= published_trial.finished_trials
+    ) and (
+        published_trial.completed_trials is None or completed >= published_trial.completed_trials
+    )
+
+
+def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:
+    """Return whether a completed trial has the published identity.
+
+    :param optuna.trial.FrozenTrial trial: Ledger trial to compare.
+    :param _TrialRef expected: Published trial number, generation, and attempt identity.
+    :return bool: ``True`` when the trial is complete and all identity fields match.
+    """
+    return (
+        trial.state == optuna.trial.TrialState.COMPLETE
+        and trial.number == expected.trial_number
+        and trial.user_attrs.get(GENERATION_ID_ATTR) == expected.generation_id
+        and trial.user_attrs.get(ATTEMPT_ID_ATTR) == expected.attempt_id
+    )
 
 
 class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
@@ -188,20 +306,20 @@ def _resolve_storage(url: str | None) -> Any:
     """Translate a storage URL into an Optuna storage object or pass through.
 
     Recognized schemes:
-      * ``None`` -> in-memory study (not resumable).
+      * Any URL recognized by :func:`storage_is_in_memory` -> in-memory study
+        (not resumable).
       * ``journal:///path.journal`` -> Optuna ``JournalStorage(JournalFileBackend(path))``.
         Safe for parallel ``n_jobs`` on a single host.
       * Anything else (``sqlite:///``, ``postgresql://``, ``mysql://``, ...) -> passed to
         Optuna unchanged.
 
-    Earlier versions silently rewrote ``sqlite:///x.db`` to ``x.journal`` whenever
-    ``n_jobs > 1`` (review v0.5.2 / blocker 6). That broke study identity: the same
-    config could resolve to two different studies depending on parallelism. Now the
-    user picks the scheme, and ``Experiment._validate_phase_graph`` rejects SQLite
-    with parallel ``n_jobs`` at config-load time so the failure is loud and early.
+    ``Experiment.resolved_storage`` selects the URL for ``storage: auto`` before
+    this helper is called. Explicit SQLite URLs are never rewritten; validation
+    rejects those with parallel jobs. Journal URLs also accept escaped
+    ``file:`` filenames with ``uri=true``, as generated by auto storage.
 
     Args:
-        url: The user-supplied storage URL, or ``None`` for in-memory.
+        url: The resolved storage URL, or an in-memory sentinel.
 
     Returns:
         ``None`` for in-memory; a configured ``JournalStorage`` for the
@@ -209,27 +327,27 @@ def _resolve_storage(url: str | None) -> Any:
         through to Optuna's RDB-aware loader).
 
     """
-    if url is None:
+    if url is None or storage_is_in_memory(url):
         return None
     if storage_backend(url) == "journal":
         path = Path(file_url_path(url)).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         log.info("Using JournalFileStorage at %s", path)
-        from optuna.storages import JournalStorage
         from optuna.storages.journal import JournalFileBackend
 
         return JournalStorage(JournalFileBackend(str(path)))
     return url
 
 
-def _phase_study_name(experiment: Experiment, phase: Phase) -> str:
+def _phase_study_name(experiment: Experiment, phase: Phase | str) -> str:
     """Return the stable Optuna study name for a phase.
 
     :param Experiment experiment: Parsed experiment config supplying the experiment name.
-    :param Phase phase: Phase whose name is appended to the study namespace.
+    :param Phase | str phase: Phase or historical phase name appended to the namespace.
     :return str: Stable Optuna study name for the experiment/phase pair.
     """
-    return f"{experiment.experiment}::{phase.name}"
+    name = phase if isinstance(phase, str) else phase.name
+    return f"{experiment.experiment}::{name}"
 
 
 def _create_phase_study(
@@ -247,7 +365,7 @@ def _create_phase_study(
     """
     return optuna.create_study(
         study_name=_phase_study_name(experiment, phase),
-        storage=None if dry_run else _resolve_storage(experiment.storage),
+        storage=None if dry_run else _resolve_storage(experiment.resolved_storage),
         sampler=_build_sampler(phase.sampler, phase.search_space, n_jobs=phase.n_jobs),
         pruner=optuna.pruners.NopPruner(),
         direction=experiment.metric.goal,
@@ -255,20 +373,23 @@ def _create_phase_study(
     )
 
 
-def _load_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study:
+def _load_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study:
     """Load an existing persistent Optuna study for a phase.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
-    :param Phase phase: Phase whose stable study name is loaded.
+    :param Phase | str phase: Phase or historical phase name whose study is loaded.
     :return optuna.Study: Existing Optuna study for the phase.
     """
-    return optuna.load_study(
-        study_name=_phase_study_name(experiment, phase),
-        storage=_resolve_storage(experiment.storage),
+    assert experiment.resolved_storage is not None
+    storage = (
+        _resolve_storage(experiment.resolved_storage)
+        if storage_backend(experiment.resolved_storage) == "journal"
+        else optuna.storages.RDBStorage(experiment.resolved_storage, skip_table_creation=True)
     )
+    return optuna.load_study(study_name=_phase_study_name(experiment, phase), storage=storage)
 
 
-def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
+def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
     """Return whether a SQLite storage already contains the phase study.
 
     Strict and tri-state on purpose (PR #5 review / reviewer 2, issue 1):
@@ -283,16 +404,16 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
     part of the contract.
 
     :param Experiment experiment: Parsed experiment config with SQLite storage.
-    :param Phase phase: Phase whose stable study name should be checked.
+    :param Phase | str phase: Phase or historical phase name to check.
     :return bool: ``True`` when the database contains the study, ``False``
         when the database or its schema does not exist.
     :raises StudyStorageUnavailableError: The database file exists but could
         not be read (locked, corrupt, permission-denied, ...), so whether the
         study exists cannot be determined.
     """
-    assert experiment.storage is not None
-    uri = sqlite_readonly_uri(experiment.storage)
-    database = sqlite_database_path(experiment.storage)
+    assert experiment.resolved_storage is not None
+    uri = sqlite_readonly_uri(experiment.resolved_storage)
+    database = sqlite_database_path(experiment.resolved_storage)
     if uri is None or database is None or not database.exists():
         return False
     try:
@@ -321,27 +442,208 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase) -> bool:
     return row is not None
 
 
-def _load_existing_phase_study(experiment: Experiment, phase: Phase) -> optuna.Study | None:
+def _rdb_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
+    """Return whether external RDB storage contains a phase study.
+
+    :param Experiment experiment: Parsed experiment with external RDB storage.
+    :param Phase | str phase: Phase or historical phase name to check.
+    :return bool: ``True`` when the storage contains the named study, ``False`` when its
+        Optuna ``studies`` table does not exist or contains no matching row.
+    :raises StudyStorageUnavailableError: The storage or its study table could not be read.
+    """
+    assert experiment.resolved_storage is not None
+    try:
+        engine = sqlalchemy.create_engine(experiment.resolved_storage)
+        try:
+            if not sqlalchemy.inspect(engine).has_table("studies"):
+                return False
+            with engine.connect() as connection:
+                row = connection.execute(
+                    sqlalchemy.text("SELECT 1 FROM studies WHERE study_name = :study_name"),
+                    {"study_name": _phase_study_name(experiment, phase)},
+                ).fetchone()
+        finally:
+            engine.dispose()
+    except Exception as exc:  # noqa: BLE001 - mutating preflight must fail closed
+        raise StudyStorageUnavailableError(
+            f"External RDB storage could not be read while checking for study "
+            f"{_phase_study_name(experiment, phase)!r}."
+        ) from exc
+    return row is not None
+
+
+@dataclass
+class _JournalSnapshot(BaseJournalBackend):
+    """Replay one captured journal without rereading or writing the live file."""
+
+    logs: list[dict[str, Any]]
+
+    def read_logs(self, log_number_from: int) -> Iterable[dict[str, Any]]:
+        """Return snapshot records starting at the requested log number.
+
+        :param int log_number_from: First record to replay.
+        :return Iterable[dict[str, Any]]: Captured records from that position.
+        """
+        return self.logs[log_number_from:]
+
+    def append_logs(self, logs: list[dict[str, Any]]) -> None:
+        """Reject writes through an observational journal snapshot.
+
+        :param list[dict[str, Any]] logs: Records the caller attempted to append.
+        :raises RuntimeError: Always; the snapshot is read-only.
+        """
+        raise RuntimeError("A journal snapshot is read-only.")
+
+
+def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | None:
+    """Capture a complete journal as a read-only in-memory storage.
+
+    Optuna tolerates an undecodable final record while another writer appends.
+    Such a snapshot is incomplete, so inspection cannot claim known counts or
+    confirmed absence.
+
+    :param str storage_url: Journal storage URL to inspect.
+    :param str label: Study or experiment named in an inspection failure.
+    :return JournalStorage | None: Snapshot storage, or ``None`` when absent.
+    :raises StudyStorageUnavailableError: The snapshot is unreadable or incomplete.
+    """
+    path = Path(file_url_path(storage_url)).expanduser()
+    try:
+        try:
+            with path.open("rb") as source:
+                size = os.fstat(source.fileno()).st_size
+                data = source.read(size)
+        except FileNotFoundError:
+            return None
+        if len(data) != size:
+            raise ValueError("The journal was truncated while its snapshot was being read.")
+        if data and not data.endswith(b"\n"):
+            raise ValueError("The journal ends with an incomplete record.")
+        records = [json.loads(line) for line in data.split(b"\n")[:-1]]
+        return JournalStorage(_JournalSnapshot(records))
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {path} could not be completely read while checking for {label}."
+        ) from exc
+
+
+def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.Study | None:
+    """Replay a complete journal snapshot before deciding whether a study exists.
+
+    Replay must finish before a missing-study KeyError can be distinguished
+    from a malformed journal operation.
+
+    :param str storage_url: Journal storage URL to inspect.
+    :param str study_name: Named study to load from the captured records.
+    :return optuna.Study | None: Read-only snapshot study, or confirmed absence.
+    :raises StudyStorageUnavailableError: The snapshot is unreadable or incomplete.
+    """
+    storage = _journal_snapshot_storage(storage_url, f"study {study_name!r}")
+    if storage is None:
+        return None
+    try:
+        return optuna.load_study(study_name=study_name, storage=storage)
+    except KeyError:
+        return None
+
+
+def _existing_phase_study_names(experiment: Experiment) -> tuple[str, ...]:
+    """List this experiment's retained phase studies without creating storage.
+
+    :param Experiment experiment: Persistent experiment whose study namespace is read.
+    :return tuple[str, ...]: Sorted phase-name suffixes of existing studies.
+    :raises StudyStorageUnavailableError: Existing storage cannot be inspected.
+    """
+    assert experiment.resolved_storage is not None
+    backend = storage_backend(experiment.resolved_storage)
+    names: list[str]
+    if backend == "sqlite":
+        uri = sqlite_readonly_uri(experiment.resolved_storage)
+        database = sqlite_database_path(experiment.resolved_storage)
+        if uri is None or database is None or not database.exists():
+            return ()
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=0.1)
+            try:
+                names = [row[0] for row in conn.execute("SELECT study_name FROM studies")]
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return ()
+            raise StudyStorageUnavailableError(
+                f"SQLite storage {database} could not be read while listing phase studies."
+            ) from exc
+        except sqlite3.Error as exc:
+            raise StudyStorageUnavailableError(
+                f"SQLite storage {database} could not be read while listing phase studies."
+            ) from exc
+    elif backend == "journal":
+        storage = _journal_snapshot_storage(
+            experiment.resolved_storage, f"experiment {experiment.experiment!r}"
+        )
+        if storage is None:
+            return ()
+        try:
+            names = [study.study_name for study in storage.get_all_studies()]
+        except Exception as exc:
+            raise StudyStorageUnavailableError(
+                "Journal storage could not be replayed while listing phase studies."
+            ) from exc
+    else:
+        try:
+            engine = sqlalchemy.create_engine(experiment.resolved_storage)
+            try:
+                if not sqlalchemy.inspect(engine).has_table("studies"):
+                    return ()
+                with engine.connect() as connection:
+                    names = [
+                        row[0]
+                        for row in connection.execute(
+                            sqlalchemy.text("SELECT study_name FROM studies")
+                        )
+                    ]
+            finally:
+                engine.dispose()
+        except Exception as exc:  # noqa: BLE001 - rebind planning cannot guess omitted studies
+            raise StudyStorageUnavailableError(
+                "External RDB storage could not be read while listing phase studies."
+            ) from exc
+    prefix = f"{experiment.experiment}::"
+    return tuple(sorted(name[len(prefix) :] for name in names if name.startswith(prefix)))
+
+
+def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study | None:
     """Load a phase study only if it already exists.
 
     Recovery and read-like paths must not call ``create_study(load_if_exists=True)`` because
     that can create an empty study and make missing evidence look safe. This helper checks
-    file-backed storage before delegating to Optuna's loader, then treats an absent study as
+    persistent storage before delegating to Optuna's loader, then treats an absent study as
     ``None``.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
-    :param Phase phase: Phase whose stable study name should be loaded.
+    :param Phase | str phase: Phase or historical phase name whose study is loaded.
     :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
-    :raises StudyStorageUnavailableError: File-backed SQLite storage exists but
+    :raises StudyStorageUnavailableError: Persistent storage exists but
         could not be read, so whether the study exists cannot be determined;
         callers on mutating paths must abort rather than treat this as absence.
     """
-    if experiment.storage is None:
+    storage = experiment.resolved_storage
+    if storage_is_in_memory(storage):
         return None
-    backend = storage_backend(experiment.storage)
-    if backend == "sqlite" and not _sqlite_study_exists(experiment, phase):
-        return None
-    if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
+    assert storage is not None
+    backend = storage_backend(storage)
+    if backend == "sqlite":
+        if not _sqlite_study_exists(experiment, phase):
+            return None
+    elif backend == "journal":
+        if _load_journal_study_snapshot(storage, _phase_study_name(experiment, phase)) is None:
+            return None
+        # Preflight verified a complete snapshot. Mutating callers still use
+        # Optuna's normal backend, including its concurrent-append semantics.
+        return _load_phase_study(experiment, phase)
+    elif not _rdb_study_exists(experiment, phase):
+        # Optuna initializes its schema even when load_study finds no study.
         return None
     try:
         return _load_phase_study(experiment, phase)
@@ -365,71 +667,185 @@ def _decoded_string_attr(value_json: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
+_PHASE_TRIAL_STATS_SQL = """
+    WITH phase_trials AS (
+        SELECT trials.number,
+               trials.state,
+               generation.value_json AS generation_json,
+               attempt.value_json AS attempt_json
+        FROM trials
+        JOIN studies ON trials.study_id = studies.study_id
+        LEFT JOIN trial_user_attributes AS generation
+          ON trials.trial_id = generation.trial_id AND generation.key = :generation_key
+        LEFT JOIN trial_user_attributes AS attempt
+          ON trials.trial_id = attempt.trial_id AND attempt.key = :attempt_key
+        WHERE studies.study_name = :study_name
+    )
+    SELECT 'count', NULL, state, generation_json, NULL, COUNT(*)
+    FROM phase_trials
+    GROUP BY state, generation_json
+    UNION ALL
+    SELECT 'running', number, state, generation_json, attempt_json, 1
+    FROM phase_trials
+    WHERE state = 'RUNNING'
+    UNION ALL
+    SELECT 'published', number, state, generation_json, attempt_json, 1
+    FROM phase_trials
+    WHERE number = :published_trial_number
+"""
+
+
+def _phase_trial_stats_params(
+    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None
+) -> dict[str, str | int]:
+    """Return bind parameters for the observational phase-trial SQL query.
+
+    :param Experiment experiment: Config providing the phase's stable study name.
+    :param Phase phase: Phase whose study is queried.
+    :param _TrialRef | None published_trial: Published local trial whose number is included,
+        or ``None`` to bind ``published_trial_number`` to ``-1``.
+    :return dict[str, str | int]: Attribute keys, study name, and published trial number;
+        only the trial number from ``published_trial`` is used.
+    """
+    return {
+        "generation_key": GENERATION_ID_ATTR,
+        "attempt_key": ATTEMPT_ID_ATTR,
+        "study_name": _phase_study_name(experiment, phase),
+        "published_trial_number": published_trial.trial_number if published_trial else -1,
+    }
+
+
+def _unavailable_phase_trial_stats(
+    experiment: Experiment, phase: Phase, exc: BaseException
+) -> _PhaseTrialStats:
+    """Log a storage-read failure and return an unavailable phase-trial snapshot.
+
+    External RDB URLs and driver messages can contain credentials, so those
+    warnings report only the backend and exception type.
+
+    :param Experiment experiment: Config whose storage backend or local path is reported.
+    :param Phase phase: Phase whose status read failed.
+    :param BaseException exc: Read exception whose direct cause is reported when present.
+    :return _PhaseTrialStats: Empty count maps and ``running_attempts=None`` with
+        ``available=False``.
+    """
+    cause = exc.__cause__ or exc
+    backend = storage_backend(experiment.resolved_storage)
+    if backend in {"sqlite", "journal"}:
+        log.warning(
+            "could not read status trial data from storage %s for phase %s: %s: %s",
+            experiment.resolved_storage,
+            phase.name,
+            type(cause).__name__,
+            cause,
+        )
+    else:
+        log.warning(
+            "could not read status trial data from %s storage for phase %s: %s",
+            backend,
+            phase.name,
+            type(cause).__name__,
+        )
+    return _PhaseTrialStats({}, False, {}, None)
+
+
+def _sqlite_phase_trial_stats(
+    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+) -> _PhaseTrialStats:
     """Return trial-state counts and RUNNING identities in one SQLite read.
 
     Status polling must be read-only. Passing a fresh SQLite URL through
     Optuna's storage constructor can create the database/schema and race the
     runner's first ``create_study`` call. Opening the file in SQLite read-only
     mode avoids both side effects: a missing, locked, or still-initializing DB
-    simply reports no counts for now.
+    simply reports no counts for now. A confirmed missing file has known zero
+    counts; a failed read, including an unreadable schema, reports unavailable counts.
 
     Counts and RUNNING identities come from one CTE-backed statement, so one
     storage snapshot. SQL aggregates terminal rows by state and generation,
-    while the ``UNION ALL`` arm returns identities only for RUNNING rows. This
+    while the ``UNION ALL`` arms return RUNNING identities and the requested
+    published trial. This
     avoids transferring every historical trial on every status poll without
     splitting the read into two snapshots that could disagree during a live
     write (PR #5 review / reviewer 2, blocker 6).
 
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
+    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
     :return _PhaseTrialStats: Counts, RUNNING identities, and an availability
         flag; counts are empty, running attempts ``None``, and availability
         false when the DB cannot be read safely.
     """
-    assert experiment.storage is not None
-    uri = sqlite_readonly_uri(experiment.storage)
+    assert experiment.resolved_storage is not None
+    uri = sqlite_readonly_uri(experiment.resolved_storage)
     if uri is None:
         return _PhaseTrialStats({}, False, {}, None)
+    database = sqlite_database_path(experiment.resolved_storage)
+    assert database is not None
+    try:
+        database.stat()
+    except FileNotFoundError:
+        return _PhaseTrialStats({}, True, {}, [])
+    except OSError as exc:
+        return _unavailable_phase_trial_stats(experiment, phase, exc)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=0.1)
         try:
             rows = conn.execute(
-                """
-                WITH phase_trials AS (
-                    SELECT trials.number,
-                           trials.state,
-                           generation.value_json AS generation_json,
-                           attempt.value_json AS attempt_json
-                    FROM trials
-                    JOIN studies ON trials.study_id = studies.study_id
-                    LEFT JOIN trial_user_attributes AS generation
-                      ON trials.trial_id = generation.trial_id AND generation.key = ?
-                    LEFT JOIN trial_user_attributes AS attempt
-                      ON trials.trial_id = attempt.trial_id AND attempt.key = ?
-                    WHERE studies.study_name = ?
-                )
-                SELECT 'count', NULL, state, generation_json, NULL, COUNT(*)
-                FROM phase_trials
-                GROUP BY state, generation_json
-                UNION ALL
-                SELECT 'running', number, state, generation_json, attempt_json, 1
-                FROM phase_trials
-                WHERE state = 'RUNNING'
-                """,
-                (
-                    GENERATION_ID_ATTR,
-                    ATTEMPT_ID_ATTR,
-                    _phase_study_name(experiment, phase),
-                ),
+                _PHASE_TRIAL_STATS_SQL,
+                _phase_trial_stats_params(experiment, phase, published_trial),
             ).fetchall()
         finally:
             conn.close()
-    except sqlite3.Error:
-        return _PhaseTrialStats({}, False, {}, None)
+    except sqlite3.Error as exc:
+        return _unavailable_phase_trial_stats(experiment, phase, exc)
+    return _trial_stats_from_rows(
+        rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
+    )
+
+
+def _rdb_phase_trial_stats(
+    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+) -> _PhaseTrialStats:
+    """Inspect external SQL storage without Optuna's schema-initializing loader.
+
+    :param Experiment experiment: Config containing the external storage URL.
+    :param Phase phase: Phase whose trial counts and running identities are read.
+    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
+    :return _PhaseTrialStats: One snapshot, or an unavailable observation on read failure.
+    """
+    assert experiment.resolved_storage is not None
+    try:
+        engine = sqlalchemy.create_engine(experiment.resolved_storage)
+        try:
+            with engine.connect() as connection:
+                rows = connection.execute(
+                    sqlalchemy.text(_PHASE_TRIAL_STATS_SQL),
+                    _phase_trial_stats_params(experiment, phase, published_trial),
+                ).fetchall()
+        finally:
+            engine.dispose()
+    except Exception as exc:  # noqa: BLE001 - status reports unavailable on any connection/read failure
+        return _unavailable_phase_trial_stats(experiment, phase, exc)
+    return _trial_stats_from_rows(
+        rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
+    )
+
+
+def _trial_stats_from_rows(
+    rows: Iterable[Sequence[Any]], *, study_name: str, published_trial: _TrialRef | None = None
+) -> _PhaseTrialStats:
+    """Decode aggregated counts and RUNNING identities from a SQL snapshot.
+
+    :param Iterable[Sequence[Any]] rows: Rows from the observational SQL query.
+    :param str study_name: Study name used in damaged-row diagnostics.
+    :param _TrialRef | None published_trial: Expected local trial from the publication.
+    :return _PhaseTrialStats: Counts and running identities from the supplied rows.
+    """
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
-    running_attempts: list[_RunningTrialRef] = []
+    running_attempts: list[_TrialRef] = []
+    published_trial_available = False
     for row_kind, number, state, generation_json, attempt_json, tally in rows:
         state_name = str(state)
         generation_id = _decoded_string_attr(generation_json)
@@ -439,6 +855,13 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
             if generation_id is not None:
                 states = generation_counts.setdefault(generation_id, {})
                 states[state_name] = states.get(state_name, 0) + count
+            continue
+        if row_kind == "published":
+            published_trial_available = (
+                state_name == "COMPLETE"
+                and _TrialRef(number, generation_id, _decoded_string_attr(attempt_json))
+                == published_trial
+            )
             continue
         if row_kind != "running":
             continue
@@ -450,46 +873,60 @@ def _sqlite_phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTri
             log.warning(
                 "study %s has a RUNNING trial with no trial number; "
                 "omitting it from the reported running attempts",
-                _phase_study_name(experiment, phase),
+                study_name,
             )
             continue
         running_attempts.append(
-            _RunningTrialRef(
+            _TrialRef(
                 trial_number=number,
                 generation_id=generation_id,
                 attempt_id=_decoded_string_attr(attempt_json),
             )
         )
-    return _PhaseTrialStats(counts, True, generation_counts, running_attempts)
+    return _PhaseTrialStats(
+        counts, True, generation_counts, running_attempts, published_trial_available
+    )
 
 
-def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats:
+def _phase_trial_stats(
+    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+) -> _PhaseTrialStats:
     """Read counts and RUNNING identities without creating a missing study.
 
-    Both facts come from the one trial list this function already loads, so a
-    caller never has to reread the study to learn which rows the RUNNING count
-    refers to (PR #5 review / reviewer 2, blocker 6).
+    SQL backends use one SELECT statement; journal storage uses one trial list.
+    Counts, RUNNING identities, and published trial verification therefore
+    describe the same snapshot.
+    Confirmed absence reports available zero counts; read failures report
+    unavailable counts.
 
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
+    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
     :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
-    if experiment.storage is None:
+    if experiment.resolved_storage is None:
         return _PhaseTrialStats({}, False, {}, None)
-    backend = storage_backend(experiment.storage)
+    backend = storage_backend(experiment.resolved_storage)
     if backend == "sqlite":
-        return _sqlite_phase_trial_stats(experiment, phase)
-    if backend == "journal" and not Path(file_url_path(experiment.storage)).expanduser().exists():
-        return _PhaseTrialStats({}, False, {}, None)
+        return _sqlite_phase_trial_stats(experiment, phase, published_trial)
+    if backend != "journal":
+        return _rdb_phase_trial_stats(experiment, phase, published_trial)
     try:
-        study = _load_phase_study(experiment, phase)
+        study = _load_journal_study_snapshot(
+            experiment.resolved_storage, _phase_study_name(experiment, phase)
+        )
+        if study is None:
+            return _PhaseTrialStats({}, True, {}, [])
         trials = study.get_trials(deepcopy=False)
-    except Exception:  # noqa: BLE001
-        return _PhaseTrialStats({}, False, {}, None)
+    except Exception as exc:  # noqa: BLE001
+        return _unavailable_phase_trial_stats(experiment, phase, exc)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
-    running_attempts: list[_RunningTrialRef] = []
+    running_attempts: list[_TrialRef] = []
+    published_trial_available = False
     for trial in trials:
+        if published_trial is not None and _published_trial_matches(trial, published_trial):
+            published_trial_available = True
         counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
         generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
         if isinstance(generation_id, str):
@@ -499,10 +936,12 @@ def _phase_trial_stats(experiment: Experiment, phase: Phase) -> _PhaseTrialStats
             continue
         attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
         running_attempts.append(
-            _RunningTrialRef(
+            _TrialRef(
                 trial_number=trial.number,
                 generation_id=generation_id if isinstance(generation_id, str) else None,
                 attempt_id=attempt_id if isinstance(attempt_id, str) else None,
             )
         )
-    return _PhaseTrialStats(counts, True, generation_counts, running_attempts)
+    return _PhaseTrialStats(
+        counts, True, generation_counts, running_attempts, published_trial_available
+    )

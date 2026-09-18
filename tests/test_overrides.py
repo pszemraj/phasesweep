@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import datetime
 import shlex
 from pathlib import Path
@@ -9,6 +10,7 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment, run_experiment
+from phasesweep.config import Phase, Suite
 from phasesweep.runtime.commands import (
     compose_trainer_config,
     dump_overrides_json,
@@ -62,7 +64,19 @@ def test_hydra_rejects_non_finite_values(value: float) -> None:
 
 def test_argparse():
     s = format_argparse({"lr": 3e-4, "weight_decay": 0.05})
-    assert s == "--lr 0.0003 --weight_decay 0.05"
+    assert s == "--lr=0.0003 --weight_decay=0.05"
+
+
+@pytest.mark.parametrize("tag", ["--other-option", "-x", "two words", "a=b", "", "$(echo hi)"])
+def test_argparse_round_trips_option_like_values(tag):
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--offset", type=float)
+    parser.add_argument("--tag")
+
+    parsed = parser.parse_args(shlex.split(format_argparse({"offset": -1e-5, "tag": tag})))
+
+    assert parsed.offset == -1e-5
+    assert parsed.tag == tag
 
 
 def test_argparse_renders_the_documented_wire_forms():
@@ -79,18 +93,12 @@ def test_argparse_renders_the_documented_wire_forms():
     )
 
     assert shlex.split(s) == [
-        "--none",
-        "None",
-        "--flag",
-        "true",
-        "--n",
-        "3",
-        "--ratio",
-        "2.5",
-        "--tag",
-        "s",
-        "--items",
-        "[1,a,false]",
+        "--none=None",
+        "--flag=true",
+        "--n=3",
+        "--ratio=2.5",
+        "--tag=s",
+        "--items=[1,a,false]",
     ]
 
 
@@ -555,7 +563,7 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
     distinct JSON-mode dumps — so no two configs that render different commands
     can share a study identity."""
     # Import only: the fingerprint code itself is deliberately untouched.
-    from phasesweep.engine.guards import _phase_fingerprint
+    from phasesweep.engine.fingerprints import _phase_fingerprint
 
     fingerprints: dict[str, str] = {}
     for label, literal in {"int": "1", "str": '"1"', "bool": "true", "float": "1.0"}.items():
@@ -576,11 +584,10 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
 
 def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_path):
     """A contract shared between a json_file study and an argparse study is only
-    legal for the json_file one; the argparse study fails when it is compiled."""
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            """
+    legal for the json_file one; loading rejects the whole invalid suite."""
+    path = write_yaml(
+        tmp_path,
+        """
             suite: mixed_formats
             defaults:
               trial_command: "echo {overrides}"
@@ -602,9 +609,11 @@ def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_pat
                 override_format: argparse
                 phases: [{name: p, n_trials: 1, contracts: [frozen]}]
             """,
-        )
     )
 
+    with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):
+        load_config(path)
+    config = Suite.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     structured, flat = config.studies
     config.experiment_for_study(structured)
     with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):
@@ -716,6 +725,189 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
     )
     with pytest.raises(ValidationError, match="re-samples key"):
         load_experiment(p)
+
+
+def test_promotion_fallback_key_cannot_be_resampled_by_descendant(tmp_path: Path) -> None:
+    """Fallback exports make the baseline's keys immutable to descendants."""
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        override_format: argparse
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases:
+          - name: depth
+            n_trials: 1
+            search_space:
+              depth: {{ type: int, low: 8, high: 8 }}
+          - name: learning_rate
+            n_trials: 1
+            search_space:
+              lr: {{ type: int, low: 3, high: 3 }}
+            promotion:
+              min_delta_vs: depth
+              min_delta: 1
+              on_fail: continue_baseline
+          - name: regularization
+            inherits: [learning_rate]
+            n_trials: 1
+            search_space:
+              depth: {{ type: int, low: 16, high: 16 }}
+        """,
+    )
+
+    with pytest.raises(ValidationError, match="re-samples key"):
+        load_experiment(p)
+
+
+@pytest.mark.parametrize(
+    ("phases", "match"),
+    [
+        pytest.param(
+            """
+              - name: base
+                n_trials: 1
+                fixed_overrides: { depth: 8 }
+              - name: first
+                n_trials: 1
+                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
+              - name: second
+                n_trials: 1
+                promotion: { min_delta_vs: first, min_delta: 1, on_fail: continue_baseline }
+              - name: child
+                inherits: [second]
+                n_trials: 1
+                search_space: { depth: { type: int, low: 16, high: 16 } }
+            """,
+            "re-samples key",
+            id="transitive-fallback",
+        ),
+        pytest.param(
+            """
+              - name: base
+                n_trials: 1
+                fixed_overrides: { depth: 8 }
+              - name: fallback
+                n_trials: 1
+                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
+              - name: other
+                n_trials: 1
+                fixed_overrides: { depth: 16 }
+              - name: child
+                inherits: [fallback, other]
+                n_trials: 1
+            """,
+            "conflicting locked key",
+            id="multi-parent-conflict",
+        ),
+        pytest.param(
+            """
+              - name: base
+                n_trials: 1
+                fixed_overrides: { model: base }
+              - name: fallback
+                n_trials: 1
+                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
+              - name: child
+                inherits: [fallback]
+                n_trials: 1
+                search_space: { model.depth: { type: int, low: 8, high: 8 } }
+            """,
+            "dotted-key namespace collision",
+            id="dotted-key-collision",
+        ),
+    ],
+)
+def test_promotion_fallback_keys_reach_all_descendant_validators(
+    tmp_path: Path, phases: str, match: str
+) -> None:
+    """Possible fallback exports participate in every descendant key check."""
+    p = write_yaml(
+        tmp_path,
+        f"""
+        experiment: t
+        workdir: {tmp_path}/runs
+        trial_command: "echo {{overrides}}"
+        override_format: argparse
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases:
+        {phases}
+        """,
+    )
+
+    with pytest.raises(ValidationError, match=match):
+        load_experiment(p)
+
+
+def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
+    """The runtime keeps malformed or stale configs from replacing inherited winners."""
+    from phasesweep.engine.phase import _composed_overrides
+    from phasesweep.engine.state import Winner
+
+    experiment = make_experiment(
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(name="base", n_trials=1),
+            Phase(name="child", n_trials=1, inherits=["base"]),
+        ],
+    )
+    stale_child = experiment.phases[1].model_copy(update={"search_space": {"depth": object()}})
+    inherited = {
+        "base": Winner(
+            trial_number=0,
+            params={"depth": 8},
+            effective_overrides={"depth": 8},
+            metric=1.0,
+        )
+    }
+
+    with pytest.raises(ValueError, match="re-samples inherited winner key"):
+        _composed_overrides(experiment, stale_child, {"depth": 16}, inherited)
+
+
+def test_correlated_promotion_outcomes_can_rejoin_through_two_parents() -> None:
+    """A diamond may reuse one promotion branch without combining both branches."""
+    experiment = make_experiment(
+        trial_command="echo {config_path}",
+        override_format="yaml_file",
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"model": {"depth": 8}}),
+            Phase(
+                name="choice",
+                n_trials=1,
+                fixed_overrides={"model.depth": 16},
+                promotion={
+                    "min_delta_vs": "base",
+                    "min_delta": 1,
+                    "on_fail": "continue_baseline",
+                },
+            ),
+            Phase(name="left", n_trials=1, inherits=["choice"], fixed_overrides={"left": 1}),
+            Phase(name="right", n_trials=1, inherits=["choice"], fixed_overrides={"right": 1}),
+            Phase(
+                name="later",
+                n_trials=1,
+                inherits=["left", "right"],
+                fixed_overrides={"lr": 0.01},
+            ),
+        ],
+    )
+
+    assert [phase.name for phase in experiment.phases] == [
+        "base",
+        "choice",
+        "left",
+        "right",
+        "later",
+    ]
 
 
 @pytest.mark.parametrize(

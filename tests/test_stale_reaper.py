@@ -18,6 +18,7 @@ import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.optuna as engine_optuna
 from phasesweep.config import (
     Experiment,
     IntParam,
@@ -35,34 +36,35 @@ from phasesweep.engine import (
     StudyStorageUnavailableError,
     run_experiment,
 )
-from phasesweep.engine.guards import (
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.attempts import (
     ATTEMPT_REGISTRY_SCHEMA_VERSION,
     _inspect_active_attempts,
     _preflight_active_attempts,
-    _preflight_existing_studies,
     _PreflightCleanupReport,
-    _reap_stale_trials,
     _record_stale_trial_failure,
     _register_active_attempt,
-    _validate_artifact_root_binding,
 )
+from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.fingerprints import _evaluation_semantics, _phase_fingerprint
+from phasesweep.engine.guards import _preflight_existing_studies
+from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _generation_path, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
+    CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     PHASE_ABORT_ATTR,
+    PHASE_EVALUATION_SEMANTICS_ATTR,
+    PHASE_FINGERPRINT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
-    _attempts_dir,
-    _experiment_dir,
-    _generation_path,
-    _trial_dir_for,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.runtime.files import canonical_storage_identity
@@ -178,6 +180,19 @@ def _stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
 
 
+def _stamp_current_evaluator_revision(
+    study: optuna.Study, experiment: Experiment, phase_name: str
+) -> None:
+    """Give a fabricated current-version study its recorded evaluator revision.
+
+    :param optuna.Study study: Fabricated study standing in for a current run.
+    :param Experiment experiment: Config whose evaluator produced its trials.
+    :param str phase_name: Phase owning the study.
+    """
+    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    study.set_user_attr(PHASE_EVALUATION_SEMANTICS_ATTR, _evaluation_semantics(experiment, phase))
+
+
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     """If config changed AND a stale RUNNING trial exists, reap must happen first.
 
@@ -263,6 +278,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     )
 
     _stamp_artifact_root(study, exp)
+    _stamp_current_evaluator_revision(study, exp, "a")
     identity = _environment_identity(exp)
     t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     t.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
@@ -329,6 +345,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
         _stamp_artifact_root(study, experiment)
+        _stamp_current_evaluator_revision(study, experiment, "b")
         _validate_artifact_root_binding(experiment, claim_fresh=True)
         trial = study.ask()
         trial_dir = _trial_dir_for(
@@ -351,6 +368,10 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         )
 
         experiment = experiment.model_copy(update={"env": {"STALE_PID": str(stale.pid)}})
+        study.set_user_attr(
+            PHASE_FINGERPRINT_ATTR,
+            _phase_fingerprint(experiment, experiment.phases[1], {}),
+        )
         identity = _environment_identity(experiment)
         trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
         trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
@@ -448,9 +469,17 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
     )
 
     if stage == "load":
+
+        def loader(*_args: object, **_kwargs: object) -> object:
+            raise shutdown
+
         monkeypatch.setattr(
-            "phasesweep.engine.guards._load_existing_phase_study",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(shutdown),
+            "phasesweep.engine.artifact_roots._load_existing_phase_study",
+            loader,
+        )
+        monkeypatch.setattr(
+            "phasesweep.engine.relocation._load_existing_phase_study",
+            loader,
         )
     elif stage == "get_trials":
         study = SimpleNamespace(
@@ -458,15 +487,31 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
             user_attrs={},
             get_trials=lambda **_kwargs: (_ for _ in ()).throw(shutdown),
         )
+
+        def loader(*_args: object, **_kwargs: object) -> object:
+            return study
+
         monkeypatch.setattr(
-            "phasesweep.engine.guards._load_existing_phase_study",
-            lambda *_args, **_kwargs: study,
+            "phasesweep.engine.artifact_roots._load_existing_phase_study",
+            loader,
+        )
+        monkeypatch.setattr(
+            "phasesweep.engine.relocation._load_existing_phase_study",
+            loader,
         )
     else:
         study = optuna.create_study(direction="minimize")
+
+        def loader(*_args: object, **_kwargs: object) -> object:
+            return study
+
         monkeypatch.setattr(
-            "phasesweep.engine.guards._load_existing_phase_study",
-            lambda *_args, **_kwargs: study,
+            "phasesweep.engine.artifact_roots._load_existing_phase_study",
+            loader,
+        )
+        monkeypatch.setattr(
+            "phasesweep.engine.relocation._load_existing_phase_study",
+            loader,
         )
         if stage == "stale_reaper":
             monkeypatch.setattr(
@@ -507,9 +552,17 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
         phase.name: optuna.create_study(study_name=phase.name, direction="minimize")
         for phase in experiment.phases
     }
+
+    def loader(_experiment: object, phase: Phase) -> optuna.Study:
+        return studies[phase.name]
+
     monkeypatch.setattr(
-        "phasesweep.engine.guards._load_existing_phase_study",
-        lambda _experiment, phase: studies[phase.name],
+        "phasesweep.engine.artifact_roots._load_existing_phase_study",
+        loader,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.relocation._load_existing_phase_study",
+        loader,
     )
 
     def reap(_study: optuna.Study, _experiment: Experiment, phase_name: str, **_kwargs) -> int:
@@ -1059,16 +1112,20 @@ def test_reaper_uses_persisted_trial_dir_when_workdir_changes(tmp_path: Path) ->
             boot_id="test-boot",
         )
 
-    import phasesweep.engine.guards as _reaper
+    import phasesweep.engine.attempts as attempt_mod
+    import phasesweep.engine.cleanup as _reaper
 
-    real_read = _reaper.read_stale_process_identity
-    _reaper.read_stale_process_identity = fake_read_identity  # type: ignore[assignment]
+    real_read = attempt_mod.read_stale_process_identity
+    attempt_mod.read_stale_process_identity = fake_read_identity  # type: ignore[assignment]
+    real_attempt_cleanup = attempt_mod.cleanup_stale_trial_process
     real_cleanup = _reaper.cleanup_stale_trial_process
+    attempt_mod.cleanup_stale_trial_process = lambda _identity: True
     _reaper.cleanup_stale_trial_process = lambda _identity: True
     try:
         _reap_stale_trials(study, exp, "p")
     finally:
-        _reaper.read_stale_process_identity = real_read  # type: ignore[assignment]
+        attempt_mod.read_stale_process_identity = real_read  # type: ignore[assignment]
+        attempt_mod.cleanup_stale_trial_process = real_attempt_cleanup
         _reaper.cleanup_stale_trial_process = real_cleanup
 
     assert seen_dirs == [str(persisted_trial_dir)], (
@@ -1092,7 +1149,7 @@ def test_reaper_falls_back_for_prelaunch_trial_without_trial_dir_attr(
     expected_trial_dir = _trial_dir_for(exp, exp.phases[0].name, trial.number)
 
     monkeypatch.setattr(
-        "phasesweep.engine.guards.read_stale_process_identity",
+        "phasesweep.engine.attempts.read_stale_process_identity",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("prelaunch trials must not read process identity")
         ),
@@ -1109,6 +1166,92 @@ def test_reaper_falls_back_for_prelaunch_trial_without_trial_dir_attr(
         "outcome": "failure",
         "cause": "stale RUNNING trial recovered after its orchestrator stopped",
     }
+
+
+def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Allocations interrupted before the objective retain environment provenance."""
+
+    class PowerLoss(BaseException):
+        pass
+
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'allocation.db'}",
+        trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        override_format="argparse",
+        n_trials=3,
+        sampler=Sampler(type="random", seed=1),
+    )
+
+    def allocate_then_die(self: optuna.Study, _objective: object, **_kwargs: object) -> None:
+        self.ask()
+        raise PowerLoss("after allocation, before objective metadata")
+
+    for _ in range(2):
+        with monkeypatch.context() as patch:
+            patch.setattr(optuna.Study, "optimize", allocate_then_die)
+            with pytest.raises(PowerLoss, match="after allocation"):
+                run_experiment(exp)
+
+    winners = run_experiment(exp)
+
+    assert winners["p"].metric == pytest.approx(1.0)
+    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    trials = study.get_trials(deepcopy=False)
+    assert [trial.state for trial in trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    identity = _environment_identity(exp)
+    assert all(trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest for trial in trials)
+
+
+def test_allocation_context_covers_first_environment_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed first environment write does not poison abort recovery."""
+
+    trainer = write_trainer(tmp_path, "print('x=1.0')")
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'first-write.db'}",
+        trial_command=f"{sys.executable} {trainer} {{overrides}}",
+        override_format="argparse",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=1),
+    )
+
+    real_set_user_attr = optuna.Trial.set_user_attr
+    failed = False
+
+    def fail_first_environment_write(self: optuna.Trial, key: str, value: object) -> None:
+        nonlocal failed
+        if key == TRAINER_ENV_DIGEST_ATTR and not failed:
+            failed = True
+            raise OSError("first environment write failed")
+        real_set_user_attr(self, key, value)
+
+    monkeypatch.setattr(optuna.Trial, "set_user_attr", fail_first_environment_write)
+
+    with pytest.raises(OSError, match="first environment write failed"):
+        run_experiment(exp)
+
+    resumed = exp.model_copy(update={"phases": [exp.phases[0].model_copy(update={"n_trials": 2})]})
+    winners = run_experiment(resumed)
+
+    assert winners["p"].metric == pytest.approx(1.0)
+    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    trials = study.get_trials(deepcopy=False)
+    assert [trial.state for trial in trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    assert TRAINER_ENV_DIGEST_ATTR not in trials[0].user_attrs
+    assert run_experiment(resumed)["p"].metric == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize("bad_value", ["", 123])
@@ -1154,18 +1297,20 @@ def test_reaper_reports_storage_failures_after_cleanup(
     trial.set_user_attr(ATTEMPT_ID_ATTR, "tell-failure-attempt")
     trial.set_user_attr(TRIAL_DIR_ATTR, str(tmp_path / "runs" / "t" / "p" / "trial_00000"))
 
-    monkeypatch.setattr(
-        "phasesweep.engine.guards._read_trial_process_identity",
-        lambda *_args, **_kwargs: StaleProcessIdentity(
+    def fake_identity(*_args: object, **_kwargs: object) -> StaleProcessIdentity:
+        return StaleProcessIdentity(
             schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
             attempt_id="tell-failure-attempt",
             pid=99999,
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
-        ),
-    )
-    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", lambda _: True)
+        )
+
+    monkeypatch.setattr("phasesweep.engine.attempts._read_trial_process_identity", fake_identity)
+    monkeypatch.setattr("phasesweep.engine.cleanup._read_trial_process_identity", fake_identity)
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _: True)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", lambda _: True)
 
     if failure_site == "outcome":
         patch_rejected_trial_user_attr(
@@ -1252,6 +1397,8 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
     study, trial_dir, stale_number = _fabricate_stale_running_trial(
         exp, "p", attempt_id="queued-attempt"
     )
+    _stamp_current_evaluator_revision(study, exp, "p")
+    study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
     write_attempt_lifecycle(trial_dir, attempt_id="queued-attempt", state="allocated")
 
     winners = run_experiment(exp)
@@ -1304,7 +1451,8 @@ def test_exited_attempt_recovers_without_signalling(
     def _no_signal(*_args: object, **_kwargs: object) -> bool:
         raise AssertionError("an 'exited' attempt must never be signalled")
 
-    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", _no_signal)
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", _no_signal)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", _no_signal)
 
     assert _reap_stale_trials(study, exp, "p") == 1
     assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
@@ -1351,6 +1499,182 @@ def _fabricate_registered_attempt(
         generation_id="old-generation",
     )
     return study, trial_dir, number
+
+
+def _fabricate_registered_journal_attempt(
+    tmp_path: Path,
+    *,
+    attempt_id: str,
+) -> tuple[Experiment, Path, Path]:
+    """Create an allocated registry entry backed by a journal study."""
+    ledger = tmp_path / "attempts.journal"
+    experiment = make_experiment(
+        experiment="journal-attempt",
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{ledger}",
+    )
+    study = optuna.create_study(
+        study_name="journal-attempt::p",
+        storage=engine_optuna._resolve_storage(experiment.resolved_storage),
+        direction="minimize",
+    )
+    trial = study.ask()
+    trial_dir = _trial_dir_for(
+        experiment,
+        "p",
+        trial.number,
+        generation_id="old-generation",
+        attempt_id=attempt_id,
+    )
+    trial_dir.mkdir(parents=True)
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name="p",
+        study_name=study.study_name,
+        trial_number=trial.number,
+        trial_dir=trial_dir,
+        generation_id="old-generation",
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    return experiment, ledger, _attempts_dir(experiment) / f"{attempt_id}.json"
+
+
+@pytest.mark.parametrize("tail", [b"{}\n", b"not-json\n", b"not-json", b'{"unterminated"'])
+def test_registry_retains_attempt_when_journal_snapshot_is_unreadable(
+    tmp_path: Path, tail: bytes
+) -> None:
+    """Malformed journal tails cannot discard a stale-attempt recovery record."""
+    experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
+        tmp_path, attempt_id="journal-attempt"
+    )
+    ledger.write_bytes(ledger.read_bytes() + tail)
+    ledger_before = ledger.read_bytes()
+    entry_before = entry_path.read_bytes()
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    assert ledger.read_bytes() == ledger_before
+    assert entry_path.read_bytes() == entry_before
+
+
+def test_registry_retains_attempt_when_live_journal_loses_snapshotted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later live replay cannot erase snapshot-proven recovery evidence."""
+    import phasesweep.engine.attempts as attempts_mod
+
+    experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
+        tmp_path, attempt_id="changed-journal-attempt"
+    )
+    create_study_only = ledger.read_bytes().splitlines(keepends=True)[0]
+    entry_before = entry_path.read_bytes()
+    real_snapshot = attempts_mod._load_journal_study_snapshot
+
+    def snapshot_then_truncate(storage_url: str, study_name: str):
+        snapshot = real_snapshot(storage_url, study_name)
+        ledger.write_bytes(create_study_only)
+        return snapshot
+
+    monkeypatch.setattr(attempts_mod, "_load_journal_study_snapshot", snapshot_then_truncate)
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    assert ledger.read_bytes() == create_study_only
+    assert entry_path.read_bytes() == entry_before
+
+
+def test_registry_discards_attempt_for_a_confirmed_missing_journal_study(tmp_path: Path) -> None:
+    """A valid journal can still prove that a named stale study is gone."""
+    experiment, _ledger, entry_path = _fabricate_registered_journal_attempt(
+        tmp_path, attempt_id="missing-journal-attempt"
+    )
+    storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+    optuna.delete_study(study_name="journal-attempt::p", storage=storage)
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    assert not entry_path.exists()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+@pytest.mark.parametrize(
+    "identity_change", [None, "attempt", "generation", "missing-attempt", "missing-generation"]
+)
+def test_registry_terminal_cleanup_requires_matching_attempt_identity(
+    tmp_path: Path, backend: str, identity_change: str | None
+) -> None:
+    """A stale registry entry cannot consume a replacement trial's cleanup evidence."""
+    from phasesweep.engine.cleanup import _iter_cleanup_uncertain_trials
+
+    experiment = make_experiment(
+        experiment="terminal-identity",
+        workdir=tmp_path / "runs",
+        storage=f"{backend}:///{tmp_path / 'ledger'}",
+    )
+    old_dir = tmp_path / "old-attempt"
+    old_dir.mkdir()
+    write_attempt_lifecycle(old_dir, attempt_id="old-attempt", state="allocated")
+    _register_active_attempt(
+        experiment,
+        attempt_id="old-attempt",
+        phase_name="p",
+        study_name="terminal-identity::p",
+        trial_number=0,
+        trial_dir=old_dir,
+        generation_id="old-generation",
+    )
+    # A restored divergent ledger can reuse the number without preserving
+    # the registry entry's attempt. Recovery must inspect that trial itself.
+    storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+    study = optuna.create_study(study_name="terminal-identity::p", storage=storage)
+    trial = study.ask()
+    new_dir = tmp_path / "ledger-attempt"
+    new_dir.mkdir()
+    if identity_change != "missing-attempt":
+        trial.set_user_attr(
+            ATTEMPT_ID_ATTR, "new-attempt" if identity_change == "attempt" else "old-attempt"
+        )
+    if identity_change != "missing-generation":
+        trial.set_user_attr(
+            GENERATION_ID_ATTR,
+            "new-generation" if identity_change == "generation" else "old-generation",
+        )
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(new_dir))
+    trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+
+    # Registry recovery must keep working when this phase is no longer
+    # declared; there may be no later per-phase scan to catch missing identity.
+    experiment = experiment.model_copy(
+        update={"phases": [experiment.phases[0].model_copy(update={"name": "renamed"})]}
+    )
+    report = _PreflightCleanupReport()
+    if identity_change == "generation":
+        with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
+            _preflight_active_attempts(experiment, report)
+    elif identity_change in {"missing-attempt", "missing-generation"}:
+        with pytest.raises(ProcessCleanupUncertainError, match="identity is missing") as exc_info:
+            _preflight_active_attempts(experiment, report)
+        assert "Restore the original storage ledger" in str(exc_info.value)
+        assert "before retrying recovery" in str(exc_info.value)
+        assert report.uncertain_attempt_ids == {"old-attempt"}
+    else:
+        _preflight_active_attempts(experiment, report)
+
+    if identity_change is None:
+        assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [0]
+        assert report.recovered_attempt_ids == {"old-attempt"}
+        assert list(_iter_cleanup_uncertain_trials(study)) == []
+    else:
+        assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
+        assert report.recovered_attempt_ids == set()
+        with pytest.raises(ProcessCleanupUncertainError) as exc_info:
+            list(_iter_cleanup_uncertain_trials(study))
+        assert "Restore the original storage ledger" in str(exc_info.value)
+    assert bool(list(_attempts_dir(experiment).glob("*.json"))) == (
+        identity_change in {"generation", "missing-attempt", "missing-generation"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -1531,6 +1855,10 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         attempt_id="partial-attempt",
         persist_trial_attempt_id=False,
         persist_trial_generation_id=False,
+    )
+    _stamp_current_evaluator_revision(study, experiment, "p")
+    study.set_user_attr(
+        PHASE_FINGERPRINT_ATTR, _phase_fingerprint(experiment, experiment.phases[0], {})
     )
     write_attempt_lifecycle(trial_dir, attempt_id="partial-attempt", state="allocated")
 
@@ -1810,10 +2138,10 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
         )
 
     attempts_dir = tmp_path / "runs" / "unregistrable" / "attempts"
-    import phasesweep.engine.guards as guards_mod
+    import phasesweep.engine.attempts as attempts_mod
     import phasesweep.engine.phase as phase_mod
 
-    real_atomic_write_text = guards_mod.private_atomic_write_text
+    real_atomic_write_text = attempts_mod.private_atomic_write_text
     real_write_attempt_lifecycle = phase_mod.write_attempt_lifecycle
     if failure_site == "registry":
 
@@ -1822,7 +2150,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
                 raise OSError(errno.EACCES, "injected registry write failure")
             real_atomic_write_text(path, text)
 
-        monkeypatch.setattr(guards_mod, "private_atomic_write_text", refuse_registry_writes)
+        monkeypatch.setattr(attempts_mod, "private_atomic_write_text", refuse_registry_writes)
     else:
 
         def refuse_lifecycle_write(*_args: object, **_kwargs: object) -> None:
@@ -1852,7 +2180,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "active_attempt_persistence"
 
     # Restoring writes does not erase the abort; a higher target explicitly recovers it.
-    monkeypatch.setattr(guards_mod, "private_atomic_write_text", real_atomic_write_text)
+    monkeypatch.setattr(attempts_mod, "private_atomic_write_text", real_atomic_write_text)
     monkeypatch.setattr(phase_mod, "write_attempt_lifecycle", real_write_attempt_lifecycle)
     with pytest.raises(NoFeasibleTrialError, match="Increase n_trials above 2"):
         run_experiment(_exp(2))

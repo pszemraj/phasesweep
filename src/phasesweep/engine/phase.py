@@ -17,30 +17,23 @@ import optuna
 from phasesweep.config import Experiment, Gate, Phase
 from phasesweep.config.models import _iter_fixed_override_layers
 from phasesweep.config.search import _placeholder_values_for
+from phasesweep.engine.artifact_roots import _bind_study_artifact_root
+from phasesweep.engine.artifacts import _write_trials_csv
+from phasesweep.engine.attempts import (
+    _register_active_attempt,
+    _retire_active_attempt,
+    _trial_requires_cleanup_recovery,
+)
+from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
-from phasesweep.engine.guards import (
-    _accepted_trial_target,
-    _AcceptedPartialDecision,
-    _bind_study_artifact_root,
-    _load_accepted_partial_decision,
-    _load_phase_policy_state,
-    _reap_stale_trials,
-    _record_trial_target,
-    _register_active_attempt,
-    _retire_active_attempt,
-    _trial_requires_cleanup_recovery,
-    _validate_environment_cohort,
-    _validate_study_direction,
-    _validate_study_schema,
-    _validate_trial_target,
-    _verify_fingerprint,
-    _verify_winner_objective_evidence,
-)
+from phasesweep.engine.evidence import _verify_winner_objective_evidence
+from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.optuna import _create_phase_study, _phase_study_name, _suggest
+from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -66,10 +59,19 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     Winner,
     WinnerSource,
-    _phase_dir,
-    _trial_dir_for,
-    _write_trials_csv,
     constraint_attr,
+)
+from phasesweep.engine.study_policy import (
+    _accepted_trial_target,
+    _AcceptedPartialDecision,
+    _load_accepted_partial_decision,
+    _load_phase_policy_state,
+    _record_allocation_context,
+    _record_trial_target,
+    _validate_environment_cohort,
+    _validate_study_direction,
+    _validate_study_schema,
+    _validate_trial_target,
 )
 from phasesweep.engine.trial import (
     TrialExecutionError,
@@ -81,7 +83,7 @@ from phasesweep.engine.trial import (
     prepare_trainer_input,
 )
 from phasesweep.runtime.commands import render_command
-from phasesweep.runtime.gpu import GpuLeaseTimeoutError, GpuPool
+from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.process import PhaseSweepShutdown, write_attempt_lifecycle
 
 log = logging.getLogger("phasesweep.engine.phase")
@@ -224,9 +226,15 @@ def _composed_overrides(
         Later layers (later keys in the merge order) overwrite earlier ones.
 
     """
-    out: dict[str, Any] = {}
+    inherited_overrides: dict[str, Any] = {}
     for parent in phase.inherits:
-        out.update(inherited_winners[parent].effective_overrides)
+        inherited_overrides.update(inherited_winners[parent].effective_overrides)
+    resampled = set(inherited_overrides) & set(sampled)
+    if resampled:
+        raise ValueError(
+            f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)}."
+        )
+    out = dict(inherited_overrides)
     for _origin, fixed_overrides in _iter_fixed_override_layers(experiment, phase):
         out.update(fixed_overrides)
     out.update(sampled)
@@ -587,6 +595,7 @@ def _run_phase(
                 error,
             )
         abort["flag"] = True
+        gpu_pool.cancel_waiters()
         with contextlib.suppress(Exception):
             study.stop()
 
@@ -703,6 +712,7 @@ def _run_phase(
                 if not threshold_tripped and not fatal_tripped:
                     return
                 abort["flag"] = True
+                gpu_pool.cancel_waiters()
                 if abort_recorded["flag"]:
                     return
                 if fatal_tripped:
@@ -779,14 +789,14 @@ def _run_phase(
         """
         assert generation_id is not None
 
-        if abort["flag"]:
-            raise optuna.TrialPruned("phase aborted")
-
         # Stamp the environment as the first durable fact of allocation. Even
-        # a failure while creating lifecycle/registry metadata must remain in
+        # a peer abort or failure creating lifecycle/registry metadata must remain in
         # the study's known semantic cohort on the next invocation.
         trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, environment_identity.digest)
         trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(environment_identity.names))
+
+        if abort["flag"]:
+            raise optuna.TrialPruned("phase aborted")
 
         sampled = {name: _suggest(trial, name, p) for name, p in phase.search_space.items()}
         overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
@@ -859,7 +869,6 @@ def _run_phase(
                     raise optuna.TrialPruned("phase aborted")
 
                 timeout_seconds = phase.timeout_seconds_per_trial
-                timeout_capped_by_wallclock = False
                 if optimize_deadline is not None:
                     remaining_wallclock = optimize_deadline - time.monotonic()
                     if remaining_wallclock <= 0.0:
@@ -867,9 +876,6 @@ def _run_phase(
                         raise _DeadlineTrialExecutionError(
                             f"{timeout_source or 'wallclock'} deadline reached before trial launch."
                         )
-                    if timeout_seconds is None or remaining_wallclock < timeout_seconds:
-                        timeout_seconds = remaining_wallclock
-                        timeout_capped_by_wallclock = True
 
                 prepared_input = prepare_trainer_input(
                     experiment=experiment,
@@ -883,6 +889,13 @@ def _run_phase(
                 # started. If this ledger write fails, no subprocess consumes
                 # evidence that the study cannot later verify.
                 trial.set_user_attr(TRAINER_INPUT_ATTR, prepared_input.record())
+                if optimize_deadline is not None:
+                    remaining_wallclock = optimize_deadline - time.monotonic()
+                    if remaining_wallclock <= 0.0:
+                        _stop_for_deadline()
+                        raise _DeadlineTrialExecutionError(
+                            f"{timeout_source or 'wallclock'} deadline reached before trial launch."
+                        )
                 executed = launch_trial(
                     experiment=experiment,
                     phase_name=phase.name,
@@ -892,6 +905,7 @@ def _run_phase(
                     trial_dir=trial_dir,
                     overrides=overrides,
                     timeout_seconds=timeout_seconds,
+                    wallclock_deadline=optimize_deadline,
                     gpu_id=gpu_assignment.visible_devices,
                     gpu_lease_fds=gpu_assignment.lease_fds,
                     prepared_input=prepared_input,
@@ -920,7 +934,6 @@ def _run_phase(
                     # is already recorded and ``_raise_if_fatal_aborted`` will
                     # fire after ``study.optimize`` returns regardless.
                     with contextlib.suppress(Exception):
-                        trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
                         trial.set_user_attr(
                             FAILURE_REASON_ATTR,
                             executed.process.failure_reason
@@ -931,6 +944,8 @@ def _run_phase(
         except GpuLeaseTimeoutError as exc:
             _stop_for_deadline()
             raise _DeadlineTrialExecutionError(str(exc)) from exc
+        except GpuLeaseCancelledError as exc:
+            raise optuna.TrialPruned("phase aborted") from exc
 
         # Extraction happens outside GPU lease but INSIDE the phase/run
         # wallclock budget: the configured timeouts bound the whole trial,
@@ -941,7 +956,6 @@ def _run_phase(
             gates=_phase_gates(experiment, phase),
             enforce_gates=phase.promotion is None or phase.promotion.requires_gates,
             deadline=optimize_deadline,
-            trainer_timeout_is_deadline=timeout_capped_by_wallclock,
         )
         if result.deadline_exhausted:
             # Preserve causal attribution carried by the result: a trainer
@@ -1037,6 +1051,10 @@ def _run_phase(
             raise
         except UnsafeProcessCleanupError as exc:
             _record_fatal_abort(exc)
+            # Both trainer and evidence-worker cleanup failures retain this
+            # diagnostic; the fatal policy below remains the recovery authority.
+            with contextlib.suppress(Exception):
+                trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
             _record_outcome(
                 trial,
                 "fatal",
@@ -1102,6 +1120,8 @@ def _run_phase(
         # Terminal state alone is insufficient for an unsafe-cleanup trial: its
         # registry entry is the cross-phase/storage recovery locator and must
         # survive until preflight durably consumes cleanup evidence.
+        # Optuna skips callbacks for uncaught objective errors; the enclosing
+        # run's reconciliation retires those attempts after checking cleanup.
         finished_attempt = _trial.user_attrs.get(ATTEMPT_ID_ATTR)
         if (
             isinstance(finished_attempt, str)
@@ -1168,6 +1188,12 @@ def _run_phase(
         _consecutive_failures = current_policy_state.consecutive_failures
     try:
         try:
+            assert generation_id is not None
+            _record_allocation_context(
+                study,
+                generation_id=generation_id,
+                trainer_environment=environment_identity.digest,
+            )
             study.optimize(
                 objective,
                 n_trials=remaining,
@@ -1371,6 +1397,9 @@ def _select_phase_winner(
             attempt_id=selected.attempt_id,
         ),
         objective_provenance=selected.objective_provenance,
+        trainer_input=(
+            dict(selected.trainer_input) if selected.trainer_input is not None else None
+        ),
         # The digest comes from the winning TRIAL — a top-up can select a
         # trial an earlier invocation ran under another environment — while
         # the contract is config, identical for every trial in the study

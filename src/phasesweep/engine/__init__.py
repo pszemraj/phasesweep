@@ -11,6 +11,7 @@ from phasesweep.engine.errors import (
     PublicationAccessError,
     PublicationCommitError,
     PublicationIntegrityError,
+    PublishedStudyMissingError,
     RunRequestError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
@@ -21,6 +22,7 @@ from phasesweep.engine.errors import (
     TrialTargetRegressionError,
     WinnerIntegrityError,
 )
+from phasesweep.engine.provenance import generation_id_source
 from phasesweep.engine.read import (
     PhaseWinnerView,
     read_status,
@@ -33,10 +35,10 @@ from phasesweep.engine.run import (
     config_status,
     run_config,
     run_experiment,
-    run_suite,
 )
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import Winner, generation_id_source
+from phasesweep.engine.state import Winner
+from phasesweep.engine.suite import run_suite
 from phasesweep.engine.trial import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 
 __all__ = [
@@ -54,6 +56,7 @@ __all__ = [
     "PublicationAccessError",
     "PublicationCommitError",
     "PublicationIntegrityError",
+    "PublishedStudyMissingError",
     "RunRequestError",
     "SamplerContinuationUnsupportedError",
     "StudyContextConflictError",

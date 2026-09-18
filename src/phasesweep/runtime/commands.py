@@ -111,14 +111,13 @@ def format_hydra(overrides: dict[str, Any]) -> str:
 
 
 def format_argparse(overrides: dict[str, Any]) -> str:
-    """argparse-style: ``--key value``, both unconditionally quoted.
+    """Render argparse options as shell-quoted ``--key=value`` tokens.
 
     Args:
         overrides: Mapping from override key to value.
 
     Returns:
-        A single space-separated string of shell-quoted ``--key`` ``value``
-        token pairs.
+        A single space-separated string of shell-quoted ``--key=value`` tokens.
 
     Raises:
         TypeError: A value is outside the shared CLI override contract (see
@@ -128,8 +127,7 @@ def format_argparse(overrides: dict[str, Any]) -> str:
     """
     parts: list[str] = []
     for k, v in overrides.items():
-        parts.append(shlex.quote(f"--{k}"))
-        parts.append(shlex.quote(_render_override_value(v, "argparse")))
+        parts.append(shlex.quote(f"--{k}={_render_override_value(v, 'argparse')}"))
     return " ".join(parts)
 
 

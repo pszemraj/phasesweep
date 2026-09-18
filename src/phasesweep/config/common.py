@@ -4,10 +4,27 @@ from __future__ import annotations
 
 import math
 import re
+from typing import Annotated, TypeAlias
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, BeforeValidator, ConfigDict
 
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _reject_boolean_number(value: object) -> object:
+    """Reject YAML booleans before Pydantic coerces them to zero or one.
+
+    :param object value: Raw numeric config value.
+    :raises ValueError: If the value is a boolean.
+    :return object: The unchanged non-boolean value.
+    """
+    if isinstance(value, bool):
+        raise ValueError("numeric config values must be numbers, not booleans")
+    return value
+
+
+ConfigInt: TypeAlias = Annotated[int, BeforeValidator(_reject_boolean_number)]
+ConfigFloat: TypeAlias = Annotated[float, BeforeValidator(_reject_boolean_number)]
 
 
 class _Frozen(BaseModel):
@@ -16,7 +33,12 @@ class _Frozen(BaseModel):
     # Config values can contain storage credentials and environment secrets.
     # Pydantic normally repeats the rejected input in ValidationError text,
     # which would leak those values through CLI diagnostics.
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        hide_input_in_errors=True,
+        revalidate_instances="always",
+    )
 
 
 def _require_finite(label: str, value: float) -> None:

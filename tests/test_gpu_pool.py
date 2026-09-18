@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import sys
+import threading
 import time
 from contextlib import suppress
 
@@ -23,6 +24,7 @@ from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import (
     GpuDevice,
+    GpuLeaseCancelledError,
     GpuLeaseTimeoutError,
     GpuPool,
     _detect_gpu_inventory,
@@ -139,6 +141,50 @@ def test_whole_node_policy_waits_for_every_host_lock(tmp_path, monkeypatch) -> N
         ):
             pass
         fcntl.flock(held, fcntl.LOCK_UN)
+
+
+def test_whole_node_policy_cancels_while_waiting_for_host_lock(tmp_path, monkeypatch) -> None:
+    """An abort wakes a whole-node request after it releases partial leases."""
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
+    lock_path = _gpu_lock_path(GpuDevice("1", _TEST_UUID_MAP["1"]))
+    attempted_locked_device = threading.Event()
+    result: list[BaseException] = []
+    original_try_host_lease = _try_host_gpu_lease
+
+    def signal_locked_attempt(device: GpuDevice):
+        lease = original_try_host_lease(device)
+        if device.visible_token == "1":
+            attempted_locked_device.set()
+        return lease
+
+    with open_lock_file(lock_path) as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        monkeypatch.setattr("phasesweep.runtime.gpu._try_host_gpu_lease", signal_locked_attempt)
+        pool = GpuPool.create(n_jobs=1, explicit_ids=[0, 1], policy="whole_node")
+
+        def acquire() -> None:
+            try:
+                with pool.acquire():
+                    pytest.fail("the held host lock should prevent acquisition")
+            except BaseException as exc:
+                result.append(exc)
+
+        worker = threading.Thread(target=acquire)
+        worker.start()
+        try:
+            assert attempted_locked_device.wait(timeout=1.0)
+        finally:
+            pool.cancel_waiters()
+            worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert len(result) == 1
+    assert isinstance(result[0], GpuLeaseCancelledError)
+    assert pool._whole_node_in_use is False
+
+    competitor = GpuPool.create(n_jobs=1, explicit_ids=[0])
+    with competitor.acquire(deadline=time.monotonic() + 1.0) as assignment:
+        assert assignment.visible_devices == "0"
 
 
 def test_none_policy_disables_cuda_isolation(monkeypatch) -> None:

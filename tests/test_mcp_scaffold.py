@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import stat
 from pathlib import Path
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from phasesweep.cli import cli as cli_main
@@ -43,13 +46,17 @@ def test_init_catalog_writes_read_only_catalog(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert f"wrote {output}" in result.output
 
-    assert (tmp_path / "runs" / ".mcp" / "runs").is_dir()
-    assert (tmp_path / "runs" / ".mcp" / "logs").is_dir()
-
     # The scaffold boots the real server loader as-is, read-only.
     registry = Registry.load(output)
     entry = registry.get("srv")
-    assert registry.state_dir == tmp_path / "runs" / ".mcp"
+    digest = hashlib.sha256(str(output.resolve()).encode()).hexdigest()[:12]
+    assert registry.state_dir == tmp_path / "state-home" / "phasesweep" / "mcp" / digest
+    assert (registry.state_dir / "runs").is_dir()
+    assert (registry.state_dir / "logs").is_dir()
+    assert (registry.state_dir / "origin").read_text() == str(output.resolve()) + "\n"
+    assert stat.S_IMODE(registry.state_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((registry.state_dir / "origin").stat().st_mode) == 0o600
+    assert not (tmp_path / "runs").exists()
     assert entry.config_path == config
     assert entry.cwd == output.parent.resolve()
     assert entry.allow_launch is False
@@ -105,18 +112,87 @@ def test_init_catalog_quotes_implicit_yaml_scalar_ids(tmp_path: Path, filename: 
     assert Registry.load(output).get(experiment_id).id == experiment_id
 
 
-def test_init_catalog_quotes_state_dir_with_yaml_punctuation(tmp_path: Path) -> None:
+def test_init_catalog_quotes_state_dir_with_yaml_punctuation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     catalog_dir = tmp_path / "project # one"
     catalog_dir.mkdir()
     output = catalog_dir / "catalog.yaml"
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state # one"))
 
     result = CliRunner().invoke(
         cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
 
     assert result.exit_code == 0, result.output
-    assert Registry.load(output).state_dir == (catalog_dir / "runs" / ".mcp").resolve()
+    assert Registry.load(output).state_dir.parent == tmp_path / "state # one" / "phasesweep" / "mcp"
+
+
+@pytest.mark.parametrize("xdg", [None, "", "relative"])
+def test_scaffold_state_falls_back_to_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, xdg: str | None
+) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    if xdg is None:
+        monkeypatch.delenv("XDG_STATE_HOME")
+    else:
+        monkeypatch.setenv("XDG_STATE_HOME", xdg)
+    state = Path(yaml.safe_load(scaffold_catalog_text(tmp_path / "catalog.yaml", []))["state_dir"])
+    assert state.parent == tmp_path / ".local" / "state" / "phasesweep" / "mcp"
+
+
+def test_catalog_filenames_have_distinct_state(tmp_path: Path) -> None:
+    states = [
+        yaml.safe_load(scaffold_catalog_text(tmp_path / name, []))["state_dir"]
+        for name in ("one.yaml", "two.yaml")
+    ]
+    assert states[0] != states[1]
+
+
+def test_home_override_pins_scaffold_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "private-root"
+    root.mkdir(mode=0o700)
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "catalog.yaml"
+    result = CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
+    assert result.exit_code == 0, result.output
+    state = Registry.load(output).state_dir
+    assert state.parent == root / "mcp"
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative-but-unused")
+    assert Registry.load(output).state_dir == state
+    assert (state / "origin").read_text() == str(output.resolve()) + "\n"
+
+
+def test_scaffold_rejects_invalid_home_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative")
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "catalog.yaml"
+    result = CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
+    assert result.exit_code == 2
+    assert "PHASESWEEP_HOME must be an absolute path" in result.output
+    assert not output.exists()
+
+
+def test_scaffold_refuses_unsafe_state(tmp_path: Path) -> None:
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "catalog.yaml"
+    state = Path(yaml.safe_load(scaffold_catalog_text(output, [config]))["state_dir"])
+    state.mkdir(parents=True)
+    state.chmod(0o755)
+    result = CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
+    assert result.exit_code == 2
+    assert not output.exists()
+    assert stat.S_IMODE(state.stat().st_mode) == 0o755
 
 
 def test_init_catalog_validates_before_publish(tmp_path: Path) -> None:

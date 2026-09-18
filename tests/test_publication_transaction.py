@@ -23,43 +23,53 @@ import signal
 import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
-import phasesweep.engine.run as engine_run
-import phasesweep.engine.state as engine_state
+import phasesweep.engine.artifacts as artifact_io
+import phasesweep.engine.generation as generation_ops
+import phasesweep.engine.publication_validation as validation_ops
+import phasesweep.engine.run as run_engine
+import phasesweep.engine.suite as suite_ops
 from phasesweep import load_config, run_experiment
-from phasesweep.config import Experiment, IntParam, Phase, Sampler, Suite
+from phasesweep.cli import _show_suite_winners
+from phasesweep.config import Experiment, IntParam, Phase, Promotion, Sampler, Suite
 from phasesweep.engine import (
     NoFeasibleTrialError,
     PublicationCommitError,
     PublicationIntegrityError,
     TerminalReport,
     Winner,
+    WinnerIntegrityError,
     generation_id_source,
     read_status,
     read_winner,
 )
-from phasesweep.engine.run import run_suite
-from phasesweep.engine.state import (
-    PublicationPointer,
+from phasesweep.engine.paths import (
     _generation_dir,
     _generation_path,
     _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
-    _last_successful_generation_id,
+    _generations_dir,
     _last_successful_generation_path,
     _last_successful_suite_generation_path,
-    _resolve_publication_pointer,
-    _resolve_suite_publication_pointer,
     _suite_generation_path,
     _suite_generation_record_path,
     _suite_generation_summary_path,
+    _suite_generations_dir,
     _suite_summary_path,
+)
+from phasesweep.engine.publication import (
+    PublicationPointer,
+    _last_successful_generation_id,
+    _resolve_publication_pointer,
+    _resolve_suite_publication_pointer,
     _unresolvable_pointer,
 )
+from phasesweep.engine.suite import run_suite
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
@@ -190,7 +200,7 @@ def test_summary_readback_refusals_are_publication_commit_errors(
         summary_path.write_text(summary_text)
 
     with pytest.raises(PublicationCommitError, match=match):
-        engine_run._validate_publishable_summary(
+        generation_ops._validate_publishable_summary(
             summary_path=summary_path,
             owner_key="experiment",
             owner_value="expected",
@@ -213,7 +223,7 @@ def test_precommit_validation_failure_keeps_prior_publication(
     def fail_validation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated pre-commit validation failure")
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", fail_validation)
+    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
 
     captured: list[str] = []
 
@@ -252,14 +262,14 @@ def test_pointer_commit_failure_keeps_prior_publication(
     assert first_generation is not None
 
     pointer_path = _last_successful_generation_path(experiment)
-    original_write = engine_run._write_yaml_atomic
+    original_write = artifact_io._write_yaml_atomic
 
     def flaky_write(path: Path, payload: object) -> None:
         if path == pointer_path:
             raise OSError("simulated pointer commit failure")
         return original_write(path, payload)
 
-    monkeypatch.setattr(engine_run, "_write_yaml_atomic", flaky_write)
+    monkeypatch.setattr(artifact_io, "_write_yaml_atomic", flaky_write)
 
     with pytest.raises(OSError, match="simulated pointer commit failure"):
         run_experiment(experiment)
@@ -283,10 +293,12 @@ def test_required_publication_sidecar_failure_prevents_pointer_commit(tmp_path: 
             experiment: Experiment,
             generation_id: str,
             winners: Mapping[str, Winner],
+            summary: Mapping[str, object],
         ) -> None:
             nonlocal prepared_generation
             prepared_generation = generation_id
             assert set(winners) == {"p"}
+            assert summary["generation_id"] == generation_id
             assert _last_successful_generation_id(experiment) is None
             raise OSError("simulated detached snapshot persistence failure")
 
@@ -313,8 +325,10 @@ def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) ->
             experiment: Experiment,
             generation_id: str,
             winners: Mapping[str, Winner],
+            summary: Mapping[str, object],
         ) -> None:
             assert set(winners) == {"p"}
+            assert summary["generation_id"] == generation_id
             assert _last_successful_generation_id(experiment) is None
             events.append(f"prepared:{generation_id}")
 
@@ -356,9 +370,9 @@ def test_record_write_failure_after_commit_leaves_run_successful(
     def fail_record_write(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated record write failure")
 
-    monkeypatch.setattr(engine_run, "_write_generation_record_once", fail_record_write)
+    monkeypatch.setattr(generation_ops, "_write_generation_record_once", fail_record_write)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
@@ -366,7 +380,9 @@ def test_record_write_failure_after_commit_leaves_run_successful(
     assert second_generation is not None
     assert second_generation != first_generation
     assert any(
-        "failed to write the immutable generation record" in r.message for r in caplog.records
+        r.name == "phasesweep.engine.generation"
+        and "failed to write the immutable generation record" in r.message
+        for r in caplog.records
     )
     # The record itself never got created; publication still succeeded.
     assert not _generation_record_path(experiment, second_generation).is_file()
@@ -391,9 +407,9 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     def fail_projection(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated projection failure")
 
-    monkeypatch.setattr(engine_run, "_copy_yaml_projection", fail_projection)
+    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", fail_projection)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         winners = run_experiment(experiment)
 
     assert set(winners) == {"p"}
@@ -458,7 +474,7 @@ def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_su
     def interrupt_record_write(*_args: object, **_kwargs: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(engine_run, "_write_generation_record_once", interrupt_record_write)
+    monkeypatch.setattr(generation_ops, "_write_generation_record_once", interrupt_record_write)
 
     winners = run_experiment(experiment)
 
@@ -521,14 +537,14 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
     """
     experiment = _stored_experiment(tmp_path)
 
-    original_validate = engine_run._validate_generation_publishable
+    original_validate = generation_ops._validate_generation_publishable
 
-    def validate_then_signal(*args: object, **kwargs: object) -> bytes:
-        summary_bytes = original_validate(*args, **kwargs)
+    def validate_then_signal(*args: object, **kwargs: object) -> tuple[dict[str, Any], bytes]:
+        validated = original_validate(*args, **kwargs)
         os.kill(os.getpid(), signal.SIGTERM)
-        return summary_bytes
+        return validated
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", validate_then_signal)
+    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
 
     try:
         winners = run_experiment(experiment)
@@ -591,17 +607,17 @@ def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_
     )
     assert isinstance(config, Suite)
 
-    original_validate = engine_run._validate_generation_publishable
+    original_validate = generation_ops._validate_generation_publishable
     signalled = {"done": False}
 
-    def validate_then_signal(*args: object, **kwargs: object) -> bytes:
-        summary_bytes = original_validate(*args, **kwargs)
+    def validate_then_signal(*args: object, **kwargs: object) -> tuple[dict[str, Any], bytes]:
+        validated = original_validate(*args, **kwargs)
         if not signalled["done"]:
             signalled["done"] = True
             os.kill(os.getpid(), signal.SIGTERM)
-        return summary_bytes
+        return validated
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", validate_then_signal)
+    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
 
     try:
         with pytest.raises(PhaseSweepShutdown) as exc_info:
@@ -638,7 +654,7 @@ def test_execution_failure_leaves_current_pointer_terminal(tmp_path: Path) -> No
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
 
-    assert _current_pointer_state(experiment) in engine_run._TERMINAL_GENERATION_STATES
+    assert _current_pointer_state(experiment) in generation_ops._TERMINAL_GENERATION_STATES
 
 
 # --------------------------------------------------------------------------
@@ -654,7 +670,7 @@ def test_generation_record_is_write_once(tmp_path: Path) -> None:
     assert generation_id is not None
     first_content = _generation_record_path(experiment, generation_id).read_bytes()
 
-    engine_run._write_generation_state(
+    generation_ops._write_generation_state(
         experiment,
         generation_id=generation_id,
         state="failed",
@@ -672,7 +688,7 @@ def test_generation_record_is_write_once(tmp_path: Path) -> None:
 
     # A second attempt at the SAME state is refused too -- not "monotonic",
     # truly write-once.
-    engine_run._write_generation_state(
+    generation_ops._write_generation_state(
         experiment,
         generation_id=generation_id,
         state="published",
@@ -694,7 +710,7 @@ def test_successful_publication_never_logs_a_record_refusal(
     noise on every publication.
     """
     experiment = _stored_experiment(tmp_path)
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.generation"):
         run_experiment(experiment)
         run_experiment(experiment)  # republish onto the same storage
     assert not [r for r in caplog.records if "Refusing to rewrite" in r.message]
@@ -728,13 +744,15 @@ def test_publication_refuses_invalid_winner_artifact(
     """
     experiment = _stored_experiment(tmp_path)
 
-    original = engine_run._validate_generation_publishable
+    original = generation_ops._validate_generation_publishable
 
     def delete_winner_then_validate(exp, generation_id: str) -> None:  # noqa: ANN001
         mutate_winner(_generation_winner_path(exp, generation_id, "p"))
         original(exp, generation_id)
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", delete_winner_then_validate)
+    monkeypatch.setattr(
+        generation_ops, "_validate_generation_publishable", delete_winner_then_validate
+    )
 
     with pytest.raises(RuntimeError, match=error_match):
         run_experiment(experiment)
@@ -771,6 +789,45 @@ def test_manifest_rejects_winner_source_identity_disagreement(
     assert read_winner(experiment, "p") is None
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kind", "unknown_source"),
+        ("phase", "../other"),
+        ("phase", "other"),
+        ("trial_number", 999),
+        ("study", 999),
+        ("phase_fingerprint", 999),
+    ],
+)
+def test_manifest_rejects_malformed_reanchored_winner_provenance(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner = yaml.safe_load(winner_path.read_text())
+    if field == "phase_fingerprint":
+        winner[field] = value
+    else:
+        winner["winner_source"][field] = value
+    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    artifact = next(
+        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
+    )
+    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+    assert _resolve_publication_pointer(experiment).state == "failed"
+    assert read_status(experiment)["publication_integrity"] == "failed"
+    assert read_winner(experiment, "p") is None
+
+
 def test_read_side_accepts_legacy_summary_without_manifest(tmp_path: Path) -> None:
     """A pre-manifest summary (no schema_version) keeps the identity-only gate."""
     experiment = _stored_experiment(tmp_path)
@@ -789,6 +846,29 @@ def test_read_side_accepts_legacy_summary_without_manifest(tmp_path: Path) -> No
     assert read_winner(experiment, "p") is not None
 
 
+def test_load_winner_rejects_linked_winner_with_legacy_summary(tmp_path: Path) -> None:
+    """Strict resume rejects a linked winner even when legacy summaries lack a manifest."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
+        summary.pop(key, None)
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    preserved_winner_path = winner_path.with_name("winner.original.yaml")
+    winner_path.rename(preserved_winner_path)
+    winner_path.symlink_to(preserved_winner_path.name)
+
+    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
+        artifact_io._load_winner(experiment, experiment.phases[0], {})
+
+
 def test_suite_publication_refuses_broken_component_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -797,16 +877,16 @@ def test_suite_publication_refuses_broken_component_manifest(
     suite = _stored_suite_config(tmp_path)
     component = suite.experiment_for_study(suite.studies[0])
 
-    original = engine_run._validate_suite_generation_publishable
+    original = suite_ops._validate_suite_generation_publishable
 
-    def break_component_then_validate(suite_arg, generation_id: str) -> None:  # noqa: ANN001
+    def break_component_then_validate(suite_arg, generation_id: str, **kwargs) -> None:  # noqa: ANN001
         component_generation = _last_successful_generation_id(component)
         assert component_generation is not None
         _generation_winner_path(component, component_generation, "p").unlink()
-        original(suite_arg, generation_id)
+        original(suite_arg, generation_id, **kwargs)
 
     monkeypatch.setattr(
-        engine_run, "_validate_suite_generation_publishable", break_component_then_validate
+        suite_ops, "_validate_suite_generation_publishable", break_component_then_validate
     )
 
     with pytest.raises(RuntimeError, match="component manifest is invalid"):
@@ -939,7 +1019,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
     summary_path.write_bytes(tampered)
 
     parsed_summary_bytes = False
-    original_safe_load = engine_state.yaml.safe_load
+    original_safe_load = validation_ops.yaml.safe_load
 
     def track_safe_load(stream):  # noqa: ANN001, ANN202
         nonlocal parsed_summary_bytes
@@ -947,7 +1027,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
             parsed_summary_bytes = True
         return original_safe_load(stream)
 
-    monkeypatch.setattr(engine_state.yaml, "safe_load", track_safe_load)
+    monkeypatch.setattr(validation_ops.yaml, "safe_load", track_safe_load)
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
@@ -958,7 +1038,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
 
 @pytest.mark.parametrize(
     "tamper",
-    ["phase_plan", "metric_goal", "objective_evidence", "config_fingerprint"],
+    ["phase_plan", "metric_goal", "objective_evidence", "config_fingerprint", "completion"],
 )
 def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     tmp_path: Path,
@@ -983,9 +1063,13 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
         flag = next(key for key, value in evidence.items() if type(value) is bool)
         evidence[flag] = not evidence[flag]
         semantic_error = "metric semantics"
-    else:
+    elif tamper == "config_fingerprint":
         summary["config_fingerprint"] = "0" * 64
         semantic_error = "config fingerprint"
+    else:
+        summary["phases"][0]["completion"]["finished_trials"] = 0
+        summary["phases"][0]["completion"]["completed_trials"] = 0
+        semantic_error = "completion"
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
 
     pointer = _resolve_publication_pointer(experiment)
@@ -998,6 +1082,55 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     assert pointer.state == "failed"
     assert pointer.error is not None
     assert semantic_error in pointer.error
+
+
+@pytest.mark.parametrize("tamper", ["completion", "duplicate"])
+def test_summary_promotion_decisions_match_hashed_artifacts(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    """A re-anchored summary cannot change or duplicate a promotion decision."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        trial_command="echo x=-{trial_id}",
+        phases=[
+            Phase(
+                name=name,
+                n_trials=1,
+                allow_no_gpu_isolation=True,
+                sampler=Sampler(type="random", seed=0),
+                promotion=(
+                    Promotion(min_delta_vs="base", min_delta=100, on_fail="skip")
+                    if name == "candidate"
+                    else None
+                ),
+            )
+            for name in ("base", "candidate")
+        ],
+    )
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    decisions = summary["promotion_decisions"]
+    assert len(decisions) == 1
+    if tamper == "completion":
+        decisions[0]["candidate_completion"]["finished_trials"] = 0
+        decisions[0]["candidate_completion"]["completed_trials"] = 0
+        expected_error = "disagrees with the summary"
+    else:
+        decisions.append(dict(decisions[0]))
+        expected_error = "duplicate promotion decision"
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert expected_error in pointer.error
 
 
 def test_publication_pointer_reports_absent_before_anything_publishes(tmp_path: Path) -> None:
@@ -1022,7 +1155,7 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
     patch_path_method_failure(
         monkeypatch,
         pointer,
-        "stat",
+        "lstat",
         PermissionError("permission denied"),
     )
 
@@ -1062,8 +1195,19 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
     assert _last_successful_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
+    pointer_path = _last_successful_generation_path(experiment)
+    pointer_bytes = pointer_path.read_bytes()
+    generations_before = set(_generation_dir(experiment, generation_id).parent.iterdir())
+    with pytest.raises(PublicationIntegrityError, match="does not match its recorded hash"):
+        run_experiment(experiment)
+    assert pointer_path.read_bytes() == pointer_bytes
+    assert set(_generation_dir(experiment, generation_id).parent.iterdir()) == generations_before
 
-def test_deleted_pointer_with_an_intact_namespace_reports_absent(tmp_path: Path) -> None:
+
+@pytest.mark.parametrize("delete_current_pointer", [False, True])
+def test_deleted_pointer_with_an_intact_namespace_reports_absent(
+    tmp_path: Path, delete_current_pointer: bool
+) -> None:
     """The pointer is the publication authority; an orphaned namespace is not one."""
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
@@ -1071,12 +1215,18 @@ def test_deleted_pointer_with_an_intact_namespace_reports_absent(tmp_path: Path)
     assert generation_id is not None
 
     _last_successful_generation_path(experiment).unlink()
+    if delete_current_pointer:
+        _generation_path(experiment).unlink()
     assert _generation_summary_path(experiment, generation_id).is_file()
 
     assert _resolve_publication_pointer(experiment) == PublicationPointer(
         state="absent", generation_id=None, error=None
     )
-    assert read_status(experiment)["publication_integrity"] == "absent"
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "absent"
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+    assert read_winner(experiment, "p") is None
 
 
 def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path) -> None:
@@ -1114,8 +1264,10 @@ def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
         _last_successful_generation_id(experiment, raise_on_manifest_error=True)
 
 
+@pytest.mark.parametrize("damage", ["summary", "winner"])
 def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
     tmp_path: Path,
+    damage: str,
 ) -> None:
     """The suite pointer gets the same four-state verdict as the experiment pointer."""
     suite = _stored_suite_config(tmp_path)
@@ -1131,7 +1283,11 @@ def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
 
     summary = yaml.safe_load(_suite_generation_summary_path(suite, generation_id).read_text())
     component_path = Path(summary["studies"][0]["component_summary_path"])
-    component_path.write_text(component_path.read_text() + "\n# tampered\n")
+    if damage == "summary":
+        component_path.write_text(component_path.read_text() + "\n# tampered\n")
+    else:
+        component_winner = component_path.parent / "phases" / "p" / "winner.yaml"
+        component_winner.write_text(component_winner.read_text() + "\n# tampered\n")
 
     pointer = _resolve_suite_publication_pointer(suite)
     assert pointer.state == "failed"
@@ -1152,6 +1308,34 @@ def test_suite_pointer_anchors_the_exact_summary_bytes(tmp_path: Path) -> None:
     payload = yaml.safe_load(_last_successful_suite_generation_path(suite).read_text())
     assert payload["summary_size_bytes"] == len(summary)
     assert payload["summary_sha256"] == hashlib.sha256(summary).hexdigest()
+
+
+@pytest.mark.parametrize("exposed", ["yes", None])
+def test_suite_pointer_rejects_nonboolean_exposure(tmp_path: Path, exposed: object) -> None:
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    pointer = _resolve_suite_publication_pointer(suite)
+    assert pointer.state == "ok"
+    assert pointer.generation_id is not None
+    summary_path = _suite_generation_summary_path(suite, pointer.generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    phase = summary["studies"][0]["phases"][0]
+    phase["exposed"] = exposed
+    phase["metric"] = 999.0
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reanchor_summary_pointer(_last_successful_suite_generation_path(suite), summary_path)
+
+    assert _resolve_suite_publication_pointer(suite).state == "failed"
+    with pytest.raises(PublicationIntegrityError):
+        _show_suite_winners(suite)
+    previous_success = _last_successful_suite_generation_path(suite).read_bytes()
+    previous_current = _suite_generation_path(suite).read_bytes()
+
+    with pytest.raises(PublicationIntegrityError):
+        run_suite(suite)
+
+    assert _last_successful_suite_generation_path(suite).read_bytes() == previous_success
+    assert _suite_generation_path(suite).read_bytes() == previous_current
 
 
 @pytest.mark.parametrize("tamper", ["generation_id", "summary_path"])
@@ -1197,6 +1381,106 @@ def test_suite_publication_pointer_reports_absent_before_anything_publishes(
     )
 
 
+@pytest.mark.parametrize("suite_owner", [False, True])
+def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(
+    tmp_path: Path, suite_owner: bool
+) -> None:
+    if suite_owner:
+        owner = _stored_suite_config(tmp_path)
+        run = run_suite
+        pointer_path = _last_successful_suite_generation_path(owner)
+        current_path = _suite_generation_path(owner)
+        resolve = _resolve_suite_publication_pointer
+    else:
+        owner = _stored_experiment(tmp_path)
+        run = run_experiment
+        pointer_path = _last_successful_generation_path(owner)
+        current_path = _generation_path(owner)
+        resolve = _resolve_publication_pointer
+    run(owner)
+    current = current_path.read_bytes()
+    pointer_path.unlink()
+    pointer_path.symlink_to("missing-target.yaml")
+    assert pointer_path.is_symlink() and not pointer_path.exists()
+
+    assert resolve(owner).state == "failed"
+    with pytest.raises(PublicationIntegrityError):
+        run(owner)
+
+    assert pointer_path.is_symlink()
+    assert current_path.read_bytes() == current
+
+
+def test_surviving_pointer_prevents_legacy_fallback_after_generation_loss(
+    tmp_path: Path,
+) -> None:
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    _generation_path(experiment).unlink()
+    generations = _generations_dir(experiment)
+    generations.rename(generations.with_name(f"saved-{generations.name}"))
+
+    assert _resolve_publication_pointer(experiment).state == "failed"
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "failed"
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+    assert read_winner(experiment, "p") is None
+
+
+def test_dangling_generation_root_does_not_enable_legacy_winner(tmp_path: Path) -> None:
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    assert read_winner(experiment, "p") is not None
+    _last_successful_generation_path(experiment).unlink()
+    _generation_path(experiment).unlink()
+    generations = _generations_dir(experiment)
+    generations.rename(generations.with_name("saved-generations"))
+    generations.symlink_to("missing-generations", target_is_directory=True)
+    assert generations.is_symlink() and not generations.exists()
+
+    status = read_status(experiment)
+
+    assert status["publication_integrity"] == "absent"
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
+    assert read_winner(experiment, "p") is None
+
+
+def test_suite_deleted_pointers_do_not_expose_compatibility_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    assert _suite_summary_path(suite).is_file()
+    _last_successful_suite_generation_path(suite).unlink()
+    _suite_generation_path(suite).unlink()
+
+    assert _resolve_suite_publication_pointer(suite).state == "absent"
+    _show_suite_winners(suite)
+    assert capsys.readouterr().out.strip() == "(no successful suite result yet)"
+
+
+def test_dangling_suite_generation_root_does_not_enable_legacy_summary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    suite = _stored_suite_config(tmp_path)
+    run_suite(suite)
+    assert _suite_summary_path(suite).is_file()
+    _last_successful_suite_generation_path(suite).unlink()
+    _suite_generation_path(suite).unlink()
+    generations = _suite_generations_dir(suite)
+    generations.rename(generations.with_name("saved-suite-generations"))
+    generations.symlink_to("missing-suite-generations", target_is_directory=True)
+    assert generations.is_symlink() and not generations.exists()
+
+    assert _resolve_suite_publication_pointer(suite).state == "absent"
+    _show_suite_winners(suite)
+    assert capsys.readouterr().out.strip() == "(no successful suite result yet)"
+
+
 # --------------------------------------------------------------------------
 # Identity fields (read_status): pinned reads of a failed-publication
 # generation, and single-capture consistency.
@@ -1216,7 +1500,7 @@ def test_pinned_read_of_failed_publication_generation_reports_truthful_identity(
     def fail_validation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated pre-commit validation failure")
 
-    monkeypatch.setattr(engine_run, "_validate_generation_publishable", fail_validation)
+    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
 
     captured: list[str] = []
 
@@ -1330,7 +1614,7 @@ def test_suite_precommit_validation_failure_keeps_prior_publication(
     def fail_validation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated suite validation failure")
 
-    monkeypatch.setattr(engine_run, "_validate_suite_generation_publishable", fail_validation)
+    monkeypatch.setattr(suite_ops, "_validate_suite_generation_publishable", fail_validation)
 
     with pytest.raises(RuntimeError, match="simulated suite validation failure"):
         run_suite(suite)
@@ -1361,9 +1645,9 @@ def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
     def fail_projection(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated suite projection failure")
 
-    monkeypatch.setattr(engine_run, "_copy_yaml_projection", fail_projection)
+    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", fail_projection)
 
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"):
+    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
         results = run_suite(suite)
 
     assert set(results) == {"one"}
@@ -1441,7 +1725,7 @@ def test_suite_generation_record_is_write_once(tmp_path: Path) -> None:
     record_path = _suite_generation_record_path(suite, generation_id)
     first_content = record_path.read_bytes()
 
-    engine_run._write_suite_generation_state(
+    suite_ops._write_suite_generation_state(
         suite,
         generation_id=generation_id,
         state="failed",
@@ -1492,7 +1776,7 @@ def test_suite_manifest_names_the_generation_that_produced_its_winners(
     top_up = component.model_copy(
         update={"phases": [component.phases[0].model_copy(update={"n_trials": 2})]}
     )
-    original_promotion = engine_run._apply_study_promotion
+    original_promotion = suite_ops._apply_study_promotion
 
     def interleave(**kwargs: object):
         # Publish a newer component generation in the gap between the
@@ -1500,7 +1784,7 @@ def test_suite_manifest_names_the_generation_that_produced_its_winners(
         run_experiment(top_up)
         return original_promotion(**kwargs)
 
-    monkeypatch.setattr(engine_run, "_apply_study_promotion", interleave)
+    monkeypatch.setattr(suite_ops, "_apply_study_promotion", interleave)
     results = run_suite(config)
 
     summary = yaml.safe_load(_suite_summary_path(config).read_text())
@@ -1551,11 +1835,11 @@ def test_suite_state_write_failure_preserves_cancellation(
     def cancel(*_args: object, **_kwargs: object):
         raise shutdown
 
-    original_state = engine_run._write_suite_generation_state
+    original_state = suite_ops._write_suite_generation_state
 
-    monkeypatch.setattr(engine_run, "_run_experiment_outcome", cancel)
+    monkeypatch.setattr(run_engine, "_run_experiment_outcome", cancel)
     monkeypatch.setattr(
-        engine_run,
+        suite_ops,
         "_write_suite_generation_state",
         _fail_terminal_generation_state(
             original_state,
@@ -1564,7 +1848,7 @@ def test_suite_state_write_failure_preserves_cancellation(
     )
 
     with (
-        caplog.at_level(logging.ERROR, logger="phasesweep.engine.run"),
+        caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"),
         pytest.raises(PhaseSweepShutdown) as exc_info,
     ):
         run_suite(config)
@@ -1698,6 +1982,20 @@ def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> Non
     record_path = _generation_dir(experiment, "launcher-granted-1") / _REPRODUCIBILITY_NAME
     record_path.write_text(json.dumps(record))
     assert generation_id_source(experiment, "launcher-granted-1") is None
+
+
+def test_generation_id_source_rejects_linked_provenance_record(tmp_path: Path) -> None:
+    """A source claim is not trusted through a linked reproducibility record."""
+    experiment = _stored_experiment(tmp_path)
+    generation_id = "launcher-granted-1"
+    run_experiment(experiment, generation_id=generation_id)
+
+    record_path = _generation_dir(experiment, generation_id) / _REPRODUCIBILITY_NAME
+    preserved_record_path = record_path.with_name("reproducibility.original.json")
+    record_path.rename(preserved_record_path)
+    record_path.symlink_to(preserved_record_path.name)
+
+    assert generation_id_source(experiment, generation_id) is None
 
 
 def test_generation_manifest_covers_the_provenance_files(tmp_path: Path) -> None:
@@ -1964,10 +2262,10 @@ def test_experiment_state_write_failure_preserves_primary_error(
         n_trials=1,
         max_consecutive_failures=1,
     )
-    original = engine_run._write_generation_state
+    original = generation_ops._write_generation_state
 
     monkeypatch.setattr(
-        engine_run,
+        generation_ops,
         "_write_generation_state",
         _fail_terminal_generation_state(original, SystemExit("simulated persistence interruption")),
     )

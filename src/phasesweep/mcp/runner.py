@@ -39,6 +39,7 @@ from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
+    PublishedStudyMissingError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
@@ -70,6 +71,7 @@ FailureCode: TypeAlias = Literal[
     "artifact_root_conflict",
     "study_schema_mismatch",
     "storage_unavailable",
+    "published_study_missing",
     "sampler_continuation_unsupported",
     "trial_target_regression",
     "experiment_busy",
@@ -78,6 +80,7 @@ FailureCode: TypeAlias = Literal[
     "cleanup_uncertain",
     "cancelled",
     "result_snapshot_unavailable",
+    "publication_not_committed",
     "internal_error",
 ]
 
@@ -115,9 +118,10 @@ def _base_failure_payload(
     :param BaseException error: Exception whose type selects the failure code.
     :param str | None stage: Failure stage to report for most error types;
         clamped to one of ``"preflight"``, ``"execution"``, or ``"cleanup"``,
-        falling back to ``"execution"`` for any other value. Two error types
+        falling back to ``"execution"`` for any other value. Three error types
         override this with a fixed stage regardless of input:
-        :class:`ExperimentLockBusyError` always reports ``"preflight"`` and
+        :class:`ExperimentLockBusyError` and :class:`PublishedStudyMissingError`
+        always report ``"preflight"`` and
         :class:`ProcessCleanupUncertainError` always reports ``"cleanup"``.
     :return dict[str, object]: Payload with ``code``, ``stage``, ``retryable``,
         ``actor``, and ``remediation`` keys; falls back to ``"internal_error"``
@@ -173,6 +177,17 @@ def _base_failure_payload(
             "remediation": (
                 "Use a new experiment name, or ask the operator to archive the "
                 "unsupported persistent study before retrying."
+            ),
+        }
+    if isinstance(error, PublishedStudyMissingError):
+        return {
+            "code": "published_study_missing",
+            "stage": "preflight",
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Restore the original complete storage ledger and study, or use a new "
+                "experiment identity for a fresh run."
             ),
         }
     if isinstance(error, StudyStorageUnavailableError):
@@ -233,7 +248,10 @@ def _base_failure_payload(
             "retryable": False,
             "actor": "operator",
             "remediation": (
-                "Ask the operator to run phasesweep mcp recover-run before another launch."
+                "Ask the operator to restore the original complete storage ledger and "
+                "access to it, then run phasesweep mcp recover-run before another launch."
+                if isinstance(error.__cause__, StudyStorageUnavailableError)
+                else "Ask the operator to run phasesweep mcp recover-run before another launch."
             ),
         }
     if isinstance(error, NoFeasibleTrialError):
@@ -301,16 +319,23 @@ def _cleanup_failure_payload(
     :param str | None cause_stage: Stage at which ``primary`` occurred, used
         when classifying it as the nested cause.
     :return dict[str, object]: A ``"cleanup_uncertain"`` failure payload, with
-        ``primary`` nested under ``"cause"`` unless ``primary`` is itself a
-        :class:`ProcessCleanupUncertainError`.
+        ``primary`` nested under ``"cause"``. For an existing cleanup error,
+        retain its explicit storage failure when that prevents inspection.
     """
-    cleanup = ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
+    cleanup = (
+        primary
+        if isinstance(primary, ProcessCleanupUncertainError)
+        else ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
+    )
     payload = _base_failure_payload(cleanup, stage="cleanup")
-    if not isinstance(primary, ProcessCleanupUncertainError):
-        # ``cause`` is diagnostic history, not a second action contract. It
-        # intentionally retains the primary failure's own actor/retryability
-        # (for example, a user cancellation) while the authoritative outer
-        # cleanup_uncertain verdict blocks every relaunch pending recovery.
+    # ``cause`` is diagnostic history, not a second action contract. It
+    # intentionally retains the primary failure's own actor/retryability
+    # (for example, a storage error or user cancellation) while the authoritative
+    # outer cleanup_uncertain verdict blocks every relaunch pending recovery.
+    if isinstance(primary, ProcessCleanupUncertainError):
+        if isinstance(primary.__cause__, StudyStorageUnavailableError):
+            payload["cause"] = _base_failure_payload(primary.__cause__, stage=cause_stage)
+    else:
         payload["cause"] = _base_failure_payload(primary, stage=cause_stage)
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
@@ -321,11 +346,18 @@ def _terminal_error(
 ) -> tuple[BaseException, str | None]:
     """Return the engine's primary error and stage, or the caller's fallback.
 
+    A storage failure wrapped before any terminal report comes from the
+    ownership check that precedes generation allocation.
+
     :param TerminalReport | None report: Engine terminal report, when one was delivered.
     :param BaseException fallback: Exception caught by the runner.
     :return tuple[BaseException, str | None]: Authoritative error and failure stage.
     """
     if report is None:
+        if isinstance(fallback, ProcessCleanupUncertainError) and isinstance(
+            fallback.__cause__, StudyStorageUnavailableError
+        ):
+            return fallback, "preflight"
         return fallback, "execution"
     return report.primary_error or fallback, report.failure_stage
 
@@ -412,6 +444,7 @@ class _RunnerPublicationHook(PublicationHook):
         self.snapshot: dict[str, object] | None = None
         self.state: Literal["prepared", "committed"] | None = None
         self.generation_id: str | None = None
+        self.summary: Mapping[str, object] | None = None
 
     def prepare(
         self,
@@ -419,12 +452,14 @@ class _RunnerPublicationHook(PublicationHook):
         experiment: Experiment,
         generation_id: str,
         winners: Mapping[str, Winner],
+        summary: Mapping[str, object],
     ) -> None:
         """Persist the exact run result before the last-success pointer advances.
 
         :param Experiment experiment: Executed frozen experiment configuration.
         :param str generation_id: Generation ready for publication.
         :param Mapping[str, Winner] winners: Engine-selected generation winners.
+        :param Mapping[str, object] summary: Validated generation summary awaiting publication.
         :raises Exception: If capture, validation, or durable persistence fails.
         """
         snapshot = capture_result_snapshot(
@@ -443,6 +478,7 @@ class _RunnerPublicationHook(PublicationHook):
         self.snapshot = snapshot
         self.state = "prepared"
         self.generation_id = generation_id
+        self.summary = summary
         self._status["result_publication_state"] = "prepared"
         self._status["result_publication_generation_id"] = generation_id
 
@@ -458,11 +494,17 @@ class _RunnerPublicationHook(PublicationHook):
         :raises RuntimeError: If no matching prepared snapshot exists.
         :raises OSError: If the committed receipt cannot be persisted.
         """
-        if self.state != "prepared" or self.snapshot is None or self.generation_id != generation_id:
+        if (
+            self.state != "prepared"
+            or self.snapshot is None
+            or self.generation_id != generation_id
+            or self.summary is None
+        ):
             raise RuntimeError("publication commit has no matching prepared run snapshot")
         committed = mark_result_snapshot_published(
             self.snapshot,
             generation_id=generation_id,
+            published_summary=self.summary,
         )
         self.snapshot = committed
         self.state = "committed"
@@ -485,6 +527,7 @@ class _RunnerPublicationHook(PublicationHook):
         self._status.pop("result_publication_generation_id", None)
         self.state = None
         self.generation_id = None
+        self.summary = None
 
 
 def _write_status(
@@ -622,9 +665,9 @@ def _persist_spawned_handle(
     :param str config_sha256: Hash of the config snapshot this runner executes.
     :param str started_at: ISO-8601 UTC launch timestamp recorded by the server.
     :param bool allow_cancel: Cancel permission frozen at launch time.
-    :raises RuntimeError: If Linux ``/proc`` start time is unavailable, so the
-        handle could not be made PID-reuse safe, or the server never created a
-        pending handle for ``run_id``.
+    :raises RuntimeError: If Linux ``/proc`` start time or boot id is unavailable,
+        so the handle could not be made PID-reuse safe, or the server never
+        created a pending handle for ``run_id``.
     """
     store = RunStore(state_dir)
     pid = os.getpid()
@@ -634,6 +677,11 @@ def _persist_spawned_handle(
         raise RuntimeError(
             "cannot persist a PID-reuse-safe MCP runner handle because Linux "
             "/proc start time is unavailable"
+        )
+    boot_id = read_boot_id()
+    if boot_id is None:
+        raise RuntimeError(
+            "cannot persist a PID-reuse-safe MCP runner handle because Linux boot id is unavailable"
         )
     pending = store.get(run_id)
     if pending is None:
@@ -653,7 +701,7 @@ def _persist_spawned_handle(
             # Binds pid/pid_starttime to this boot: after a reboot the pair can
             # name an unrelated process, and a reader that knows the boot
             # differs can rule the runner dead without signalling anything.
-            boot_id=read_boot_id(),
+            boot_id=boot_id,
         )
     )
 
@@ -757,6 +805,7 @@ def main(argv: list[str] | None = None) -> int:
 
     status: dict = {
         "run_id": args.run_id,
+        "from_phase": args.from_phase,
         "returncode": 0,
         "error_class": None,
         "cleanup_confirmed": True,

@@ -10,7 +10,6 @@ Verifies:
 from __future__ import annotations
 
 import hashlib
-import shutil
 from pathlib import Path
 
 import yaml
@@ -83,21 +82,11 @@ def test_full_sweep_and_replay(tmp_path):
     stored = yaml.safe_load((exp_dir / "depth" / "winner.yaml").read_text())
     assert stored["objective_provenance"] == provenance
 
-    # Replay: drop the regularization study and its winner, then re-run from that phase.
-    # The depth and lr winners should be re-loaded from yaml without re-running trials.
-    import optuna
-
-    optuna.delete_study(
-        study_name=f"{exp.experiment}::regularization",
-        storage=exp.storage,
-    )
-
-    # Also wipe the regularization phase dir so winner.yaml gets rewritten.
-    shutil.rmtree(exp_dir / "regularization")
-
+    # Replay from regularization with its durable study intact. The depth and
+    # lr winners are re-loaded from the prior publication without re-running.
     winners2 = run_experiment(exp, from_phase="regularization")
     assert winners2["depth"].params == winners["depth"].params  # loaded from disk
     assert winners2["lr"].params == winners["lr"].params  # loaded from disk
-    assert "regularization" in winners2  # re-run
+    assert winners2["regularization"].params == winners["regularization"].params
     # Reloaded winners preserve the frozen provenance record verbatim.
     assert winners2["depth"].objective_provenance == provenance

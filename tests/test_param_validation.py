@@ -27,6 +27,7 @@ from phasesweep.config import (
     check_bounds,
 )
 from phasesweep.config.common import _find_prefix_collisions
+from phasesweep.config.search import grid_search_space
 from phasesweep.engine.optuna import _build_sampler
 from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
 
@@ -104,6 +105,45 @@ def test_param_constructors_reject_invalid_scalar_settings() -> None:
     for _case, model, kwargs, match in cases:
         with pytest.raises(ValidationError, match=match):
             model(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("model", "payload"),
+    [
+        (Phase, {"name": "p", "n_trials": True}),
+        (FloatParam, {"type": "float", "low": False, "high": 1.0}),
+        (IntParam, {"type": "int", "low": 0, "high": True}),
+    ],
+)
+def test_numeric_config_fields_reject_yaml_booleans(
+    model: type, payload: dict[str, object]
+) -> None:
+    """Boolean YAML scalars must not become numeric sweep controls."""
+    with pytest.raises(ValidationError, match="numbers, not booleans"):
+        model.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("low", "high"),
+    [(-(2**53) - 1, 0), (0, 2**53 + 1)],
+)
+def test_int_param_rejects_bounds_optuna_cannot_round_trip(low: int, high: int) -> None:
+    """Numeric integer domains must survive Optuna's float representation."""
+    with pytest.raises(ValidationError, match="round-trip exactly through Optuna"):
+        IntParam(type="int", low=low, high=high)
+
+
+def test_int_param_accepts_exact_boundaries_and_large_categorical_choices() -> None:
+    """The exact numeric boundary and categorical 64-bit values remain available."""
+    assert IntParam(type="int", low=-(2**53), high=2**53).model_dump() == {
+        "type": "int",
+        "low": -(2**53),
+        "high": 2**53,
+        "log": False,
+        "step": 1,
+    }
+    choices = [2**63 - 2, 2**63 - 1]
+    assert CategoricalParam(type="categorical", choices=choices).choices == choices
 
 
 def test_check_bounds_rejects_non_finite_values():
@@ -192,6 +232,18 @@ def test_validate_rejects_invalid_grid_configs(tmp_path: Path) -> None:
             "must be an integer",
         ),
         (
+            "rounded_below_low",
+            "eps: { type: float, low: 1.0e-13, high: 1.1e-12, step: 1.0e-12 }",
+            2,
+            "cannot preserve its configured bounds and step",
+        ),
+        (
+            "rounded_above_high",
+            "eps: { type: float, low: 6.0e-13, high: 1.6e-12, step: 1.0e-12 }",
+            2,
+            "cannot preserve its configured bounds and step",
+        ),
+        (
             "partial_matrix",
             "x: { type: categorical, choices: [1, 2, 3] }",
             2,
@@ -241,9 +293,151 @@ def test_schema_rejects_non_finite_bounds() -> None:
 
 def test_validate_accepts_divisible_grid_float(tmp_path: Path) -> None:
     """low=0, high=1, step=0.25 -> exactly [0, 0.25, 0.5, 0.75, 1.0]."""
-    load_experiment(
+    experiment = load_experiment(
         _grid_yaml(tmp_path, "x: { type: float, low: 0.0, high: 1.0, step: 0.25 }", n_trials=5)
     )
+    assert grid_search_space(experiment.phases[0].search_space, phase_name="p") == {
+        "x": [0.0, 0.25, 0.5, 0.75, 1.0]
+    }
+
+
+def test_grid_float_rejects_an_upper_bound_off_the_step_lattice() -> None:
+    """A close float ratio must not omit the configured upper bound."""
+    with pytest.raises(ValueError, match="must be an integer"):
+        grid_search_space(
+            {"x": FloatParam(type="float", low=0.0, high=100.00000001, step=1.0)},
+            phase_name="p",
+        )
+
+
+def test_grid_int_rejects_an_upper_bound_off_the_step_lattice() -> None:
+    """A complete stepped grid must include its configured upper bound."""
+    with pytest.raises(ValueError, match="must evenly divide"):
+        grid_search_space(
+            {"depth": IntParam(type="int", low=0, high=5, step=2)},
+            phase_name="p",
+        )
+
+
+@pytest.mark.parametrize(
+    "search_space",
+    [
+        pytest.param(
+            {"x": IntParam(type="int", low=0, high=4_096)},
+            id="int-range",
+        ),
+        pytest.param(
+            {"x": FloatParam(type="float", low=0.0, high=4_096.0, step=1.0)},
+            id="float-range",
+        ),
+        pytest.param(
+            {
+                "left": CategoricalParam(type="categorical", choices=list(range(65))),
+                "right": CategoricalParam(type="categorical", choices=list(range(64))),
+            },
+            id="product-of-small-dimensions",
+        ),
+    ],
+)
+def test_grid_rejects_oversized_cardinality_before_materializing_values(
+    search_space: dict[str, IntParam | FloatParam | CategoricalParam],
+) -> None:
+    """Grid validation bounds ranges and products before expanding values."""
+    with pytest.raises(ValidationError, match="combinations.*maximum of 4,096"):
+        make_experiment(
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=1,
+                    sampler=Sampler(type="grid"),
+                    search_space=search_space,
+                )
+            ]
+        )
+
+
+def test_grid_accepts_maximum_cardinality() -> None:
+    """The configured grid ceiling itself remains a valid full matrix."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="p",
+                n_trials=4_096,
+                sampler=Sampler(type="grid"),
+                search_space={
+                    "left": CategoricalParam(type="categorical", choices=list(range(64))),
+                    "right": CategoricalParam(type="categorical", choices=list(range(64))),
+                },
+            )
+        ]
+    )
+    assert grid_search_space(experiment.phases[0].search_space, phase_name="p") == {
+        "left": list(range(64)),
+        "right": list(range(64)),
+    }
+
+
+@pytest.mark.parametrize("sampler", ["random", "tpe", "cmaes"])
+@pytest.mark.parametrize(
+    "param",
+    [
+        {"type": "int", "low": 0, "high": 5, "step": 2},
+        {"type": "float", "low": 0, "high": 1, "step": 0.3},
+        {"type": "float", "low": -0.4, "high": 0.5, "step": 0.2},
+    ],
+)
+def test_non_grid_samplers_reject_off_lattice_endpoints(sampler, param) -> None:
+    with pytest.raises(ValidationError, match="evenly divid"):
+        make_experiment(
+            phases=[
+                {
+                    "name": "p",
+                    "n_trials": 1,
+                    "sampler": {"type": sampler, "seed": 0},
+                    "search_space": {"x": param},
+                }
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "param",
+    [
+        IntParam(type="int", low=0, high=6, step=2),
+        IntParam(type="int", low=-5, high=1, step=2),
+        IntParam(type="int", low=3, high=3, step=7),
+        FloatParam(type="float", low=0, high=1, step=0.1),
+        FloatParam(type="float", low=-0.3, high=0.3, step=0.2),
+        FloatParam(type="float", low=0.1, high=0.7, step=0.3),
+        FloatParam(type="float", low=-0.2, high=-0.2, step=0.3),
+        FloatParam(type="float", low=0, high=1e-12, step=1e-13),
+        FloatParam(type="float", low=-0.7, high=1.13),
+    ],
+)
+def test_non_grid_distributions_retain_configured_endpoints(param) -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": param},
+            )
+        ]
+    )
+    retained = experiment.phases[0].search_space["x"]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        distribution = (
+            optuna.distributions.IntDistribution(retained.low, retained.high, step=retained.step)
+            if isinstance(retained, IntParam)
+            else optuna.distributions.FloatDistribution(
+                retained.low, retained.high, step=retained.step
+            )
+        )
+    assert distribution.high == param.high
+    assert retained.model_dump() == param.model_dump()
+    assert not caught
 
 
 def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:

@@ -10,6 +10,18 @@ class PhaseSweepError(RuntimeError):
     """
 
 
+class ProcessCleanupUncertainError(PhaseSweepError):
+    """Base class for failures where a subprocess group may still be alive."""
+
+
+class UnsafeProcessCleanupError(ProcessCleanupUncertainError):
+    """Raised when a trial's trainer or evidence worker may still be alive.
+
+    This must not be included in Optuna's ``catch`` tuple: uncertain cleanup
+    aborts the phase and run until recovery confirms the process group is gone.
+    """
+
+
 class LockBusyError(PhaseSweepError):
     """Raised when a required same-host lock is already held."""
 

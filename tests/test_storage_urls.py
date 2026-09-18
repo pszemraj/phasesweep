@@ -5,36 +5,192 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_config, load_experiment
 from phasesweep.config import (
+    ExecutionContext,
     Experiment,
     IntParam,
     LogRegexExtractor,
     Metric,
     Phase,
+    Sampler,
     Suite,
 )
+from phasesweep.engine import read_status, run_experiment
+from phasesweep.engine.locking import _run_lock_paths
 from phasesweep.engine.optuna import _resolve_storage
+from phasesweep.engine.relocation import _plan_artifact_root_rebinds
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,
     sqlite_database_path,
+    sqlite_uri_filename_path,
     storage_backend,
     storage_recovery_locator,
 )
 from tests.conftest import make_experiment, write_yaml
 
 
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_auto_storage_resolves_without_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_jobs: int
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    experiment = make_experiment(
+        workdir="relative", storage="auto", n_jobs=n_jobs, allow_no_gpu_isolation=True
+    )
+    url = experiment.resolved_storage
+    assert url is not None
+    assert experiment.storage == experiment.model_dump()["storage"] == "auto"
+    assert "resolved_storage" not in experiment.model_dump()
+    assert storage_backend(url) == ("journal" if n_jobs > 1 else "sqlite")
+    filename = file_url_path(url) if n_jobs > 1 else sqlite_uri_filename_path(url)
+    assert filename == str(
+        tmp_path / "relative" / "t" / ("study.journal" if n_jobs > 1 else "study.db")
+    )
+    assert not (tmp_path / "relative").exists()
+    explicit = experiment.model_copy(update={"storage": url})
+    assert explicit.resolved_storage == url
+    assert _run_lock_paths(experiment) == _run_lock_paths(explicit)
+
+
+@pytest.mark.parametrize("invalid", ["provenance", "seed", "acknowledgement"])
+def test_auto_storage_requires_persistent_contract(invalid: str) -> None:
+    payload = make_experiment(storage="auto").model_dump()
+    if invalid == "provenance":
+        payload["provenance"] = {}
+    else:
+        payload["phases"][0]["sampler"] = (
+            Sampler(type="random") if invalid == "seed" else Sampler(type="tpe", seed=0)
+        ).model_dump()
+    with pytest.raises(ValidationError, match="provenance|seed|acknowledge_nonresumable"):
+        Experiment.model_validate(payload)
+
+
+def test_suite_auto_storage_uses_compiled_names_and_overrides(tmp_path: Path) -> None:
+    exp = make_experiment(workdir=tmp_path / "runs", storage="auto")
+    defaults = exp.model_dump(mode="json")
+    defaults.pop("experiment")
+    phases = defaults.pop("phases")
+    parallel = [{**phases[0], "name": "parallel", "n_jobs": 2, "allow_no_gpu_isolation": True}]
+    suite = Suite.model_validate(
+        {
+            "suite": "suite",
+            "defaults": defaults,
+            "studies": [
+                {"name": "first", "phases": phases},
+                {"name": "second", "phases": phases + parallel},
+                {"name": "memory", "phases": phases, "storage": None},
+            ],
+        }
+    )
+    first, second, memory = [suite.experiment_for_study(study) for study in suite.studies]
+    assert (
+        sqlite_database_path(first.resolved_storage)
+        == tmp_path / "runs" / "suite__first" / "study.db"
+    )
+    assert file_url_path(second.resolved_storage) == str(
+        tmp_path / "runs" / "suite__second" / "study.journal"
+    )
+    assert memory.resolved_storage is None
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_jobs: int
+) -> None:
+    import optuna
+
+    root = tmp_path / "runs ? # %20 🚀"
+    exp = make_experiment(
+        workdir=root,
+        storage="auto",
+        n_jobs=n_jobs,
+        allow_no_gpu_isolation=True,
+        trial_command="echo x=0.5 {overrides}",
+        execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
+    )
+    run_experiment(exp)
+    database = root / exp.experiment / ("study.journal" if n_jobs > 1 else "study.db")
+    assert database.is_file()
+    assert (root / exp.experiment / ".gitignore").read_text() == "*\n"
+    assert not (tmp_path / "runs ").exists()
+    locator = storage_recovery_locator(exp.resolved_storage)
+    monkeypatch.chdir(tmp_path)
+    assert canonical_storage_identity(locator) == canonical_storage_identity(exp.resolved_storage)
+    stored = optuna.load_study(study_name="t::p", storage=_resolve_storage(locator))
+    assert len(stored.trials) == 2
+    topup = exp.model_copy(update={"phases": [exp.phases[0].model_copy(update={"n_trials": 3})]})
+    run_experiment(topup)
+    assert len(stored.trials) == 3
+    assert read_status(topup)["publication_integrity"] == "ok"
+
+
+@pytest.mark.parametrize("n_jobs", [1, 2])
+@pytest.mark.parametrize("relocated", [False, True])
+def test_auto_backend_change_refuses_existing_tree(
+    tmp_path: Path, n_jobs: int, relocated: bool
+) -> None:
+    from phasesweep.engine import ArtifactRootConflictError, ArtifactRootRebindError
+
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage="auto",
+        n_jobs=n_jobs,
+        n_trials=1,
+        allow_no_gpu_isolation=True,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    run_experiment(exp)
+    if relocated:
+        moved_workdir = tmp_path / "moved"
+        Path(exp.workdir).rename(moved_workdir)
+        exp = exp.model_copy(update={"workdir": str(moved_workdir)})
+    changed = exp.model_copy(
+        update={"phases": [exp.phases[0].model_copy(update={"n_jobs": 3 - n_jobs})]}
+    )
+    with pytest.raises(ArtifactRootConflictError, match="n_jobs") as run_error:
+        run_experiment(changed)
+    with pytest.raises(ArtifactRootRebindError, match="n_jobs") as rebind_error:
+        _plan_artifact_root_rebinds([changed])
+    for error in (run_error, rebind_error):
+        message = str(error.value)
+        assert "auto" in message
+        assert "study.db" in message
+        assert "study.journal" in message
+        assert "Restore" in message
+        assert "new experiment name" in message
+        assert "does not convert" in message
+        assert "the next ordinary run binds" not in message
+    new_database = (
+        Path(file_url_path(changed.resolved_storage))
+        if n_jobs == 1
+        else sqlite_database_path(changed.resolved_storage)
+    )
+    assert not new_database.exists()
+
+
 def test_resolve_storage_urls(tmp_path: Path) -> None:
-    """Only journal:/// is translated; other URLs pass through to Optuna."""
+    """Translate in-memory sentinels and journals while preserving RDB URLs."""
+    import optuna
     from optuna.storages import JournalStorage
 
     cases = [
         ("sqlite_passthrough", "sqlite:///./runs/phases.db", "passthrough"),
         ("rdb_passthrough", "postgresql://user:pass@host/db", "passthrough"),
         ("in_memory", None, "none"),
+        ("in_memory_sentinel", ":memory:", "none"),
+        ("in_memory_sqlite", "sqlite:///:memory:", "none"),
+        ("in_memory_sqlite_empty", "sqlite://", "none"),
+        (
+            "in_memory_sqlite_uri",
+            "sqlite:///file:phasesweep-memory?mode=memory&cache=shared&uri=true",
+            "none",
+        ),
         ("journal", f"journal:///{tmp_path}/phases.journal", "journal"),
     ]
 
@@ -46,6 +202,23 @@ def test_resolve_storage_urls(tmp_path: Path) -> None:
             assert isinstance(result, JournalStorage), case
         else:
             assert result is None, case
+            assert optuna.create_study(storage=result).trials == [], case
+
+
+def test_bare_in_memory_storage_runs_without_persistent_preflight(tmp_path: Path) -> None:
+    """The documented bare sentinel must reach a fresh in-memory study."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=":memory:",
+        trial_command="echo x=1 {overrides}",
+        n_trials=1,
+        gpu_policy="none",
+    )
+
+    outcome = run_experiment(experiment)
+
+    assert set(outcome) == {"p"}
+    assert outcome["p"].trial_number == 0
 
 
 def _storage_policy_config(
@@ -240,10 +413,9 @@ def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path
     study's Experiment exactly like ``storage`` and other defaulted fields
     (see ``Suite.experiment_for_study``); a study can still opt out and hit
     the same Experiment-level rejection as a standalone config."""
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            """
+    path = write_yaml(
+        tmp_path,
+        """
             suite: external_rdb_suite
             defaults:
               storage: postgresql://user:pass@host/db
@@ -262,9 +434,11 @@ def test_suite_allow_external_rdb_single_host_flows_from_defaults(tmp_path: Path
                 allow_external_rdb_single_host: false
                 phases: [{name: p, n_trials: 1, sampler: {type: random, seed: 0}}]
             """,
-        )
     )
 
+    with pytest.raises(ValidationError, match="allow_external_rdb_single_host"):
+        load_config(path)
+    config = Suite.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     assert isinstance(config, Suite)
     inherited_study, opted_out_study = config.studies
 
@@ -305,6 +479,7 @@ def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     ("storage", "expected_backend", "expected_name"),
     [
         ("sqlite+pysqlite:///studies.db?timeout=30", "sqlite", "studies.db"),
+        ("sqlite:///study#experiment.db", "sqlite", "study#experiment.db"),
         (
             "sqlite:///file:uri.db?mode=rwc&cache=shared&uri=true",
             "sqlite",
@@ -337,6 +512,72 @@ def test_storage_recovery_locator_freezes_relative_file_paths(
     assert str(registration_cwd) in locator
     if expected_backend == "sqlite" and "?" in storage:
         assert "timeout=30" in locator or "cache=shared" in locator
+
+
+@pytest.mark.parametrize("scheme", ["sqlite", "sqlite+pysqlite"])
+def test_literal_hash_sqlite_path_survives_status_resume_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scheme: str
+) -> None:
+    import optuna
+
+    monkeypatch.chdir(tmp_path)
+    storage = f"{scheme}:///study#experiment.db"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+    run_experiment(exp)
+    assert (tmp_path / "study#experiment.db").is_file()
+    assert read_status(exp)["phases"][0]["trials"] == {"COMPLETE": 1}
+    topup = exp.model_copy(update={"phases": [exp.phases[0].model_copy(update={"n_trials": 2})]})
+    run_experiment(topup)
+    assert read_status(topup)["phases"][0]["published_study_unavailable"] is False
+    locator = storage_recovery_locator(storage)
+    monkeypatch.chdir(tmp_path.parent)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(locator))
+    assert len(study.trials) == 2
+
+
+def test_literal_tilde_sqlite_path_survives_status_resume_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit SQLite filenames keep SQLAlchemy's literal tilde semantics."""
+    import optuna
+
+    invocation = tmp_path / "invocation"
+    home = tmp_path / "home"
+    invocation.mkdir()
+    home.mkdir()
+    (invocation / "~").mkdir()
+    monkeypatch.chdir(invocation)
+    monkeypatch.setenv("HOME", str(home))
+    storage = "sqlite:///~/study.db"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        n_trials=1,
+        trial_command="echo x=0.5 {overrides}",
+    )
+
+    run_experiment(exp)
+
+    database = invocation / "~" / "study.db"
+    assert database.is_file()
+    assert not (home / "study.db").exists()
+    assert sqlite_database_path(storage) == Path("~/study.db")
+    assert read_status(exp)["phases"][0]["trials"] == {"COMPLETE": 1}
+
+    topup = exp.model_copy(update={"phases": [exp.phases[0].model_copy(update={"n_trials": 2})]})
+    run_experiment(topup)
+    locator = storage_recovery_locator(storage)
+    assert locator is not None
+    assert canonical_storage_identity(locator) == canonical_storage_identity(storage)
+
+    monkeypatch.chdir(tmp_path)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(locator))
+    assert len(study.trials) == 2
 
 
 def test_sqlite_parallel_error_does_not_say_multi_host() -> None:
@@ -397,6 +638,16 @@ def test_sqlite_driver_url_rejected_with_parallel_jobs(tmp_path: Path) -> None:
             "query password rotation",
             "postgresql://sweep@db.internal/studies?password=old-secret",
             "postgresql://sweep@db.internal/studies?PASSWORD=new-secret",
+        ),
+        (
+            "password-file rotation",
+            "postgresql://sweep@db.internal/studies?passfile=/secure/old.pgpass",
+            "postgresql://sweep@db.internal/studies?passfile=/secure/new.pgpass",
+        ),
+        (
+            "default versus explicit password file",
+            "postgresql://sweep@db.internal/studies",
+            "postgresql://sweep@db.internal/studies?passfile=/secure/new.pgpass",
         ),
         (
             "access token rotation",

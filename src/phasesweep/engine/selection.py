@@ -11,20 +11,19 @@ from typing import Any
 import optuna
 
 from phasesweep.config import Experiment, Phase, Promotion, Suite, check_bounds
+from phasesweep.engine.artifacts import _winner_common_payload, _winner_source_or_default
 from phasesweep.engine.errors import PhaseSweepError, PromotionError, TrialEvidenceMissingError
+from phasesweep.engine.evidence import _trial_objective_provenance
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
-    OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
     WinnerSource,
     WinnerSourceKind,
-    _winner_common_payload,
-    _winner_source_or_default,
     constraint_attr,
 )
 
@@ -184,25 +183,7 @@ def select_winner(
             )
         gates = parsed_gates
 
-    provenance: dict[str, Any] | None = None
-    raw_provenance = best.user_attrs.get(OBJECTIVE_PROVENANCE_ATTR)
-    if raw_provenance is not None:
-        if not isinstance(raw_provenance, str) or not raw_provenance:
-            raise TrialEvidenceMissingError(
-                f"Winning trial {best.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
-            )
-        try:
-            parsed_provenance = json.loads(raw_provenance)
-        except json.JSONDecodeError as exc:
-            raise TrialEvidenceMissingError(
-                f"Winning trial {best.number} has corrupt "
-                f"{OBJECTIVE_PROVENANCE_ATTR!r} JSON evidence."
-            ) from exc
-        if not isinstance(parsed_provenance, dict):
-            raise TrialEvidenceMissingError(
-                f"Winning trial {best.number} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence."
-            )
-        provenance = parsed_provenance
+    provenance = _trial_objective_provenance(best)
 
     env_digest = best.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
     raw_trainer_input = best.user_attrs.get(TRAINER_INPUT_ATTR)
@@ -320,6 +301,9 @@ def _clone_winner_from_baseline(
             if baseline.objective_provenance is not None
             else None
         ),
+        trainer_input=(
+            dict(baseline.trainer_input) if baseline.trainer_input is not None else None
+        ),
         # The exposed result IS the baseline's trial, so it keeps the baseline's
         # environment identity rather than the candidate phase's.
         trainer_env_digest=baseline.trainer_env_digest,
@@ -334,7 +318,7 @@ def _clone_winner_from_baseline(
             trial_number=baseline_source.trial_number,
             generation_id=baseline_source.generation_id,
             attempt_id=baseline_source.attempt_id,
-            study=source_study or baseline_source.study,
+            study=baseline_source.study or source_study,
         ),
     )
 
@@ -414,6 +398,7 @@ def _promotion_decision_payload(
         "candidate_trial_number": candidate.trial_number,
         "candidate_generation_id": candidate.generation_id,
         "candidate_attempt_id": candidate.attempt_id,
+        "candidate_completion": candidate.completion,
         "baseline_trial_number": baseline.trial_number,
         "baseline_generation_id": baseline.generation_id,
         "baseline_attempt_id": baseline.attempt_id,

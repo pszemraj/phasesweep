@@ -17,8 +17,13 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, check_bounds
-from phasesweep.engine.errors import PhaseSweepError
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
+from phasesweep.errors import (
+    ProcessCleanupUncertainError as ProcessCleanupUncertainError,
+)
+from phasesweep.errors import (
+    UnsafeProcessCleanupError as UnsafeProcessCleanupError,
+)
 from phasesweep.evidence.evaluation import (
     DeadlineExceededError,
     ExtractorError,
@@ -109,6 +114,18 @@ class TrialResult:
 # list to opt its ambient value in explicitly.
 _BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
 
+_TRIAL_BOUND_ENV = (
+    "PHASESWEEP_TRIAL_DIR",
+    "PHASESWEEP_TRIAL_ID",
+    "PHASESWEEP_PHASE",
+    "PHASESWEEP_RUN_NAME",
+    "PHASESWEEP_GENERATION_ID",
+    "PHASESWEEP_ATTEMPT_ID",
+    "PHASESWEEP_OVERRIDES_SHA256",
+    "PHASESWEEP_OBJECTIVE_PATH",
+    "WANDB_RUN_ID",
+)
+
 # Warn-once keys for :func:`_warn_dropped_cuda_visibility`, so a narrowed
 # contract reports the divergence once per phase instead of once per trial.
 _DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
@@ -121,7 +138,8 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
     ``none`` starts from the minimal base; a list adds exactly the named
     semantic ambient variables on top of that base. ``passthrough_env`` adds
     credential/transport variables to either narrowed contract. Configured
-    ``experiment.env`` values always apply last (review v0.5.17 / blocker 4).
+    ``experiment.env`` values apply last, except trial-bound keys that
+    PhaseSweep assigns for each attempt.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, str]: The composed trainer environment.
@@ -136,6 +154,10 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
         names.extend(experiment.execution.passthrough_env)
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
+    # These values are assigned for each trial after the base environment is
+    # recorded. Ambient copies cannot affect the trainer or its study cohort.
+    for name in _TRIAL_BOUND_ENV:
+        env.pop(name, None)
     return env
 
 
@@ -143,7 +165,7 @@ def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
     """Return the ``inherit_env`` contract in its canonical persisted form.
 
     A list contract is a *set* of names — order carries no meaning — so it is
-    sorted, matching how :func:`phasesweep.engine.guards._execution_identity`
+    sorted, matching how :func:`phasesweep.engine.fingerprints._execution_identity`
     canonicalises the same field for fingerprints.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
@@ -176,7 +198,8 @@ def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
     they are credentials or transport inputs allowed to rotate between
     invocations. Every other inherited value is semantic and must remain in
     one cohort for persistent-study reuse. Configured ``experiment.env``
-    entries are always semantic even if they reuse a pass-through name.
+    entries remain semantic even if they reuse a pass-through name, except
+    trial bindings assigned by PhaseSweep, which are removed first.
 
     The digest is the SHA-256 of the compact JSON encoding of the
     ``[[name, value], ...]`` pairs sorted by name. JSON is used rather than a
@@ -321,20 +344,6 @@ class TrialExecutionError(RuntimeError):
     """
 
 
-class ProcessCleanupUncertainError(PhaseSweepError):
-    """Base class for failures where a subprocess group may still be alive."""
-
-
-class UnsafeProcessCleanupError(ProcessCleanupUncertainError):
-    """Raised when a trial process group may still be alive after cleanup.
-
-    This must NOT be included in Optuna's ``catch`` tuple. The correct behavior
-    is to abort the phase/run, not mark one trial FAIL and continue — a leaked
-    process group can hold GPU memory, write conflicting outputs, or starve
-    the host scheduler (review v0.5.9 / blocker 3).
-    """
-
-
 def _failed_trial(
     *,
     rc: int,
@@ -445,6 +454,7 @@ def launch_trial(
     trial_dir: Path,
     overrides: dict[str, Any],
     timeout_seconds: float | None,
+    wallclock_deadline: float | None = None,
     gpu_id: int | str | None = None,
     gpu_lease_fds: tuple[int, ...] = (),
     prepared_input: PreparedTrainerInput | None = None,
@@ -466,12 +476,12 @@ def launch_trial(
         attempt_id: Immutable identity of this subprocess attempt.
         trial_dir: Resolved per-trial directory; created if missing.
         overrides: Composed overrides (inherited + fixed + sampled) for this trial.
-        timeout_seconds: Total wall-clock budget passed to
-            :func:`run_supervised`, or ``None`` for no timeout. The budget
-            covers the whole supervised launch (supervisor startup, identity
-            persistence, payload delivery) as well as trainer execution, so
-            an already-expired phase/run deadline can never start new
-            trainer work (review v0.5.16 / blocker 6).
+        timeout_seconds: Per-trial wall-clock budget passed to
+            :func:`run_supervised`, or ``None`` for no per-trial timeout.
+        wallclock_deadline: Optional absolute phase/run deadline. Passing the
+            original deadline preserves time consumed by command rendering,
+            artifact writes, environment recording, cwd resolution, and log
+            opening before supervision begins.
         gpu_id: CUDA device token from the pool, or ``None`` for inactive pool;
             written into ``CUDA_VISIBLE_DEVICES`` if not ``None``.
         gpu_lease_fds: Host GPU-lock descriptors inherited by the trusted
@@ -585,6 +595,7 @@ def launch_trial(
             timeout=timeout_seconds,
             trial_dir=workdir,
             attempt_id=attempt_id,
+            wallclock_deadline=wallclock_deadline,
             cwd=None if trainer_cwd is None else str(trainer_cwd),
             gpu_lease_fds=gpu_lease_fds,
         )
@@ -600,6 +611,7 @@ def launch_trial(
         run_name=run_name,
         return_code=proc_result.return_code,
         duration_seconds=proc_result.duration_seconds,
+        wandb_environment=dict(env),
     )
 
     return ExecutedTrial(
@@ -616,7 +628,6 @@ def extract_trial_result(
     gates: list[Gate] | None = None,
     enforce_gates: bool = True,
     deadline: float | None = None,
-    trainer_timeout_is_deadline: bool = False,
 ) -> TrialResult:
     """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
 
@@ -652,10 +663,6 @@ def extract_trial_result(
             a single blocking local stage can overrun by at most its own
             duration; W&B polling additionally caps its request budget to the
             remainder.
-        trainer_timeout_is_deadline: ``True`` when the caller capped the
-            trainer's wallclock budget to the remaining phase/run deadline, so
-            a trainer timeout is recorded as ``deadline_exhausted`` instead of
-            an ordinary per-trial limit.
 
     Returns:
         :class:`TrialResult` with either a finite metric and feasibility flag,
@@ -700,7 +707,9 @@ def extract_trial_result(
             rc=rc,
             duration=duration,
             failure_reason=failure_reason,
-            deadline_exhausted=trainer_timeout_is_deadline and executed.process.timed_out,
+            deadline_exhausted=(
+                executed.process.timeout_capped_by_wallclock and executed.process.timed_out
+            ),
         )
 
     expired = _deadline_failure("metric extraction")

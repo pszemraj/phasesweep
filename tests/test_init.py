@@ -29,8 +29,9 @@ def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
         experiment = load_experiment(config_path)
         assert experiment.experiment == "phasesweep_starter"
         assert Path(experiment.workdir).is_absolute()
-        assert experiment.storage == (
-            f"sqlite:///file:{config_path.parent / 'runs' / 'phases.db'}?uri=true"
+        assert experiment.storage == "auto"
+        assert sqlite_uri_filename_path(experiment.resolved_storage) == str(
+            config_path.parent / "runs" / experiment.experiment / "study.db"
         )
         assert [phase.name for phase in experiment.phases] == ["depth", "learning_rate"]
         assert sum(phase.n_trials for phase in experiment.phases) == 4
@@ -70,7 +71,7 @@ def _assert_starter_destination_round_trip(output: Path) -> Path:
     runs_dir = output.parent / "runs"
     rendered = yaml.safe_load(_starter_experiment_text(output))
     assert rendered["workdir"] == str(runs_dir)
-    assert sqlite_uri_filename_path(rendered["storage"]) == str(runs_dir / "phases.db")
+    assert rendered["storage"] == "auto"
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
@@ -118,11 +119,11 @@ def test_init_preserves_question_mark_in_sqlite_path(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     experiment = load_experiment(output)
-    database = project / "runs" / "phases.db"
-    assert sqlite_uri_filename_path(experiment.storage) == str(database)
+    database = project / "runs" / experiment.experiment / "study.db"
+    assert sqlite_uri_filename_path(experiment.resolved_storage) == str(database)
 
-    database.parent.mkdir()
-    create_study(storage=experiment.storage, study_name="path_check")
+    database.parent.mkdir(parents=True)
+    create_study(storage=experiment.resolved_storage, study_name="path_check")
     assert database.is_file()
     assert not (tmp_path / "local").exists()
 

@@ -9,6 +9,7 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import phasesweep.engine.publication_validation as validation_ops
 from phasesweep import load_config, load_experiment, run_config
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
@@ -28,21 +29,25 @@ from phasesweep.config import (
 from phasesweep.engine import (
     PhaseSweepError,
     PromotionError,
+    PublicationIntegrityError,
     RunRequestError,
     read_status,
     read_winner,
     run_experiment,
 )
+from phasesweep.engine.paths import (
+    _generation_path,
+    _generation_promotion_decision_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+    _promotion_decision_path,
+    _trial_dir_for,
+)
 from phasesweep.engine.run import ExperimentRunOutcome
 from phasesweep.engine.selection import _apply_promotion, _apply_study_promotion
 from phasesweep.engine.state import (
     Winner,
-    _generation_path,
-    _generation_promotion_decision_path,
-    _generation_summary_path,
-    _last_successful_generation_path,
-    _promotion_decision_path,
-    _trial_dir_for,
 )
 from phasesweep.evidence.evaluation import evaluate_gates
 from phasesweep.mcp.redaction import winners_payload
@@ -199,6 +204,118 @@ def test_promotion_can_continue_baseline_on_insufficient_delta(tmp_path: Path) -
     summary = yaml.safe_load((tmp_path / "runs" / "t" / "summary.yaml").read_text())
     assert summary["promotion_decisions"][0] == decision
     assert summary["phases"][1]["promotion"] == decision
+
+    generation_id = winners["candidate"].generation_id
+    assert generation_id is not None
+    candidate_path = _generation_winner_path(exp, generation_id, "candidate")
+    candidate = yaml.safe_load(candidate_path.read_text())
+    candidate["metric"]["objective"] = 999.0
+    candidate_path.write_text(yaml.safe_dump(candidate, sort_keys=False))
+    summary_path = _generation_summary_path(exp, generation_id)
+    published_summary = yaml.safe_load(summary_path.read_text())
+    published_summary["phases"][1]["metric"] = 999.0
+    artifact = next(
+        item
+        for item in published_summary["artifacts"]
+        if item["kind"] == "winner" and item["phase"] == "candidate"
+    )
+    artifact["sha256"] = hashlib.sha256(candidate_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(published_summary, sort_keys=False))
+    pointer_path = _last_successful_generation_path(exp)
+    pointer = yaml.safe_load(pointer_path.read_text())
+    summary_bytes = summary_path.read_bytes()
+    pointer["summary_size_bytes"] = len(summary_bytes)
+    pointer["summary_sha256"] = hashlib.sha256(summary_bytes).hexdigest()
+    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
+
+    assert read_status(exp)["publication_integrity"] == "failed"
+    assert read_winner(exp, "candidate") is None
+
+
+def test_successful_promotion_keeps_independent_candidate_keys(tmp_path: Path) -> None:
+    """Promotion does not turn an un-inherited baseline key into a candidate lock."""
+    trainer = _write_score_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        phases=[
+            Phase(
+                name="baseline",
+                n_trials=1,
+                fixed_overrides={"score": 1.0},
+                search_space={"depth": IntParam(type="int", low=8, high=8)},
+            ),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                fixed_overrides={"score": 0.5},
+                search_space={"depth": IntParam(type="int", low=16, high=16)},
+                promotion={
+                    "min_delta_vs": "baseline",
+                    "min_delta": 0.1,
+                    "on_fail": "continue_baseline",
+                },
+            ),
+        ],
+    )
+
+    winners = run_experiment(experiment)
+
+    assert winners["candidate"].effective_overrides["depth"] == 16
+    assert winners["candidate"].source is not None
+    assert winners["candidate"].source.kind == "phase_trial"
+    decision = yaml.safe_load(
+        (tmp_path / "runs" / "t" / "candidate" / "promotion.yaml").read_text()
+    )
+    assert decision["promoted"] is True
+
+
+@pytest.mark.parametrize("candidate_promotes", [False, True])
+def test_promotion_alternative_namespaces_are_not_combined(
+    tmp_path: Path, candidate_promotes: bool
+) -> None:
+    """A fallback mapping and candidate dotted key remain separate outcomes."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trial_command="echo x=1 {config_path}",
+        override_format="yaml_file",
+        phases=[
+            Phase(
+                name="base",
+                n_trials=1,
+                gpu_policy="none",
+                fixed_overrides={"model": {"depth": 8}},
+            ),
+            Phase(
+                name="candidate",
+                n_trials=1,
+                gpu_policy="none",
+                fixed_overrides={"model.depth": 16},
+                promotion={
+                    "min_delta_vs": "base",
+                    "min_delta": 0 if candidate_promotes else 1,
+                    "on_fail": "continue_baseline",
+                },
+            ),
+            Phase(
+                name="later",
+                n_trials=1,
+                gpu_policy="none",
+                inherits=["candidate"],
+                fixed_overrides={"lr": 0.01},
+            ),
+        ],
+    )
+
+    winners = run_experiment(experiment)
+
+    expected = (
+        {"model.depth": 16, "lr": 0.01}
+        if candidate_promotes
+        else {"model": {"depth": 8}, "lr": 0.01}
+    )
+    assert winners["later"].effective_overrides == expected
 
 
 def test_added_phase_can_continue_baseline_from_published_generation(tmp_path: Path) -> None:
@@ -510,6 +627,88 @@ def test_suite_promotion_can_continue_baseline_study(tmp_path: Path) -> None:
     ).is_dir()
 
 
+def test_chained_suite_fallback_preserves_concrete_source_study(tmp_path: Path) -> None:
+    """Suite fallback keeps the original study identity through a fallback chain."""
+    trainer = _write_score_trainer(tmp_path)
+    config = load_config(
+        write_yaml(
+            tmp_path,
+            f"""
+            suite: chained_promotion
+            defaults:
+              workdir: {tmp_path}/runs
+              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+              override_format: argparse
+              metric:
+                name: x
+                goal: minimize
+                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+            studies:
+              - name: a
+                phases:
+                  - name: base
+                    n_trials: 1
+                    fixed_overrides: {{ score: 1.0 }}
+                    search_space: {{}}
+                  - name: exposure
+                    n_trials: 1
+                    fixed_overrides: {{ score: 0.95 }}
+                    search_space: {{}}
+                    promotion:
+                      min_delta_vs: base
+                      min_delta: 0.1
+                      on_fail: continue_baseline
+              - name: b
+                depends_on: [a]
+                promotion:
+                  min_delta_vs: a.exposure
+                  min_delta: 0.1
+                  on_fail: continue_baseline
+                phases:
+                  - name: b_eval
+                    n_trials: 1
+                    fixed_overrides: {{ score: 0.95 }}
+                    search_space: {{}}
+              - name: c
+                depends_on: [b]
+                promotion:
+                  min_delta_vs: b.b_eval
+                  min_delta: 0.1
+                  on_fail: continue_baseline
+                phases:
+                  - name: c_eval
+                    n_trials: 1
+                    fixed_overrides: {{ score: 0.95 }}
+                    search_space: {{}}
+            """,
+        )
+    )
+    assert isinstance(config, Suite)
+
+    winners = run_config(config)
+
+    exposed = winners["c"]["c_eval"]
+    assert exposed.source is not None
+    assert exposed.source.study == "a"
+    assert exposed.source.phase == "base"
+
+    summary = yaml.safe_load(
+        (tmp_path / "runs" / "chained_promotion" / "suite_summary.yaml").read_text()
+    )
+    c_record = next(record for record in summary["studies"] if record["name"] == "c")
+    c_winner = next(phase for phase in c_record["phases"] if phase.get("exposed"))
+    assert c_winner["winner_source"]["study"] == "a"
+
+    tampered = yaml.safe_load(yaml.safe_dump(summary))
+    tampered_c = next(record for record in tampered["studies"] if record["name"] == "c")
+    tampered_winner = next(phase for phase in tampered_c["phases"] if phase.get("exposed"))
+    tampered_winner["winner_source"]["study"] = "b"
+    with pytest.raises(
+        PublicationIntegrityError, match="does not match any verified component summary"
+    ):
+        validation_ops._validate_suite_summary_integrity("test-suite-generation", tampered)
+
+
 def test_suite_dependency_on_skipped_promotion_is_an_expected_failure(tmp_path: Path) -> None:
     """A downstream dependency omitted by ``on_fail: skip`` is a policy outcome."""
     trainer = _write_score_trainer(tmp_path)
@@ -592,6 +791,14 @@ def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path)
     authoritative = yaml.safe_load(
         _generation_promotion_decision_path(experiment, successful, "candidate").read_text()
     )
+    # A decision made by this generation must still appear in its summary.
+    first_summary_path = _generation_summary_path(experiment, successful)
+    first_summary = yaml.safe_load(first_summary_path.read_text())
+    first_summary["promotion_decisions"] = []
+    with pytest.raises(PublicationIntegrityError, match="absent from the summary"):
+        validation_ops._validate_generation_manifest(
+            first_summary_path.parent, successful, first_summary
+        )
     _promotion_decision_path(experiment, "candidate").write_text(
         "generation_id: forged\naction: stop\nmessage: tampered\n"
     )
@@ -603,6 +810,49 @@ def test_resume_copies_promotion_from_last_successful_generation(tmp_path: Path)
         _generation_promotion_decision_path(experiment, resumed, "candidate").read_text()
     )
     assert copied == authoritative
+    summary_path = _generation_summary_path(experiment, resumed)
+    summary = yaml.safe_load(summary_path.read_text())
+    assert summary["promotion_decisions"] == [authoritative]
+    assert copied["generation_id"] == successful != resumed
+
+    # main (f789116) wrote schema-2 resumes with the projected promotion in
+    # the manifest but omitted it from promotion_decisions. Recreate those
+    # exact summary semantics and anchor the bytes as the old writer did.
+    assert summary["schema_version"] == 2
+    summary["promotion_decisions"] = []
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False), encoding="utf-8")
+    pointer_path = _last_successful_generation_path(experiment)
+    pointer = yaml.safe_load(pointer_path.read_text())
+    content = summary_path.read_bytes()
+    pointer["summary_size_bytes"] = len(content)
+    pointer["summary_sha256"] = hashlib.sha256(content).hexdigest()
+    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False), encoding="utf-8")
+
+    assert read_status(experiment)["publication_integrity"] == "ok"
+    assert read_winner(experiment, "candidate") is not None
+    run_experiment(experiment, from_phase="later")
+    upgraded = yaml.safe_load(pointer_path.read_text())["generation_id"]
+    upgraded_summary = yaml.safe_load(_generation_summary_path(experiment, upgraded).read_text())
+    assert upgraded != resumed
+    assert upgraded_summary["promotion_decisions"] == [authoritative]
+    assert read_status(experiment)["publication_integrity"] == "ok"
+
+    # Merely claiming a different generation cannot disguise a local decision
+    # omitted from the summary: the named source must hold the same decision.
+    first_promotion_path = _generation_promotion_decision_path(experiment, successful, "candidate")
+    original_content = first_promotion_path.read_bytes()
+    for source_generation in ("missing-source", resumed):
+        forged = {**authoritative, "generation_id": source_generation}
+        content = yaml.safe_dump(forged, sort_keys=False).encode("utf-8")
+        first_promotion_path.write_bytes(content)
+        for entry in first_summary["artifacts"]:
+            if entry.get("kind") == "promotion" and entry.get("phase") == "candidate":
+                entry["sha256"] = hashlib.sha256(content).hexdigest()
+        with pytest.raises(PublicationIntegrityError, match="source generation"):
+            validation_ops._validate_generation_manifest(
+                first_summary_path.parent, successful, first_summary
+            )
+    first_promotion_path.write_bytes(original_content)
 
 
 def test_suite_promotion_study_phase_selector_requires_prior_phase(tmp_path: Path) -> None:

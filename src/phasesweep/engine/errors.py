@@ -58,9 +58,9 @@ class PublicationIntegrityError(PhaseSweepError):
 
     Read-only surfaces use this type to distinguish corruption from a tree that
     never published, and resume/publication paths use it when a manifest they
-    must trust is malformed or no longer matches its artifacts. A fresh forward
-    run is not blocked merely because an older publication is corrupt;
-    generation namespaces are immutable, so it cannot overwrite that evidence.
+    must trust is malformed or no longer matches its artifacts. A corrupt
+    last-success pointer also blocks a forward run so it cannot mask the
+    damaged publication by advancing that pointer.
     """
 
 
@@ -126,7 +126,11 @@ class TrialEvidenceMissingError(PhaseSweepError):
 
 
 class StudyStorageUnavailableError(PhaseSweepError):
-    """Raised when persistent study storage cannot be inspected during preflight."""
+    """Raised when required persistent study state cannot be inspected or persisted."""
+
+
+class PublishedStudyMissingError(PhaseSweepError):
+    """Raised before launch when a published phase's local trial is absent or replaced."""
 
 
 class ActiveAttemptPersistenceError(PhaseSweepError):

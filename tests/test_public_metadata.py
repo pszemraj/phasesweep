@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib
 import stat
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -19,7 +21,8 @@ import phasesweep.engine as engine
 import phasesweep.evidence as evidence
 from phasesweep.engine import errors as engine_errors
 from phasesweep.engine import run_experiment
-from phasesweep.engine.state import _generation_dir, _last_successful_generation_id
+from phasesweep.engine.paths import _generation_dir
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.evidence import evaluation as evidence_evaluation
 from tests.conftest import make_experiment, write_constant_trainer
 
@@ -47,6 +50,45 @@ def test_console_scripts_declare_importable_targets() -> None:
         assert callable(getattr(module, attribute)), f"{target} is not callable"
 
 
+def test_mcp_entrypoint_without_optional_sdk(tmp_path: Path) -> None:
+    """Exercise the real entry point in a fresh process even with the dev extra installed."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+from importlib.machinery import PathFinder
+import sys
+from importlib.metadata import entry_points
+from unittest.mock import patch
+
+find_spec = PathFinder.find_spec
+def without_mcp(name, *args, **kwargs):
+    return None if name == "mcp" or name.startswith("mcp.") else find_spec(name, *args, **kwargs)
+
+with patch.object(PathFinder, "find_spec", side_effect=without_mcp):
+    try:
+        import mcp
+    except ModuleNotFoundError:
+        pass
+    else:
+        raise AssertionError("negative test did not isolate the MCP SDK")
+    entry = next(iter(entry_points(group="console_scripts", name="phasesweep-mcp")))
+    sys.exit(entry.load()(["--catalog", sys.argv[1]]))
+""",
+            str(tmp_path / "unused-catalog.yaml"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "MCP support is not installed" in result.stderr
+    assert "pip install" in result.stderr and "[mcp]" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert result.stdout == ""
+
+
 def test_engine_exports_all_typed_preflight_errors() -> None:
     """Engine callers can catch every typed preflight failure from the public API."""
     names = (
@@ -56,6 +98,7 @@ def test_engine_exports_all_typed_preflight_errors() -> None:
         "StudyFingerprintMismatchError",
         "StudySchemaMismatchError",
         "StudyStorageUnavailableError",
+        "PublishedStudyMissingError",
         "TrialTargetRegressionError",
     )
 

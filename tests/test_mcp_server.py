@@ -23,6 +23,8 @@ import pytest
 import yaml
 from click.testing import CliRunner
 
+import phasesweep.mcp.recovery as mcp_recovery
+import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.mcp.server as mcp_server
 from phasesweep.cli import cli as cli_main
@@ -43,16 +45,30 @@ from phasesweep.engine import (
     TerminalReport,
     run_experiment,
 )
-from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
-from phasesweep.engine.guards import (
-    _experiment_lock,
-    _experiment_semantic_fingerprint,
-    _phase_fingerprint,
-    _reap_stale_trials,
-    _register_active_attempt,
+from phasesweep.engine.artifact_roots import (
+    _bind_study_artifact_root,
     _validate_artifact_root_binding,
 )
-from phasesweep.engine.run import _write_generation_state
+from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
+from phasesweep.engine.fingerprints import (
+    _experiment_semantic_fingerprint,
+    _phase_fingerprint,
+)
+from phasesweep.engine.generation import _write_generation_state
+from phasesweep.engine.locking import _experiment_lock
+from phasesweep.engine.paths import (
+    _attempts_dir,
+    _experiment_dir,
+    _generation_record_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+    _trial_dir_for,
+    _winner_path,
+)
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -61,27 +77,19 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     PUBLICATION_POINTER_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
-    _attempts_dir,
-    _experiment_dir,
-    _generation_record_path,
-    _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_id,
-    _last_successful_generation_path,
-    _trial_dir_for,
-    _winner_path,
 )
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
+    ExperimentBusyError,
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.server import (
     TOOL_AWAIT_RUN,
     TOOL_GET_RUN_RESULTS,
@@ -159,6 +167,7 @@ def _write_trial_process_identity(
     attempt_id: str,
     pid: int,
     starttime: int,
+    boot_id: str | None = None,
 ) -> None:
     _write_process_identity(
         trial_dir / PROCESS_IDENTITY_FILE,
@@ -168,7 +177,7 @@ def _write_trial_process_identity(
             pid=pid,
             pgid=pid,
             proc_starttime=starttime,
-            boot_id=read_boot_id(),
+            boot_id=read_boot_id() if boot_id is None else boot_id,
         ),
     )
 
@@ -215,6 +224,7 @@ def _write_stale_running_trial(
     cleanup_confirmed: bool | None = None,
     generation_id: str = "stale-generation",
     persist_trial_attrs: bool = True,
+    boot_id: str | None = None,
 ) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
@@ -240,6 +250,7 @@ def _write_stale_running_trial(
         attempt_id=attempt_id,
         pid=4343,
         starttime=222,
+        boot_id=boot_id,
     )
     if persist_trial_attrs:
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
@@ -291,19 +302,32 @@ def _stage_stale_running_recovery_scaffold(
     kill_stale_group_stub: Callable[..., bool],
     cleanup_trial_stub: Callable[..., bool],
     monkeypatch: pytest.MonkeyPatch,
+    allow_cancel: bool = False,
+    earlier_boot: bool = False,
 ) -> tuple[PhaseSweepMCP, RunStore, RunHandle, str, list[str]]:
     """Shared scaffold for the interrupted-recovery --confirm retry tests: a
     stale RUNNING trial, a run handle, and a terminal status with a captured
     ``result_snapshot``, with ``kill_stale_group``/``cleanup_stale_trial_process``
     stubbed to succeed. Callers monkeypatch their own fail-once target and
-    invoke the returned command twice. Returns ``(app, store, handle,
+    invoke the returned command twice. ``allow_cancel`` permits an intervening
+    cancellation in a retry test. ``earlier_boot`` records both runner and
+    trial identities under a different boot ID. Returns ``(app, store, handle,
     attempt_id, command)``.
     """
     config = _config(tmp_path)
+    recorded_boot_id = None
+    if earlier_boot:
+        current_boot_id = read_boot_id()
+        if current_boot_id is None:
+            pytest.skip("boot id unavailable on this platform")
+        recorded_boot_id = "00000000-0000-0000-0000-000000000000"
+        if recorded_boot_id == current_boot_id:
+            recorded_boot_id = "11111111-1111-1111-1111-111111111111"
     trial_number = _write_stale_running_trial(
         config,
         cleanup_confirmed=False,
         generation_id=run_id,
+        boot_id=recorded_boot_id,
     )
     attempt_id = f"stale-attempt-{trial_number}"
     experiment = load_config(config)
@@ -316,7 +340,10 @@ def _stage_stale_running_recovery_scaffold(
         config_sha256=reg.config_sha256,
         pid=999999,
         starttime=111,
+        allow_cancel=allow_cancel,
     )
+    if recorded_boot_id is not None:
+        handle = replace(handle, boot_id=recorded_boot_id)
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     if include_generation_record:
@@ -339,9 +366,13 @@ def _stage_stale_running_recovery_scaffold(
         result_snapshot_state="complete",
         result_snapshot=snapshot,
     )
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", kill_stale_group_stub)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", kill_stale_group_stub)
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        cleanup_trial_stub,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         cleanup_trial_stub,
     )
     command = [
@@ -570,7 +601,7 @@ def test_operator_recovery_clears_pre_spawn_orphan_snapshot(tmp_path: Path) -> N
         ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
     )
     assert preflight.exit_code == 0, preflight.output
-    assert "before any runner could spawn" in preflight.output
+    assert "no runner can still start a trainer under this identity" in preflight.output
     assert snapshot.is_file()
 
     confirmed = CliRunner().invoke(
@@ -586,8 +617,162 @@ def test_operator_recovery_clears_pre_spawn_orphan_snapshot(tmp_path: Path) -> N
         ],
     )
     assert confirmed.exit_code == 0, confirmed.output
-    assert "no runner or trainer was launched" in confirmed.output
+    assert "no runner can still start a trainer under this identity" in confirmed.output
     assert not snapshot.exists()
+
+
+@pytest.mark.parametrize("interrupted_recovery", [False, True])
+def test_operator_recovery_clears_abandoned_transactional_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted_recovery: bool
+) -> None:
+    """A free launch lease makes a persisted launch recoverable without losing its log."""
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-abandoned-preparation"
+    pending = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+        allow_cancel=True,
+    )
+    preparation = store.prepare_launch(pending, config.read_bytes())
+    with pytest.raises(RunLaunchUnsettledError, match="verified runner identity"):
+        app.cancel(run_id)
+    log_path = store.log_path(run_id)
+    recovered_log = log_path.with_suffix(".log.recovered")
+    log_bytes = b"runner failed before persisting its process identity\n"
+    log_path.write_bytes(log_bytes)
+    artifacts = (
+        registry.state_dir / "runs" / f"{run_id}.json",
+        store.config_snapshot_path(run_id),
+        store.launch_lease_path(run_id),
+        store._logs_dir / f"{run_id}.transition.lock",
+        log_path,
+    )
+    original = {path: path.read_bytes() for path in artifacts}
+
+    held = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert held.exit_code != 0
+    assert "launch outcome is unresolved" in held.output
+    assert {path: path.read_bytes() for path in artifacts} == original
+
+    preparation.close()
+
+    if interrupted_recovery:
+
+        def interrupt_unlink(_path: Path) -> None:
+            raise OSError("interrupted after archiving runner log")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(mcp_runs, "_strict_unlink", interrupt_unlink)
+            with pytest.raises(OSError, match="interrupted after archiving"):
+                store.clear_pre_spawn_orphan(run_id)
+        assert recovered_log.read_bytes() == log_bytes
+        assert not log_path.exists()
+        original.pop(log_path)
+        original[recovered_log] = log_bytes
+
+    preflight = CliRunner().invoke(
+        cli_main,
+        ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id],
+    )
+
+    assert preflight.exit_code == 0, preflight.output
+    assert "no runner can still start a trainer under this identity" in preflight.output
+    if interrupted_recovery:
+        assert f"Runner log already preserved at {recovered_log}." in preflight.output
+    else:
+        assert f" runner log {log_path} as {recovered_log}." in preflight.output
+        assert not recovered_log.exists()
+    assert {path: path.read_bytes() for path in original} == original
+
+    confirmed = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert "no runner can still start a trainer under this identity" in confirmed.output
+    assert str(recovered_log) in confirmed.output
+    assert all(not path.exists() for path in artifacts)
+    assert recovered_log.read_bytes() == log_bytes
+    assert store.launch_inventory() == ([], set())
+
+
+@pytest.mark.parametrize(
+    "terminal_evidence",
+    ["status", "cleanup_uncertain", "cleanup_recovery"],
+)
+def test_operator_recovery_refuses_leased_preparation_with_terminal_evidence(
+    tmp_path: Path,
+    terminal_evidence: str,
+) -> None:
+    """Terminal evidence prevents a launch lease from proving a pre-spawn orphan."""
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    del app
+    reg = registry.get("srv")
+    run_id = f"srv-leased-{terminal_evidence.replace('_', '-')}"
+    pending = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+    )
+    preparation = store.prepare_launch(pending, config.read_bytes())
+    preparation.close()
+    evidence_path = {
+        "status": store.status_path(run_id),
+        "cleanup_uncertain": store.cleanup_uncertain_path(run_id),
+        "cleanup_recovery": store.cleanup_recovery_path(run_id),
+    }[terminal_evidence]
+    evidence_path.write_text(json.dumps({"run_id": run_id}) + "\n")
+    artifacts = (
+        registry.state_dir / "runs" / f"{run_id}.json",
+        store.config_snapshot_path(run_id),
+        store.launch_lease_path(run_id),
+        evidence_path,
+    )
+    original = {path: path.read_bytes() for path in artifacts}
+
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "launch outcome is unresolved" in result.output
+    assert {path: path.read_bytes() for path in artifacts} == original
 
 
 @pytest.mark.parametrize("evidence", ["log", "dangling_handle"])
@@ -868,6 +1053,38 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     assert app.launch("srv")["state"] == "running"
 
 
+def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed status write cannot erase proof that Popen never succeeded."""
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+
+    with monkeypatch.context() as faults:
+
+        def fail_popen(*args: object, **kwargs: object) -> None:
+            raise OSError("runner executable is unavailable")
+
+        def fail_status(*args: object, **kwargs: object) -> None:
+            raise OSError("status directory is unavailable")
+
+        faults.setattr(mcp_server.subprocess, "Popen", fail_popen)
+        faults.setattr(mcp_server, "write_status_file_if_absent", fail_status)
+
+        with pytest.raises(OSError, match="runner executable"):
+            app.launch("srv")
+
+    (pending,) = store.list_handles()
+    assert store.recorded_terminal_status(pending) is None
+    assert store.launch_lease_path(pending.run_id).is_file()
+    assert store.is_pre_spawn_orphan(pending.run_id)
+
+    patch_popen_capture(monkeypatch)
+    assert app.launch("srv")["state"] == "running"
+    assert store.get(pending.run_id) is None
+
+
 def test_launch_terminates_real_runner_when_log_context_exit_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1046,8 +1263,9 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
 def test_restarted_server_reaps_abandoned_transaction_before_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A server crash before Popen leaves a provably removable preparation."""
+    """A retry preserves diagnostics from an abandoned launch preparation."""
     config = _config(tmp_path)
     _first, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
@@ -1059,19 +1277,35 @@ def test_restarted_server_reaps_abandoned_transaction_before_retry(
         launch_state="launching",
     )
     preparation = store.prepare_launch(pending, config.read_bytes())
-    preparation.close()  # Simulate the launching server disappearing before Popen.
+    abandoned_log = store.log_path(abandoned_id)
+    recovered_log = abandoned_log.with_suffix(".log.recovered")
+    log_bytes = b"runner import failed before the launch receipt\n"
+    abandoned_log.write_bytes(log_bytes)
+    preparation.close()  # Simulate both server and child disappearing before a receipt.
 
     restarted_store = RunStore(registry.state_dir)
     restarted = PhaseSweepMCP(registry, restarted_store)
     monkeypatch.setattr(restarted_store, "new_run_id", lambda _experiment_id: "srv-retry")
     patch_popen_capture(monkeypatch)
 
-    result = restarted.launch("srv")
+    with caplog.at_level(logging.INFO, logger="phasesweep.mcp.server"):
+        result = restarted.launch("srv")
 
     assert result["run_id"] == "srv-retry"
+    assert set(result) == {"experiment_id", "run_id", "state"}
+    assert (
+        "phasesweep.mcp.server",
+        logging.INFO,
+        f"preserved abandoned launch log run={abandoned_id} at {recovered_log}",
+    ) in caplog.record_tuples
     assert restarted_store.get(abandoned_id) is None
     assert not restarted_store.config_snapshot_path(abandoned_id).exists()
     assert not restarted_store.launch_lease_path(abandoned_id).exists()
+    assert not abandoned_log.exists()
+    assert recovered_log.read_bytes() == log_bytes
+    handles, unreadable = restarted_store.launch_inventory()
+    assert [handle.run_id for handle in handles] == ["srv-retry"]
+    assert unreadable == set()
 
 
 def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
@@ -1098,11 +1332,11 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
     assert app.launch("srv")["state"] == "running"
 
 
-def test_acknowledgement_write_failure_terminates_receipted_runner(
+def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A durable receipt alone cannot let the child cross the work boundary."""
+    """An interrupted ACK write cannot prove the child stayed behind the barrier."""
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
@@ -1132,8 +1366,53 @@ def test_acknowledgement_write_failure_terminates_receipted_runner(
     (handle,) = store.list_handles()
     assert handle.launch_state == "spawned"
     assert cleanup_calls == [(handle.pid, handle.pid_starttime, handle.pgid)]
-    assert store.state(handle) == "failed"
+    assert store.state(handle) == "running"
+    assert store.cleanup_uncertain(handle)
+    assert store.recovery_required(handle)
+    status = store.recorded_terminal_status(handle)
+    assert status is not None
+    assert status["cleanup_confirmed"] is False
     assert not store.launch_lease_path(handle.run_id).exists()
+
+
+def test_interruption_after_ack_keeps_spawn_cleanup_reserved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
+    real_write = os.write
+
+    def interrupt_after_ack(fd: int, data: bytes) -> int:
+        written = real_write(fd, data)
+        if data == b"A":
+            raise KeyboardInterrupt
+        return written
+
+    def confirm_runner_group_cleanup(
+        pid: int | None,
+        starttime: int | None,
+        *,
+        pgid: int | None = None,
+    ) -> bool:
+        cleanup_calls.append((pid, starttime, pgid))
+        return True
+
+    monkeypatch.setattr(mcp_server.os, "write", interrupt_after_ack)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", confirm_runner_group_cleanup)
+
+    with pytest.raises(KeyboardInterrupt):
+        app.launch("srv")
+
+    (handle,) = store.list_handles()
+    assert cleanup_calls == [(handle.pid, handle.pid_starttime, handle.pgid)]
+    assert store.cleanup_uncertain(handle)
+    assert store.recovery_required(handle)
+    status = store.recorded_terminal_status(handle)
+    assert status is not None
+    assert status["cleanup_confirmed"] is False
 
 
 def test_completed_lease_cleanup_failure_cannot_replace_launch_success(
@@ -1162,7 +1441,9 @@ def test_completed_lease_cleanup_failure_cannot_replace_launch_success(
     assert store.launch_lease_path(result["run_id"]).is_file()
 
 
-def test_cancel_refuses_unsettled_launch_without_runner_identity(tmp_path: Path) -> None:
+def test_cancel_refuses_unsettled_launch_without_runner_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
@@ -1180,6 +1461,45 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(tmp_path: Path)
 
     assert not store.cleanup_uncertain_path(pending.run_id).exists()
     assert store.recovery_required(pending)
+
+    spawned = replace(
+        pending,
+        launch_state="spawned",
+        pid=999999,
+        pgid=999999,
+        pid_starttime=111,
+        boot_id=read_boot_id(),
+    )
+    original_state = store.state
+    first_read = True
+
+    def complete_launch_after_state_read(
+        saved: RunHandle, *, transition_locked: bool = False
+    ) -> RunState:
+        nonlocal first_read
+        state = original_state(saved, transition_locked=transition_locked)
+        if first_read:
+            first_read = False
+            store.update(spawned)
+        return state
+
+    signalled: list[tuple[int | None, int | None, int | None]] = []
+
+    def kill_runner(
+        pid: int | None, starttime: int | None, *, pgid: int | None, grace_seconds: float
+    ) -> bool:
+        signalled.append((pid, starttime, pgid))
+        return True
+
+    monkeypatch.setattr(store, "state", complete_launch_after_state_read)
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", kill_runner)
+
+    cancelled = app.cancel(pending.run_id)
+
+    assert store.get(pending.run_id) == spawned
+    assert signalled == [(999999, 111, 999999)]
+    assert cancelled["state"] == "running"
+    assert cancelled["recovery_required"] is True
 
 
 @pytest.mark.parametrize(
@@ -1255,7 +1575,9 @@ def test_launch_terminates_spawned_runner_when_handle_update_fails(
     pending = store.get(spawned.run_id)
     assert pending is not None
     assert pending.launch_state == "spawned"
-    assert store.state(pending) == "failed"
+    assert store.state(pending) == "running"
+    assert store.recovery_required(pending)
+    assert store.cleanup_uncertain(pending)
 
 
 def test_launch_interrupt_during_handle_update_terminates_runner(
@@ -1289,9 +1611,10 @@ def test_launch_interrupt_during_handle_update_terminates_runner(
     (pending,) = store.list_handles()
     terminal = store.recorded_terminal_status(pending)
     assert terminal is not None
-    assert terminal["cleanup_confirmed"] is True
+    assert terminal["cleanup_confirmed"] is False
     assert terminal["error_class"] == "KeyboardInterrupt"
-    assert store.state(pending) == "failed"
+    assert store.state(pending) == "running"
+    assert store.recovery_required(pending)
     assert terminated and terminated[0][1] is not None
 
 
@@ -1326,11 +1649,11 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
     assert "cleanup uncertain after failed runner launch bookkeeping" in caplog.text
 
 
-def test_launch_retains_recovery_reservation_when_cleanup_marker_cannot_clear(
+def test_post_ack_launch_failure_does_not_clear_reservation_from_runner_group_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Confirmed process death is not enough when its uncertainty marker cannot clear."""
+    """A dead runner group does not prove separate trial groups have stopped."""
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
@@ -1338,11 +1661,14 @@ def test_launch_retains_recovery_reservation_when_cleanup_marker_cannot_clear(
     def fail_update(_handle: RunHandle) -> None:
         raise OSError("runs directory is not writable")
 
-    def fail_clear(_handle: RunHandle) -> None:
+    clear_calls: list[RunHandle] = []
+
+    def track_clear(handle: RunHandle) -> None:
+        clear_calls.append(handle)
         raise OSError("cleanup marker cannot be removed")
 
     monkeypatch.setattr(store, "update", fail_update)
-    monkeypatch.setattr(store, "clear_cleanup_uncertain", fail_clear)
+    monkeypatch.setattr(store, "clear_cleanup_uncertain", track_clear)
     monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *args, **kwargs: True)
 
     with pytest.raises(OSError, match="runs directory"):
@@ -1355,6 +1681,7 @@ def test_launch_retains_recovery_reservation_when_cleanup_marker_cannot_clear(
     assert store.cleanup_uncertain(pending)
     assert store.state(pending) == "running"
     assert store.recovery_required(pending)
+    assert clear_calls == []
 
 
 def _launch_with_poison_project(
@@ -1530,6 +1857,54 @@ def test_launch_records_the_current_boot_id_in_the_spawned_handle(
     assert handle.boot_id == read_boot_id()
 
 
+def test_launch_refuses_a_runner_receipt_without_boot_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+    monkeypatch.setattr(mcp_server, "read_boot_id", lambda: None)
+    monkeypatch.setattr("tests.mcp_helpers.read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(RuntimeError, match="boot id"):
+        app.launch("srv")
+
+    (pending,) = store.list_handles()
+    assert store.state(pending) == "failed"
+
+
+def test_runner_does_not_persist_a_receipt_without_boot_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run_id = "srv-no-boot"
+    started_at = "2026-06-24T00:00:00Z"
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256="0" * 64,
+        started_at=started_at,
+    )
+    monkeypatch.setattr(mcp_runner, "read_boot_id", lambda: None)
+
+    with pytest.raises(RuntimeError, match="boot id"):
+        mcp_runner._persist_spawned_handle(
+            state_dir=tmp_path / "state",
+            run_id=run_id,
+            experiment_id="srv",
+            config_sha256="0" * 64,
+            started_at=started_at,
+            allow_cancel=False,
+        )
+
+    pending = store.get(run_id)
+    assert pending is not None
+    assert pending.launch_state == "launching"
+
+
 def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1552,7 +1927,11 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
             starttime=111,
             allow_cancel=True,
         ),
-        boot_id="0" * len(current_boot) if current_boot != "0" * len(current_boot) else "1",
+        boot_id=(
+            "00000000-0000-0000-0000-000000000000"
+            if current_boot != "00000000-0000-0000-0000-000000000000"
+            else "11111111-1111-1111-1111-111111111111"
+        ),
     )
     store.create(handle)
     write_run_status(store, "srv-boot", returncode=0, result_snapshot_state="pending")
@@ -1571,6 +1950,47 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
     assert result["cleanup_confirmed"] is True
     # The orphaned pending snapshot is a separate operator concern from process
     # cleanup, so it still asks for recovery.
+    assert result["recovery_required"] is True
+
+
+@pytest.mark.parametrize("unknown_side", ["saved", "current"])
+def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unknown_side: str,
+) -> None:
+    current_boot = read_boot_id()
+    if current_boot is None:
+        pytest.skip("boot id unavailable on this platform")
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    handle = replace(
+        make_run_handle(
+            run_id="srv-unknown-boot",
+            experiment_id="srv",
+            pid=999999,
+            starttime=111,
+            allow_cancel=True,
+        ),
+        boot_id=None if unknown_side == "saved" else current_boot,
+    )
+    store.create(handle)
+    if unknown_side == "current":
+        monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
+        monkeypatch.setattr(mcp_server, "read_boot_id", lambda: None)
+    signalled: list[object] = []
+
+    def record_signal(*args: object, **kwargs: object) -> bool:
+        signalled.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(mcp_server, "kill_stale_group", record_signal)
+
+    result = app.cancel(handle.run_id)
+
+    assert signalled == []
+    assert result["state"] == "running"
+    assert result["cleanup_confirmed"] is False
     assert result["recovery_required"] is True
 
 
@@ -1731,7 +2151,7 @@ def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> Non
     assert results.published_config_matches_current is None
 
 
-@pytest.mark.parametrize("method_name", ["status", "winners"])
+@pytest.mark.parametrize("method_name", ["status", "winners", "await_run"])
 def test_run_tools_reject_config_snapshot_hash_mismatch(
     tmp_path: Path,
     method_name: str,
@@ -1750,7 +2170,10 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
     )
 
     with pytest.raises(Exception, match="saved config snapshot"):
-        getattr(app, method_name)(run_id=run_id)
+        if method_name == "await_run":
+            asyncio.run(app.await_run(run_id))
+        else:
+            getattr(app, method_name)(run_id=run_id)
 
 
 @pytest.mark.parametrize("method_name", ["status", "winners"])
@@ -1973,6 +2396,35 @@ def _record_published_run_snapshot(
     return run_id, trainer, config, catalog
 
 
+def test_frozen_legacy_snapshot_reports_published_study_check_as_unknown(tmp_path: Path) -> None:
+    """A snapshot that predates the check must not assert study availability."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    snapshot = terminal["result_snapshot"]
+    assert isinstance(snapshot, dict)
+    phase = snapshot["status"]["phases"][0]
+    assert isinstance(phase, dict)
+    phase.pop("published_study_unavailable")
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="complete",
+        result_snapshot=snapshot,
+    )
+
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+
+    assert status.result_source == "frozen_run_snapshot"
+    assert status.phases[0].published_study_unavailable is None
+
+
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     tmp_path: Path,
 ) -> None:
@@ -2106,12 +2558,21 @@ def test_run_scoped_snapshot_survives_publication_pointer_removal(
     assert results.winner_count == 1
 
 
-def test_run_scoped_snapshot_survives_artifact_tree_relocation(tmp_path: Path) -> None:
-    """Completed run reads use frozen evidence even when the live tree moved."""
+@pytest.mark.parametrize("config_snapshot_damage", ["missing", "corrupt"])
+def test_run_scoped_snapshot_survives_artifact_tree_relocation(
+    tmp_path: Path,
+    config_snapshot_damage: str,
+) -> None:
+    """Completed run reads use frozen evidence without mutable sibling artifacts."""
     run_id, _trainer, config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, _store = make_mcp_app(catalog)
+    app, _registry, store = make_mcp_app(catalog)
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
+    config_snapshot = store.config_snapshot_path(run_id)
+    if config_snapshot_damage == "missing":
+        config_snapshot.unlink()
+    else:
+        config_snapshot.write_text("not: a valid experiment snapshot\n")
     source = _experiment_dir(experiment)
     relocated = tmp_path / "relocated" / source.name
     relocated.parent.mkdir()
@@ -2128,6 +2589,276 @@ def test_run_scoped_snapshot_survives_artifact_tree_relocation(tmp_path: Path) -
     assert results.result_source == "frozen_run_snapshot"
     assert results.publication_integrity == "ok"
     assert results.winner_count == 1
+
+
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
+    tmp_path: Path,
+    read_tool: str,
+) -> None:
+    """Cleanup uncertainty reserves the run without erasing its frozen result."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    store.config_snapshot_path(run_id).unlink()
+    handle = store.get(run_id)
+    assert handle is not None
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    write_run_status(store, **{**terminal, "cleanup_confirmed": False})
+    store.mark_cleanup_uncertain(handle)
+
+    payload: GetRunResultsResult | GetRunStatusResult | AwaitRunResult
+    if read_tool == "winners":
+        results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+        assert results.winner_count == 1
+        payload = results
+    else:
+        payload = (
+            AwaitRunResult.model_validate(asyncio.run(app.await_run(run_id)))
+            if read_tool == "await_run"
+            else GetRunStatusResult.model_validate(app.status(run_id=run_id))
+        )
+        assert payload.phases[0].winner_present is True
+        assert payload.run is not None
+        assert payload.run.state == "running"
+        assert payload.run.recovery_required is True
+    assert payload.result_source == "frozen_run_snapshot"
+    assert payload.publication_integrity == "ok"
+    assert payload.represented_generation_id == run_id
+
+
+@pytest.mark.parametrize("read_tool", ["status", "await_run"])
+def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
+) -> None:
+    """A pending-to-complete write cannot pair terminal facts with running state."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
+    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    original_run_payload = app._run_payload
+    finalized = False
+
+    def finish_after_run_payload(saved: RunHandle) -> dict[str, Any]:
+        nonlocal finalized
+        run = original_run_payload(saved)
+        if not finalized:
+            assert run["state"] == "running"
+            finalized = True
+            write_run_status(store, **complete)
+        return run
+
+    monkeypatch.setattr(app, "_run_payload", finish_after_run_payload)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = (
+        asyncio.run(app.await_run(run_id, timeout_seconds=0))
+        if read_tool == "await_run"
+        else app.status(run_id=run_id)
+    )
+
+    assert finalized
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["run"]["state"] == "succeeded"
+    assert payload["run"]["recovery_required"] is False
+    if read_tool == "status":
+        assert (
+            _status_next_action(GetRunStatusResult.model_validate(payload)) == TOOL_GET_RUN_RESULTS
+        )
+    else:
+        assert payload["reason"] == "terminal"
+
+
+@pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
+) -> None:
+    """A runner's final write during its exit probe remains readable."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
+    store.config_snapshot_path(run_id).unlink()
+    finalized = False
+
+    def finish_before_reporting_exit(_handle: RunHandle) -> bool:
+        nonlocal finalized
+        assert not finalized
+        finalized = True
+        write_run_status(store, **complete)
+        return False
+
+    monkeypatch.setattr(store, "_runner_is_live", finish_before_reporting_exit)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = (
+        app.winners(run_id=run_id)
+        if read_tool == "winners"
+        else (
+            asyncio.run(app.await_run(run_id, timeout_seconds=0))
+            if read_tool == "await_run"
+            else app.status(run_id=run_id)
+        )
+    )
+
+    assert finalized
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["represented_generation_id"] == run_id
+    if read_tool == "winners":
+        assert payload["winner_count"] == 1
+    else:
+        assert payload["run"]["state"] == "succeeded"
+        if read_tool == "await_run":
+            assert payload["reason"] == "terminal"
+
+
+@pytest.mark.parametrize(
+    ("read_tool", "transition"),
+    [
+        ("status", "complete"),
+        ("winners", "complete"),
+        ("await_run", "complete"),
+        ("status", "pending_runner_exit"),
+        ("winners", "pending_runner_exit"),
+        ("await_run", "pending_runner_exit"),
+        ("status", "no_status_runner_exit"),
+        ("winners", "no_status_runner_exit"),
+        ("status", "no_status_runner_exit_with_recovery_lock"),
+        ("winners", "no_status_runner_exit_with_recovery_lock"),
+        ("await_run", "no_status_runner_exit_with_recovery_lock"),
+        ("await_run", "no_status_runner_exit"),
+    ],
+)
+def test_run_scoped_live_read_uses_snapshot_completed_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str, transition: str
+) -> None:
+    """A live read follows final snapshot or recovery state recorded during it."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    if transition.startswith("no_status_runner_exit"):
+        store.status_path(run_id).unlink()
+    else:
+        write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
+    runner_live = True
+    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: runner_live)
+    monkeypatch.setattr(
+        "phasesweep.mcp.runs.is_same_live_process", lambda _pid, _starttime: runner_live
+    )
+    original_live = app._live_status_payload
+    finalized = False
+
+    def finish_during_live_read(
+        experiment_id: str, experiment: Experiment, saved: RunHandle | None
+    ) -> dict[str, Any]:
+        nonlocal finalized, runner_live
+        status = original_live(experiment_id, experiment, saved)
+        if not finalized:
+            finalized = True
+            if transition == "complete":
+                write_run_status(store, **complete)
+            else:
+                runner_live = False
+        return status
+
+    monkeypatch.setattr(app, "_live_status_payload", finish_during_live_read)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    lock = (
+        store.transition_lock(handle)
+        if transition == "no_status_runner_exit_with_recovery_lock"
+        else contextlib.nullcontext()
+    )
+    with lock:
+        payload = (
+            app.winners(run_id=run_id)
+            if read_tool == "winners"
+            else (
+                asyncio.run(app.await_run(run_id, timeout_seconds=0))
+                if read_tool == "await_run"
+                else app.status(run_id=run_id)
+            )
+        )
+    if transition == "no_status_runner_exit_with_recovery_lock":
+        assert not store.cleanup_uncertain(handle)
+        assert store.state(handle) == "running"
+
+    assert finalized
+    if transition == "complete":
+        assert payload["result_source"] == "frozen_run_snapshot"
+        assert payload["represented_generation_id"] == run_id
+        if read_tool == "winners":
+            assert payload["winner_count"] == 1
+        else:
+            assert payload["run"]["state"] == "succeeded"
+            if read_tool == "await_run":
+                assert payload["reason"] == "terminal"
+    else:
+        assert payload["result_source"] == "terminal_snapshot_unavailable"
+        assert payload["publication_integrity"] == "unknown"
+        assert payload["represented_generation_id"] is None
+        if read_tool == "winners":
+            assert payload["winner_count"] == 0
+            assert payload["failure"]["code"] == "result_snapshot_unavailable"
+        else:
+            assert payload["phases"][0]["trial_data_available"] is False
+            assert payload["phases"][0]["winner_present"] is False
+            assert payload["run"]["recovery_required"] is True
+            assert payload["run"]["failure"]["code"] == "result_snapshot_unavailable"
+        assert store.recovery_required(handle)
+        if read_tool == "await_run":
+            assert payload["reason"] == "recovery_required"
+
+
+@pytest.mark.parametrize("read_tool", ["status", "await_run"])
+def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
+) -> None:
+    """A frozen result can coexist with cleanup uncertainty added during the read."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    original_run_payload = app._run_payload
+    marked = False
+
+    def reserve_after_run_payload(saved: RunHandle) -> dict[str, Any]:
+        nonlocal marked
+        run = original_run_payload(saved)
+        if not marked:
+            assert run["state"] == "succeeded"
+            marked = True
+            write_run_status(store, **{**complete, "cleanup_confirmed": False})
+            store.mark_cleanup_uncertain(saved)
+        return run
+
+    monkeypatch.setattr(app, "_run_payload", reserve_after_run_payload)
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+
+    payload = (
+        asyncio.run(app.await_run(run_id, timeout_seconds=0))
+        if read_tool == "await_run"
+        else app.status(run_id=run_id)
+    )
+
+    assert marked
+    assert payload["result_source"] == "frozen_run_snapshot"
+    assert payload["run"]["state"] == "running"
+    assert payload["run"]["recovery_required"] is True
+    if read_tool == "await_run":
+        assert payload["reason"] == "recovery_required"
 
 
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
@@ -2460,6 +3191,7 @@ def test_corrupt_run_handle_fails_closed_for_experiment_scoped_winners(tmp_path:
         "log_path",
         "cleanup_uncertain_path",
         "cleanup_recovery_path",
+        "transition_lock",
     ],
 )
 def test_deleted_run_handle_with_surviving_run_evidence_fails_closed(
@@ -2478,7 +3210,11 @@ def test_deleted_run_handle_with_surviving_run_evidence_fails_closed(
     _represent_legacy_generation(reg.experiment, run_id)
     # No handle file at all -- deleted after the run -- but one sibling
     # per-run file under the same state dir survives it.
-    evidence = getattr(store, surviving)(run_id)
+    evidence = (
+        store._logs_dir / f"{run_id}.transition.lock"
+        if surviving == "transition_lock"
+        else getattr(store, surviving)(run_id)
+    )
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.write_text("orphaned\n")
 
@@ -2996,6 +3732,74 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     assert status["failure"]["cause"]["stage"] == "execution"
 
 
+def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path) -> None:
+    """A terminal trial missing its attempt id remains attributable to recover-run."""
+    config = _config(tmp_path)
+    store = RunStore(tmp_path / "state")
+    run_id = "r-terminal-identity"
+    status_path = store.status_path(run_id)
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = "2026-06-24T00:00:00Z"
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+    )
+
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    phase = experiment.phases[0]
+    study = optuna.create_study(
+        study_name=f"{experiment.experiment}::{phase.name}",
+        storage=experiment.storage,
+        direction="minimize",
+    )
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
+    _bind_study_artifact_root(study, experiment)
+    trial = study.ask()
+    attempt_id = "terminal-identity-attempt"
+    generation_id = "earlier-generation"
+    trial_dir = _trial_dir_for(
+        experiment,
+        phase.name,
+        trial.number,
+        generation_id=generation_id,
+        attempt_id=attempt_id,
+    )
+    trial_dir.mkdir(parents=True)
+    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
+    trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(trial, state=optuna.trial.TrialState.FAIL)
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name=phase.name,
+        study_name=study.study_name,
+        trial_number=trial.number,
+        trial_dir=trial_dir,
+        generation_id=generation_id,
+    )
+
+    with pytest.raises(ProcessCleanupUncertainError, match="identity is missing"):
+        runner_main(
+            runner_argv(
+                store,
+                run_id=run_id,
+                config=config,
+                config_sha256=config_sha256,
+                experiment_id="srv",
+                started_at=started_at,
+            )
+        )
+
+    status = json.loads(status_path.read_text())
+    assert status["cleanup_confirmed"] is False
+    assert status["uncertain_attempt_ids"] == [attempt_id]
+
+
 def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
@@ -3246,6 +4050,76 @@ def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
     assert not store.cleanup_uncertain_path(run_id).exists()
 
 
+def test_cancel_does_not_resurrect_marker_after_operator_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    run_id = "srv-cancel-after-recovery"
+    _write_cleanup_uncertain_failed_trial(config, generation_id=run_id)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+        allow_cancel=True,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+    store.mark_cleanup_uncertain(handle)
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process", lambda _identity: True
+    )
+
+    read_running = threading.Event()
+    recovery_done = threading.Event()
+    original_state = store.state
+    first_cancel_read = True
+
+    def pause_cancel_state(saved: RunHandle, *, transition_locked: bool = False) -> RunState:
+        nonlocal first_cancel_read
+        state = original_state(saved, transition_locked=transition_locked)
+        if threading.current_thread() is not threading.main_thread() and first_cancel_read:
+            first_cancel_read = False
+            read_running.set()
+            assert recovery_done.wait(timeout=10)
+        return state
+
+    monkeypatch.setattr(store, "state", pause_cancel_state)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        cancelling = pool.submit(app.cancel, run_id)
+        assert read_running.wait(timeout=10)
+        confirmed = CliRunner().invoke(
+            cli_main,
+            [
+                "mcp",
+                "recover-run",
+                "--state-dir",
+                str(registry.state_dir),
+                "--run-id",
+                run_id,
+                "--confirm",
+            ],
+        )
+        recovery_done.set()
+        assert confirmed.exit_code == 0, confirmed.output
+        result = cancelling.result(timeout=10)
+
+    assert result["state"] == "failed"
+    assert result["recovery_required"] is False
+    assert not store.cleanup_uncertain_path(run_id).exists()
+    assert store.state(handle) == "failed"
+
+
 def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3316,6 +4190,188 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     assert captured["cmd"]
 
 
+def test_recovery_preserves_status_written_after_initial_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-status-during-recovery"
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.mark_cleanup_uncertain(handle)
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    snapshot = capture_result_snapshot(experiment, generation_id=run_id)
+
+    def runner_finishes_during_cleanup(*_args: object, **_kwargs: object) -> None:
+        write_run_status(
+            store,
+            run_id,
+            returncode=0,
+            error_class=None,
+            cleanup_confirmed=True,
+            result_snapshot_state="complete",
+            result_snapshot=snapshot,
+        )
+
+    monkeypatch.setattr(mcp_recovery, "_cleanup_runner", runner_finishes_during_cleanup)
+    result = CliRunner().invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["returncode"] == 0
+    assert terminal["result_snapshot_state"] == "complete"
+
+
+def test_launch_bookkeeping_failure_preserves_runner_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    patch_popen_capture(monkeypatch)
+
+    def interrupted_update(handle: RunHandle) -> None:
+        experiment = load_config(config)
+        assert isinstance(experiment, Experiment)
+        write_run_status(
+            store,
+            handle.run_id,
+            returncode=0,
+            error_class=None,
+            cleanup_confirmed=True,
+            result_snapshot_state="complete",
+            result_snapshot=capture_result_snapshot(experiment, generation_id=handle.run_id),
+        )
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(store, "update", interrupted_update)
+    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *_args, **_kwargs: True)
+    with pytest.raises(KeyboardInterrupt):
+        app.launch("srv")
+    (handle,) = store.list_handles()
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["returncode"] == 0
+    assert terminal["result_snapshot_state"] == "complete"
+
+
+def test_launch_failure_cannot_replace_status_published_during_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    pending = make_run_handle(
+        run_id="srv-racing-terminal",
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        launch_state="launching",
+    )
+    store.create(pending)
+    runner_status = {
+        "run_id": pending.run_id,
+        "returncode": 0,
+        "cleanup_confirmed": True,
+        "result_snapshot_state": "failed",
+        "ended_at": mcp_server.utc_now_iso(),
+    }
+    original_write = mcp_runs.write_status_file
+    original_link = mcp_runs.os.link
+
+    def racing_write(path: Path, payload: dict) -> None:
+        original_write(path, runner_status)
+        original_write(path, payload)
+
+    def racing_link(src: str, dst: str, **kwargs: object) -> None:
+        if dst == store.status_path(pending.run_id).name:
+            original_write(store.status_path(pending.run_id), runner_status)
+        original_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(mcp_server, "write_status_file", racing_write, raising=False)
+    monkeypatch.setattr(mcp_runs.os, "link", racing_link)
+    app._record_launch_failure(pending, cleanup_confirmed=True, error_class="Injected")
+
+    terminal = store.recorded_terminal_status(pending)
+    assert terminal is not None
+    assert terminal["returncode"] == 0
+    assert terminal.get("error_class") != "Injected"
+
+
+@pytest.mark.parametrize("unknown_side", ["saved", "current"])
+def test_operator_recovery_refuses_unknown_boot_process_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unknown_side: str,
+) -> None:
+    current_boot = read_boot_id()
+    if current_boot is None:
+        pytest.skip("boot id unavailable on this platform")
+    config = _config(tmp_path)
+    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-recovery-unknown-boot"
+    handle = replace(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+            pid=999999,
+            starttime=111,
+        ),
+        boot_id=None if unknown_side == "saved" else current_boot,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    store.mark_cleanup_uncertain(handle)
+    if unknown_side == "current":
+        monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
+        monkeypatch.setattr(mcp_recovery, "read_boot_id", lambda: None, raising=False)
+    signalled: list[object] = []
+
+    def record_signal(*args: object, **kwargs: object) -> bool:
+        signalled.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(mcp_recovery, "kill_stale_group", record_signal)
+
+    for confirmed in (False, True):
+        command = [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+        ]
+        if confirmed:
+            command.append("--confirm")
+        result = CliRunner().invoke(cli_main, command)
+        assert result.exit_code != 0
+        assert "boot id" in f"{result.output} {result.exception}".lower()
+
+    assert signalled == []
+    assert store.cleanup_uncertain_path(run_id).is_file()
+
+
 def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3350,7 +4406,7 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
         signalled.append((args, kwargs))
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", spy_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", spy_kill_stale_group)
 
     runner = CliRunner()
     dry = runner.invoke(
@@ -3378,6 +4434,69 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
     assert not store.cleanup_uncertain_path(run_id).exists()
 
 
+def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rebooted no-status run frees capacity without borrowing later results."""
+    current_boot = read_boot_id()
+    if current_boot is None:
+        pytest.skip("boot id unavailable on this platform")
+    config = _config(tmp_path)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    reg = registry.get("srv")
+    run_id = "srv-earlier-boot-no-status"
+    earlier_boot = "00000000-0000-0000-0000-000000000000"
+    if earlier_boot == current_boot:
+        earlier_boot = "11111111-1111-1111-1111-111111111111"
+    handle = replace(
+        make_run_handle(
+            run_id=run_id,
+            experiment_id=reg.id,
+            config_sha256=reg.config_sha256,
+        ),
+        boot_id=earlier_boot,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    later_trial = _write_stale_running_trial(config, generation_id="srv-later-run")
+
+    assert _load_phase_trial(config, later_trial).state == optuna.trial.TrialState.RUNNING
+    assert store.state(handle) == "failed"
+    assert not store.recovery_required(handle)
+    assert store.live_runs() == []
+
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    status = app.status(run_id=run_id)
+    winners = app.winners(run_id=run_id)
+    awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
+
+    failure = {
+        "code": "result_snapshot_unavailable",
+        "stage": "cleanup",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            "Report that this run's historical results are unavailable and ask "
+            "the operator to inspect the PhaseSweep run or server diagnostics; "
+            "do not substitute mutable experiment-level results."
+        ),
+    }
+    for payload in (status, awaited):
+        assert payload["result_source"] == "terminal_snapshot_unavailable"
+        assert payload["represented_generation_id"] is None
+        assert payload["run"]["state"] == "failed"
+        assert payload["run"]["recovery_required"] is False
+        assert payload["run"]["failure"] == failure
+        assert payload["phases"][0]["running_trials_total"] == 0
+        assert payload["phases"][0]["trial_data_available"] is False
+    assert winners["result_source"] == "terminal_snapshot_unavailable"
+    assert winners["represented_generation_id"] is None
+    assert winners["failure"] == failure
+    assert app.latest_run("srv")["run"]["failure"] == failure
+    assert awaited["reason"] == "terminal"
+
+
 def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3403,7 +4522,7 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
         cleanup_calls += 1
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", unexpected_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", unexpected_cleanup)
     with _experiment_lock(reg.experiment):
         result = CliRunner().invoke(
             cli_main,
@@ -3456,10 +4575,15 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     awaited = asyncio.run(app.await_run(run_id))
 
     for payload in (status, awaited):
-        assert payload["result_source"] == "current_shared_study"
+        assert payload["result_source"] == "terminal_snapshot_unavailable"
+        assert payload["publication_integrity"] == "unknown"
+        assert payload["represented_generation_id"] is None
         assert payload["run"]["state"] == "running"
         assert payload["run"]["recovery_required"] is True
-    assert winners["result_source"] == "current_shared_study"
+        assert payload["run"]["failure"]["code"] == "result_snapshot_unavailable"
+    assert winners["result_source"] == "terminal_snapshot_unavailable"
+    assert winners["publication_integrity"] == "unknown"
+    assert winners["winner_count"] == 0
     assert awaited["reason"] == "recovery_required"
     preflight = CliRunner().invoke(
         cli_main,
@@ -3555,7 +4679,7 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
     def unexpected_cleanup(*args: object, **kwargs: object) -> bool:
         raise AssertionError("pre-spawn launch failure must not run process cleanup")
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", unexpected_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", unexpected_cleanup)
 
     result = CliRunner().invoke(
         cli_main,
@@ -3640,11 +4764,15 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
         return trial_cleanup_allowed
 
     monkeypatch.setattr(
-        "phasesweep.cli.kill_stale_group",
+        "phasesweep.mcp.recovery.kill_stale_group",
         _counting_success_callback(runner_cleanup_calls),
     )
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        trial_cleanup,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         trial_cleanup,
     )
     runner = CliRunner()
@@ -3773,9 +4901,13 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         uncertain_attempt_ids=[attempt_id] if causally_reported else [],
         **status_kwargs,
     )
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", lambda *args, **kwargs: True)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *args, **kwargs: True)
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        lambda _identity: True,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: True,
     )
     recovery_path = store.cleanup_recovery_path(earlier_run_id)
@@ -4004,9 +5136,13 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         trial_cleanup_calls.append((identity.pid, identity.proc_starttime, identity.pgid))
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_runner_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_runner_cleanup)
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        fake_trial_cleanup,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         fake_trial_cleanup,
     )
 
@@ -4078,15 +5214,44 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         }
         assert recovered_status["phases"][0]["running_trials_total"] == 0
 
+    final_status = store.status_path(run_id).read_bytes()
+    final_recovery = store.cleanup_recovery_path(run_id).read_bytes()
+    repeat = runner.invoke(
+        cli_main,
+        [
+            "mcp",
+            "recover-run",
+            "--state-dir",
+            str(registry.state_dir),
+            "--run-id",
+            run_id,
+            "--confirm",
+        ],
+    )
+    if expect_running_before_confirm:
+        assert repeat.exit_code == 0, repeat.output
+        assert "No cleanup uncertainty or terminal result repair" in repeat.output
+    else:
+        # Cleanup is settled, but an absent historical snapshot remains an
+        # explicit refusal; retry must not repeat process cleanup to repair it.
+        assert repeat.exit_code == 1, repeat.output
+        assert "no immutable terminal result snapshot" in repeat.output
+    assert store.status_path(run_id).read_bytes() == final_status
+    assert store.cleanup_recovery_path(run_id).read_bytes() == final_recovery
+    assert runner_cleanup_calls == [(999999, 111, 999999)]
+    assert trial_cleanup_calls == [expected_identity]
+
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
     assert launched["state"] == "running"
     assert captured["cmd"]
 
 
+@pytest.mark.parametrize("earlier_boot", [False, True])
 def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    earlier_boot: bool,
 ) -> None:
     """Pins that a --confirm retry after an interrupted
     ``finalize_result_snapshot`` call reuses the cleanup-recovery evidence
@@ -4107,7 +5272,10 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         kill_stale_group_stub=_counting_success_callback(runner_cleanup_calls),
         cleanup_trial_stub=_counting_success_callback(trial_cleanup_calls),
         monkeypatch=monkeypatch,
+        earlier_boot=earlier_boot,
     )
+    assert store.state(handle) == ("failed" if earlier_boot else "running")
+    assert store.recovery_required(handle)
 
     snapshot_calls = 0
     snapshot_attempt_ids: list[set[str]] = []
@@ -4129,7 +5297,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
             confirmed_attempt_locations=confirmed_attempt_locations,
         )
 
-    monkeypatch.setattr("phasesweep.cli.finalize_result_snapshot", flaky_snapshot)
+    monkeypatch.setattr("phasesweep.mcp.recovery.finalize_result_snapshot", flaky_snapshot)
 
     runner = CliRunner()
     first = runner.invoke(cli_main, command)
@@ -4140,14 +5308,18 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["reaped_attempt_ids"] == [attempt_id]
     assert store.recovery_required(handle)
-    assert len(runner_cleanup_calls) == 1
+    assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
+    frozen_status = app.status(run_id=run_id)
+    assert frozen_status["result_source"] == "frozen_run_snapshot"
+    assert frozen_status["phases"][0]["trials"]["RUNNING"] == 1
+    assert len(runner_cleanup_calls) == (0 if earlier_boot else 1)
     assert len(trial_cleanup_calls) == 1
 
     retry = runner.invoke(cli_main, command)
 
     assert retry.exit_code == 0, retry.output
     assert "Finalized stored terminal result snapshot" in retry.output
-    assert len(runner_cleanup_calls) == 1
+    assert len(runner_cleanup_calls) == (0 if earlier_boot else 1)
     assert len(trial_cleanup_calls) == 1
     assert snapshot_calls == 2
     assert snapshot_attempt_ids == [{attempt_id}, {attempt_id}]
@@ -4163,6 +5335,80 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert recovered_status["terminal_trials_this_run"] == 1
     assert recovered_status["terminal_trials_before_run"] == 0
     assert recovered_status["target_already_satisfied"] is False
+
+    final_status = store.status_path(run_id).read_bytes()
+
+    def forbid_redundant_finalization(*_args: object, **_kwargs: object) -> dict:
+        raise AssertionError("completed recovery must not finalize again")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            "phasesweep.mcp.recovery.finalize_result_snapshot", forbid_redundant_finalization
+        )
+        repeat = runner.invoke(cli_main, command)
+
+    assert repeat.exit_code == 0, repeat.output
+    assert "No cleanup uncertainty or terminal result repair" in repeat.output
+    assert store.status_path(run_id).read_bytes() == final_status
+    assert not store.recovery_required(handle)
+
+
+def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_written(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed final status persistence keeps the prior frozen result and reservation."""
+    run_id = "srv-pending-write-failure"
+    app, store, handle, attempt_id, command = _stage_stale_running_recovery_scaffold(
+        tmp_path,
+        run_id=run_id,
+        error_class="UnsafeProcessCleanupError",
+        include_generation_record=True,
+        mark_cleanup_uncertain=False,
+        snapshot_bound_to_generation=True,
+        kill_stale_group_stub=lambda *_args, **_kwargs: True,
+        cleanup_trial_stub=lambda *_args, **_kwargs: True,
+        monkeypatch=monkeypatch,
+        allow_cancel=True,
+    )
+
+    def refuse_status_write(_path: Path, _payload: dict) -> None:
+        raise OSError("status file unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("phasesweep.mcp.recovery.write_status_file", refuse_status_write)
+        failed = CliRunner().invoke(cli_main, command)
+
+    assert failed.exit_code != 0
+    assert "failed to finalize terminal result snapshot" in failed.output
+    assert store.recovery_required(handle)
+    frozen_status = app.status(run_id=run_id)
+    assert frozen_status["run"]["recovery_required"] is True
+    assert frozen_status["result_source"] == "frozen_run_snapshot"
+    assert frozen_status["phases"][0]["trials"]["RUNNING"] == 1
+    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
+    assert awaited["result_source"] == "frozen_run_snapshot"
+    assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
+    assert store.cleanup_recovery_path(run_id).is_file()
+    assert store.cleanup_uncertain_path(run_id).is_file()
+    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *_args, **_kwargs: True)
+    cancelled = app.cancel(run_id)
+    assert cancelled["state"] == "running"
+    assert cancelled["recovery_required"] is True
+    assert store.cleanup_uncertain_path(run_id).is_file()
+    with pytest.raises(ExperimentBusyError):
+        app.launch("srv")
+
+    retried = CliRunner().invoke(cli_main, command)
+    assert retried.exit_code == 0, retried.output
+    recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
+    assert recovery["reaped_attempt_ids"] == [attempt_id]
+    assert not store.cleanup_uncertain_path(run_id).exists()
+    assert not store.recovery_required(handle)
+    phase = app.status(run_id=run_id)["phases"][0]
+    assert phase["trials"]["RUNNING"] == 0
+    assert phase["trials"]["FAIL"] == 1
 
 
 def test_operator_recovery_uses_runner_reconciliation_evidence(
@@ -4183,7 +5429,11 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     reconciled_attempt_ids: set[str] = set()
     reconciled_attempt_generations: dict[str, str] = {}
     monkeypatch.setattr(
-        "phasesweep.engine.guards.cleanup_stale_trial_process",
+        "phasesweep.engine.attempts.cleanup_stale_trial_process",
+        lambda _identity: True,
+    )
+    monkeypatch.setattr(
+        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: True,
     )
     assert (
@@ -4221,7 +5471,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
         result_snapshot_state="complete",
         result_snapshot=capture_result_snapshot(experiment),
     )
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", lambda *args, **kwargs: True)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *args, **kwargs: True)
 
     result = CliRunner().invoke(
         cli_main,
@@ -4255,7 +5505,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     having found no cleanup evidence.
     """
     run_id = "srv-cleanup-recovery-retry"
-    _app, store, handle, attempt_id, command = _stage_stale_running_recovery_scaffold(
+    app, store, handle, attempt_id, command = _stage_stale_running_recovery_scaffold(
         tmp_path,
         run_id=run_id,
         error_class="cancelled",
@@ -4281,6 +5531,11 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     assert store.cleanup_uncertain_path(run_id).is_file()
     recovery = json.loads(store.cleanup_recovery_path(run_id).read_text())
     assert recovery["reaped_attempt_ids"] == [attempt_id]
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["result_snapshot_state"] == "complete"
+    frozen_status = app.status(run_id=run_id)
+    assert frozen_status["result_source"] == "frozen_run_snapshot"
+    assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
 
     retry = runner.invoke(cli_main, command)
 
@@ -4313,8 +5568,9 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     def fake_cleanup(*args: object, **kwargs: object) -> bool:
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", fake_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
 
     first_handle = make_run_handle(
         run_id=first_run,
@@ -4425,8 +5681,9 @@ def _stage_terminal_uncertain_run(
     def fake_cleanup(*args: object, **kwargs: object) -> bool:
         return True
 
-    monkeypatch.setattr("phasesweep.cli.kill_stale_group", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.guards.cleanup_stale_trial_process", fake_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
     command = [
         "mcp",
         "recover-run",
@@ -4453,6 +5710,17 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     store, handle, trial_number, config, command = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=False
     )
+    experiment = load_config(config)
+    assert isinstance(experiment, Experiment)
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment),
+    )
     recovery_record = store.cleanup_recovery_path(run_id)
 
     def crash_on_recovery_record(path: Path, text: str) -> None:
@@ -4460,7 +5728,9 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
             raise RuntimeError("simulated crash before the recovery record")
         real_write(path, text)
 
-    monkeypatch.setattr("phasesweep.cli.private_atomic_write_text", crash_on_recovery_record)
+    monkeypatch.setattr(
+        "phasesweep.mcp.recovery.private_atomic_write_text", crash_on_recovery_record
+    )
     runner = CliRunner()
 
     first = runner.invoke(cli_main, command)
@@ -4471,8 +5741,13 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     study = _load_first_phase_study(config)
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
     assert not recovery_record.exists()
+    assert store.recovery_required(handle)
+    assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    assert app.status(run_id=run_id)["result_source"] == "frozen_run_snapshot"
+    assert app.winners(run_id=run_id)["result_source"] == "frozen_run_snapshot"
 
-    monkeypatch.setattr("phasesweep.cli.private_atomic_write_text", real_write)
+    monkeypatch.setattr("phasesweep.mcp.recovery.private_atomic_write_text", real_write)
 
     retry = runner.invoke(cli_main, command)
 
