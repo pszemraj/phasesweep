@@ -2,7 +2,7 @@
 
 PhaseSweep runs phase-chained hyperparameter sweeps from one ordinary YAML file. That file contains your trainer's base configuration, the metric, and the search plan. PhaseSweep materializes a complete trainer YAML for every trial, decides what to try next, persists each phase winner, and carries selected values forward as fixed inputs to later phases.
 
-This is useful when a full joint sweep is too expensive or hard to interpret. For example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](docs/config.md#phase-keys) explains the inheritance model and its tradeoffs.
+This is useful when a full joint sweep is too expensive or hard to interpret. For example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](docs/config.md#phase-composition) explains the inheritance model and its tradeoffs.
 
 ![PhaseSweep phase DAG](docs/images/diagramA_dag.png)
 
@@ -93,11 +93,11 @@ effective_overrides:
 
 Put your trainer's normal base configuration under `trainer_config`, point `trial_command` at its YAML entry point, and pass `{config_path}` where that entry point expects the file. Dotted search keys such as `model.depth` update the corresponding nested value; every other base setting is preserved.
 
-Follow the [trainer contract](docs/config.md#trainer-contract) for objective reporting and the [override formats](docs/config.md#override-formats) for other trainer interfaces.
+Follow the [trainer contract](docs/config.md#trainer-contract) for objective reporting and the [trainer inputs](docs/config.md#trainer-inputs) for the retained YAML and command-line boundaries.
 
 Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints one sampled command per phase without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
 
-The starter keeps its database and artifacts under `<workdir>/<experiment>/` with `storage: auto`. See the [output layout](docs/runtime.md#output-layout) for storage placement, ignored artifacts, and relocation.
+The starter keeps its database and artifacts under `<workdir>/<experiment>/` with `storage: auto`. See the [output layout](docs/runtime.md#output-layout) for storage placement and ignored artifacts. This breaking release requires a fresh artifact root and local ledger; use the preserved 0.3.1 release to operate an older namespace.
 
 ```bash
 phasesweep status experiment.yaml                           # durable progress, nothing launched
@@ -112,11 +112,12 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 
 ## Reference
 
-- [Configuration guide](docs/config.md): trainer contract, experiment and suite YAML, search spaces, inheritance, gates, promotion, and extractors.
+- [Configuration guide](docs/config.md): Experiment YAML, search spaces, inheritance, local gates, and objective extractors.
 - [Configuration reference](docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
-- [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
+- [Runtime behavior](docs/runtime.md): filesystem layout, fresh-state cutover, locks, GPU leases, process supervision, fingerprints, and resume.
 - [MCP setup](docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.
 - [MCP operator reference](docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.
+- [Consolidation release notes](docs/release_notes.md): breaking removals, direct replacements, and the fresh-state requirement.
 - [Toy experiment and MCP catalog](examples/experiment.yaml): a checkout-local CLI example backed by the packaged fake trainer, plus an [MCP catalog](examples/catalog.yaml) whose detached-run state and experiment outputs use absolute scratch paths under `/tmp`.
 - [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer integration.
 - [Development](docs/development.md): source checkout, contributor setup, and quality gates.

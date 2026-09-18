@@ -4,7 +4,7 @@ PhaseSweep owns the MCP server and its operator-reviewed catalog. Your MCP
 client owns its configuration and any client-specific instructions; PhaseSweep
 does not create, edit, inspect, or remove client files.
 
-Requirements: Python 3.11+, the [MCP runtime platform requirements](runtime.md#platform-support), a PhaseSweep experiment that passes validation, and a client with local stdio MCP support.
+Requirements: Python 3.11+, the [MCP runtime requirements](runtime.md), a PhaseSweep experiment that passes validation, and a client with local stdio MCP support.
 
 ## Setup
 
@@ -29,7 +29,7 @@ phasesweep mcp init-catalog --from ./experiment.yaml
 ```
 
 The command writes `catalog.yaml` with side effects disabled and winner values
-redacted, validates it, and provisions its [private state layout](mcp.md#the-catalog).
+redacted, validates it, and provisions a fresh [private state layout](mcp.md#fresh-mcp-state).
 Before connecting a client, review every experiment description and config
 path, `visible_params`, each `allow` setting, the catalog state directory, and
 the experiment working directories. Add another `--from` for each experiment;
@@ -86,4 +86,4 @@ absolute executable path using that client's documentation.
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the catalog only if that is the authority you intend, then reconnect the client.
 - `concurrency limit reached`: await one of the returned blocking run IDs. Do not cancel it or launch a replacement automatically.
 - `recovery_required: true`, unresolved launch, uncertain cleanup, or unavailable terminal snapshot: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
-- Catalog path, storage, or working-directory rejection: follow [paths and the working directory](mcp.md#paths-and-the-working-directory).
+- Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).

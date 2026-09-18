@@ -40,7 +40,7 @@ phasesweep show-winners examples/tiny_decoder_enwik8/experiment.yaml
 
 A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 batches each). A resumed study launches only the attempts still needed to reach that target. Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`. The phase comments in [`experiment.yaml`](experiment.yaml) explain the learning-rate, weight-decay, and gradient-clipping order.
 
-The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#result-envelope) validates that report.
+The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#objective-evidence-constraints-and-gates) validates that report.
 
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
@@ -71,7 +71,7 @@ execution:
 ```
 
 These root-key changes preserve the smoke search while satisfying the
-[persistent storage and absolute path requirements for MCP](../../docs/mcp.md#paths-and-the-working-directory).
+[persistent storage and absolute path requirements for MCP](../../docs/mcp.md#the-catalog).
 
 ```bash
 phasesweep validate /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml
