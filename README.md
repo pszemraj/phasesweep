@@ -114,7 +114,6 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 - [Runtime behavior](docs/runtime.md): filesystem layout, fresh-state cutover, locks, GPU leases, process supervision, fingerprints, and resume.
 - [MCP setup](docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.
 - [MCP operator reference](docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.
-- [Consolidation release notes](docs/release_notes.md): breaking removals, direct replacements, and the fresh-state requirement.
 - [Toy experiment and MCP catalog](examples/experiment.yaml): a checkout-local CLI example backed by the packaged fake trainer, plus an [MCP catalog](examples/catalog.yaml) whose detached-run state and experiment outputs use absolute scratch paths under `/tmp`.
 - [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer integration.
 - [Development](docs/development.md): source checkout, contributor setup, and quality gates.
