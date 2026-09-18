@@ -58,6 +58,7 @@ from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import (
     Winner,
 )
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
 from phasesweep.mcp.runs import RunHandle, RunStore
@@ -1608,9 +1609,34 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     assert report.cleanup_error is shutdown
 
 
-def test_shutdown_during_post_error_reconciliation_remains_cancellation(
+@pytest.mark.parametrize(
+    ("initial_error", "cleanup_confirmed"),
+    [
+        pytest.param(NoFeasibleTrialError("trainer failed"), True, id="ordinary-failure"),
+        pytest.param(
+            UnsafeProcessCleanupError("trial cleanup could not be confirmed"),
+            False,
+            id="unsafe-process-cleanup",
+        ),
+        pytest.param(
+            PhaseSweepShutdown(
+                signal.SIGTERM,
+                ShutdownCleanupReport(
+                    signum=signal.SIGTERM,
+                    cleanup_confirmed=False,
+                    child_pgids=(1234,),
+                ),
+            ),
+            False,
+            id="earlier-uncertain-shutdown",
+        ),
+    ],
+)
+def test_shutdown_during_post_error_reconciliation_preserves_cleanup_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    initial_error: BaseException,
+    cleanup_confirmed: bool,
 ) -> None:
     experiment = make_experiment(workdir=tmp_path / "runs")
     shutdown = PhaseSweepShutdown(
@@ -1634,7 +1660,7 @@ def test_shutdown_during_post_error_reconciliation_remains_cancellation(
         return {}
 
     def fail_run(*args: object, **kwargs: object) -> None:
-        raise NoFeasibleTrialError("trainer failed")
+        raise initial_error
 
     captured: list[TerminalReport] = []
     monkeypatch.setattr("phasesweep.engine.guards._preflight_existing_studies", preflight)
@@ -1644,9 +1670,11 @@ def test_shutdown_during_post_error_reconciliation_remains_cancellation(
         run_experiment(experiment, terminal_callback=captured.append)
 
     assert exc_info.value is shutdown
+    assert exc_info.value.__cause__ is initial_error
     assert len(captured) == 1
     assert captured[0].primary_error is shutdown
-    assert captured[0].cleanup_confirmed is True
+    assert captured[0].cleanup_confirmed is cleanup_confirmed
+    assert captured[0].cleanup_error is (None if cleanup_confirmed else initial_error)
 
 
 def test_runner_records_snapshot_serialization_failure(

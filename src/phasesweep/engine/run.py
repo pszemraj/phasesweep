@@ -506,14 +506,21 @@ def _run_experiment_outcome(
                 cleanup.uncertain_attempt_ids.update(reconciliation.uncertain_attempt_ids)
                 cleanup.cleanup_confirmed = reconciliation.cleanup_confirmed
                 cleanup.error = reconciliation.error
+            original_cleanup_uncertain = isinstance(exc, ProcessCleanupUncertainError) or (
+                isinstance(exc, PhaseSweepShutdown) and not exc.report.cleanup_confirmed
+            )
+            if original_cleanup_uncertain:
+                # A later signal can interrupt reconciliation before it inspects
+                # the registry entry that records the original uncertain group.
+                # Preserve that existing evidence even when the signal handler
+                # had no currently tracked child to clean up itself.
+                cleanup.mark_uncertain(exc)
             primary_error = control_error or exc
             shutdown_cleanup_uncertain = (
                 isinstance(primary_error, PhaseSweepShutdown)
                 and not primary_error.report.cleanup_confirmed
             )
             if shutdown_cleanup_uncertain:
-                cleanup.mark_uncertain(primary_error)
-            if isinstance(primary_error, ProcessCleanupUncertainError):
                 cleanup.mark_uncertain(primary_error)
             failed_generation_id = generation_id
             failed_error_class = type(primary_error).__name__
@@ -547,6 +554,7 @@ def _run_experiment_outcome(
                     (ProcessCleanupUncertainError, StudyStorageUnavailableError),
                 )
                 and not shutdown_cleanup_uncertain
+                and control_error is None
             ):
                 # Cleanup uncertainty intentionally becomes the actionable error;
                 # the original failure remains chained for diagnosis but is unsafe to handle alone.
