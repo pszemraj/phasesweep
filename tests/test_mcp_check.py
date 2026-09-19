@@ -253,8 +253,9 @@ def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None
     runs_dir.chmod(0o700)
     (runs_dir / "old-run.json").write_text("{}\n")
 
-    with pytest.raises(CatalogError, match="durable run data has no format marker"):
+    with pytest.raises(CatalogError, match="durable run data has no format marker") as exc_info:
         check_catalog(catalog)
+    assert exc_info.value.suggestion is None
     with pytest.raises(CatalogError, match="durable run data has no format marker"):
         Registry.load(catalog)
 
@@ -263,6 +264,7 @@ def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None
     assert result.exit_code == 2
     assert "durable run data has no format marker" in result.output
     assert "use a fresh MCP state directory" in result.output
+    assert "writable directory path" not in result.output
 
 
 def test_check_catalog_reports_state_write_probe_failure(
