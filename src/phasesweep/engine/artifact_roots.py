@@ -216,6 +216,9 @@ def _validate_artifact_root_binding(
                 "release, or use the preserved PhaseSweep 0.3.1 environment to operate "
                 "the existing state. Nothing was written."
             ) from None
+        # A read without a binding must still classify the selected ledger: an
+        # unavailable ledger is not equivalent to an empty current-format one.
+        # Tolerant per-phase status counts only apply after this provenance check.
         _validate_local_storage_format(experiment)
         if claim_fresh:
             try:

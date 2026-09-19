@@ -555,15 +555,15 @@ def _validate_local_storage_format(experiment: Experiment) -> None:
     :param Experiment experiment: Experiment whose resolved local ledger is inspected.
     :raises StudyStorageUnavailableError: An existing local ledger cannot be
         inspected without mutation.
-    :raises StudySchemaMismatchError: A PhaseSweep study is unmarked or uses
-        a pre-cutover/unsupported schema.
+    :raises StudySchemaMismatchError: A populated PhaseSweep study is unmarked,
+        or a PhaseSweep study uses a pre-cutover/unsupported schema.
     """
     storage = experiment.resolved_storage
     if storage_is_in_memory(storage):
         return
     assert storage is not None
     backend = storage_backend(storage)
-    versions: list[tuple[str, object]] = []
+    versions: list[tuple[str, object, bool]] = []
     if backend == "sqlite":
         database = sqlite_database_path(storage)
         uri = sqlite_readonly_uri(storage)
@@ -580,12 +580,14 @@ def _validate_local_storage_format(experiment: Experiment) -> None:
                 }
                 if "studies" not in tables:
                     return
-                names = [
-                    str(row[0])
-                    for row in conn.execute("SELECT study_name FROM studies").fetchall()
-                    if "::" in str(row[0])
+                studies = [
+                    (int(study_id), str(name))
+                    for study_id, name in conn.execute(
+                        "SELECT study_id, study_name FROM studies"
+                    ).fetchall()
+                    if "::" in str(name)
                 ]
-                if not names:
+                if not studies:
                     return
                 attrs: dict[str, object] = {}
                 if "study_user_attributes" in tables:
@@ -604,7 +606,20 @@ def _validate_local_storage_format(experiment: Experiment) -> None:
                             attrs[str(study_name)] = json.loads(value_json)
                         except (TypeError, json.JSONDecodeError):
                             attrs[str(study_name)] = value_json
-                versions = [(name, attrs.get(name)) for name in names]
+                populated_study_ids = (
+                    {
+                        int(study_id)
+                        for (study_id,) in conn.execute(
+                            "SELECT DISTINCT study_id FROM trials"
+                        ).fetchall()
+                    }
+                    if "trials" in tables
+                    else set()
+                )
+                versions = [
+                    (name, attrs.get(name), study_id in populated_study_ids)
+                    for study_id, name in studies
+                ]
             finally:
                 conn.close()
         except sqlite3.Error as exc:
@@ -618,7 +633,11 @@ def _validate_local_storage_format(experiment: Experiment) -> None:
             return
         try:
             versions = [
-                (study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR))
+                (
+                    study.study_name,
+                    study.user_attrs.get(STUDY_SCHEMA_ATTR),
+                    bool(snapshot.get_all_trials(study._study_id, deepcopy=False)),
+                )
                 for study in snapshot.get_all_studies()
                 if "::" in study.study_name
             ]
@@ -629,10 +648,13 @@ def _validate_local_storage_format(experiment: Experiment) -> None:
     else:
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
 
+    # Match _validate_study_schema: create_study can survive an interruption
+    # before the first schema stamp, and an empty unmarked study is claimable.
     unsupported = [
         (name, version)
-        for name, version in versions
-        if type(version) is not int or version != STUDY_SCHEMA_VERSION
+        for name, version, has_trials in versions
+        if (type(version) is not int or version != STUDY_SCHEMA_VERSION)
+        and (version is not None or has_trials)
     ]
     if unsupported:
         detail = ", ".join(f"{name!r} ({version!r})" for name, version in unsupported)

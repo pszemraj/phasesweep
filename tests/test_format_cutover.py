@@ -12,6 +12,7 @@ from phasesweep import run_experiment
 from phasesweep.config import Experiment
 from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
+from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_constant_trainer
@@ -60,16 +61,25 @@ def test_pre_cutover_memory_output_is_refused_before_mutation(
     assert not _artifact_root_binding_path(experiment).exists()
 
 
-def test_old_populated_ledger_is_refused_with_a_fresh_output_root(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+@pytest.mark.parametrize("schema_version", [2, None], ids=["old-version", "unmarked"])
+def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
+    tmp_path: Path, backend: str, schema_version: int | None
+) -> None:
     """Changing experiment/workdir cannot reinterpret an old populated ledger as fresh."""
-    database = tmp_path / "old.db"
-    storage = f"sqlite:///{database}"
-    old = optuna.create_study(study_name="old_experiment::removed_phase", storage=storage)
-    old.set_user_attr(STUDY_SCHEMA_ATTR, 2)
+    ledger = tmp_path / f"old.{backend}"
+    storage = f"{backend}:///{ledger}"
+    old = optuna.create_study(
+        study_name="old_experiment::removed_phase", storage=_resolve_storage(storage)
+    )
+    if schema_version is not None:
+        old.set_user_attr(STUDY_SCHEMA_ATTR, schema_version)
     trial = old.ask()
     old.tell(trial, 1.0)
     ledger_before = {
-        path.name: path.read_bytes() for path in sorted(tmp_path.glob("old.db*")) if path.is_file()
+        path.name: path.read_bytes()
+        for path in sorted(tmp_path.glob(f"{ledger.name}*"))
+        if path.is_file()
     }
     experiment = _experiment(tmp_path, storage=storage).model_copy(
         update={"experiment": "fresh_name", "workdir": str(tmp_path / "fresh-runs")}
@@ -83,7 +93,9 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(tmp_path: Path
 
     assert not _experiment_dir(experiment).exists()
     assert {
-        path.name: path.read_bytes() for path in sorted(tmp_path.glob("old.db*")) if path.is_file()
+        path.name: path.read_bytes()
+        for path in sorted(tmp_path.glob(f"{ledger.name}*"))
+        if path.is_file()
     } == ledger_before
 
 
@@ -119,3 +131,27 @@ def test_current_sqlite_format_continues_after_top_up(tmp_path: Path) -> None:
     assert len(study.trials) == 2
     binding = json.loads(_artifact_root_binding_path(experiment).read_text(encoding="utf-8"))
     assert binding["schema_version"] == ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_empty_unstamped_phase_study_can_resume_in_current_ledger(
+    tmp_path: Path, backend: str
+) -> None:
+    """An interrupted new phase is stamped and resumed rather than classified as old state."""
+    ledger = tmp_path / f"current.{backend}"
+    storage = f"{backend}:///{ledger}"
+    experiment = _experiment(tmp_path, storage=storage)
+    run_experiment(experiment)
+
+    resumed_phase = experiment.phases[0].model_copy(update={"name": "q"})
+    resumed = experiment.model_copy(update={"phases": [experiment.phases[0], resumed_phase]})
+    interrupted = optuna.create_study(
+        study_name="t::q", storage=_resolve_storage(resumed.resolved_storage)
+    )
+    assert interrupted.user_attrs.get(STUDY_SCHEMA_ATTR) is None
+
+    run_experiment(resumed)
+
+    study = optuna.load_study(study_name="t::q", storage=_resolve_storage(resumed.resolved_storage))
+    assert study.user_attrs[STUDY_SCHEMA_ATTR] == STUDY_SCHEMA_VERSION
+    assert len(study.trials) == 1
