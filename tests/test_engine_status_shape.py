@@ -2,19 +2,15 @@
 
 ``config_status`` is a documented package-root API (docs/development.md) and
 ``phasesweep status`` renders its payload verbatim, so its key set is a
-contract for downstream consumers. The suite branch embeds
-``experiment_status`` under every study, which means *any* change to the
-experiment payload silently changes the suite payload too. These tests pin
-both key sets — experiment and suite — so that coupling can never drift
-unnoticed again (review finding 11).
+contract for downstream consumers. These tests pin the experiment payload so
+that changes to the public CLI shape do not drift unnoticed.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from phasesweep import config_status, load_config, run_experiment
-from phasesweep.config import Suite
+from phasesweep import config_status, load_experiment, run_experiment
 from phasesweep.engine import read_status
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _last_successful_generation_id
@@ -51,22 +47,6 @@ FAILED_PUBLICATION_STATUS_KEYS = [
 ``publication_error`` is the one conditional key: it appears only alongside
 ``publication_integrity: "failed"`` or ``"permission_denied"`` so a healthy
 payload carries no empty error field (review v0.5.18 / finding F4).
-"""
-
-SUITE_STATUS_KEYS = [
-    "kind",
-    "suite",
-    "workdir",
-    "published_suite_generation_id",
-    "publication_integrity",
-    "studies",
-]
-"""Exact ordered key set of a suite status envelope.
-
-The envelope reports the *suite* last-success pointer's own four-state verdict
-beside the per-study payloads (re-review v0.5.19 / observation N2), with
-``publication_error`` as the same one conditional key the experiment payload
-carries.
 """
 
 PHASE_STATUS_KEYS = {
@@ -110,8 +90,8 @@ reviewer 2, blocker 6); the CLI phase payload keeps exactly
 """
 
 
-def _write_suite(tmp_path: Path) -> Path:
-    """Write a two-study suite whose trainer reports a constant objective."""
+def _write_experiment(tmp_path: Path) -> Path:
+    """Write an experiment whose trainer reports a constant objective."""
     trainer = write_trainer(
         tmp_path,
         """
@@ -125,39 +105,28 @@ def _write_suite(tmp_path: Path) -> Path:
     return write_yaml(
         tmp_path,
         f"""
-        suite: shape_suite
-        defaults:
-          workdir: {tmp_path}/runs
-          storage: sqlite:///{tmp_path}/shape.db
-          provenance: {{revision: test-fixture-v1}}
-          trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-          override_format: argparse
-          metric:
-            name: x
-            goal: minimize
-            extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        studies:
-          - name: ran
-            phases:
-              - name: p
-                n_trials: 1
-                sampler: {{ type: random, seed: 0 }}
-                search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-          - name: untouched
-            phases:
-              - name: p
-                n_trials: 1
-                sampler: {{ type: random, seed: 0 }}
-                search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
+        experiment: shape
+        workdir: {tmp_path}/runs
+        storage: sqlite:///{tmp_path}/shape.db
+        provenance: {{revision: test-fixture-v1}}
+        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+        override_format: argparse
+        metric:
+          name: x
+          goal: minimize
+          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
+        phases:
+          - name: p
+            n_trials: 1
+            sampler: {{ type: random, seed: 0 }}
+            search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
         """,
     )
 
 
 def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
     """A standalone experiment payload carries generation identity plus phases."""
-    config = load_config(_write_suite(tmp_path))
-    assert isinstance(config, Suite)
-    experiment = config.experiment_for_study(config.studies[0])
+    experiment = load_experiment(_write_experiment(tmp_path))
     run_experiment(experiment)
 
     payload = config_status(experiment)
@@ -178,62 +147,6 @@ def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
     assert phase["completed"] == 1
 
 
-def test_suite_config_status_embeds_the_full_experiment_status(tmp_path: Path) -> None:
-    """Every suite study embeds the same payload a standalone experiment reports.
-
-    Including the four generation-identity keys and current-generation trial
-    counts: a suite study is not a reduced view of an experiment.
-    """
-    config = load_config(_write_suite(tmp_path))
-    assert isinstance(config, Suite)
-    ran_study, untouched_study = config.studies
-    ran = config.experiment_for_study(ran_study)
-    run_experiment(ran)
-
-    payload = config_status(config)
-
-    assert list(payload) == SUITE_STATUS_KEYS
-    assert payload["kind"] == "suite"
-    assert payload["suite"] == "shape_suite"
-    # Only a component study ran, so the suite itself has published nothing --
-    # reported as its own verdict rather than left unstated.
-    assert payload["publication_integrity"] == "absent"
-    assert payload["published_suite_generation_id"] is None
-    assert "publication_error" not in payload
-
-    for study_payload in payload["studies"]:
-        assert list(study_payload) == ["name", "depends_on", "status"]
-        status = study_payload["status"]
-        assert list(status) == EXPERIMENT_STATUS_KEYS
-        assert not READ_STATUS_ONLY_KEYS & set(status)
-        for phase in status["phases"]:
-            assert set(phase) == PHASE_STATUS_KEYS
-            assert not READ_STATUS_ONLY_PHASE_KEYS & set(phase)
-
-    ran_status, untouched_status = (study["status"] for study in payload["studies"])
-
-    # The embedded payload is exactly what the standalone call returns.
-    assert ran_status == experiment_status(ran)
-    assert untouched_status == experiment_status(config.experiment_for_study(untouched_study))
-
-    # The study that ran reports its own generation identity and this
-    # generation's trial counts, not an empty placeholder.
-    assert ran_status["current_generation_id"] is not None
-    assert ran_status["is_published"] is True
-    assert ran_status["phases"][0]["generation_trials"] == {"COMPLETE": 1}
-    assert ran_status["phases"][0]["winner"] is not None
-
-    # A study that never ran reports null identity and no winner, without
-    # borrowing the sibling study's generation.
-    assert untouched_status["current_generation_id"] is None
-    assert untouched_status["published_generation_id"] is None
-    assert untouched_status["represented_generation_id"] is None
-    assert untouched_status["is_published"] is False
-    assert untouched_status["publication_integrity"] == "absent"
-    assert untouched_status["phases"][0]["generation_trials"] == {}
-    assert untouched_status["phases"][0]["winner"] is None
-
-
 def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path) -> None:
     """The path-free phase view carries running attempts; the CLI view does not.
 
@@ -242,9 +155,7 @@ def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path
     (PR #5 review / reviewer 2, blocker 6), and ``experiment_status`` is a
     pinned public contract that must not grow a key because of it.
     """
-    config = load_config(_write_suite(tmp_path))
-    assert isinstance(config, Suite)
-    experiment = config.experiment_for_study(config.studies[0])
+    experiment = load_experiment(_write_experiment(tmp_path))
     run_experiment(experiment)
 
     (read_phase,) = read_status(experiment)["phases"]
@@ -265,9 +176,7 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     be byte-identical to a tree that had never published, so the operator's
     natural next move was to re-run over the evidence.
     """
-    config = load_config(_write_suite(tmp_path))
-    assert isinstance(config, Suite)
-    experiment = config.experiment_for_study(config.studies[0])
+    experiment = load_experiment(_write_experiment(tmp_path))
     run_experiment(experiment)
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None

@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from pathlib import Path
 
 import optuna
 import pytest
-import sqlalchemy
-import yaml
 
 import phasesweep.engine.optuna as engine_optuna
 import phasesweep.engine.read as engine_read
@@ -22,25 +19,17 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
-    Promotion,
     Sampler,
-    WandbExtractor,
 )
-from phasesweep.engine import read_status, read_winner, read_winners
+from phasesweep.engine import read_status, read_winners
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.paths import (
     _generation_path,
-    _generation_record_path,
     _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_path,
-    _winner_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.relocation import _plan_artifact_root_rebinds
 from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import (
-    PUBLICATION_POINTER_SCHEMA_VERSION,
-)
+from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_trainer
 
 
@@ -69,68 +58,11 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
     )
 
 
-def test_read_winner_parses_a_valid_file(tmp_path: Path) -> None:
-    exp = _experiment(tmp_path)
-    path = _winner_path(exp, "p")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "phase": "p",
-                "trial_number": 3,
-                "metric": {"loss": 0.123, "goal": "minimize"},
-                "params": {"lr": 0.001},
-                "effective_overrides": {"lr": 0.001},
-                "gates": [{"name": "g", "passed": True}],
-                "completion": {"incomplete": False},
-                "winner_source": {
-                    "kind": "phase_trial",
-                    "phase": "p",
-                    "trial_number": 3,
-                    "generation_id": "generation-test",
-                    "attempt_id": "attempt-test",
-                    "study": None,
-                },
-            }
-        )
-    )
-    view = read_winner(exp, "p")
-    assert view is not None
-    assert view.trial_number == 3
-    assert view.metric == 0.123
-    assert view.gates_passed is True
-    assert view.incomplete is False
-    assert view.source is not None
-    assert view.source.phase == "p"
-    assert view.source.trial_number == 3
-
-
-@pytest.mark.parametrize(
-    "body",
-    [
-        '{"trial_number": 0, "metric": {"loss":',
-        "phase: p\n",
-        "- not\n- a\n- mapping\n",
-        """\
-phase: p
-trial_number: 3
-metric: {loss: 0.123, goal: minimize}
-params: {lr: 0.001}
-effective_overrides: {lr: 0.001}
-completion: [not, a, mapping]
-""",
-    ],
-    ids=["truncated", "missing_keys", "non_mapping", "bad_completion"],
-)
-def test_read_winner_tolerates_torn_or_malformed_file(tmp_path: Path, body: str) -> None:
-    # Status reads stay permissive for legacy, hand-edited, or externally corrupted files.
-    exp = _experiment(tmp_path)
-    path = _winner_path(exp, "p")
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    path.write_text(body)
-    assert read_winner(exp, "p") is None
-    assert read_winners(exp) == []
+def _mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
+    """Stamp manually constructed studies and bind their current-format root."""
+    for study in studies:
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
@@ -171,159 +103,15 @@ def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None
     assert status["phases"][0]["running_attempts"] is None
 
 
-@pytest.mark.parametrize("database_state", ["uninitialized", "absent-study", "empty-study"])
-def test_external_status_does_not_initialize_or_change_schema(
-    tmp_path, monkeypatch, database_state
-):
-    storage = f"sqlite:///{tmp_path / 'status.db'}"
-    if database_state != "uninitialized":
-        optuna.create_study(
-            study_name="read_t::p" if database_state == "empty-study" else "unrelated",
-            storage=storage,
-        )
-    engine = sqlalchemy.create_engine(storage)
-    before = sqlalchemy.inspect(engine).get_table_names()
-    writes = []
-
-    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
-    def observe_sql(conn, cursor, statement, parameters, context, executemany):
-        if statement.lstrip().upper().startswith(("CREATE", "INSERT", "UPDATE", "DELETE", "ALTER")):
-            writes.append(statement)
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
-    experiment = _experiment(tmp_path).model_copy(
-        update={
-            "storage": "postgresql://localhost/status_placeholder",
-            "allow_external_rdb_single_host": True,
-        }
-    )
-
-    phase = read_status(experiment)["phases"][0]
-
-    assert phase["trials"] == {}
-    assert phase["trial_data_available"] is (database_state != "uninitialized")
-    assert sqlalchemy.inspect(engine).get_table_names() == before
-    assert writes == []
-    engine.dispose()
-
-
-@pytest.mark.parametrize("database_state", ["uninitialized", "absent-study", "present-study"])
-def test_external_preflight_checks_study_presence_without_initializing_schema(
-    tmp_path, monkeypatch, database_state
-):
-    storage = f"sqlite:///{tmp_path / 'preflight.db'}"
-    if database_state != "uninitialized":
-        optuna.create_study(
-            study_name="read_t::p" if database_state == "present-study" else "unrelated",
-            storage=storage,
-        )
-    engine = sqlalchemy.create_engine(storage)
-    before = sqlalchemy.inspect(engine).get_table_names()
-    writes = []
-    loaded = []
-
-    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
-    def observe_sql(conn, cursor, statement, parameters, context, executemany):
-        if statement.lstrip().upper().startswith(("CREATE", "INSERT", "UPDATE", "DELETE", "ALTER")):
-            writes.append(statement)
-
-    def load_local_study(experiment, phase):
-        loaded.append(phase.name)
-        return optuna.load_study(study_name="read_t::p", storage=storage)
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
-    monkeypatch.setattr(engine_optuna, "_load_phase_study", load_local_study)
-    experiment = _experiment(tmp_path).model_copy(
-        update={
-            "storage": "postgresql://localhost/preflight_placeholder",
-            "allow_external_rdb_single_host": True,
-        }
-    )
-
-    study = engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
-
-    assert (study is not None) is (database_state == "present-study")
-    assert loaded == (["p"] if database_state == "present-study" else [])
-    assert sqlalchemy.inspect(engine).get_table_names() == before
-    assert writes == []
-    engine.dispose()
-
-
-def test_external_preflight_fails_closed_when_study_presence_cannot_be_read(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from phasesweep.engine import StudyStorageUnavailableError
-
-    experiment = _experiment(tmp_path).model_copy(
-        update={
-            "storage": "postgresql://localhost/preflight_placeholder",
-            "allow_external_rdb_single_host": True,
-        }
-    )
-
-    def unavailable_engine(*args: object, **kwargs: object):
-        raise sqlalchemy.exc.OperationalError("connect", {}, RuntimeError("unavailable"))
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", unavailable_engine)
-
-    with pytest.raises(StudyStorageUnavailableError, match="could not be read"):
-        engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
-
-
-def test_external_status_reads_counts_and_running_identities_in_one_statement(
-    tmp_path, monkeypatch
-):
-    storage = f"sqlite:///{tmp_path / 'status.db'}"
-    study = optuna.create_study(study_name="read_t::p", storage=storage)
-    completed = study.ask()
-    completed.set_user_attr("phasesweep_generation_id", "gen-1")
-    completed.set_user_attr("phasesweep_attempt_id", "completed-attempt")
-    study.tell(completed, 0.5)
-    running = study.ask()
-    running.set_user_attr("phasesweep_generation_id", "gen-1")
-    running.set_user_attr("phasesweep_attempt_id", "attempt-1")
-    study.ask()
-    engine = sqlalchemy.create_engine(storage)
-    statements = []
-
-    @sqlalchemy.event.listens_for(engine, "before_cursor_execute")
-    def observe_sql(conn, cursor, statement, parameters, context, executemany):
-        statements.append(statement)
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", lambda *args, **kwargs: engine)
-    experiment = _experiment(tmp_path).model_copy(
-        update={
-            "storage": "postgresql://localhost/status_placeholder",
-            "allow_external_rdb_single_host": True,
-        }
-    )
-
-    stats = engine_optuna._phase_trial_stats(
-        experiment, experiment.phases[0], engine_optuna._TrialRef(0, "gen-1", "completed-attempt")
-    )
-
-    assert stats.available
-    assert stats.published_trial_available
-    assert stats.counts == {"COMPLETE": 1, "RUNNING": 2}
-    assert stats.generation_counts == {"gen-1": {"COMPLETE": 1, "RUNNING": 1}}
-    assert sorted(stats.running_attempts, key=lambda ref: ref.trial_number) == [
-        engine_optuna._TrialRef(1, "gen-1", "attempt-1"),
-        engine_optuna._TrialRef(2, None, None),
-    ]
-    assert len(statements) == 1
-    assert statements[0].lstrip().startswith("WITH")
-    engine.dispose()
-
-
 def test_read_status_uses_one_sqlite_snapshot_per_phase(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = tmp_path / "phases.db"
     storage = f"sqlite:///{db}"
-    optuna.create_study(study_name="read_t::p", storage=storage).optimize(
-        lambda trial: 1.0, n_trials=1
-    )
+    study = optuna.create_study(study_name="read_t::p", storage=storage)
+    study.optimize(lambda trial: 1.0, n_trials=1)
     exp = _experiment(tmp_path, storage=storage)
+    _mark_current_format(exp, study)
     real_connect = engine_optuna.sqlite3.connect
     connections = 0
 
@@ -349,6 +137,7 @@ def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
     study = optuna.create_study(study_name="read_t::p", storage=storage)
     study.optimize(lambda trial: 1.0, n_trials=50)
     exp = _experiment(tmp_path, storage=storage)
+    _mark_current_format(exp, study)
     real_connect = engine_optuna.sqlite3.connect
     transferred_rows: list[int] = []
 
@@ -396,10 +185,10 @@ def test_read_status_counts_sqlite_trials_with_storage_url_variants(
 ) -> None:
     db = tmp_path / database_name
     storage = storage_template.format(db=db)
-    optuna.create_study(study_name="read_t::p", storage=storage).optimize(
-        lambda trial: 1.0, n_trials=1
-    )
+    study = optuna.create_study(study_name="read_t::p", storage=storage)
+    study.optimize(lambda trial: 1.0, n_trials=1)
     exp = _experiment(tmp_path, storage=storage)
+    _mark_current_format(exp, study)
 
     status = read_status(exp)
 
@@ -427,6 +216,7 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(
     running.set_user_attr("phasesweep_generation_id", "gen-1")
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
     study.ask()
+    _mark_current_format(exp, study)
 
     phase = read_status(exp)["phases"][0]
 
@@ -447,9 +237,14 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
 ) -> None:
     """Unread trial data reports no RUNNING identities, not an empty list."""
     ledger = tmp_path / f"corrupt.{backend}"
+    exp = _experiment(tmp_path, storage=f"{backend}:///{ledger}")
+    study = optuna.create_study(
+        study_name="read_t::p",
+        storage=engine_optuna._resolve_storage(exp.resolved_storage),
+    )
+    _mark_current_format(exp, study)
     # Journal tolerates a torn final record; an earlier malformed record must fail.
     ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
-    exp = _experiment(tmp_path, storage=f"{backend}:///{ledger}")
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.optuna"):
         phase = read_status(exp)["phases"][0]
@@ -464,28 +259,6 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     assert len(warnings) == 1
     assert str(ledger) in warnings[0]
     assert cause in warnings[0]
-
-
-def test_external_status_warning_omits_storage_credentials(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    storage = "postgresql://private-user:private-password@example.invalid/study?token=private-token"
-    exp = _experiment(tmp_path).model_copy(
-        update={"storage": storage, "allow_external_rdb_single_host": True}
-    )
-
-    def unavailable_engine(*args: object, **kwargs: object) -> None:
-        raise sqlalchemy.exc.OperationalError("connect", {}, RuntimeError(storage))
-
-    monkeypatch.setattr(sqlalchemy, "create_engine", unavailable_engine)
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.optuna"):
-        phase = read_status(exp)["phases"][0]
-
-    assert phase["trial_data_available"] is False
-    assert phase["running_attempts"] is None
-    assert "postgresql storage for phase p: OperationalError" in caplog.text
-    for secret in ("private-user", "private-password", "private-token", storage):
-        assert secret not in caplog.text
 
 
 @pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
@@ -507,9 +280,10 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
     if published:
         run_experiment(experiment)
     else:
-        optuna.create_study(
+        study = optuna.create_study(
             study_name="t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
         )
+        _mark_current_format(experiment, study)
     original = ledger.read_bytes()
     tail = {
         "garbage": b"not a journal record\n",
@@ -555,6 +329,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     study.tell(trial, 0.5)
+    _mark_current_format(experiment, study)
     complete = ledger.read_bytes()
     if change == "finish-partial":
         ledger.write_bytes(complete[:-1])
@@ -594,7 +369,6 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
 ) -> None:
     """The same status flags select the same remedy for both file backends."""
     from phasesweep.engine import (
-        ArtifactRootRebindError,
         ProcessCleanupUncertainError,
         PublishedStudyMissingError,
     )
@@ -626,7 +400,9 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         storage = engine_optuna._resolve_storage(experiment.resolved_storage)
         optuna.delete_study(study_name="t::p", storage=storage)
         if damage == "empty-study":
-            optuna.create_study(study_name="t::p", storage=storage)
+            _mark_current_format(
+                experiment, optuna.create_study(study_name="t::p", storage=storage)
+            )
     ledger_before = ledger.read_bytes() if ledger.exists() else None
     generation_before = _generation_path(experiment).read_bytes()
 
@@ -656,12 +432,6 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     with pytest.raises(expected_error):
         run_experiment(experiment)
     assert _generation_path(experiment).read_bytes() == generation_before
-    if damage == "stale-ledger":
-        with pytest.raises(ArtifactRootRebindError, match="published trial identity") as excinfo:
-            _plan_artifact_root_rebinds([experiment])
-        assert str(excinfo.value).endswith("Nothing was written.")
-        assert ledger.read_bytes() == ledger_before
-        assert _generation_path(experiment).read_bytes() == generation_before
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
@@ -678,6 +448,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     if mismatch != "state":
         study.tell(trial, 0.5)
+    _mark_current_format(experiment, study)
     expected = engine_optuna._TrialRef(
         1 if mismatch == "number" else 0,
         "different" if mismatch == "generation" else "generation",
@@ -691,404 +462,12 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
     assert stats.counts == {"RUNNING" if mismatch == "state" else "COMPLETE": 1}
 
 
-@pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
-def test_baseline_promotion_checks_local_candidate_and_allows_skipped_source_loss(
-    tmp_path: Path, n_jobs: int
-) -> None:
-    from phasesweep.engine import PublishedStudyMissingError
-
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage="auto",
-        trial_command="echo x=-{trial_id}",
-        phases=[
-            Phase(
-                name=name,
-                n_trials=1,
-                n_jobs=n_jobs,
-                allow_no_gpu_isolation=True,
-                sampler=Sampler(type="random", seed=0),
-                promotion=(
-                    Promotion(min_delta_vs="base", min_delta=100, on_fail="continue_baseline")
-                    if name == "candidate"
-                    else None
-                ),
-            )
-            for name in ("base", "candidate")
-        ],
-    )
-    run_experiment(experiment)
-    ledger = tmp_path / "runs" / "t" / ("study.db" if n_jobs == 1 else "study.journal")
-    backup = ledger.read_bytes()
-    experiment = experiment.model_copy(
-        update={
-            "phases": [
-                experiment.phases[0],
-                experiment.phases[1].model_copy(update={"n_trials": 2}),
-            ]
-        }
-    )
-    winners = run_experiment(experiment)
-    assert winners["candidate"].source.phase == "base"
-    assert winners["candidate"].promotion["candidate_trial_number"] == 1
-    assert all(
-        not phase["published_study_unavailable"] for phase in read_status(experiment)["phases"]
-    )
-
-    optuna.delete_study(
-        study_name="t::base", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
-    )
-    resumed = run_experiment(experiment, from_phase="candidate")
-    assert resumed["candidate"].attempt_id == winners["base"].attempt_id
-
-    ledger.write_bytes(backup)
-    generation_before = _generation_path(experiment).read_bytes()
-    phases = read_status(experiment)["phases"]
-    assert phases[0]["published_study_unavailable"] is False
-    assert phases[1]["published_study_unavailable"] is True
-    assert phases[1]["trial_data_available"] is True
-    assert phases[1]["completed"] == 1
-    with pytest.raises(
-        PublishedStudyMissingError, match="phase 'candidate'.*published trial identity"
-    ):
-        run_experiment(experiment, from_phase="candidate")
-    assert _generation_path(experiment).read_bytes() == generation_before
-
-
-@pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
-def test_skipped_promotion_candidate_requires_its_published_trial_history(
-    tmp_path: Path, n_jobs: int
-) -> None:
-    from phasesweep.engine import PublishedStudyMissingError
-
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage="auto",
-        trial_command="echo x=-{trial_id}",
-        phases=[
-            Phase(
-                name=name,
-                n_trials=1,
-                n_jobs=n_jobs,
-                allow_no_gpu_isolation=True,
-                sampler=Sampler(type="random", seed=0),
-                promotion=(
-                    Promotion(min_delta_vs="base", min_delta=100, on_fail="skip")
-                    if name == "candidate"
-                    else None
-                ),
-            )
-            for name in ("base", "candidate")
-        ],
-    )
-    assert list(run_experiment(experiment)) == ["base"]
-    generation_before = _generation_path(experiment).read_bytes()
-    publication_before = _last_successful_generation_path(experiment).read_bytes()
-    assert all(
-        not phase["published_study_unavailable"] for phase in read_status(experiment)["phases"]
-    )
-
-    optuna.delete_study(
-        study_name="t::candidate",
-        storage=engine_optuna._resolve_storage(experiment.resolved_storage),
-    )
-
-    candidate = read_status(experiment)["phases"][1]
-    assert candidate["completed"] == 0
-    assert candidate["trial_data_available"] is True
-    assert candidate["published_study_unavailable"] is True
-    with pytest.raises(PublishedStudyMissingError, match="phase 'candidate'.*study is missing"):
-        run_experiment(experiment, from_phase="candidate")
-    assert _generation_path(experiment).read_bytes() == generation_before
-    assert _last_successful_generation_path(experiment).read_bytes() == publication_before
-    assert engine_optuna._load_existing_phase_study(experiment, experiment.phases[1]) is None
-
-
-@pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
-def test_skipped_promotion_candidate_requires_its_published_completion_boundary(
-    tmp_path: Path, n_jobs: int
-) -> None:
-    from phasesweep.engine import PublishedStudyMissingError
-
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage="auto",
-        trial_command="echo x={trial_id}",
-        phases=[
-            Phase(
-                name=name,
-                n_trials=1,
-                n_jobs=n_jobs,
-                allow_no_gpu_isolation=True,
-                sampler=Sampler(type="random", seed=0),
-                promotion=(
-                    Promotion(min_delta_vs="base", min_delta=100, on_fail="skip")
-                    if name == "candidate"
-                    else None
-                ),
-            )
-            for name in ("base", "candidate")
-        ],
-    )
-    assert list(run_experiment(experiment)) == ["base"]
-    ledger = tmp_path / "runs" / "t" / ("study.db" if n_jobs == 1 else "study.journal")
-    one_trial_ledger = ledger.read_bytes()
-
-    experiment = experiment.model_copy(
-        update={
-            "phases": [
-                experiment.phases[0],
-                experiment.phases[1].model_copy(update={"n_trials": 3}),
-            ]
-        }
-    )
-    assert list(run_experiment(experiment)) == ["base"]
-    publication = _resolve_publication_pointer(experiment)
-    decision = publication.summary["promotion_decisions"][0]
-    assert decision["candidate_trial_number"] == 0
-    generation_before = _generation_path(experiment).read_bytes()
-    publication_before = _last_successful_generation_path(experiment).read_bytes()
-
-    ledger.write_bytes(one_trial_ledger)
-
-    candidate = read_status(experiment)["phases"][1]
-    assert candidate["trials"] == {"COMPLETE": 1}
-    assert candidate["published_study_unavailable"] is True
-    with pytest.raises(PublishedStudyMissingError, match="published completion boundary"):
-        run_experiment(experiment, from_phase="candidate")
-    assert _generation_path(experiment).read_bytes() == generation_before
-    assert _last_successful_generation_path(experiment).read_bytes() == publication_before
-    assert decision["candidate_completion"]["finished_trials"] == 3
-    assert decision["candidate_completion"]["completed_trials"] == 3
-
-
-def _mark_generation_published(exp: Experiment, generation_id: str, phase_name: str) -> None:
-    """Publish an immutable generation (summary + record + phase winner) on disk.
-
-    Pointer validation (:func:`phasesweep.engine.publication._last_successful_generation_id`)
-    now reads back the generation's own immutable *summary*, not the
-    lifecycle record's state, so a summary naming this owner and id is
-    required for the pointer to resolve as published (review v0.5.15 /
-    blocker 3). The record is written too, purely as the informational,
-    post-commit artifact real publications also produce.
-    """
-    summary_path = _generation_summary_path(exp, generation_id)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(
-        yaml.safe_dump({"experiment": exp.experiment, "generation_id": generation_id})
-    )
-    summary = summary_path.read_bytes()
-    _last_successful_generation_path(exp).write_text(
-        yaml.safe_dump(
-            {
-                "schema_version": PUBLICATION_POINTER_SCHEMA_VERSION,
-                "experiment": exp.experiment,
-                "generation_id": generation_id,
-                "summary_size_bytes": len(summary),
-                "summary_sha256": hashlib.sha256(summary).hexdigest(),
-            }
-        )
-    )
-    record_path = _generation_record_path(exp, generation_id)
-    record_path.parent.mkdir(parents=True, exist_ok=True)
-    record_path.write_text(
-        yaml.safe_dump(
-            {"experiment": exp.experiment, "generation_id": generation_id, "state": "published"}
-        )
-    )
-    winner_path = _generation_winner_path(exp, generation_id, phase_name)
-    winner_path.parent.mkdir(parents=True, exist_ok=True)
-    winner_path.write_text(
-        yaml.safe_dump(
-            {
-                "phase": phase_name,
-                "trial_number": 0,
-                "metric": {"loss": 0.1, "goal": "minimize"},
-                "params": {"lr": 0.001},
-                "effective_overrides": {"lr": 0.001},
-                "completion": {"incomplete": False},
-                "generation_id": generation_id,
-                "winner_source": {
-                    "kind": "phase_trial",
-                    "phase": phase_name,
-                    "trial_number": 0,
-                    "generation_id": generation_id,
-                    "attempt_id": None,
-                    "study": None,
-                },
-            }
-        )
-    )
-
-
-def test_read_status_distinguishes_current_from_published_generation(tmp_path: Path) -> None:
-    """A failed rerun's counts must never be mistaken for the older published winner's."""
-    exp = _experiment(tmp_path)
-    _mark_generation_published(exp, "generation-good", "p")
-    # A newer generation has since started (and, in this scenario, failed) without
-    # ever publishing - the mutable current-generation pointer moved on.
-    _generation_path(exp).parent.mkdir(parents=True, exist_ok=True)
-    _generation_path(exp).write_text(yaml.safe_dump({"generation_id": "generation-failed"}))
-
-    status = read_status(exp)
-
-    assert status["current_generation_id"] == "generation-failed"
-    assert status["published_generation_id"] == "generation-good"
-    assert status["current_generation_id"] != status["published_generation_id"]
-    # In default (non-pinned) mode, represented_generation_id is the captured
-    # published id, and winner/summary facts scope to it -- never the
-    # failed/in-progress current one.
-    assert status["represented_generation_id"] == "generation-good"
-    assert status["is_published"] is True
-    assert status["phases"][0]["winner_present"] is True
-    assert status["summary_present"] is True
-
-
-def test_read_status_explicit_generation_id_is_self_scoped(tmp_path: Path) -> None:
-    """An explicit generation_id pins the represented identity to that one generation.
-
-    ``current_generation_id`` and ``published_generation_id`` always report
-    the *actual* pointers -- never forced to the pinned id (review v0.5.15 /
-    blocker 3, defect 2: "pinned reads lie"). Here no current-pointer file
-    exists at all, so ``current_generation_id`` is genuinely ``None`` even
-    though the pinned generation itself is fully published.
-    """
-    exp = _experiment(tmp_path)
-    _mark_generation_published(exp, "generation-good", "p")
-
-    status = read_status(exp, generation_id="generation-good")
-
-    assert status["current_generation_id"] is None
-    assert status["published_generation_id"] == "generation-good"
-    assert status["represented_generation_id"] == "generation-good"
-    assert status["is_published"] is True
-    assert status["phases"][0]["winner_present"] is True
-
-
-def test_read_status_pinned_read_of_unpublished_generation_is_not_marked_published(
-    tmp_path: Path,
-) -> None:
-    """Pinning a generation that never published reports is_published=False, not a lie."""
-    exp = _experiment(tmp_path)
-    _mark_generation_published(exp, "generation-good", "p")
-    # A second, never-published generation has its own (unpublished) winner.
-    other_winner = _generation_winner_path(exp, "generation-orphan", "p")
-    other_winner.parent.mkdir(parents=True, exist_ok=True)
-    other_winner.write_text(
-        yaml.safe_dump(
-            {
-                "phase": "p",
-                "trial_number": 1,
-                "metric": {"loss": 0.2, "goal": "minimize"},
-                "params": {"lr": 0.002},
-                "effective_overrides": {"lr": 0.002},
-                "completion": {"incomplete": False},
-                "generation_id": "generation-orphan",
-                "winner_source": {
-                    "kind": "phase_trial",
-                    "phase": "p",
-                    "trial_number": 1,
-                    "generation_id": "generation-orphan",
-                    "attempt_id": None,
-                    "study": None,
-                },
-            }
-        )
-    )
-
-    status = read_status(exp, generation_id="generation-orphan")
-
-    assert status["published_generation_id"] == "generation-good"
-    assert status["represented_generation_id"] == "generation-orphan"
-    assert status["is_published"] is False
-    # The orphaned generation's own winner is still readable pinned.
-    assert status["phases"][0]["winner_present"] is True
-
-
-def test_read_status_legacy_workdir_without_generation_metadata_is_published(
-    tmp_path: Path,
-) -> None:
-    """A pre-generation workdir's ``winner.yaml`` is the publication, so say so.
-
-    Legacy layouts have no ``generation.yaml`` and therefore no pointer
-    identity to compare, which used to report ``is_published: False`` right
-    next to a real winner path -- an upgrading operator read "never
-    published" about a published result. The three identity fields stay
-    ``None`` (there is genuinely no generation id to report; none is
-    fabricated) while ``is_published`` follows the winner actually on disk.
-    """
-    exp = _experiment(tmp_path)
-    legacy_winner = _winner_path(exp, "p")
-    legacy_winner.parent.mkdir(parents=True, exist_ok=True)
-    legacy_winner.write_text(
-        yaml.safe_dump(
-            {
-                "phase": "p",
-                "trial_number": 2,
-                "metric": {"loss": 0.3, "goal": "minimize"},
-                "params": {"lr": 0.003},
-                "effective_overrides": {"lr": 0.003},
-                "completion": {"incomplete": False},
-            }
-        )
-    )
-    assert not _generation_path(exp).exists()
-
-    status = read_status(exp)
-
-    assert status["current_generation_id"] is None
-    assert status["published_generation_id"] is None
-    assert status["represented_generation_id"] is None
-    assert status["is_published"] is True
-    assert status["publication_integrity"] == "ok"
-    assert status["phases"][0]["winner_present"] is True
-
-    # The path-bearing CLI/suite view derives from the same read and must not
-    # contradict its own winner path either.
-    cli_status = experiment_status(exp)
-    assert cli_status["is_published"] is True
-    assert cli_status["phases"][0]["winner"] == str(legacy_winner)
-
-
 def test_read_status_untouched_workdir_is_not_published(tmp_path: Path) -> None:
     """No generation metadata *and* no legacy winner is still "nothing published"."""
     exp = _experiment(tmp_path)
 
     status = read_status(exp)
 
-    assert status["is_published"] is False
-    assert status["phases"][0]["winner_present"] is False
-
-
-def test_read_status_unpublished_generation_is_not_published(tmp_path: Path) -> None:
-    """A generation-aware workdir that never published keeps ``is_published: False``.
-
-    The legacy fallback must not leak into layouts that *do* carry generation
-    metadata: once ``generation.yaml`` exists, a stale compatibility
-    ``winner.yaml`` is not authoritative.
-    """
-    exp = _experiment(tmp_path)
-    _generation_path(exp).parent.mkdir(parents=True, exist_ok=True)
-    _generation_path(exp).write_text(yaml.safe_dump({"generation_id": "generation-running"}))
-    legacy_winner = _winner_path(exp, "p")
-    legacy_winner.parent.mkdir(parents=True, exist_ok=True)
-    legacy_winner.write_text(
-        yaml.safe_dump(
-            {
-                "phase": "p",
-                "trial_number": 2,
-                "metric": {"loss": 0.3, "goal": "minimize"},
-                "params": {"lr": 0.003},
-                "effective_overrides": {"lr": 0.003},
-                "completion": {"incomplete": False},
-            }
-        )
-    )
-
-    status = read_status(exp)
-
-    assert status["current_generation_id"] == "generation-running"
-    assert status["published_generation_id"] is None
     assert status["is_published"] is False
     assert status["phases"][0]["winner_present"] is False
 
@@ -1156,24 +535,18 @@ def test_objective_evidence_assurance_json_envelope_checkpoint_binding(
             (True, False, False),
             id="log_regex",
         ),
-        pytest.param(
-            WandbExtractor(type="wandb", entity="acme", project="proj", metric_key="eval/loss"),
-            (True, False, True),
-            id="wandb",
-        ),
     ],
 )
 def test_objective_evidence_assurance_attempt_triple_by_kind(
     tmp_path: Path,
-    extractor: JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor,
+    extractor: JsonEnvelopeExtractor | LogRegexExtractor,
     expected_triple: tuple[bool, bool, bool],
 ) -> None:
     """Each extractor kind reports its own (location, identity, source-key) triple.
 
     ``json_envelope`` structurally echoes and cross-checks the attempt
-    identity; ``wandb`` is keyed by an immutable run id that IS the attempt
-    id; ``log_regex`` is merely read from an attempt-scoped location with
-    nothing in its contents tying it to that attempt (review v0.5.15 / item C).
+    identity; ``log_regex`` is merely read from an attempt-scoped location
+    with nothing in its contents tying it to that attempt.
     """
     exp = _experiment(tmp_path)
     exp = exp.model_copy(
@@ -1380,25 +753,6 @@ def test_read_status_reuses_the_pointer_authenticated_summary(
     assert status["result_phase_plan"] == ["p"]
     assert status["metric"]["name"] == "x"
     assert _resolve_publication_pointer(experiment).state == "failed"
-
-
-def test_result_phase_plan_falls_back_to_the_current_config_for_a_planless_summary(
-    tmp_path: Path,
-) -> None:
-    """A summary that records no plan leaves the current config describing it.
-
-    Pre-manifest layouts published a summary with no ``phase_plan`` at all;
-    the only phase names such a tree can be read under are the configured
-    ones, and that fallback must survive.
-    """
-    exp = _experiment(tmp_path)
-    _mark_generation_published(exp, "generation-planless", "p")
-
-    status = read_status(exp)
-
-    assert status["is_published"] is True
-    assert status["result_context"] == "current_config"
-    assert status["result_phase_plan"] == ["p"]
 
 
 @pytest.mark.parametrize("unsafe_name", ["../escape", "", "phases/p"])

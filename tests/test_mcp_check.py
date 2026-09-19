@@ -240,6 +240,33 @@ def test_check_catalog_rejects_unusable_state_layout(tmp_path: Path, blocked_pat
         Registry.load(catalog)
 
 
+def test_check_catalog_refuses_pre_cutover_state_cleanly(tmp_path: Path) -> None:
+    catalog = write_mcp_config_catalog(
+        tmp_path,
+        {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
+    )
+    state_dir = tmp_path / "state"
+    runs_dir = state_dir / "runs"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o700)
+    runs_dir.mkdir(mode=0o700)
+    runs_dir.chmod(0o700)
+    (runs_dir / "old-run.json").write_text("{}\n")
+
+    with pytest.raises(CatalogError, match="durable run data has no format marker") as exc_info:
+        check_catalog(catalog)
+    assert exc_info.value.suggestion is None
+    with pytest.raises(CatalogError, match="durable run data has no format marker"):
+        Registry.load(catalog)
+
+    result = CliRunner().invoke(cli_main, ["mcp", "check", "--catalog", str(catalog)])
+
+    assert result.exit_code == 2
+    assert "durable run data has no format marker" in result.output
+    assert "use a fresh MCP state directory" in result.output
+    assert "writable directory path" not in result.output
+
+
 def test_check_catalog_reports_state_write_probe_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

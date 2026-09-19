@@ -21,7 +21,7 @@ from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from phasesweep.config import Experiment, Suite
+from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
 from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
 from phasesweep.config.models import _metric_semantics_payload
@@ -229,6 +229,8 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
         for directory in (resolved, resolved / "runs", resolved / "logs"):
             with tempfile.NamedTemporaryFile(dir=directory):
                 pass
+    except ValueError as exc:
+        raise CatalogError(f"state_dir is not usable: {resolved}: {exc}") from exc
     except (OSError, UnsafePrivatePathError) as exc:
         raise CatalogError(
             f"state_dir is not usable: {resolved}: {exc}",
@@ -313,9 +315,8 @@ def _require_mcp_stable_paths(
     backend = storage_backend(storage)
     if backend not in {"sqlite", "journal"}:
         raise CatalogError(
-            f"{experiment_id!r}: MCP experiments currently support only local-node "
-            "SQLite or JournalStorage file-backed Optuna storage; external RDB "
-            "storage is out of scope until multi-host cleanup semantics are supported",
+            f"{experiment_id!r}: MCP experiments support only local-node SQLite or "
+            "JournalStorage file-backed Optuna storage; external RDB storage is unsupported",
             suggestion=_suggest_storage(config_dir),
         )
     raw_path = sqlite_uri_filename_path(storage) if backend == "sqlite" else None
@@ -375,8 +376,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     :param _Entry entry: Schema-validated catalog entry to load.
     :return RegisteredExperiment: Frozen entry with resolved paths and config hash.
     :raises CatalogError: If the config path or ``cwd`` does not exist, the
-        config cannot be parsed, it is a suite rather than an experiment, or it
-        fails the MCP path-stability rules.
+        config cannot be parsed or fails the MCP path-stability rules.
     """
     cfg_path = _resolve_catalog_relative_path(base, entry.config)
     if not cfg_path.is_file():
@@ -391,11 +391,6 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
         config = load_config_bytes(config_bytes, source=cfg_path)
     except (ValueError, OSError) as exc:
         raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
-    if isinstance(config, Suite):
-        raise CatalogError(
-            f"{entry.id!r}: suite configs are not supported by the MCP layer "
-            "in this version; register single-experiment configs"
-        )
     _require_mcp_stable_paths(entry.id, config, config_dir=cfg_path.parent)
     if config.execution.cwd is None:
         # The detached runner enters the catalog entry's cwd before invoking

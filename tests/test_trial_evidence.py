@@ -23,10 +23,9 @@ import optuna
 import pytest
 import yaml
 
-import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.evidence as evidence_ops
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Phase, Promotion, Sampler
+from phasesweep.config import Experiment, IntParam, Phase, Sampler
 from phasesweep.engine import (
     NoFeasibleTrialError,
     TrialEvidenceMissingError,
@@ -103,11 +102,6 @@ def _evidence_experiment(
     if override_format == "yaml_file":
         trial_command = f"python {trainer} --out {{trial_dir}}/r.json --config {{config_path}}"
         trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
-    elif override_format == "json_file":
-        trial_command = (
-            f"python {trainer} --out {{trial_dir}}/r.json --overrides {{overrides_path}}"
-        )
-        trainer_config = None
     else:
         trial_command = f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
         trainer_config = None
@@ -208,9 +202,7 @@ def _pointer_bytes(experiment: Experiment) -> bytes:
     ("override_format", "filename"),
     [
         ("yaml_file", "trainer_config.yaml"),
-        ("json_file", "overrides.json"),
         ("argparse", "overrides_resolved.json"),
-        ("hydra", "overrides_resolved.json"),
     ],
 )
 def test_trial_records_the_exact_generated_trainer_input(
@@ -218,7 +210,7 @@ def test_trial_records_the_exact_generated_trainer_input(
     override_format: str,
     filename: str,
 ) -> None:
-    """Every input mode persists one format-independent historical record."""
+    """Every retained input mode persists a historical trainer-input record."""
     experiment = _evidence_experiment(tmp_path, override_format=override_format)
     run_experiment(experiment)
     input_path = _sole_trial_dir(experiment) / filename
@@ -265,7 +257,7 @@ def _published_winner_payload(experiment: Experiment, generation_id: str) -> dic
         ),
         pytest.param(
             "emptied",
-            "missing its 'overrides_resolved.json' audit artifact",
+            "has no attempt lifecycle record",
             id="same-named-empty-directory",
         ),
     ],
@@ -280,8 +272,8 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     Each variant removes a different piece of the one completed trial's
     evidence: the whole directory, the resolved-overrides audit artifact, the
     objective source the metric was extracted from, and the directory replaced
-    by an empty one of the same name (which passes a bare existence check and
-    is caught by the audit artifacts instead).
+    by an empty one of the same name (which passes a bare existence check but
+    lacks the current-format lifecycle record).
     """
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
@@ -319,13 +311,12 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
         "file_without_digest",
         "file_with_parent_path",
         "file_with_absolute_path",
-        "wandb_without_address",
     ],
 )
 def test_present_incomplete_objective_provenance_blocks_selection(
     tmp_path: Path, damage: str
 ) -> None:
-    """Only absent provenance is legacy; partial current records cannot publish."""
+    """Partial current provenance records cannot publish."""
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
     study = optuna.load_study(
@@ -344,9 +335,6 @@ def test_present_incomplete_objective_provenance_blocks_selection(
         record["source"]["path"] = "../not-a-trial-file"
     elif damage == "file_with_absolute_path":
         record["source"]["path"] = "/not-a-trial-file"
-    else:
-        record["extractor"]["kind"] = "wandb"
-        record["source"] = {"kind": "wandb"}
     trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR] = json.dumps(record)
     study = optuna.create_study(direction="minimize")
     study.add_trial(trial)
@@ -383,8 +371,6 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     [
         pytest.param("yaml_file", "trainer_config.yaml", "delete", id="yaml-delete"),
         pytest.param("yaml_file", "trainer_config.yaml", "alter", id="yaml-alter"),
-        pytest.param("json_file", "overrides.json", "delete", id="json-delete"),
-        pytest.param("json_file", "overrides.json", "alter", id="json-alter"),
     ],
 )
 def test_topup_refuses_damaged_generated_trainer_input(
@@ -530,55 +516,6 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     resumed = run_experiment(experiment, from_phase="q")
 
     assert resumed["p"].trial_number == 0
-
-
-def test_from_phase_promotion_uses_the_baseline_source_evidence(tmp_path: Path) -> None:
-    """A promoted skipped winner resolves evidence from its baseline, not exposure phase."""
-    trainer = write_trainer(tmp_path / "promotion_trainer.py", _CONSTANT_TRAINER)
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        phases=[
-            Phase(name="base", n_trials=1, sampler=Sampler(type="random", seed=0)),
-            Phase(
-                name="candidate",
-                n_trials=1,
-                sampler=Sampler(type="random", seed=1),
-                promotion=Promotion(
-                    min_delta_vs="base", min_delta=1.0, on_fail="continue_baseline"
-                ),
-            ),
-            Phase(name="later", n_trials=1, sampler=Sampler(type="random", seed=2)),
-        ],
-    )
-    winners = run_experiment(experiment)
-    assert winners["candidate"].source is not None
-    assert winners["candidate"].source.phase == "base"
-    candidate_dir = _phase_dir(experiment, "candidate")
-    for trial_dir in candidate_dir.glob("trial_*"):
-        shutil.rmtree(trial_dir)
-    optuna.delete_study(
-        study_name=_phase_study_name(experiment, experiment.phases[1]),
-        storage=experiment.storage,
-    )
-
-    resumed = run_experiment(experiment, from_phase="later")
-
-    assert resumed["candidate"].source is not None
-    assert resumed["candidate"].source.phase == "base"
-
-
-def test_skipped_winner_evidence_uses_the_relocated_artifact_tree(tmp_path: Path) -> None:
-    """Historical evidence is reconstructed under the current relocated workdir."""
-    experiment, _marker = _from_phase_evidence_experiment(tmp_path)
-    run_experiment(experiment)
-    moved_workdir = tmp_path / "moved-runs"
-    Path(experiment.workdir).rename(moved_workdir)
-    moved = experiment.model_copy(update={"workdir": str(moved_workdir)})
-
-    winner = artifact_io._load_winner(moved, moved.phases[0], {})
-    evidence_ops._verify_skipped_winner_evidence(moved, moved.phases[0], winner)
 
 
 # --------------------------------------------------------------------------

@@ -5,14 +5,15 @@
 ```bash
 git clone https://github.com/pszemraj/phasesweep.git
 cd phasesweep
-python -m pip install -e ".[dev,wandb]"
+python -m pip install -e ".[dev]"
 ```
 
-The `mcp` SDK is included in the development extra. Run Python-dependent commands in the environment where you installed the project.
+The `mcp` SDK is included in the development extra. Run Python-dependent
+commands in the environment where you installed the project.
 
 ## Quality gates
 
-Run the repository's checks sequentially:
+Run the repository checks sequentially:
 
 ```bash
 pytest
@@ -22,91 +23,98 @@ mypy src
 scripts/check_installed_wheel.sh
 ```
 
-The final script builds a wheel in a temporary directory, asserts its packaged-data members retain public read bits, installs it into a temporary prefix, checks that the installed version matches the one `git describe` implies for the checkout, verifies both console entry points and packaged-data presence, and exercises `phasesweep init`, validation, dry-run, execution, replay, and catalog scaffolding without relying on the checkout at runtime. It checks two trials in each starter phase, winning depth eight in both downstream trainer YAMLs, and unchanged persistent trial counts after replay from `learning_rate`. A temporary interpreter launcher selects the installed prefix even when the starter drops ambient `PYTHONPATH` through `inherit_env: none`. Failed checks print a `check_installed_wheel:` diagnostic before exiting non-zero. It leaves no build or acceptance artifact in the repository.
+Run `pytest` by itself, with no concurrent lint, type check, or build job:
+process-supervision and timeout tests are timing-sensitive. The installed-wheel
+script builds and installs into a temporary location, verifies the package and
+console entry points outside the checkout, and exercises the starter's
+validation, dry run, execution, replay, and catalog scaffolding. It leaves no
+acceptance artifacts in the repository.
 
-Run `pytest` by itself, with no concurrent lint, type-check, or build jobs. Some process-supervision and timeout tests are timing-sensitive and can fail under unrelated validation load. A clean full-suite run should not print a warning summary; investigate and fix new warnings instead of accepting them as background noise. GitHub Actions runs Ruff linting, Ruff formatting checks, and mypy in a single Linux pull-request job. Run the full pytest suite and installed-wheel smoke locally, sequentially, in the installed development environment before merging. These checks are intentionally excluded from Actions to limit usage. Hardware tests remain excluded by default. The static-check job does not establish the full Python, Optuna, or platform support matrix.
+GitHub Actions intentionally has one Linux pull-request static-check job for
+Ruff linting, Ruff format checking, and mypy. The full suite and installed
+wheel check stay local to control CI cost. Hardware tests remain opt-in.
 
-The supported Optuna range is `>=4.0,<4.10`. PhaseSweep reads SQL storage schemas directly for read-only status and relies on sampler/storage behavior, so run the full suite at both dependency endpoints before widening that range.
+The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
+read-only inspection behavior depends on that range; do not widen it without
+targeted validation.
 
 ## Package map
 
-The package is organized by behavior:
-
-- `phasesweep.config`: Pydantic config models and strict YAML loading.
-- `phasesweep.engine`: Optuna study orchestration, fingerprints, locks, promotion, persistence, status, and suite execution.
-- `phasesweep.evidence`: metric extractors, post-trial evidence gates, and W&B polling.
-- `phasesweep.reporting`: the trainer-side objective-envelope writer.
-- `phasesweep.runtime`: subprocess, GPU, lock, storage URL, and override helpers.
-- `phasesweep.mcp`: stdio MCP server, catalog registry, detached runner, run-handle store, operator recovery, and the client-config installer (`phasesweep.mcp.install`).
+- `phasesweep.config`: Pydantic Experiment models and strict YAML loading.
+- `phasesweep.engine`: phase orchestration, fingerprints, local persistence,
+  immutable generation publication, and read-only status.
+- `phasesweep.evidence`: local objective extraction and post-trial gates.
+- `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
+- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local
+  storage URLs, and override rendering.
+- `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable
+  run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
-Common package-root calls are `load_config`, `load_experiment`, `run_config`, `run_experiment`, `run_suite`, and `config_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct submodules under `engine`, `evidence`, `runtime`, or `mcp`.
+Common package-root calls are `load_config`, `load_experiment`, `run_config`,
+`run_experiment`, and `config_status`. Schema types are exported from
+`phasesweep.config`. Tests that need internals import direct modules under
+`engine`, `evidence`, `runtime`, or `mcp`.
 
-Within the engine, use these modules to follow ownership and publication. Module names in this table are relative to `phasesweep.engine`: its `evidence` module validates saved trial artifacts, while the separate `phasesweep.evidence` package extracts metrics and evaluates gates.
+Within `phasesweep.engine`, module ownership is intentionally direct:
 
 | Responsibility | Modules |
 | --- | --- |
-| Experiment, suite, and phase orchestration | `run`, `suite`, `phase` |
-| Resume selection and continuation preflight | `resume` |
-| Preflight ordering, lock ownership, and study continuation policy | `guards`, `locking`, `study_policy` |
-| Active-attempt ownership and stale or uncertain trial cleanup | `attempts`, `cleanup` |
-| Artifact-root ownership, relocation, and trial-evidence checks | `artifact_roots`, `relocation`, `evidence` |
-| Shared state types, direct paths, and semantic fingerprints | `state`, `paths`, `fingerprints` |
-| Publication validation and pointer resolution | `publication_validation`, `publication` |
-| Provenance, winner artifacts, and generation publication writes | `provenance`, `artifacts`, `generation` |
+| Experiment and phase orchestration | `run`, `phase` |
+| Resume selection and continuation preflight | `resume`, `study_policy`, `guards` |
+| Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
+| Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
+| Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
+| Publication and read-only views | `generation`, `publication`, `publication_validation`, `read` |
 
-`mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery); the CLI handles options and renders its messages and errors. Internal callers import each helper from its owning module.
+`mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery);
+the CLI owns its arguments and rendering.
 
-The control flow of a typical run is:
+The ordinary control flow is:
 
 ```mermaid
 flowchart TD
-    cli["CLI run"] --> dispatch["run.run_config"]
-    dispatch -->|Experiment| experiment["run: execute experiment"]
-    dispatch -->|Suite| suite["suite.run_suite"]
-    suite -->|"declaration order; dependencies must name prior studies"| experiment
-    experiment --> phase["phase._run_phase"]
-    phase --> optimize["study.optimize / objective"]
-    optimize --> launch["launch_trial / supervised trainer"]
-    launch --> evidence["extract_trial_result"]
-    evidence --> select["select_winner"]
-    select --> promote["_apply_promotion"]
-    promote --> winner["artifacts._save_winner"]
-    winner --> more{"more phases?"}
-    more -->|yes| phase
-    more -->|no| summary["write generation summary"]
-    summary --> publish["generation._publish_generation validates result graph"]
-    publish --> sidecar["optional hook: prepare frozen MCP result"]
-    sidecar --> pointer["commit last_successful_generation pointer"]
-    pointer --> receipt["optional hook: record MCP commit receipt"]
+    cli["CLI or detached MCP runner"] --> run["run.run_experiment"]
+    run --> phase["phase._run_phase"]
+    phase --> optimize["Optuna optimize"]
+    optimize --> launch["supervise trainer"]
+    launch --> evidence["extract local evidence and gates"]
+    evidence --> select["select feasible winner"]
+    select --> next{"more phases?"}
+    next -->|yes| phase
+    next -->|no| generation["write immutable generation"]
+    generation --> pointer["commit last-successful pointer"]
+    pointer --> snapshot["freeze MCP terminal result when applicable"]
 ```
-
-For suites, each executed component experiment completes this publication sequence before suite promotion is evaluated. After the declared-study loop completes, the engine validates and publishes the suite summary through its own last-success pointer.
 
 ## Test map
 
-Tests are organized by behavior:
-
-- `tests/test_e2e.py`: full sweep and `--from-phase` replay.
-- `tests/test_storage_urls.py`, `tests/test_locking.py`: storage identity, URL parsing, and same-host advisory locks.
-- `tests/test_process_supervision.py`, `tests/test_stale_reaper.py`, `tests/test_trial_launch.py`: subprocess launch and cleanup, signal handling, reached/skipped-phase reaping.
-- `tests/test_fingerprint.py`: semantic fingerprints, resume verification, run-control exclusions.
-- `tests/test_filesystem_layout.py`: output namespace layout and experiment-name validation.
-- `tests/test_param_validation.py`: search-space validation, override keys, sampler compatibility, grids, seeds, template placeholders.
-- `tests/test_runtime_behavior.py`, `tests/test_protocol.py`, `tests/test_engine_read.py`, `tests/test_engine_status_shape.py`, `tests/test_publication_transaction.py`, `tests/test_trial_evidence.py`: timeout policy, contracts, evidence gates, promotion, suites, publication transactions, evidence-integrity guards, and read-only engine views.
-- `tests/test_mcp_*.py`: MCP catalog validation, preflight, and scaffolding; redaction; status timing and await_run; run handles; detached runner; server logic; the install/uninstall client-config flow; and e2e flow.
-- `tests/test_init.py`: starter creation, validation, dry-run, catalog scaffolding, output placement, and overwrite refusal.
-- `tests/test_reporting.py`: summary rendering, winner manifests, and report serialization.
-- `tests/test_tiny_decoder_example.py`: adapter composition, attempt-scoped final-checkpoint result envelopes, zero-seed handling, and empty-validation rejection.
-- `tests/test_config.py`, `tests/test_extractors.py`, `tests/test_overrides.py`, `tests/test_selector.py`, `tests/test_gpu_pool.py`, `tests/test_cli.py`, `tests/test_public_metadata.py`: focused unit surfaces.
+- `tests/test_e2e.py`: complete experiment and `--from-phase` replay.
+- `tests/test_config.py`, `tests/test_param_validation.py`, and
+  `tests/test_overrides.py`: Experiment validation, composition, parameter
+  domains, and retained input boundaries.
+- `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and
+  `tests/test_trial_launch.py`: local evidence, gates, and supervised trials.
+- `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`,
+  `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`:
+  continuation, current-format publication, and read-only views.
+- `tests/test_storage_urls.py`, `tests/test_locking.py`,
+  `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local
+  storage, locks, format cutover, and output layout.
+- `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots,
+  detached launch, status, cancellation, and recovery.
+- `tests/test_init.py` and `tests/test_reporting.py`: starter creation,
+  catalog scaffolding, and result rendering.
 
 ## Tracked TODOs
 
-- TODO(mcp): Remove the private FastMCP strict-schema patch once the `mcp` SDK exposes a tested public closed-input-schema API; until then keep the optional dependency pinned to the tested 1.27.x range and keep the behavior-level request-handler tests as the safety net.
-- TODO(mcp): Split `mcp/server.py` into SDK-free application logic, schemas, launch lifecycle, and FastMCP adapter modules after the MCP alpha surface stabilizes.
-- TODO(mcp): Add active-run indexing, archival, or bounded history pagination before treating thousands of historical MCP handles in one `state_dir` as a supported operating mode.
-- TODO(mcp): Add an aggregated read-only trial-count path for JournalStorage before recommending very frequent `get_run_status` polling on very large local studies; external RDB-backed studies remain outside the MCP local-node support scope until multi-host cleanup and locking semantics are designed.
-- TODO(runtime): Design an explicit `trial_budget_mode: complete` before promising `n_trials` successful objective evaluations; the current behavior intentionally matches Optuna's terminal-attempt budget, while a completion budget needs repeated optimize scheduling, a total-attempt safety cap, and clear interactions with pruning, infeasible-but-COMPLETE trials, max-consecutive-failure aborts, and wallclock deadlines.
-- TODO(runtime): Extend [artifact relocation](runtime.md#fingerprints-and-resume) to cover persisted trial paths, active-attempt registry entries, and published suite summaries. This requires artifact-root-relative paths, a shared resolver, metadata-only replacement suite generations, and a retryable migration that cannot leave mixed bindings after a storage failure.
-- TODO(runtime): Add a `phasesweep prune --keep-last N` command for generation-namespace growth: immutable `generations/<id>/` namespaces accumulate one directory per invocation and nothing deletes them today. Pruning must refuse to remove the generation the last-success pointer targets or any ancestor generation transitively cited by its carried winners, must not touch trial directories (they are evidence, not generation state), and should report what it kept and why.
-- TODO(example): Update the `examples/tiny_decoder_enwik8/upstream` submodule after the trainer template handles `seed: 0`, CPU/MPS autocast as fp32/disabled by default, uses CUDA-only `pin_memory`, moves batches with CUDA-only `non_blocking=True`, accumulates RMSNorm reductions in FP32, rejects overlong causal-mask sequence lengths, and unwraps `torch.compile` modules before checkpointing; keep those PyTorch training changes in the upstream trainer repo rather than patching the gitlink contents here.
+- TODO(mcp): Replace the private FastMCP strict-schema patch when the SDK
+  exposes a tested public closed-input-schema API; keep behavior-level request
+  validation as the safety net until then.
+- TODO(mcp): Split `mcp/server.py` after the MCP SDK surface stabilizes, without
+  changing its run-handle or snapshot semantics.
+- TODO(runtime): Design an explicit completion-budget mode only if its attempt
+  accounting, failure cap, and timeout semantics are specified separately.
+- TODO(runtime): Add a deliberately scoped generation-pruning command only if
+  it preserves the current last-successful pointer and all cited winner
+  provenance.

@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from phasesweep.config.models import Config, Experiment, Suite, _compile_suite_experiments
+from phasesweep.config.models import Config, Experiment
 
 
 class ConfigError(ValueError):
@@ -129,16 +129,14 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
         source: Human-readable source label used in validation errors.
 
     Returns:
-        :class:`Experiment` or :class:`Suite` parsed from exactly ``data``.
-        Every suite study has also been resolved and validated as an experiment.
+        :class:`Experiment` parsed from exactly ``data``.
 
     Raises:
         ConfigError: ``data`` is not UTF-8 text, the YAML cannot be parsed (including
             duplicate mapping keys rejected by the strict loader), or the top level
             is not a mapping.
-        pydantic.ValidationError: The parsed mapping fails :class:`Suite` or
-            :class:`Experiment` model validation.
-        ValueError: A suite study cannot resolve its required fields or defaults.
+        pydantic.ValidationError: The parsed mapping fails :class:`Experiment`
+            model validation.
 
     """
     try:
@@ -147,29 +145,27 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
         raise ConfigError(f"{source}: config must be UTF-8 text: {exc}") from exc
     parsed = _load_yaml_mapping_from_text(text, source)
     if "suite" in parsed:
-        suite = Suite.model_validate(parsed)
-        _compile_suite_experiments(suite)
-        return suite
+        raise ConfigError(
+            f"{source}: suite configs are no longer supported. Define one complete experiment YAML."
+        )
     return Experiment.model_validate(parsed)
 
 
 def load_config(path: str | Path) -> Config:
-    """Parse and validate either a single experiment YAML or a suite YAML.
+    """Parse and validate a single experiment YAML.
 
     Args:
         path: Filesystem path to a phasesweep YAML file.
 
     Returns:
-        :class:`Experiment` for legacy/current single-study configs, or
-        :class:`Suite` for configs with a top-level ``suite`` key.
+        :class:`Experiment` parsed from the YAML.
 
     Raises:
         OSError: ``path`` cannot be read.
         ConfigError: The file is not UTF-8 text, the YAML cannot be parsed
             (including duplicate mapping keys), or the top level is not a mapping.
-        pydantic.ValidationError: The parsed mapping fails :class:`Suite` or
-            :class:`Experiment` model validation.
-        ValueError: A suite study cannot resolve its required fields or defaults.
+        pydantic.ValidationError: The parsed mapping fails :class:`Experiment`
+            model validation.
 
     """
     path_obj = Path(path)
@@ -194,12 +190,8 @@ def load_experiment(path: str | Path) -> Experiment:
     Raises:
         OSError: ``path`` cannot be read.
         ConfigError: YAML parse error, top-level is not a mapping, duplicate
-            mapping keys, or the file is a suite config rather than a single
-            experiment.
+            mapping keys, or the file is a removed suite config.
         pydantic.ValidationError: Any Pydantic / cross-phase validation failure.
 
     """
-    config = load_config(path)
-    if isinstance(config, Suite):
-        raise ConfigError(f"{path}: expected a single experiment config, got a suite config.")
-    return config
+    return load_config(path)

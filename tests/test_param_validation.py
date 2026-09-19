@@ -490,6 +490,13 @@ def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None
         )
 
 
+@pytest.mark.parametrize("storage", ["postgresql://localhost/phases", "mysql://localhost/phases"])
+def test_config_rejects_external_storage_before_artifacts(storage: str) -> None:
+    """Only memory, local SQLite, local Journal, and auto remain valid storage choices."""
+    with pytest.raises(ValidationError, match="storage must be in-memory"):
+        make_experiment(storage=storage)
+
+
 def test_categorical_choices_reject_duplicates() -> None:
     """A repeated choice inflates cardinality and skews sampling weight."""
     with pytest.raises(ValidationError, match="must remain distinguishable"):
@@ -639,13 +646,6 @@ def test_rejects_dotted_prefix_collisions() -> None:
     [
         (
             "python train.py --out {trial_dir}/result.json",
-            "hydra",
-            {"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-            None,
-            r"does not reference \{overrides\}",
-        ),
-        (
-            "python train.py --out {trial_dir}/result.json",
             "argparse",
             {"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
             None,
@@ -657,27 +657,6 @@ def test_rejects_dotted_prefix_collisions() -> None:
             None,
             {"lr": 1e-3},
             r"does not reference \{overrides\}",
-        ),
-        (
-            "python train.py --out {trial_dir} '{{overrides}}'",
-            "hydra",
-            {"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-            None,
-            r"does not reference \{overrides\}",
-        ),
-        (
-            "python train.py '{{overrides_path}}'",
-            "json_file",
-            {"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-            None,
-            r"does not reference \{overrides_path\}",
-        ),
-        (
-            "python train.py --out {trial_dir}/result.json {overrides}",
-            "json_file",
-            {"x": IntParam(type="int", low=0, high=10)},
-            None,
-            r"\{overrides_path\}",
         ),
     ],
 )
@@ -727,31 +706,12 @@ def test_trial_command_accepts_supported_templates() -> None:
     """Accepted templates include normal overrides, format specs, and no-override phases."""
     cases = [
         (
-            "field_conversion",
-            lambda: make_experiment(
-                trial_command="python train.py {overrides!s}",
-                override_format="hydra",
-                n_trials=1,
-                search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-            ),
-        ),
-        (
             "field_format_spec",
             lambda: make_experiment(
                 trial_command="python train.py '{overrides:>1}'",
                 override_format="argparse",
                 n_trials=1,
                 search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
-            ),
-        ),
-        (
-            "constant_no_overrides",
-            lambda: make_experiment(
-                trial_command="python train.py --out {trial_dir}/result.json",
-                override_format="hydra",
-                n_trials=1,
-                search_space={},
-                fixed_overrides={},
             ),
         ),
         (
@@ -763,14 +723,6 @@ def test_trial_command_accepts_supported_templates() -> None:
             lambda: make_experiment(
                 trial_command="python train.py --out {trial_dir}/result.json {overrides}",
                 override_format="argparse",
-                n_trials=1,
-            ),
-        ),
-        (
-            "json_file_overrides_path",
-            lambda: make_experiment(
-                override_format="json_file",
-                trial_command="python train.py --out {trial_dir}/result.json --cfg {overrides_path}",
                 n_trials=1,
             ),
         ),
@@ -852,13 +804,13 @@ def test_override_keys_reject_malformed_and_shell_unsafe_values() -> None:
 
 
 def test_search_space_accepts_well_formed_keys() -> None:
-    """Sanity: legitimate hydra-style keys must not trigger the validator.
+    """Sanity: legitimate dotted keys must not trigger the validator.
     Without these passing, the validator would be unusably strict.
     """
     good_keys = [
         "lr",
         "model.depth",
-        "hydra.run.dir",
+        "trainer.run.dir",
         "data.train_path",
         "optim.weight_decay",
         "x_y_z",

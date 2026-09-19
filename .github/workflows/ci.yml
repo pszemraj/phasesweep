@@ -18,9 +18,7 @@ jobs:
         run: >-
           python -m pip install
           'ruff>=0.5' 'mypy>=1.10' 'types-PyYAML>=6.0'
-          'types-requests>=2.31'
-          'wandb>=0.16'
-          'optuna==4.9.0' 'sqlalchemy>=1.4.2' 'cmaes>=0.10'
+          'optuna==4.9.0' 'cmaes>=0.10'
           'pydantic>=2.0' 'pyyaml>=6.0' 'click>=8.1' 'mcp>=1.27,<1.28'
       - run: ruff check .
       - run: ruff format --check .

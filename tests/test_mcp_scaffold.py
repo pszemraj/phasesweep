@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import stat
 from pathlib import Path
 
@@ -81,6 +82,22 @@ def test_init_catalog_pins_runner_cwd_to_catalog_directory(tmp_path: Path) -> No
     text = output.read_text()
     assert 'cwd: "."' in text
     assert f"phasesweep mcp check --catalog {output}" in text
+
+
+def test_init_catalog_honors_umask(tmp_path: Path) -> None:
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "project" / "catalog.yaml"
+    previous_umask = os.umask(0o002)
+    try:
+        result = CliRunner().invoke(
+            cli_main,
+            ["mcp", "init-catalog", "--from", str(config), "-o", str(output)],
+        )
+    finally:
+        os.umask(previous_umask)
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(output.stat().st_mode) == 0o664
 
 
 @pytest.mark.parametrize("filename", ["model # 1.yaml", "model: 1.yaml", "model\n1.yaml"])
@@ -231,10 +248,17 @@ def test_init_catalog_losing_publish_race_preserves_other_writer(
 ) -> None:
     config = _write_config(tmp_path, "srv.yaml")
     output = tmp_path / "catalog.yaml"
+    original_link = os.link
 
-    def lose_publish_race(_source: Path, destination: Path) -> None:
-        destination.write_text("other process\n")
-        raise FileExistsError(destination)
+    def lose_publish_race(
+        source: str | Path,
+        destination: str | Path,
+        **_kwargs: object,
+    ) -> None:
+        if Path(destination) == output:
+            output.write_text("other process\n")
+            raise FileExistsError(destination)
+        original_link(source, destination, **_kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr("phasesweep.cli.os.link", lose_publish_race)
 

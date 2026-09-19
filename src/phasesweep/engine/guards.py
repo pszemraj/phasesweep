@@ -56,9 +56,6 @@ def _preflight_existing_studies(
     :raises ArtifactRootConflictError: A phase's persistent study is already
         bound to a different artifact root than this config's workdir offers;
         raised before any inspection, reaping, or trial work.
-    :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
-        predates artifact-root binding, so which workdir owns its evidence
-        cannot be inferred; raised on the same terms.
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
         be inspected; raised before any claim, reaping, or registry recovery.
     :raises PublishedStudyMissingError: A reached phase has a published winner

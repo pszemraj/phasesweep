@@ -599,9 +599,8 @@ def service_pending_shutdown() -> None:
     """Deliver a shutdown signal absorbed by an earlier one-way commit window.
 
     Explicit checkpoint counterpart to :func:`absorb_shutdown_signals`: a
-    caller that must not start new work after an absorbed shutdown (e.g. the
-    suite loop before its next study) calls this at its decision point. A
-    no-op when nothing is pending.
+    caller that must not start new work after an absorbed shutdown calls this
+    at its decision point. A no-op when nothing is pending.
 
     Raises:
         PhaseSweepShutdown: Via ``_shutdown_handler``, when an absorbed
@@ -1060,8 +1059,8 @@ def read_attempt_lifecycle(
         expected_attempt_id: Attempt identity stored on the Optuna trial.
 
     Returns:
-        The validated record, or ``None`` when no record exists (legacy
-        attempts written before this schema).
+        The validated record, or ``None`` when no record exists. Current
+        recovery callers decide whether absence is safe for their state.
 
     Raises:
         ValueError: The record is malformed, uses an unknown schema or state,

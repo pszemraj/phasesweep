@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import json
 import logging
 import os
@@ -19,7 +18,7 @@ from typing import Any
 import click
 import yaml
 
-from phasesweep.config import ConfigError, Experiment, Suite, load_config
+from phasesweep.config import ConfigError, Experiment, load_config
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine import (
     PhaseSweepError,
@@ -29,27 +28,13 @@ from phasesweep.engine import (
     run_config,
 )
 from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
-from phasesweep.engine.fingerprints import (
-    _experiment_semantic_fingerprint,
-    _suite_fingerprint,
-)
-from phasesweep.engine.locking import _experiment_lock, _suite_lock
-from phasesweep.engine.paths import _experiment_dir, _suite_dir
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication import (
-    _published_summary_path_for,
     _published_winner_path_for,
     _resolve_publication_pointer,
-    _resolve_suite_publication_pointer,
 )
-from phasesweep.engine.relocation import (
-    _apply_artifact_root_rebind,
-    _plan_artifact_root_rebinds,
-    _validate_suite_artifact_root_rebind,
-)
-from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND
 from phasesweep.mcp.errors import CatalogError
-from phasesweep.mcp.install import installer as mcp_installer
-from phasesweep.mcp.install.targets import agent_ids
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
     CatalogCheckReport,
@@ -91,8 +76,7 @@ def _configure_logging(verbose: bool) -> None:
     )
     # Optuna's per-trial INFO output is essentially 1:1 with phasesweep's own
     # runner.info "[phase/trial_N] <cmd>" line and adds nothing. Quiet it down
-    # by default; -v restores INFO (DEBUG would surface RDB internals which we
-    # don't want even in verbose mode).
+    # by default; -v restores INFO for trial-level diagnostics.
     import optuna  # local import: keeps `phasesweep --help` snappy
 
     optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
@@ -150,14 +134,12 @@ def main() -> None:
     sys.exit(status if isinstance(status, int) else 0)
 
 
-def _load_cli_config(path: Path) -> Experiment | Suite:
+def _load_cli_config(path: Path) -> Experiment:
     """Load and fully validate a CLI config with path-aware diagnostics.
 
     :param Path path: Config file supplied to a CLI command.
-    :return Experiment | Suite: Validated config. Every suite study has also
-        been compiled into an experiment to validate its resolved defaults.
-    :raises ConfigError: The file cannot be parsed, fails model validation, or
-        contains a suite study that cannot compile into an experiment.
+    :return Experiment: Validated experiment configuration.
+    :raises ConfigError: The file cannot be parsed or fails model validation.
     """
     from pydantic import ValidationError
 
@@ -374,7 +356,7 @@ def report_objective_cmd(
 def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool) -> None:
     """Run all phases defined in ``config_path``.
 
-    :param Path config_path: Path to the experiment or suite YAML file.
+    :param Path config_path: Path to the experiment YAML file.
     :param str | None from_phase: Optional phase name to start from after loading
         earlier winners from disk.
     :param bool dry_run: Render example commands without launching subprocesses.
@@ -387,9 +369,6 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     install_signal_handlers()
     config = _load_cli_config(config_path)
     if from_phase is not None:
-        if isinstance(config, Suite):
-            click.echo("--from-phase is only supported for single experiment configs.", err=True)
-            sys.exit(2)
         valid = [p.name for p in config.phases]
         if from_phase not in valid:
             click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
@@ -399,23 +378,15 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
 
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
-    help="Validate a phasesweep experiment or suite config without launching any trials.",
+    help="Validate a phasesweep experiment config without launching any trials.",
     short_help="Validate a config file.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def validate(config_path: Path) -> None:
     """Validate ``config_path`` without running anything."""
     config = _load_cli_config(config_path)
-    if isinstance(config, Experiment):
-        click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
-        _render_experiment_phases(config)
-        return
-
-    click.echo(f"OK: suite {config.suite} ({len(config.studies)} studies)")
-    for study in config.studies:
-        deps = f" depends_on={study.depends_on}" if study.depends_on else ""
-        click.echo(f"  study {study.name}{deps}")
-        _render_experiment_phases(config.experiment_for_study(study), indent="    ")
+    click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
+    _render_experiment_phases(config)
 
 
 def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> None:
@@ -426,10 +397,7 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
     """
     for p in experiment.phases:
         deps = f" inherits={p.inherits}" if p.inherits else ""
-        contracts = f" contracts={p.contracts}" if p.contracts else ""
-        click.echo(
-            f"{indent}- {p.name}: n_trials={p.n_trials} sampler={p.sampler.type}{deps}{contracts}"
-        )
+        click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} sampler={p.sampler.type}{deps}")
         # Capability disclosure (review v0.5.18 / finding F7): state the
         # resume/reproduce contract before a trial runs, not after an
         # interrupted operator hits the runtime continuation guard.
@@ -461,7 +429,7 @@ def _publication_integrity_error(
     the corruption afterwards. The immutable namespace is still on disk until
     then, so inspecting or restoring it first is the whole remedy.
 
-    :param str subject: Experiment or suite the corrupt publication belongs to.
+    :param str subject: Experiment the corrupt publication belongs to.
     :param str detail: Validation error explaining why it no longer validates.
         Punctuated here rather than at the raising site, since validators
         return bare reason clauses.
@@ -483,7 +451,7 @@ def _publication_integrity_error(
 def _publication_access_error(subject: str, detail: str) -> PublicationAccessError:
     """Build the diagnostic for a publication this user cannot validate.
 
-    :param str subject: Experiment or suite the publication belongs to.
+    :param str subject: Experiment the publication belongs to.
     :param str detail: Path-free permission diagnostic from the validator.
     :return PublicationAccessError: Complete single-line operator diagnostic.
     """
@@ -494,7 +462,7 @@ def _publication_access_error(subject: str, detail: str) -> PublicationAccessErr
         f"{subject} records a publication that cannot be validated as the current user: "
         f"{detail} Results remain hidden, but this is not evidence of corruption. Re-read "
         "the publication as the publishing user or restore read permission before launching "
-        "another run; rebind-workdir is not a permission-repair command."
+        "another run."
     )
 
 
@@ -503,33 +471,12 @@ def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
 
     Reads the status payload that was just rendered rather than re-resolving
     the pointer, so the exit status can never disagree with what the operator
-    was shown. A suite payload is checked at both levels: its own suite
-    last-success pointer first — mirroring :func:`_show_suite_winners`, so the
-    two surfaces name the same subject for the same tree (re-review v0.5.19 /
-    observation N2) — and then one embedded study at a time, since a corrupt
-    component publication is a corrupt suite result too.
+    was shown.
 
     :param dict[str, Any] payload: ``config_status`` payload already rendered.
     :raises PublicationAccessError: Publication validation was denied by permissions.
     :raises PublicationIntegrityError: A reported publication no longer validates.
     """
-    if payload.get("kind") == "suite":
-        if payload.get("publication_integrity") == "permission_denied":
-            raise _publication_access_error(
-                f"Suite {str(payload.get('suite'))!r}",
-                str(payload.get("publication_error")),
-            )
-        if payload.get("publication_integrity") == "failed":
-            raise _publication_integrity_error(
-                f"Suite {str(payload.get('suite'))!r}",
-                str(payload.get("publication_error")),
-                Path(str(payload.get("workdir"))),
-            )
-        studies = payload.get("studies")
-        for study in studies if isinstance(studies, list) else []:
-            if isinstance(study, dict) and isinstance(study.get("status"), dict):
-                _raise_on_failed_publication(study["status"])
-        return
     if payload.get("publication_integrity") == "permission_denied":
         raise _publication_access_error(
             f"Experiment {str(payload.get('experiment'))!r}",
@@ -547,125 +494,22 @@ def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
 @cli.command(
     name="show-winners",
     context_settings=CONTEXT_SETTINGS,
-    help=(
-        "Print published experiment winners or the last successful exposed suite winners. "
-        "Pass the same experiment or suite config YAML used for the run."
-    ),
+    help="Print published experiment winners.",
     short_help="Print saved phase winners.",
 )
 @click.argument("config_path", metavar="CONFIG_YAML", type=CONFIG_PATH)
 def show_winners(config_path: Path) -> None:
     """Print winner files referenced by ``config_path``."""
-    config = _load_cli_config(config_path)
-    if isinstance(config, Suite):
-        _show_suite_winners(config)
-        return
-    _show_experiment_winners(config)
-
-
-def _show_suite_winners(suite: Suite) -> None:
-    """Print the authoritative exposed winners from the last successful suite run.
-
-    :param Suite suite: Compiled suite whose published summary is rendered.
-    :raises PublicationAccessError: This user cannot validate the published suite.
-    :raises PublicationIntegrityError: The suite last-success pointer names a
-        suite generation that no longer validates. Reported as corruption
-        rather than as "no successful suite result yet", which is what a suite
-        that has genuinely never published reports (review v0.5.18 / finding F4).
-    :raises click.ClickException: If the published summary cannot be read, or its
-        study, phase, or annotation records are malformed; raw component-experiment
-        winners are never substituted for it.
-    """
-    publication = _resolve_suite_publication_pointer(suite)
-    if publication.state == "permission_denied":
-        raise _publication_access_error(
-            f"Suite {suite.suite!r}",
-            str(publication.error),
-        )
-    if publication.state == "failed":
-        raise _publication_integrity_error(
-            f"Suite {suite.suite!r}",
-            str(publication.error),
-            _suite_dir(suite),
-        )
-    summary_path = _published_summary_path_for(suite, publication.generation_id)
-    if publication.generation_id is not None:
-        summary = publication.summary
-    elif summary_path is not None and summary_path.is_file():
-        try:
-            summary = yaml.safe_load(summary_path.read_text())
-        except (OSError, yaml.YAMLError):
-            summary = None
-    else:
-        summary = None
-    if summary_path is None or summary is None:
-        click.echo("(no successful suite result yet)")
-        return
-    try:
-        if not isinstance(summary, dict):
-            raise TypeError("summary must be a mapping")
-        studies = summary["studies"]
-        if not isinstance(studies, list):
-            raise TypeError("studies must be a list")
-    except (OSError, KeyError, TypeError, yaml.YAMLError) as exc:
-        raise click.ClickException(
-            "the last successful suite summary is unreadable; refusing to substitute "
-            "raw component-experiment winners"
-        ) from exc
-
-    stored_fingerprint = summary.get("suite_fingerprint")
-    if isinstance(stored_fingerprint, str) and stored_fingerprint != _suite_fingerprint(suite):
-        generation_id = summary.get("suite_generation_id", "unknown")
-        click.echo(
-            "# Historical suite result: saved generation "
-            f"{generation_id} does not match the current compiled suite config."
-        )
-        click.echo("# Rendering the saved study graph and annotations.")
-
-    for study in studies:
-        if not isinstance(study, dict) or not isinstance(study.get("name"), str):
-            raise click.ClickException(
-                "the last successful suite summary has invalid study records"
-            )
-        click.echo(f"### study {study['name']}")
-        promotion = study.get("promotion")
-        if isinstance(promotion, dict):
-            click.echo("--- suite promotion decision ---")
-            click.echo(yaml.safe_dump(promotion, sort_keys=False).rstrip())
-        click.echo("--- exposed winners ---")
-        phases = study.get("phases")
-        if not isinstance(phases, list):
-            raise click.ClickException(
-                "the last successful suite summary has invalid phase records"
-            )
-        for winner in phases:
-            if not isinstance(winner, dict) or not isinstance(winner.get("name"), str):
-                raise click.ClickException(
-                    "the last successful suite summary has invalid phase records"
-                )
-            phase_name = winner["name"]
-            comment = winner.get("comment")
-            if comment is not None and not isinstance(comment, str):
-                raise click.ClickException(
-                    "the last successful suite summary has an invalid phase annotation"
-                )
-            if winner.get("exposed") is False:
-                click.echo(f"=== {phase_name} === (no exposed winner)")
-                _render_phase_comment(comment, prefix="# ")
-                continue
-            click.echo(f"=== {phase_name} ===")
-            _render_phase_comment(comment, prefix="# ")
-            click.echo(yaml.safe_dump(winner, sort_keys=False).rstrip())
+    _show_experiment_winners(_load_cli_config(config_path))
 
 
 def _show_experiment_winners(experiment: Experiment) -> None:
     """Print winner files for one experiment.
 
-    A published result is rendered against the phase plan and comments its
-    own generation summary recorded, mirroring the suite path (review
-    v0.5.16 / blocker 4): old evidence must never be decorated with the
-    current config's annotations, and a config that has drifted since
-    publication is labeled historical instead of silently reinterpreted.
+    A published result is rendered against the phase plan recorded in its own
+    generation summary: old evidence must never be decorated with the current
+    config's annotations, and a config that has drifted since publication is
+    labeled historical instead of silently reinterpreted.
 
     :param Experiment experiment: Experiment whose published winners are rendered.
     :raises PublicationAccessError: This user cannot validate the publication.
@@ -728,7 +572,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
 
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
-    help="Print read-only trial counts and phase state for a phasesweep experiment or suite.",
+    help="Print read-only trial counts and phase state for a phasesweep experiment.",
     short_help="Print read-only run status.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
@@ -740,12 +584,10 @@ def status(config_path: Path) -> None:
     to decide what to inspect, and the boundary's one-line diagnostic follows
     on stderr (review v0.5.18 / finding F4).
 
-    :param Path config_path: Experiment or suite YAML file to inspect.
+    :param Path config_path: Experiment YAML file to inspect.
     :raises PublicationAccessError: The reported publication cannot be
         validated as the current user.
-    :raises PublicationIntegrityError: The reported publication - or, for a
-        suite, its own suite-level publication or any component study's - no
-        longer validates.
+    :raises PublicationIntegrityError: The reported publication no longer validates.
     """
     config = _load_cli_config(config_path)
     payload = config_status(config)
@@ -753,103 +595,9 @@ def status(config_path: Path) -> None:
     _raise_on_failed_publication(payload)
 
 
-@cli.command(
-    name="rebind-workdir",
-    context_settings=CONTEXT_SETTINGS,
-    help=(
-        "Point this config's persistent phase studies at the workdir it now declares, after "
-        "you have already moved the experiment's complete artifact tree there. Verifies at the "
-        "destination that every trial in the study ledger still has its evidence directory, "
-        "that no trial is RUNNING and no attempt is unresolved, and that any recorded "
-        "publication validates; refuses moving a published suite. Also the migration path "
-        "for a study that predates artifact-root binding: point the config at that study's "
-        "original tree - there, an interrupted RUNNING trial whose persisted paths already "
-        "lie under that tree is allowed through, and the next ordinary run recovers it. "
-        "Updates both the tree-to-storage record and study-side bindings; writes nothing "
-        "unless every check passes."
-    ),
-    short_help="Rebind studies to a moved artifact tree.",
-)
-@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
-def rebind_workdir(config_path: Path) -> None:
-    """Move each phase study's artifact-root binding to the configured workdir.
-
-    Each persistent phase study is bound to the one artifact root it publishes
-    into, so an ordinary run against a different ``workdir`` is refused rather
-    than allowed to produce a second, divergent publication tree. This command
-    is the operator's explicit statement that the tree itself was relocated,
-    and the only way a study that predates the binding is adopted at all. It is
-    a rebind, never a move: PhaseSweep does not copy, delete, or verify the
-    original tree.
-
-    With auto storage, the database must have moved with the artifact tree.
-    Its recorded previous filename is recognized without converting backends
-    or moving an explicit external database into the namespace.
-
-    What it verifies at the destination, per experiment: the namespace exists;
-    every trial the study ledger holds still has its evidence directory there,
-    which is what rejects a stale copy taken before the ledger advanced; no
-    trial is ``RUNNING`` and no attempt registry entry is unresolved, because
-    recovery follows the absolute paths those attempts persisted; and, when the
-    studies record completed trials, the recorded publication validates. A
-    suite that published a suite generation cannot be moved - suite summaries
-    record absolute component paths. Adopting it at its original tree is allowed.
-
-    The one ``RUNNING`` exception is adoption in place: when a pre-binding
-    study's interrupted trial persisted paths that already resolve exactly
-    under the offered workdir - proof the destination is the original root,
-    not a copy - the binding is written with the trial (and its registry
-    entry) left as-is, and the next ordinary run recovers it through the
-    standard stale-attempt protocol. That protocol, not a manual Optuna
-    ``tell(FAIL)``, is what records the durable failure outcome the study
-    schema requires.
-
-    The destination's reverse root-to-storage binding is updated before the
-    study attrs so an interrupted rebind converges on retry. No trial,
-    publication, or attempt metadata is rewritten, so the refusals remain
-    broader than the cases PhaseSweep can repair (re-review v0.5.19 / blocker
-    B2; see the tracked relocation TODO in ``docs/development.md``).
-
-    :param Path config_path: Path to the experiment or suite YAML file whose
-        ``workdir`` already names the artifact tree these studies own.
-    :raises ArtifactRootRebindError: Storage is in-memory, every existing study
-        is unbound and empty, a study cannot be read, or a destination fails
-        any of the checks above; validation refusals write nothing. A later
-        apply-time failure can follow an earlier suite component already being
-        rebound, because the per-study storage updates are not one transaction.
-    :raises ExperimentLockBusyError: Another orchestrator owns one of the
-        experiment (or suite) consistency locks.
-    """
-    config = _load_cli_config(config_path)
-    experiments = (
-        [config.experiment_for_study(study) for study in config.studies]
-        if isinstance(config, Suite)
-        else [config]
-    )
-    with contextlib.ExitStack() as locks:
-        # Every lock is held across validation AND application so no other
-        # orchestrator can run, publish, or bind between the two halves. The
-        # locks are non-blocking, so contention reports busy rather than
-        # deadlocking on acquisition order.
-        if isinstance(config, Suite):
-            locks.enter_context(_suite_lock(config))
-        for experiment in experiments:
-            locks.enter_context(_experiment_lock(experiment))
-        plans = _plan_artifact_root_rebinds(experiments)
-        if isinstance(config, Suite):
-            # Suite-level publication state is validated after the per-study
-            # plans and before any of them is applied, so a suite refusal still
-            # leaves every component binding exactly as it was.
-            _validate_suite_artifact_root_rebind(config, plans)
-        for plan in plans:
-            for study_name, previous, destination in _apply_artifact_root_rebind(plan):
-                origin = previous if previous is not None else "(unbound)"
-                click.echo(f"{study_name}: {origin} -> {destination}")
-
-
 @cli.group(
     context_settings=CONTEXT_SETTINGS,
-    help="Manage the optional MCP server and coding-agent integrations.",
+    help="Manage the optional MCP server, catalog, and operator recovery.",
     short_help="Manage the MCP server and agent integrations.",
 )
 def mcp() -> None:
@@ -1099,242 +847,6 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
         return False
     click.echo(f"wrote {output}")
     return True
-
-
-@mcp.command(
-    context_settings=CONTEXT_SETTINGS,
-    help=(
-        "Wire the phasesweep MCP server into coding-agent configs: an MCP server entry plus a "
-        "marker-fenced instructions block per agent, project-scoped wherever the client "
-        "supports it. The catalog is validated with the exact server startup rules before any "
-        "client config is touched. Strict JSON configs are re-serialized and may be reformatted. "
-        "Generated entries bind to the Python environment running this command; rerun install "
-        "after replacing that environment. Without --agent, choose from all supported agents in "
-        "one menu, with detected clients preselected."
-    ),
-    short_help="Connect coding agents to the MCP server.",
-)
-@click.option(
-    "--catalog",
-    type=click.Path(dir_okay=False, path_type=Path),
-    default=None,
-    metavar="PATH",
-    show_default="<project>/catalog.yaml",
-    help="MCP catalog the installed server entry will serve.",
-)
-@click.option(
-    "--agent",
-    "agents",
-    multiple=True,
-    type=click.Choice(agent_ids()),
-    help="Agent to configure explicitly; repeat for more.",
-)
-@click.option(
-    "--type",
-    "integration",
-    type=click.Choice(["mcp", "instructions", "all"]),
-    default="all",
-    show_default=True,
-    help="Integration to write: the MCP server entry, the instructions block, or both.",
-)
-@click.option(
-    "--project",
-    "project_dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default=Path("."),
-    show_default="current directory",
-    help="Project root for project-scoped client files.",
-)
-@click.option("--yes", is_flag=True, help="Apply without confirmation prompts.")
-@click.option(
-    "--allow-user-scope",
-    is_flag=True,
-    help="Acknowledge user-scoped MCP config writes when using --yes.",
-)
-@click.option(
-    "--dry-run", is_flag=True, help="Preview planned client-file edits without applying them."
-)
-@click.pass_context
-def install(
-    ctx: click.Context,
-    catalog: Path | None,
-    agents: tuple[str, ...],
-    integration: str,
-    project_dir: Path,
-    yes: bool,
-    allow_user_scope: bool,
-    dry_run: bool,
-) -> None:
-    """Install phasesweep MCP and instructions integrations for coding agents.
-
-    Validates the operator-reviewed catalog first, then delegates the
-    plan-then-apply flow to :mod:`phasesweep.mcp.install.installer`.
-    Operator-facing: output may include paths.
-
-    :param click.Context ctx: Active Click context used for the exit code.
-    :param Path | None catalog: Catalog path; defaults to ``<project>/catalog.yaml``.
-    :param tuple[str, ...] agents: Explicit agent ids for unattended runs.
-    :param str integration: ``mcp``, ``instructions``, or ``all``.
-    :param Path project_dir: Project root for project-scoped client files.
-    :param bool yes: Skip every confirmation prompt.
-    :param bool allow_user_scope: Acknowledge unattended user-scoped MCP config writes.
-    :param bool dry_run: Preview installer verdicts without changing client files.
-    """
-    project = project_dir.resolve()
-    catalog_path: Path | None = None
-    report: CatalogCheckReport | None = None
-    if integration != "instructions":
-        if importlib.util.find_spec("mcp") is None:
-            click.echo(
-                "phasesweep mcp install: MCP support is not installed; install with "
-                f"`{MCP_EXTRA_INSTALL_COMMAND}`; no client config was touched.",
-                err=True,
-            )
-            ctx.exit(2)
-        catalog_path = (catalog if catalog is not None else project / "catalog.yaml").resolve()
-        if not catalog_path.exists():
-            output_arg = shlex.quote(str(catalog_path))
-            click.echo(
-                f"phasesweep mcp install: no catalog at {catalog_path}. Create and review one first:\n"
-                "  phasesweep mcp init-catalog --from <experiment.yaml> "
-                f"-o {output_arg}\n"
-                "Then edit its descriptions, visibility, and permissions, run "
-                "`phasesweep mcp check`, and retry install; nothing was changed.",
-                err=True,
-            )
-            ctx.exit(2)
-        try:
-            report = check_catalog(catalog_path)
-        except CatalogError as exc:
-            click.echo(f"phasesweep mcp install: {_catalog_error_text(exc)}", err=True)
-            ctx.exit(2)
-        if not report.ok:
-            _echo_catalog_report(report)
-            click.echo(
-                "phasesweep mcp install: fix the catalog (see report above); "
-                "no client config was touched.",
-                err=True,
-            )
-            ctx.exit(2)
-    ctx.exit(
-        mcp_installer.run(
-            "install",
-            project,
-            catalog_path,
-            list(agents) or None,
-            integration,  # type: ignore[arg-type]
-            yes,
-            dry_run,
-            allow_user_scope,
-            catalog_report=report,
-        )
-    )
-
-
-@mcp.command(
-    context_settings=CONTEXT_SETTINGS,
-    help=(
-        "Remove installer-owned phasesweep integration data: recognizable generated-shape JSON "
-        "entries and marker-fenced TOML or instruction blocks, per selected agent. Unmanaged "
-        "same-name entries stay untouched."
-    ),
-    short_help="Disconnect coding agents.",
-)
-@click.option(
-    "--agent",
-    "agents",
-    multiple=True,
-    type=click.Choice(agent_ids()),
-    help="Agent to clean up explicitly; repeat for more.",
-)
-@click.option(
-    "--type",
-    "integration",
-    type=click.Choice(["mcp", "instructions", "all"]),
-    default="all",
-    show_default=True,
-    help="Integration to remove.",
-)
-@click.option(
-    "--project",
-    "project_dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default=Path("."),
-    show_default="current directory",
-    help="Project root for project-scoped client files.",
-)
-@click.option("--yes", is_flag=True, help="Apply without confirmation prompts.")
-@click.option(
-    "--dry-run", is_flag=True, help="Preview planned client-file removals without applying them."
-)
-@click.pass_context
-def uninstall(
-    ctx: click.Context,
-    agents: tuple[str, ...],
-    integration: str,
-    project_dir: Path,
-    yes: bool,
-    dry_run: bool,
-) -> None:
-    """Remove installed phasesweep integrations from coding agents.
-
-    :param click.Context ctx: Active Click context used for the exit code.
-    :param tuple[str, ...] agents: Explicit agent ids for unattended runs.
-    :param str integration: ``mcp``, ``instructions``, or ``all``.
-    :param Path project_dir: Project root for project-scoped client files.
-    :param bool yes: Skip every confirmation prompt.
-    :param bool dry_run: Preview uninstaller verdicts without changing client files.
-    """
-    ctx.exit(
-        mcp_installer.run(
-            "uninstall",
-            project_dir.resolve(),
-            None,
-            list(agents) or None,
-            integration,  # type: ignore[arg-type]
-            yes,
-            dry_run,
-        )
-    )
-
-
-@mcp.command(
-    name="check-install",
-    context_settings=CONTEXT_SETTINGS,
-    help=(
-        "Verify each coding agent's configured phasesweep MCP launcher still resolves: the "
-        "absolute executable exists and is executable, and the configured catalog is readable. "
-        "Read-only; prints repair guidance for anything broken."
-    ),
-    short_help="Verify configured MCP launchers.",
-)
-@click.option(
-    "--agent",
-    "agents",
-    multiple=True,
-    type=click.Choice(agent_ids()),
-    help="Agent to check explicitly; repeat for more. Default: every supported agent.",
-)
-@click.option(
-    "--project",
-    "project_dir",
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default=Path("."),
-    show_default="current directory",
-    help="Project root for project-scoped client files.",
-)
-@click.pass_context
-def check_install_cmd(ctx: click.Context, agents: tuple[str, ...], project_dir: Path) -> None:
-    """Verify configured MCP launchers resolve, for the operator.
-
-    Read-only repair guidance for stale installs (review v0.5.15 / item G):
-    reports each configured launcher's health without editing any client file.
-
-    :param click.Context ctx: Active Click context used for the exit code.
-    :param tuple[str, ...] agents: Explicit agent ids, or empty for all.
-    :param Path project_dir: Project root for project-scoped client files.
-    """
-    ctx.exit(mcp_installer.check_install(project_dir.resolve(), list(agents) or None))
 
 
 if __name__ == "__main__":

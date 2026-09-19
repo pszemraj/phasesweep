@@ -1,11 +1,9 @@
-"""Pydantic config models for experiments, phases, suites, and protocols."""
+"""Pydantic config models for experiments, phases, and protocols."""
 
 from __future__ import annotations
 
-import copy
 import string
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -43,7 +41,7 @@ from phasesweep.runtime.files import (
     storage_is_in_memory,
 )
 
-OverrideFormat = Literal["yaml_file", "argparse", "json_file", "hydra"]
+OverrideFormat = Literal["yaml_file", "argparse"]
 
 
 class Metric(_Frozen):
@@ -104,43 +102,6 @@ class Constraint(_Frozen):
         return self
 
 
-class Contract(_Frozen):
-    """Named fixed-comparison contract shared across phases or studies."""
-
-    fixed_overrides: dict[str, Any] = Field(default_factory=dict)
-    gates: list[Gate] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def _validate_override_key_syntax(self) -> Contract:
-        """Reject malformed contract override keys.
-
-        :raises ValueError: If any fixed override key has invalid syntax.
-        :return Contract: Self, unchanged.
-        """
-        for key in self.fixed_overrides:
-            _validate_override_key(key, label="contract fixed_overrides")
-        return self
-
-
-class Promotion(_Frozen):
-    """Conditional phase promotion against a previously-computed baseline winner."""
-
-    min_delta_vs: str
-    min_delta: ConfigFloat = 0.0
-    requires_gates: bool = True
-    on_fail: Literal["stop", "skip", "continue_baseline"] = "stop"
-
-    @model_validator(mode="after")
-    def _validate_delta(self) -> Promotion:
-        """Require a finite promotion delta.
-
-        :raises ValueError: If ``min_delta`` is not finite.
-        :return Promotion: Self, unchanged.
-        """
-        _require_finite("promotion.min_delta", self.min_delta)
-        return self
-
-
 GpuPolicy = Literal["single_per_trial", "whole_node", "none"]
 
 
@@ -165,10 +126,6 @@ class Phase(_Frozen):
     fixed_overrides: dict[str, Any] = Field(
         default_factory=dict,
         description="Hard-coded overrides applied to every trial in this phase.",
-    )
-    contracts: list[str] = Field(
-        default_factory=list,
-        description="Named fixed-comparison contracts applied to every trial in this phase.",
     )
     search_space: dict[str, SearchParam] = Field(
         default_factory=dict,
@@ -377,7 +334,6 @@ class Phase(_Frozen):
         ),
     )
     gates: list[Gate] = Field(default_factory=list)
-    promotion: Promotion | None = None
 
     @field_validator("name")
     @classmethod
@@ -548,115 +504,6 @@ class ExecutionContext(_Frozen):
         return self
 
 
-@dataclass(frozen=True)
-class _ConcreteOverrideOutcome:
-    """One compatible concrete set of winner override keys.
-
-    :param frozenset[str] keys: Keys exposed by this outcome.
-    :param tuple[tuple[str, str], ...] origins: Producing layer for each key,
-        sorted by key. Shared origins are safe when two parents reach the same
-        inherited winner through a diamond.
-    :param tuple[tuple[str, str], ...] decisions: Promotion branch selections
-        inherited by this outcome, sorted by phase name.
-    """
-
-    keys: frozenset[str]
-    origins: tuple[tuple[str, str], ...] = ()
-    decisions: tuple[tuple[str, str], ...] = ()
-
-
-def _merge_override_outcomes(
-    outcomes: tuple[_ConcreteOverrideOutcome, ...],
-) -> _ConcreteOverrideOutcome | None:
-    """Merge compatible concrete outcomes, or return ``None`` for conflicting branches.
-
-    :param tuple[_ConcreteOverrideOutcome, ...] outcomes: Outcomes to compose.
-    :return _ConcreteOverrideOutcome | None: Their composed keys, origins, and
-        decisions, or ``None`` if one promotion is required to take two branches.
-    """
-    decisions: dict[str, str] = {}
-    keys: set[str] = set()
-    origins: dict[str, str] = {}
-    for outcome in outcomes:
-        for phase_name, branch in outcome.decisions:
-            prior_branch = decisions.get(phase_name)
-            if prior_branch is not None and prior_branch != branch:
-                return None
-            decisions[phase_name] = branch
-        keys.update(outcome.keys)
-        for key, origin in outcome.origins:
-            origins.setdefault(key, origin)
-    return _ConcreteOverrideOutcome(
-        keys=frozenset(keys),
-        origins=tuple(sorted(origins.items())),
-        decisions=tuple(sorted(decisions.items())),
-    )
-
-
-def _consume_outcome_expansions(phase_name: str, count: int, remaining_expansions: int) -> int:
-    """Charge parent combinations or baseline fallbacks before their allocation.
-
-    :param str phase_name: Phase named in complexity errors.
-    :param int count: Candidate outcomes about to be expanded.
-    :param int remaining_expansions: Unspent experiment-wide candidate budget.
-    :raises ValueError: The expansion would exceed the validation budget.
-    :return int: Remaining candidate budget.
-    """
-    if count > remaining_expansions:
-        raise ValueError(
-            f"Phase {phase_name!r} exceeds supported validation complexity: "
-            "at most 4,096 candidate outcome expansions per experiment. "
-            "Reduce conditional promotion branching or parent combinations."
-        )
-    return remaining_expansions - count
-
-
-def _compatible_parent_outcome_combinations(
-    parents: list[str],
-    outcomes_by_phase: Mapping[str, tuple[_ConcreteOverrideOutcome, ...]],
-    *,
-    phase_name: str,
-    remaining_expansions: int,
-) -> tuple[list[tuple[_ConcreteOverrideOutcome, ...]], int]:
-    """Return direct-parent outcome combinations with consistent promotion branches.
-
-    :param list[str] parents: Ordered direct parents of the phase being checked.
-    :param Mapping[str, tuple[_ConcreteOverrideOutcome, ...]] outcomes_by_phase:
-        Concrete exposed outcomes for each prior phase.
-    :param str phase_name: Phase named in complexity errors.
-    :param int remaining_expansions: Unspent experiment-wide candidate budget.
-    :raises ValueError: The next expansion would exceed the validation budget.
-    :return tuple: Compatible selections and the remaining candidate budget.
-    """
-    combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = [()]
-    for parent in parents:
-        # Charge every candidate before allocating the next layer, including
-        # combinations that will be rejected for incompatible decisions.
-        candidates = len(combinations) * len(outcomes_by_phase[parent])
-        remaining_expansions = _consume_outcome_expansions(
-            phase_name, candidates, remaining_expansions
-        )
-        next_combinations: list[tuple[_ConcreteOverrideOutcome, ...]] = []
-        for combination in combinations:
-            for outcome in outcomes_by_phase[parent]:
-                candidate = (*combination, outcome)
-                if _merge_override_outcomes(candidate) is not None:
-                    next_combinations.append(candidate)
-        combinations = next_combinations
-    return combinations, remaining_expansions
-
-
-def _deduplicate_override_outcomes(
-    outcomes: list[_ConcreteOverrideOutcome],
-) -> tuple[_ConcreteOverrideOutcome, ...]:
-    """Return outcomes once each while preserving their first-seen order.
-
-    :param list[_ConcreteOverrideOutcome] outcomes: Outcomes to deduplicate.
-    :return tuple[_ConcreteOverrideOutcome, ...]: Ordered unique outcomes.
-    """
-    return tuple(dict.fromkeys(outcomes))
-
-
 class Experiment(_Frozen):
     """Top-level experiment: trial command, metric, constraints, and ordered phases."""
 
@@ -664,36 +511,20 @@ class Experiment(_Frozen):
     storage: str | None = Field(
         default=None,
         description=(
-            "Optuna storage URL, or auto for study.db inside the experiment artifact "
+            "Local Optuna storage URL, or auto for study.db inside the experiment artifact "
             "namespace (study.journal when any phase has n_jobs > 1). "
             "Use sqlite:///path.db for resumable single-job studies, "
-            "journal:///path.journal for parallel studies, or any RDB URL Optuna accepts "
-            "(RDB backends additionally require allow_external_rdb_single_host: true; "
-            "see below). Nested odbc_connect strings must name each target selector once. "
-            "Null for non-resumable in-memory runs (not recommended). "
+            "journal:///path.journal for parallel studies, or null for non-resumable "
+            "in-memory runs. "
             "Explicit SQLite URLs are never rewritten to JournalStorage. Changing auto's "
             "backend changes storage identity and cannot resume an existing tree."
-        ),
-    )
-    # Renamed from `allow_unsafe_multihost` (review v0.5.15 / item E): the old name
-    # read as "enables multi-host operation," but the flag actually acknowledges the
-    # opposite — that this external relational-DB storage is still coordinated
-    # host-locally, with every process confined to ONE host.
-    allow_external_rdb_single_host: bool = Field(
-        default=False,
-        description=(
-            "Acknowledge the loss of PhaseSweep's host-local-filesystem-based "
-            "coordination guarantees (locks, generation pointers) when storage is a "
-            "shared relational backend (e.g. postgresql://, mysql://). Set this to true "
-            "only when every process that will ever touch this storage and workdir "
-            "runs on a single host."
         ),
     )
     workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
     trial_command: str = Field(
         description=(
             "Shell command template. Placeholders: {config_path}, {overrides}, "
-            "{overrides_path}, {trial_dir}, {trial_id}, {phase}, {run_name}."
+            "{trial_dir}, {trial_id}, {phase}, {run_name}."
         )
     )
     trainer_config: dict[str, Any] = Field(
@@ -715,7 +546,6 @@ class Experiment(_Frozen):
     override_format: OverrideFormat = "yaml_file"
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
-    contracts: dict[str, Contract] = Field(default_factory=dict)
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
     execution: ExecutionContext = Field(
@@ -744,15 +574,22 @@ class Experiment(_Frozen):
 
     @field_validator("storage")
     @classmethod
-    def _storage_identity_is_unambiguous(cls, value: str | None) -> str | None:
-        """Reject storage locators with ambiguous nested ODBC target fields.
+    def _storage_is_local(cls, value: str | None) -> str | None:
+        """Allow only in-memory, local SQLite, local Journal, and auto storage.
 
         :param str | None value: Configured Optuna storage locator.
-        :raises ValueError: An ``odbc_connect`` target selector appears more than once.
+        :raises ValueError: The locator selects an unsupported storage backend.
         :return str | None: The validated locator, unchanged.
         """
-        if value != "auto":
-            canonical_storage_identity(value)
+        if value == "auto" or storage_is_in_memory(value):
+            return value
+        backend = storage_backend(value)
+        if backend not in {"sqlite", "journal"}:
+            raise ValueError(
+                "storage must be in-memory, sqlite:///, journal:///, or auto; "
+                f"got backend {backend!r}."
+            )
+        canonical_storage_identity(value)
         return value
 
     @model_validator(mode="after")
@@ -819,40 +656,20 @@ class Experiment(_Frozen):
 
     @model_validator(mode="after")
     def _validate_phase_graph(self) -> Experiment:
-        """Validate phase composition + per-phase semantic consistency.
+        """Validate ordered phase composition and per-phase semantics.
 
-        Each phase is checked for:
-          * local fixed/sampled key collision (review v0.5.2 / blocker 5)
-          * transitive inherited locked-key collisions (review v0.5.2 / item 4)
-          * unresolved multi-parent locked-key collisions (review v0.5.2 / item 5)
-          * sampler / search-space compatibility (review v0.5.2 / blocker 2)
-          * bounded parent-outcome enumeration across the complete experiment
-          * SQLite + parallel n_jobs (review v0.5.2 / blocker 6)
-          * sampler seed / non-resumable acknowledgement on persistent storage
-            (review v0.5.18 / finding F7)
+        Each exported override key carries its producing phase as its origin.
+        Re-exporting preserves that origin, making a same-origin diamond valid.
+        Different origins for one inherited key require a child fixed override;
+        a fixed child key deliberately establishes a new origin.
 
-        Returns:
-            Self, unchanged. Pydantic post-init validator protocol.
-
-        Raises:
-            ValueError: A phase name is duplicated; a phase references an unknown
-                contract, a non-prior inherit, or a non-prior promotion baseline; a
-                key is both fixed and sampled locally, claimed by two applied
-                contracts, or overrides a contract-locked key; inherited locked keys
-                conflict across parents or are re-sampled; a key and one of its
-                dotted subkeys collide; the metric and constraint names are not all
-                distinct; or any of the delegated per-phase checks (sampler/search
-                space, storage policy, sampler seed and non-resumable
-                acknowledgement, JSON-file override encodability, trial command
-                template) rejects the phase, or parent-outcome expansion exceeds
-                the experiment-wide validation complexity ceiling.
-
+        :raises ValueError: A phase graph, override composition, sampler,
+            storage, value-wire contract, or trial command is invalid.
+        :return Experiment: Self, unchanged.
         """
         seen: dict[str, Phase] = {}
         seen_casefolded: dict[str, str] = {}
-        possible_exported_keys_by_phase: dict[str, set[str]] = {}
-        concrete_outcomes_by_phase: dict[str, tuple[_ConcreteOverrideOutcome, ...]] = {}
-        remaining_expansions = 4096
+        origins_by_phase: dict[str, dict[str, str]] = {}
 
         for phase in self.phases:
             if phase.name in seen:
@@ -863,26 +680,13 @@ class Experiment(_Frozen):
                     f"Phase names {seen_casefolded[casefolded_name]!r} and "
                     f"{phase.name!r} must be unique case-insensitively."
                 )
-            for contract_name in phase.contracts:
-                if contract_name not in self.contracts:
-                    raise ValueError(
-                        f"Phase {phase.name!r} references unknown contract {contract_name!r}."
-                    )
             for parent in phase.inherits:
                 if parent not in seen:
                     raise ValueError(
                         f"Phase {phase.name!r} inherits from {parent!r}, "
-                        f"which is not a prior phase."
+                        "which is not a prior phase."
                     )
-            if phase.promotion is not None and phase.promotion.min_delta_vs not in seen:
-                raise ValueError(
-                    f"Phase {phase.name!r} promotion references "
-                    f"{phase.promotion.min_delta_vs!r}, which is not a prior phase."
-                )
 
-            # Local same-phase collision (review v0.5.2 / blocker 5): sampling a key that the
-            # same phase also lists as fixed silently lets sampled win — that's
-            # not "fixed" in any meaningful sense.
             local_collisions = set(phase.fixed_overrides) & set(phase.search_space)
             if local_collisions:
                 raise ValueError(
@@ -891,191 +695,57 @@ class Experiment(_Frozen):
                     "fixed or sampled, not both."
                 )
 
-            contract_keys: set[str] = set()
-            contract_key_owner: dict[str, str] = {}
-            for contract_name in phase.contracts:
-                contract = self.contracts[contract_name]
-                for key in contract.fixed_overrides:
-                    if key in contract_key_owner:
-                        raise ValueError(
-                            f"Phase {phase.name!r} applies contracts with conflicting "
-                            f"fixed key {key!r}: {contract_key_owner[key]!r} and "
-                            f"{contract_name!r}."
-                        )
-                    contract_keys.add(key)
-                    contract_key_owner[key] = contract_name
+            inherited_origins: dict[str, set[str]] = {}
+            for parent in phase.inherits:
+                for key, origin in origins_by_phase[parent].items():
+                    inherited_origins.setdefault(key, set()).add(origin)
 
-            contract_local_collisions = contract_keys & (
-                set(phase.fixed_overrides) | set(phase.search_space)
-            )
-            if contract_local_collisions:
+            unresolved = {
+                key: origins
+                for key, origins in inherited_origins.items()
+                if len(origins) > 1 and key not in phase.fixed_overrides
+            }
+            if unresolved:
+                details = ", ".join(
+                    f"{key!r} from {sorted(origins)}" for key, origins in sorted(unresolved.items())
+                )
                 raise ValueError(
-                    f"Phase {phase.name!r} tries to override contract-locked key(s) "
-                    f"{sorted(contract_local_collisions)}. Contract keys are immutable "
-                    "inside the applying phase."
+                    f"Phase {phase.name!r} inherits conflicting key(s) from multiple parents: "
+                    f"{details}. Resolve explicitly with phase.fixed_overrides or remove one inherit."
                 )
 
-            # Sampling is deliberately conservative: descendants may never
-            # re-sample any key that a parent could expose. Namespace checks
-            # below instead evaluate concrete, mutually exclusive promotion
-            # outcomes so keys from impossible branch combinations are not
-            # treated as coexisting.
-            possible_inherited_keys: set[str] = set()
-            for parent in phase.inherits:
-                possible_inherited_keys.update(possible_exported_keys_by_phase[parent])
-
-            parent_combinations, remaining_expansions = _compatible_parent_outcome_combinations(
-                phase.inherits,
-                concrete_outcomes_by_phase,
-                phase_name=phase.name,
-                remaining_expansions=remaining_expansions,
-            )
-            inherited_outcomes: list[_ConcreteOverrideOutcome] = []
-            for combination in parent_combinations:
-                parent_origins: dict[str, set[str]] = {}
-                for _parent, outcome in zip(phase.inherits, combination, strict=True):
-                    for key, origin in outcome.origins:
-                        parent_origins.setdefault(key, set()).add(origin)
-                unresolved = {
-                    key: origins
-                    for key, origins in parent_origins.items()
-                    if len(origins) > 1 and key not in phase.fixed_overrides
-                }
-                if unresolved:
-                    details = ", ".join(
-                        f"{key!r} from {sorted(origins)}"
-                        for key, origins in sorted(unresolved.items())
-                    )
-                    raise ValueError(
-                        f"Phase {phase.name!r} inherits conflicting locked key(s) from multiple "
-                        f"parents: {details}. Resolve explicitly with phase.fixed_overrides "
-                        "or remove one inherit."
-                    )
-                merged = _merge_override_outcomes(combination)
-                assert merged is not None  # compatible-combination invariant
-                inherited_outcomes.append(merged)
-            inherited_outcomes = list(_deduplicate_override_outcomes(inherited_outcomes))
-
-            collisions = possible_inherited_keys & set(phase.search_space.keys())
-            if collisions:
+            inherited_collisions = set(inherited_origins) & set(phase.search_space)
+            if inherited_collisions:
                 raise ValueError(
-                    f"Phase {phase.name!r} re-samples key(s) {sorted(collisions)} "
+                    f"Phase {phase.name!r} re-samples key(s) {sorted(inherited_collisions)} "
                     f"that are locked by inherited phase(s) {phase.inherits!r} "
                     f"(possibly transitively). Either remove the key from search_space, "
-                    f"or drop the inherit."
+                    "or drop the inherit."
                 )
 
-            local_keys = contract_keys | set(phase.fixed_overrides) | set(phase.search_space)
-            local_origins = {
-                key: f"{phase.name}:contract:{contract_key_owner[key]}" for key in contract_keys
+            resolved_origins = {
+                key: next(iter(origins))
+                for key, origins in inherited_origins.items()
+                if key not in phase.fixed_overrides
             }
-            local_origins.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
-            local_origins.update({key: f"{phase.name}:sampled" for key in phase.search_space})
-            candidate_outcomes = [
-                _ConcreteOverrideOutcome(
-                    keys=outcome.keys | local_keys,
-                    origins=tuple(sorted({**dict(outcome.origins), **local_origins}.items())),
-                    decisions=outcome.decisions,
+            resolved_origins.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
+            resolved_origins.update({key: f"{phase.name}:sampled" for key in phase.search_space})
+            prefix_collisions = _find_prefix_collisions(set(resolved_origins))
+            if prefix_collisions:
+                pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
+                raise ValueError(
+                    f"Phase {phase.name!r} has dotted-key namespace collision(s) "
+                    f"across inherited and local overrides: {pairs}. "
+                    "A key and a sub-key cannot both be overridden across the inheritance chain."
                 )
-                for outcome in inherited_outcomes
-            ]
-            candidate_outcomes = list(_deduplicate_override_outcomes(candidate_outcomes))
-            for outcome in candidate_outcomes:
-                prefix_collisions = _find_prefix_collisions(set(outcome.keys))
-                if prefix_collisions:
-                    pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
-                    raise ValueError(
-                        f"Phase {phase.name!r} has dotted-key namespace collision(s) "
-                        f"across inherited and local overrides: {pairs}. "
-                        "A key and a sub-key cannot both be overridden across the "
-                        "inheritance chain."
-                    )
 
-            # Sampler/search-space compatibility (review v0.5.2 / blocker 2): catch at config-load
-            # so `phasesweep validate` is meaningful, not at first trial launch.
             _validate_sampler_search_space(phase)
-
-            # Storage policy (review v0.5.2 / blocker 6): SQLite + parallel writes deadlocks under
-            # contention; we no longer auto-remap to JournalStorage. Tell the user.
-            # Also enforces the single-host coordination boundary (review v0.5.14 / item D):
-            # shared RDB storage across hosts silently breaks lock/generation-pointer
-            # safety unless explicitly acknowledged.
-            _validate_storage_policy(
-                self.resolved_storage, phase, self.allow_external_rdb_single_host
-            )
-
-            # Sampler reproducibility/resumability contract (review v0.5.18 /
-            # finding F7): a durable study outlives the process that created
-            # it, so an unseeded or non-resumable sampler is a config-level
-            # decision the operator must make before the first trial, not a
-            # surprise the runtime guard springs on them mid-target.
+            _validate_storage_policy(self.resolved_storage, phase)
             _validate_sampler_resumability(self.resolved_storage, phase)
-
-            # JSON wire serializability (review v0.5.17 / finding B): the
-            # template preflight below renders with write_files=False, so it
-            # never calls write_json_file and never proves the composed values
-            # can actually be encoded. Check them explicitly here.
-            _validate_json_file_override_values(self, phase)
-
-            # CLI override wire contract (PR #5 review / reviewer 2, blocker 3):
-            # rendering a structured or non-finite value and hashing its
-            # JSON-mode dump can disagree, so two different commands can share
-            # one fingerprint. Restrict scalar/list CLI values to the set
-            # where the wire form and semantic dump agree.
             _validate_cli_override_values(self, phase)
+            _validate_trial_command_template(self, phase, frozenset(inherited_origins))
 
-            # Trial command template (v0.5.3 follow-up): render every concrete
-            # inherited outcome. Catches typos like `{trail_dir}`, unknown
-            # placeholders, unbalanced braces, and namespace failures at
-            # config-load instead of three minutes into a sweep.
-            _validate_trial_command_template(
-                self,
-                phase,
-                [outcome.keys for outcome in inherited_outcomes],
-            )
-
-            exported_keys = (
-                possible_inherited_keys
-                | contract_keys
-                | set(phase.fixed_overrides)
-                | set(phase.search_space)
-            )
-            # A failing promotion can expose its comparison baseline rather
-            # than this phase's candidate. Descendants must treat every key
-            # that either outcome can expose as inherited and immutable to
-            # sampling.
-            if phase.promotion is not None and phase.promotion.on_fail == "continue_baseline":
-                baseline_outcomes = concrete_outcomes_by_phase[phase.promotion.min_delta_vs]
-                # The baseline need not be an inherited parent. Copying its
-                # outcomes is another expansion, even for a parentless phase.
-                remaining_expansions = _consume_outcome_expansions(
-                    phase.name, len(baseline_outcomes), remaining_expansions
-                )
-                candidate_outcomes = [
-                    _ConcreteOverrideOutcome(
-                        keys=outcome.keys,
-                        origins=outcome.origins,
-                        decisions=tuple(sorted((*outcome.decisions, (phase.name, "candidate")))),
-                    )
-                    for outcome in candidate_outcomes
-                ]
-                fallback_outcomes = [
-                    _ConcreteOverrideOutcome(
-                        keys=outcome.keys,
-                        origins=outcome.origins,
-                        decisions=tuple(sorted((*outcome.decisions, (phase.name, "fallback")))),
-                    )
-                    for outcome in baseline_outcomes
-                ]
-                concrete_outcomes_by_phase[phase.name] = _deduplicate_override_outcomes(
-                    [*candidate_outcomes, *fallback_outcomes]
-                )
-                exported_keys |= possible_exported_keys_by_phase[phase.promotion.min_delta_vs]
-            else:
-                concrete_outcomes_by_phase[phase.name] = _deduplicate_override_outcomes(
-                    candidate_outcomes
-                )
-            possible_exported_keys_by_phase[phase.name] = exported_keys
+            origins_by_phase[phase.name] = resolved_origins
             seen[phase.name] = phase
             seen_casefolded[casefolded_name] = phase.name
 
@@ -1085,48 +755,12 @@ class Experiment(_Frozen):
         return self
 
 
-def _validate_storage_policy(
-    storage: str | None, phase: Phase, allow_external_rdb_single_host: bool
-) -> None:
-    """Reject SQLite+parallel storage and unacknowledged multi-host RDB storage.
+def _validate_storage_policy(storage: str | None, phase: Phase) -> None:
+    """Reject SQLite storage for parallel phases.
 
-    Two independent policies are enforced here:
-
-    1. SQLite + parallel ``n_jobs`` (review v0.5.2 / blocker 6): SQLite serializes
-       writers; concurrent Optuna trials cause ``database is locked`` errors.
-       Earlier versions auto-rewrote ``sqlite:///x.db`` to a JournalStorage path,
-       but that fragmented study identity behind a single URL — the same config
-       could point at two different studies depending on ``n_jobs``. Now we
-       require the user to pick the scheme explicitly.
-    2. Unacknowledged multi-host-capable storage (review v0.5.14 / item D): PhaseSweep's
-       coordination (locks, generation pointers) is host-local-filesystem based.
-       Pointing several hosts at one shared RDB storage (MySQL/Postgres/...)
-       silently breaks those safety guarantees, so any backend other than
-       ``sqlite``/``journal`` is rejected unless the operator explicitly sets
-       ``allow_external_rdb_single_host: true``. In-memory storage (``None`` or the
-       bare ``":memory:"``/URI-memory sentinels recognized by
-       :func:`phasesweep.runtime.files.storage_is_in_memory`) is exempt: it
-       cannot be shared across hosts in the first place.
-
-    Both checks use :func:`phasesweep.runtime.files.storage_backend` so all
-    SQLAlchemy dialects (``sqlite:///``, ``sqlite+pysqlite:///``, ...) are
-    classified consistently. Earlier versions only matched the bare
-    ``sqlite:///`` prefix and let driver-qualified URLs through unsafely
-    (review v0.5.7 / blocker 1).
-
-    Args:
-        storage: The experiment-level storage URL, or ``None`` (in-memory).
-        phase: The phase being validated; its ``n_jobs`` decides whether the
-            SQLite-parallel restriction applies.
-        allow_external_rdb_single_host: Experiment-level acknowledgement that every
-            process touching this storage and workdir runs on a single host,
-            required to use any non-file-backed (RDB) storage.
-
-    Raises:
-        ValueError: ``phase.n_jobs > 1`` AND ``storage`` resolves to SQLite, or
-            ``storage`` is not in-memory, resolves to a backend other than
-            ``sqlite``/``journal``, and ``allow_external_rdb_single_host`` is not set.
-
+    :param str | None storage: Experiment-level storage URL, or ``None`` for memory.
+    :param Phase phase: The phase whose parallelism is being validated.
+    :raises ValueError: SQLite storage is used with ``n_jobs > 1``.
     """
     if storage is None:
         return
@@ -1136,26 +770,7 @@ def _validate_storage_policy(
             f"Phase {phase.name!r} has n_jobs={phase.n_jobs} with SQLite storage. "
             "SQLite serializes writers and will deadlock under "
             "parallel Optuna access. Use storage: journal:///path.journal for a "
-            "single-host parallel sweep, or an RDB URL such as "
-            "postgresql://... for durable storage and dashboard access from a "
-            "single phasesweep orchestrator."
-        )
-    if (
-        not storage_is_in_memory(storage)
-        and backend not in {"sqlite", "journal"}
-        and not allow_external_rdb_single_host
-    ):
-        raise ValueError(
-            f"The configured storage resolves to backend {backend!r}, a shared "
-            "relational store. PhaseSweep's coordination (locks, generation "
-            "pointers) is host-local-filesystem based, so pointing multiple "
-            f"hosts at one shared {backend} storage silently breaks those safety "
-            "guarantees. Set allow_external_rdb_single_host: true only when every "
-            "process that will ever touch this storage and workdir runs on a "
-            "single host — this acknowledges the storage is external, not that "
-            "coordination is distributed; otherwise use storage: "
-            "journal:///path.journal for a single-host parallel sweep, or "
-            "storage: sqlite:///path.db for sequential n_jobs: 1 studies."
+            "single-host parallel sweep."
         )
 
 
@@ -1214,133 +829,6 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
         )
 
 
-_JSON_SCALARS = (str, int, float, bool, type(None))
-
-
-def _first_json_unserializable(value: Any, _seen: set[int] | None = None) -> Any | None:
-    """Return the first object inside ``value`` that strict JSON cannot represent.
-
-    Used only to turn a bare ``TypeError`` from :func:`json.dumps` into a
-    message that names the offending *type* rather than repeating the encoder's
-    generic complaint. Containers are tracked by identity so a recursive YAML
-    anchor cannot spin this into a ``RecursionError``.
-
-    :param Any value: Composed override value to inspect.
-    :param set[int] | None _seen: Internal recursion guard of container ids.
-    :return Any | None: The offending object, or ``None`` when every leaf is a
-        JSON scalar.
-    """
-    if isinstance(value, _JSON_SCALARS):
-        return None
-    seen = set() if _seen is None else _seen
-    if id(value) in seen:
-        return None
-    seen.add(id(value))
-    if isinstance(value, dict):
-        for key, item in value.items():
-            # json.dumps stringifies scalar keys but rejects anything else.
-            if not isinstance(key, _JSON_SCALARS):
-                return key
-            found = _first_json_unserializable(item, seen)
-            if found is not None:
-                return found
-        return None
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            found = _first_json_unserializable(item, seen)
-            if found is not None:
-                return found
-        return None
-    return value
-
-
-def _iter_fixed_override_layers(
-    experiment: Experiment,
-    phase: Phase,
-) -> Iterator[tuple[str, Mapping[str, Any]]]:
-    """Yield contract and phase-local fixed overrides in precedence order.
-
-    The diagnostic label travels with each mapping so config validation can
-    name the source that supplied an invalid value. Runtime composition puts
-    these layers after inherited winners and before sampled values, preserving
-    the full inherited-lowest / sampled-highest precedence contract.
-
-    :param Experiment experiment: Experiment supplying named contracts.
-    :param Phase phase: Phase supplying contract order and local overrides.
-    :return Iterator[tuple[str, Mapping[str, Any]]]: Diagnostic origin and
-        override mapping for each fixed layer.
-    """
-    for contract_name in phase.contracts:
-        yield (
-            f"contract {contract_name!r} fixed_overrides",
-            experiment.contracts[contract_name].fixed_overrides,
-        )
-    yield "fixed_overrides", phase.fixed_overrides
-
-
-def _validate_json_file_override_values(experiment: Experiment, phase: Phase) -> None:
-    """Reject ``json_file`` override values the wire serializer cannot encode.
-
-    ``override_format: json_file`` writes the composed overrides through
-    :func:`phasesweep.runtime.commands.write_json_file`, which uses a strict
-    ``json.dumps`` with no ``default=`` fallback. Nothing else proved those
-    values encodable before the first real trial: the template preflight in
-    :func:`_validate_trial_command_template` renders with ``write_files=False``,
-    which skips ``write_json_file`` entirely. So a YAML like ``cutoff:
-    2024-01-01`` — PyYAML resolves that to :class:`datetime.date`, not to a
-    string — loaded clean, passed ``phasesweep validate``, and then killed the
-    first trial in ``json.dumps`` (review v0.5.17 / finding B).
-
-    Only the statically-known layers are checked, in composition order:
-    contract ``fixed_overrides`` then phase ``fixed_overrides``. Sampled values
-    need no check (``CategoricalParam`` already restricts choices to Optuna
-    scalars, which are exactly the JSON scalars, and float/int params yield
-    numbers), and inherited values are themselves composed from an earlier
-    phase's already-validated layers.
-
-    :param Experiment experiment: Experiment being validated; supplies
-        ``override_format`` and the contract definitions.
-    :param Phase phase: Phase whose composed fixed values are checked.
-    :raises ValueError: A composed value cannot be encoded by the canonical
-        strict serializer.
-    """
-    if experiment.override_format != "json_file":
-        return
-
-    # Lazy import to avoid a circular config <-> runtime cycle.
-    from phasesweep.runtime.commands import dump_overrides_json
-
-    for origin, overrides in _iter_fixed_override_layers(experiment, phase):
-        for key, value in overrides.items():
-            try:
-                dump_overrides_json(value)
-            except (TypeError, ValueError) as exc:
-                offender = _first_json_unserializable(value) if isinstance(exc, TypeError) else None
-                detail = (
-                    f"type {type(offender).__name__}"
-                    if offender is not None
-                    else f"{type(exc).__name__}: {exc}"
-                )
-                # TypeError covers YAML-native-object cases (date/datetime, etc.);
-                # ValueError here is the strict encoder's allow_nan=False rejecting
-                # a non-finite float (.inf/.nan). The two remedies are unrelated, so
-                # the hint text must not conflate them.
-                hint = (
-                    "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
-                    "into Python date/datetime objects; quote the value in YAML "
-                    '(e.g. "2024-01-01") to keep it a JSON string.'
-                    if isinstance(exc, TypeError)
-                    else "JSON has no representation for non-finite floats; use a "
-                    'finite value, or quote it in YAML (e.g. "inf") if the trial '
-                    "command should receive it as text."
-                )
-                raise ValueError(
-                    f"Phase {phase.name!r}: override_format='json_file' but {origin} key "
-                    f"{key!r} holds a value the overrides.json serializer cannot encode "
-                    f"({detail}): {value!r}. {hint}"
-                ) from exc
-
-
 def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     """Reject scalar/list CLI override values with no faithful wire form.
 
@@ -1348,15 +836,14 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     so the accepted values cannot drift between preflight and execution. The
     supported domain is ``None``, ``bool``, ``int``, finite ``float``, ``str``,
     and lists/tuples of those. Structured trainer configuration belongs in the
-    default ``yaml_file`` mode; ``json_file`` remains an overrides-only
-    compatibility boundary.
+    default ``yaml_file`` mode.
 
     :param Experiment experiment: Experiment being validated; supplies
-        ``override_format`` and the contract definitions.
+        ``override_format``.
     :param Phase phase: Phase whose composed fixed values are checked.
     :raises ValueError: A composed value is outside the selected CLI value contract.
     """
-    if experiment.override_format not in {"argparse", "hydra"}:
+    if experiment.override_format != "argparse":
         return
 
     from phasesweep.runtime.commands import _OverrideValueError, _render_override_value
@@ -1380,55 +867,50 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
                     "the default override_format='yaml_file'."
                 )
             rendered[wire] = (index, choice)
-    for origin, overrides in _iter_fixed_override_layers(experiment, phase):
-        for key, value in overrides.items():
-            try:
-                _render_override_value(value, override_format)
-            except _OverrideValueError as exc:
-                offender = exc.value
-                if isinstance(offender, Mapping):
-                    hint = (
-                        f"A mapping has no {override_format} wire form the fingerprint "
-                        "preserves faithfully. Use the default override_format='yaml_file' "
-                        "for structured trainer configuration."
-                    )
-                elif isinstance(offender, float):
-                    hint = (
-                        "JSON has no representation for non-finite floats; use a finite "
-                        'value, or quote it in YAML (e.g. "inf") if the trial command '
-                        "should receive it as text."
-                    )
-                elif isinstance(offender, (list, tuple)):
-                    hint = "Override lists cannot recursively contain themselves."
-                else:
-                    hint = (
-                        "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
-                        "into Python date/datetime objects; quote the value in YAML "
-                        '(e.g. "2024-01-01") to send it as text, or use '
-                        "the default override_format='yaml_file' if the trainer needs a "
-                        "structured value."
-                    )
-                where = f" at position {exc.position}" if exc.position else ""
-                raise ValueError(
-                    f"Phase {phase.name!r}: override_format={override_format!r} but {origin} "
-                    f"key {key!r} holds a value{where} that {override_format} cannot render "
-                    f"faithfully (type {type(offender).__name__}): {offender!r}. "
-                    f"{override_format} override values must have one canonical wire form "
-                    "the JSON-mode fingerprint preserves faithfully: null, booleans, "
-                    f"integers, finite floats, strings, and lists of those. {hint}"
-                ) from exc
+    for key, value in phase.fixed_overrides.items():
+        try:
+            _render_override_value(value, override_format)
+        except _OverrideValueError as exc:
+            offender = exc.value
+            if isinstance(offender, Mapping):
+                hint = (
+                    f"A mapping has no {override_format} wire form the fingerprint "
+                    "preserves faithfully. Use the default override_format='yaml_file' "
+                    "for structured trainer configuration."
+                )
+            elif isinstance(offender, float):
+                hint = (
+                    "JSON has no representation for non-finite floats; use a finite "
+                    'value, or quote it in YAML (e.g. "inf") if the trial command '
+                    "should receive it as text."
+                )
+            elif isinstance(offender, (list, tuple)):
+                hint = "Override lists cannot recursively contain themselves."
+            else:
+                hint = (
+                    "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
+                    "into Python date/datetime objects; quote the value in YAML "
+                    '(e.g. "2024-01-01") to send it as text, or use '
+                    "the default override_format='yaml_file' if the trainer needs a "
+                    "structured value."
+                )
+            where = f" at position {exc.position}" if exc.position else ""
+            raise ValueError(
+                f"Phase {phase.name!r}: override_format={override_format!r} but "
+                f"fixed_overrides key {key!r} holds a value{where} that {override_format} "
+                f"cannot render faithfully (type {type(offender).__name__}): {offender!r}. "
+                f"{override_format} override values must have one canonical wire form "
+                "the JSON-mode fingerprint preserves faithfully: null, booleans, "
+                f"integers, finite floats, strings, and lists of those. {hint}"
+            ) from exc
 
 
 def _format_field_names(template: str) -> set[str]:
     """Return the *real* ``str.format`` field names referenced by ``template``.
 
-    Substring matching on ``"{overrides_path}"`` is unsafe: an escaped
-    ``{{overrides_path}}`` in the template renders as the literal string
-    ``{overrides_path}`` (see Python docs on PEP 3101 format strings) and would
-    fool a substring check into thinking the placeholder is used (review v0.5.6
-    / blocker 2). ``string.Formatter().parse()`` walks the template the same
-    way ``str.format`` does and reports only true field references, with
-    escaped braces handled correctly.
+    ``string.Formatter().parse()`` walks the template the same way
+    ``str.format`` does and reports only true field references, with escaped
+    braces handled correctly.
 
     Field expressions like ``{trial_dir!s}``, ``{m.name}``, and ``{a[0]}`` all
     have the *root* name extracted (``trial_dir``, ``m``, ``a``) so a check
@@ -1454,35 +936,24 @@ def _format_field_names(template: str) -> set[str]:
 def _validate_trial_command_template(
     experiment: Experiment,
     phase: Phase,
-    inherited_key_outcomes: list[frozenset[str]],
+    inherited_keys: frozenset[str],
 ) -> None:
-    """Preflight the trial command for each concrete inherited-key outcome.
+    """Preflight the trial command with its inherited keys.
 
     :param Experiment experiment: Experiment containing the command template.
     :param Phase phase: Phase whose candidate execution is being checked.
-    :param list[frozenset[str]] inherited_key_outcomes: Compatible inherited
-        key sets from concrete upstream promotion outcomes.
-    :raises ValueError: A concrete outcome cannot render or reach the trainer.
-    """
-    for inherited_keys in dict.fromkeys(inherited_key_outcomes):
-        _validate_trial_command_template_outcome(experiment, phase, inherited_keys)
+    :param frozenset[str] inherited_keys: Keys inherited from direct parents.
+    :raises ValueError: The trial command cannot render or reach the trainer.
 
-
-def _validate_trial_command_template_outcome(
-    experiment: Experiment, phase: Phase, inherited_keys: frozenset[str]
-) -> None:
-    """Render ``trial_command`` once per phase with placeholder overrides.
+    Render ``trial_command`` once per phase with placeholder overrides.
 
     Catches at config-load (not at trial-launch, three minutes into a sweep):
 
     * Typos like ``{trail_dir}`` or any other unknown ``{placeholder}``.
     * Unbalanced braces (``{trial_dir`` -> ``str.format`` raises ``ValueError``).
     * The primary ``yaml_file`` mode missing ``{config_path}``.
-    * Phases declaring ``override_format: json_file`` but a template missing
-      ``{overrides_path}`` (rendered fine, but the trainer never sees the JSON
-      and silently runs with defaults).
-    * Phases using the explicit ``argparse`` or optional ``hydra``
-      compatibility formats with overrides but a template missing
+    * Phases using the explicit ``argparse`` compatibility format with
+      overrides but a template missing
       ``{overrides}`` — the same silent-no-op failure mode (review v0.5.6 /
       blocker 2).
 
@@ -1512,8 +983,7 @@ def _validate_trial_command_template_outcome(
     # winners), so the placeholder set must include them or render_command
     # could miss a key the trainer expects.
     overrides: dict[str, Any] = {k: "<inherited>" for k in inherited_keys}
-    for _origin, fixed_overrides in _iter_fixed_override_layers(experiment, phase):
-        overrides.update(fixed_overrides)
+    overrides.update(phase.fixed_overrides)
     overrides.update(_placeholder_values_for(phase.search_space))
 
     has_overrides = bool(overrides)
@@ -1558,8 +1028,7 @@ def _validate_trial_command_template_outcome(
         raise ValueError(
             f"Phase {phase.name!r}: trial_command references unknown placeholder "
             f"{{{bad}}}. Supported: {{config_path}} (yaml_file only), "
-            f"{{overrides}}, {{overrides_path}} (json_file only), {{trial_dir}}, "
-            f"{{trial_id}}, {{phase}}, {{run_name}}."
+            f"{{overrides}}, {{trial_dir}}, {{trial_id}}, {{phase}}, {{run_name}}."
         ) from exc
     except (ValueError, TypeError, IndexError) as exc:
         raise ValueError(
@@ -1575,7 +1044,7 @@ def _validate_trial_command_template_outcome(
                 "the complete per-trial YAML. Add {config_path} to trial_command, or "
                 "select an explicit compatibility override_format."
             )
-        if "overrides" in fields or "overrides_path" in fields:
+        if "overrides" in fields:
             raise ValueError(
                 f"override_format='yaml_file' but phase {phase.name!r} trial_command "
                 "references an overrides-only placeholder. Use {config_path}; it names "
@@ -1596,17 +1065,7 @@ def _validate_trial_command_template_outcome(
     if not has_overrides:
         return
 
-    if experiment.override_format == "json_file" and "overrides_path" not in fields:
-        raise ValueError(
-            f"override_format='json_file' but phase {phase.name!r} has "
-            "inherited, fixed, or sampled overrides and trial_command "
-            "does not reference {overrides_path}. The trainer would "
-            "never see the override JSON. Either add {overrides_path} "
-            "to trial_command, or use the default override_format='yaml_file' "
-            "with an embedded trainer_config and {config_path}. The explicit "
-            "argparse and Hydra compatibility formats use {overrides}."
-        )
-    if experiment.override_format in ("argparse", "hydra") and "overrides" not in fields:
+    if experiment.override_format == "argparse" and "overrides" not in fields:
         raise ValueError(
             f"override_format={experiment.override_format!r} but phase "
             f"{phase.name!r} has inherited, fixed, or sampled overrides "
@@ -1618,217 +1077,4 @@ def _validate_trial_command_template_outcome(
         )
 
 
-class SuiteDefaults(_Frozen):
-    """Shared defaults applied to every study in a suite."""
-
-    storage: str | None = None
-    allow_external_rdb_single_host: bool = False
-    workdir: str = "./runs"
-    trial_command: str | None = None
-    trainer_config: dict[str, Any] = Field(default_factory=dict)
-    provenance: dict[str, str] = Field(default_factory=dict)
-    override_format: OverrideFormat = "yaml_file"
-    metric: Metric | None = None
-    constraints: list[Constraint] = Field(default_factory=list)
-    contracts: dict[str, Contract] = Field(default_factory=dict)
-    env: dict[str, str] = Field(default_factory=dict)
-    execution: ExecutionContext = Field(default_factory=ExecutionContext)
-    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
-
-
-def _validate_suite_component_name(kind: str, value: str) -> str:
-    """Validate a suite or study name used in the compiled experiment namespace.
-
-    :param str kind: Human-readable component kind for the validation error.
-    :param str value: Candidate component name.
-    :raises ValueError: If ``value`` contains the reserved ``__`` separator.
-    :return str: The safe component name, unchanged.
-    """
-    if "__" in value:
-        raise ValueError(
-            f"{kind} name {value!r} must not contain '__': the compiled component "
-            "experiment is named '<suite>__<study>', so a double underscore inside "
-            "either part makes two different suite/study pairs share one artifact "
-            "namespace, study identity, and fingerprint."
-        )
-    return _validate_safe_name(kind, value)
-
-
-class StudySpec(_Frozen):
-    """One experiment-like study inside a suite run plan."""
-
-    name: str
-    depends_on: list[str] = Field(default_factory=list)
-    storage: str | None = None
-    allow_external_rdb_single_host: bool | None = None
-    workdir: str | None = None
-    trial_command: str | None = None
-    trainer_config: dict[str, Any] | None = None
-    provenance: dict[str, str] | None = None
-    override_format: OverrideFormat | None = None
-    metric: Metric | None = None
-    constraints: list[Constraint] | None = None
-    contracts: dict[str, Contract] = Field(default_factory=dict)
-    phases: list[Phase] = Field(min_length=1)
-    env: dict[str, str] | None = None
-    execution: ExecutionContext | None = None
-    timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
-    promotion: Promotion | None = None
-
-    @field_validator("name")
-    @classmethod
-    def _study_name_is_safe(cls, value: str) -> str:
-        """Validate study names used as experiment-name suffixes and path components.
-
-        :param str value: Candidate study name.
-        :raises ValueError: If ``value`` is not a safe name or contains ``__``.
-        :return str: The validated study name, unchanged.
-        """
-        return _validate_suite_component_name("Study", value)
-
-
-class Suite(_Frozen):
-    """Suite of independent or dependency-ordered phase-chain studies."""
-
-    suite: str
-    defaults: SuiteDefaults = Field(default_factory=SuiteDefaults)
-    studies: list[StudySpec] = Field(min_length=1)
-
-    @field_validator("suite")
-    @classmethod
-    def _suite_name_is_safe(cls, value: str) -> str:
-        """Validate suite names used as output path and experiment-name prefixes.
-
-        :param str value: Candidate suite name.
-        :raises ValueError: If ``value`` is not a safe name or contains ``__``.
-        :return str: The validated suite name, unchanged.
-        """
-        return _validate_suite_component_name("Suite", value)
-
-    @model_validator(mode="after")
-    def _validate_study_graph(self) -> Suite:
-        """Require prior-only dependencies and comparable promotion metrics.
-
-        :raises ValueError: If study names duplicate case-insensitively, dependencies point forward,
-            or a promotion compares different resolved metric contracts.
-        :return Suite: Self, unchanged.
-        """
-        seen: set[str] = set()
-        seen_casefolded: dict[str, str] = {}
-        phases_by_study: dict[str, set[str]] = {}
-        metrics_by_study: dict[str, Metric | None] = {}
-        for study in self.studies:
-            if study.name in seen:
-                raise ValueError(f"Duplicate study name {study.name!r}.")
-            folded = study.name.casefold()
-            if folded in seen_casefolded:
-                raise ValueError(
-                    f"Study names {seen_casefolded[folded]!r} and "
-                    f"{study.name!r} must be unique case-insensitively."
-                )
-            seen_casefolded[folded] = study.name
-            resolved_metric = (
-                study.metric if "metric" in study.model_fields_set else self.defaults.metric
-            )
-            for dep in study.depends_on:
-                if dep not in seen:
-                    raise ValueError(
-                        f"Study {study.name!r} depends_on {dep!r}, which is not a prior study."
-                    )
-            if study.promotion is not None:
-                selector = study.promotion.min_delta_vs
-                baseline_study, _, baseline_phase = selector.partition(".")
-                if baseline_study not in seen:
-                    raise ValueError(
-                        f"Study {study.name!r} promotion references {baseline_study!r}, "
-                        "which is not a prior study."
-                    )
-                if baseline_phase and baseline_phase not in phases_by_study[baseline_study]:
-                    raise ValueError(
-                        f"Study {study.name!r} promotion references missing baseline phase "
-                        f"{selector!r}."
-                    )
-                baseline_metric = metrics_by_study[baseline_study]
-                if (
-                    resolved_metric is not None
-                    and baseline_metric is not None
-                    and resolved_metric != baseline_metric
-                ):
-                    raise ValueError(
-                        f"Study {study.name!r} promotion against {selector!r} requires the "
-                        "same resolved metric contract, but the candidate resolves to "
-                        f"{resolved_metric.model_dump(mode='json')!r} and the baseline "
-                        f"resolves to {baseline_metric.model_dump(mode='json')!r}. Put the "
-                        "shared metric in suite.defaults or make both study metrics identical."
-                    )
-            seen.add(study.name)
-            phases_by_study[study.name] = {phase.name for phase in study.phases}
-            metrics_by_study[study.name] = resolved_metric
-        return self
-
-    def experiment_for_study(self, study: StudySpec) -> Experiment:
-        """Compile a suite study into a normal :class:`Experiment`.
-
-        :param StudySpec study: Suite study to compile.
-        :raises ValueError: If a required study field is missing from both the
-            study and suite defaults.
-        :return Experiment: Concrete experiment config for ``study``.
-        """
-        defaults = self.defaults
-
-        def value(name: str, *, required: bool = False) -> Any:
-            """Resolve a study field, falling back to suite defaults.
-
-            :param str name: Field name to resolve.
-            :param bool required: Whether ``None`` is invalid after fallback.
-            :raises ValueError: If ``required`` is true and the resolved value is ``None``.
-            :return Any: Deep-copied resolved value.
-            """
-            if name in study.model_fields_set:
-                selected = getattr(study, name)
-            else:
-                selected = getattr(defaults, name)
-            if required and selected is None:
-                raise ValueError(
-                    f"Suite {self.suite!r} study {study.name!r} must define {name!r} "
-                    "or inherit it from suite.defaults."
-                )
-            return copy.deepcopy(selected)
-
-        env = copy.deepcopy(defaults.env)
-        if "env" in study.model_fields_set and study.env is not None:
-            env.update(study.env)
-
-        contracts = copy.deepcopy(defaults.contracts)
-        contracts.update(copy.deepcopy(study.contracts))
-
-        return Experiment(
-            experiment=f"{self.suite}__{study.name}",
-            storage=value("storage"),
-            allow_external_rdb_single_host=value("allow_external_rdb_single_host", required=True),
-            workdir=value("workdir", required=True),
-            trial_command=value("trial_command", required=True),
-            trainer_config=value("trainer_config") or {},
-            provenance=value("provenance") or {},
-            override_format=value("override_format", required=True),
-            metric=value("metric", required=True),
-            constraints=value("constraints") or [],
-            contracts=contracts,
-            phases=copy.deepcopy(study.phases),
-            env=env,
-            execution=value("execution") or ExecutionContext(),
-            timeout_seconds_per_run=value("timeout_seconds_per_run"),
-        )
-
-
-def _compile_suite_experiments(suite: Suite) -> dict[str, Experiment]:
-    """Resolve every study before any component execution can begin.
-
-    :param Suite suite: Validated suite whose defaults are resolved by its compiler.
-    :raises ValueError: A study cannot resolve to a valid experiment.
-    :return dict[str, Experiment]: Experiments keyed by case-preserving study name.
-    """
-    return {study.name: suite.experiment_for_study(study) for study in suite.studies}
-
-
-Config = Experiment | Suite
+Config = Experiment

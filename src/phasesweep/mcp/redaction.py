@@ -11,7 +11,6 @@ from __future__ import annotations
 from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
-from phasesweep.engine.artifacts import _winner_source_or_default
 from phasesweep.engine.read import ResultContext
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState
@@ -114,8 +113,7 @@ def winners_payload(
     :param VisibleParamsPolicy visible_params: Catalog policy for sampled param values.
     :param ResultContext result_context: Whether ``metric``/``declared_phases``
         are the represented generation's own recorded semantics or the current
-        config's (the latter when nothing is published, or for a pre-manifest
-        legacy layout that recorded none).
+        config's when nothing is published.
     :param bool | None published_config_matches_current: Whether the represented
         generation's recorded config fingerprint matches the config this read
         was interpreted through; ``None`` when undeterminable.
@@ -126,12 +124,13 @@ def winners_payload(
     phases: list[dict[str, Any]] = []
     for view in views:
         params, redacted = _visible_winner_params(view.params, visible_params)
-        source = _winner_source_or_default(view, view.phase)
+        source = view.source
+        if source is None:
+            raise RuntimeError("Current-format winner is missing source provenance.")
         winner_source = {
             "kind": source.kind,
             "phase": source.phase,
             "trial_number": source.trial_number,
-            "study": source.study,
         }
         source_generation_id = source.generation_id
         winner_generation = (
@@ -141,27 +140,11 @@ def winners_payload(
             if source_generation_id == represented_generation_id
             else "prior_generation"
         )
-        promotion = None
-        if view.promotion is not None and view.promotion.get("action") in (
-            "promote",
-            "continue_baseline",
-        ):
-            promotion = {
-                "action": view.promotion["action"],
-                "baseline_phase": view.promotion["baseline"],
-                "candidate_trial_number": view.promotion["candidate_trial_number"],
-                "candidate_metric": view.promotion["candidate_metric"],
-                "baseline_trial_number": view.promotion["baseline_trial_number"],
-                "baseline_metric": view.promotion["baseline_metric"],
-                "min_delta": view.promotion["min_delta"],
-                "improvement": view.promotion["improvement"],
-            }
         phases.append(
             {
                 "phase": view.phase,
                 "winner_source": winner_source,
                 "winner_generation": winner_generation,
-                "promotion": promotion,
                 "metric": view.metric,
                 "params": params,
                 "params_redacted": redacted,
