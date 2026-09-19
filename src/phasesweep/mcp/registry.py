@@ -229,7 +229,7 @@ def _prepare_state_dir(base: Path, path: Path) -> Path:
         for directory in (resolved, resolved / "runs", resolved / "logs"):
             with tempfile.NamedTemporaryFile(dir=directory):
                 pass
-    except (OSError, UnsafePrivatePathError) as exc:
+    except (OSError, UnsafePrivatePathError, ValueError) as exc:
         raise CatalogError(
             f"state_dir is not usable: {resolved}: {exc}",
             suggestion=_state_dir_remediation(resolved),
