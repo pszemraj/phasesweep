@@ -35,7 +35,6 @@ EVIDENCE_PROVENANCE_SCHEMA_VERSION = 1
 # semantic inputs to study, winner, and publication fingerprints; package
 # versions alone do not determine whether old trial readings can be reused.
 LOG_REGEX_EVALUATION_REVISION = 2
-DIRECTORY_SIZE_EVALUATION_REVISION = 2
 
 
 def extractor_config_fingerprint(cfg: Extractor) -> str:
