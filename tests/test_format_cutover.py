@@ -61,6 +61,38 @@ def test_pre_cutover_memory_output_is_refused_before_mutation(
     assert not _artifact_root_binding_path(experiment).exists()
 
 
+def test_pre_cutover_artifact_binding_version_is_refused_before_mutation(
+    tmp_path: Path,
+) -> None:
+    """An old binding marker cannot authorize a current-format artifact tree."""
+    experiment = _experiment(tmp_path, storage=None)
+    root = _experiment_dir(experiment)
+    binding_path = _artifact_root_binding_path(experiment)
+    binding_path.parent.mkdir(parents=True)
+    binding_path.write_text(
+        json.dumps(
+            {
+                "schema_version": ARTIFACT_ROOT_BINDING_SCHEMA_VERSION - 1,
+                "experiment": experiment.experiment,
+                "artifact_root": str(root.resolve()),
+                "storage_key": None,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    before = _tree_bytes(root)
+
+    with pytest.raises(
+        ArtifactRootConflictError,
+        match=r"unsupported pre-cutover.*format 2.*fresh artifact root",
+    ):
+        run_experiment(experiment)
+
+    assert _tree_bytes(root) == before
+
+
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.parametrize("schema_version", [2, None], ids=["old-version", "unmarked"])
 def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
