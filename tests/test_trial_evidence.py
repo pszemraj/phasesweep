@@ -102,6 +102,9 @@ def _evidence_experiment(
     if override_format == "yaml_file":
         trial_command = f"python {trainer} --out {{trial_dir}}/r.json --config {{config_path}}"
         trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
+    elif override_format == "json_file":
+        trial_command = f"python {trainer} --out {{trial_dir}}/r.json --input {{overrides_path}}"
+        trainer_config = None
     else:
         trial_command = f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
         trainer_config = None
@@ -203,6 +206,8 @@ def _pointer_bytes(experiment: Experiment) -> bytes:
     [
         ("yaml_file", "trainer_config.yaml"),
         ("argparse", "overrides_resolved.json"),
+        ("hydra", "overrides_resolved.json"),
+        ("json_file", "overrides.json"),
     ],
 )
 def test_trial_records_the_exact_generated_trainer_input(
@@ -371,6 +376,8 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     [
         pytest.param("yaml_file", "trainer_config.yaml", "delete", id="yaml-delete"),
         pytest.param("yaml_file", "trainer_config.yaml", "alter", id="yaml-alter"),
+        pytest.param("json_file", "overrides.json", "delete", id="json-delete"),
+        pytest.param("json_file", "overrides.json", "alter", id="json-alter"),
     ],
 )
 def test_topup_refuses_damaged_generated_trainer_input(

@@ -34,6 +34,7 @@ from phasesweep.evidence.evaluation import (
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor
 from phasesweep.runtime.commands import (
+    dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
     render_command,
 )
@@ -423,6 +424,9 @@ def prepare_trainer_input(
                 "{run_name}": run_name,
             },
         )
+    elif experiment.override_format == "json_file":
+        filename = "overrides.json"
+        text = dump_json_file_overrides(overrides)
     else:
         filename = "overrides_resolved.json"
         text = resolved_text

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,8 +15,10 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.config import Phase
 from phasesweep.runtime.commands import (
     compose_trainer_config,
+    dump_json_file_overrides,
     dump_trainer_config_yaml,
     format_argparse,
+    format_hydra,
     render_command,
 )
 from tests.conftest import (
@@ -225,7 +229,7 @@ def test_compatibility_format_rejects_ignored_trainer_config() -> None:
 
 
 @pytest.mark.parametrize("selector", ["hydra", "json_file"])
-def test_removed_override_format_is_rejected_during_config_validation(
+def test_restored_override_format_is_validated_without_artifacts(
     tmp_path: Path, selector: str
 ) -> None:
     p = write_yaml(
@@ -233,7 +237,7 @@ def test_removed_override_format_is_rejected_during_config_validation(
         f"""
         experiment: t
         workdir: {tmp_path / "runs"}
-        trial_command: "echo {{overrides}}"
+        trial_command: "echo {{{"overrides_path" if selector == "json_file" else "overrides"}}}"
         override_format: {selector}
         metric:
           name: x
@@ -243,9 +247,156 @@ def test_removed_override_format_is_rejected_during_config_validation(
         """,
     )
 
-    with pytest.raises(ValidationError, match="override_format"):
-        load_experiment(p)
+    assert load_experiment(p).override_format == selector
     assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        False,
+        3,
+        -4,
+        2.5,
+        -1e-5,
+        "null",
+        "true",
+        "3",
+        "2.5",
+        "",
+        "two words",
+        "quote\"and'quote",
+        "C:\\data\\file",
+        "trailing\\",
+        'backslash\\"quote',
+        "two\\\\slashes",
+        "a,b",
+        "{a: b}",
+        "$money",
+        "unicode café",
+        [None, "false", [True, "a,b", "C:\\data"]],
+    ],
+)
+def test_hydra_values_round_trip_real_parser_and_omegaconf(value):
+    from hydra.core.override_parser.overrides_parser import OverridesParser
+    from omegaconf import OmegaConf
+
+    argument = shlex.split(format_hydra({"value": value}))[0]
+    parsed = OverridesParser.create().parse_override(argument)
+    assert not parsed.is_sweep_override()
+    actual = OmegaConf.to_container(OmegaConf.create({"value": parsed.value()}), resolve=True)[
+        "value"
+    ]
+    assert actual == value
+    assert type(actual) is type(value)
+    assert json.dumps(actual) == json.dumps(value)
+
+
+@pytest.mark.parametrize("value", ["${oc.env:HOME}", "literal ${other}", ["${x}"], "line\nbreak"])
+def test_hydra_unsupported_literals_fail_before_artifacts(tmp_path, value):
+    with pytest.raises((TypeError, ValueError), match="hydra"):
+        make_experiment(
+            workdir=str(tmp_path / "runs"),
+            override_format="hydra",
+            trial_command="echo {overrides}",
+            phases=[Phase(name="p", n_trials=1, fixed_overrides={"value": value})],
+        )
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize("overrides", [{"x": 1, "x.y": 2}, {"x.y": 2, "x": 1}, {"x": {}, "x.y": 2}])
+def test_json_file_rejects_dotted_collisions(overrides):
+    with pytest.raises(ValueError, match="parent key"):
+        dump_json_file_overrides(overrides)
+
+
+@pytest.mark.parametrize("value", [float("inf"), datetime.date(2024, 1, 1), {1: "value"}, (1, 2)])
+def test_json_file_rejects_non_json_values(value):
+    with pytest.raises((TypeError, ValueError)):
+        dump_json_file_overrides({"value": value})
+
+
+@pytest.mark.parametrize("selector", ["hydra", "json_file"])
+def test_restored_input_real_consumer_inherits_and_replays(tmp_path, selector):
+    from phasesweep.config import (
+        CategoricalParam,
+        ExecutionContext,
+        LogRegexExtractor,
+        Metric,
+        Sampler,
+    )
+
+    trainer = tmp_path / "trainer.py"
+    if selector == "hydra":
+        (tmp_path / "config.yaml").write_text(
+            "model: {depth: 0}\nrate: 0.0\ntag: ''\n", encoding="utf-8"
+        )
+        trainer.write_text(
+            "import hydra, json, os\nfrom pathlib import Path\n"
+            "from omegaconf import OmegaConf\n"
+            "@hydra.main(version_base=None, config_path='.', config_name='config')\n"
+            "def main(cfg):\n"
+            "    values = OmegaConf.to_container(cfg, resolve=True)\n"
+            "    Path(os.environ['PHASESWEEP_TRIAL_DIR'], 'consumed.json').write_text(json.dumps(values))\n"
+            "    print('loss=' + str(10 - values['model']['depth']))\n"
+            "main()\n",
+            encoding="utf-8",
+        )
+        placeholder = "{overrides} hydra.run.dir={trial_dir}/hydra hydra.output_subdir=null"
+    else:
+        trainer.write_text(
+            "import json, sys, os\nfrom pathlib import Path\n"
+            "values = json.loads(Path(sys.argv[1]).read_text())\n"
+            "Path(os.environ['PHASESWEEP_TRIAL_DIR'], 'consumed.json').write_text(json.dumps(values))\n"
+            "print('loss=' + str(10 - values['model']['depth']))\n",
+            encoding="utf-8",
+        )
+        placeholder = "{overrides_path}"
+    experiment = make_experiment(
+        workdir=str(tmp_path / "runs"),
+        storage="auto",
+        provenance={"trainer": "fixture"},
+        override_format=selector,
+        execution=ExecutionContext(inherit_env="none"),
+        trial_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(trainer))} {placeholder}",
+        metric=Metric(
+            name="loss",
+            goal="minimize",
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.]+)"),
+        ),
+        phases=[
+            Phase(
+                name="depth",
+                n_trials=2,
+                gpu_policy="none",
+                sampler=Sampler(type="grid"),
+                fixed_overrides={"tag": 'space,quote"backslash\\'},
+                search_space={"model.depth": CategoricalParam(type="categorical", choices=[2, 4])},
+            ),
+            Phase(
+                name="rate",
+                inherits=["depth"],
+                n_trials=2,
+                gpu_policy="none",
+                sampler=Sampler(type="grid"),
+                search_space={"rate": CategoricalParam(type="categorical", choices=[0.1, 0.2])},
+            ),
+        ],
+    )
+    winners = run_experiment(experiment)
+    root = Path(experiment.workdir) / experiment.experiment
+    receipts = sorted((root / "rate").glob("trial_*/consumed.json"))
+    assert len(receipts) == 2
+    for receipt in receipts:
+        consumed = json.loads(receipt.read_text())
+        assert consumed["model"]["depth"] == 4
+        assert type(consumed["model"]["depth"]) is int
+        assert consumed["tag"] == 'space,quote"backslash\\'
+    run_experiment(experiment, from_phase="rate")
+    assert sorted((root / "rate").glob("trial_*/consumed.json")) == receipts
+    assert winners["depth"].effective_overrides["model.depth"] == 4
 
 
 def _override_yaml(tmp_path, override_format: str, body: str):

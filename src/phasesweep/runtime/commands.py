@@ -6,6 +6,7 @@ injection or misparse from shell metacharacters in paths or categorical values.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import shlex
@@ -15,7 +16,7 @@ from typing import Any, Literal
 
 import yaml
 
-_CliOverrideFormat = Literal["argparse"]
+_CliOverrideFormat = Literal["argparse", "hydra"]
 
 
 class _OverrideValueError(TypeError):
@@ -56,11 +57,20 @@ def _render_override_value(
     :return str: Canonical value text for ``fmt``.
     """
     if value is None:
-        return "None"
+        return "None" if fmt == "argparse" else "null"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        return value
+        if fmt == "argparse":
+            return value
+        # OmegaConf resolves interpolations even inside Hydra quoted strings.
+        # Literal interpolation syntax is deliberately outside this wire contract.
+        if "${" in value or any(ord(char) < 32 for char in value):
+            raise _OverrideValueError(fmt, value, position)
+        # Hydra only unescapes backslashes preceding a quote (including the
+        # closing quote). JSON escaping changes other backslashes and Unicode.
+        escaped = re.sub(r'\\+(?="|$)', lambda match: match.group() * 2, value)
+        return '"' + escaped.replace('"', '\\"') + '"'
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -86,6 +96,63 @@ def _render_override_value(
         finally:
             ancestors.remove(id(value))
     raise _OverrideValueError(fmt, value, position)
+
+
+def format_hydra(overrides: dict[str, Any]) -> str:
+    """Render native Hydra arguments without importing the trainer's SDK.
+
+    :param dict[str, Any] overrides: Scalar/list values keyed by dotted parameter names.
+    :return str: Shell-quoted native ``key=value`` tokens.
+    :raises TypeError: A literal has no faithful supported Hydra representation.
+    """
+    return " ".join(
+        shlex.quote(f"{key}={_render_override_value(value, 'hydra')}")
+        for key, value in overrides.items()
+    )
+
+
+def dump_overrides_json(payload: Any) -> str:
+    """Encode only JSON-compatible values using the trainer's strict wire format.
+
+    :param Any payload: JSON-compatible scalar, list, or string-keyed mapping.
+    :return str: Deterministic JSON text.
+    :raises TypeError: A value is outside the JSON data model.
+    :raises ValueError: A value is non-finite or recursive.
+    """
+    _validate_trainer_config_value(payload, position="JSON overrides")
+    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
+
+
+def dump_json_file_overrides(overrides: dict[str, Any]) -> str:
+    """Expand dotted keys and serialize the overrides-only trainer input.
+
+    :param dict[str, Any] overrides: Resolved overrides, without a base configuration.
+    :return str: Exact text to write to ``overrides.json``.
+    :raises ValueError: A key collides with another key's namespace.
+    :raises TypeError: A value cannot be represented as JSON.
+    """
+    nested: dict[str, Any] = {}
+    for key, value in overrides.items():
+        parts = key.split(".")
+        if any(".".join(parts[:index]) in overrides for index in range(1, len(parts))):
+            raise ValueError(f"Cannot expand override {key!r}: a parent key is also overridden.")
+        current = nested
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+        current[parts[-1]] = value
+    return dump_overrides_json(nested)
+
+
+def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
+    """Write the nested overrides-only JSON consumed by the trainer.
+
+    :param dict[str, Any] overrides: Resolved dotted overrides.
+    :param Path trial_dir: Attempt directory.
+    :return Path: Written trainer input.
+    """
+    path = trial_dir / "overrides.json"
+    path.write_text(dump_json_file_overrides(overrides), encoding="utf-8")
+    return path
 
 
 def format_argparse(overrides: dict[str, Any]) -> str:
@@ -311,14 +378,15 @@ def render_command(
 ) -> str:
     """Substitute placeholders in the user's trial_command template.
 
-    Path-like substitutions (``{trial_dir}``, ``{config_path}``) are shell-quoted.
+    Path substitutions (``{trial_dir}``, ``{config_path}``, ``{overrides_path}``)
+    are shell-quoted.
 
     Args:
         template: The user's ``trial_command`` template with ``{...}``
-            placeholders. Supported keys: ``config_path``, ``overrides``,
+            placeholders. Supported keys: ``config_path``, ``overrides``, ``overrides_path``,
             ``trial_dir``, ``trial_id``, ``phase``, ``run_name``.
         overrides: The composed overrides for this trial.
-        fmt: One of ``"yaml_file"`` or ``"argparse"``.
+        fmt: One of ``yaml_file``, ``argparse``, ``hydra``, or ``json_file``.
         trial_dir: Per-trial directory used for ``{trial_dir}``.
         trial_id: Numeric trial number, used for ``{trial_id}``.
         phase: Phase name, used for ``{phase}``.
@@ -346,6 +414,7 @@ def render_command(
 
     """
     config_path = ""
+    overrides_path = ""
     if fmt == "yaml_file":
         base = {} if trainer_config is None else trainer_config
         config_substitutions = {
@@ -375,11 +444,23 @@ def render_command(
         overrides_str = ""
     elif fmt == "argparse":
         overrides_str = format_argparse(overrides)
+    elif fmt == "hydra":
+        overrides_str = format_hydra(overrides)
+    elif fmt == "json_file":
+        if materialized_input_path is not None:
+            overrides_path = str(materialized_input_path)
+        elif write_files:
+            overrides_path = str(write_json_file(overrides, trial_dir))
+        else:
+            dump_json_file_overrides(overrides)
+            overrides_path = str(trial_dir / "overrides.json")
+        overrides_str = ""
     else:
         raise ValueError(f"Unknown override_format: {fmt}")
 
     return template.format(
         config_path=shlex.quote(config_path) if config_path else "",
+        overrides_path=shlex.quote(overrides_path) if overrides_path else "",
         overrides=overrides_str,
         trial_dir=shlex.quote(str(trial_dir)),
         trial_id=str(trial_id),

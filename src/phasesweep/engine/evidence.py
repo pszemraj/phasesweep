@@ -50,6 +50,8 @@ _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
 _TRAINER_INPUT_FILENAMES = {
     "yaml_file": "trainer_config.yaml",
     "argparse": "overrides_resolved.json",
+    "hydra": "overrides_resolved.json",
+    "json_file": "overrides.json",
 }
 
 
