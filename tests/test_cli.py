@@ -937,6 +937,43 @@ def test_cli_boundary_reports_expected_run_failure(
 
 
 @pytest.mark.parametrize(
+    ("env_name", "env_value"),
+    [("WANDB_MODE", "offline"), ("WANDB_DISABLED", "true")],
+)
+def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
+    env_name: str,
+    env_value: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from phasesweep.config import Metric, WandbExtractor
+
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        metric=Metric(
+            name="loss",
+            goal="minimize",
+            extractor=WandbExtractor(
+                type="wandb", entity="entity", project="project", metric_key="eval/loss"
+            ),
+        ),
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    monkeypatch.setenv(env_name, env_value)
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "W&B evidence requires online logging" in captured.err
+    assert "internal error" not in captured.err
+    assert "Traceback" not in captured.err
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize(
     "error",
     [
         UnsafeLockPathError("PHASESWEEP_LOCK_DIR must be an absolute path"),

@@ -880,12 +880,52 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     override_format: Literal["argparse", "hydra"] = (
         "hydra" if experiment.override_format == "hydra" else "argparse"
     )
+
+    def validation_error(location: str, exc: _OverrideValueError) -> ValueError:
+        offender = exc.value
+        if isinstance(offender, Mapping):
+            hint = (
+                f"A mapping has no {override_format} wire form the fingerprint "
+                "preserves faithfully. Use the default override_format='yaml_file' "
+                "for structured trainer configuration."
+            )
+        elif isinstance(offender, float):
+            hint = (
+                "JSON has no representation for non-finite floats; use a finite "
+                'value, or quote it in YAML (e.g. "inf") if the trial command '
+                "should receive it as text."
+            )
+        elif isinstance(offender, (list, tuple)):
+            hint = "Override lists cannot recursively contain themselves."
+        else:
+            hint = (
+                "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
+                "into Python date/datetime objects; quote the value in YAML "
+                '(e.g. "2024-01-01") to send it as text, or use '
+                "the default override_format='yaml_file' if the trainer needs a "
+                "structured value."
+            )
+        where = f" at position {exc.position}" if exc.position else ""
+        return ValueError(
+            f"Phase {phase.name!r}: override_format={override_format!r} but "
+            f"{location} holds a value{where} that {override_format} cannot render "
+            f"faithfully (type {type(offender).__name__}): {offender!r}. "
+            f"{override_format} override values must have one canonical wire form "
+            "the JSON-mode fingerprint preserves faithfully: null, booleans, "
+            f"integers, finite floats, strings, and lists of those. {hint}"
+        )
+
     for key, param in phase.search_space.items():
         if not isinstance(param, CategoricalParam):
             continue
         rendered: dict[str, tuple[int, Any]] = {}
         for index, choice in enumerate(param.choices):
-            wire = _render_override_value(choice, override_format)
+            try:
+                wire = _render_override_value(choice, override_format)
+            except _OverrideValueError as exc:
+                raise validation_error(
+                    f"categorical search_space key {key!r} choice at index {index}", exc
+                ) from exc
             earlier = rendered.get(wire)
             if earlier is not None:
                 earlier_index, earlier_choice = earlier
@@ -902,38 +942,7 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
         try:
             _render_override_value(value, override_format)
         except _OverrideValueError as exc:
-            offender = exc.value
-            if isinstance(offender, Mapping):
-                hint = (
-                    f"A mapping has no {override_format} wire form the fingerprint "
-                    "preserves faithfully. Use the default override_format='yaml_file' "
-                    "for structured trainer configuration."
-                )
-            elif isinstance(offender, float):
-                hint = (
-                    "JSON has no representation for non-finite floats; use a finite "
-                    'value, or quote it in YAML (e.g. "inf") if the trial command '
-                    "should receive it as text."
-                )
-            elif isinstance(offender, (list, tuple)):
-                hint = "Override lists cannot recursively contain themselves."
-            else:
-                hint = (
-                    "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
-                    "into Python date/datetime objects; quote the value in YAML "
-                    '(e.g. "2024-01-01") to send it as text, or use '
-                    "the default override_format='yaml_file' if the trainer needs a "
-                    "structured value."
-                )
-            where = f" at position {exc.position}" if exc.position else ""
-            raise ValueError(
-                f"Phase {phase.name!r}: override_format={override_format!r} but "
-                f"fixed_overrides key {key!r} holds a value{where} that {override_format} "
-                f"cannot render faithfully (type {type(offender).__name__}): {offender!r}. "
-                f"{override_format} override values must have one canonical wire form "
-                "the JSON-mode fingerprint preserves faithfully: null, booleans, "
-                f"integers, finite floats, strings, and lists of those. {hint}"
-            ) from exc
+            raise validation_error(f"fixed_overrides key {key!r}", exc) from exc
 
 
 def _format_field_names(template: str) -> set[str]:

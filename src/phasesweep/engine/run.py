@@ -31,7 +31,7 @@ from phasesweep.engine.phase import _placeholder_winner, _run_phase
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
-from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.engine.trial import ProcessCleanupUncertainError, _preflight_trainer_environments
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
 from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
 
@@ -248,6 +248,10 @@ def run_experiment(
             dry_run=True,
             generation_id=None,
         )
+    # Runtime inheritance can introduce W&B settings that static config
+    # validation cannot see. Refuse conflicting/offline environments before
+    # claiming a generation or creating execution artifacts.
+    _preflight_trainer_environments(experiment, from_phase=from_phase)
     outcome = _run_experiment_outcome(
         experiment,
         from_phase=from_phase,

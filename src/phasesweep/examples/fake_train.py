@@ -13,6 +13,38 @@ import yaml
 from phasesweep import report_objective
 
 
+def _parse_kv(tokens: list[str]) -> dict[str, Any]:
+    """Parse the toy trainer's supported argparse/Hydra override tokens.
+
+    :param list[str] tokens: Remaining ``key=value`` or ``--key=value`` tokens.
+    :raises ValueError: A token or key is unsupported by this trainer.
+    :return dict[str, Any]: Parsed numeric values keyed by trainer config path.
+    """
+    supported = {
+        "n_layers",
+        "model.n_layers",
+        "lr",
+        "optimizer.lr",
+        "weight_decay",
+        "optimizer.weight_decay",
+        "dropout",
+        "model.dropout",
+    }
+    overrides: dict[str, Any] = {}
+    for raw_token in tokens:
+        token = raw_token[2:] if raw_token.startswith("--") else raw_token
+        if "=" not in token:
+            raise ValueError(f"Unsupported trainer argument {raw_token!r}; expected key=value.")
+        key, raw_value = token.split("=", 1)
+        if key not in supported:
+            raise ValueError(f"Unsupported fake-trainer override {key!r}.")
+        value = yaml.safe_load(raw_value)
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"Fake-trainer override {key!r} must be numeric, got {value!r}.")
+        overrides[key] = value
+    return overrides
+
+
 def _load_config(path: Path) -> dict[str, Any]:
     """Load the complete YAML config supplied by PhaseSweep.
 
@@ -60,7 +92,7 @@ def main() -> None:
         default=None,
         help="seconds to sleep before writing result (simulates a long trial; used by tests)",
     )
-    args, _unknown = p.parse_known_args()
+    args, remaining = p.parse_known_args()
 
     config: dict[str, Any] = {}
     if args.config_path is not None:
@@ -73,6 +105,7 @@ def main() -> None:
         "dropout": args.dropout,
     }
     overrides = {k: v for k, v in overrides.items() if v is not None}
+    overrides.update(_parse_kv(remaining))
     sleep_seconds = float(
         args.sleep if args.sleep is not None else _get(config, "runtime.sleep", 0.0)
     )

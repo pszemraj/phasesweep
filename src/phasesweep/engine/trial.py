@@ -20,6 +20,9 @@ from phasesweep.config import Experiment, Gate, check_bounds
 from phasesweep.config.models import _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
+    PhaseSweepError,
+)
+from phasesweep.errors import (
     ProcessCleanupUncertainError as ProcessCleanupUncertainError,
 )
 from phasesweep.errors import (
@@ -164,8 +167,29 @@ def _trainer_environment(experiment: Experiment, phase_name: str | None = None) 
     )
     query = _wandb_query(experiment, phase.gates)
     if query is not None:
-        env = compose_wandb_environment(query, experiment.env, env)
+        try:
+            env = compose_wandb_environment(query, experiment.env, env)
+        except ValueError as exc:
+            raise PhaseSweepError(str(exc)) from exc
     return env
+
+
+def _preflight_trainer_environments(
+    experiment: Experiment, *, from_phase: str | None = None
+) -> None:
+    """Validate each phase environment that this invocation can launch.
+
+    :param Experiment experiment: Parsed experiment supplying phase contracts.
+    :param str | None from_phase: Optional first phase to execute.
+    :raises PhaseSweepError: A composed runtime environment disables required
+        remote evidence or conflicts with its managed identity.
+    """
+    reached = from_phase is None
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
+        if reached:
+            _trainer_environment(experiment, phase.name)
 
 
 def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
@@ -566,6 +590,9 @@ def launch_trial(
     wandb_query = _wandb_query(experiment, phase.gates)
     if wandb_query is not None:
         env["WANDB_RUN_ID"] = attempt_id
+    # Without a W&B evidence consumer, monitoring remains trainer-owned: keep
+    # any configured/ambient W&B identity unchanged. Trainers can still bind
+    # monitoring to this attempt explicitly through PHASESWEEP_ATTEMPT_ID.
     trainer_cwd = _resolved_execution_cwd(experiment)
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)

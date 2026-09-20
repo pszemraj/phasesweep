@@ -12,7 +12,7 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import Phase
+from phasesweep.config import JsonEnvelopeExtractor, Metric, Phase
 from phasesweep.runtime.commands import (
     compose_trainer_config,
     dump_json_file_overrides,
@@ -306,6 +306,24 @@ def test_hydra_unsupported_literals_fail_before_artifacts(tmp_path, value):
     assert not (tmp_path / "runs").exists()
 
 
+@pytest.mark.parametrize("value", ["${oc.env:HOME}", "line\nbreak"])
+def test_hydra_unsupported_categorical_literals_fail_before_artifacts(tmp_path, value):
+    with pytest.raises(ValueError, match=r"categorical search_space key 'value'.*hydra"):
+        make_experiment(
+            workdir=str(tmp_path / "runs"),
+            override_format="hydra",
+            trial_command="echo {overrides}",
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=1,
+                    search_space={"value": {"type": "categorical", "choices": ["ok", value]}},
+                )
+            ],
+        )
+    assert not (tmp_path / "runs").exists()
+
+
 @pytest.mark.parametrize("overrides", [{"x": 1, "x.y": 2}, {"x.y": 2, "x": 1}, {"x": {}, "x.y": 2}])
 def test_json_file_rejects_dotted_collisions(overrides):
     with pytest.raises(ValueError, match="parent key"):
@@ -397,6 +415,53 @@ def test_restored_input_real_consumer_inherits_and_replays(tmp_path, selector):
     run_experiment(experiment, from_phase="rate")
     assert sorted((root / "rate").glob("trial_*/consumed.json")) == receipts
     assert winners["depth"].effective_overrides["model.depth"] == 4
+
+
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_packaged_fake_trainer_consumes_dotted_cli_overrides(
+    tmp_path: Path, override_format: str
+) -> None:
+    trainer = copy_fake_train(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        override_format=override_format,
+        trial_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(trainer))} {{overrides}}",
+        metric=Metric(
+            name="eval_loss",
+            goal="minimize",
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope",
+                path="result.json",
+                objective_name="eval_loss",
+                split="validation",
+                policy="synthetic",
+            ),
+        ),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                fixed_overrides={
+                    "model.n_layers": 6,
+                    "optimizer.lr": 0.001,
+                    "optimizer.weight_decay": 0.2,
+                    "model.dropout": 0.25,
+                },
+            )
+        ],
+    )
+
+    run_experiment(experiment)
+
+    (result_path,) = (Path(experiment.workdir) / experiment.experiment / "p").glob(
+        "trial_*/result.json"
+    )
+    assert json.loads(result_path.read_text())["config"] == {
+        "n_layers": 6,
+        "lr": 0.001,
+        "weight_decay": 0.2,
+        "dropout": 0.25,
+    }
 
 
 def _override_yaml(tmp_path, override_format: str, body: str):
@@ -514,7 +579,7 @@ metric:
 phases:
   - name: arch
     fixed_overrides:
-      model_family: llama
+      model.dropout: 0.2
     n_trials: 2
     sampler: {{ type: grid }}
     search_space:
@@ -531,10 +596,9 @@ phases:
     exp = load_experiment(yaml_path)
     winners = run_experiment(exp)
 
-    # The opt phase winner should have model_family in effective_overrides
+    # The opt phase winner should have the parent's fixed override.
     opt_winner = winners["opt"]
-    assert "model_family" in opt_winner.effective_overrides
-    assert opt_winner.effective_overrides["model_family"] == "llama"
+    assert opt_winner.effective_overrides["model.dropout"] == 0.2
     # And also the inherited n_layers
     assert "n_layers" in opt_winner.effective_overrides
 
