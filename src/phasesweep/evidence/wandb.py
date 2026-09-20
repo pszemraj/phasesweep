@@ -17,6 +17,7 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+_WORKER_STDERR_LOG = "wandb-worker.stderr.log"
 
 
 @dataclass(frozen=True)
@@ -170,10 +171,12 @@ def poll_wandb_summary(
     )
     if time.monotonic() >= deadline:
         raise WandbPollTimeout(run_id, timeout_seconds)
+    diagnostic_path: Path | None = None
     with TemporaryDirectory(prefix="phasesweep-wandb-") as directory:
         worker_dir = Path(directory)
         request_path = worker_dir / "request.json"
         response_path = worker_dir / "response.json"
+        stderr_path = worker_dir / "stderr.log"
         private_atomic_write_text(
             request_path,
             json.dumps(
@@ -192,7 +195,7 @@ def poll_wandb_summary(
         )
         with (
             (worker_dir / "stdout.log").open("w", encoding="utf-8") as stdout,
-            (worker_dir / "stderr.log").open("w", encoding="utf-8") as stderr,
+            stderr_path.open("w", encoding="utf-8") as stderr,
         ):
             # Never let a previous safe trainer identity hide a failed worker launch.
             (trial_dir / PROCESS_IDENTITY_FILE).unlink(missing_ok=True)
@@ -221,6 +224,27 @@ def poll_wandb_summary(
         response = (
             json.loads(response_path.read_text(encoding="utf-8")) if response_path.is_file() else {}
         )
+        if not result.timed_out and (
+            result.return_code != 0
+            or result.failure_reason is not None
+            or response.get("status")
+            not in {
+                "summary",
+                "setup_error",
+                "terminal_error",
+                "invalid_evidence",
+                "import_error",
+                "timeout",
+            }
+        ):
+            diagnostic = stderr_path.read_text(encoding="utf-8", errors="replace")
+            if diagnostic:
+                diagnostic_path = trial_dir / _WORKER_STDERR_LOG
+                private_atomic_write_text(
+                    diagnostic_path,
+                    diagnostic,
+                    require_private_dir=False,
+                )
     # Definite operational causes remain definite even if cleanup crossed a deadline.
     if response.get("status") == "setup_error":
         raise WandbSetupError(run_id, response["cause"])
@@ -240,8 +264,10 @@ def poll_wandb_summary(
         or result.failure_reason is not None
         or response.get("status") != "summary"
     ):
+        diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
         raise RuntimeError(
             f"W&B evidence worker failed for attempt {run_id!r} (exit {result.return_code})."
+            f"{diagnostic}"
         )
     return response["capture"]
 

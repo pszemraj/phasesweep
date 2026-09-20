@@ -616,6 +616,27 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     assert_published_winner_evidence_local(_experiment_dir(topup))
 
 
+def test_log_regex_evaluation_revision_change_blocks_study_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import phasesweep.evidence.evaluation as evaluation_ops
+
+    experiment = _evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    pointer_before = _pointer_bytes(experiment)
+    monkeypatch.setattr(
+        evaluation_ops,
+        "LOG_REGEX_EVALUATION_REVISION",
+        evaluation_ops.LOG_REGEX_EVALUATION_REVISION + 1,
+    )
+
+    with pytest.raises(TrialEvidenceMissingError, match="extractor evaluation contract"):
+        run_experiment(_evidence_experiment(tmp_path, n_trials=2))
+
+    assert _trial_count(experiment) == 1
+    assert _pointer_bytes(experiment) == pointer_before
+
+
 @pytest.mark.parametrize(
     ("override_format", "filename", "damage"),
     [

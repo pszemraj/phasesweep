@@ -280,6 +280,28 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
     assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
 
 
+def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path):
+    from phasesweep.evidence.wandb import poll_wandb_summary
+
+    wandb_worker_sdk("raise RuntimeError('worker-diagnostic-marker')")
+
+    with pytest.raises(RuntimeError, match="Diagnostic preserved") as exc_info:
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=5,
+        )
+
+    diagnostic = tmp_path / "wandb-worker.stderr.log"
+    assert "worker-diagnostic-marker" in diagnostic.read_text()
+    assert diagnostic.stat().st_mode & 0o777 == 0o600
+    assert "worker-diagnostic-marker" not in str(exc_info.value)
+
+
 def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch):
     from phasesweep.errors import UnsafeProcessCleanupError
     from phasesweep.evidence.wandb import poll_wandb_summary

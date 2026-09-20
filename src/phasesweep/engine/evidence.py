@@ -455,6 +455,14 @@ def _verify_trial_evidence_dir(
         verify_digest=verify_objective_digest,
     )
     assert provenance is not None
+    recorded_extractor = provenance["extractor"]
+    if recorded_extractor["kind"] != extractor.type or recorded_extractor[
+        "config_sha256"
+    ] != extractor_config_fingerprint(extractor):
+        raise TrialEvidenceMissingError(
+            f"{subject} objective evidence disagrees with its configured extractor "
+            "evaluation contract."
+        )
     capture = provenance.get("remote_capture")
     if capture is not None and capture["run_id"] != attempt_id:
         raise TrialEvidenceMissingError(f"{subject} W&B capture belongs to another attempt.")
@@ -483,9 +491,7 @@ def _verify_trial_evidence_dir(
     if isinstance(extractor, WandbExtractor):
         source = provenance["source"]
         if (
-            provenance["extractor"]["kind"] != "wandb"
-            or provenance["extractor"]["config_sha256"] != extractor_config_fingerprint(extractor)
-            or capture is None
+            capture is None
             or any(
                 capture[field] != getattr(extractor, field)
                 for field in ("base_url", "entity", "project")
@@ -496,12 +502,8 @@ def _verify_trial_evidence_dir(
             raise TrialEvidenceMissingError(
                 f"{subject} W&B evidence disagrees with its configured source or selected scalar."
             )
-    elif provenance["extractor"]["kind"] == "wandb":
-        raise TrialEvidenceMissingError(f"{subject} W&B evidence cannot justify a local objective.")
     if isinstance(extractor, JsonExtractor) and (
-        provenance["extractor"]["kind"] != "json"
-        or provenance["extractor"]["config_sha256"] != extractor_config_fingerprint(extractor)
-        or provenance["source"].get("path") != extractor.path
+        provenance["source"].get("path") != extractor.path
         or provenance["source"].get("key") != extractor.key
     ):
         raise TrialEvidenceMissingError(
