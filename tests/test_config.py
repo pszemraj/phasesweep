@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from phasesweep import load_config, load_experiment
 from phasesweep.config import (
     ConfigError,
+    Constraint,
     ExecutionContext,
     Experiment,
     JsonExtractor,
@@ -16,8 +17,75 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
+    WandbExtractor,
+    WandbSummaryRequiredGate,
 )
 from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("base_url", "https://another.test"),
+        ("entity", "another"),
+        ("project", "another"),
+        ("poll_seconds", 3),
+        ("timeout_seconds", 5),
+    ],
+)
+def test_wandb_consumers_must_agree_per_phase(field, value):
+    objective = WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+    conflicting = objective.model_copy(update={field: value, "metric_key": "memory"})
+    with pytest.raises(ValueError, match=rf"constraints\[0\].extractor.{field}.*metric.extractor"):
+        make_experiment(
+            metric=Metric(extractor=objective),
+            constraints=[Constraint(name="memory", extractor=conflicting, max=5)],
+        )
+
+
+def test_wandb_query_normalizes_targets_and_collects_exact_keys():
+    from phasesweep.config.models import _wandb_query
+
+    objective = WandbExtractor(
+        type="wandb",
+        base_url="https://API.WANDB.AI/",
+        entity="e",
+        project="p",
+        metric_key="eval/loss",
+    )
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="e", project="p", keys=["complete"]
+    )
+    experiment = make_experiment(metric=Metric(extractor=objective), gates=[gate])
+    query = _wandb_query(experiment, experiment.phases[0].gates)
+    assert query.source.base_url == "https://api.wandb.ai"
+    assert query.numeric_keys == ("eval/loss",)
+    assert query.presence_keys == ("complete",)
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"WANDB_RUN_ID": "foreign"},
+        {"WANDB_RESUME": "allow"},
+        {"WANDB_PROJECT": "foreign"},
+        {"WANDB_ENTITY": "foreign"},
+        {"WANDB_BASE_URL": "https://foreign.test"},
+        {"WANDB_MODE": "offline"},
+        {"WANDB_MODE": "disabled"},
+        {"WANDB_DISABLED": "true"},
+    ],
+)
+def test_wandb_managed_conflicts_fail_during_config_validation(env):
+    with pytest.raises(ValueError, match="W&B|WANDB"):
+        make_experiment(
+            env=env,
+            metric=Metric(
+                extractor=WandbExtractor(
+                    type="wandb", entity="e", project="p", metric_key="eval/loss"
+                )
+            ),
+        )
 
 
 def test_phase_composition_accepts_a_linear_chain() -> None:

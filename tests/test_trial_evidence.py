@@ -25,7 +25,17 @@ import yaml
 
 import phasesweep.engine.evidence as evidence_ops
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Phase, Sampler
+from phasesweep.config import (
+    Constraint,
+    ExecutionContext,
+    Experiment,
+    IntParam,
+    Metric,
+    Phase,
+    Sampler,
+    WandbExtractor,
+    WandbSummaryRequiredGate,
+)
 from phasesweep.engine import (
     NoFeasibleTrialError,
     TrialEvidenceMissingError,
@@ -53,6 +63,172 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
 )
 from tests.conftest import assert_published_winner_evidence_local, make_experiment, write_trainer
+
+
+@pytest.mark.parametrize("consumers", ["primary", "constraint", "gate", "combined"])
+def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
+    tmp_path,
+    monkeypatch,
+    wandb_worker_sdk,
+    consumers,
+):
+    import sys
+
+    from phasesweep.engine import read_winners
+
+    calls_path = tmp_path / "remote-reads"
+    wandb_worker_sdk(f"""
+        from pathlib import Path
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                with Path({str(calls_path)!r}).open("a") as stream:
+                    stream.write(path + "\\n")
+                return type("Run", (), {{"state": "finished", "summary_metrics":
+                    {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted"}}}})()
+    """)
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, os
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--x", type=int)
+        parser.add_argument("--receipt", required=True)
+        args = parser.parse_args()
+        Path(args.receipt).write_text(json.dumps({
+            "x": args.x,
+            "identity": {name: os.environ.get(name) for name in
+                ["WANDB_RUN_ID", "WANDB_ENTITY", "WANDB_PROJECT", "WANDB_RESUME", "WANDB_BASE_URL"]},
+        }))
+        print("x=0.5")
+    """,
+    )
+    remote = WandbExtractor(
+        type="wandb",
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=5,
+    )
+    constraints = (
+        [
+            Constraint(
+                name="memory", extractor=remote.model_copy(update={"metric_key": "memory"}), max=5
+            )
+        ]
+        if consumers in {"constraint", "combined"}
+        else []
+    )
+    gates = (
+        [
+            WandbSummaryRequiredGate(
+                type="wandb_summary_required",
+                base_url="https://example.test",
+                entity="e",
+                project="p",
+                poll_seconds=0.01,
+                timeout_seconds=5,
+                keys=["complete"],
+            )
+        ]
+        if consumers in {"gate", "combined"}
+        else []
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'study.db'}",
+        trial_command=f"{sys.executable} {trainer} --receipt {{trial_dir}}/receipt.json {{overrides}}",
+        metric=Metric(extractor=remote) if consumers in {"primary", "combined"} else None,
+        constraints=constraints,
+        execution=ExecutionContext(inherit_env="none"),
+        phases=[
+            Phase(
+                name="first",
+                n_trials=1,
+                fixed_overrides={"x": 7},
+                gates=gates,
+                sampler=Sampler(type="random", seed=0),
+            ),
+            Phase(
+                name="next",
+                n_trials=1,
+                inherits=["first"],
+                gates=gates,
+                sampler=Sampler(type="random", seed=0),
+            ),
+        ],
+    )
+    # Ambient managed identity is normalized; no SDK/account authentication is needed by fixtures.
+    monkeypatch.setenv("WANDB_RUN_ID", "ambient-old-run")
+    monkeypatch.setenv("WANDB_PROJECT", "ambient-old-project")
+    winners = run_experiment(experiment)
+    assert winners["next"].effective_overrides == {"x": 7}
+    assert len(calls_path.read_text().splitlines()) == 2
+
+    for phase in experiment.phases:
+        winner = winners[phase.name]
+        capture = winner.objective_provenance["remote_capture"]
+        assert capture["run_id"] == winner.attempt_id
+        assert capture["run_state"] == "finished"
+        assert "secret" not in json.dumps(capture)
+        trial_dir = next(_phase_dir(experiment, phase.name).glob("trial_*"))
+        receipt = json.loads((trial_dir / "receipt.json").read_text())
+        assert receipt["x"] == 7
+        assert receipt["identity"] == {
+            "WANDB_RUN_ID": winner.attempt_id,
+            "WANDB_ENTITY": "e",
+            "WANDB_PROJECT": "p",
+            "WANDB_RESUME": "never",
+            "WANDB_BASE_URL": "https://example.test",
+        }
+        if consumers == "primary" and phase.name == "first":
+            from dataclasses import replace
+
+            for fields, replacement in [
+                (("source", "metric_key"), "wrong"),
+                (("remote_capture", "run_id"), "another-attempt"),
+                (("remote_capture", "project"), "another-project"),
+                (("remote_capture", "values", "eval/loss"), 9.0),
+                (("remote_capture", "constraint_keys"), {"undeclared": "eval/loss"}),
+            ]:
+                altered = deepcopy(winner.objective_provenance)
+                target = altered
+                for field in fields[:-1]:
+                    target = target[field]
+                target[fields[-1]] = replacement
+                with pytest.raises(TrialEvidenceMissingError):
+                    evidence_ops._verify_winner_objective_evidence(
+                        experiment, phase.name, replace(winner, objective_provenance=altered)
+                    )
+    # Remote deletion and unavailable credentials/SDK cannot affect frozen reads/replay.
+    wandb_worker_sdk("raise AssertionError('remote access after publication')")
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "wandb", None)
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
+    assert len(read_winners(experiment)) == 2
+    assert run_experiment(experiment)["next"].attempt_id == winners["next"].attempt_id
+    assert len(calls_path.read_text().splitlines()) == 2
+    if consumers == "primary":
+        from phasesweep.engine.state import TRIAL_TARGET_ATTR
+        from phasesweep.errors import PhaseSweepError
+
+        increased = experiment.model_copy(
+            update={
+                "phases": [
+                    experiment.phases[0],
+                    experiment.phases[1].model_copy(update={"n_trials": 2}),
+                ]
+            }
+        )
+        with pytest.raises(PhaseSweepError, match="optional SDK"):
+            run_experiment(increased)
+        study = optuna.load_study(study_name="t::next", storage=experiment.resolved_storage)
+        assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
+        assert len(study.trials) == 1
+
 
 # Every trial prints the same objective, so selection always ties and the tie
 # break (lowest trial number) makes trial 0 the winner no matter how many

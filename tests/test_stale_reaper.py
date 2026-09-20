@@ -1653,6 +1653,65 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
         stale.wait(timeout=5)
 
 
+def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
+    tmp_path, monkeypatch, wandb_worker_sdk
+):
+    """The existing registry owns the polling worker after the trainer exits."""
+    from phasesweep.runtime.process import read_stale_process_identity
+
+    old = make_experiment(
+        workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'study.db'}", n_trials=1
+    )
+    study, trial_dir, number = _fabricate_registered_attempt(old, "p", attempt_id="remote-attempt")
+    started = tmp_path / "worker-started"
+    wandb_worker_sdk(f"""
+        import time
+        from pathlib import Path
+        class Api:
+            def __init__(self, **kwargs):
+                Path({str(started)!r}).write_text("started")
+                time.sleep(60)
+    """)
+    parent_code = f"""
+from pathlib import Path
+from phasesweep.evidence.wandb import poll_wandb_summary
+poll_wandb_summary(base_url="https://example.test", entity="e", project="p",
+    run_id="remote-attempt", trial_dir=Path({str(trial_dir)!r}),
+    poll_seconds=0.01, timeout_seconds=120)
+"""
+    parent = subprocess.Popen([sys.executable, "-c", parent_code])
+    identity = None
+    try:
+        deadline = time.monotonic() + 10
+        while not started.exists() and time.monotonic() < deadline:
+            assert parent.poll() is None
+            time.sleep(0.02)
+        assert started.exists()
+        identity = read_stale_process_identity(trial_dir, expected_attempt_id="remote-attempt")
+        parent.kill()
+        parent.wait(timeout=5)
+        monkeypatch.setitem(sys.modules, "wandb", None)
+        removed = old.model_copy(
+            update={
+                "phases": [
+                    Phase(name="replacement", n_trials=1, sampler=Sampler(type="random", seed=0))
+                ]
+            }
+        )
+        report = _PreflightCleanupReport()
+        _preflight_active_attempts(removed, report)
+        assert report.cleanup_confirmed
+        assert report.recovered_attempt_ids == {"remote-attempt"}
+        assert study.get_trials()[number].state == optuna.trial.TrialState.FAIL
+        assert not list(_attempts_dir(old).glob("*.json"))
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=5)
+        if identity is not None:
+            cleanup_stale_trial_process(identity)
+
+
 def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) -> None:
     """A registered attempt is repaired through its *recorded* storage URL.
 

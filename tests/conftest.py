@@ -402,3 +402,28 @@ def make_trial_context(
         return_code=0,
         duration_seconds=0.0,
     )
+
+
+@pytest.fixture
+def wandb_worker_sdk(tmp_path, monkeypatch):
+    """Supply controlled API responses to the real supervised evidence worker."""
+    import sys
+    from types import ModuleType
+
+    # Availability preflight is independent of the worker fixtures and must
+    # also work in the core-only test environment.
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", ModuleType("wandb.apis.public"))
+    root = tmp_path / "sdk"
+    apis = root / "wandb" / "apis"
+    apis.mkdir(parents=True)
+    (root / "wandb" / "__init__.py").write_text("")
+    (root / "wandb" / "errors.py").write_text(
+        "class AuthenticationError(Exception): pass\nclass UsageError(Exception): pass\n"
+    )
+    (apis / "__init__.py").write_text("")
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(root), os.environ.get("PYTHONPATH", "")]))
+
+    def install(source):
+        (apis / "public.py").write_text(textwrap.dedent(source))
+
+    return install

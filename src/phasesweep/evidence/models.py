@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
     BaseModel,
@@ -186,7 +189,44 @@ class LogRegexExtractor(_TrialFilePathModel):
         return value
 
 
-ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor
+class _WandbSummarySource(_Frozen):
+    """One normalized remote target and a bounded finished-summary query."""
+
+    base_url: str = "https://api.wandb.ai"
+    entity: str = Field(min_length=1, pattern=r"^[^/\s]+$")
+    project: str = Field(min_length=1, pattern=r"^[^/\s]+$")
+    poll_seconds: ConfigFloat = Field(default=2.0, gt=0, allow_inf_nan=False)
+    timeout_seconds: ConfigFloat = Field(default=120.0, ge=1, allow_inf_nan=False)
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalized_endpoint(cls, value: str) -> str:
+        """Normalize the endpoint without admitting credentials or query strings."""
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"https", "http"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "W&B base_url requires an HTTP(S) endpoint without credentials, query, or fragment."
+            )
+        return urlunsplit(
+            (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
+        )
+
+
+class WandbExtractor(_WandbSummarySource):
+    """Select one exact scalar key from the attempt's finished W&B summary."""
+
+    type: Literal["wandb"]
+    metric_key: str = Field(min_length=1)
+
+
+ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
 Extractor = JsonExtractor | ObjectiveExtractor
 
 
@@ -214,7 +254,7 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
     - A single coarse ``attempt_bound`` claim overstated weak extractors, so
       it is split into three precise flags (review v0.5.15 / item C):
 
-      - ``attempt_location_scoped`` is ``True`` for every extractor kind:
+      - ``attempt_location_scoped`` is ``True`` for local extractors:
         each reads evidence from a trial directory uniquely scoped to this
         generation+attempt. Scoping alone is weak: nothing in a ``log_regex``
         file's *contents* identifies the
@@ -225,11 +265,11 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         ``overrides_sha256`` in its own body, and
         ``_extract_json_envelope`` cross-checks those reported values
         against the runtime's own identity before accepting the result.
-        ``log_regex`` has no identity fields to check at all, so it is
+        Other readers have no reported identity fields to check, so it is
         ``False``.
-      - ``source_identity_keyed`` is ``False`` for both local extractor
-        kinds: their sources are location-addressed files. The envelope's
-        stronger guarantee is captured by ``attempt_identity_bound``.
+      - ``source_identity_keyed`` is ``True`` for W&B: the normalized target
+        and exact attempt ID identify its finished summary. Local readers use
+        location-addressed files. W&B makes no envelope metadata assurances.
 
     :param ObjectiveExtractor extractor: Configured objective extractor to describe.
     :return dict[str, str | bool]: Assurance payload with the extractor ``kind``
@@ -258,9 +298,9 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         }
     return {
         "kind": extractor.type,
-        "attempt_location_scoped": True,
+        "attempt_location_scoped": not isinstance(extractor, WandbExtractor),
         "attempt_identity_bound": False,
-        "source_identity_keyed": False,
+        "source_identity_keyed": isinstance(extractor, WandbExtractor),
         "objective_name_bound": False,
         "split_bound": False,
         "evaluation_policy_bound": False,
@@ -283,7 +323,7 @@ class _ObjectiveEvidenceFields(BaseModel):
     :func:`objective_evidence_assurance` for exactly what each flag means.
     """
 
-    kind: Literal["json_envelope", "log_regex"]
+    kind: Literal["json_envelope", "log_regex", "wandb"]
     attempt_location_scoped: bool
     attempt_identity_bound: bool
     source_identity_keyed: bool
@@ -445,7 +485,73 @@ class Sha256Gate(_TrialFilePathModel):
         return value.lower()
 
 
+class WandbSummaryRequiredGate(_WandbSummarySource):
+    """Require keys in the same finished capture used by other remote consumers."""
+
+    type: Literal["wandb_summary_required"]
+    keys: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+
+
+@dataclass(frozen=True)
+class WandbQuery:
+    """An attempt's shared query compiled from existing evidence declarations."""
+
+    source: _WandbSummarySource
+    numeric_keys: tuple[str, ...]
+    presence_keys: tuple[str, ...]
+    constraint_keys: tuple[tuple[str, str], ...] = ()
+    gate_keys: tuple[tuple[int, tuple[str, ...]], ...] = ()
+
+
+def compose_wandb_environment(
+    query: WandbQuery, configured: Mapping[str, str], environment: Mapping[str, str]
+) -> dict[str, str]:
+    """Bind remote evidence before environment identity, preserving other settings.
+
+    :param WandbQuery query: Phase's agreed target and evidence requirements.
+    :param Mapping[str, str] configured: Explicit experiment environment entries.
+    :param Mapping[str, str] environment: Already composed trainer environment.
+    :return dict[str, str]: Bound base environment, before the generated attempt ID.
+    :raises ValueError: Explicit managed settings conflict, or remote logging is disabled.
+    """
+    source = query.source
+    bindings = {
+        "WANDB_BASE_URL": source.base_url,
+        "WANDB_ENTITY": source.entity,
+        "WANDB_PROJECT": source.project,
+        "WANDB_RESUME": "never",
+    }
+    for key, expected in bindings.items():
+        if key in configured:
+            actual = configured[key]
+            if key == "WANDB_BASE_URL":
+                actual = _WandbSummarySource._normalized_endpoint(actual)
+            if actual != expected:
+                raise ValueError(
+                    f"env.{key} conflicts with managed W&B evidence; remove it or match the evidence target."
+                )
+    if "WANDB_RUN_ID" in configured:
+        raise ValueError("env.WANDB_RUN_ID conflicts with the generated W&B attempt ID; remove it.")
+    if environment.get("WANDB_MODE", "online").lower() in {
+        "offline",
+        "dryrun",
+        "disabled",
+    } or environment.get("WANDB_DISABLED", "").lower() in {"1", "true", "yes", "on"}:
+        raise ValueError(
+            "W&B evidence requires online logging; remove offline/disabled W&B settings."
+        )
+    result = dict(environment)
+    result.update(bindings)
+    result.pop("WANDB_RUN_ID", None)
+    return result
+
+
 Gate = Annotated[
-    RequiredFileGate | JsonEqualsGate | JsonScalarBoundGate | ArtifactSizeGate | Sha256Gate,
+    RequiredFileGate
+    | JsonEqualsGate
+    | JsonScalarBoundGate
+    | ArtifactSizeGate
+    | Sha256Gate
+    | WandbSummaryRequiredGate,
     Field(discriminator="type"),
 ]

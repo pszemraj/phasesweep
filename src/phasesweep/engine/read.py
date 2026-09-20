@@ -428,7 +428,7 @@ def _recorded_objective_evidence(candidate: object) -> dict[str, str | bool] | N
     }
     if not isinstance(candidate, Mapping) or set(candidate) != expected:
         return None
-    if candidate.get("kind") not in {"json_envelope", "log_regex"}:
+    if candidate.get("kind") not in {"json_envelope", "log_regex", "wandb"}:
         return None
     if any(type(candidate[key]) is not bool for key in candidate if key != "kind"):
         return None

@@ -32,6 +32,11 @@ from phasesweep.evidence.models import (
     Extractor,
     Gate,
     ObjectiveExtractor,
+    WandbExtractor,
+    WandbQuery,
+    WandbSummaryRequiredGate,
+    _WandbSummarySource,
+    compose_wandb_environment,
     objective_evidence_assurance,
 )
 from phasesweep.runtime.files import (
@@ -744,6 +749,9 @@ class Experiment(_Frozen):
             _validate_sampler_resumability(self.resolved_storage, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
+            query = _wandb_query(self, phase.gates, gate_location=f"phases[{len(seen)}].gates")
+            if query is not None:
+                compose_wandb_environment(query, self.env, self.env)
 
             origins_by_phase[phase.name] = resolved_origins
             seen[phase.name] = phase
@@ -1105,6 +1113,63 @@ def _validate_trial_command_template(
             f"Add {{{required_placeholder}}} to trial_command, or use the default "
             "override_format='yaml_file' with trainer_config and {config_path}."
         )
+
+
+def _wandb_query(
+    experiment: Experiment, gates: list[Gate], *, gate_location: str = "gates"
+) -> WandbQuery | None:
+    """Compile existing declarations into one target and one capture per phase.
+
+    :param Experiment experiment: Primary objective and scalar constraints.
+    :param list[Gate] gates: Current phase's gates.
+    :param str gate_location: Configuration path for actionable conflict diagnostics.
+    :return WandbQuery | None: Agreed query, or no remote consumer.
+    :raises ValueError: Remote consumers disagree on target or polling policy.
+    """
+    consumers: list[tuple[str, _WandbSummarySource]] = []
+    if isinstance(experiment.metric.extractor, WandbExtractor):
+        consumers.append(("metric.extractor", experiment.metric.extractor))
+    consumers.extend(
+        (f"constraints[{index}].extractor", constraint.extractor)
+        for index, constraint in enumerate(experiment.constraints)
+        if isinstance(constraint.extractor, WandbExtractor)
+    )
+    consumers.extend(
+        (f"{gate_location}[{index}]", gate)
+        for index, gate in enumerate(gates)
+        if isinstance(gate, WandbSummaryRequiredGate)
+    )
+    if not consumers:
+        return None
+    first_location, first = consumers[0]
+    for location, source in consumers[1:]:
+        for field in ("base_url", "entity", "project", "poll_seconds", "timeout_seconds"):
+            if getattr(source, field) != getattr(first, field):
+                raise ValueError(
+                    f"{location}.{field} conflicts with {first_location}.{field}; W&B consumers must share one target and polling policy."
+                )
+    numeric = {source.metric_key for _, source in consumers if isinstance(source, WandbExtractor)}
+    presence = {
+        key
+        for _, source in consumers
+        if isinstance(source, WandbSummaryRequiredGate)
+        for key in source.keys
+    }
+    return WandbQuery(
+        first,
+        tuple(sorted(numeric)),
+        tuple(sorted(presence)),
+        tuple(
+            (constraint.name, constraint.extractor.metric_key)
+            for constraint in experiment.constraints
+            if isinstance(constraint.extractor, WandbExtractor)
+        ),
+        tuple(
+            (index, tuple(gate.keys))
+            for index, gate in enumerate(gates)
+            if isinstance(gate, WandbSummaryRequiredGate)
+        ),
+    )
 
 
 Config = Experiment

@@ -25,6 +25,7 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
+    WandbExtractor,
 )
 from phasesweep.engine import (
     ArtifactRootConflictError,
@@ -97,6 +98,27 @@ from tests.conftest import (
     write_trainer,
     write_yaml,
 )
+
+
+def test_wandb_managed_defaults_and_rotating_credentials_do_not_change_cohort(monkeypatch):
+    experiment = make_experiment(
+        metric=Metric(
+            extractor=WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+        ),
+        execution=ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"]),
+    )
+    monkeypatch.setenv("WANDB_API_KEY", "first")
+    monkeypatch.setenv("WANDB_RUN_ID", "old")
+    monkeypatch.setenv("WANDB_PROJECT", "old")
+    first = _environment_identity(experiment)
+    monkeypatch.setenv("WANDB_API_KEY", "rotated")
+    monkeypatch.setenv("WANDB_RUN_ID", "different")
+    monkeypatch.setenv("WANDB_PROJECT", "different")
+    second = _environment_identity(experiment)
+    assert first.digest == second.digest
+    assert second.values["WANDB_API_KEY"] == "rotated"
+    assert second.values["WANDB_PROJECT"] == "p"
+    assert "WANDB_RUN_ID" not in second.values
 
 
 def _two_phase_experiment(

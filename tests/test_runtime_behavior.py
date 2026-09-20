@@ -94,6 +94,46 @@ from tests.conftest import (
 )
 
 
+@pytest.mark.parametrize(("value", "state"), [(3, "COMPLETE"), (10**400, "FAIL")])
+def test_invalid_remote_constraint_fails_but_measured_violation_is_complete(
+    tmp_path,
+    wandb_worker_sdk,
+    value,
+    state,
+):
+    from phasesweep.config import WandbExtractor
+
+    wandb_worker_sdk(f"""
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                return type("Run", (), {{"state": "finished", "summary_metrics": {{"memory": {value!r}}}}})()
+    """)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'study.db'}",
+        trial_command="echo {overrides} x=0.25",
+        n_trials=1,
+        constraints=[
+            Constraint(
+                name="memory",
+                max=1,
+                extractor=WandbExtractor(
+                    type="wandb", entity="e", project="p", metric_key="memory", timeout_seconds=5
+                ),
+            )
+        ],
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+    trial = optuna.load_study(study_name="t::p", storage=experiment.resolved_storage).trials[0]
+    assert trial.state.name == state
+    if state == "COMPLETE":
+        assert trial.value == 0.25
+    else:
+        assert "numeric evidence" in json.dumps(trial.user_attrs)
+
+
 def test_run_experiment_revalidates_programmatically_copied_config(tmp_path: Path) -> None:
     """The library boundary rejects model_copy updates that skipped validation."""
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)

@@ -410,7 +410,7 @@ def _run_phase(
     # The trainer environment is a property of this process and its config, not
     # of any one trial, so it is composed once per phase execution and stamped
     # onto every trial (review v0.5.18 / finding F3).
-    environment_identity = _environment_identity(experiment)
+    environment_identity = _environment_identity(experiment, phase.name)
 
     if not dry_run:
         # A study this invocation just created was invisible to preflight, so
@@ -525,6 +525,12 @@ def _run_phase(
                 "timeout_scope": None,
             },
         )
+
+    from phasesweep.config.models import _wandb_query
+    from phasesweep.evidence.wandb import require_wandb_sdk
+
+    if _wandb_query(experiment, phase.gates) is not None:
+        require_wandb_sdk()
 
     gpu_pool = GpuPool.create(
         n_jobs=phase.n_jobs,

@@ -12,11 +12,12 @@ import json
 import logging
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, check_bounds
+from phasesweep.config.models import _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
     ProcessCleanupUncertainError as ProcessCleanupUncertainError,
@@ -32,7 +33,7 @@ from phasesweep.evidence.evaluation import (
     evaluate_gates,
     run_extractor,
 )
-from phasesweep.evidence.models import JsonEnvelopeExtractor
+from phasesweep.evidence.models import JsonEnvelopeExtractor, compose_wandb_environment
 from phasesweep.runtime.commands import (
     dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
@@ -130,7 +131,7 @@ _TRIAL_BOUND_ENV = (
 _DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
 
 
-def _trainer_environment(experiment: Experiment) -> dict[str, str]:
+def _trainer_environment(experiment: Experiment, phase_name: str | None = None) -> dict[str, str]:
     """Compose the trainer environment per the execution contract.
 
     ``inherit_env: all`` preserves the historical full-inheritance behavior.
@@ -141,6 +142,7 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
     PhaseSweep assigns for each attempt.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
+    :param str | None phase_name: Phase whose remote consumers manage W&B identity.
     :return dict[str, str]: The composed trainer environment.
     """
     contract = experiment.execution.inherit_env
@@ -157,6 +159,12 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
     # recorded. Ambient copies cannot affect the trainer or its study cohort.
     for name in _TRIAL_BOUND_ENV:
         env.pop(name, None)
+    phase = next(
+        (phase for phase in experiment.phases if phase.name == phase_name), experiment.phases[0]
+    )
+    query = _wandb_query(experiment, phase.gates)
+    if query is not None:
+        env = compose_wandb_environment(query, experiment.env, env)
     return env
 
 
@@ -190,7 +198,9 @@ class EnvironmentIdentity:
     values: dict[str, str]
 
 
-def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
+def _environment_identity(
+    experiment: Experiment, phase_name: str | None = None
+) -> EnvironmentIdentity:
     """Fingerprint the semantic part of the composed trainer environment.
 
     Values named by ``execution.passthrough_env`` are deliberately excluded:
@@ -212,10 +222,11 @@ def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
     themselves never enter config metadata.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
+    :param str | None phase_name: Phase whose remote consumers normalize W&B defaults.
     :return EnvironmentIdentity: Digest, sorted variable names, and the
         composed name-to-value mapping the digest covers.
     """
-    env = _trainer_environment(experiment)
+    env = _trainer_environment(experiment, phase_name)
     passthrough = set(experiment.execution.passthrough_env) - set(experiment.env)
     items = sorted((name, value) for name, value in env.items() if name not in passthrough)
     encoded = json.dumps(items, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -351,6 +362,7 @@ def _failed_trial(
     constraints: dict[str, float] | None = None,
     gate_results: list[GateResult] | None = None,
     deadline_exhausted: bool = False,
+    objective_provenance: dict[str, Any] | None = None,
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
 
@@ -366,6 +378,7 @@ def _failed_trial(
         constraints: Constraint readings collected before the failure, if any.
         gate_results: Evidence gate results collected before the failure, if any.
         deadline_exhausted: Whether the phase/run deadline caused the failure.
+        objective_provenance: Frozen evidence already captured before a later gate failed.
 
     Returns:
         A :class:`TrialResult` with ``metric=None`` and ``feasible=False``.
@@ -380,6 +393,7 @@ def _failed_trial(
         failure_reason=failure_reason,
         gate_results=gate_results,
         deadline_exhausted=deadline_exhausted,
+        objective_provenance=objective_provenance,
     )
 
 
@@ -543,9 +557,15 @@ def launch_trial(
     # subprocess receives, and the opt-in raw record is written before any
     # per-trial binding is layered on, so the file stays the digest's exact
     # preimage (review v0.5.18 / finding F3).
-    identity = _environment_identity(experiment)
+    identity = _environment_identity(experiment, phase_name)
     _record_trainer_environment(experiment, identity, workdir)
     env = dict(identity.values)
+    phase = next(
+        (phase for phase in experiment.phases if phase.name == phase_name), experiment.phases[0]
+    )
+    wandb_query = _wandb_query(experiment, phase.gates)
+    if wandb_query is not None:
+        env["WANDB_RUN_ID"] = attempt_id
     trainer_cwd = _resolved_execution_cwd(experiment)
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
@@ -606,6 +626,8 @@ def launch_trial(
         run_name=run_name,
         return_code=proc_result.return_code,
         duration_seconds=proc_result.duration_seconds,
+        wandb_environment=env if wandb_query is not None else None,
+        wandb_query=wandb_query,
     )
 
     return ExecutedTrial(
@@ -665,6 +687,9 @@ def extract_trial_result(
     """
     import time
 
+    executed = replace(
+        executed, ctx=replace(executed.ctx, wandb_query=_wandb_query(experiment, gates or []))
+    )
     rc = executed.process.return_code
     duration = executed.process.duration_seconds
     failure_reason = executed.process.failure_reason
@@ -812,6 +837,8 @@ def extract_trial_result(
             feasible = False
 
     gate_results = evaluate_gates(executed.ctx, gates or [], deadline=deadline)
+    if executed.ctx.wandb_capture:
+        objective_provenance["remote_capture"] = dict(executed.ctx.wandb_capture)
     failed_gates = [gate for gate in gate_results if not gate.passed]
     if failed_gates and enforce_gates:
         detail = "; ".join(gate.detail for gate in failed_gates)
@@ -825,6 +852,7 @@ def extract_trial_result(
             rc=rc,
             duration=duration,
             failure_reason=f"evidence gates failed: {detail}",
+            objective_provenance=objective_provenance,
             constraints=constraint_values,
             gate_results=gate_results,
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),

@@ -5,7 +5,9 @@ import json
 import os
 import time
 import tracemalloc
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -16,10 +18,337 @@ from phasesweep.config import (
     JsonEqualsGate,
     JsonExtractor,
     LogRegexExtractor,
+    WandbExtractor,
+    WandbSummaryRequiredGate,
 )
 from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.evaluation import extractor_config_fingerprint
 from tests.conftest import make_trial_context
+
+
+def _wandb_poll(**kwargs):
+    from phasesweep.evidence.wandb import _poll_wandb_summary
+
+    return _poll_wandb_summary(
+        base_url="https://example.test",
+        entity="entity",
+        project="project",
+        run_id="attempt",
+        poll_seconds=0.001,
+        timeout_seconds=1,
+        **kwargs,
+    )
+
+
+def test_json_float_overflow_is_invalid_evidence(tmp_path):
+    from phasesweep.evidence.evaluation import json_float
+
+    with pytest.raises(ValueError, match="finite scalar range"):
+        json_float(10**400, label="objective")
+    (tmp_path / "result.json").write_text(json.dumps({"x": 10**400}))
+    with pytest.raises(ExtractorError, match="finite scalar range"):
+        run_extractor(
+            make_trial_context(tmp_path), JsonExtractor(type="json", path="result.json", key="x")
+        )
+
+
+def test_wandb_real_sdk_decodes_refreshed_finished_summary(tmp_path, monkeypatch):
+    public = pytest.importorskip("wandb.apis.public")
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path))
+    calls = []
+    responses = iter(
+        [
+            {"state": "running", "summaryMetrics": '{"eval/loss": 9}'},
+            {
+                "state": "finished",
+                "summaryMetrics": '{"eval/loss": 0.25, "large": {"unrelated": true}}',
+            },
+        ]
+    )
+
+    class Transport:
+        def execute_graphql(self, query, variables, **kwargs):
+            calls.append(variables)
+            return {"project": {"run": next(responses)}}
+
+    # Keep actual Api.run, Run construction, and summary decoding. Replace only
+    # authenticated transport setup; this test never contacts the service.
+    def initialize(self, overrides=None, timeout=None):
+        assert overrides == {"base_url": "https://example.test"}
+        self.settings = {"entity": "entity", "project": "project"}
+        self._runs = {}
+        self._service_api = Transport()
+        self.api_key = None
+
+    monkeypatch.setattr(public.Api, "__init__", initialize)
+    capture = _wandb_poll(required_keys=["eval/loss"], presence_keys=["large", "absent"])
+    assert capture["values"] == {"eval/loss": 0.25}
+    assert capture["present_keys"] == ["large"]
+    assert len(calls) == 2
+    assert all(
+        call == {"entity": "entity", "project": "project", "name": "attempt"} for call in calls
+    )
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 503])
+def test_wandb_real_sdk_error_causes_are_preserved(monkeypatch, status):
+    public = pytest.importorskip("wandb.apis.public")
+    from requests import HTTPError, Response
+    from wandb.errors import CommError
+
+    from phasesweep.evidence.wandb import WandbSetupError
+
+    response = Response()
+    response.status_code = status
+    error = CommError("secret-token", exc=HTTPError("secret-token", response=response))
+    attempts = []
+
+    def initialize(self, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise error
+
+    monkeypatch.setattr(public.Api, "__init__", initialize)
+    monkeypatch.setattr(
+        public.Api,
+        "run",
+        lambda self, path: SimpleNamespace(state="finished", summary_metrics={"eval/loss": 0.25}),
+    )
+    if status in {401, 403}:
+        with pytest.raises(WandbSetupError) as caught:
+            _wandb_poll(required_keys=["eval/loss"])
+        assert str(status) in caught.value.cause
+        assert "secret-token" not in caught.value.cause
+        assert len(attempts) == 1
+    else:
+        assert _wandb_poll(required_keys=["eval/loss"])["values"] == {"eval/loss": 0.25}
+        assert len(attempts) == 2
+
+
+@pytest.mark.parametrize("state", ["failed", "crashed", "killed", "preempted"])
+def test_wandb_terminal_runs_cannot_win(monkeypatch, state):
+    public = pytest.importorskip("wandb.apis.public")
+    from phasesweep.evidence.wandb import WandbRunTerminalError
+
+    monkeypatch.setattr(
+        public,
+        "Api",
+        lambda **kwargs: SimpleNamespace(
+            run=lambda path: SimpleNamespace(state=state, summary_metrics={"loss": 0.2})
+        ),
+    )
+    with pytest.raises(WandbRunTerminalError) as caught:
+        _wandb_poll(required_keys=["loss"])
+    assert caught.value.state == state
+
+
+@pytest.mark.parametrize("value", [True, "0.2", None, [], {}, float("inf"), 10**400])
+def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
+    public = pytest.importorskip("wandb.apis.public")
+    monkeypatch.setattr(
+        public,
+        "Api",
+        lambda **kwargs: SimpleNamespace(
+            run=lambda path: SimpleNamespace(state="finished", summary_metrics={"loss": value})
+        ),
+    )
+    with pytest.raises(ValueError):
+        _wandb_poll(required_keys=["loss"])
+
+
+def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
+    from phasesweep.evidence.models import WandbQuery
+
+    objective = WandbExtractor(
+        type="wandb", entity="entity", project="project", metric_key="eval/loss"
+    )
+    constraint = objective.model_copy(update={"metric_key": "memory"})
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="entity", project="project", keys=["done"]
+    )
+    query = WandbQuery(objective, ("eval/loss", "memory"), ("done",))
+    ctx = replace(make_trial_context(tmp_path), wandb_query=query)
+    calls = []
+
+    def capture(**kwargs):
+        calls.append(kwargs)
+        return {
+            "values": {"eval/loss": 0.2, "memory": 4.0},
+            "present_keys": ["done"],
+            "retrieved_at": "2026-09-20T00:00:00Z",
+        }
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    provenance = {}
+    assert run_extractor(ctx, objective, provenance=provenance) == 0.2
+    assert run_extractor(ctx, constraint) == 4
+    assert all(result.passed for result in evaluate_gates(ctx, [gate]))
+    assert len(calls) == 1
+    assert calls[0]["required_keys"] == ("eval/loss", "memory")
+    assert provenance["remote_capture"]["run_id"] == ctx.attempt_id
+
+
+def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monkeypatch):
+    from phasesweep.evidence.wandb import _poll_wandb_summary
+
+    public = pytest.importorskip("wandb.apis.public")
+    calls = []
+
+    def lookup(path):
+        calls.append(path)
+        return SimpleNamespace(state="finished", summary_metrics={})
+
+    monkeypatch.setattr(public, "Api", lambda **kwargs: SimpleNamespace(run=lookup))
+    monkeypatch.setattr(
+        "phasesweep.evidence.evaluation.poll_wandb_summary",
+        lambda trial_dir, environment, **kwargs: _poll_wandb_summary(**kwargs),
+    )
+    result = evaluate_gates(
+        make_trial_context(tmp_path),
+        [
+            WandbSummaryRequiredGate(
+                type="wandb_summary_required", entity="e", project="p", keys=["complete"]
+            )
+        ],
+    )[0]
+    assert not result.passed
+    assert not result.deadline_exhausted
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("stage", ["constructor", "lookup"])
+def test_wandb_late_sdk_success_is_rejected(monkeypatch, stage):
+    public = pytest.importorskip("wandb.apis.public")
+    from phasesweep.evidence.wandb import WandbPollTimeout
+
+    clock = [0.0]
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+
+    class Api:
+        def __init__(self, **kwargs):
+            if stage == "constructor":
+                clock[0] = 2.0
+
+        def run(self, path):
+            clock[0] = 2.0
+            return SimpleNamespace(state="finished", summary_metrics={"loss": 0.2})
+
+    monkeypatch.setattr(public, "Api", Api)
+    with pytest.raises(WandbPollTimeout):
+        _wandb_poll(required_keys=["loss"])
+
+
+def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_path, monkeypatch):
+    from phasesweep.evidence.wandb import poll_wandb_summary
+    from phasesweep.runtime.process import read_attempt_lifecycle
+
+    monkeypatch.setenv("WANDB_API_KEY", "excluded-parent-secret")
+    wandb_worker_sdk("""
+        import os
+        class Api:
+            def __init__(self, **kwargs):
+                assert "WANDB_API_KEY" not in os.environ
+                assert os.environ["HTTPS_PROXY"] == "https://transport.test"
+                assert "PYTHONHOME" not in os.environ
+            def run(self, path):
+                assert path == "entity/project/attempt"
+                return type("Run", (), {"state": "finished", "summary_metrics":
+                    {"loss": 0.25, "done": object(), "unrelated": object()}})()
+    """)
+    capture = poll_wandb_summary(
+        base_url="https://example.test",
+        entity="entity",
+        project="project",
+        run_id="attempt",
+        trial_dir=tmp_path,
+        poll_seconds=0.01,
+        timeout_seconds=5,
+        required_keys=["loss"],
+        presence_keys=["done", "missing"],
+        environment={"HTTPS_PROXY": "https://transport.test", "PYTHONHOME": "/trainer/python"},
+    )
+    assert capture["values"] == {"loss": 0.25}
+    assert capture["present_keys"] == ["done"]
+    assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
+
+
+def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch):
+    from phasesweep.errors import UnsafeProcessCleanupError
+    from phasesweep.evidence.wandb import poll_wandb_summary
+    from phasesweep.runtime import process
+
+    with (tmp_path / "trainer.log").open("w") as output:
+        result = process.run_supervised(
+            "true",
+            env=dict(os.environ),
+            stdout=output,
+            stderr=output,
+            timeout=5,
+            trial_dir=tmp_path,
+            attempt_id="attempt",
+        )
+    assert result.cleanup_confirmed
+    original_abort = process._abort_launch
+
+    def fail_identity(path, identity):
+        assert not path.exists()
+        raise OSError("injected identity failure")
+
+    def uncertain_abort(proc, pgid):
+        assert original_abort(proc, pgid)
+        return False
+
+    monkeypatch.setattr(process, "_write_process_identity", fail_identity)
+    monkeypatch.setattr(process, "_abort_launch", uncertain_abort)
+    with pytest.raises(UnsafeProcessCleanupError, match="cleanup is uncertain"):
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=5,
+        )
+    lifecycle = process.read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt")
+    assert lifecycle.state == "launching"
+    assert lifecycle.cleanup_confirmed is None
+
+
+@pytest.mark.parametrize("stage", ["constructor", "lookup"])
+def test_wandb_supervision_bounds_blocked_sdk_and_descendants(wandb_worker_sdk, tmp_path, stage):
+    from phasesweep.evidence.wandb import WandbPollTimeout, poll_wandb_summary
+    from phasesweep.runtime.process import is_pid_alive
+    from tests.conftest import is_pid_zombie
+
+    pid_file = tmp_path / "descendant"
+    wandb_worker_sdk(f"""
+        import os, subprocess, sys, time
+        from pathlib import Path
+        def block():
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            Path({str(pid_file)!r}).write_text(str(child.pid))
+            time.sleep(60)
+        class Api:
+            def __init__(self, **kwargs):
+                if {stage!r} == "constructor": block()
+            def run(self, path):
+                block()
+    """)
+    start = time.monotonic()
+    with pytest.raises(WandbPollTimeout):
+        poll_wandb_summary(
+            base_url="https://example.test",
+            entity="e",
+            project="p",
+            run_id="attempt",
+            trial_dir=tmp_path,
+            poll_seconds=0.01,
+            timeout_seconds=2,
+        )
+    assert time.monotonic() - start < 12
+    pid = int(pid_file.read_text())
+    assert not is_pid_alive(pid) or is_pid_zombie(pid)
 
 
 def _assert_log_regex_provenance(

@@ -20,6 +20,7 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
+    WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
@@ -535,11 +536,16 @@ def test_objective_evidence_assurance_json_envelope_checkpoint_binding(
             (True, False, False),
             id="log_regex",
         ),
+        pytest.param(
+            WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss"),
+            (False, False, True),
+            id="wandb",
+        ),
     ],
 )
 def test_objective_evidence_assurance_attempt_triple_by_kind(
     tmp_path: Path,
-    extractor: JsonEnvelopeExtractor | LogRegexExtractor,
+    extractor: JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor,
     expected_triple: tuple[bool, bool, bool],
 ) -> None:
     """Each extractor kind reports its own (location, identity, source-key) triple.

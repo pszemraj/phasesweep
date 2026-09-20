@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import optuna
 
 from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
@@ -24,9 +25,20 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     Winner,
+    constraint_attr,
 )
-from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
-from phasesweep.evidence.models import _validate_trial_file_path
+from phasesweep.evidence.evaluation import (
+    EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+    extractor_config_fingerprint,
+    json_float,
+)
+from phasesweep.evidence.models import (
+    ObjectiveExtractor,
+    WandbExtractor,
+    WandbQuery,
+    _validate_trial_file_path,
+    _WandbSummarySource,
+)
 from phasesweep.runtime.files import (
     file_sha256,
 )
@@ -155,7 +167,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     if not isinstance(extractor, Mapping):
         fail("missing extractor identity")
     kind = extractor.get("kind")
-    if kind not in {"json_envelope", "log_regex"} or not _valid_sha256(
+    if kind not in {"json_envelope", "log_regex", "wandb"} or not _valid_sha256(
         extractor.get("config_sha256")
     ):
         fail("invalid extractor identity")
@@ -164,6 +176,47 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     source = provenance.get("source")
     if not isinstance(source, Mapping):
         fail("missing source")
+    capture = provenance.get("remote_capture")
+    if capture is not None:
+        if not isinstance(capture, Mapping) or capture.get("kind") != "wandb":
+            fail("invalid remote capture")
+        for field in ("base_url", "entity", "project", "run_id", "retrieved_at"):
+            if not isinstance(capture.get(field), str) or not capture[field]:
+                fail(f"missing remote {field}")
+        try:
+            target = _WandbSummarySource(
+                base_url=capture["base_url"], entity=capture["entity"], project=capture["project"]
+            )
+        except ValueError:
+            fail("invalid remote target")
+        if target.base_url != capture["base_url"] or capture.get("run_state") != "finished":
+            fail("remote target is not normalized or run is not finished")
+        values = capture.get("values")
+        present = capture.get("present_keys")
+        if (
+            not isinstance(values, Mapping)
+            or not isinstance(present, list)
+            or any(not isinstance(key, str) or not key for key in present)
+        ):
+            fail("invalid remote summary subset")
+        for key, value in values.items():
+            try:
+                valid = (
+                    isinstance(key, str)
+                    and bool(key)
+                    and math.isfinite(json_float(value, label=key))
+                )
+            except ValueError:
+                valid = False
+            if not valid:
+                fail("invalid remote numeric evidence")
+    if kind == "wandb":
+        if source.get("kind") != "wandb" or not isinstance(capture, Mapping):
+            fail("W&B objective has no remote capture")
+        key = source.get("metric_key")
+        if not isinstance(key, str) or not key or key not in capture["values"]:
+            fail("W&B objective has no captured metric key")
+        return
     if (
         source.get("kind") != "file"
         or not isinstance(source.get("path"), str)
@@ -207,6 +260,8 @@ def _verify_objective_source_evidence(
     _validate_objective_provenance(provenance, subject=subject)
     source = provenance["source"]
     assert isinstance(source, Mapping)  # required by _validate_objective_provenance
+    if source["kind"] == "wandb":
+        return
     raw_path = str(source["path"])
     candidate = Path(raw_path)
     source_path = candidate if candidate.is_absolute() else trial_dir / candidate
@@ -337,6 +392,10 @@ def _verify_trial_evidence_dir(
     provenance: Mapping[str, Any] | None,
     trainer_input: Any,
     verify_objective_digest: bool,
+    extractor: ObjectiveExtractor,
+    metric_value: float,
+    wandb_query: WandbQuery | None,
+    constraints: Mapping[str, Any],
 ) -> None:
     """Require one trial's evidence directory and audit artifacts to still exist.
 
@@ -357,6 +416,10 @@ def _verify_trial_evidence_dir(
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
     :param Any trainer_input: Versioned historical generated-input record.
     :param bool verify_objective_digest: Re-hash the objective source as well.
+    :param ObjectiveExtractor extractor: Configured primary evidence reader.
+    :param float metric_value: Selected scalar recorded by the study or winner.
+    :param WandbQuery | None wandb_query: Shared remote evidence binding for this phase.
+    :param Mapping[str, Any] constraints: Saved constraint measurements.
     :raises TrialEvidenceMissingError: The directory, an audit artifact, the
         generated trainer input, or recorded objective source is missing,
         foreign, or altered.
@@ -389,6 +452,50 @@ def _verify_trial_evidence_dir(
         subject=subject,
         verify_digest=verify_objective_digest,
     )
+    assert provenance is not None
+    capture = provenance.get("remote_capture")
+    if capture is not None and capture["run_id"] != attempt_id:
+        raise TrialEvidenceMissingError(f"{subject} W&B capture belongs to another attempt.")
+    if wandb_query is not None:
+        if (
+            capture is None
+            or any(
+                capture[field] != getattr(wandb_query.source, field)
+                for field in ("base_url", "entity", "project")
+            )
+            or set(capture["values"]) != set(wandb_query.numeric_keys)
+            or capture.get("constraint_keys") != dict(wandb_query.constraint_keys)
+            or capture.get("gate_keys")
+            != {str(index): list(keys) for index, keys in wandb_query.gate_keys}
+            or any(
+                capture["values"].get(key) != constraints.get(name)
+                for name, key in wandb_query.constraint_keys
+            )
+            or not set(wandb_query.presence_keys).issubset(capture["present_keys"])
+        ):
+            raise TrialEvidenceMissingError(
+                f"{subject} W&B capture disagrees with its shared constraint/gate evidence."
+            )
+    elif capture is not None:
+        raise TrialEvidenceMissingError(f"{subject} has undeclared W&B evidence.")
+    if isinstance(extractor, WandbExtractor):
+        source = provenance["source"]
+        if (
+            provenance["extractor"]["kind"] != "wandb"
+            or provenance["extractor"]["config_sha256"] != extractor_config_fingerprint(extractor)
+            or capture is None
+            or any(
+                capture[field] != getattr(extractor, field)
+                for field in ("base_url", "entity", "project")
+            )
+            or source.get("metric_key") != extractor.metric_key
+            or capture["values"].get(extractor.metric_key) != metric_value
+        ):
+            raise TrialEvidenceMissingError(
+                f"{subject} W&B evidence disagrees with its configured source or selected scalar."
+            )
+    elif provenance["extractor"]["kind"] == "wandb":
+        raise TrialEvidenceMissingError(f"{subject} W&B evidence cannot justify a local objective.")
 
 
 def _validate_selection_evidence(
@@ -429,6 +536,7 @@ def _validate_selection_evidence(
             if identity is None:
                 continue
             generation_id, attempt_id = identity
+            assert trial.value is not None
             subject = (
                 f"Study {study.study_name!r} phase {phase_name!r} trial {trial.number} "
                 "is eligible to win selection but"
@@ -463,6 +571,16 @@ def _validate_selection_evidence(
                 provenance=_trial_objective_provenance(trial),
                 trainer_input=trial.user_attrs.get(TRAINER_INPUT_ATTR),
                 verify_objective_digest=False,
+                extractor=experiment.metric.extractor,
+                metric_value=float(trial.value),
+                wandb_query=_wandb_query(
+                    experiment,
+                    next(phase.gates for phase in experiment.phases if phase.name == phase_name),
+                ),
+                constraints={
+                    c.name: trial.user_attrs.get(constraint_attr(c.name))
+                    for c in experiment.constraints
+                },
             )
 
 
@@ -510,6 +628,12 @@ def _verify_winner_objective_evidence(
         provenance=selected.objective_provenance,
         trainer_input=selected.trainer_input,
         verify_objective_digest=True,
+        extractor=experiment.metric.extractor,
+        metric_value=selected.metric,
+        wandb_query=_wandb_query(
+            experiment, next(phase.gates for phase in experiment.phases if phase.name == phase_name)
+        ),
+        constraints=selected.constraints,
     )
 
 
@@ -564,4 +688,8 @@ def _verify_skipped_winner_evidence(
         provenance=winner.objective_provenance,
         trainer_input=winner.trainer_input,
         verify_objective_digest=True,
+        extractor=experiment.metric.extractor,
+        metric_value=winner.metric,
+        wandb_query=_wandb_query(experiment, phase.gates),
+        constraints=winner.constraints,
     )

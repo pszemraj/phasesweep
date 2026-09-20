@@ -2195,11 +2195,13 @@ def _publish_drift_experiment(tmp_path: Path) -> tuple[Path, Path, Path]:
 
 def _record_published_run_snapshot(
     tmp_path: Path,
+    *,
+    extractor: object | None = None,
 ) -> tuple[str, Path, Path, Path]:
     """Publish one generation whose id also has a completed MCP run snapshot."""
     trainer = write_constant_trainer(tmp_path)
     config = tmp_path / "srv.yaml"
-    experiment = _drift_experiment(tmp_path, trainer)
+    experiment = _drift_experiment(tmp_path, trainer, extractor=extractor)
     _write_experiment_config(config, experiment)
     catalog = _catalog(tmp_path, config)
     _app, registry, store = make_mcp_app(catalog)
@@ -2225,6 +2227,36 @@ def _record_published_run_snapshot(
         result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
     )
     return run_id, trainer, config, catalog
+
+
+def test_wandb_frozen_mcp_results_need_no_remote_access(tmp_path, monkeypatch, wandb_worker_sdk):
+    from phasesweep.config import WandbExtractor
+
+    wandb_worker_sdk("""
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                return type("Run", (), {"state": "finished", "summary_metrics": {"eval/loss": 0.25}})()
+    """)
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(
+        tmp_path,
+        extractor=WandbExtractor(
+            type="wandb", entity="e", project="p", metric_key="eval/loss", timeout_seconds=5
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "wandb", None)
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    wandb_worker_sdk("raise AssertionError('deleted remote run')")
+    app, _registry, _store = make_mcp_app(catalog)
+    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
+    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
+    assert results.publication_integrity == "ok"
+    assert results.winner_count == 1
+    assert results.metric.objective_evidence.kind == "wandb"
+    assert results.metric.objective_evidence.source_identity_keyed
+    assert not results.metric.objective_evidence.evaluation_policy_bound
+    assert status.metric == results.metric
 
 
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
