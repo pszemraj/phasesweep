@@ -57,13 +57,24 @@ python scripts/accept_wandb_training.py \
   --workdir /tmp/phasesweep-wandb-acceptance
 ```
 
-This makes four sequential CPU training runs. The
+To exercise one GPU lease across the same four sequential attempts, use a fresh
+work directory and select a host GPU:
+
+```bash
+python scripts/accept_wandb_training.py \
+  --entity YOUR_ENTITY --project YOUR_PROJECT \
+  --device cuda --gpu-id 0 \
+  --workdir /tmp/phasesweep-wandb-gpu-acceptance
+```
+
+This makes four sequential training runs on the selected device. The
 [standalone trainer](../examples/wandb_linear_train.py) fits one weight to
 `y = 2x` using 64 fixed examples and 20 full-batch SGD steps, then evaluates
 32 held-out examples. Phase one compares learning rates 0.01 and 0.1; phase two
 inherits the winner and compares weight decay 0 and 0.01. Its objective goes
-only to W&B; its local receipt contains parameters only. There is no PhaseSweep
-trainer import, objective mirror, dataset download, or GPU requirement.
+only to W&B; its parameter receipt remains parameters-only, and a separate
+device receipt confirms where the model and tensors executed. There is no
+PhaseSweep trainer import, objective mirror, or dataset download.
 
 The driver prints its launch budget, checks the four attempt identities,
 targets, finite measured scores, minimization, publication, consumed inherited
