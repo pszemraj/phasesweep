@@ -177,6 +177,32 @@ env -u PYTHONPATH python -c 'import phasesweep, pathlib, sys; sys.exit(0 if path
 python -c 'import phasesweep.examples.fake_train' \
   || fail "installed wheel cannot import phasesweep.examples.fake_train"
 
+python - <<'PY'
+import sys
+from phasesweep.config import (
+    Experiment, JsonExtractor, Metric, WandbExtractor, WandbSummaryRequiredGate,
+)
+from phasesweep.runtime.commands import dump_json_file_overrides, format_hydra
+from phasesweep.evidence.wandb import poll_wandb_summary
+
+schema = Experiment.model_json_schema()
+assert set(schema["properties"]["override_format"]["enum"]) == {
+    "yaml_file", "argparse", "hydra", "json_file",
+}
+assert set(schema["$defs"]["Metric"]["properties"]["extractor"]["discriminator"]["mapping"]) == {
+    "json", "json_envelope", "log_regex", "wandb",
+}
+assert "WandbSummaryRequiredGate" in schema["$defs"]
+assert Metric(extractor=JsonExtractor(type="json", path="result.json", key="eval.loss"))
+assert WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+assert WandbSummaryRequiredGate(type="wandb_summary_required", entity="e", project="p", keys=["done"])
+assert callable(poll_wandb_summary)
+assert '"depth": 2' in dump_json_file_overrides({"model.depth": 2})
+assert "true" in format_hydra({"value": "true"})
+assert not any(name == "wandb" or name.startswith("wandb.") for name in sys.modules)
+print("Installed input/extractor imports and schemas passed without importing W&B.")
+PY
+
 command -v phasesweep >/dev/null \
   || fail "console script 'phasesweep' is missing from $install_root/bin"
 command -v phasesweep-mcp >/dev/null \
