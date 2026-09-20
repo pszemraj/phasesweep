@@ -141,6 +141,27 @@ def test_status_floors_inconsistent_historical_terminal_count() -> None:
     assert payload["phases"][0]["terminal_trials_before_run"] == 0
 
 
+def test_run_scoped_status_reports_zero_progress_before_generation(tmp_path: Path) -> None:
+    app, registry, _store = _app_with_run(tmp_path)
+    phase_target = registry.get("srv").experiment.phases[0].n_trials
+
+    phase = app.status(run_id="r1")["phases"][0]
+
+    assert phase["trials"] == {
+        "WAITING": 0,
+        "RUNNING": 0,
+        "COMPLETE": 0,
+        "PRUNED": 0,
+        "FAIL": 0,
+    }
+    assert phase["terminal_trials_total"] == 0
+    assert phase["terminal_trials_before_run"] == 0
+    assert phase["attempts_launched_this_run"] == 0
+    assert phase["terminal_trials_this_run"] == 0
+    assert phase["target_already_satisfied"] is False
+    assert phase["remaining_trials"] == phase_target
+
+
 def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path) -> None:
     app, registry, store = _app_with_run(tmp_path)
     experiment = registry.get("srv").experiment
