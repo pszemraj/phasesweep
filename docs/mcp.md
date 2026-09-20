@@ -125,6 +125,14 @@ Winner results describe selected values, not convergence curves, robustness,
 causality, or unreturned trial history. Treat `<redacted>` values as deliberate
 catalog policy, not missing data.
 
+The operator may configure W&B, ordinary JSON, log, or envelope scoring.
+Frozen result reads preserve the producing reader's assurance fields and need
+no W&B SDK, credentials, or remote access. W&B binds its source to the managed
+attempt ID; it does not assert the envelope's evaluation metadata or input
+content guarantees. The trainer owns evaluation and aggregation; the metric
+goal ranks the selected trial scalars. Log reduction defaults to `last` and is
+independent of the ranking goal.
+
 ## Run state and recovery
 
 Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log,

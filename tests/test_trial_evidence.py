@@ -30,6 +30,7 @@ from phasesweep.config import (
     ExecutionContext,
     Experiment,
     IntParam,
+    JsonExtractor,
     Metric,
     Phase,
     Sampler,
@@ -52,6 +53,7 @@ from phasesweep.engine.paths import (
     _generations_dir,
     _last_successful_generation_path,
     _phase_dir,
+    _trial_dir_for,
 )
 from phasesweep.engine.publication import (
     _last_successful_generation_id,
@@ -63,6 +65,73 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
 )
 from tests.conftest import assert_published_winner_evidence_local, make_experiment, write_trainer
+
+
+@pytest.mark.parametrize("mutation", ["changed", "deleted"])
+def test_json_primary_external_trainer_inherits_replays_and_verifies_source(tmp_path, mutation):
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", required=True)
+        parser.add_argument("--x", type=int)
+        parser.add_argument("--y", type=int, default=0)
+        args = parser.parse_args()
+        Path(args.out).write_text(json.dumps({
+            "eval": {"loss": (args.x - 2)**2 + args.y},
+            "parameters": {"x": args.x, "y": args.y},
+        }))
+    """,
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'json.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="eval.loss")),
+        phases=[
+            Phase(
+                name="first",
+                n_trials=2,
+                sampler=Sampler(type="grid"),
+                search_space={"x": {"type": "categorical", "choices": [1, 2]}},
+            ),
+            Phase(
+                name="next",
+                n_trials=2,
+                inherits=["first"],
+                sampler=Sampler(type="grid"),
+                search_space={"y": {"type": "categorical", "choices": [0, 1]}},
+            ),
+        ],
+    )
+    winners = run_experiment(experiment)
+    assert winners["first"].metric == winners["next"].metric == 0
+    assert winners["next"].effective_overrides == {"x": 2, "y": 0}
+    for output in _phase_dir(experiment, "next").glob("trial_*/r.json"):
+        assert json.loads(output.read_text())["parameters"]["x"] == 2
+    replay = run_experiment(experiment, from_phase="next")
+    assert replay["first"].attempt_id == winners["first"].attempt_id
+    assert replay["next"].attempt_id == winners["next"].attempt_id
+    assert len(list((tmp_path / "runs" / "t").glob("*/trial_*"))) == 4
+    winner = winners["first"]
+    source = (
+        _trial_dir_for(
+            experiment,
+            "first",
+            winner.trial_number,
+            generation_id=winner.generation_id,
+            attempt_id=winner.attempt_id,
+        )
+        / "r.json"
+    )
+    if mutation == "changed":
+        source.write_text(source.read_text().replace('"loss": 0', '"loss": 9'))
+    else:
+        source.unlink()
+    with pytest.raises(TrialEvidenceMissingError):
+        run_experiment(experiment, from_phase="next")
 
 
 @pytest.mark.parametrize("consumers", ["primary", "constraint", "gate", "combined"])

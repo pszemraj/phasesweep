@@ -20,6 +20,10 @@ python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesw
 ```
 
 Contributor and editable-install setup is in [development](development.md).
+If cataloged experiments read W&B evidence, install the `mcp,wandb` extras
+together in that environment. Config validation and frozen result reads do not
+authenticate; new W&B work requires the SDK and the trainer's composed account
+access.
 
 ### 2. Create and review the catalog
 

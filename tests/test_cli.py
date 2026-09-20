@@ -52,6 +52,55 @@ from tests.conftest import (
 )
 
 
+@pytest.mark.parametrize(
+    ("extractor", "details"),
+    [
+        ({"type": "json", "path": "r.json", "key": "eval.loss"}, ["r.json", "eval.loss"]),
+        (
+            {"type": "wandb", "entity": "e", "project": "p", "metric_key": "eval/loss"},
+            ["eval/loss", "api.wandb.ai"],
+        ),
+        (
+            {"type": "log_regex", "pattern": "loss=(?P<value>[0-9.]+)"},
+            ["select", "last", "stdout.log"],
+        ),
+        (
+            {
+                "type": "json_envelope",
+                "objective_name": "loss",
+                "split": "validation",
+                "policy": "final",
+                "expected_step": 20,
+            },
+            ["policy", "final", "expected_step", "20"],
+        ),
+    ],
+)
+def test_validate_and_dry_run_explain_scoring_without_sdk(
+    tmp_path, monkeypatch, caplog, extractor, details
+):
+    from phasesweep.config import Metric
+
+    monkeypatch.setitem(sys.modules, "wandb", None)
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        n_trials=1,
+        metric=Metric(name="loss", goal="minimize", extractor=extractor),
+    )
+    config = tmp_path / "experiment.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+    assert result.exit_code == 0, result.output
+    assert "goal=minimize" in result.output
+    assert all(detail in result.output for detail in details)
+    with caplog.at_level(logging.INFO):
+        run_experiment(experiment, dry_run=True)
+    assert "goal=minimize" in caplog.text
+    assert all(detail in caplog.text for detail in details)
+    assert not (tmp_path / "runs").exists()
+
+
 def test_help_registers_commands_and_options() -> None:
     runner = CliRunner()
     result = runner.invoke(cli_main, ["--help"], terminal_width=120)

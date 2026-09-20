@@ -87,11 +87,54 @@ from phasesweep.runtime.process import (
 from tests.conftest import (
     copy_fake_train,
     make_experiment,
+    make_trial_context,
     patch_rejected_trial_user_attr,
     write_constant_trainer,
     write_trainer,
     write_yaml,
 )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        b"not-json",
+        b"\xff",
+        b'{"other": 1}',
+        b'{"loss": true}',
+        b'{"loss": "0.2"}',
+        b'{"loss": null}',
+        b'{"loss": []}',
+        b'{"loss": {}}',
+        b'{"loss": NaN}',
+        b'{"loss": 1e400}',
+        json.dumps({"loss": 10**400}).encode(),
+        "unreadable",
+    ],
+)
+def test_json_primary_invalid_evidence_fails_trial(tmp_path, payload):
+    source = tmp_path / "r.json"
+    if payload == "unreadable":
+        source.write_text('{"loss": 0.2}')
+        source.chmod(0)
+    elif payload is not None:
+        source.write_bytes(payload)
+    experiment = make_experiment(
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="loss"))
+    )
+    executed = ExecutedTrial(
+        ctx=make_trial_context(tmp_path),
+        process=ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1),
+    )
+    try:
+        result = extract_trial_result(experiment=experiment, executed=executed)
+        assert result.metric is None
+        assert not result.feasible
+        assert result.failure_reason.startswith("metric extractor")
+    finally:
+        if source.exists():
+            source.chmod(0o600)
 
 
 @pytest.mark.parametrize(("value", "state"), [(3, "COMPLETE"), (10**400, "FAIL")])

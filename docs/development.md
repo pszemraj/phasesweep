@@ -5,11 +5,12 @@
 ```bash
 git clone https://github.com/pszemraj/phasesweep.git
 cd phasesweep
-python -m pip install -e ".[dev]"
+python -m pip install -e ".[dev,wandb]"
 ```
 
-The `mcp` SDK is included in the development extra. Run Python-dependent
-commands in the environment where you installed the project.
+The development extra includes MCP and Hydra for integration checks; the
+optional W&B extra exercises the installed SDK. Run Python-dependent commands
+in the environment where you installed the project.
 
 ## Quality gates
 
@@ -38,12 +39,46 @@ The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
 read-only inspection behavior depends on that range; do not widen it without
 targeted validation.
 
+The restored W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's
+summary decoding and error behavior with controlled responses, plus supervised
+worker fixtures for deadlines, cleanup faults, and recovery. They do not certify
+live service access. Input tests use the real Hydra 1.3 parser and entrypoint;
+rendering itself has no Hydra runtime dependency.
+
+### Manual W&B-only training acceptance
+
+With PyTorch already available and access to an authorized W&B project, manually
+run the [acceptance driver](../scripts/accept_wandb_training.py) in a fresh
+temporary output directory:
+
+```bash
+python scripts/accept_wandb_training.py \
+  --entity YOUR_ENTITY --project YOUR_PROJECT \
+  --workdir /tmp/phasesweep-wandb-acceptance
+```
+
+This makes four sequential CPU training runs. The
+[standalone trainer](../examples/wandb_linear_train.py) fits one weight to
+`y = 2x` using 64 fixed examples and 20 full-batch SGD steps, then evaluates
+32 held-out examples. Phase one compares learning rates 0.01 and 0.1; phase two
+inherits the winner and compares weight decay 0 and 0.01. Its objective goes
+only to W&B; its local receipt contains parameters only. There is no PhaseSweep
+trainer import, objective mirror, dataset download, or GPU requirement.
+
+The driver prints its launch budget, checks the four attempt identities,
+targets, finite measured scores, minimization, publication, consumed inherited
+parameters, and replay without more trials or remote reads. Trainer and poll
+caps are each 120 seconds, phase caps 600 seconds, and the experiment cap 1,200
+seconds; process cleanup grace remains separate. This manual service check is
+outside both the default suite and CI. Unavailable live access is a blocked
+acceptance result, not evidence of service readiness.
+
 ## Package map
 
 - `phasesweep.config`: Pydantic Experiment models and strict YAML loading.
 - `phasesweep.engine`: phase orchestration, fingerprints, local persistence,
   immutable generation publication, and read-only status.
-- `phasesweep.evidence`: local objective extraction and post-trial gates.
+- `phasesweep.evidence`: JSON, envelope, log, and supervised W&B extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local
   storage URLs, and override rendering.
@@ -78,7 +113,7 @@ flowchart TD
     run --> phase["phase._run_phase"]
     phase --> optimize["Optuna optimize"]
     optimize --> launch["supervise trainer"]
-    launch --> evidence["extract local evidence and gates"]
+    launch --> evidence["read configured scalar and gates"]
     evidence --> select["select feasible winner"]
     select --> next{"more phases?"}
     next -->|yes| phase
@@ -94,7 +129,8 @@ flowchart TD
   `tests/test_overrides.py`: Experiment validation, composition, parameter
   domains, and retained input boundaries.
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and
-  `tests/test_trial_launch.py`: local evidence, gates, and supervised trials.
+  `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates,
+  supervised trials, and durable input verification.
 - `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`,
   `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`:
   continuation, current-format publication, and read-only views.

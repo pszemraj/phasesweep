@@ -19,6 +19,7 @@ import click
 import yaml
 
 from phasesweep.config import ConfigError, Experiment, load_config
+from phasesweep.config.models import _metric_scoring_line
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine import (
     PhaseSweepError,
@@ -395,6 +396,7 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
     :param Experiment experiment: Experiment whose phases should be printed.
     :param str indent: Prefix to place before each rendered phase line.
     """
+    click.echo(f"{indent}{_metric_scoring_line(experiment.metric)}")
     for p in experiment.phases:
         deps = f" inherits={p.inherits}" if p.inherits else ""
         click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} sampler={p.sampler.type}{deps}")

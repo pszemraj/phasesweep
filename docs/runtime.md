@@ -52,6 +52,7 @@ demo/
     winner.yaml
     trial_00000__generation_<id>__attempt_<id>/
       trainer_config.yaml       # yaml_file only
+      overrides.json            # json_file only; nested overrides
       overrides_resolved.json
       command.txt
       stdout.log
@@ -100,8 +101,26 @@ database backends are not part of the runtime.
 
 Each trial has an attempt-scoped directory and process group. The runtime
 captures `stdout.log` and `stderr.log`, prepares the configured input, and
-supervises cleanup. See the [configuration guide](config.md) for trainer input,
-local evidence, gate, constraint, and environment definitions.
+supervises cleanup. YAML input identifies the complete generated configuration;
+JSON identifies the nested overrides file. Argparse and Hydra retain the
+resolved-overrides identity together with the command. Historical inputs are
+verified using their saved format.
+
+W&B polling starts only after successful trainer cleanup and GPU-lease release.
+It uses the same durable attempt slot and process supervisor, so recovery can
+find the reader after abrupt parent exit, even if its phase was removed.
+Uncertain cleanup blocks further work. One absolute polling deadline covers
+worker startup, SDK construction, requests, retries, and summary visibility;
+phase/run deadlines can shorten it, while cleanup grace stays separate.
+Trainer return code and duration remain trainer measurements.
+
+Finished W&B captures freeze only the requested numeric values and gate-presence
+evidence, with target, attempt, retrieval time, selected key, and consumer
+bindings. Published results and no-op replay need no SDK, credentials, or
+network reads. New remote work checks SDK availability after recognized-state
+recovery and before accepting a larger target. Missing/invalid evidence fails a
+trial; a measured constraint violation remains complete but infeasible.
+See the [configuration guide](config.md) for scoring and environment details.
 
 ## GPU isolation
 

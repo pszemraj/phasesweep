@@ -83,6 +83,14 @@ def _metric_semantics_payload(metric: Metric) -> dict[str, Any]:
     }
 
 
+def _metric_scoring_line(metric: Metric) -> str:
+    """Describe the scalar source, within-trial selection, and between-trial goal."""
+    return (
+        f"metric={metric.name!r} goal={metric.goal} "
+        f"extractor={metric.extractor.model_dump(mode='json', exclude_none=True)}"
+    )
+
+
 class Constraint(_Frozen):
     """A scalar bound that trials must satisfy to be considered feasible."""
 

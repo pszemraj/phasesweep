@@ -43,7 +43,9 @@ phases:
       optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-The packaged fake trainer reports its objective through `report_objective(...)`.
+The packaged fake trainer uses the optional `report_objective(...)` envelope
+helper. Your own trainer can report through W&B, ordinary JSON, or logs without
+importing PhaseSweep.
 
 ## Install and try it
 
@@ -51,6 +53,7 @@ Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
 
 ```bash
 pip install git+https://github.com/pszemraj/phasesweep.git
+phasesweep --version
 
 mkdir phasesweep-demo && cd phasesweep-demo
 phasesweep init                       # writes the starter experiment.yaml
@@ -91,8 +94,29 @@ effective_overrides:
 
 ## Use your own trainer
 
-See the [configuration guide](docs/config.md) for trainer inputs, dotted
-overrides, and objective reporting. Preview one command per phase without
+Choose the input interface your trainer already accepts:
+
+| Input | Command placeholder |
+| --- | --- |
+| Complete base-plus-overrides YAML (`yaml_file`, default) | `--config {config_path}` |
+| Command-line flags (`argparse`) | `{overrides}` produces `--key=value` |
+| Native Hydra overrides (`hydra`) | `{overrides}` produces `key=value` |
+| Nested overrides-only JSON (`json_file`) | `--overrides {overrides_path}` |
+
+For ordinary JSON output, pass an output path under `{trial_dir}` to your
+trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`.
+For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT,
+metric_key: eval/loss}` and have the trainer honor the supplied W&B identity.
+Install W&B support with
+`python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"`.
+
+`metric.goal` ranks each trial's selected scalar. Log matching selects the
+last observation by default; W&B selects an exact finished-summary key.
+The trainer owns evaluation, early stopping, checkpoint selection, and
+aggregation. Inheritance transfers parameters, not model weights.
+
+See the [configuration guide](docs/config.md) for input types, reporting,
+credentials, and selection details. Preview one command per phase without
 launching work with `phasesweep run experiment.yaml --dry-run`.
 `phasesweep init` never overwrites an existing file; use `-o PATH` for another
 destination.
@@ -109,7 +133,7 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 
 ## Reference
 
-- [Configuration guide](docs/config.md): Experiment YAML, search spaces, inheritance, local gates, and objective extractors.
+- [Configuration guide](docs/config.md): Experiment YAML, search spaces, inheritance, gates, and objective extractors.
 - [Configuration reference](docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
 - [Runtime behavior](docs/runtime.md): filesystem layout, fresh-state cutover, locks, GPU leases, process supervision, fingerprints, and resume.
 - [MCP setup](docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.

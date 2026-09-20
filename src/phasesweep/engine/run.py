@@ -24,7 +24,7 @@ import phasesweep.engine.resume as resume_ops
 from phasesweep._metadata import __version__
 from phasesweep.config import Config, Experiment
 from phasesweep.config.common import _validate_safe_name
-from phasesweep.config.models import _metric_semantics_payload
+from phasesweep.config.models import _metric_scoring_line, _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
@@ -570,6 +570,7 @@ def _run_experiment_inner(
         # Capability disclosure (review v0.5.18 / finding F7): restate the same
         # per-phase resume/reproduce contract `phasesweep validate` prints, in
         # the preview an operator reads immediately before committing to a run.
+        log.info("DRY RUN %s", _metric_scoring_line(experiment.metric))
         for previewed in experiment.phases:
             log.info("DRY RUN %s", sampler_capability_line(previewed))
 

@@ -577,9 +577,9 @@ phases:
     assert exp.phases[0].max_consecutive_failures == 5
 
 
-def test_plain_json_extractor_is_not_a_primary_objective() -> None:
-    with pytest.raises(ValidationError, match="json_envelope"):
-        Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))
+def test_plain_json_extractor_is_a_primary_objective() -> None:
+    metric = Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))
+    assert metric.extractor.type == "json"
 
 
 def test_suite_config_is_rejected_before_artifacts(tmp_path: Path) -> None:

@@ -42,6 +42,12 @@ A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 
 
 The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#objective-evidence-constraints-and-gates) validates that report.
 
+Checkpoint loading and final evaluation belong to this example's trainer
+wrapper. PhaseSweep reads the reported scalar and checks its envelope metadata;
+it does not evaluate models. Other trainers can use ordinary JSON, log matching,
+or finished W&B summaries without the envelope helper. Phase inheritance carries
+selected parameter values, not checkpoint weights.
+
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
 ## MCP smoke

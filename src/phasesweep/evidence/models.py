@@ -226,8 +226,8 @@ class WandbExtractor(_WandbSummarySource):
     metric_key: str = Field(min_length=1)
 
 
-ObjectiveExtractor = JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
-Extractor = JsonExtractor | ObjectiveExtractor
+ObjectiveExtractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
+Extractor = ObjectiveExtractor
 
 
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
@@ -323,7 +323,7 @@ class _ObjectiveEvidenceFields(BaseModel):
     :func:`objective_evidence_assurance` for exactly what each flag means.
     """
 
-    kind: Literal["json_envelope", "log_regex", "wandb"]
+    kind: Literal["json", "json_envelope", "log_regex", "wandb"]
     attempt_location_scoped: bool
     attempt_identity_bound: bool
     source_identity_keyed: bool

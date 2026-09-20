@@ -16,6 +16,7 @@ from phasesweep.config import (
     FloatParam,
     IntParam,
     JsonEnvelopeExtractor,
+    JsonExtractor,
     LogRegexExtractor,
     Metric,
     Phase,
@@ -541,11 +542,16 @@ def test_objective_evidence_assurance_json_envelope_checkpoint_binding(
             (False, False, True),
             id="wandb",
         ),
+        pytest.param(
+            JsonExtractor(type="json", path="result.json", key="eval.loss"),
+            (True, False, False),
+            id="json",
+        ),
     ],
 )
 def test_objective_evidence_assurance_attempt_triple_by_kind(
     tmp_path: Path,
-    extractor: JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor,
+    extractor: JsonEnvelopeExtractor | JsonExtractor | LogRegexExtractor | WandbExtractor,
     expected_triple: tuple[bool, bool, bool],
 ) -> None:
     """Each extractor kind reports its own (location, identity, source-key) triple.

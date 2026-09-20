@@ -26,8 +26,11 @@ trainer_config:
     weight_decay: 0.05
 
 metric:
+  # This toy trainer chooses the optional envelope reporter. Existing trainers
+  # may use json, log_regex, or wandb without a PhaseSweep reporting import.
   name: eval_loss
   goal: minimize
+  # Goal ranks trial scalars; the trainer owns evaluation and aggregation.
   extractor:
     type: json_envelope
     path: result.json

@@ -22,37 +22,45 @@
 
 # trial_command: str (required)
 # Shell template for one trial. Supported placeholders are {config_path},
-# {overrides}, {trial_dir}, {trial_id}, {phase}, and {run_name}. yaml_file
-# requires {config_path}; argparse requires {overrides}.
+# {overrides}, {overrides_path}, {trial_dir}, {trial_id}, {phase}, and {run_name}.
+# yaml_file requires {config_path}; argparse/hydra require {overrides};
+# json_file requires {overrides_path}. Constant commands may omit the input
+# placeholder when every phase's composed overrides are genuinely empty.
 
 # trainer_config: dict[str, JSON/YAML-compatible value] = {}
 # Complete base configuration for override_format: yaml_file. Dotted inherited,
 # fixed, and sampled values are applied to a copied mapping per trial. A nonempty
-# mapping is invalid with argparse because argparse does not consume it.
+# mapping is invalid with any other input format because it does not consume it.
 
 # provenance: dict[str, str] = {}
 # Meaningful external trainer/data/dependency identifiers. Required for durable
 # local storage and part of the experiment identity.
 
-# override_format: Literal["yaml_file", "argparse"] = "yaml_file"
+# override_format: Literal["yaml_file", "argparse", "hydra", "json_file"] = "yaml_file"
 # yaml_file writes a complete trainer_config.yaml and uses {config_path}.
 # argparse emits shell-safe --key=value tokens through {overrides}; it accepts
 # null, booleans, integers, finite floats, strings, and nested lists of them.
+# hydra renders native key=value tokens through {overrides}, preserving those
+# types. Control characters and interpolation-like strings are unsupported.
+# json_file writes strictly encoded nested overrides.json via {overrides_path};
+# flat overrides_resolved.json remains the audit copy. Dotted collisions fail.
 
 # metric: Metric (required)
 #   name: str = "objective"       # `goal` is reserved and cannot be the name.
 #   goal: Literal["minimize", "maximize"] = "minimize"
-#   extractor: JsonEnvelopeExtractor | LogRegexExtractor (required)
-# Metric extractors are local and must yield a finite value.
+#   extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
+# All readers must yield a finite scalar. Goal ranks trials, not observations.
 
 # constraints: list[Constraint] = []
-# Each constraint has name, a local `json` scalar extractor, and at least one
-# finite min/max bound. A failed constraint is COMPLETE but ineligible to win.
+# Each constraint has name, a scalar extractor, and at least one finite min/max
+# bound. A measured bound violation is COMPLETE but ineligible to win; missing
+# or invalid evidence fails the trial.
 
 # env: dict[str, str] = {}
 # Semantic environment values applied over execution inheritance. Generic
-# credential/telemetry variables, including WANDB_* values, can be passed to a
-# trainer but do not configure a PhaseSweep remote evidence source.
+# credential/telemetry variables can be passed to a trainer. When W&B evidence
+# is configured, PhaseSweep manages target, attempt ID, and never-resume policy;
+# explicit conflicts or offline/disabled mode fail before training.
 
 # execution: ExecutionContext = {}
 #   cwd: str | null = null
@@ -143,7 +151,8 @@
 # type: "json"
 # path: str (trial-relative file; required)
 # key: str (nonempty dotted JSON path; required)
-# Constraint-only scalar extractor. The selected value must be a finite number.
+# Primary or constraint scalar reader. The selected value must be a finite
+# JSON number (no bool/string/container/nonfinite or unrepresentable integer).
 
 # type: "json_envelope"
 # path: str = "result.json"         # trial-relative file
@@ -159,8 +168,26 @@
 # file: str = "stdout.log"          # trial-relative file
 # pattern: str (required; named (?P<value>...) capture)
 # select: "last" | "first" | "min" | "max" = "last"
+# Select chooses an observation within a trial independently of metric.goal.
+
+# type: "wandb"
+# base_url: str = "https://api.wandb.ai"  # normalized HTTP(S) API endpoint
+# entity: str (required)
+# project: str (required)
+# metric_key: str (required; exact nonempty summary key, e.g. eval/loss)
+# poll_seconds: finite float = 2.0     # > 0
+# timeout_seconds: finite float = 120.0 # >= 1
+# Reads only the managed attempt's finished summary. Primary, constraints, and
+# phase gates must agree on the target and polling fields, and share one capture.
+# The trainer owns evaluation, checkpoint choice, aggregation, and early stopping.
+# Envelope policy/expected_step validate metadata; they do not schedule evaluation.
 
 # GATE OBJECTS
+
+# type: "wandb_summary_required"
+# base_url/entity/project/poll_seconds/timeout_seconds: same as wandb above
+# keys: list[str] (nonempty exact summary keys)
+# Presence-only gate. Missing keys in the accepted finished capture fail it.
 
 # type: "required_file"
 # path: str (trial-relative file; required)

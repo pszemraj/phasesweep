@@ -2229,8 +2229,11 @@ def _record_published_run_snapshot(
     return run_id, trainer, config, catalog
 
 
-def test_wandb_frozen_mcp_results_need_no_remote_access(tmp_path, monkeypatch, wandb_worker_sdk):
-    from phasesweep.config import WandbExtractor
+@pytest.mark.parametrize("kind", ["wandb", "json"])
+def test_restored_reader_frozen_mcp_results_need_no_remote_access(
+    tmp_path, monkeypatch, wandb_worker_sdk, kind
+):
+    from phasesweep.config import JsonExtractor, WandbExtractor
 
     wandb_worker_sdk("""
         class Api:
@@ -2242,7 +2245,9 @@ def test_wandb_frozen_mcp_results_need_no_remote_access(tmp_path, monkeypatch, w
         tmp_path,
         extractor=WandbExtractor(
             type="wandb", entity="e", project="p", metric_key="eval/loss", timeout_seconds=5
-        ),
+        )
+        if kind == "wandb"
+        else JsonExtractor(type="json", path="r.json", key="x"),
     )
     monkeypatch.setitem(sys.modules, "wandb", None)
     monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
@@ -2253,8 +2258,8 @@ def test_wandb_frozen_mcp_results_need_no_remote_access(tmp_path, monkeypatch, w
     status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     assert results.publication_integrity == "ok"
     assert results.winner_count == 1
-    assert results.metric.objective_evidence.kind == "wandb"
-    assert results.metric.objective_evidence.source_identity_keyed
+    assert results.metric.objective_evidence.kind == kind
+    assert results.metric.objective_evidence.source_identity_keyed == (kind == "wandb")
     assert not results.metric.objective_evidence.evaluation_policy_bound
     assert status.metric == results.metric
 

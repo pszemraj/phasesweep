@@ -537,15 +537,15 @@ def run_extractor(
     Args:
         ctx: Trial context passed through to the chosen extractor.
         cfg: A concrete extractor config (one of :class:`JsonExtractor`,
-            :class:`JsonEnvelopeExtractor`, or :class:`LogRegexExtractor`).
+            :class:`JsonEnvelopeExtractor`, :class:`LogRegexExtractor`, or
+            :class:`WandbExtractor`).
         deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
             Extraction fails before local evidence is read when the deadline
             has already elapsed.
         provenance: Optional sink that, on success, is filled with the frozen
             evidence provenance record: schema version, the extractor's kind
             and exact config fingerprint, the per-source evidence identity
-            (file digest) and the capture timestamp (review v0.5.17 / finding
-            F).
+            (file digest or shared remote capture) and the capture timestamp.
 
     Returns:
         The numeric value the extractor pulled from this trial's outputs.

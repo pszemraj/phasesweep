@@ -33,6 +33,7 @@ from phasesweep.evidence.evaluation import (
     json_float,
 )
 from phasesweep.evidence.models import (
+    JsonExtractor,
     ObjectiveExtractor,
     WandbExtractor,
     WandbQuery,
@@ -167,7 +168,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     if not isinstance(extractor, Mapping):
         fail("missing extractor identity")
     kind = extractor.get("kind")
-    if kind not in {"json_envelope", "log_regex", "wandb"} or not _valid_sha256(
+    if kind not in {"json", "json_envelope", "log_regex", "wandb"} or not _valid_sha256(
         extractor.get("config_sha256")
     ):
         fail("invalid extractor identity")
@@ -240,9 +241,10 @@ def _verify_objective_source_evidence(
     subject: str,
     verify_digest: bool,
 ) -> None:
-    """Require a trial's frozen objective source to still be on disk as recorded.
+    """Verify the retained local source or the frozen remote capture.
 
-    The record must be complete and name a local file in this tree.
+    Local records name a file in this trial tree. Remote records are validated
+    without contacting the service again.
 
     :param Path trial_dir: Structurally translated directory for the trial.
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
@@ -496,6 +498,15 @@ def _verify_trial_evidence_dir(
             )
     elif provenance["extractor"]["kind"] == "wandb":
         raise TrialEvidenceMissingError(f"{subject} W&B evidence cannot justify a local objective.")
+    if isinstance(extractor, JsonExtractor) and (
+        provenance["extractor"]["kind"] != "json"
+        or provenance["extractor"]["config_sha256"] != extractor_config_fingerprint(extractor)
+        or provenance["source"].get("path") != extractor.path
+        or provenance["source"].get("key") != extractor.key
+    ):
+        raise TrialEvidenceMissingError(
+            f"{subject} JSON evidence disagrees with its configured path/key."
+        )
 
 
 def _validate_selection_evidence(
