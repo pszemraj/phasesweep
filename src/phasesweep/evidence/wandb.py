@@ -92,18 +92,14 @@ def _is_nonretryable_authorization_error(exc: Exception) -> bool:
 
 def _is_retryable_setup_error(exc: Exception) -> bool:
     """Recognize temporary transport failures using public SDK/request errors."""
-    from requests.exceptions import (
-        ConnectionError as RequestsConnectionError,  # type: ignore[import-not-found,import-untyped]
-    )
-    from requests.exceptions import (
-        Timeout as RequestsTimeout,  # type: ignore[import-not-found,import-untyped]
-    )
+    import requests.exceptions as request_errors  # type: ignore[import-not-found,import-untyped]
 
     if _is_nonretryable_authorization_error(exc):
         return False
     for error in _error_chain(exc):
         if _http_status(error) in _RETRYABLE_HTTP_STATUSES or isinstance(
-            error, (ConnectionError, TimeoutError, RequestsConnectionError, RequestsTimeout)
+            error,
+            (ConnectionError, TimeoutError, request_errors.ConnectionError, request_errors.Timeout),
         ):
             return True
         # The supported SDK can suppress the original sidecar transport cause.

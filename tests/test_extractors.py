@@ -90,17 +90,25 @@ def test_wandb_real_sdk_decodes_refreshed_finished_summary(tmp_path, monkeypatch
     )
 
 
-@pytest.mark.parametrize("status", [401, 403, 429, 503])
+@pytest.mark.parametrize("status", [401, 403, 429, 503, "connection", "timeout"])
 def test_wandb_real_sdk_error_causes_are_preserved(monkeypatch, status):
     public = pytest.importorskip("wandb.apis.public")
     from requests import HTTPError, Response
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+    from requests.exceptions import Timeout as RequestsTimeout
     from wandb.errors import CommError
 
     from phasesweep.evidence.wandb import WandbSetupError
 
-    response = Response()
-    response.status_code = status
-    error = CommError("secret-token", exc=HTTPError("secret-token", response=response))
+    if isinstance(status, int):
+        response = Response()
+        response.status_code = status
+        cause = HTTPError("secret-token", response=response)
+    else:
+        cause = (RequestsConnectionError if status == "connection" else RequestsTimeout)(
+            "secret-token"
+        )
+    error = CommError("secret-token", exc=cause)
     attempts = []
 
     def initialize(self, **kwargs):
