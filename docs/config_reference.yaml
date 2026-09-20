@@ -125,7 +125,9 @@
 # cannot resume a partially completed target across processes.
 
 #   gates: list[Gate] = []
-# Every gate is a local post-trial hard check. Gate failure fails the trial.
+# Every gate is a post-trial hard check. File and JSON gates inspect local
+# attempt artifacts; wandb_summary_required uses the phase's shared remote capture.
+# Gate failure fails the trial.
 
 # SEARCH PARAMETER OBJECTS
 
