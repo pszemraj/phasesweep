@@ -32,7 +32,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep import __version__
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.engine import read_status, read_winners
+from phasesweep.engine import (
+    ArtifactRootConflictError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    read_status,
+    read_winners,
+)
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
@@ -53,6 +59,7 @@ from phasesweep.mcp.errors import (
     ResumeNotReadyError,
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
+    RunPersistentStateUnavailableError,
     RunResultSnapshotUnavailableError,
     RunSnapshotUnavailableError,
     UnknownExperimentError,
@@ -1175,14 +1182,36 @@ class PhaseSweepMCP:
         :return dict[str, Any]: Path-free live status payload.
         """
         comparison = self._catalog_comparison_experiment(experiment_id)
-        status = read_status(
-            experiment,
-            generation_id=handle.run_id,
-            comparison_experiment=comparison,
-        )
+        try:
+            status = read_status(
+                experiment,
+                generation_id=handle.run_id,
+                comparison_experiment=comparison,
+            )
+        except (
+            ArtifactRootConflictError,
+            StudySchemaMismatchError,
+            StudyStorageUnavailableError,
+        ) as exc:
+            self._raise_persistent_read_error(handle, exc)
         if comparison is None:
             status["published_config_matches_current"] = None
         return status
+
+    @staticmethod
+    def _raise_persistent_read_error(
+        handle: RunHandle,
+        exc: ArtifactRootConflictError | StudySchemaMismatchError | StudyStorageUnavailableError,
+    ) -> NoReturn:
+        """Replace a path-bearing live-study read failure with a safe tool error.
+
+        :param RunHandle handle: Run whose immutable config selected the failed state.
+        :param ArtifactRootConflictError | StudySchemaMismatchError | StudyStorageUnavailableError exc:
+            Explicit persistent-state failure to redact.
+        :raises RunPersistentStateUnavailableError: Always, without storage details.
+        """
+        log.info("persistent state read failed for run=%s: %s", handle.run_id, exc)
+        raise RunPersistentStateUnavailableError(handle.run_id) from None
 
     def _snapshot_status_payload(
         self,
@@ -1370,11 +1399,18 @@ class PhaseSweepMCP:
             # the config declares now: a phase renamed since publication used
             # to drop its winner from this payload entirely while reporting
             # the new name as missing (review v0.5.16 / blocker 4).
-            winner_views = read_winners(
-                experiment,
-                generation_id=status["represented_generation_id"],
-                phase_names=status["result_phase_plan"],
-            )
+            try:
+                winner_views = read_winners(
+                    experiment,
+                    generation_id=status["represented_generation_id"],
+                    phase_names=status["result_phase_plan"],
+                )
+            except (
+                ArtifactRootConflictError,
+                StudySchemaMismatchError,
+                StudyStorageUnavailableError,
+            ) as exc:
+                self._raise_persistent_read_error(handle, exc)
             if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
                 winner_views = []
             # The live read may span the runner's final snapshot write.

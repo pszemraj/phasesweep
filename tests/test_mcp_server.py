@@ -97,6 +97,7 @@ from phasesweep.mcp.errors import (
     ExperimentBusyError,
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
+    RunPersistentStateUnavailableError,
     UnknownExperimentError,
 )
 from phasesweep.mcp.registry import Registry
@@ -2230,6 +2231,38 @@ def _record_published_run_snapshot(
         result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
     )
     return run_id, trainer, config, catalog
+
+
+@pytest.mark.parametrize("read_method", ["status", "winners"])
+def test_mcp_run_reads_redact_downgraded_persistent_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    read_method: str,
+) -> None:
+    """Live status and result reads never expose a downgraded ledger's details."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
+    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+
+    experiment = registry.get("srv").experiment
+    study = optuna.load_study(
+        study_name=f"{experiment.experiment}::p",
+        storage=experiment.storage,
+    )
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
+
+    with pytest.raises(RunPersistentStateUnavailableError) as excinfo:
+        getattr(app, read_method)(run_id)
+
+    message = str(excinfo.value)
+    assert run_id in message
+    assert "persistent study state" in message
+    assert str(tmp_path) not in message
 
 
 @pytest.mark.parametrize("integrity", ["failed", "permission_denied"])
