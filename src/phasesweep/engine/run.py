@@ -31,7 +31,11 @@ from phasesweep.engine.phase import _placeholder_winner, _run_phase
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
-from phasesweep.engine.trial import ProcessCleanupUncertainError, _preflight_trainer_environments
+from phasesweep.engine.trial import (
+    ProcessCleanupUncertainError,
+    _preflight_trainer_environments,
+    _trainer_environment,
+)
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
@@ -40,6 +44,32 @@ from phasesweep.runtime.process import (
 )
 
 log = logging.getLogger("phasesweep.engine.run")
+
+
+def _preflight_missing_reached_phase_environments(
+    experiment: Experiment,
+    existing_studies: Mapping[str, object],
+    *,
+    from_phase: str | None,
+) -> None:
+    """Validate launch environments for reached phases with no durable study.
+
+    A phase absent from an otherwise bound tree has no completed trial to
+    replay, so it must be able to launch before this invocation claims a
+    generation or tops up an earlier phase. Existing studies remain deferred to
+    recovery, which can distinguish new work from an offline-safe no-op.
+
+    :param Experiment experiment: Parsed experiment supplying phase environments.
+    :param Mapping[str, object] existing_studies: Durable studies found under the lock.
+    :param str | None from_phase: Optional first phase this invocation can execute.
+    :raises PhaseSweepError: A missing reached phase has an invalid launch environment.
+    """
+    reached = from_phase is None
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
+        if reached and phase.name not in existing_studies:
+            _trainer_environment(experiment, phase.name)
 
 
 @dataclass(frozen=True)
@@ -338,6 +368,11 @@ def _run_experiment_outcome(
                 "Restore the original complete storage ledger and access to it before "
                 "retrying. For an MCP run, then run phasesweep mcp recover-run."
             ) from exc
+        _preflight_missing_reached_phase_environments(
+            experiment,
+            existing_studies,
+            from_phase=from_phase,
+        )
         ensure_artifact_dir(path_ops._experiment_dir(experiment))
         run_stack.enter_context(artifact_io._file_log_handler(path_ops._run_log_path(experiment)))
         generation_id = generation_ops._claim_generation(experiment, requested_generation_id)

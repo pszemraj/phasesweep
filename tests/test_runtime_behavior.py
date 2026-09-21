@@ -28,6 +28,7 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
+    WandbSummaryRequiredGate,
 )
 from phasesweep.engine import (
     PhaseSweepError,
@@ -47,6 +48,7 @@ from phasesweep.engine.optuna import (
 )
 from phasesweep.engine.paths import (
     _attempts_dir,
+    _generation_path,
     _last_successful_generation_path,
     _summary_path,
     _winner_path,
@@ -530,6 +532,49 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     second_trial_dir = next(path for path in trial_dirs if path != first_trial_dir)
     assert not (second_trial_dir / "r.json").exists()
     assert {path: path.read_bytes() for path in protected} == protected
+
+
+def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newly reached W&B phase must validate before an existing phase can top up."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    local = Phase(name="local", n_trials=1, sampler=Sampler(type="random", seed=0))
+    initial = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        phases=[local],
+    )
+    run_experiment(initial)
+    generation_before = _generation_path(initial).read_bytes()
+
+    remote = Phase(
+        name="remote",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        gates=[
+            WandbSummaryRequiredGate(
+                type="wandb_summary_required",
+                entity="entity",
+                project="project",
+                keys=["complete"],
+            )
+        ],
+    )
+    expanded = initial.model_copy(
+        update={"phases": [local.model_copy(update={"n_trials": 2}), remote]}
+    )
+    monkeypatch.setenv("WANDB_MODE", "offline")
+
+    with pytest.raises(PhaseSweepError, match="requires online"):
+        run_experiment(expanded)
+
+    assert _generation_path(initial).read_bytes() == generation_before
+    study = optuna.load_study(study_name="t::local", storage=storage)
+    assert len(study.get_trials(deepcopy=False)) == 1
 
 
 def test_terminal_callback_reports_success_evidence(
