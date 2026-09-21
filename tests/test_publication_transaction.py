@@ -531,6 +531,7 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
             run_experiment(experiment)
 
         assert exc_info.value.signum == signal.SIGTERM
+        assert exc_info.value.published_result_committed is True
         generation_id = _last_successful_generation_id(experiment)
         assert generation_id is not None
         assert _record_state(experiment, generation_id) == "published"

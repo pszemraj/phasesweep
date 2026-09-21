@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -45,6 +46,7 @@ from phasesweep.errors import GpuConfigurationError, LockBusyError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
+from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
     make_experiment,
     write_trainer,
@@ -876,11 +878,11 @@ def _invoke_cli_boundary(
     return 0 if code is None else int(code)
 
 
-def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
     """Make ``phasesweep run`` reach the engine and fail with ``error``.
 
     :param pytest.MonkeyPatch monkeypatch: Fixture used to replace CLI collaborators.
-    :param Exception error: Exception ``run_config`` raises once the CLI calls it.
+    :param BaseException error: Exception ``run_config`` raises once the CLI calls it.
     """
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
     monkeypatch.setattr("phasesweep.cli.load_config", lambda _path: object())
@@ -889,6 +891,44 @@ def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None
         raise error
 
     monkeypatch.setattr("phasesweep.cli.run_config", fail)
+
+
+@pytest.mark.parametrize(
+    ("published_result_committed", "expects_notice"),
+    [
+        pytest.param(False, False, id="ordinary-pre-publication-shutdown"),
+        pytest.param(True, True, id="post-publication-shutdown"),
+    ],
+)
+def test_cli_only_explains_marked_post_publication_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    published_result_committed: bool,
+    expects_notice: bool,
+) -> None:
+    """Only the engine's post-publication shutdown marker permits the CLI notice."""
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    shutdown = PhaseSweepShutdown(
+        signal.SIGTERM,
+        ShutdownCleanupReport(
+            signum=signal.SIGTERM,
+            cleanup_confirmed=True,
+            child_pgids=(),
+        ),
+    )
+    assert shutdown.published_result_committed is False
+    if published_result_committed:
+        shutdown.published_result_committed = True
+    _stub_run_command(monkeypatch, shutdown)
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 128 + signal.SIGTERM
+    notice = "shutdown was honored after the published result was committed"
+    assert (notice in captured.err) is expects_notice
 
 
 def test_cli_boundary_reports_config_syntax_error_without_traceback(

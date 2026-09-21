@@ -129,7 +129,7 @@ class SignalOwnershipUnavailableError(RuntimeError):
 
 
 class PhaseSweepShutdown(SystemExit):
-    """SystemExit carrying child process-group cleanup evidence."""
+    """SystemExit carrying cleanup evidence and post-publication state."""
 
     def __init__(self, signum: int, report: ShutdownCleanupReport) -> None:
         """Create a POSIX-style signaled exit with structured cleanup evidence.
@@ -144,6 +144,9 @@ class PhaseSweepShutdown(SystemExit):
         super().__init__(128 + signum)
         self.signum = signum
         self.report = report
+        # The engine sets this only when its post-publication checkpoint
+        # services a shutdown that was absorbed while committing results.
+        self.published_result_committed = False
 
 
 # Python-level shutdown deferral. Kernel signal masks are per-thread, but

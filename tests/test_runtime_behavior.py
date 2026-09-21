@@ -2258,8 +2258,10 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
         return real_launch_trial(**kwargs)
 
     monkeypatch.setattr(phase_mod, "launch_trial", interrupt_first_launch)
-    with pytest.raises(PhaseSweepShutdown):
+    with pytest.raises(PhaseSweepShutdown) as exc_info:
         run_experiment(exp)
+
+    assert exc_info.value.published_result_committed is False
 
     study = optuna.load_study(study_name="t::p", storage=exp.storage)
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None

@@ -297,7 +297,14 @@ def run_experiment(
     # Publication and its terminal callback are already durable/successful at
     # this boundary. Deliver any shutdown absorbed by the one-way commit window
     # before returning control or allowing a long-lived caller to start work.
-    service_pending_shutdown()
+    try:
+        service_pending_shutdown()
+    except PhaseSweepShutdown as exc:
+        # This is the sole post-publication delivery point. Keep that fact on
+        # the control-flow exception so process frontends can explain the
+        # signalled exit without re-reading mutable publication pointers.
+        exc.published_result_committed = True
+        raise
     return dict(outcome.winners)
 
 

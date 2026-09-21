@@ -47,6 +47,7 @@ from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import report_objective
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
 from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
     install_signal_handlers,
 )
 
@@ -374,7 +375,16 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
         if from_phase not in valid:
             click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
             sys.exit(2)
-    run_config(config, from_phase=from_phase, dry_run=dry_run)
+    try:
+        run_config(config, from_phase=from_phase, dry_run=dry_run)
+    except PhaseSweepShutdown as exc:
+        if exc.published_result_committed:
+            click.echo(
+                "phasesweep: shutdown was honored after the published result was committed; "
+                "the result is available for inspection.",
+                err=True,
+            )
+        raise
 
 
 @cli.command(
