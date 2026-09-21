@@ -601,7 +601,11 @@ def read_status(
         config fingerprint against the current config's semantic fingerprint;
         ``None`` when the represented summary records no fingerprint.
     """
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    _validate_artifact_root_binding(
+        experiment,
+        claim_fresh=False,
+        validate_storage_format=False,
+    )
     current_generation_id = _current_pointer_generation_id(experiment)
     publication = _resolve_publication_pointer(experiment)
     published_generation_id = publication.generation_id if publication.state == "ok" else None
@@ -629,8 +633,13 @@ def read_status(
         else {}
     )
     phase_stats = {
-        phase.name: _phase_trial_stats(experiment, phase, published_trials.get(phase.name))
-        for phase in experiment.phases
+        phase.name: _phase_trial_stats(
+            experiment,
+            phase,
+            published_trials.get(phase.name),
+            validate_storage_format=index == 0,
+        )
+        for index, phase in enumerate(experiment.phases)
     }
     summary_path = (
         _generation_summary_path(experiment, winner_scope_generation_id)

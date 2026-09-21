@@ -648,6 +648,17 @@ def _validate_local_storage_format(experiment: Experiment) -> None:
     else:
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
 
+    _validate_storage_versions(versions)
+
+
+def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> None:
+    """Reject unsupported PhaseSweep study versions from one storage snapshot.
+
+    :param Iterable[tuple[str, object, bool]] versions: Study name, decoded schema
+        version, and whether the study contains trials.
+    :raises StudySchemaMismatchError: A populated study is unmarked or any study
+        carries an unsupported explicit schema version.
+    """
     # Match _validate_study_schema: create_study can survive an interruption
     # before the first schema stamp, and an empty unmarked study is claimable.
     unsupported = [
@@ -735,6 +746,34 @@ _PHASE_TRIAL_STATS_SQL = """
         LEFT JOIN study_user_attributes AS schema
           ON studies.study_id = schema.study_id AND schema.key = :study_schema_key
         WHERE studies.study_name = :study_name
+    ),
+    unsupported_study AS (
+        SELECT studies.study_name,
+               schema.value_json AS schema_json,
+               EXISTS(
+                   SELECT 1 FROM trials AS ledger_trials
+                   WHERE ledger_trials.study_id = studies.study_id
+               ) AS has_trials
+        FROM studies
+        LEFT JOIN study_user_attributes AS schema
+          ON studies.study_id = schema.study_id AND schema.key = :study_schema_key
+        WHERE :validate_storage_format = 1
+          AND instr(studies.study_name, '::') > 0
+          AND (
+              (
+                  schema.value_json IS NULL
+                  AND EXISTS(
+                      SELECT 1 FROM trials AS ledger_trials
+                      WHERE ledger_trials.study_id = studies.study_id
+                  )
+              )
+              OR (
+                  schema.value_json IS NOT NULL
+                  AND schema.value_json != :expected_study_schema_json
+              )
+          )
+        ORDER BY studies.study_id
+        LIMIT 1
     )
     SELECT 'count', NULL, state, generation_json, NULL, COUNT(*), schema_json
     FROM phase_trials
@@ -747,11 +786,18 @@ _PHASE_TRIAL_STATS_SQL = """
     SELECT 'published', number, state, generation_json, attempt_json, 1, schema_json
     FROM phase_trials
     WHERE number = :published_trial_number
+    UNION ALL
+    SELECT 'schema', NULL, study_name, NULL, NULL, has_trials, schema_json
+    FROM unsupported_study
 """
 
 
 def _phase_trial_stats_params(
-    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None
+    experiment: Experiment,
+    phase: Phase,
+    published_trial: _TrialRef | None,
+    *,
+    validate_storage_format: bool,
 ) -> dict[str, str | int]:
     """Return bind parameters for the observational phase-trial SQL query.
 
@@ -759,6 +805,8 @@ def _phase_trial_stats_params(
     :param Phase phase: Phase whose study is queried.
     :param _TrialRef | None published_trial: Published local trial whose number is included,
         or ``None`` to bind ``published_trial_number`` to ``-1``.
+    :param bool validate_storage_format: Whether this snapshot must also reject
+        unsupported studies anywhere in the ledger.
     :return dict[str, str | int]: Attribute keys, study name, and published trial number;
         only the trial number from ``published_trial`` is used.
     """
@@ -766,6 +814,8 @@ def _phase_trial_stats_params(
         "generation_key": GENERATION_ID_ATTR,
         "attempt_key": ATTEMPT_ID_ATTR,
         "study_schema_key": STUDY_SCHEMA_ATTR,
+        "expected_study_schema_json": json.dumps(STUDY_SCHEMA_VERSION),
+        "validate_storage_format": int(validate_storage_format),
         "study_name": _phase_study_name(experiment, phase),
         "published_trial_number": published_trial.trial_number if published_trial else -1,
     }
@@ -794,7 +844,11 @@ def _unavailable_phase_trial_stats(
 
 
 def _sqlite_phase_trial_stats(
-    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+    experiment: Experiment,
+    phase: Phase,
+    published_trial: _TrialRef | None = None,
+    *,
+    validate_storage_format: bool = False,
 ) -> _PhaseTrialStats:
     """Return trial-state counts and RUNNING identities in one SQLite read.
 
@@ -816,6 +870,8 @@ def _sqlite_phase_trial_stats(
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
     :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
+    :param bool validate_storage_format: Whether this same snapshot must also
+        reject unsupported studies anywhere in the ledger.
     :return _PhaseTrialStats: Counts, RUNNING identities, and an availability
         flag; counts are empty, running attempts ``None``, and availability
         false when the DB cannot be read safely.
@@ -837,7 +893,12 @@ def _sqlite_phase_trial_stats(
         try:
             rows = conn.execute(
                 _PHASE_TRIAL_STATS_SQL,
-                _phase_trial_stats_params(experiment, phase, published_trial),
+                _phase_trial_stats_params(
+                    experiment,
+                    phase,
+                    published_trial,
+                    validate_storage_format=validate_storage_format,
+                ),
             ).fetchall()
         finally:
             conn.close()
@@ -863,6 +924,7 @@ def _trial_stats_from_rows(
     running_attempts: list[_TrialRef] = []
     published_trial_available = False
     study_schema: object = None
+    storage_versions: list[tuple[str, object, bool]] = []
     for row_kind, number, state, generation_json, attempt_json, tally, schema_json in rows:
         try:
             decoded_schema = (
@@ -870,9 +932,12 @@ def _trial_stats_from_rows(
             )
         except (TypeError, json.JSONDecodeError):
             decoded_schema = schema_json
+        state_name = str(state)
+        if row_kind == "schema":
+            storage_versions.append((state_name, decoded_schema, bool(tally)))
+            continue
         if study_schema is None:
             study_schema = decoded_schema
-        state_name = str(state)
         generation_id = _decoded_string_attr(generation_json)
         if row_kind == "count":
             count = int(tally)
@@ -908,6 +973,7 @@ def _trial_stats_from_rows(
                 attempt_id=_decoded_string_attr(attempt_json),
             )
         )
+    _validate_storage_versions(storage_versions)
     if counts and (type(study_schema) is not int or study_schema != STUDY_SCHEMA_VERSION):
         raise StudySchemaMismatchError(
             f"Study {study_name!r} uses pre-cutover or unsupported schema "
@@ -919,7 +985,11 @@ def _trial_stats_from_rows(
 
 
 def _phase_trial_stats(
-    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+    experiment: Experiment,
+    phase: Phase,
+    published_trial: _TrialRef | None = None,
+    *,
+    validate_storage_format: bool = False,
 ) -> _PhaseTrialStats:
     """Read counts and RUNNING identities without creating a missing study.
 
@@ -932,20 +1002,45 @@ def _phase_trial_stats(
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
     :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
+    :param bool validate_storage_format: Whether this snapshot must also reject
+        unsupported studies anywhere in the ledger.
     :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
     if experiment.resolved_storage is None:
         return _PhaseTrialStats({}, False, {}, None)
     backend = storage_backend(experiment.resolved_storage)
     if backend == "sqlite":
-        return _sqlite_phase_trial_stats(experiment, phase, published_trial)
+        return _sqlite_phase_trial_stats(
+            experiment,
+            phase,
+            published_trial,
+            validate_storage_format=validate_storage_format,
+        )
     if backend != "journal":
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     try:
-        study = _load_journal_study_snapshot(
-            experiment.resolved_storage, _phase_study_name(experiment, phase)
+        snapshot = _journal_snapshot_storage(
+            experiment.resolved_storage,
+            f"study {_phase_study_name(experiment, phase)!r}",
         )
-        if study is None:
+        if snapshot is None:
+            return _PhaseTrialStats({}, True, {}, [])
+        if validate_storage_format:
+            _validate_storage_versions(
+                (
+                    study.study_name,
+                    study.user_attrs.get(STUDY_SCHEMA_ATTR),
+                    bool(snapshot.get_all_trials(study._study_id, deepcopy=False)),
+                )
+                for study in snapshot.get_all_studies()
+                if "::" in study.study_name
+            )
+        try:
+            study = optuna.load_study(
+                study_name=_phase_study_name(experiment, phase),
+                storage=snapshot,
+            )
+        except KeyError:
             return _PhaseTrialStats({}, True, {}, [])
         trials = study.get_trials(deepcopy=False)
         schema = study.user_attrs.get(STUDY_SCHEMA_ATTR)

@@ -191,6 +191,7 @@ def _validate_artifact_root_binding(
     *,
     claim_fresh: bool,
     validate_storage_format: bool = True,
+    validate_unbound_storage: bool = True,
 ) -> None:
     """Validate or claim the storage ledger that owns an artifact tree.
 
@@ -203,7 +204,10 @@ def _validate_artifact_root_binding(
     :param bool claim_fresh: Write the record when the root has no recognized
         PhaseSweep durable state.
     :param bool validate_storage_format: Inspect the selected persistent ledger
-        for unsupported study schemas.
+        for unsupported study schemas after a matching binding is read.
+    :param bool validate_unbound_storage: Inspect the selected persistent ledger
+        when no binding exists yet. Mutating preflight disables this only until
+        its later claim step performs the same validation immediately before writing.
     :raises ArtifactRootConflictError: The binding cannot be validated as the
         current user, or is malformed or names another owner.
     """
@@ -221,7 +225,7 @@ def _validate_artifact_root_binding(
                 "release, or use the preserved PhaseSweep 0.3.1 environment to operate "
                 "the existing state. Nothing was written."
             ) from None
-        if validate_storage_format:
+        if validate_unbound_storage:
             # A read without a binding must still classify the selected ledger:
             # an unavailable ledger is not equivalent to an empty
             # current-format one. Tolerant per-phase status counts only apply
@@ -392,6 +396,7 @@ def _load_and_check_artifact_roots(
         experiment,
         claim_fresh=False,
         validate_storage_format=False,
+        validate_unbound_storage=False,
     )
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
