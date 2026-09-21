@@ -63,6 +63,45 @@ def test_wandb_query_normalizes_targets_and_collects_exact_keys():
     assert query.presence_keys == ("complete",)
 
 
+def test_wandb_gate_query_identity_ignores_gate_list_order():
+    from phasesweep.config.models import _wandb_query
+
+    first = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="e", project="p", keys=["complete"]
+    )
+    second = first.model_copy(update={"keys": ["artifact_ready"]})
+    experiment = make_experiment(gates=[first, second])
+
+    ordered = _wandb_query(experiment, [first, second])
+    reordered = _wandb_query(experiment, [second, first])
+
+    assert ordered is not None
+    assert reordered is not None
+    assert dict(ordered.gate_keys) == dict(reordered.gate_keys)
+
+
+def test_wandb_environment_identity_can_bind_offline_mode_without_launch():
+    from phasesweep.config.models import _wandb_query
+    from phasesweep.evidence.models import compose_wandb_environment
+
+    experiment = make_experiment(
+        metric=Metric(
+            extractor=WandbExtractor(type="wandb", entity="e", project="p", metric_key="loss")
+        )
+    )
+    query = _wandb_query(experiment, experiment.phases[0].gates)
+    assert query is not None
+
+    with pytest.raises(ValueError, match="requires online"):
+        compose_wandb_environment(query, {}, {"WANDB_MODE": "offline"})
+
+    environment = compose_wandb_environment(
+        query, {}, {"WANDB_MODE": "offline"}, require_online=False
+    )
+    assert environment["WANDB_MODE"] == "offline"
+    assert environment["WANDB_PROJECT"] == "p"
+
+
 @pytest.mark.parametrize(
     "env",
     [

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -492,6 +494,18 @@ class WandbSummaryRequiredGate(_WandbSummarySource):
     keys: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
 
 
+def wandb_gate_identity(gate: WandbSummaryRequiredGate) -> str:
+    """Return a canonical identity for one W&B summary-presence gate.
+
+    :param WandbSummaryRequiredGate gate: Gate whose declaration is frozen into a capture.
+    :return str: SHA-256 identity stable across enclosing gate-list reordering.
+    """
+    payload = json.dumps(
+        gate.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 @dataclass(frozen=True)
 class WandbQuery:
     """An attempt's shared query compiled from existing evidence declarations."""
@@ -500,17 +514,22 @@ class WandbQuery:
     numeric_keys: tuple[str, ...]
     presence_keys: tuple[str, ...]
     constraint_keys: tuple[tuple[str, str], ...] = ()
-    gate_keys: tuple[tuple[int, tuple[str, ...]], ...] = ()
+    gate_keys: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def compose_wandb_environment(
-    query: WandbQuery, configured: Mapping[str, str], environment: Mapping[str, str]
+    query: WandbQuery,
+    configured: Mapping[str, str],
+    environment: Mapping[str, str],
+    *,
+    require_online: bool = True,
 ) -> dict[str, str]:
     """Bind remote evidence before environment identity, preserving other settings.
 
     :param WandbQuery query: Phase's agreed target and evidence requirements.
     :param Mapping[str, str] configured: Explicit experiment environment entries.
     :param Mapping[str, str] environment: Already composed trainer environment.
+    :param bool require_online: Whether disabled/offline ambient logging is invalid for this use.
     :return dict[str, str]: Bound base environment, before the generated attempt ID.
     :raises ValueError: Explicit managed settings conflict, or remote logging is disabled.
     """
@@ -532,11 +551,10 @@ def compose_wandb_environment(
                 )
     if "WANDB_RUN_ID" in configured:
         raise ValueError("env.WANDB_RUN_ID conflicts with the generated W&B attempt ID; remove it.")
-    if environment.get("WANDB_MODE", "online").lower() in {
-        "offline",
-        "dryrun",
-        "disabled",
-    } or environment.get("WANDB_DISABLED", "").lower() in {"1", "true", "yes", "on"}:
+    if require_online and (
+        environment.get("WANDB_MODE", "online").lower() in {"offline", "dryrun", "disabled"}
+        or environment.get("WANDB_DISABLED", "").lower() in {"1", "true", "yes", "on"}
+    ):
         raise ValueError(
             "W&B evidence requires online logging; remove offline/disabled W&B settings."
         )

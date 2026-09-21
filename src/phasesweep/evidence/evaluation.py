@@ -476,7 +476,7 @@ def _capture_wandb(
             "run_id": ctx.attempt_id,
             "run_state": "finished",
             "constraint_keys": dict(query.constraint_keys),
-            "gate_keys": {str(index): list(keys) for index, keys in query.gate_keys},
+            "gate_keys": {identity: list(keys) for identity, keys in query.gate_keys},
             **capture,
         }
     )

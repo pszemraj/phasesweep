@@ -38,6 +38,7 @@ from phasesweep.evidence.models import (
     _WandbSummarySource,
     compose_wandb_environment,
     objective_evidence_assurance,
+    wandb_gate_identity,
 )
 from phasesweep.runtime.files import (
     canonical_storage_identity,
@@ -1188,8 +1189,8 @@ def _wandb_query(
             if isinstance(constraint.extractor, WandbExtractor)
         ),
         tuple(
-            (index, tuple(gate.keys))
-            for index, gate in enumerate(gates)
+            (wandb_gate_identity(gate), tuple(gate.keys))
+            for gate in gates
             if isinstance(gate, WandbSummaryRequiredGate)
         ),
     )

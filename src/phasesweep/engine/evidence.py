@@ -478,7 +478,7 @@ def _verify_trial_evidence_dir(
             or set(capture["values"]) != set(wandb_query.numeric_keys)
             or capture.get("constraint_keys") != dict(wandb_query.constraint_keys)
             or capture.get("gate_keys")
-            != {str(index): list(keys) for index, keys in wandb_query.gate_keys}
+            != {identity: list(keys) for identity, keys in wandb_query.gate_keys}
             or any(
                 capture["values"].get(key) != constraints.get(name)
                 for name, key in wandb_query.constraint_keys
