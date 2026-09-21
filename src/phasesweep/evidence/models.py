@@ -500,9 +500,13 @@ def wandb_gate_identity(gate: WandbSummaryRequiredGate) -> str:
     :param WandbSummaryRequiredGate gate: Gate whose declaration is frozen into a capture.
     :return str: SHA-256 identity stable across enclosing gate-list reordering.
     """
-    payload = json.dumps(
-        gate.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    identity = {
+        "base_url": gate.base_url,
+        "entity": gate.entity,
+        "project": gate.project,
+        "keys": sorted(set(gate.keys)),
+    }
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
 
 

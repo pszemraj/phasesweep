@@ -80,6 +80,39 @@ def test_wandb_gate_query_identity_ignores_gate_list_order():
     assert dict(ordered.gate_keys) == dict(reordered.gate_keys)
 
 
+def test_wandb_gate_query_identity_uses_only_target_and_required_keys():
+    from phasesweep.config.models import _wandb_query
+
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required",
+        base_url="https://API.WANDB.AI/",
+        entity="e",
+        project="p",
+        keys=["complete", "artifact_ready"],
+        poll_seconds=2,
+        timeout_seconds=120,
+    )
+    operational_change = gate.model_copy(
+        update={
+            "keys": ["artifact_ready", "complete"],
+            "poll_seconds": 5,
+            "timeout_seconds": 300,
+        }
+    )
+    target_change = gate.model_copy(update={"project": "another"})
+    keys_change = gate.model_copy(update={"keys": ["complete"]})
+
+    def gate_keys(candidate: WandbSummaryRequiredGate) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        experiment = make_experiment(gates=[candidate])
+        query = _wandb_query(experiment, experiment.phases[0].gates)
+        assert query is not None
+        return query.gate_keys
+
+    assert gate_keys(operational_change) == gate_keys(gate)
+    assert gate_keys(target_change) != gate_keys(gate)
+    assert gate_keys(keys_change) != gate_keys(gate)
+
+
 def test_wandb_environment_identity_can_bind_offline_mode_without_launch():
     from phasesweep.config.models import _wandb_query
     from phasesweep.evidence.models import compose_wandb_environment

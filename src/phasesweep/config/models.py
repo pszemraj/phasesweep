@@ -1189,7 +1189,7 @@ def _wandb_query(
             if isinstance(constraint.extractor, WandbExtractor)
         ),
         tuple(
-            (wandb_gate_identity(gate), tuple(gate.keys))
+            (wandb_gate_identity(gate), tuple(sorted(set(gate.keys))))
             for gate in gates
             if isinstance(gate, WandbSummaryRequiredGate)
         ),
