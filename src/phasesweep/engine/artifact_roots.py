@@ -144,7 +144,8 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
 
     :param Experiment experiment: Experiment whose artifact root is inspected.
     :raises ArtifactRootConflictError: The artifact root cannot be enumerated.
-    :return str | None: Known durable entry name, or ``None`` for a fresh root.
+    :return str | None: Known durable entry name, or ``None`` when no known
+        PhaseSweep state entry is present.
     """
     root = _experiment_dir(experiment)
     if not root.is_dir():
@@ -199,10 +200,10 @@ def _validate_artifact_root_binding(
     pre-cutover state and is refused by this release.
 
     :param Experiment experiment: Config whose root and storage must agree.
-    :param bool claim_fresh: Write the record when the root has no durable state.
-    :param bool validate_storage_format: Inspect a matched persistent ledger for
-        unsupported study schemas. Status reads disable this global pass and
-        validate each declared study inside their existing storage snapshots.
+    :param bool claim_fresh: Write the record when the root has no recognized
+        PhaseSweep durable state.
+    :param bool validate_storage_format: Inspect the selected persistent ledger
+        for unsupported study schemas.
     :raises ArtifactRootConflictError: The binding cannot be validated as the
         current user, or is malformed or names another owner.
     """
@@ -220,10 +221,12 @@ def _validate_artifact_root_binding(
                 "release, or use the preserved PhaseSweep 0.3.1 environment to operate "
                 "the existing state. Nothing was written."
             ) from None
-        # A read without a binding must still classify the selected ledger: an
-        # unavailable ledger is not equivalent to an empty current-format one.
-        # Tolerant per-phase status counts only apply after this provenance check.
-        _validate_local_storage_format(experiment)
+        if validate_storage_format:
+            # A read without a binding must still classify the selected ledger:
+            # an unavailable ledger is not equivalent to an empty
+            # current-format one. Tolerant per-phase status counts only apply
+            # after this provenance check.
+            _validate_local_storage_format(experiment)
         if claim_fresh:
             try:
                 atomic_write_text(path, json.dumps(expected, sort_keys=True) + "\n")
@@ -385,7 +388,11 @@ def _load_and_check_artifact_roots(
     """
     # Reject an existing foreign or pre-cutover root before touching storage,
     # including an in-memory configuration offered a bound root.
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    _validate_artifact_root_binding(
+        experiment,
+        claim_fresh=False,
+        validate_storage_format=False,
+    )
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
         try:

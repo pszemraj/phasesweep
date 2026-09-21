@@ -165,16 +165,44 @@ def test_current_sqlite_format_continues_after_top_up(tmp_path: Path) -> None:
     assert binding["schema_version"] == ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 
 
-def test_bound_root_read_refuses_downgraded_ledger_schema(tmp_path: Path) -> None:
-    """Read surfaces reject the same pre-cutover ledger that execution rejects."""
-    storage = f"sqlite:///{tmp_path / 'current.db'}"
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+@pytest.mark.parametrize("leftover_study", ["t::retired", "other_experiment::phase"])
+def test_bound_root_status_refuses_empty_stamped_legacy_studies(
+    tmp_path: Path, backend: str, leftover_study: str
+) -> None:
+    """Status rejects empty retired or foreign studies with an old format stamp."""
+    storage = f"{backend}:///{tmp_path / f'current.{backend}'}"
     experiment = _experiment(tmp_path, storage=storage)
     run_experiment(experiment)
-    study = optuna.load_study(study_name="t::p", storage=storage)
-    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
+    leftover = optuna.create_study(study_name=leftover_study, storage=_resolve_storage(storage))
+    leftover.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
 
     with pytest.raises(StudySchemaMismatchError, match="pre-cutover or unsupported"):
         read_status(experiment)
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_startup_scans_the_ledger_format_once(
+    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The root preflight defers its only full-ledger scan until it can claim state."""
+    import phasesweep.engine.artifact_roots as artifact_roots
+
+    storage = f"{backend}:///{tmp_path / f'current.{backend}'}"
+    experiment = _experiment(tmp_path, storage=storage)
+    real_validate = artifact_roots._validate_local_storage_format
+    calls = 0
+
+    def counted_validate(candidate: Experiment) -> None:
+        nonlocal calls
+        calls += 1
+        real_validate(candidate)
+
+    monkeypatch.setattr(artifact_roots, "_validate_local_storage_format", counted_validate)
+
+    run_experiment(experiment)
+
+    assert calls == 1
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
