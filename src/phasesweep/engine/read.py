@@ -43,7 +43,6 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import (
     _last_successful_generation_id,
-    _published_summary_path_for,
     _published_winner_path,
     _published_winner_path_for,
     _resolve_publication_pointer,
@@ -633,12 +632,11 @@ def read_status(
         phase.name: _phase_trial_stats(experiment, phase, published_trials.get(phase.name))
         for phase in experiment.phases
     }
-    summary_path: Path | None
-    if pinned:
-        assert winner_scope_generation_id is not None
-        summary_path = _generation_summary_path(experiment, winner_scope_generation_id)
-    else:
-        summary_path = _published_summary_path_for(experiment, winner_scope_generation_id)
+    summary_path = (
+        _generation_summary_path(experiment, winner_scope_generation_id)
+        if winner_scope_generation_id is not None
+        else None
+    )
 
     # The represented generation's winner/summary facts are historical
     # evidence, so the metric they are reported under must be the one that

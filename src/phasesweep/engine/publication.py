@@ -246,19 +246,3 @@ def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | No
     return _published_winner_path_for(
         experiment, _last_successful_generation_id(experiment), phase_name
     )
-
-
-def _published_summary_path_for(
-    experiment: Experiment,
-    published_generation_id: str | None,
-) -> Path | None:
-    """Resolve an authoritative current-format summary path.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str | None published_generation_id: Already-resolved last-success id.
-    :return Path | None: The immutable generation-scoped summary path, or
-        ``None`` when no last-success generation was resolved.
-    """
-    if published_generation_id is None:
-        return None
-    return path_ops._generation_summary_path(experiment, published_generation_id)

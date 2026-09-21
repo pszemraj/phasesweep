@@ -192,10 +192,8 @@ GenerationIdSource = Literal["caller", "engine"]
 _MANIFEST_ARTIFACT_KINDS = frozenset({"winner"})
 _ARTIFACT_FILENAMES = {"winner": "winner.yaml"}
 # Manifest kinds that name a file in the generation namespace root rather than
-# a phase. Their entries carry ``path`` instead of ``phase``; a generation
-# published before finding F6 lists neither kind and holds neither file, which
-# is exactly what keeps it valid under the same "listed if and only if
-# present" invariant.
+# a phase. Their entries carry ``path`` instead of ``phase``; both are required
+# in every current-format generation.
 _GENERATION_FILE_FILENAMES = {
     "config_snapshot": GENERATION_CONFIG_SNAPSHOT_FILENAME,
     "reproducibility": GENERATION_REPRODUCIBILITY_FILENAME,

@@ -81,8 +81,8 @@ def _generation_artifact_manifest(
 
     The namespace-root provenance files written at claim time
     (:func:`phasesweep.engine.provenance._write_generation_provenance`) are listed first, under entries
-    that carry ``path`` instead of ``phase``. They are absent -- and so
-    unlisted -- in generations published before finding F6.
+    that carry ``path`` instead of ``phase``. Both are mandatory for every
+    current-format generation.
 
     :param Experiment experiment: Experiment whose generation is summarized.
     :param str generation_id: Immutable generation namespace to scan.
@@ -150,9 +150,8 @@ def _validate_generation_manifest(
     The manifest covers phase-scoped winners (``kind`` + ``phase``) and the
     namespace-root provenance files frozen at claim time (``kind`` + ``path``; see
     :func:`_validate_generation_provenance_files`, review v0.5.18 / finding
-    F6). Both obey the same listed-if-and-only-if-present rule, which is what
-    keeps a generation published before either existed valid without a schema
-    bump.
+    F6). Every current-format summary lists both provenance files, each of
+    which must exist and match its recorded hash.
 
     A winner carried forward from an earlier generation additionally has that
     generation resolved in this same tree
@@ -544,9 +543,8 @@ def _validate_generation_provenance_files(
     to its recorded content, and the namespace holds nothing the manifest does
     not list -- onto ``config.snapshot.yaml`` and ``reproducibility.json``
     (review v0.5.18 / finding F6). The two are all-or-nothing: they are
-    written together at claim time, so a manifest that lists one without the
-    other has been edited. A generation published before those files existed
-    lists neither and holds neither, which passes every check here unchanged.
+    written together at claim time and every current-format summary must list
+    both. A missing file or manifest entry is therefore a format violation.
 
     Note that the snapshot is owner-only, so a reader who cannot read it
     cannot validate the publication at all -- the same fail-closed outcome as
