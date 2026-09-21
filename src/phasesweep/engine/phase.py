@@ -407,11 +407,6 @@ def _run_phase(
     policy_state = None
     recovery_abort: dict[str, Any] | None = None
     partial_decision: _AcceptedPartialDecision | None = None
-    # The trainer environment is a property of this process and its config, not
-    # of any one trial, so it is composed once per phase execution and stamped
-    # onto every trial (review v0.5.18 / finding F3).
-    environment_identity = _environment_identity(experiment, phase.name)
-
     if not dry_run:
         # A study this invocation just created was invisible to preflight, so
         # it claims its publication root here — before any inspection, reaping,
@@ -420,7 +415,6 @@ def _run_phase(
         _validate_study_direction(study, experiment.metric.goal)
         _validate_study_schema(study)
         _reap_stale_trials(study, experiment, phase.name)
-        _validate_environment_cohort(study, environment_identity.digest)
         policy_state = _load_phase_policy_state(study)
         phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
         _validate_trial_target(study, phase)
@@ -525,6 +519,13 @@ def _run_phase(
                 "timeout_scope": None,
             },
         )
+
+    # Compose and validate the launch environment only after recovery proves
+    # this phase has work remaining. Published/no-op replay must not require an
+    # online W&B environment, while every new allocation still joins the
+    # study's established semantic environment cohort.
+    environment_identity = _environment_identity(experiment, phase.name)
+    _validate_environment_cohort(study, environment_identity.digest)
 
     from phasesweep.config.models import _wandb_query
     from phasesweep.evidence.wandb import require_wandb_sdk
@@ -945,7 +946,6 @@ def _run_phase(
             experiment=experiment,
             executed=executed,
             gates=_phase_gates(phase),
-            enforce_gates=True,
             deadline=optimize_deadline,
         )
         if result.deadline_exhausted:

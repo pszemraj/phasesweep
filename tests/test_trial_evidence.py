@@ -278,7 +278,9 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     monkeypatch.setitem(sys.modules, "wandb", None)
     monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
     assert len(read_winners(experiment)) == 2
-    assert run_experiment(experiment)["next"].attempt_id == winners["next"].attempt_id
+    with monkeypatch.context() as replay_env:
+        replay_env.setenv("WANDB_MODE", "offline")
+        assert run_experiment(experiment)["next"].attempt_id == winners["next"].attempt_id
     assert len(calls_path.read_text().splitlines()) == 2
     if consumers == "primary":
         from phasesweep.engine.state import TRIAL_TARGET_ATTR

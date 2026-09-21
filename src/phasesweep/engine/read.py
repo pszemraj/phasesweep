@@ -601,7 +601,11 @@ def read_status(
         config fingerprint against the current config's semantic fingerprint;
         ``None`` when the represented summary records no fingerprint.
     """
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    _validate_artifact_root_binding(
+        experiment,
+        claim_fresh=False,
+        validate_storage_format=False,
+    )
     current_generation_id = _current_pointer_generation_id(experiment)
     publication = _resolve_publication_pointer(experiment)
     published_generation_id = publication.generation_id if publication.state == "ok" else None

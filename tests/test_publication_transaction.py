@@ -510,8 +510,8 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
     """A shutdown signal racing the publication transaction loses to the commit.
 
     The signal lands mid-transaction (during pre-commit validation); the
-    publication must still commit, the run must return success, and the
-    shutdown must be delivered at the next checkpoint — never rewritten into
+    publication must still commit and the shutdown must be delivered at the
+    next checkpoint — never rewritten into
     a ``failed``/``publication_failed`` state for the committed generation
     (review v0.5.16 / blocker 1, window 2).
     """
@@ -527,18 +527,15 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
     monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
 
     try:
-        winners = run_experiment(experiment)
+        with pytest.raises(PhaseSweepShutdown) as exc_info:
+            run_experiment(experiment)
 
-        assert set(winners) == {"p"}
+        assert exc_info.value.signum == signal.SIGTERM
         generation_id = _last_successful_generation_id(experiment)
         assert generation_id is not None
         assert _record_state(experiment, generation_id) == "published"
         assert _current_pointer_state(experiment) == "published"
-
-        # The absorbed shutdown is still honored before any new work starts.
-        with pytest.raises(PhaseSweepShutdown) as exc_info:
-            runtime_process.service_pending_shutdown()
-        assert exc_info.value.signum == signal.SIGTERM
+        assert runtime_process.service_pending_shutdown() is None
     finally:
         runtime_process._deferred_shutdown_signum = None
 
@@ -730,6 +727,34 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
     artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
     _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+    assert _resolve_publication_pointer(experiment).state == "failed"
+    assert read_status(experiment)["publication_integrity"] == "failed"
+    assert read_winner(experiment, "p") is None
+
+
+@pytest.mark.parametrize("removed_artifact", ["promotion_decisions", "promotion.yaml"])
+def test_manifest_rejects_removed_promotion_artifacts(
+    tmp_path: Path,
+    removed_artifact: str,
+) -> None:
+    """Current-format publications cannot silently adopt removed promotion state."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    if removed_artifact == "promotion_decisions":
+        summary_path = _generation_summary_path(experiment, generation_id)
+        summary = yaml.safe_load(summary_path.read_text())
+        summary[removed_artifact] = []
+        summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+        _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    else:
+        promotion_path = (
+            _generation_dir(experiment, generation_id) / "phases" / "p" / removed_artifact
+        )
+        promotion_path.write_text("removed: true\n")
 
     assert _resolve_publication_pointer(experiment).state == "failed"
     assert read_status(experiment)["publication_integrity"] == "failed"

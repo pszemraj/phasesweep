@@ -10,7 +10,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config import Experiment
-from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError
+from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError, read_status
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
@@ -163,6 +163,18 @@ def test_current_sqlite_format_continues_after_top_up(tmp_path: Path) -> None:
     assert len(study.trials) == 2
     binding = json.loads(_artifact_root_binding_path(experiment).read_text(encoding="utf-8"))
     assert binding["schema_version"] == ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
+
+
+def test_bound_root_read_refuses_downgraded_ledger_schema(tmp_path: Path) -> None:
+    """Read surfaces reject the same pre-cutover ledger that execution rejects."""
+    storage = f"sqlite:///{tmp_path / 'current.db'}"
+    experiment = _experiment(tmp_path, storage=storage)
+    run_experiment(experiment)
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
+
+    with pytest.raises(StudySchemaMismatchError, match="pre-cutover or unsupported"):
+        read_status(experiment)
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])

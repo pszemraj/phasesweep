@@ -189,6 +189,7 @@ def _validate_artifact_root_binding(
     experiment: Experiment,
     *,
     claim_fresh: bool,
+    validate_storage_format: bool = True,
 ) -> None:
     """Validate or claim the storage ledger that owns an artifact tree.
 
@@ -199,6 +200,9 @@ def _validate_artifact_root_binding(
 
     :param Experiment experiment: Config whose root and storage must agree.
     :param bool claim_fresh: Write the record when the root has no durable state.
+    :param bool validate_storage_format: Inspect a matched persistent ledger for
+        unsupported study schemas. Status reads disable this global pass and
+        validate each declared study inside their existing storage snapshots.
     :raises ArtifactRootConflictError: The binding cannot be validated as the
         current user, or is malformed or names another owner.
     """
@@ -257,8 +261,17 @@ def _validate_artifact_root_binding(
             "this current-format tree, or use a fresh artifact root and local storage. "
             "Nothing was written."
         )
-    if claim_fresh:
-        _validate_local_storage_format(experiment)
+    if validate_storage_format:
+        try:
+            _validate_local_storage_format(experiment)
+        except StudyStorageUnavailableError:
+            if claim_fresh:
+                raise
+            # A matched binding already proves which ledger owns this tree.
+            # Permissive read paths can still report frozen publication data
+            # while their trial-data snapshot reports the ledger unavailable.
+            # Mutating callers immediately perform strict study discovery and
+            # fail there before any trial work or publication.
 
 
 def _claim_study_artifact_root(study: optuna.Study, offered: str) -> None:

@@ -25,6 +25,7 @@ from phasesweep.engine.errors import (
     TrialTargetRegressionError,
 )
 from phasesweep.engine.study_policy import (
+    _load_accepted_partial_decision,
     _validate_environment_cohort,
     _validate_study_direction,
     _validate_study_schema,
@@ -141,10 +142,18 @@ def _preflight_existing_studies(
             _validate_study_direction(study, experiment.metric.goal)
             _validate_study_schema(study)
             if reached:
-                _validate_environment_cohort(
-                    study, _environment_identity(experiment, phase.name).digest
-                )
                 _validate_trial_target(study, phase)
+                partial_decision = _load_accepted_partial_decision(study)
+                finished_trials = sum(
+                    trial.state.is_finished() for trial in study.get_trials(deepcopy=False)
+                )
+                needs_new_trials = phase.n_trials > finished_trials and not (
+                    partial_decision is not None and phase.n_trials == partial_decision.trial_target
+                )
+                if needs_new_trials:
+                    _validate_environment_cohort(
+                        study, _environment_identity(experiment, phase.name).digest
+                    )
         except Exception as exc:
             errors.append(exc)
     if errors:

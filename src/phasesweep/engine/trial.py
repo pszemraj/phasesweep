@@ -134,7 +134,12 @@ _TRIAL_BOUND_ENV = (
 _DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
 
 
-def _trainer_environment(experiment: Experiment, phase_name: str | None = None) -> dict[str, str]:
+def _trainer_environment(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    require_wandb_online: bool = True,
+) -> dict[str, str]:
     """Compose the trainer environment per the execution contract.
 
     ``inherit_env: all`` preserves the historical full-inheritance behavior.
@@ -145,7 +150,9 @@ def _trainer_environment(experiment: Experiment, phase_name: str | None = None) 
     PhaseSweep assigns for each attempt.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
-    :param str | None phase_name: Phase whose remote consumers manage W&B identity.
+    :param str phase_name: Phase whose remote consumers manage W&B identity.
+    :param bool require_wandb_online: Reject offline/disabled W&B modes when the
+        caller is preparing new remote work.
     :return dict[str, str]: The composed trainer environment.
     """
     contract = experiment.execution.inherit_env
@@ -162,25 +169,34 @@ def _trainer_environment(experiment: Experiment, phase_name: str | None = None) 
     # recorded. Ambient copies cannot affect the trainer or its study cohort.
     for name in _TRIAL_BOUND_ENV:
         env.pop(name, None)
-    phase = next(
-        (phase for phase in experiment.phases if phase.name == phase_name), experiment.phases[0]
-    )
+    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
     query = _wandb_query(experiment, phase.gates)
     if query is not None:
         try:
-            env = compose_wandb_environment(query, experiment.env, env)
+            env = compose_wandb_environment(
+                query,
+                experiment.env,
+                env,
+                require_online=require_wandb_online,
+            )
         except ValueError as exc:
             raise PhaseSweepError(str(exc)) from exc
+    elif "WANDB_RUN_ID" not in experiment.env:
+        # Without a remote evidence consumer, an explicitly configured run ID
+        # remains trainer-owned. An ambient/inherited ID is not stable trial
+        # semantics and must not split the persistent-study cohort.
+        env.pop("WANDB_RUN_ID", None)
     return env
 
 
 def _preflight_trainer_environments(
     experiment: Experiment, *, from_phase: str | None = None
 ) -> None:
-    """Validate each phase environment that this invocation can launch.
+    """Validate environments for phases that a fresh artifact tree would launch.
 
-    ``validate`` deliberately does not call this. It remains a static config
-    check, so its result does not vary with the shell from which it is invoked.
+    Existing current-format trees defer this check until recovered study state
+    proves that a phase has new work. A fresh tree has no trials to replay, so
+    every reached phase can be checked before any execution artifact is created.
 
     :param Experiment experiment: Parsed experiment supplying phase contracts.
     :param str | None from_phase: Optional first phase to execute.
@@ -226,7 +242,10 @@ class EnvironmentIdentity:
 
 
 def _environment_identity(
-    experiment: Experiment, phase_name: str | None = None
+    experiment: Experiment,
+    phase_name: str | None = None,
+    *,
+    require_wandb_online: bool = True,
 ) -> EnvironmentIdentity:
     """Fingerprint the semantic part of the composed trainer environment.
 
@@ -249,11 +268,22 @@ def _environment_identity(
     themselves never enter config metadata.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
-    :param str | None phase_name: Phase whose remote consumers normalize W&B defaults.
+    :param str | None phase_name: Phase whose remote consumers normalize W&B
+        defaults. May be omitted only for a single-phase experiment.
+    :param bool require_wandb_online: Reject offline/disabled W&B modes when the
+        caller is preparing new remote work.
     :return EnvironmentIdentity: Digest, sorted variable names, and the
         composed name-to-value mapping the digest covers.
     """
-    env = _trainer_environment(experiment, phase_name)
+    if phase_name is None:
+        if len(experiment.phases) != 1:
+            raise ValueError("phase_name is required for a multi-phase environment identity.")
+        phase_name = experiment.phases[0].name
+    env = _trainer_environment(
+        experiment,
+        phase_name,
+        require_wandb_online=require_wandb_online,
+    )
     passthrough = set(experiment.execution.passthrough_env) - set(experiment.env)
     items = sorted((name, value) for name, value in env.items() if name not in passthrough)
     encoded = json.dumps(items, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -672,7 +702,6 @@ def extract_trial_result(
     experiment: Experiment,
     executed: ExecutedTrial,
     gates: list[Gate] | None = None,
-    enforce_gates: bool = True,
     deadline: float | None = None,
 ) -> TrialResult:
     """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
@@ -698,9 +727,6 @@ def extract_trial_result(
         executed: Output of :func:`launch_trial`; provides the trial context
             and the :class:`ProcessResult`.
         gates: Evidence gates that must pass for the trial to count.
-        enforce_gates: If ``True``, failed gates fail the trial. If ``False``,
-            gates are advisory and are recorded without changing the metric
-            result.
         deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
             ``timeout_seconds_per_phase`` / ``timeout_seconds_per_run`` bound
             the *whole* trial — extraction and gates included, not just the
@@ -870,7 +896,7 @@ def extract_trial_result(
     if executed.ctx.wandb_capture:
         objective_provenance["remote_capture"] = dict(executed.ctx.wandb_capture)
     failed_gates = [gate for gate in gate_results if not gate.passed]
-    if failed_gates and enforce_gates:
+    if failed_gates:
         detail = "; ".join(gate.detail for gate in failed_gates)
         log.warning(
             "[%s/trial_%d] evidence gate(s) failed: %s",

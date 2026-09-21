@@ -275,7 +275,11 @@ def _warn_environment_drift(
     # read-only paths that import this module never need.
     from phasesweep.engine.trial import _environment_identity
 
-    current_digest = _environment_identity(experiment).digest
+    current_digest = _environment_identity(
+        experiment,
+        phase_name,
+        require_wandb_online=False,
+    ).digest
     if stored_digest == current_digest:
         return
     key = (experiment.experiment, phase_name, stored_digest)

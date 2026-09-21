@@ -724,24 +724,27 @@ _PHASE_TRIAL_STATS_SQL = """
         SELECT trials.number,
                trials.state,
                generation.value_json AS generation_json,
-               attempt.value_json AS attempt_json
+               attempt.value_json AS attempt_json,
+               schema.value_json AS schema_json
         FROM trials
         JOIN studies ON trials.study_id = studies.study_id
         LEFT JOIN trial_user_attributes AS generation
           ON trials.trial_id = generation.trial_id AND generation.key = :generation_key
         LEFT JOIN trial_user_attributes AS attempt
           ON trials.trial_id = attempt.trial_id AND attempt.key = :attempt_key
+        LEFT JOIN study_user_attributes AS schema
+          ON studies.study_id = schema.study_id AND schema.key = :study_schema_key
         WHERE studies.study_name = :study_name
     )
-    SELECT 'count', NULL, state, generation_json, NULL, COUNT(*)
+    SELECT 'count', NULL, state, generation_json, NULL, COUNT(*), schema_json
     FROM phase_trials
-    GROUP BY state, generation_json
+    GROUP BY state, generation_json, schema_json
     UNION ALL
-    SELECT 'running', number, state, generation_json, attempt_json, 1
+    SELECT 'running', number, state, generation_json, attempt_json, 1, schema_json
     FROM phase_trials
     WHERE state = 'RUNNING'
     UNION ALL
-    SELECT 'published', number, state, generation_json, attempt_json, 1
+    SELECT 'published', number, state, generation_json, attempt_json, 1, schema_json
     FROM phase_trials
     WHERE number = :published_trial_number
 """
@@ -762,6 +765,7 @@ def _phase_trial_stats_params(
     return {
         "generation_key": GENERATION_ID_ATTR,
         "attempt_key": ATTEMPT_ID_ATTR,
+        "study_schema_key": STUDY_SCHEMA_ATTR,
         "study_name": _phase_study_name(experiment, phase),
         "published_trial_number": published_trial.trial_number if published_trial else -1,
     }
@@ -858,7 +862,16 @@ def _trial_stats_from_rows(
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
     published_trial_available = False
-    for row_kind, number, state, generation_json, attempt_json, tally in rows:
+    study_schema: object = None
+    for row_kind, number, state, generation_json, attempt_json, tally, schema_json in rows:
+        try:
+            decoded_schema = (
+                json.loads(schema_json) if isinstance(schema_json, str) else schema_json
+            )
+        except (TypeError, json.JSONDecodeError):
+            decoded_schema = schema_json
+        if study_schema is None:
+            study_schema = decoded_schema
         state_name = str(state)
         generation_id = _decoded_string_attr(generation_json)
         if row_kind == "count":
@@ -895,6 +908,11 @@ def _trial_stats_from_rows(
                 attempt_id=_decoded_string_attr(attempt_json),
             )
         )
+    if counts and (type(study_schema) is not int or study_schema != STUDY_SCHEMA_VERSION):
+        raise StudySchemaMismatchError(
+            f"Study {study_name!r} uses pre-cutover or unsupported schema "
+            f"{study_schema!r}; expected {STUDY_SCHEMA_VERSION}."
+        )
     return _PhaseTrialStats(
         counts, True, generation_counts, running_attempts, published_trial_available
     )
@@ -930,6 +948,14 @@ def _phase_trial_stats(
         if study is None:
             return _PhaseTrialStats({}, True, {}, [])
         trials = study.get_trials(deepcopy=False)
+        schema = study.user_attrs.get(STUDY_SCHEMA_ATTR)
+        if trials and (type(schema) is not int or schema != STUDY_SCHEMA_VERSION):
+            raise StudySchemaMismatchError(
+                f"Study {study.study_name!r} uses pre-cutover or unsupported schema "
+                f"{schema!r}; expected {STUDY_SCHEMA_VERSION}."
+            )
+    except StudySchemaMismatchError:
+        raise
     except Exception as exc:  # noqa: BLE001
         return _unavailable_phase_trial_stats(experiment, phase, exc)
     counts: dict[str, int] = {}

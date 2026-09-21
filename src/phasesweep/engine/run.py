@@ -33,7 +33,11 @@ from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _preflight_trainer_environments
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
-from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
+from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
+    service_pending_shutdown,
+    signal_handler_scope,
+)
 
 log = logging.getLogger("phasesweep.engine.run")
 
@@ -248,10 +252,11 @@ def run_experiment(
             dry_run=True,
             generation_id=None,
         )
-    # Runtime inheritance can introduce W&B settings that static config
-    # validation cannot see. Refuse conflicting/offline environments before
-    # claiming a generation or creating execution artifacts.
-    _preflight_trainer_environments(experiment, from_phase=from_phase)
+    # A fresh artifact tree cannot be a no-op replay, so validate its launch
+    # environments before creating state. Existing current-format trees defer
+    # the same check until recovery proves a phase has new work remaining.
+    if not path_ops._artifact_root_binding_path(experiment).exists():
+        _preflight_trainer_environments(experiment, from_phase=from_phase)
     outcome = _run_experiment_outcome(
         experiment,
         from_phase=from_phase,
@@ -679,6 +684,7 @@ def _run_experiment_inner(
         winners=winners,
         publication_hook=publication_hook,
     )
+    service_pending_shutdown()
     log.info("Wrote %s", summary_path)
 
     return winners

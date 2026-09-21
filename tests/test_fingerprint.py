@@ -677,6 +677,7 @@ def test_identical_semantic_environment_resumes_persistent_study(
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-a.json")
 
     run_experiment(experiment)
+    monkeypatch.setenv("WANDB_RUN_ID", "outer-run-b")
     monkeypatch.setenv("PHASESWEEP_TRIAL_ID", "outer-trial-b")
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-b.json")
     run_experiment(_with_trial_target(experiment, 2))
@@ -684,8 +685,11 @@ def test_identical_semantic_environment_resumes_persistent_study(
     study = optuna.load_study(study_name="t::p", storage=experiment.storage)
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
     base = _environment_identity(experiment)
-    assert "WANDB_RUN_ID" in base.values
-    assert not {"PHASESWEEP_TRIAL_ID", "PHASESWEEP_OBJECTIVE_PATH"} & set(base.values)
+    assert not {
+        "WANDB_RUN_ID",
+        "PHASESWEEP_TRIAL_ID",
+        "PHASESWEEP_OBJECTIVE_PATH",
+    } & set(base.values)
 
 
 def test_passthrough_token_rotation_resumes_persistent_study(

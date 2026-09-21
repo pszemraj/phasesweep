@@ -14,7 +14,13 @@ from typing import Any
 import pytest
 import yaml
 
-from phasesweep.config import ExecutionContext, JsonEnvelopeExtractor, Metric
+from phasesweep.config import (
+    ExecutionContext,
+    JsonEnvelopeExtractor,
+    Metric,
+    WandbSummaryRequiredGate,
+)
+from phasesweep.engine.artifacts import _warn_environment_drift
 from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
 from phasesweep.runtime.process import ProcessResult
 from tests.conftest import make_experiment
@@ -545,6 +551,32 @@ def test_passthrough_value_rotation_preserves_semantic_environment_digest(
     assert first.digest == second.digest
     assert first.values["WANDB_API_KEY"] == "first-secret"
     assert second.values["WANDB_API_KEY"] == "rotated-secret"
+
+
+def test_skipped_phase_drift_uses_that_phases_remote_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated W&B phase cannot block drift checks for a skipped local phase."""
+    base = make_experiment(execution=ExecutionContext(inherit_env="all"))
+    remote = base.phases[0].model_copy(
+        update={
+            "name": "remote",
+            "gates": [
+                WandbSummaryRequiredGate(
+                    type="wandb_summary_required",
+                    entity="entity",
+                    project="project",
+                    keys=["eval/loss"],
+                )
+            ],
+        }
+    )
+    local = base.phases[0].model_copy(update={"name": "local", "gates": []})
+    experiment = base.model_copy(update={"phases": [remote, local]})
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    stored = _environment_identity(experiment, "local").digest
+
+    _warn_environment_drift(experiment, "local", stored)
 
 
 def test_launch_trial_preserves_configured_and_passthrough_wandb_environment(
