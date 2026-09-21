@@ -69,6 +69,9 @@
 #   record_env: bool = false
 # cwd and the environment-selection contract join durable experiment identity.
 # Pass-through values may rotate, but their names/classification remain semantic.
+# record_env writes the full composed trainer environment, including ambient
+# values, to owner-only (0600) environment.json in each trial directory. It can
+# contain secrets; leave it false unless retaining those values is intentional.
 
 # timeout_seconds_per_run: float | null = null
 # Finite whole-invocation wallclock budget. It is a run control, not a new

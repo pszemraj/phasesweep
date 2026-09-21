@@ -93,7 +93,8 @@ rather than tight status polling. Never cancel a run or launch a replacement
 automatically.
 
 `get_run_results` is run-specific; terminal reads use that run's frozen result
-snapshot. CLI-only experiments remain inspectable through `phasesweep status`
+snapshot. A plain `phasesweep run` can publish winners, but it does not create
+an MCP run record. Its results remain inspectable through `phasesweep status`
 and `phasesweep show-winners`; the server does not create handles for an
 arbitrary existing output tree.
 

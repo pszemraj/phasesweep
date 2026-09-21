@@ -15,7 +15,9 @@ The submodule checkout also brings the [dataset](upstream/data/README.md): `upst
 
 For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-extra) as well.
 
-The pinned trainer has [known portability and numerical limitations](../../docs/development.md#tracked-todos). Fix them upstream, then update the submodule pointer here.
+Review the pinned trainer's [device and precision support](upstream/README.md#device-selection--precision)
+and [requirements](upstream/README.md#requirements) before extending this example.
+Make trainer changes upstream, then update the submodule pointer here.
 
 ## CLI smoke sweep
 

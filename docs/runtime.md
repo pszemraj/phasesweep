@@ -37,6 +37,7 @@ demo/
   .gitignore
   artifact_root_binding.json
   run.log
+  study.db                        # storage: auto with sequential phases
   generation.yaml
   last_successful_generation.yaml
   summary.yaml
@@ -50,7 +51,10 @@ demo/
       phases/<phase>/winner.yaml
   <phase>/
     winner.yaml
+    trials.csv
     trial_00000__generation_<id>__attempt_<id>/
+      attempt_lifecycle.json
+      process_identity.json
       trainer_config.yaml       # yaml_file only
       overrides.json            # json_file only; nested overrides
       overrides_resolved.json

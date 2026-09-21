@@ -61,6 +61,12 @@ phasesweep validate experiment.yaml   # checks it without launching anything
 phasesweep run experiment.yaml        # four tiny trials, a few seconds
 ```
 
+This breaking release accepts only fresh current-format state. When upgrading
+from 0.3.1, use a fresh artifact root and local ledger (plus a fresh MCP state
+directory when applicable); there is no migration, adoption, or repair path.
+Use the preserved 0.3.1 environment for existing state. See the
+[fresh-state cutover](docs/runtime.md#fresh-state-cutover) for the full scope.
+
 The run log shows the phase chaining directly (abridged):
 
 ```text

@@ -147,6 +147,7 @@ handled. They do not create an alternate winner.
 
 ## Trainer inputs
 
+Set the top-level `override_format` to select the boundary your trainer accepts.
 PhaseSweep supports four input boundaries:
 
 - `yaml_file` is the default. It copies `trainer_config`, applies inherited,
