@@ -706,50 +706,6 @@ class RunStore:
             return None
         return self._load_handle(path, expected_run_id=run_id)
 
-    def handle_exists(self, run_id: str) -> bool:
-        """Return whether a persisted handle file exists for ``run_id``, decodable or not.
-
-        :meth:`get` collapses "no such run" and "handle present but
-        undecodable" into ``None``. Authority decisions must tell them apart:
-        an undecodable handle carries frozen launch authority that can no
-        longer be read and must fail closed. A missing handle alone does *not*
-        prove the id was never an MCP run -- the file may have been deleted
-        while other per-run files survive (:meth:`run_evidence_exists`), or
-        the whole state dir replaced, which only the generation's own
-        durable id-source record can reveal (PR #5 review / P2 missing-handle
-        authority).
-
-        :param str run_id: Agent-supplied run id to look up.
-        :return bool: ``True`` when a handle file exists for a well-shaped id.
-        """
-        if not SAFE_NAME_PATTERN.fullmatch(run_id):
-            return False
-        path = self._runs_dir / f"{run_id}.json"
-        return path.exists() or path.is_symlink()
-
-    def run_evidence_exists(self, run_id: str) -> bool:
-        """Return whether any durable per-run file besides the handle survives.
-
-        A deleted ``runs/<run_id>.json`` removes the frozen launch-authority
-        record but usually not its siblings: the per-run config snapshot,
-        terminal status, log, and cleanup markers all live under this same
-        state dir. Any survivor proves ``run_id`` *was* a launched MCP run
-        whose authority can no longer be read, so visibility decisions must
-        fail closed instead of treating the id as a never-MCP generation and
-        applying current catalog policy (PR #5 review / P2 missing-handle
-        authority).
-
-        :param str run_id: Agent-supplied run id to look up.
-        :return bool: ``True`` when any per-run file exists for a well-shaped id.
-        """
-        if not SAFE_NAME_PATTERN.fullmatch(run_id):
-            return False
-        for suffix in _RUN_EVIDENCE_SUFFIXES:
-            path = self._logs_dir / f"{run_id}{suffix}"
-            if path.exists() or path.is_symlink():
-                return True
-        return False
-
     def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
         """Load persisted handles and identify malformed handle records.
 
@@ -1215,19 +1171,6 @@ class RunStore:
         :return bool: Whether the recorded boot id is known and differs from this boot.
         """
         return identity_from_earlier_boot(self.cleanup_identity(handle).boot_id)
-
-    def live_run_for(self, experiment_id: str) -> RunHandle | None:
-        """Return the currently-running handle for an experiment, if any.
-
-        Used to reject a second launch before the engine's flock would.
-
-        :param str experiment_id: Catalog id whose live run should be found.
-        :return RunHandle | None: Currently-running handle, if one exists.
-        """
-        for handle in self.list_handles():
-            if handle.experiment_id == experiment_id and self.state(handle) == "running":
-                return handle
-        return None
 
     def latest_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the newest persisted handle for an experiment deterministically.

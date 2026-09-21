@@ -133,7 +133,7 @@ def test_status_floors_inconsistent_historical_terminal_count() -> None:
     payload = status_payload(
         "srv",
         status,
-        None,
+        {"run_id": "run-1"},
         result_source="current_shared_study",
         elapsed_seconds=None,
     )

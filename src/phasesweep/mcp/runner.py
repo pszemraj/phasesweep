@@ -142,7 +142,7 @@ def _base_failure_payload(
     if isinstance(error, ArtifactRootConflictError):
         # Not a fingerprint problem: the study is healthy but is not provably
         # this workdir's, and the fingerprint remediation (new experiment name
-        # / archive the study) would destroy the binding's value. The wording
+        # / archive the study) would destroy the binding's value.
         return {
             "code": "artifact_root_conflict",
             "stage": failure_stage,

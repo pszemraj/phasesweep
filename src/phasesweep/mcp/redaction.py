@@ -172,7 +172,7 @@ def winners_payload(
 def status_payload(
     experiment_id: str,
     status: dict[str, Any],
-    run: dict[str, Any] | None,
+    run: dict[str, Any],
     *,
     result_source: ResultSource,
     elapsed_seconds: int | None,
@@ -180,10 +180,9 @@ def status_payload(
     """Build the ``get_run_status`` payload from the path-free read_status dict.
 
     ``status`` is the read_status output (already path-free). ``run`` is the
-    process-level state for a specific run_id, or None for an experiment-level
-    query with no recorded runs. Timing fields are counts of seconds computed
-    by the server - durations only, never timestamps of operator activity or
-    anything path-shaped.
+    process-level state for the specific run_id. Timing fields are counts of
+    seconds computed by the server - durations only, never timestamps of
+    operator activity or anything path-shaped.
 
     ``current_generation_id``/``published_generation_id``/
     ``represented_generation_id``/``is_published`` follow the identity
@@ -212,7 +211,7 @@ def status_payload(
 
     :param str experiment_id: Catalog id whose status is being returned.
     :param dict[str, Any] status: Path-free status payload from ``read_status``.
-    :param dict[str, Any] | None run: Optional path-free detached-run state.
+    :param dict[str, Any] run: Path-free detached-run state.
     :param ResultSource result_source: Whether status came from current shared
         state or a frozen terminal run snapshot.
     :param int | None elapsed_seconds: Seconds since launch (running) or total

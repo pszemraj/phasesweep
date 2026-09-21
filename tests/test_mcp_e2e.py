@@ -321,6 +321,8 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
         "Use `run_id` for every lifecycle read",
         "Never edit an experiment config yourself",
         "Never open raw datasets",
+        "Never open W&B dashboards",
+        "`winner_generation`",
     ):
         assert safety_contract in initialization.instructions
     tools = asyncio.run(server.list_tools())
@@ -407,6 +409,9 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_STATUS])
     assert "params" in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
+    assert "Whether this winner was selected in the represented generation" in json.dumps(
+        output_schemas[TOOL_GET_RUN_RESULTS]
+    )
     # Both result surfaces disclose which config labeled the result they show.
     results_properties = output_schemas[TOOL_GET_RUN_RESULTS]["properties"]
     status_properties = output_schemas[TOOL_GET_RUN_STATUS]["properties"]

@@ -256,6 +256,7 @@ class ResumeNotReadyError(McpToolError):
         """
         super().__init__(
             f"cannot resume {experiment_id!r} from phase {from_phase!r}: "
-            f"earlier phase {missing_phase!r} {reason}. Call get_run_results "
-            "for the experiment and resume only after every earlier phase has a winner."
+            f"earlier phase {missing_phase!r} {reason}. Call get_latest_run({experiment_id!r}) "
+            "first; if it finds a run, call get_run_results with its run_id. Resume only after "
+            "every earlier phase has a winner."
         )

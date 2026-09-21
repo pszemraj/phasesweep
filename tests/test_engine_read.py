@@ -301,7 +301,11 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
 
     status = read_status(experiment)
     mcp_status = status_payload(
-        "exp", status, None, result_source="current_shared_study", elapsed_seconds=None
+        "exp",
+        status,
+        {"run_id": "mcp-run"},
+        result_source="current_shared_study",
+        elapsed_seconds=None,
     )
     for payload in (status, experiment_status(experiment), mcp_status):
         phase = payload["phases"][0]
@@ -413,7 +417,7 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     mcp_status = status_payload(
         experiment_id="t",
         status=status,
-        run=None,
+        run={"run_id": "mcp-run"},
         result_source="current_shared_study",
         elapsed_seconds=None,
     )

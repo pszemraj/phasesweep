@@ -489,8 +489,11 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
     config = _config(tmp_path, phases=RESUMABLE_PHASES)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
 
-    with pytest.raises(Exception, match="earlier phase 'p' has no winner yet"):
+    with pytest.raises(Exception, match="earlier phase 'p' has no winner yet") as excinfo:
         app.launch("srv", from_phase="q")
+
+    assert "get_latest_run('srv') first" in str(excinfo.value)
+    assert "get_run_results with its run_id" in str(excinfo.value)
 
 
 def _write_winner_yaml(
@@ -2227,6 +2230,95 @@ def _record_published_run_snapshot(
         result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
     )
     return run_id, trainer, config, catalog
+
+
+@pytest.mark.parametrize("integrity", ["failed", "permission_denied"])
+def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    integrity: str,
+) -> None:
+    """A frozen publication verdict suppresses winners across both snapshot paths."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    handle = store.get(run_id)
+    assert handle is not None
+    complete = store.recorded_terminal_status(handle)
+    assert complete is not None
+    snapshot = json.loads(json.dumps(complete["result_snapshot"]))
+    snapshot["status"]["publication_integrity"] = integrity
+    unusable = {**complete, "result_snapshot": snapshot}
+
+    write_run_status(store, **unusable)
+    frozen = app.winners(run_id=run_id)
+
+    assert frozen["publication_integrity"] == integrity
+    assert frozen["winner_count"] == 0
+    assert frozen["phases"] == []
+
+    # The runner can finish its snapshot while a live storage read is in
+    # progress. The second branch must apply the same winner suppression to
+    # the snapshot that replaced that temporary live view.
+    write_run_status(store, **{**unusable, "result_snapshot_state": "pending"})
+    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    original_live_status = app._live_status_payload
+    finalized = False
+
+    def finalize_during_live_read(
+        experiment_id: str,
+        experiment: Experiment,
+        saved: RunHandle,
+    ) -> dict[str, Any]:
+        nonlocal finalized
+        status = original_live_status(experiment_id, experiment, saved)
+        assert not finalized
+        finalized = True
+        write_run_status(store, **unusable)
+        return status
+
+    monkeypatch.setattr(app, "_live_status_payload", finalize_during_live_read)
+    completed_during_read = app.winners(run_id=run_id)
+
+    assert finalized
+    assert completed_during_read["publication_integrity"] == integrity
+    assert completed_during_read["winner_count"] == 0
+    assert completed_during_read["phases"] == []
+
+
+@pytest.mark.parametrize("integrity", ["failed", "permission_denied"])
+def test_mcp_winners_hide_unusable_live_publications(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    integrity: str,
+) -> None:
+    """A live publication failure or access denial cannot expose stale winners."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, store = make_mcp_app(catalog)
+    experiment = app._registry.get("srv").experiment
+    store.status_path(run_id).unlink()
+    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    if integrity == "failed":
+        _generation_summary_path(experiment, run_id).unlink()
+    else:
+        import phasesweep.engine.read as engine_read
+        from phasesweep.engine.publication import PublicationPointer
+
+        monkeypatch.setattr(
+            engine_read,
+            "_resolve_publication_pointer",
+            lambda _experiment: PublicationPointer(
+                state="permission_denied",
+                generation_id=run_id,
+                error="injected publication access denial",
+            ),
+        )
+
+    results = app.winners(run_id=run_id)
+
+    assert results["result_source"] == "current_shared_study"
+    assert results["publication_integrity"] == integrity
+    assert results["winner_count"] == 0
+    assert results["phases"] == []
 
 
 @pytest.mark.parametrize("kind", ["wandb", "json"])

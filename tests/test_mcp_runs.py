@@ -89,7 +89,6 @@ def test_launching_handle_reserves_concurrency_until_outcome_is_known(tmp_path: 
     assert store.state(loaded) == "running"
     assert store.recovery_required(loaded)
     assert store.live_runs() == [loaded]
-    assert store.live_run_for("exp") == loaded
 
 
 def test_create_refuses_existing_identity_without_replacement(tmp_path: Path) -> None:
@@ -120,7 +119,7 @@ def test_create_serializes_before_reserving_the_final_path(
     with pytest.raises(TypeError, match="serialization"):
         store.create(handle)
 
-    assert not store.handle_exists(handle.run_id)
+    assert store.get(handle.run_id) is None
     assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
 
 
@@ -150,7 +149,7 @@ def test_create_fsync_failure_rolls_back_the_reserved_identity(
         store.create(handle)
 
     assert failed
-    assert not store.handle_exists(handle.run_id)
+    assert store.get(handle.run_id) is None
     assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
     store.create(handle)
     assert store.get(handle.run_id) == handle
@@ -217,7 +216,7 @@ def test_failed_pre_spawn_cleanup_retains_recoverable_lease(
     monkeypatch.setattr(mcp_runs, "_strict_unlink", real_unlink)
     assert store.is_pre_spawn_orphan(handle.run_id)
     store.clear_pre_spawn_orphan(handle.run_id)
-    assert not store.run_evidence_exists(handle.run_id)
+    assert store.launch_inventory() == ([], set())
 
 
 def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
@@ -280,7 +279,7 @@ def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
 
     assert store.is_pre_spawn_orphan(handle.run_id)
     store.clear_pre_spawn_orphan(handle.run_id)
-    assert not store.run_evidence_exists(handle.run_id)
+    assert store.launch_inventory() == ([], set())
 
 
 def test_free_launch_lease_cannot_override_missing_handle_with_runner_log(
@@ -557,9 +556,6 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
         "run:exp-orphan",
         "run:exp-transition",
     }
-    assert store.run_evidence_exists("exp-dangling")
-    assert store.run_evidence_exists("exp-directory")
-    assert store.run_evidence_exists("exp-transition")
 
 
 def test_get_skips_malformed_handle(tmp_path: Path) -> None:
@@ -574,7 +570,6 @@ def test_dangling_handle_still_reserves_launch_authority(tmp_path: Path) -> None
     handle_path.symlink_to("missing-handle.json")
 
     assert store.get("dangling") is None
-    assert store.handle_exists("dangling")
     assert store.launch_inventory() == ([], {"run:dangling"})
 
 
@@ -624,7 +619,7 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
 
     if record_kind == "handle":
         assert store.get(handle.run_id) is None
-        assert store.handle_exists(handle.run_id)
+        assert store.launch_inventory() == ([], {f"run:{handle.run_id}"})
     elif record_kind == "status":
         assert store.recorded_terminal_status(handle) is None
         assert store.state(handle) == "running"
@@ -796,7 +791,6 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     assert store.snapshot_recovery_required(handle)
     assert store.recovery_required(handle)
     assert store.live_runs() == [handle]
-    assert store.live_run_for("exp") == handle
 
     write_run_status(
         store,
@@ -812,7 +806,6 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     assert not store.snapshot_recovery_required(handle)
     assert not store.recovery_required(handle)
     assert store.live_runs() == []
-    assert store.live_run_for("exp") is None
 
 
 def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) -> None:
@@ -932,7 +925,6 @@ def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) ->
 
     assert store.state(handle) == "failed"
     assert store.live_runs() == []
-    assert store.live_run_for("exp") is None
 
 
 def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
@@ -1280,7 +1272,6 @@ def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
     assert store.state(handle) == "failed"
     assert store.cleanup_recovery_required(handle)
     assert store.recovery_required(handle)
-    assert store.live_run_for("exp") is None
 
 
 def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> None:
@@ -1345,7 +1336,6 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
 
     assert store.state(handle) == "running"
     assert store.live_runs() == [handle]
-    assert store.live_run_for("exp") == handle
 
     private_atomic_write_text(
         store.cleanup_recovery_path("exp-1"),
@@ -1360,7 +1350,6 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
 
     assert store.state(handle) == "failed"
     assert store.live_runs() == []
-    assert store.live_run_for("exp") is None
 
 
 def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> None:
@@ -1504,18 +1493,6 @@ def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     handle = make_run_handle(run_id="exp-x", pid=os.getpid(), starttime=live_starttime + 99_999)
     assert store.state(handle) == "running"
     assert store.cleanup_uncertain(handle)
-
-
-def test_live_run_for_ignores_terminal_runs(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    store.create(make_run_handle(run_id="exp-run", experiment_id="exp"))
-    store.create(make_run_handle(run_id="exp-done", experiment_id="exp"))
-    write_run_status(store, "exp-done", returncode=0)  # terminal: succeeded
-
-    live = store.live_run_for("exp")
-    assert live is not None
-    assert live.run_id == "exp-run"
-    assert store.live_run_for("other-experiment") is None
 
 
 def test_state_cleanup_uncertain_for_zombie_runner_without_status(tmp_path: Path) -> None:
