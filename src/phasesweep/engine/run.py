@@ -264,6 +264,10 @@ def run_experiment(
         publication_hook=publication_hook,
         generation_id=generation_id,
     )
+    # Publication and its terminal callback are already durable/successful at
+    # this boundary. Deliver any shutdown absorbed by the one-way commit window
+    # before returning control or allowing a long-lived caller to start work.
+    service_pending_shutdown()
     return dict(outcome.winners)
 
 
@@ -684,7 +688,6 @@ def _run_experiment_inner(
         winners=winners,
         publication_hook=publication_hook,
     )
-    service_pending_shutdown()
     log.info("Wrote %s", summary_path)
 
     return winners

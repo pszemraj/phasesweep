@@ -916,19 +916,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     except PhaseSweepShutdown as exc:
         code = exc.code if isinstance(exc.code, int) else 1
-        status["returncode"] = code
-        status["error_class"] = "cancelled"
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed
             if terminal_report is not None
             else exc.report.cleanup_confirmed
         )
-        primary, failure_stage = _terminal_error(terminal_report, exc)
-        status["failure"] = _terminal_failure_payload(
-            primary,
-            stage=failure_stage,
-            cleanup_confirmed=status["cleanup_confirmed"],
-        )
+        if terminal_report is None or terminal_report.primary_error is not None:
+            status["returncode"] = code
+            status["error_class"] = "cancelled"
+            primary, failure_stage = _terminal_error(terminal_report, exc)
+            status["failure"] = _terminal_failure_payload(
+                primary,
+                stage=failure_stage,
+                cleanup_confirmed=status["cleanup_confirmed"],
+            )
         raise
     except ProcessCleanupUncertainError as exc:
         status["returncode"] = 1

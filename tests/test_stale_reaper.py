@@ -354,7 +354,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
             PHASE_FINGERPRINT_ATTR,
             _phase_fingerprint(experiment, experiment.phases[1], {}),
         )
-        identity = _environment_identity(experiment)
+        identity = _environment_identity(experiment, "b")
         trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
         trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
         run_experiment(experiment)
@@ -1125,7 +1125,7 @@ def _fabricate_stale_running_trial(
     _stamp_artifact_root(study, experiment)
     _validate_artifact_root_binding(experiment, claim_fresh=True)
     trial = study.ask()
-    identity = _environment_identity(experiment)
+    identity = _environment_identity(experiment, phase_name)
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
     trial_dir = _trial_dir_for(
