@@ -296,7 +296,7 @@ def test_hydra_values_round_trip_real_parser_and_omegaconf(value):
 
 @pytest.mark.parametrize("value", ["${oc.env:HOME}", "literal ${other}", ["${x}"], "line\nbreak"])
 def test_hydra_unsupported_literals_fail_before_artifacts(tmp_path, value):
-    with pytest.raises((TypeError, ValueError), match="hydra"):
+    with pytest.raises(ValueError, match=r"Hydra cannot pass literal strings.*interpolation"):
         make_experiment(
             workdir=str(tmp_path / "runs"),
             override_format="hydra",
@@ -308,7 +308,10 @@ def test_hydra_unsupported_literals_fail_before_artifacts(tmp_path, value):
 
 @pytest.mark.parametrize("value", ["${oc.env:HOME}", "line\nbreak"])
 def test_hydra_unsupported_categorical_literals_fail_before_artifacts(tmp_path, value):
-    with pytest.raises(ValueError, match=r"categorical search_space key 'value'.*hydra"):
+    with pytest.raises(
+        ValueError,
+        match=r"categorical search_space key 'value'.*Hydra cannot pass literal strings.*interpolation",
+    ):
         make_experiment(
             workdir=str(tmp_path / "runs"),
             override_format="hydra",
@@ -322,6 +325,45 @@ def test_hydra_unsupported_categorical_literals_fail_before_artifacts(tmp_path, 
             ],
         )
     assert not (tmp_path / "runs").exists()
+
+
+def test_yaml_exponent_scalars_preserve_declared_types(tmp_path):
+    """YAML's scalar typing remains visible to fixed and categorical overrides."""
+    experiment = load_experiment(
+        write_yaml(
+            tmp_path,
+            """
+            experiment: exponent_scalars
+            workdir: runs
+            trial_command: "python train.py {overrides}"
+            override_format: argparse
+            metric:
+              name: loss
+              goal: minimize
+              extractor: {type: json_envelope, objective_name: loss, split: validation, policy: final}
+            phases:
+              - name: p
+                n_trials: 1
+                fixed_overrides:
+                  plain_exponent: 1e-3
+                  decimal_exponent: 1.0e-3
+                search_space:
+                  learning_rate:
+                    type: categorical
+                    choices: [1e-3, 1.0e-3]
+            """,
+        )
+    )
+
+    phase = experiment.phases[0]
+    assert phase.fixed_overrides["plain_exponent"] == "1e-3"
+    assert type(phase.fixed_overrides["plain_exponent"]) is str
+    assert phase.fixed_overrides["decimal_exponent"] == 0.001
+    assert type(phase.fixed_overrides["decimal_exponent"]) is float
+    choices = phase.search_space["learning_rate"].choices
+    assert choices == ["1e-3", 0.001]
+    assert type(choices[0]) is str
+    assert type(choices[1]) is float
 
 
 @pytest.mark.parametrize("overrides", [{"x": 1, "x.y": 2}, {"x.y": 2, "x": 1}, {"x": {}, "x.y": 2}])
@@ -560,8 +602,9 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
 # ---- migrated from version-named files ----
 
 
-def test_effective_overrides_include_fixed(tmp_path):
-    """Winner's effective_overrides must include parent's fixed_overrides, not just sampled params."""
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_effective_overrides_include_fixed(tmp_path, override_format):
+    """The packaged trainer consumes dotted inherited CLI values in both supported forms."""
     trainer = copy_fake_train(tmp_path)
 
     db_path = tmp_path / "phases.db"
@@ -571,7 +614,7 @@ storage: sqlite:///{db_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} {{overrides}}"
-override_format: argparse
+override_format: {override_format}
 metric:
   name: eval_loss
   goal: minimize
@@ -583,24 +626,32 @@ phases:
     n_trials: 2
     sampler: {{ type: grid }}
     search_space:
-      n_layers: {{ type: categorical, choices: [4, 8] }}
+      model.n_layers: {{ type: categorical, choices: [4, 8] }}
   - name: opt
     inherits: [arch]
-    n_trials: 4
-    sampler: {{ type: tpe, seed: 0, acknowledge_nonresumable: true }}
+    n_trials: 2
+    sampler: {{ type: grid }}
     search_space:
-      lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }}
+      optimizer.lr: {{ type: categorical, choices: [1.0e-5, 0.0003] }}
 """
     yaml_path = tmp_path / "exp.yaml"
     yaml_path.write_text(yaml_text)
     exp = load_experiment(yaml_path)
     winners = run_experiment(exp)
 
-    # The opt phase winner should have the parent's fixed override.
+    # The opt phase winner should have the parent's fixed override and sampled
+    # dotted key. The 1e-5 categorical value is rendered in exponent form,
+    # which the fake trainer must parse on both compatibility wires.
     opt_winner = winners["opt"]
     assert opt_winner.effective_overrides["model.dropout"] == 0.2
-    # And also the inherited n_layers
-    assert "n_layers" in opt_winner.effective_overrides
+    assert opt_winner.effective_overrides["model.n_layers"] == 8
+    assert opt_winner.effective_overrides["optimizer.lr"] == 0.0003
+
+    result_paths = sorted((Path(exp.workdir) / exp.experiment / "opt").glob("trial_*/result.json"))
+    assert len(result_paths) == 2
+    consumed = [json.loads(path.read_text())["config"] for path in result_paths]
+    assert {values["lr"] for values in consumed} == {1e-5, 0.0003}
+    assert {values["n_layers"] for values in consumed} == {8}
 
 
 def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):

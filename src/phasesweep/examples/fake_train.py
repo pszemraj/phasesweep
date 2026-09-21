@@ -20,9 +20,8 @@ def _parse_kv(tokens: list[str]) -> dict[str, Any]:
     :raises ValueError: A token or key is unsupported by this trainer.
     :return dict[str, Any]: Parsed numeric values keyed by trainer config path.
     """
-    supported = {
-        "n_layers",
-        "model.n_layers",
+    integer_keys = {"n_layers", "model.n_layers"}
+    float_keys = {
         "lr",
         "optimizer.lr",
         "weight_decay",
@@ -36,11 +35,14 @@ def _parse_kv(tokens: list[str]) -> dict[str, Any]:
         if "=" not in token:
             raise ValueError(f"Unsupported trainer argument {raw_token!r}; expected key=value.")
         key, raw_value = token.split("=", 1)
-        if key not in supported:
+        if key not in integer_keys | float_keys:
             raise ValueError(f"Unsupported fake-trainer override {key!r}.")
-        value = yaml.safe_load(raw_value)
-        if isinstance(value, bool) or not isinstance(value, int | float):
-            raise ValueError(f"Fake-trainer override {key!r} must be numeric, got {value!r}.")
+        try:
+            value = int(raw_value) if key in integer_keys else float(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Fake-trainer override {key!r} must be numeric, got {raw_value!r}."
+            ) from exc
         overrides[key] = value
     return overrides
 

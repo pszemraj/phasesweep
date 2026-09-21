@@ -124,6 +124,12 @@ representable range. Categorical choices must be distinct under Python
 equality; seed keys are rejected by default unless `allow_seed_search: true`
 makes a variance audit explicit.
 
+YAML decides scalar types before PhaseSweep reads fixed overrides or categorical
+choices. In this loader, bare `1e-3` is a string, while `1.0e-3` and `0.001`
+are floats. PhaseSweep preserves that distinction so string categories remain
+usable. Write a decimal value (or an exponent with a decimal mantissa) for a
+numeric override, and quote a value when you intend a string category.
+
 Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid has
 at most 4,096 concrete combinations, counted before trials are materialized.
 Its trial target must equal that cardinality unless `allow_partial_grid: true`

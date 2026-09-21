@@ -897,6 +897,12 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
             )
         elif isinstance(offender, (list, tuple)):
             hint = "Override lists cannot recursively contain themselves."
+        elif isinstance(offender, str) and override_format == "hydra":
+            hint = (
+                "Hydra cannot pass literal strings containing '${' interpolation syntax or "
+                "control characters. Use the default override_format='yaml_file' if the "
+                "trainer needs that literal value."
+            )
         else:
             hint = (
                 "YAML resolves unquoted scalars such as 2024-01-01 or 12:30:00 "
