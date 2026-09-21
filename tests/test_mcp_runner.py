@@ -928,6 +928,8 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
         experiment: Experiment,
         phase: Phase,
         published_trial: engine_optuna._TrialRef | None = None,
+        *,
+        validate_storage_format: bool = False,
     ) -> engine_optuna._PhaseTrialStats:
         nonlocal capture_reads
         if _generation_summary_path(experiment, generation_id).is_file():
@@ -938,8 +940,19 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_optuna.sqlite3, "connect", locked_connect)
-                return original_stats(experiment, phase, published_trial)
-        return original_stats(experiment, phase, published_trial)
+                return original_stats(
+                    experiment,
+                    phase,
+                    published_trial,
+                    validate_storage_format=validate_storage_format,
+                )
+
+        return original_stats(
+            experiment,
+            phase,
+            published_trial,
+            validate_storage_format=validate_storage_format,
+        )
 
     monkeypatch.setattr(engine_optuna, "_sqlite_phase_trial_stats", transient_capture_failure)
     if not pointer_commits:
@@ -1996,6 +2009,8 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         captured_experiment: Experiment,
         phase: Phase,
         published_trial: engine_optuna._TrialRef | None = None,
+        *,
+        validate_storage_format: bool = False,
     ) -> engine_optuna._PhaseTrialStats:
         if _generation_summary_path(captured_experiment, run_id).is_file():
 
@@ -2004,8 +2019,19 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_optuna.sqlite3, "connect", locked_connect)
-                return original_stats(captured_experiment, phase, published_trial)
-        return original_stats(captured_experiment, phase, published_trial)
+                return original_stats(
+                    captured_experiment,
+                    phase,
+                    published_trial,
+                    validate_storage_format=validate_storage_format,
+                )
+
+        return original_stats(
+            captured_experiment,
+            phase,
+            published_trial,
+            validate_storage_format=validate_storage_format,
+        )
 
     monkeypatch.setattr(
         engine_optuna,
