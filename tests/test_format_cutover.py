@@ -185,12 +185,13 @@ def test_bound_root_status_refuses_empty_stamped_legacy_studies(
 def test_startup_scans_the_ledger_format_once(
     tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The root preflight defers its only full-ledger scan until it can claim state."""
+    """Root preflight scans once before Optuna loads any declared study."""
     import phasesweep.engine.artifact_roots as artifact_roots
 
     storage = f"{backend}:///{tmp_path / f'current.{backend}'}"
     experiment = _experiment(tmp_path, storage=storage)
     real_validate = artifact_roots._validate_local_storage_format
+    real_load = artifact_roots._load_existing_phase_study
     calls = 0
 
     def counted_validate(candidate: Experiment) -> None:
@@ -198,7 +199,12 @@ def test_startup_scans_the_ledger_format_once(
         calls += 1
         real_validate(candidate)
 
+    def checked_load(candidate: Experiment, phase):
+        assert calls == 1
+        return real_load(candidate, phase)
+
     monkeypatch.setattr(artifact_roots, "_validate_local_storage_format", counted_validate)
+    monkeypatch.setattr(artifact_roots, "_load_existing_phase_study", checked_load)
 
     run_experiment(experiment)
 

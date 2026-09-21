@@ -206,8 +206,8 @@ def _validate_artifact_root_binding(
     :param bool validate_storage_format: Inspect the selected persistent ledger
         for unsupported study schemas after a matching binding is read.
     :param bool validate_unbound_storage: Inspect the selected persistent ledger
-        when no binding exists yet. Mutating preflight disables this only until
-        its later claim step performs the same validation immediately before writing.
+        when no binding exists yet. Callers may disable this after classifying
+        the same ledger earlier under the experiment lock.
     :raises ArtifactRootConflictError: The binding cannot be validated as the
         current user, or is malformed or names another owner.
     """
@@ -392,12 +392,7 @@ def _load_and_check_artifact_roots(
     """
     # Reject an existing foreign or pre-cutover root before touching storage,
     # including an in-memory configuration offered a bound root.
-    _validate_artifact_root_binding(
-        experiment,
-        claim_fresh=False,
-        validate_storage_format=False,
-        validate_unbound_storage=False,
-    )
+    _validate_artifact_root_binding(experiment, claim_fresh=False)
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
         try:
@@ -419,7 +414,12 @@ def _load_and_check_artifact_roots(
     # empty studies: a crash cannot leave a study pointing at a tree that does
     # not itself name the same ledger. Crucially, neither claim occurs when a
     # symlink-retargeted leaf exposed a study still bound to the old target.
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
+    _validate_artifact_root_binding(
+        experiment,
+        claim_fresh=True,
+        validate_storage_format=False,
+        validate_unbound_storage=False,
+    )
     offered = _artifact_root_identity(experiment)
     for study in claimable:
         _claim_study_artifact_root(study, offered)
