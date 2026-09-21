@@ -384,7 +384,11 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
 def validate(config_path: Path) -> None:
-    """Validate ``config_path`` without running anything."""
+    """Validate static config in ``config_path`` without running anything.
+
+    This intentionally does not resolve the caller's ambient execution
+    environment; a non-dry ``run`` performs that preflight before it claims work.
+    """
     config = _load_cli_config(config_path)
     click.echo(f"OK: {config.experiment} ({len(config.phases)} phases)")
     _render_experiment_phases(config)

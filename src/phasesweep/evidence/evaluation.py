@@ -42,9 +42,9 @@ from phasesweep.runtime.time import utc_now_iso
 # Version of the objective evidence provenance payload frozen alongside a
 # metric at extraction time (review v0.5.17 / finding F).
 EVIDENCE_PROVENANCE_SCHEMA_VERSION = 1
-# Bump only evaluators whose interpretation changed. These revisions are
-# semantic inputs to study, winner, and publication fingerprints; package
-# versions alone do not determine whether old trial readings can be reused.
+# Bump when log-regex selection semantics change. The revision is frozen into
+# each trial's extractor contract, so selection and replay reject readings
+# made under an older interpretation even when the package version is absent.
 LOG_REGEX_EVALUATION_REVISION = 2
 
 

@@ -460,8 +460,10 @@ def _verify_trial_evidence_dir(
         "config_sha256"
     ] != extractor_config_fingerprint(extractor):
         raise TrialEvidenceMissingError(
-            f"{subject} objective evidence disagrees with its configured extractor "
-            "evaluation contract."
+            f"{subject} objective evidence no longer matches its configured extractor "
+            "evaluation contract. The extractor configuration or evaluator revision "
+            "changed after this trial ran, or the saved provenance was altered. "
+            f"{_TRIAL_EVIDENCE_REMEDY}"
         )
     capture = provenance.get("remote_capture")
     if capture is not None and capture["run_id"] != attempt_id:

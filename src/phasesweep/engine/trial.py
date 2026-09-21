@@ -179,6 +179,9 @@ def _preflight_trainer_environments(
 ) -> None:
     """Validate each phase environment that this invocation can launch.
 
+    ``validate`` deliberately does not call this. It remains a static config
+    check, so its result does not vary with the shell from which it is invoked.
+
     :param Experiment experiment: Parsed experiment supplying phase contracts.
     :param str | None from_phase: Optional first phase to execute.
     :raises PhaseSweepError: A composed runtime environment disables required

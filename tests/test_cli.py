@@ -101,6 +101,32 @@ def test_validate_and_dry_run_explain_scoring_without_sdk(
     assert not (tmp_path / "runs").exists()
 
 
+def test_validate_does_not_preflight_ambient_wandb_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Validation remains useful from a shell reserved for offline W&B work."""
+    from phasesweep.config import Metric, WandbExtractor
+
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        metric=Metric(
+            name="loss",
+            goal="minimize",
+            extractor=WandbExtractor(
+                type="wandb", entity="entity", project="project", metric_key="eval/loss"
+            ),
+        ),
+    )
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    monkeypatch.setenv("WANDB_MODE", "offline")
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "goal=minimize" in result.output
+
+
 def test_help_registers_commands_and_options() -> None:
     runner = CliRunner()
     result = runner.invoke(cli_main, ["--help"], terminal_width=120)
