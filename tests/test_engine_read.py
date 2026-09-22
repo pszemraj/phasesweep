@@ -341,6 +341,9 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     if change == "finish-partial":
         ledger.write_bytes(complete[:-1])
     expected = engine_optuna._TrialRef(0, "generation", "attempt")
+    # The handle's format scan also captures the journal. Take it before the
+    # patch so the one capture the file changes under is the phase snapshot's.
+    handle = engine_ledger.validate_ledger(experiment)
     real_fstat = engine_ledger.os.fstat
 
     def change_after_capture(fd):
@@ -356,8 +359,8 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
 
     with monkeypatch.context() as patched:
         patched.setattr(engine_ledger.os, "fstat", change_after_capture)
-        first = engine_ledger._phase_trial_stats(experiment, experiment.phases[0], expected)
-    second = engine_ledger._phase_trial_stats(experiment, experiment.phases[0], expected)
+        first = engine_ledger.read_phase_trial_stats(handle, experiment.phases[0], expected)
+    second = engine_ledger.read_phase_trial_stats(handle, experiment.phases[0], expected)
 
     assert first.available is (change == "append")
     assert first.published_trial_available is (change == "append")
@@ -461,7 +464,9 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
         "different" if mismatch == "attempt" else "attempt",
     )
 
-    stats = engine_ledger._phase_trial_stats(experiment, experiment.phases[0], expected)
+    stats = engine_ledger.read_phase_trial_stats(
+        engine_ledger.validate_ledger(experiment), experiment.phases[0], expected
+    )
 
     assert stats.available
     assert stats.published_trial_available is (mismatch is None)
