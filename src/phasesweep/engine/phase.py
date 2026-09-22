@@ -31,7 +31,8 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.evidence import _verify_winner_objective_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
-from phasesweep.engine.optuna import _create_phase_study, _phase_study_name, _suggest
+from phasesweep.engine.ledger import _create_phase_study
+from phasesweep.engine.optuna import _phase_study_name, _suggest
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (

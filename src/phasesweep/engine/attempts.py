@@ -19,8 +19,9 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
-from phasesweep.engine.optuna import (
+from phasesweep.engine.ledger import (
     _load_journal_study_snapshot,
+    open_registry_study,
 )
 from phasesweep.engine.paths import _attempts_dir, _trial_dir_for
 from phasesweep.engine.state import (
@@ -611,8 +612,6 @@ def _registry_attempt_fail_stale_trial(
     if storage_url is None:
         # In-memory storage died with its orchestrator; nothing to update.
         return "terminal"
-    from phasesweep.engine.optuna import _resolve_storage
-
     captured_trial = None
     try:
         journal = storage_backend(storage_url) == "journal"
@@ -631,10 +630,7 @@ def _registry_attempt_fail_stale_trial(
             if captured_trial is None:
                 return "terminal"
         try:
-            study = optuna.load_study(
-                study_name=entry["study_name"],
-                storage=_resolve_storage(storage_url),
-            )
+            study = open_registry_study(storage_url, entry["study_name"])
         except KeyError:
             if journal:
                 # The captured journal contained the study. A later replay or

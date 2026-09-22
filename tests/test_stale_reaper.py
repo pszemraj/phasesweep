@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import optuna
 import pytest
 
-import phasesweep.engine.optuna as engine_optuna
+import phasesweep.engine.ledger as engine_ledger
 from phasesweep.config import (
     Experiment,
     IntParam,
@@ -1274,7 +1274,7 @@ def _fabricate_registered_journal_attempt(
     )
     study = optuna.create_study(
         study_name="journal-attempt::p",
-        storage=engine_optuna._resolve_storage(experiment.resolved_storage),
+        storage=engine_ledger._resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
     trial = study.ask()
@@ -1348,7 +1348,7 @@ def test_registry_discards_attempt_for_a_confirmed_missing_journal_study(tmp_pat
     experiment, _ledger, entry_path = _fabricate_registered_journal_attempt(
         tmp_path, attempt_id="missing-journal-attempt"
     )
-    storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+    storage = engine_ledger._resolve_storage(experiment.resolved_storage)
     optuna.delete_study(study_name="journal-attempt::p", storage=storage)
 
     _preflight_active_attempts(experiment, _PreflightCleanupReport())
@@ -1385,7 +1385,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     )
     # A restored divergent ledger can reuse the number without preserving
     # the registry entry's attempt. Recovery must inspect that trial itself.
-    storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+    storage = engine_ledger._resolve_storage(experiment.resolved_storage)
     study = optuna.create_study(study_name="terminal-identity::p", storage=storage)
     trial = study.ask()
     new_dir = tmp_path / "ledger-attempt"

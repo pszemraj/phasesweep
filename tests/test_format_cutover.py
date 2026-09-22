@@ -12,7 +12,7 @@ from phasesweep import run_experiment
 from phasesweep.config import Experiment
 from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError, read_status
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
-from phasesweep.engine.optuna import _resolve_storage
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_constant_trainer

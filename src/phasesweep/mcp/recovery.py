@@ -27,8 +27,8 @@ from phasesweep.engine.cleanup import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.errors import PublishedStudyMissingError, StudyStorageUnavailableError
+from phasesweep.engine.ledger import _load_existing_phase_study
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.errors import PhaseSweepError
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot

@@ -24,6 +24,7 @@ import yaml
 from click.testing import CliRunner
 
 import phasesweep.engine.generation as generation_ops
+import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_config
@@ -42,8 +43,8 @@ from phasesweep.engine import (
     run_experiment,
 )
 from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
@@ -930,7 +931,7 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
     )
     generation_id = f"storage-unavailable-{'commit' if pointer_commits else 'abort'}"
     capture_reads = 0
-    original_stats = engine_optuna._sqlite_phase_trial_stats
+    original_stats = engine_ledger._sqlite_phase_trial_stats
 
     def transient_capture_failure(
         experiment: Experiment,
@@ -947,7 +948,7 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
                 raise sqlite3.OperationalError("database is locked")
 
             with monkeypatch.context() as capture_patch:
-                capture_patch.setattr(engine_optuna.sqlite3, "connect", locked_connect)
+                capture_patch.setattr(engine_ledger.sqlite3, "connect", locked_connect)
                 return original_stats(
                     experiment,
                     phase,
@@ -962,7 +963,7 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
             validate_storage_format=validate_storage_format,
         )
 
-    monkeypatch.setattr(engine_optuna, "_sqlite_phase_trial_stats", transient_capture_failure)
+    monkeypatch.setattr(engine_ledger, "_sqlite_phase_trial_stats", transient_capture_failure)
     if not pointer_commits:
         pointer_path = _last_successful_generation_path(experiment)
         original_write = generation_ops.artifact_io._write_yaml_atomic
@@ -2017,7 +2018,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     with open_private_text(store.config_snapshot_path(run_id), "x") as output:
         output.write(config_path.read_text())
     experiment = load_config(config_path)
-    original_stats = engine_optuna._sqlite_phase_trial_stats
+    original_stats = engine_ledger._sqlite_phase_trial_stats
 
     def unavailable_during_prepared_capture(
         captured_experiment: Experiment,
@@ -2032,7 +2033,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
                 raise sqlite3.OperationalError("database is locked")
 
             with monkeypatch.context() as capture_patch:
-                capture_patch.setattr(engine_optuna.sqlite3, "connect", locked_connect)
+                capture_patch.setattr(engine_ledger.sqlite3, "connect", locked_connect)
                 return original_stats(
                     captured_experiment,
                     phase,
@@ -2048,7 +2049,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         )
 
     monkeypatch.setattr(
-        engine_optuna,
+        engine_ledger,
         "_sqlite_phase_trial_stats",
         unavailable_during_prepared_capture,
     )

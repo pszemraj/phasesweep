@@ -18,8 +18,8 @@ from phasesweep.config import (
     Sampler,
 )
 from phasesweep.engine import read_status, run_experiment
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _run_lock_paths
-from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,

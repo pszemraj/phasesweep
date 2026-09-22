@@ -31,8 +31,8 @@ from phasesweep.engine.artifact_roots import (
     _validate_artifact_root_binding,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.ledger import _phase_trial_stats
 from phasesweep.engine.optuna import (
-    _phase_trial_stats,
     _published_phase_trial_refs,
     _published_trial_history_available,
 )

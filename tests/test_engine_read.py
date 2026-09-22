@@ -8,6 +8,7 @@ from pathlib import Path
 import optuna
 import pytest
 
+import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
 import phasesweep.engine.read as engine_read
 from phasesweep import run_experiment
@@ -114,7 +115,7 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
     study.optimize(lambda trial: 1.0, n_trials=1)
     exp = _experiment(tmp_path, storage=storage)
     _mark_current_format(exp, study)
-    real_connect = engine_optuna.sqlite3.connect
+    real_connect = engine_ledger.sqlite3.connect
     connections = 0
 
     def counting_connect(*args: object, **kwargs: object):
@@ -122,7 +123,7 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
         connections += 1
         return real_connect(*args, **kwargs)
 
-    monkeypatch.setattr(engine_optuna.sqlite3, "connect", counting_connect)
+    monkeypatch.setattr(engine_ledger.sqlite3, "connect", counting_connect)
 
     status = read_status(exp)
 
@@ -141,7 +142,7 @@ def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
     study.optimize(lambda trial: 1.0, n_trials=50)
     exp = _experiment(tmp_path, storage=storage)
     _mark_current_format(exp, study)
-    real_connect = engine_optuna.sqlite3.connect
+    real_connect = engine_ledger.sqlite3.connect
     transferred_rows: list[int] = []
 
     class CursorProxy:
@@ -166,7 +167,7 @@ def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
     def observed_connect(*args: object, **kwargs: object):
         return ConnectionProxy(real_connect(*args, **kwargs))
 
-    monkeypatch.setattr(engine_optuna.sqlite3, "connect", observed_connect)
+    monkeypatch.setattr(engine_ledger.sqlite3, "connect", observed_connect)
 
     status = read_status(exp)
 
@@ -212,7 +213,7 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(
     exp = _experiment(tmp_path, storage=f"{backend}:///{path}")
     study = optuna.create_study(
         study_name="read_t::p",
-        storage=engine_optuna._resolve_storage(exp.storage) or exp.storage,
+        storage=engine_ledger._resolve_storage(exp.storage) or exp.storage,
     )
     study.optimize(lambda trial: 1.0, n_trials=1)
     running = study.ask()
@@ -243,13 +244,13 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     exp = _experiment(tmp_path, storage=f"{backend}:///{ledger}")
     study = optuna.create_study(
         study_name="read_t::p",
-        storage=engine_optuna._resolve_storage(exp.resolved_storage),
+        storage=engine_ledger._resolve_storage(exp.resolved_storage),
     )
     _mark_current_format(exp, study)
     # Journal tolerates a torn final record; an earlier malformed record must fail.
     ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
 
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.optuna"):
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.ledger"):
         phase = read_status(exp)["phases"][0]
 
     assert phase["trial_data_available"] is False
@@ -257,7 +258,7 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     warnings = [
         record.getMessage()
         for record in caplog.records
-        if record.name == "phasesweep.engine.optuna"
+        if record.name == "phasesweep.engine.ledger"
     ]
     assert len(warnings) == 1
     assert str(ledger) in warnings[0]
@@ -284,7 +285,7 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
         run_experiment(experiment)
     else:
         study = optuna.create_study(
-            study_name="t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+            study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
         )
         _mark_current_format(experiment, study)
     original = ledger.read_bytes()
@@ -315,7 +316,7 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
         assert not any(phase["trials"].values())
     assert status["phases"][0]["running_attempts"] is None
     with pytest.raises(StudyStorageUnavailableError):
-        engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
+        engine_ledger._load_existing_phase_study(experiment, experiment.phases[0])
     with pytest.raises(ProcessCleanupUncertainError):
         run_experiment(experiment)
 
@@ -330,7 +331,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     ledger = tmp_path / "study.journal"
     experiment = _experiment(tmp_path, storage=f"journal:///{ledger}")
     study = optuna.create_study(
-        study_name="read_t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+        study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
     )
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
@@ -341,7 +342,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     if change == "finish-partial":
         ledger.write_bytes(complete[:-1])
     expected = engine_optuna._TrialRef(0, "generation", "attempt")
-    real_fstat = engine_optuna.os.fstat
+    real_fstat = engine_ledger.os.fstat
 
     def change_after_capture(fd):
         captured = real_fstat(fd)
@@ -355,9 +356,9 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
         return captured
 
     with monkeypatch.context() as patched:
-        patched.setattr(engine_optuna.os, "fstat", change_after_capture)
-        first = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
-    second = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
+        patched.setattr(engine_ledger.os, "fstat", change_after_capture)
+        first = engine_ledger._phase_trial_stats(experiment, experiment.phases[0], expected)
+    second = engine_ledger._phase_trial_stats(experiment, experiment.phases[0], expected)
 
     assert first.available is (change == "append")
     assert first.published_trial_available is (change == "append")
@@ -405,7 +406,7 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     elif damage == "corrupt":
         ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
     else:
-        storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+        storage = engine_ledger._resolve_storage(experiment.resolved_storage)
         optuna.delete_study(study_name="t::p", storage=storage)
         if damage == "empty-study":
             _mark_current_format(
@@ -449,7 +450,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
 ) -> None:
     experiment = _experiment(tmp_path, storage=f"{backend}:///{tmp_path / 'ledger'}")
     study = optuna.create_study(
-        study_name="read_t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+        study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
     )
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
@@ -463,7 +464,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
         "different" if mismatch == "attempt" else "attempt",
     )
 
-    stats = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
+    stats = engine_ledger._phase_trial_stats(experiment, experiment.phases[0], expected)
 
     assert stats.available
     assert stats.published_trial_available is (mismatch is None)

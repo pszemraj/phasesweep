@@ -51,7 +51,7 @@ from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
     _phase_fingerprint,
 )
-from phasesweep.engine.optuna import _sqlite_study_exists
+from phasesweep.engine.ledger import _sqlite_study_exists
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,

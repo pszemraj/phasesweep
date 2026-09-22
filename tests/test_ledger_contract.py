@@ -7,12 +7,13 @@ Optuna's storage constructors, so every other module has to go through helpers
 that validate first. This module enforces that statically with :mod:`ast`, so a
 new call site fails in CI before it can ever run.
 
-Pre-M2 the chokepoint is ``phasesweep/engine/optuna.py`` and two ratchet dicts
-(:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) record what exists
-today. They are compared for *equality*, not containment: adding a call site
-fails, and removing one fails until the ratchet is tightened in the same
-commit. M2 moves the chokepoint to ``phasesweep/engine/ledger.py`` and empties
-both ratchets.
+The chokepoint is ``phasesweep/engine/ledger.py``. Two ratchet dicts
+(:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) record what is still
+reachable from outside it. They are compared for *equality*, not containment:
+adding a call site fails, and removing one fails until the ratchet is tightened
+in the same commit. :data:`_LEGACY_SITES` is already empty; the remaining M2
+stages replace the private-helper imports with the ledger's public handle API
+and empty :data:`_LEGACY_PRIVATE_IMPORTS` too.
 
 Out of scope on purpose, because no static reader can follow them: dynamic
 attribute access such as ``getattr(optuna, "create_study")``, and anything
@@ -30,8 +31,8 @@ import pytest
 SRC = Path(__file__).resolve().parent.parent / "src"
 PACKAGE_ROOT = SRC / "phasesweep"
 
-#: Module that is allowed to construct storage. M2: ``phasesweep/engine/ledger.py``.
-CHOKEPOINT = "phasesweep/engine/optuna.py"
+#: Module that is allowed to construct storage.
+CHOKEPOINT = "phasesweep/engine/ledger.py"
 
 #: Storage entry points no module outside :data:`CHOKEPOINT` may name.
 BANNED_LEAVES: dict[str, frozenset[str]] = {
@@ -50,8 +51,9 @@ BANNED_LEAVES: dict[str, frozenset[str]] = {
     "sqlite3": frozenset({"connect"}),
 }
 
-#: Storage-private helpers defined in :data:`CHOKEPOINT`. M2 re-exports these
-#: behind a public ledger API and the private-import ratchet empties out.
+#: Every storage-private helper :data:`CHOKEPOINT` defines. The later M2 stages
+#: re-export these behind a public ledger API and the private-import ratchet
+#: empties out.
 STORAGE_PRIVATE_NAMES = frozenset(
     {
         "_resolve_storage",
@@ -59,21 +61,22 @@ STORAGE_PRIVATE_NAMES = frozenset(
         "_load_phase_study",
         "_load_existing_phase_study",
         "_validate_local_storage_format",
+        "_validate_storage_versions",
         "_phase_trial_stats",
+        "_phase_trial_stats_params",
         "_sqlite_phase_trial_stats",
         "_sqlite_study_exists",
         "_load_journal_study_snapshot",
         "_journal_snapshot_storage",
         "_JournalSnapshot",
         "_trial_stats_from_rows",
-        "_validate_storage_versions",
+        "_unavailable_phase_trial_stats",
+        "_decoded_string_attr",
     }
 )
 
-#: Banned storage entry points still reachable outside the chokepoint. M2: ``{}``.
-_LEGACY_SITES: dict[str, set[str]] = {
-    "phasesweep/engine/attempts.py": {"optuna.load_study"},
-}
+#: Banned storage entry points still reachable outside the chokepoint.
+_LEGACY_SITES: dict[str, set[str]] = {}
 
 #: Storage-private helpers still imported outside the chokepoint. M2 shrinks this.
 _LEGACY_PRIVATE_IMPORTS: dict[str, set[str]] = {
@@ -81,10 +84,7 @@ _LEGACY_PRIVATE_IMPORTS: dict[str, set[str]] = {
         "_load_existing_phase_study",
         "_validate_local_storage_format",
     },
-    "phasesweep/engine/attempts.py": {
-        "_load_journal_study_snapshot",
-        "_resolve_storage",
-    },
+    "phasesweep/engine/attempts.py": {"_load_journal_study_snapshot"},
     "phasesweep/engine/phase.py": {"_create_phase_study"},
     "phasesweep/engine/read.py": {"_phase_trial_stats"},
     "phasesweep/mcp/recovery.py": {"_load_existing_phase_study"},

@@ -19,11 +19,13 @@ from phasesweep.engine.errors import (
     PublishedStudyMissingError,
     StudyStorageUnavailableError,
 )
-from phasesweep.engine.optuna import (
+from phasesweep.engine.ledger import (
     _load_existing_phase_study,
+    _validate_local_storage_format,
+)
+from phasesweep.engine.optuna import (
     _published_phase_trial_refs,
     _published_trial_matches,
-    _validate_local_storage_format,
 )
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.publication import _resolve_publication_pointer
