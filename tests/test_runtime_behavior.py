@@ -40,7 +40,12 @@ from phasesweep.engine import (
     read_winner,
 )
 from phasesweep.engine.artifacts import _load_winner
-from phasesweep.engine.ledger import _create_phase_study, _resolve_storage
+from phasesweep.engine.ledger import (
+    _resolve_storage,
+    claim_ledger,
+    open_phase_study,
+    validate_ledger,
+)
 from phasesweep.engine.optuna import _build_sampler, _suggest
 from phasesweep.engine.paths import (
     _attempts_dir,
@@ -325,7 +330,7 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
         workdir=tmp_path / "runs",
         phases=[phase],
     )
-    study = _create_phase_study(exp, phase)
+    study = open_phase_study(claim_ledger(validate_ledger(exp)), phase)
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     observed: dict[str, object] = {}
 
@@ -586,8 +591,8 @@ def test_terminal_callback_reports_success_evidence(
     experiment = make_experiment(workdir=tmp_path / "runs")
     captured: list[TerminalReport] = []
 
-    def preflight(_experiment, *, cleanup_report, from_phase, preloaded_studies=None):
-        del from_phase, preloaded_studies
+    def preflight(_ledger, *, cleanup_report, from_phase):
+        del from_phase
         cleanup_report.uncertain_attempt_ids.add("attempt-uncertain")
         return {}
 

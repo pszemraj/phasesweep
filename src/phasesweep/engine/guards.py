@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 import optuna
 
 from phasesweep.config import Experiment
@@ -23,7 +21,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     TrialTargetRegressionError,
 )
-from phasesweep.engine.ledger import _load_and_check_artifact_roots
+from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
 from phasesweep.engine.study_policy import (
     _load_accepted_partial_decision,
     _validate_environment_cohort,
@@ -34,33 +32,65 @@ from phasesweep.engine.study_policy import (
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 
 
-def _preflight_existing_studies(
+def _reconcile_existing_studies(
     experiment: Experiment,
+    *,
+    cleanup_report: _PreflightCleanupReport,
+    from_phase: str | None = None,
+) -> dict[str, optuna.Study]:
+    """Rediscover and reconcile every existing study after a run has ended.
+
+    Post-execution reconciliation cannot reuse the handle the run claimed
+    before it started: phases created studies since then, and those must be
+    reaped too. It therefore validates and claims the ledger afresh, then runs
+    the same preflight over what that discovery found.
+
+    :param Experiment experiment: Parsed experiment whose declared phases are inspected.
+    :param _PreflightCleanupReport cleanup_report: Report the reconciliation's
+        cleanup evidence accumulates into.
+    :param str | None from_phase: Optional resume point, as for
+        :func:`_preflight_existing_studies`.
+    :return dict[str, optuna.Study]: Existing studies keyed by phase name.
+    :raises ArtifactRootConflictError: The tree or a phase's persistent study
+        is bound to a different owner; raised before any reaping.
+    :raises StudyStorageUnavailableError: A phase's persistent storage could not
+        be inspected; raised before any reaping or registry recovery.
+    :raises PublishedStudyMissingError: A reached phase has a published winner
+        but its persistent study is absent or empty.
+    :raises PhaseSweepError: Preflight over the discovered studies refused, as
+        documented on :func:`_preflight_existing_studies`.
+    """
+    try:
+        claimed = claim_ledger(validate_ledger(experiment), from_phase=from_phase)
+    except Exception as exc:
+        # Any discovery failure (including unreadable or conflicting roots)
+        # aborts before the attempt registry can be inspected, so cleanup
+        # cannot be reported as confirmed. Post-reap validation is separate.
+        cleanup_report.mark_uncertain(exc)
+        raise
+    return _preflight_existing_studies(
+        claimed, cleanup_report=cleanup_report, from_phase=from_phase
+    )
+
+
+def _preflight_existing_studies(
+    ledger: ClaimedLedger,
     *,
     cleanup_report: _PreflightCleanupReport | None = None,
     from_phase: str | None = None,
-    preloaded_studies: Mapping[str, optuna.Study] | None = None,
 ) -> dict[str, optuna.Study]:
     """Validate and reap every existing declared phase study before launch.
 
-    :param Experiment experiment: Parsed experiment whose declared phases are inspected.
+    :param ClaimedLedger ledger: Handle from :func:`phasesweep.engine.ledger.claim_ledger`;
+        its ``studies`` are the only studies inspected.
     :param _PreflightCleanupReport | None cleanup_report: Optional shared report to
         accumulate cleanup evidence into; a fresh one is created if omitted.
     :param str | None from_phase: Optional resume point. Recovery and schema checks
         still cover every phase; trial-target validation starts at this reached phase.
-    :param Mapping[str, optuna.Study] | None preloaded_studies: Studies already
-        discovered and ownership-checked under the experiment lock before the
-        generation claim. Direct callers omit this and perform the same strict
-        discovery here.
     :return dict[str, optuna.Study]: Existing studies keyed by phase name (phases
         with no durable study yet are omitted).
-    :raises ArtifactRootConflictError: A phase's persistent study is already
-        bound to a different artifact root than this config's workdir offers;
-        raised before any inspection, reaping, or trial work.
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
-        be inspected; raised before any claim, reaping, or registry recovery.
-    :raises PublishedStudyMissingError: A reached phase has a published winner
-        but its persistent study is absent or empty.
+        be read while its stale trials were recovered.
     :raises StudySchemaMismatchError: A phase's study uses an incompatible
         storage schema.
     :raises TrialTargetRegressionError: A phase's study already accepted a
@@ -72,27 +102,16 @@ def _preflight_existing_studies(
     :raises RuntimeError: Multiple studies failed and at least one error is an
         unexpected implementation failure that must retain traceback reporting.
     """
+    experiment = ledger.experiment
     report = cleanup_report or _PreflightCleanupReport()
-    # Discovery, root checks, and claims happen in ONE strict pass, and its
-    # study objects are the ones every later step operates on: an invocation
-    # offering a second publication root must not reap, inspect, or claim
-    # anything in either tree (review v0.5.19 / finding F5), and a storage
-    # read that fails must abort rather than let a second, luckier read hand
-    # recovery a study whose root was never checked (PR #5 review /
-    # reviewer 2, issue 1). The storage error still marks cleanup uncertain:
-    # an unreadable ledger cannot prove its attempts are resolved.
-    if preloaded_studies is None:
-        try:
-            loaded = _load_and_check_artifact_roots(experiment, from_phase=from_phase)
-        except Exception as exc:
-            # This discovery also runs during post-execution reconciliation.
-            # Any discovery failure (including unreadable or conflicting roots)
-            # aborts before the attempt registry can be inspected, so cleanup
-            # cannot be reported as confirmed. Post-reap validation is separate.
-            report.mark_uncertain(exc)
-            raise
-    else:
-        loaded = dict(preloaded_studies)
+    # Discovery, root checks, and claims already happened in ONE strict pass
+    # (claim_ledger), and its study objects are the ones every later step
+    # operates on: an invocation offering a second publication root must not
+    # reap, inspect, or claim anything in either tree (review v0.5.19 /
+    # finding F5), and a storage read that fails must abort rather than let a
+    # second, luckier read hand recovery a study whose root was never checked
+    # (PR #5 review / reviewer 2, issue 1).
+    loaded = ledger.studies
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []
     # The registry scan runs FIRST and is independent of the declared phase

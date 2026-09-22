@@ -1490,11 +1490,9 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
     calls = 0
     cleanup_error = ProcessCleanupUncertainError("cleanup could not be proven")
 
-    def preflight(
-        _experiment: Experiment, *, cleanup_report, from_phase, preloaded_studies=None
-    ) -> dict:
+    def preflight(_ledger: engine_ledger.ClaimedLedger, *, cleanup_report, from_phase) -> dict:
         nonlocal calls
-        del from_phase, preloaded_studies
+        del from_phase
         calls += 1
         if calls == 2:
             cleanup_report.mark_uncertain(cleanup_error)
@@ -1544,9 +1542,7 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
     def fail_run(*args: object, **kwargs: object) -> None:
         # Initial discovery and preflight succeeded. Only reconciliation loses
         # access to the root, before it can perform a second registry scan.
-        monkeypatch.setattr(
-            "phasesweep.engine.guards._load_and_check_artifact_roots", fail_discovery
-        )
+        monkeypatch.setattr("phasesweep.engine.guards.validate_ledger", fail_discovery)
         raise NoFeasibleTrialError("trainer failed")
 
     captured: list[TerminalReport] = []
@@ -1600,11 +1596,9 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     )
     preflight_calls = 0
 
-    def preflight(
-        _experiment: Experiment, *, cleanup_report, from_phase, preloaded_studies=None
-    ) -> dict:
+    def preflight(_ledger: engine_ledger.ClaimedLedger, *, cleanup_report, from_phase) -> dict:
         nonlocal preflight_calls
-        del cleanup_report, from_phase, preloaded_studies
+        del cleanup_report, from_phase
         preflight_calls += 1
         return {}
 
@@ -1667,11 +1661,9 @@ def test_shutdown_during_post_error_reconciliation_preserves_cleanup_evidence(
     )
     preflight_calls = 0
 
-    def preflight(
-        _experiment: Experiment, *, cleanup_report, from_phase, preloaded_studies=None
-    ) -> dict:
+    def preflight(_ledger: engine_ledger.ClaimedLedger, *, cleanup_report, from_phase) -> dict:
         nonlocal preflight_calls
-        del cleanup_report, from_phase, preloaded_studies
+        del cleanup_report, from_phase
         preflight_calls += 1
         if preflight_calls == 2:
             raise shutdown

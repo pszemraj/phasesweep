@@ -16,7 +16,6 @@ import optuna
 
 from phasesweep.config import Experiment, Gate, Phase
 from phasesweep.config.search import _placeholder_values_for
-from phasesweep.engine.artifact_roots import _bind_study_artifact_root
 from phasesweep.engine.artifacts import _write_trials_csv
 from phasesweep.engine.attempts import (
     _register_active_attempt,
@@ -31,7 +30,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.evidence import _verify_winner_objective_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
-from phasesweep.engine.ledger import _create_phase_study
+from phasesweep.engine.ledger import ClaimedLedger, open_phase_study, open_preview_study
 from phasesweep.engine.optuna import _phase_study_name, _suggest
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
@@ -354,7 +353,7 @@ def _run_phase(
     inherited_winners: dict[str, Winner],
     *,
     generation_id: str | None,
-    dry_run: bool = False,
+    ledger: ClaimedLedger | None,
     run_deadline: float | None = None,
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
@@ -367,7 +366,9 @@ def _run_phase(
         phase: The phase to execute.
         inherited_winners: Winners loaded for phases earlier in the chain.
         generation_id: Identity of the current engine invocation, or ``None`` for dry-run.
-        dry_run: When ``True``, render an example trial command and return a
+        ledger: The claimed ledger, for ``experiment``, that this phase opens
+            its live study through. ``None`` is a dry run: render an example
+            trial command against an in-memory preview study and return a
             placeholder midpoint winner instead of launching any subprocesses.
         run_deadline: Optional ``time.monotonic()`` deadline inherited from
             the experiment-level wallclock guard.
@@ -402,17 +403,18 @@ def _run_phase(
             a timeout, abort, or exception, which violates the runner invariant.
 
     """
+    dry_run = ledger is None
     study_name = _phase_study_name(experiment, phase)
-    study = _create_phase_study(experiment, phase, dry_run=dry_run)
+    # The live opener also claims a newly created study's publication root,
+    # before any inspection, reaping, or trial work below can run against it.
+    study = (
+        open_preview_study(experiment, phase) if ledger is None else open_phase_study(ledger, phase)
+    )
     phase_fingerprint: str
     policy_state = None
     recovery_abort: dict[str, Any] | None = None
     partial_decision: _AcceptedPartialDecision | None = None
     if not dry_run:
-        # A study this invocation just created was invisible to preflight, so
-        # it claims its publication root here — before any inspection, reaping,
-        # or trial work (review v0.5.19 / finding F5).
-        _bind_study_artifact_root(study, experiment)
         _validate_study_direction(study, experiment.metric.goal)
         _validate_study_schema(study)
         _reap_stale_trials(study, experiment, phase.name)

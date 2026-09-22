@@ -51,7 +51,7 @@ from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
     _phase_fingerprint,
 )
-from phasesweep.engine.ledger import _sqlite_study_exists
+from phasesweep.engine.ledger import ClaimedLedger, _sqlite_study_exists
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -2203,13 +2203,12 @@ def test_fresh_run_preflight_consumes_run_deadline(
     clock = {"now": 100.0}
 
     def delayed_preflight(
-        _experiment: Experiment,
+        _ledger: ClaimedLedger,
         *,
         cleanup_report: object,
         from_phase: str | None,
-        preloaded_studies: object,
     ) -> dict[str, optuna.Study]:
-        del cleanup_report, from_phase, preloaded_studies
+        del cleanup_report, from_phase
         clock["now"] += 2.0
         return {}
 

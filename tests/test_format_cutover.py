@@ -11,10 +11,19 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.config import Experiment
 from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError, read_status
-from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
-from phasesweep.engine.ledger import _resolve_storage, validate_ledger
+from phasesweep.engine.artifact_roots import (
+    ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
+    _artifact_root_binding_payload,
+)
+from phasesweep.engine.ledger import (
+    ClaimedLedger,
+    _resolve_storage,
+    claim_ledger,
+    open_phase_study,
+    validate_ledger,
+)
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
+from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_constant_trainer
 from tests.ledger_fixtures import _tree_bytes
 
@@ -199,12 +208,14 @@ def test_validate_ledger_on_a_fresh_root_creates_nothing(tmp_path: Path, backend
     assert not _experiment_dir(experiment).exists()
 
 
-def test_validate_ledger_never_creates_a_journal_parent_directory(tmp_path: Path) -> None:
-    """A journal URL under a missing directory is classified without creating it.
+def test_open_phase_study_creates_journal_parent_but_validate_does_not(tmp_path: Path) -> None:
+    """Only the live opener brings a journal's directory into existence.
 
-    ``_resolve_storage`` used to create the parent as a side effect of merely
-    translating a URL, which put a read path one call away from materializing a
-    ledger directory. Only the create path may do that now.
+    Every read path validates, so validating must never materialize a ledger
+    directory. Claiming writes the tree's ownership record, which lives in the
+    artifact root, and still leaves the ledger's directory alone. The first
+    live open is the one step that needs the directory, so it is the one step
+    that creates it.
     """
     missing = tmp_path / "not-created-by-a-read"
     experiment = _experiment(tmp_path, storage=f"journal:///{missing / 'study.journal'}")
@@ -214,6 +225,115 @@ def test_validate_ledger_never_creates_a_journal_parent_directory(tmp_path: Path
     assert ledger.backend == "journal"
     assert ledger.ledger_path == missing / "study.journal"
     assert not missing.exists()
+
+    claimed = claim_ledger(ledger)
+
+    assert _artifact_root_binding_path(experiment).is_file()
+    assert not missing.exists()
+
+    open_phase_study(claimed, experiment.phases[0])
+
+    assert (missing / "study.journal").is_file()
+
+
+@pytest.mark.parametrize("offered", ["storage-url", "validated-ledger"])
+def test_live_openers_reject_unvalidated_storage(tmp_path: Path, offered: str) -> None:
+    """Nothing weaker than a claimed handle reaches the live opener.
+
+    The annotation already refuses both at type-check time; this pins the
+    runtime guard for callers the checker never sees. A bare validated handle
+    is the dangerous case: it carries every field the opener reads, and the
+    only thing it lacks is the proof that the tree and studies were claimed.
+    The refusal lands before storage is resolved, so nothing is created.
+    """
+    missing = tmp_path / "ledger"
+    storage = f"journal:///{missing / 'study.journal'}"
+    experiment = _experiment(tmp_path, storage=storage)
+    handle: object = storage if offered == "storage-url" else validate_ledger(experiment)
+
+    with pytest.raises(TypeError, match="requires the ClaimedLedger"):
+        open_phase_study(handle, experiment.phases[0])  # type: ignore[arg-type]
+
+    assert not missing.exists()
+    assert not _artifact_root_binding_path(experiment).exists()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_claim_ledger_binds_tree_then_returns_bound_handle(tmp_path: Path, backend: str) -> None:
+    """Claiming a fresh tree records its owner and returns the handle that opens studies.
+
+    The validated handle keeps saying what validation saw ("unbound"); only the
+    claimed handle records that the fixed order's writes happened, and a study
+    opened through it carries the claimed root. Reclaiming the bound tree finds
+    that study in its one discovery pass.
+    """
+    experiment = _experiment(tmp_path, storage=f"{backend}:///{tmp_path / f'study.{backend}'}")
+    validated = validate_ledger(experiment)
+
+    claimed = claim_ledger(validated)
+
+    assert validated.binding_state == "unbound"
+    assert isinstance(claimed, ClaimedLedger)
+    assert claimed.binding_state == "bound"
+    assert claimed.artifact_root == validated.artifact_root
+    assert dict(claimed.studies) == {}
+    binding = json.loads(_artifact_root_binding_path(experiment).read_text(encoding="utf-8"))
+    assert binding == _artifact_root_binding_payload(experiment)
+    assert validate_ledger(experiment).binding_state == "bound"
+
+    study = open_phase_study(claimed, experiment.phases[0])
+
+    assert study.user_attrs[ARTIFACT_ROOT_ATTR] == claimed.artifact_root
+    reclaimed = claim_ledger(validate_ledger(experiment))
+    assert list(reclaimed.studies) == [experiment.phases[0].name]
+    with pytest.raises(TypeError):
+        reclaimed.studies["other"] = study  # type: ignore[index]
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_claim_ledger_writes_tree_binding_before_claiming_studies(
+    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash between the two claims leaves a bound tree and unclaimed studies.
+
+    The tree records its ledger first and the studies record their root second.
+    A process that dies in between leaves state the next run claims normally.
+    The opposite order could leave a study pointing at a tree that does not
+    name the same ledger, which no later run could tell apart from a conflict.
+    """
+    import phasesweep.engine.ledger as ledger_module
+
+    storage = f"{backend}:///{tmp_path / f'study.{backend}'}"
+    base = _experiment(tmp_path, storage=storage)
+    experiment = base.model_copy(
+        update={"phases": [base.phases[0], base.phases[0].model_copy(update={"name": "q"})]}
+    )
+    for phase in experiment.phases:
+        optuna.create_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
+
+    class CrashBeforeStudyClaim(Exception):
+        pass
+
+    def crash(*_args: object, **_kwargs: object) -> None:
+        assert _artifact_root_binding_path(experiment).is_file()
+        raise CrashBeforeStudyClaim
+
+    with monkeypatch.context() as patched:
+        patched.setattr(ledger_module, "_claim_study_artifact_root", crash)
+        with pytest.raises(CrashBeforeStudyClaim):
+            claim_ledger(validate_ledger(experiment))
+
+    binding = json.loads(_artifact_root_binding_path(experiment).read_text(encoding="utf-8"))
+    assert binding == _artifact_root_binding_payload(experiment)
+    for phase in experiment.phases:
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
+        assert ARTIFACT_ROOT_ATTR not in study.user_attrs
+
+    reclaimed = claim_ledger(validate_ledger(experiment))
+
+    assert sorted(reclaimed.studies) == ["p", "q"]
+    for study in reclaimed.studies.values():
+        assert study.user_attrs[ARTIFACT_ROOT_ATTR] == reclaimed.artifact_root
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])

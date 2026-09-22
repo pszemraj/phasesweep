@@ -57,8 +57,7 @@ BANNED_LEAVES: dict[str, frozenset[str]] = {
 STORAGE_PRIVATE_NAMES = frozenset(
     {
         "_resolve_storage",
-        "_create_phase_study",
-        "_load_phase_study",
+        "_build_phase_study",
         "_load_existing_phase_study",
         "_scan_ledger_format",
         "_validate_storage_versions",
@@ -73,8 +72,6 @@ STORAGE_PRIVATE_NAMES = frozenset(
         "_unavailable_phase_trial_stats",
         "_decoded_string_attr",
         "_describe_ledger",
-        "_validate_artifact_root_binding",
-        "_load_and_check_artifact_roots",
     }
 )
 
@@ -83,17 +80,12 @@ _LEGACY_SITES: dict[str, set[str]] = {}
 
 #: Private ledger helpers still imported outside the chokepoint.
 #:
-#: Read paths are gone from this list: they hold a :class:`ValidatedLedger` and
-#: call the public API. What is left is the write side. ``guards.py`` and
-#: ``run.py`` still reach for the composed discovery-and-claim flow, which
-#: becomes the public ``claim_ledger`` returning a claimed handle; ``phase.py``
-#: still opens studies for writing directly; and ``attempts.py`` still replays
-#: a journal snapshot for foreign-ledger recovery.
+#: Read paths hold a :class:`ValidatedLedger` and the write side holds a
+#: :class:`ClaimedLedger`; both call the public API. What is left is
+#: ``attempts.py``, which still replays a journal snapshot for foreign-ledger
+#: recovery.
 _LEGACY_PRIVATE_IMPORTS: dict[str, set[str]] = {
     "phasesweep/engine/attempts.py": {"_load_journal_study_snapshot"},
-    "phasesweep/engine/guards.py": {"_load_and_check_artifact_roots"},
-    "phasesweep/engine/phase.py": {"_create_phase_study"},
-    "phasesweep/engine/run.py": {"_load_and_check_artifact_roots"},
 }
 
 

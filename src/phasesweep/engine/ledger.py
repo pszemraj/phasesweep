@@ -26,9 +26,10 @@ import json
 import logging
 import os
 import sqlite3
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 import optuna
@@ -41,12 +42,17 @@ from phasesweep.engine.artifact_roots import (
     _artifact_root_binding_applies,
     _artifact_root_claim_needed,
     _artifact_root_identity,
+    _bind_study_artifact_root,
     _check_artifact_root_binding,
     _check_published_phase_studies,
     _claim_study_artifact_root,
     _write_artifact_root_binding,
 )
-from phasesweep.engine.errors import StudySchemaMismatchError, StudyStorageUnavailableError
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.optuna import (
     _build_sampler,
     _phase_study_name,
@@ -69,8 +75,12 @@ from phasesweep.runtime.files import (
 )
 
 __all__ = [
+    "ClaimedLedger",
     "ValidatedLedger",
+    "claim_ledger",
     "open_existing_study",
+    "open_phase_study",
+    "open_preview_study",
     "open_registry_study",
     "read_phase_trial_stats",
     "validate_ledger",
@@ -94,15 +104,15 @@ class ValidatedLedger:
     nothing more, so this handle is all they take.
 
     It is deliberately *not* enough to open a live study for writing. That
-    needs a claimed tree and root-claimed studies, which a later milestone
-    expresses as a separate, richer handle; the type split is what stops a read
-    path from reaching an opener that mutates.
+    needs a bound tree and root-claimed studies, which only a
+    :class:`ClaimedLedger` records; the type split is what stops a read path
+    from reaching an opener that mutates.
     """
 
-    #: Transitional. The storage helpers below still take the whole config
-    #: because they build study names and messages from it; carrying it here is
-    #: what lets a read path hold only the handle today. It disappears as those
-    #: helpers convert to ``(storage_url, study_name)``.
+    #: The exact config this handle was validated for. Study names, samplers,
+    #: and refusal messages all derive from it, so carrying it is what lets every
+    #: opener take the handle alone: no caller can pair a validated ledger with
+    #: a different config than the one that passed.
     experiment: Experiment
     experiment_name: str
     storage_url: str | None
@@ -110,6 +120,26 @@ class ValidatedLedger:
     ledger_path: Path | None
     artifact_root: str
     binding_state: BindingState
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedLedger(ValidatedLedger):
+    """A validated ledger whose tree is bound and whose existing studies are claimed.
+
+    Holding one of these is the proof that the fixed order ran through its
+    last write: :func:`claim_ledger` took a :class:`ValidatedLedger`, found
+    every existing phase study in one strict pass, wrote the tree's ownership
+    record, and only then claimed each study's artifact root. It is the only
+    handle :func:`open_phase_study` accepts, so live storage cannot be opened
+    for writing before that order completes.
+    """
+
+    #: Every existing declared phase study, keyed by phase name, from the one
+    #: strict discovery pass :func:`claim_ledger` made (phases with no durable
+    #: study yet are absent). Preflight reaps and validates exactly these
+    #: objects, so a second, luckier read can never hand recovery a study whose
+    #: root was never checked.
+    studies: Mapping[str, optuna.Study]
 
 
 def _resolve_storage(url: str | None) -> Any:
@@ -129,8 +159,8 @@ def _resolve_storage(url: str | None) -> Any:
 
     The journal's parent directory is *not* created here. Resolving a URL is
     something read paths do too, and a read must never bring a ledger
-    directory into existence; only the create path
-    (:func:`_create_phase_study`) prepares the directory first.
+    directory into existence; only the live opener
+    (:func:`open_phase_study`) prepares the directory first.
 
     Args:
         url: The resolved storage URL, or an in-memory sentinel.
@@ -151,28 +181,17 @@ def _resolve_storage(url: str | None) -> Any:
     return url
 
 
-def _create_phase_study(
-    experiment: Experiment,
-    phase: Phase,
-    *,
-    dry_run: bool = False,
-) -> optuna.Study:
-    """Create or load the Optuna study for a phase.
+def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> optuna.Study:
+    """Create or load a phase's Optuna study in already-resolved storage.
 
-    This is the create path, so it is also the only place allowed to bring a
-    journal's parent directory into existence.
+    The one ``create_study`` call both openers share, so a live study and its
+    dry-run preview can never disagree on sampler, pruner, or direction.
 
-    :param Experiment experiment: Parsed experiment config containing storage and metric settings.
+    :param Experiment experiment: Parsed experiment config supplying the metric direction.
     :param Phase phase: Phase whose sampler, search space, and study name are used.
-    :param bool dry_run: If ``True``, force in-memory storage for the preview study.
+    :param Any storage: Resolved Optuna storage, or ``None`` for in-memory.
     :return optuna.Study: Created or loaded Optuna study for the phase.
     """
-    storage: Any = None
-    if not dry_run:
-        url = experiment.resolved_storage
-        if url is not None and not storage_is_in_memory(url) and storage_backend(url) == "journal":
-            Path(file_url_path(url)).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        storage = _resolve_storage(url)
     return optuna.create_study(
         study_name=_phase_study_name(experiment, phase),
         storage=storage,
@@ -180,20 +199,6 @@ def _create_phase_study(
         pruner=optuna.pruners.NopPruner(),
         direction=experiment.metric.goal,
         load_if_exists=True,
-    )
-
-
-def _load_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study:
-    """Load an existing persistent Optuna study for a phase.
-
-    :param Experiment experiment: Parsed experiment config containing storage settings.
-    :param Phase | str phase: Phase or historical phase name whose study is loaded.
-    :return optuna.Study: Existing Optuna study for the phase.
-    """
-    assert experiment.resolved_storage is not None
-    return optuna.load_study(
-        study_name=_phase_study_name(experiment, phase),
-        storage=_resolve_storage(experiment.resolved_storage),
     )
 
 
@@ -480,19 +485,20 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> op
         return None
     assert storage is not None
     backend = storage_backend(storage)
+    study_name = _phase_study_name(experiment, phase)
     if backend == "sqlite":
         if not _sqlite_study_exists(experiment, phase):
             return None
     elif backend == "journal":
-        if _load_journal_study_snapshot(storage, _phase_study_name(experiment, phase)) is None:
+        if _load_journal_study_snapshot(storage, study_name) is None:
             return None
         # Preflight verified a complete snapshot. Mutating callers still use
         # Optuna's normal backend, including its concurrent-append semantics.
-        return _load_phase_study(experiment, phase)
+        return optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
     else:
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     try:
-        return _load_phase_study(experiment, phase)
+        return optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
     except KeyError:
         return None
 
@@ -907,102 +913,53 @@ def read_phase_trial_stats(
     return _phase_trial_stats(ledger.experiment, phase, published_trial)
 
 
-def _validate_artifact_root_binding(
-    experiment: Experiment,
-    *,
-    claim_fresh: bool,
-    validate_storage_format: bool = True,
-    validate_unbound_storage: bool = True,
-) -> None:
-    """Validate or claim the storage ledger that owns an artifact tree.
+def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> ClaimedLedger:
+    """Discover every existing phase study once, then bind the tree and claim them.
 
-    Transitional: this composes the artifact-root primitives with the ledger
-    scan so :func:`_load_and_check_artifact_roots` keeps its exact prior
-    behavior while it lives here. A later milestone replaces both with a
-    ``claim_ledger`` that returns a claimed handle.
-
-    :param Experiment experiment: Config whose root and storage must agree.
-    :param bool claim_fresh: Write the record when the root has no recognized
-        PhaseSweep durable state.
-    :param bool validate_storage_format: Inspect the selected persistent ledger
-        for unsupported study schemas after a matching binding is read.
-    :param bool validate_unbound_storage: Inspect the selected persistent ledger
-        when no binding exists yet. Callers may disable this after classifying
-        the same ledger earlier under the experiment lock.
-    :raises ArtifactRootConflictError: The binding cannot be validated as the
-        current user, or is malformed or names another owner.
-    """
-    if _check_artifact_root_binding(experiment) == "unbound":
-        if validate_unbound_storage:
-            # A read without a binding must still classify the selected ledger:
-            # an unavailable ledger is not equivalent to an empty
-            # current-format one. Tolerant per-phase status counts only apply
-            # after this provenance check.
-            _scan_ledger_format(experiment)
-        if claim_fresh:
-            _write_artifact_root_binding(experiment)
-        return
-    if validate_storage_format:
-        try:
-            _scan_ledger_format(experiment)
-        except StudyStorageUnavailableError:
-            if claim_fresh:
-                raise
-            # A matched binding already proves which ledger owns this tree.
-            # Permissive read paths can still report frozen publication data
-            # while their trial-data snapshot reports the ledger unavailable.
-            # Mutating callers immediately perform strict study discovery and
-            # fail there before any trial work or publication.
-
-
-def _load_and_check_artifact_roots(
-    experiment: Experiment, *, from_phase: str | None = None
-) -> dict[str, optuna.Study]:
-    """Load every existing phase study exactly once, then check and claim roots.
-
-    Discovery on this mutating path is strict and tri-state (PR #5 review /
-    reviewer 2, issue 1): a phase's study is *absent* (storage read fine, no
-    such study), *present* (loaded and returned), or *unavailable* -- and
+    This performs the fixed order's writes, and only after both ownership
+    directions are known to agree. Discovery is strict and tri-state (PR #5
+    review / reviewer 2, issue 1): a phase's study is *absent* (storage read
+    fine, no such study), *present* (loaded and kept), or *unavailable* -- and
     unavailable raises before any claim, reaping, or registry recovery runs.
-    The earlier shape swallowed a read failure here and let the main preflight
-    loop re-read; a transient failure (for example, a brief SQLite lock)
-    could then succeed on that second read, handing stale-trial reaping a
-    study whose artifact-root binding was never checked -- mutation of a
-    wrong-root ledger before the conflict was enforced. The returned mapping
-    is therefore the *only* discovery pass: the study objects that passed the
-    root check here are the exact objects preflight goes on to reap and
-    validate.
+    Swallowing a read failure and letting preflight read again would be unsafe:
+    a transient failure (for example, a brief SQLite lock) could succeed on the
+    second read and hand stale-trial reaping a study whose artifact-root
+    binding was never checked. The returned handle's ``studies`` is therefore
+    the *only* discovery pass: the objects that passed the root check here are
+    the exact objects preflight goes on to reap and validate.
 
-    Every declared phase is checked before any claim is written (re-review
-    v0.5.19 / blocker B3), so a refused multi-phase run leaves no study bound
-    to the rejected root. Preflight holds the experiment lock across load,
-    check, and claim, so nothing can bind in between. Phases whose study does
-    not exist yet are bound by :func:`_bind_study_artifact_root` when the
-    phase creates them. The exception is a phase with a winner in the current
-    published generation: that publication proves the phase previously had
-    trial rows with a specific generation and attempt identity. Missing or
-    replaced published trials mean durable evidence was lost rather than that
-    the phase is new. Skipped phases load their saved winners instead.
+    Every declared phase is checked before anything is written (re-review
+    v0.5.19 / blocker B3), so a refused multi-phase run leaves neither the tree
+    nor any study bound to the rejected root. Phases whose study does not exist
+    yet are bound by :func:`open_phase_study` when the phase creates them. The
+    exception is a phase with a winner in the current published generation:
+    that publication proves the phase previously had trial rows with a specific
+    generation and attempt identity, so missing or replaced published trials
+    mean durable evidence was lost rather than that the phase is new. Skipped
+    phases load their saved winners instead.
 
-    :param Experiment experiment: Parsed experiment whose declared phase
-        studies are loaded and bound to its resolved artifact root.
+    The caller holds :func:`phasesweep.engine.locking._experiment_lock` across
+    :func:`validate_ledger` and this call, so no cooperating process can bind
+    the tree in between. The binding is still read once more before the first
+    write, because that re-read is cheap and a tree modified outside the lock
+    must be refused rather than overwritten.
+
+    :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param str | None from_phase: Resume point; earlier phases will not execute.
-    :return dict[str, optuna.Study]: Existing studies keyed by phase name
-        (phases with no durable study yet are omitted).
+    :return ClaimedLedger: Bound handle carrying every existing phase study.
     :raises StudyStorageUnavailableError: A phase's persistent storage could
         not be inspected.
     :raises PublishedStudyMissingError: A phase to execute has a published
         result whose local trial identity is missing from durable storage.
     :raises ArtifactRootConflictError: A phase study is already bound to a
-        different artifact root, or carries a binding that is not a string.
+        different artifact root, carries a binding that is not a string, or the
+        tree's ownership record changed after validation.
     """
-    # Reject an existing foreign or pre-cutover root before touching storage,
-    # including an in-memory configuration offered a bound root.
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    experiment = ledger.experiment
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
         try:
-            study = _load_existing_phase_study(experiment, phase)
+            study = open_existing_study(ledger, phase)
         except Exception as exc:
             unavailable = StudyStorageUnavailableError(
                 f"Could not inspect persistent study storage for phase {phase.name!r}."
@@ -1016,20 +973,87 @@ def _load_and_check_artifact_roots(
         claimable = [
             study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
         ]
+    offered = _artifact_root_identity(experiment)
+    binding_state = _check_artifact_root_binding(experiment)
+    if binding_state != ledger.binding_state or offered != ledger.artifact_root:
+        raise ArtifactRootConflictError(
+            f"Artifact root {ledger.artifact_root!r} changed while its ledger was being "
+            f"claimed: validation found it {ledger.binding_state}, but it is now "
+            f"{binding_state} at {offered!r}. Another process modified this tree without "
+            "holding the experiment lock. Stop that process before retrying. Nothing was "
+            "written."
+        )
     # Both directions are now known-compatible. Claim the tree first, then
     # empty studies: a crash cannot leave a study pointing at a tree that does
     # not itself name the same ledger. Crucially, neither claim occurs when a
     # symlink-retargeted leaf exposed a study still bound to the old target.
-    _validate_artifact_root_binding(
-        experiment,
-        claim_fresh=True,
-        validate_storage_format=False,
-        validate_unbound_storage=False,
-    )
-    offered = _artifact_root_identity(experiment)
+    if binding_state == "unbound":
+        _write_artifact_root_binding(experiment)
     for study in claimable:
         _claim_study_artifact_root(study, offered)
-    return loaded
+    return ClaimedLedger(
+        experiment=experiment,
+        experiment_name=ledger.experiment_name,
+        storage_url=ledger.storage_url,
+        backend=ledger.backend,
+        ledger_path=ledger.ledger_path,
+        artifact_root=ledger.artifact_root,
+        binding_state="bound",
+        studies=MappingProxyType(loaded),
+    )
+
+
+def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
+    """Open a phase's live study for writing, creating it if it does not exist.
+
+    This is the only opener that may create a study in file-backed storage,
+    so it is also the only place a journal's parent directory is brought into
+    existence. Requiring a :class:`ClaimedLedger` is what makes the fixed order
+    checkable: that handle exists only once :func:`validate_ledger` and
+    :func:`claim_ledger` have run, so no caller can create a study in a ledger
+    this release refuses or in a tree that does not yet name this ledger. The
+    type is enforced at runtime as well, because an untyped caller could
+    otherwise pass a bare :class:`ValidatedLedger`, which carries every field
+    this function reads.
+
+    A study this call creates was invisible to :func:`claim_ledger`'s
+    discovery, so it claims its publication root here, before any inspection,
+    reaping, or trial work can run against it (review v0.5.19 / finding F5);
+    a study that already existed only re-confirms the root it was claimed for.
+
+    :param ClaimedLedger ledger: Handle from :func:`claim_ledger`.
+    :param Phase phase: Phase whose sampler, search space, and study name are used.
+    :return optuna.Study: The phase's live study, bound to the claimed artifact root.
+    :raises TypeError: ``ledger`` is not a :class:`ClaimedLedger`.
+    :raises ArtifactRootConflictError: The study is already bound to a different
+        artifact root, or holds trials but records no root.
+    """
+    if not isinstance(ledger, ClaimedLedger):
+        raise TypeError(
+            "open_phase_study requires the ClaimedLedger returned by claim_ledger, not "
+            f"{type(ledger).__name__}."
+        )
+    experiment = ledger.experiment
+    if ledger.backend == "journal":
+        assert ledger.ledger_path is not None
+        ledger.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    study = _build_phase_study(experiment, phase, _resolve_storage(ledger.storage_url))
+    _bind_study_artifact_root(study, experiment)
+    return study
+
+
+def open_preview_study(experiment: Experiment, phase: Phase) -> optuna.Study:
+    """Create the throwaway in-memory study a dry run renders its preview from.
+
+    A preview must leave the configured ledger and tree exactly as they were,
+    so it takes no handle and never resolves the configured storage: the study
+    it returns lives only in this process's memory.
+
+    :param Experiment experiment: Parsed experiment supplying direction and study name.
+    :param Phase phase: Phase whose sampler and search space the preview uses.
+    :return optuna.Study: Fresh in-memory study for the phase.
+    """
+    return _build_phase_study(experiment, phase, None)
 
 
 def open_registry_study(locator: str, study_name: str) -> optuna.Study:

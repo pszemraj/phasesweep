@@ -10,9 +10,10 @@ import signal
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import optuna
 import pytest
@@ -44,7 +45,7 @@ from phasesweep.engine.attempts import (
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.fingerprints import _phase_fingerprint
-from phasesweep.engine.guards import _preflight_existing_studies
+from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_existing_studies
 from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
@@ -180,6 +181,32 @@ def _stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
 
 
+def _claimed_over(
+    experiment: Experiment, studies: Mapping[str, object]
+) -> engine_ledger.ClaimedLedger:
+    """Hand preflight a claimed handle over exactly the given studies.
+
+    Preflight only ever inspects the studies its handle carries, so tests of
+    its error handling stand in for :func:`claim_ledger`'s discovery with
+    hand-built (or deliberately broken) study objects instead of running it.
+
+    :param Experiment experiment: Experiment the handle is claimed for.
+    :param Mapping[str, object] studies: Study stand-ins keyed by phase name.
+    :return engine_ledger.ClaimedLedger: Handle whose ``studies`` are ``studies``.
+    """
+    validated = engine_ledger.validate_ledger(experiment)
+    return engine_ledger.ClaimedLedger(
+        experiment=experiment,
+        experiment_name=validated.experiment_name,
+        storage_url=validated.storage_url,
+        backend=validated.backend,
+        ledger_path=validated.ledger_path,
+        artifact_root=validated.artifact_root,
+        binding_state="bound",
+        studies=MappingProxyType(dict(studies)),  # type: ignore[arg-type]
+    )
+
+
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     """If config changed AND a stale RUNNING trial exists, reap must happen first.
 
@@ -268,6 +295,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     identity = _environment_identity(exp)
     t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     t.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
+    claimed = engine_ledger.claim_ledger(engine_ledger.validate_ledger(exp))
 
     # Will raise on fingerprint mismatch, but reap must have run first.
     with pytest.raises(RuntimeError, match="different phase config"):
@@ -276,7 +304,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
             exp.phases[0],
             inherited_winners={},
             generation_id="generation-test",
-            dry_run=False,
+            ledger=claimed,
         )
     assert reap_called["flag"]
     assert fingerprint_called["flag"]
@@ -421,10 +449,10 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
 
     if stage == "load":
 
-        def loader(*_args: object, **_kwargs: object) -> dict[str, object]:
+        def claim(*_args: object, **_kwargs: object) -> engine_ledger.ClaimedLedger:
             raise shutdown
 
-        monkeypatch.setattr("phasesweep.engine.guards._load_and_check_artifact_roots", loader)
+        monkeypatch.setattr("phasesweep.engine.guards.claim_ledger", claim)
     elif stage == "get_trials":
         study = SimpleNamespace(
             study_name="shutdown::p",
@@ -432,17 +460,17 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
             get_trials=lambda **_kwargs: (_ for _ in ()).throw(shutdown),
         )
 
-        def loader(*_args: object, **_kwargs: object) -> dict[str, object]:
-            return {"p": study}
+        def claim(*_args: object, **_kwargs: object) -> engine_ledger.ClaimedLedger:
+            return _claimed_over(experiment, {"p": study})
 
-        monkeypatch.setattr("phasesweep.engine.guards._load_and_check_artifact_roots", loader)
+        monkeypatch.setattr("phasesweep.engine.guards.claim_ledger", claim)
     else:
         study = optuna.create_study(direction="minimize")
 
-        def loader(*_args: object, **_kwargs: object) -> dict[str, object]:
-            return {"p": study}
+        def claim(*_args: object, **_kwargs: object) -> engine_ledger.ClaimedLedger:
+            return _claimed_over(experiment, {"p": study})
 
-        monkeypatch.setattr("phasesweep.engine.guards._load_and_check_artifact_roots", loader)
+        monkeypatch.setattr("phasesweep.engine.guards.claim_ledger", claim)
         if stage == "stale_reaper":
             monkeypatch.setattr(
                 "phasesweep.engine.guards._reap_stale_trials",
@@ -460,7 +488,7 @@ def test_recovery_preflight_preserves_shutdown_control_flow(
 
     cleanup = _PreflightCleanupReport()
     with pytest.raises(PhaseSweepShutdown) as exc_info:
-        _preflight_existing_studies(experiment, cleanup_report=cleanup)
+        _reconcile_existing_studies(experiment, cleanup_report=cleanup)
 
     assert exc_info.value is shutdown
     assert cleanup.cleanup_confirmed is True
@@ -483,11 +511,6 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
         for phase in experiment.phases
     }
 
-    monkeypatch.setattr(
-        "phasesweep.engine.guards._load_and_check_artifact_roots",
-        lambda *_args, **_kwargs: studies,
-    )
-
     def reap(_study: optuna.Study, _experiment: Experiment, phase_name: str, **_kwargs) -> int:
         if phase_name == "a":
             raise ProcessCleanupUncertainError("cleanup uncertain")
@@ -500,7 +523,7 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
     )
 
     with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies"):
-        _preflight_existing_studies(experiment)
+        _preflight_existing_studies(_claimed_over(experiment, studies))
 
 
 def test_registry_storage_failure_marks_cleanup_report_uncertain(
@@ -517,11 +540,7 @@ def test_registry_storage_failure_marks_cleanup_report_uncertain(
     report = _PreflightCleanupReport()
 
     with pytest.raises(StudyStorageUnavailableError, match="registry storage unavailable"):
-        _preflight_existing_studies(
-            experiment,
-            cleanup_report=report,
-            preloaded_studies={},
-        )
+        _preflight_existing_studies(_claimed_over(experiment, {}), cleanup_report=report)
 
     assert report.cleanup_confirmed is False
     assert report.error is failure
@@ -571,7 +590,7 @@ def test_mixed_preflight_error_boundary(
 
     monkeypatch.setattr("phasesweep.engine.guards._validate_study_schema", reject_differently)
     with pytest.raises(expected_type, match="multiple unsafe studies") as exc_info:
-        _preflight_existing_studies(experiment, preloaded_studies=studies)
+        _preflight_existing_studies(_claimed_over(experiment, studies))
     assert isinstance(exc_info.value, PhaseSweepError) is operational
     if operational:
         assert type(exc_info.value) is PhaseSweepError
