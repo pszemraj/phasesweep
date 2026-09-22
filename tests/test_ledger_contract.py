@@ -7,6 +7,11 @@ Optuna's storage constructors, so every other module has to go through helpers
 that validate first. This module enforces that statically with :mod:`ast`, so a
 new call site fails in CI before it can ever run.
 
+Most storage entry points are banned by name (:data:`BANNED_LEAVES`): calling,
+referencing, or importing one all count. ``optuna.Study`` is banned only as a
+call (:data:`BANNED_CALLS`), because the same class is the package's study
+annotation.
+
 The chokepoint is ``phasesweep/engine/ledger.py``. Two ratchet dicts
 (:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) record what is still
 reachable from outside it. They are compared for *equality*, not containment:
@@ -35,6 +40,8 @@ PACKAGE_ROOT = SRC / "phasesweep"
 CHOKEPOINT = "phasesweep/engine/ledger.py"
 
 #: Storage entry points no module outside :data:`CHOKEPOINT` may name.
+#: ``JournalStorage`` is banned outright, like ``RDBStorage``: over any backend
+#: it is live storage, and only the chokepoint names it, even as a type.
 BANNED_LEAVES: dict[str, frozenset[str]] = {
     "optuna": frozenset(
         {
@@ -46,9 +53,19 @@ BANNED_LEAVES: dict[str, frozenset[str]] = {
             "RDBStorage",
             "JournalFileBackend",
             "JournalFileStorage",
+            "JournalStorage",
         }
     ),
+    "sqlalchemy": frozenset({"create_engine"}),
     "sqlite3": frozenset({"connect"}),
+}
+
+#: Storage entry points no module outside :data:`CHOKEPOINT` may *call*.
+#: ``optuna.Study(name, storage)`` resolves a storage URL through
+#: ``get_storage`` internally, but the class also annotates study objects
+#: throughout the package, so only a call to it counts.
+BANNED_CALLS: dict[str, frozenset[str]] = {
+    "optuna": frozenset({"Study"}),
 }
 
 #: Every private helper :data:`CHOKEPOINT` defines. Each assumes its caller
@@ -182,22 +199,25 @@ def _resolve(dotted: str, aliases: dict[str, str]) -> str | None:
     return f"{target}.{tail}" if tail else target
 
 
-def _is_banned(qualified: str) -> bool:
+def _is_banned(qualified: str, banned: dict[str, frozenset[str]] = BANNED_LEAVES) -> bool:
     """Return whether a fully qualified name is a banned storage entry point.
 
     :param str qualified: Fully qualified dotted name.
+    :param dict[str, frozenset[str]] banned: Root package -> banned leaves.
     :return bool: ``True`` when its root package and leaf are both banned.
     """
     parts = qualified.split(".")
-    return parts[-1] in BANNED_LEAVES.get(parts[0], frozenset())
+    return parts[-1] in banned.get(parts[0], frozenset())
 
 
 def banned_references(path: Path) -> set[str]:
     """Collect every banned storage entry point a module can reach.
 
-    Both call targets (``optuna.create_study(...)``) and bare references
-    (``factory = JournalFileBackend``) count, as does binding one by import,
-    since any of the three puts the constructor within the module's reach.
+    For :data:`BANNED_LEAVES`, both call targets (``optuna.create_study(...)``)
+    and bare references (``factory = JournalFileBackend``) count, as does
+    binding one by import, since any of the three puts the constructor within
+    the module's reach. For :data:`BANNED_CALLS` only a call counts, whatever
+    import spelling names the class.
 
     :param Path path: Module to scan.
     :return set[str]: Fully qualified banned names referenced by the module.
@@ -210,13 +230,17 @@ def banned_references(path: Path) -> set[str]:
         if _is_banned(target):
             found.add(target)
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Name | ast.Attribute):
+        is_call = isinstance(node, ast.Call)
+        target_node = node.func if isinstance(node, ast.Call) else node
+        if not isinstance(target_node, ast.Name | ast.Attribute):
             continue
-        dotted = _dotted(node)
+        dotted = _dotted(target_node)
         if dotted is None:
             continue
         qualified = _resolve(dotted, aliases)
-        if qualified is not None and _is_banned(qualified):
+        if qualified is None:
+            continue
+        if _is_banned(qualified) or (is_call and _is_banned(qualified, BANNED_CALLS)):
             found.add(qualified)
     return found
 
@@ -316,6 +340,51 @@ def test_ledger_private_names_are_not_imported_outside_the_ledger_module() -> No
         "Reaching past the ledger's public API skips the validate-before-open "
         "ordering the private helpers assume their caller already did."
     )
+
+
+def test_visitor_flags_study_construction_but_not_study_annotations(tmp_path: Path) -> None:
+    """``optuna.Study`` is banned as a call only; every other live-storage builder always.
+
+    ``optuna.Study(name, storage)`` resolves a storage URL internally, so it is
+    a constructor the ban must see, yet the same class annotates study objects
+    all over the package. A direct ``JournalStorage`` over any backend and a
+    ``sqlalchemy`` engine are storage too. The visitor has to tell a call from
+    a type, whichever import spelling reaches the class.
+    """
+    annotated = tmp_path / "annotated.py"
+    annotated.write_text(
+        "import optuna\n"
+        "from optuna import Study\n"
+        "from optuna.study import Study as Aliased\n"
+        "\n"
+        "def keep(study: optuna.Study, other: Study) -> optuna.study.Study:\n"
+        "    x: Aliased = study\n"
+        "    return isinstance(other, optuna.Study) and x\n",
+        encoding="utf-8",
+    )
+    constructing = tmp_path / "constructing.py"
+    constructing.write_text(
+        "import optuna\n"
+        "import sqlalchemy\n"
+        "from optuna.study import Study as Aliased\n"
+        "from optuna.storages import JournalStorage\n"
+        "\n"
+        "def build(url, backend):\n"
+        "    optuna.Study('s', url)\n"
+        "    optuna.study.Study('s', url)\n"
+        "    Aliased('s', url)\n"
+        "    sqlalchemy.create_engine(url)\n"
+        "    return JournalStorage(backend)\n",
+        encoding="utf-8",
+    )
+
+    assert banned_references(annotated) == set()
+    assert banned_references(constructing) == {
+        "optuna.Study",
+        "optuna.study.Study",
+        "optuna.storages.JournalStorage",
+        "sqlalchemy.create_engine",
+    }
 
 
 def test_ledger_public_api_returns_concrete_types() -> None:
