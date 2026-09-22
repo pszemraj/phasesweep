@@ -49,7 +49,7 @@ from phasesweep.engine import (
 )
 from phasesweep.engine.artifact_roots import (
     _bind_study_artifact_root,
-    _validate_artifact_root_binding,
+    _write_artifact_root_binding,
 )
 from phasesweep.engine.artifacts import _save_winner, _write_yaml_atomic
 from phasesweep.engine.attempts import _register_active_attempt
@@ -121,7 +121,7 @@ from phasesweep.runtime.process import (
     read_proc_starttime,
     write_attempt_lifecycle,
 )
-from tests.conftest import file_mode, make_experiment, write_constant_trainer
+from tests.conftest import file_mode, make_experiment, mark_current_format, write_constant_trainer
 from tests.mcp_helpers import (
     claim_runner_handle,
     make_mcp_app,
@@ -190,12 +190,6 @@ def _write_trial_process_identity(
     )
 
 
-def _mark_current_study(experiment: Experiment, study: optuna.Study) -> None:
-    """Mark a manually constructed study/root as current-format test state."""
-    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
-
-
 def _write_cleanup_uncertain_failed_trial(
     config: Path, *, generation_id: str = "stale-generation"
 ) -> int:
@@ -207,7 +201,7 @@ def _write_cleanup_uncertain_failed_trial(
         storage=exp.storage,
         direction="minimize",
     )
-    _mark_current_study(exp, study)
+    mark_current_format(exp, study)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
     trial_dir = _trial_dir_for(
@@ -248,7 +242,7 @@ def _write_stale_running_trial(
         storage=exp.storage,
         direction="minimize",
     )
-    _mark_current_study(exp, study)
+    mark_current_format(exp, study)
     trial = study.ask()
     attempt_id = f"stale-attempt-{trial.number}"
     trial_dir = _trial_dir_for(
@@ -506,7 +500,7 @@ def _write_winner_yaml(
     generation_id: str | None = None,
 ) -> None:
     """Publish one minimal current-format winner fixture."""
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
+    mark_current_format(experiment)
     published_generation_id = _claim_generation(experiment, generation_id)
     winner = Winner(
         trial_number=0,
@@ -885,7 +879,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
         del publication_hook
         assert generation_id == run_id
         calls.append((config_obj.experiment, from_phase, dry_run))
-        _validate_artifact_root_binding(config_obj, claim_fresh=True)
+        mark_current_format(config_obj)
         generation_path = _generation_record_path(config_obj, generation_id)
         generation_path.parent.mkdir(parents=True, exist_ok=True)
         generation_path.write_text(f"generation_id: {generation_id}\n")
@@ -3404,7 +3398,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
         storage=experiment.storage,
         direction="minimize",
     )
-    _mark_current_study(experiment, study)
+    mark_current_format(experiment, study)
     _bind_study_artifact_root(study, experiment)
     trial = study.ask()
     attempt_id = "terminal-identity-attempt"
@@ -4382,6 +4376,10 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
 
+    # A real run binds the tree in preflight, long before it registers an
+    # attempt into it. Fabricating the registry entry without the binding would
+    # leave a tree this release correctly reads as unmarked pre-cutover state.
+    mark_current_format(experiment)
     attempt_id = "registry-only-attempt"
     trial_dir = _experiment_dir(experiment) / "p" / "trial_registry_only"
     trial_dir.mkdir(parents=True)
@@ -4516,6 +4514,16 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         trial_dir=trial_dir,
         generation_id=later_generation_id,
     )
+    if changed_storage:
+        # The stale trial was written against the later ledger, which also
+        # bound the tree to it. Recovery loads the original config, and this
+        # release refuses to operate a tree bound to a different ledger. The
+        # realistic shape is therefore a tree owned by the config being
+        # recovered, with only the registry entry still naming the old
+        # locator -- which is exactly the reconciliation under test.
+        recovery_experiment = load_config(config)
+        assert isinstance(recovery_experiment, Experiment)
+        _write_artifact_root_binding(recovery_experiment)
 
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")

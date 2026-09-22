@@ -35,7 +35,6 @@ from phasesweep.engine import (
     StudyStorageUnavailableError,
     run_experiment,
 )
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.attempts import (
     _inspect_active_attempts,
     _preflight_active_attempts,
@@ -81,7 +80,12 @@ from phasesweep.runtime.process import (
     read_stale_process_identity,
     write_attempt_lifecycle,
 )
-from tests.conftest import make_experiment, patch_rejected_trial_user_attr, write_trainer
+from tests.conftest import (
+    make_experiment,
+    mark_current_format,
+    patch_rejected_trial_user_attr,
+    write_trainer,
+)
 
 
 def _write_test_process_identity(
@@ -326,10 +330,9 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         study = optuna.create_study(
             study_name="cross_phase_orphan::b", storage=storage, direction="minimize"
         )
-        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+        mark_current_format(experiment, study)
         _stamp_artifact_root(study, experiment)
         study.set_user_attr(TRIAL_TARGET_ATTR, experiment.phases[1].n_trials)
-        _validate_artifact_root_binding(experiment, claim_fresh=True)
         trial = study.ask()
         trial_dir = _trial_dir_for(
             experiment,
@@ -1124,11 +1127,10 @@ def _fabricate_stale_running_trial(
         storage=experiment.storage,
         direction="minimize",
     )
-    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    mark_current_format(experiment, study)
     phase = next(phase for phase in experiment.phases if phase.name == phase_name)
     study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
     _stamp_artifact_root(study, experiment)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
     trial = study.ask()
     identity = _environment_identity(experiment, phase_name)
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)

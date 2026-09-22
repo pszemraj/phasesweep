@@ -12,9 +12,8 @@ what old bytes look like.
 ``mcp-recover-inspect`` is held to the weaker half on purpose: recovery
 preflight legitimately needs live ``Study`` objects, so it is not under the
 constructor ban. Its invariant is "validate before open, and refuse a
-pre-cutover ledger with the bytes unchanged", and today it bypasses the format
-gate entirely. Those cells are strict xfails that flip with the ledger
-chokepoint (M2).
+pre-cutover ledger with the bytes unchanged", which it now satisfies by going
+through the ledger handle like every other read path.
 """
 
 from __future__ import annotations
@@ -35,7 +34,13 @@ from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchErro
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.read import read_status, read_winners
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.mcp.recovery import RunRecoveryError, recover_run
+from phasesweep.errors import OperatorAction
+from phasesweep.mcp.recovery import (
+    RunRecoveryError,
+    _load_recovery_studies,
+    _RecoveryNeeds,
+    recover_run,
+)
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from tests.ledger_fixtures import (
@@ -207,34 +212,19 @@ def _mode_cells() -> list[Any]:
 def _matrix() -> list[Any]:
     """Build the fixture x mode x read-path matrix.
 
-    :return list[pytest.param]: One parameter set per cell, with the recovery
-        cells over pre-cutover ledgers marked as strict xfails.
+    :return list[pytest.param]: One parameter set per cell.
     """
-    cells: list[Any] = []
-    for fixture in discover_ledger_fixtures():
-        for mode in fixture.modes:
-            for read_path in READ_PATHS:
-                marks = []
-                if read_path == RECOVERY_READ_PATH and fixture.expected(mode) != "ok":
-                    marks.append(
-                        pytest.mark.xfail(
-                            strict=True,
-                            reason=(
-                                "recovery inspect bypasses the format gate; "
-                                "flips with the ledger chokepoint (M2)"
-                            ),
-                        )
-                    )
-                cells.append(
-                    pytest.param(
-                        fixture.name,
-                        mode,
-                        read_path,
-                        marks=marks,
-                        id=f"{fixture.name}-{mode}-{read_path}",
-                    )
-                )
-    return cells
+    return [
+        pytest.param(
+            fixture.name,
+            mode,
+            read_path,
+            id=f"{fixture.name}-{mode}-{read_path}",
+        )
+        for fixture in discover_ledger_fixtures()
+        for mode in fixture.modes
+        for read_path in READ_PATHS
+    ]
 
 
 @pytest.mark.parametrize(("fixture_name", "mode", "read_path"), _matrix())
@@ -283,17 +273,50 @@ def test_recovery_inspect_never_writes_to_a_golden_ledger(
 ) -> None:
     """Recovery preflight leaves a golden ledger byte-identical, whatever it decides.
 
-    The matrix above owns the verdict, and its pre-cutover recovery cells are
-    strict xfails. A strict xfail only knows that the test failed, not which
-    assertion failed, so the bytes half of the invariant would silently stop
-    being enforced for exactly the fixtures it matters most for. This asserts
-    it on its own, for every cell, and never xfails.
+    The matrix above owns the verdict. This isolates the bytes half so it is
+    asserted on its own, for every cell, by a test that can only fail for that
+    one reason.
     """
     materialized = materialize(fixture_name, tmp_path, mode=mode)
     _recover_inspect_verdict(materialized, tmp_path)
     assert materialized.unchanged(), (
         f"recovery preflight over {fixture_name} ({mode}) changed bytes: {materialized.changes()}"
     )
+
+
+@pytest.mark.parametrize(
+    "fixture_name", ["precutover-schema2-sqlite", "precutover-unstamped-journal"]
+)
+def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_path: Path) -> None:
+    """Recovery refuses a pre-cutover ledger in the engine's own words and remedy.
+
+    The wrapper's job is to say which command the operator is running, not to
+    re-explain the failure. So the original refusal text has to survive intact,
+    and the remediation has to survive with it: ``rewrap`` carries the cause's
+    ``action`` across the layer boundary so a routing caller still learns that
+    the fix is a fresh namespace, not "run recover-run again".
+    """
+    materialized = materialize(fixture_name, tmp_path, mode="tree")
+    needs = _RecoveryNeeds(
+        terminal_status=None,
+        stored_snapshot=None,
+        prepared_publication_generation=None,
+        cleanup_needed=False,
+        terminal_cleanup_uncertain=False,
+        ownership_storage_unavailable=False,
+        snapshot_recovery_required=False,
+        snapshot_unavailable=False,
+        snapshot_finalize_needed=False,
+    )
+
+    with pytest.raises(RunRecoveryError) as excinfo:
+        _load_recovery_studies(materialized.experiment, needs)
+
+    assert _SCHEMA_MISMATCH_PHRASE in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, StudySchemaMismatchError)
+    assert str(excinfo.value) == str(excinfo.value.__cause__)
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
+    assert materialized.unchanged(), materialized.changes()
 
 
 @pytest.mark.parametrize("entry_point", ["open_existing", "constructor"])

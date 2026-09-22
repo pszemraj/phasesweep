@@ -33,7 +33,11 @@ from phasesweep.config import (
     Phase,
     Sampler,
 )
-from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
+from phasesweep.engine.artifact_roots import (
+    _check_artifact_root_binding,
+    _write_artifact_root_binding,
+)
+from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import _read_proc_stat
 from tests.tiers import flagged_tests
@@ -176,6 +180,28 @@ def drop_artifact_root_binding(storage: str, study_name: str) -> None:
             "(SELECT study_id FROM studies WHERE study_name = ?)",
             (ARTIFACT_ROOT_ATTR, study_name),
         )
+
+
+def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
+    """Make hand-built test state look like this release wrote it.
+
+    A test that constructs studies through Optuna directly skips the engine's
+    own create path, so nothing stamps the study schema and nothing records the
+    tree's ownership. Every read path then correctly refuses the state as
+    pre-cutover. This is the one place that repairs both halves, so the
+    equivalence between "the engine wrote it" and "the test built it" is
+    asserted once instead of drifting across six copies.
+
+    The tree is only claimed when it has no owner yet, matching what the engine
+    does: an already-bound tree is verified and left alone.
+
+    :param Experiment experiment: Experiment whose artifact root is claimed.
+    :param optuna.Study studies: Studies to stamp with the current study schema.
+    """
+    for study in studies:
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    if _check_artifact_root_binding(experiment) == "unbound":
+        _write_artifact_root_binding(experiment)
 
 
 @pytest.fixture(autouse=True)

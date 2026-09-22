@@ -10,13 +10,13 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
-import phasesweep.engine.artifact_roots as artifact_root_ops
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
 import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.guards as guard_ops
+import phasesweep.engine.ledger as ledger_ops
 import phasesweep.engine.locking as locking_ops
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
@@ -361,7 +361,7 @@ def _run_experiment_outcome(
         # returned objects are passed into preflight so storage is not reread
         # after this strict discovery-and-claim boundary.
         try:
-            existing_studies = artifact_root_ops._load_and_check_artifact_roots(
+            existing_studies = ledger_ops._load_and_check_artifact_roots(
                 experiment, from_phase=from_phase
             )
         except StudyStorageUnavailableError as exc:

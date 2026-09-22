@@ -11,10 +11,9 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import _generation_winner_path
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION, Winner, WinnerSource
+from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.server import (
@@ -26,6 +25,7 @@ from phasesweep.mcp.server import (
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime.time import utc_now_iso
+from tests.conftest import mark_current_format
 from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
@@ -41,16 +41,10 @@ def _complete_trials(experiment, *, n: int) -> None:
         storage=experiment.storage,
         direction="minimize",
     )
-    _mark_current_study(experiment, study)
+    mark_current_format(experiment, study)
     for i in range(n):
         trial = study.ask()
         study.tell(trial, float(i))
-
-
-def _mark_current_study(experiment, study: optuna.Study) -> None:
-    """Mark a manually constructed study/root as current-format test state."""
-    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
 def _handle(run_id: str, *, started_at: str) -> RunHandle:
@@ -313,7 +307,7 @@ def test_await_run_reports_failed_trial_progress_at_timeout(
             storage=experiment.storage,
             direction="minimize",
         )
-        _mark_current_study(experiment, study)
+        mark_current_format(experiment, study)
         study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
 
     monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
@@ -435,7 +429,7 @@ def test_await_run_returns_when_phase_gains_winner(
 
     async def sleep_then_write_winner(seconds: float) -> None:
         clock["now"] += seconds
-        _validate_artifact_root_binding(experiment, claim_fresh=True)
+        mark_current_format(experiment)
         winner = _generation_winner_path(experiment, "r1", experiment.phases[0].name)
         winner.parent.mkdir(parents=True, exist_ok=True)
         winner.write_text("{}\n")

@@ -25,15 +25,13 @@ from phasesweep.config import (
     WandbExtractor,
 )
 from phasesweep.engine import read_status, read_winners
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.paths import (
     _generation_path,
     _generation_summary_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from tests.conftest import make_experiment, write_trainer
+from tests.conftest import make_experiment, mark_current_format, write_trainer
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -59,13 +57,6 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
             )
         ],
     )
-
-
-def _mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
-    """Stamp manually constructed studies and bind their current-format root."""
-    for study in studies:
-        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
@@ -114,7 +105,7 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
     study = optuna.create_study(study_name="read_t::p", storage=storage)
     study.optimize(lambda trial: 1.0, n_trials=1)
     exp = _experiment(tmp_path, storage=storage)
-    _mark_current_format(exp, study)
+    mark_current_format(exp, study)
     real_connect = engine_ledger.sqlite3.connect
     connections = 0
 
@@ -127,7 +118,10 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
 
     status = read_status(exp)
 
-    assert connections == 1
+    # One connection for the ledger-format scan ``validate_ledger`` runs before
+    # any phase is read, then exactly one more per phase: the counts and the
+    # RUNNING identities that explain them still come from a single snapshot.
+    assert connections == 1 + len(exp.phases)
     assert status["phases"][0]["trials"] == {"COMPLETE": 1}
     assert status["phases"][0]["trial_data_available"] is True
 
@@ -141,25 +135,26 @@ def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
     study = optuna.create_study(study_name="read_t::p", storage=storage)
     study.optimize(lambda trial: 1.0, n_trials=50)
     exp = _experiment(tmp_path, storage=storage)
-    _mark_current_format(exp, study)
+    mark_current_format(exp, study)
     real_connect = engine_ledger.sqlite3.connect
-    transferred_rows: list[int] = []
+    transferred: list[tuple[str, int]] = []
 
     class CursorProxy:
-        def __init__(self, cursor) -> None:
+        def __init__(self, cursor, sql: str) -> None:
             self._cursor = cursor
+            self._sql = sql
 
         def fetchall(self):
             rows = self._cursor.fetchall()
-            transferred_rows.append(len(rows))
+            transferred.append((self._sql[:40], len(rows)))
             return rows
 
     class ConnectionProxy:
         def __init__(self, connection) -> None:
             self._connection = connection
 
-        def execute(self, *args: object, **kwargs: object):
-            return CursorProxy(self._connection.execute(*args, **kwargs))
+        def execute(self, sql: str, *args: object, **kwargs: object):
+            return CursorProxy(self._connection.execute(sql, *args, **kwargs), sql)
 
         def close(self) -> None:
             self._connection.close()
@@ -172,7 +167,11 @@ def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
     status = read_status(exp)
 
     assert status["phases"][0]["trials"] == {"COMPLETE": 50}
-    assert transferred_rows == [1]
+    # The format scan reads the ledger first and is not what this pins down.
+    # The statement under test is the one naming the ``phase_trials`` CTE: it
+    # must aggregate server-side and hand back a single row, not one per trial.
+    aggregated = [rows for sql, rows in transferred if "phase_trials" in sql]
+    assert aggregated == [1], transferred
 
 
 @pytest.mark.parametrize(
@@ -192,7 +191,7 @@ def test_read_status_counts_sqlite_trials_with_storage_url_variants(
     study = optuna.create_study(study_name="read_t::p", storage=storage)
     study.optimize(lambda trial: 1.0, n_trials=1)
     exp = _experiment(tmp_path, storage=storage)
-    _mark_current_format(exp, study)
+    mark_current_format(exp, study)
 
     status = read_status(exp)
 
@@ -220,7 +219,7 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(
     running.set_user_attr("phasesweep_generation_id", "gen-1")
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
     study.ask()
-    _mark_current_format(exp, study)
+    mark_current_format(exp, study)
 
     phase = read_status(exp)["phases"][0]
 
@@ -246,7 +245,7 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
         study_name="read_t::p",
         storage=engine_ledger._resolve_storage(exp.resolved_storage),
     )
-    _mark_current_format(exp, study)
+    mark_current_format(exp, study)
     # Journal tolerates a torn final record; an earlier malformed record must fail.
     ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
 
@@ -287,7 +286,7 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
         study = optuna.create_study(
             study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
         )
-        _mark_current_format(experiment, study)
+        mark_current_format(experiment, study)
     original = ledger.read_bytes()
     tail = {
         "garbage": b"not a journal record\n",
@@ -337,7 +336,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     study.tell(trial, 0.5)
-    _mark_current_format(experiment, study)
+    mark_current_format(experiment, study)
     complete = ledger.read_bytes()
     if change == "finish-partial":
         ledger.write_bytes(complete[:-1])
@@ -409,9 +408,7 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         storage = engine_ledger._resolve_storage(experiment.resolved_storage)
         optuna.delete_study(study_name="t::p", storage=storage)
         if damage == "empty-study":
-            _mark_current_format(
-                experiment, optuna.create_study(study_name="t::p", storage=storage)
-            )
+            mark_current_format(experiment, optuna.create_study(study_name="t::p", storage=storage))
     ledger_before = ledger.read_bytes() if ledger.exists() else None
     generation_before = _generation_path(experiment).read_bytes()
 
@@ -457,7 +454,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     if mismatch != "state":
         study.tell(trial, 0.5)
-    _mark_current_format(experiment, study)
+    mark_current_format(experiment, study)
     expected = engine_optuna._TrialRef(
         1 if mismatch == "number" else 0,
         "different" if mismatch == "generation" else "generation",

@@ -12,7 +12,7 @@ from phasesweep import run_experiment
 from phasesweep.config import Experiment
 from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError, read_status
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
-from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.ledger import _resolve_storage, validate_ledger
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_constant_trainer
@@ -177,17 +177,57 @@ def test_bound_root_status_refuses_empty_stamped_legacy_studies(
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_validate_ledger_on_a_fresh_root_creates_nothing(tmp_path: Path, backend: str) -> None:
+    """Validating a never-run experiment reports an unbound tree and writes nothing.
+
+    The handle is what every read path takes, so obtaining one must not be the
+    thing that brings the tree or the ledger into existence: a status poll on a
+    config that has never run has to stay observable and leave no trace.
+    """
+    ledger_path = tmp_path / "fresh" / f"study.{backend}"
+    experiment = _experiment(tmp_path, storage=f"{backend}:///{ledger_path}")
+
+    ledger = validate_ledger(experiment)
+
+    assert ledger.binding_state == "unbound"
+    assert ledger.backend == backend
+    assert ledger.experiment_name == experiment.experiment
+    assert ledger.artifact_root == str(_experiment_dir(experiment).resolve())
+    assert not ledger_path.exists()
+    assert not ledger_path.parent.exists()
+    assert not _artifact_root_binding_path(experiment).exists()
+    assert not _experiment_dir(experiment).exists()
+
+
+def test_validate_ledger_never_creates_a_journal_parent_directory(tmp_path: Path) -> None:
+    """A journal URL under a missing directory is classified without creating it.
+
+    ``_resolve_storage`` used to create the parent as a side effect of merely
+    translating a URL, which put a read path one call away from materializing a
+    ledger directory. Only the create path may do that now.
+    """
+    missing = tmp_path / "not-created-by-a-read"
+    experiment = _experiment(tmp_path, storage=f"journal:///{missing / 'study.journal'}")
+
+    ledger = validate_ledger(experiment)
+
+    assert ledger.backend == "journal"
+    assert ledger.ledger_path == missing / "study.journal"
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.integration
 def test_startup_scans_the_ledger_format_once(
     tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Root preflight scans once before Optuna loads any declared study."""
-    import phasesweep.engine.artifact_roots as artifact_roots
+    import phasesweep.engine.ledger as ledger
 
     storage = f"{backend}:///{tmp_path / f'current.{backend}'}"
     experiment = _experiment(tmp_path, storage=storage)
-    real_validate = artifact_roots._validate_local_storage_format
-    real_load = artifact_roots._load_existing_phase_study
+    real_validate = ledger._scan_ledger_format
+    real_load = ledger._load_existing_phase_study
     calls = 0
 
     def counted_validate(candidate: Experiment) -> None:
@@ -199,8 +239,8 @@ def test_startup_scans_the_ledger_format_once(
         assert calls == 1
         return real_load(candidate, phase)
 
-    monkeypatch.setattr(artifact_roots, "_validate_local_storage_format", counted_validate)
-    monkeypatch.setattr(artifact_roots, "_load_existing_phase_study", checked_load)
+    monkeypatch.setattr(ledger, "_scan_ledger_format", counted_validate)
+    monkeypatch.setattr(ledger, "_load_existing_phase_study", checked_load)
 
     run_experiment(experiment)
 

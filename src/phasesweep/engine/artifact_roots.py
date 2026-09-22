@@ -7,7 +7,7 @@ import json
 import logging
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import optuna
 
@@ -18,10 +18,6 @@ from phasesweep.engine.errors import (
     PublicationIntegrityError,
     PublishedStudyMissingError,
     StudyStorageUnavailableError,
-)
-from phasesweep.engine.ledger import (
-    _load_existing_phase_study,
-    _validate_local_storage_format,
 )
 from phasesweep.engine.optuna import (
     _published_phase_trial_refs,
@@ -38,6 +34,11 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.json import strict_json_loads
 
 log = logging.getLogger(__name__)
+
+#: What an artifact tree's own ownership record says about it. ``"unbound"`` is
+#: a fresh tree that has never recorded a ledger; every other shape either
+#: matches exactly (``"bound"``) or is refused.
+BindingState = Literal["bound", "unbound"]
 
 
 def _artifact_root_identity(experiment: Experiment) -> str:
@@ -188,30 +189,26 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         ) from exc
 
 
-def _validate_artifact_root_binding(
-    experiment: Experiment,
-    *,
-    claim_fresh: bool,
-    validate_storage_format: bool = True,
-    validate_unbound_storage: bool = True,
-) -> None:
-    """Validate or claim the storage ledger that owns an artifact tree.
+def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
+    """Classify an artifact tree's recorded ownership, writing nothing.
 
     Study attributes bind ledger to tree. This reverse record binds tree to
     ledger, preventing a second database from combining its trial counts with
     another database's publication. Existing unmarked PhaseSweep state is
     pre-cutover state and is refused by this release.
 
+    This is step one of the fixed ledger order, so it is strictly read-only: it
+    neither writes the record (:func:`_write_artifact_root_binding`) nor opens
+    or inspects the ledger itself
+    (:func:`phasesweep.engine.ledger._scan_ledger_format`). Separating the two
+    is what lets a pure read path classify a tree without touching a byte.
+
     :param Experiment experiment: Config whose root and storage must agree.
-    :param bool claim_fresh: Write the record when the root has no recognized
-        PhaseSweep durable state.
-    :param bool validate_storage_format: Inspect the selected persistent ledger
-        for unsupported study schemas after a matching binding is read.
-    :param bool validate_unbound_storage: Inspect the selected persistent ledger
-        when no binding exists yet. Callers may disable this after classifying
-        the same ledger earlier under the experiment lock.
+    :return BindingState: ``"bound"`` when the tree already records exactly
+        this experiment and ledger; ``"unbound"`` when it records nothing yet.
     :raises ArtifactRootConflictError: The binding cannot be validated as the
-        current user, or is malformed or names another owner.
+        current user, is malformed or names another owner, or the root holds
+        unmarked pre-cutover PhaseSweep state.
     """
     path = _artifact_root_binding_path(experiment)
     expected = _artifact_root_binding_payload(experiment)
@@ -227,21 +224,7 @@ def _validate_artifact_root_binding(
                 "release, or use the preserved PhaseSweep 0.3.1 environment to operate "
                 "the existing state. Nothing was written."
             ) from None
-        if validate_unbound_storage:
-            # A read without a binding must still classify the selected ledger:
-            # an unavailable ledger is not equivalent to an empty
-            # current-format one. Tolerant per-phase status counts only apply
-            # after this provenance check.
-            _validate_local_storage_format(experiment)
-        if claim_fresh:
-            try:
-                atomic_write_text(path, json.dumps(expected, sort_keys=True) + "\n")
-            except OSError as exc:
-                raise ArtifactRootConflictError(
-                    f"Could not bind fresh artifact root {expected['artifact_root']!r} to "
-                    f"its storage ledger: {exc}. No trial ran and nothing was published."
-                ) from exc
-        return
+        return "unbound"
     except PermissionError as exc:
         raise ArtifactRootConflictError(
             f"Artifact-root binding {path} cannot be validated as the current user "
@@ -270,17 +253,30 @@ def _validate_artifact_root_binding(
             "this current-format tree, or use a fresh artifact root and local storage. "
             "Nothing was written."
         )
-    if validate_storage_format:
-        try:
-            _validate_local_storage_format(experiment)
-        except StudyStorageUnavailableError:
-            if claim_fresh:
-                raise
-            # A matched binding already proves which ledger owns this tree.
-            # Permissive read paths can still report frozen publication data
-            # while their trial-data snapshot reports the ledger unavailable.
-            # Mutating callers immediately perform strict study discovery and
-            # fail there before any trial work or publication.
+    return "bound"
+
+
+def _write_artifact_root_binding(experiment: Experiment) -> None:
+    """Record this experiment's ownership of a tree the caller already checked.
+
+    Callers reach here only after :func:`_check_artifact_root_binding` returned
+    ``"unbound"``, so this writes the first ownership record rather than
+    replacing one.
+
+    :param Experiment experiment: Experiment whose artifact root is claimed.
+    :raises ArtifactRootConflictError: The record could not be written.
+    """
+    expected = _artifact_root_binding_payload(experiment)
+    try:
+        atomic_write_text(
+            _artifact_root_binding_path(experiment),
+            json.dumps(expected, sort_keys=True) + "\n",
+        )
+    except OSError as exc:
+        raise ArtifactRootConflictError(
+            f"Could not bind fresh artifact root {expected['artifact_root']!r} to "
+            f"its storage ledger: {exc}. No trial ran and nothing was published."
+        ) from exc
 
 
 def _claim_study_artifact_root(study: optuna.Study, offered: str) -> None:
@@ -349,83 +345,6 @@ def _bind_study_artifact_root(study: optuna.Study, experiment: Experiment) -> No
     if not _artifact_root_claim_needed(study, experiment):
         return
     _claim_study_artifact_root(study, _artifact_root_identity(experiment))
-
-
-def _load_and_check_artifact_roots(
-    experiment: Experiment, *, from_phase: str | None = None
-) -> dict[str, optuna.Study]:
-    """Load every existing phase study exactly once, then check and claim roots.
-
-    Discovery on this mutating path is strict and tri-state (PR #5 review /
-    reviewer 2, issue 1): a phase's study is *absent* (storage read fine, no
-    such study), *present* (loaded and returned), or *unavailable* -- and
-    unavailable raises before any claim, reaping, or registry recovery runs.
-    The earlier shape swallowed a read failure here and let the main preflight
-    loop re-read; a transient failure (for example, a brief SQLite lock)
-    could then succeed on that second read, handing stale-trial reaping a
-    study whose artifact-root binding was never checked -- mutation of a
-    wrong-root ledger before the conflict was enforced. The returned mapping
-    is therefore the *only* discovery pass: the study objects that passed the
-    root check here are the exact objects preflight goes on to reap and
-    validate.
-
-    Every declared phase is checked before any claim is written (re-review
-    v0.5.19 / blocker B3), so a refused multi-phase run leaves no study bound
-    to the rejected root. Preflight holds the experiment lock across load,
-    check, and claim, so nothing can bind in between. Phases whose study does
-    not exist yet are bound by :func:`_bind_study_artifact_root` when the
-    phase creates them. The exception is a phase with a winner in the current
-    published generation: that publication proves the phase previously had
-    trial rows with a specific generation and attempt identity. Missing or
-    replaced published trials mean durable evidence was lost rather than that
-    the phase is new. Skipped phases load their saved winners instead.
-
-    :param Experiment experiment: Parsed experiment whose declared phase
-        studies are loaded and bound to its resolved artifact root.
-    :param str | None from_phase: Resume point; earlier phases will not execute.
-    :return dict[str, optuna.Study]: Existing studies keyed by phase name
-        (phases with no durable study yet are omitted).
-    :raises StudyStorageUnavailableError: A phase's persistent storage could
-        not be inspected.
-    :raises PublishedStudyMissingError: A phase to execute has a published
-        result whose local trial identity is missing from durable storage.
-    :raises ArtifactRootConflictError: A phase study is already bound to a
-        different artifact root, or carries a binding that is not a string.
-    """
-    # Reject an existing foreign or pre-cutover root before touching storage,
-    # including an in-memory configuration offered a bound root.
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
-    loaded: dict[str, optuna.Study] = {}
-    for phase in experiment.phases:
-        try:
-            study = _load_existing_phase_study(experiment, phase)
-        except Exception as exc:
-            unavailable = StudyStorageUnavailableError(
-                f"Could not inspect persistent study storage for phase {phase.name!r}."
-            )
-            raise unavailable from exc
-        if study is not None:
-            loaded[phase.name] = study
-    claimable: list[optuna.Study] = []
-    if _artifact_root_binding_applies(experiment):
-        _check_published_phase_studies(experiment, loaded, from_phase=from_phase)
-        claimable = [
-            study for study in loaded.values() if _artifact_root_claim_needed(study, experiment)
-        ]
-    # Both directions are now known-compatible. Claim the tree first, then
-    # empty studies: a crash cannot leave a study pointing at a tree that does
-    # not itself name the same ledger. Crucially, neither claim occurs when a
-    # symlink-retargeted leaf exposed a study still bound to the old target.
-    _validate_artifact_root_binding(
-        experiment,
-        claim_fresh=True,
-        validate_storage_format=False,
-        validate_unbound_storage=False,
-    )
-    offered = _artifact_root_identity(experiment)
-    for study in claimable:
-        _claim_study_artifact_root(study, offered)
-    return loaded
 
 
 def _check_published_phase_studies(

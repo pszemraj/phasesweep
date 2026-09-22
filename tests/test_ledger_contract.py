@@ -51,8 +51,8 @@ BANNED_LEAVES: dict[str, frozenset[str]] = {
     "sqlite3": frozenset({"connect"}),
 }
 
-#: Every storage-private helper :data:`CHOKEPOINT` defines. The later M2 stages
-#: re-export these behind a public ledger API and the private-import ratchet
+#: Every private helper :data:`CHOKEPOINT` defines. The remaining M2 stages
+#: re-export these behind the public ledger API and the private-import ratchet
 #: empties out.
 STORAGE_PRIVATE_NAMES = frozenset(
     {
@@ -60,7 +60,7 @@ STORAGE_PRIVATE_NAMES = frozenset(
         "_create_phase_study",
         "_load_phase_study",
         "_load_existing_phase_study",
-        "_validate_local_storage_format",
+        "_scan_ledger_format",
         "_validate_storage_versions",
         "_phase_trial_stats",
         "_phase_trial_stats_params",
@@ -72,22 +72,28 @@ STORAGE_PRIVATE_NAMES = frozenset(
         "_trial_stats_from_rows",
         "_unavailable_phase_trial_stats",
         "_decoded_string_attr",
+        "_describe_ledger",
+        "_validate_artifact_root_binding",
+        "_load_and_check_artifact_roots",
     }
 )
 
 #: Banned storage entry points still reachable outside the chokepoint.
 _LEGACY_SITES: dict[str, set[str]] = {}
 
-#: Storage-private helpers still imported outside the chokepoint. M2 shrinks this.
+#: Private ledger helpers still imported outside the chokepoint.
+#:
+#: Read paths are gone from this list: they hold a :class:`ValidatedLedger` and
+#: call the public API. What is left is the write side. ``guards.py`` and
+#: ``run.py`` still reach for the composed discovery-and-claim flow, which
+#: becomes the public ``claim_ledger`` returning a claimed handle; ``phase.py``
+#: still opens studies for writing directly; and ``attempts.py`` still replays
+#: a journal snapshot for foreign-ledger recovery.
 _LEGACY_PRIVATE_IMPORTS: dict[str, set[str]] = {
-    "phasesweep/engine/artifact_roots.py": {
-        "_load_existing_phase_study",
-        "_validate_local_storage_format",
-    },
     "phasesweep/engine/attempts.py": {"_load_journal_study_snapshot"},
+    "phasesweep/engine/guards.py": {"_load_and_check_artifact_roots"},
     "phasesweep/engine/phase.py": {"_create_phase_study"},
-    "phasesweep/engine/read.py": {"_phase_trial_stats"},
-    "phasesweep/mcp/recovery.py": {"_load_existing_phase_study"},
+    "phasesweep/engine/run.py": {"_load_and_check_artifact_roots"},
 }
 
 
@@ -103,7 +109,7 @@ def _relpath(path: Path) -> str:
     """Return a module path relative to ``src`` with POSIX separators.
 
     :param Path path: Absolute path to a packaged module.
-    :return str: Path such as ``phasesweep/engine/optuna.py``.
+    :return str: Path such as ``phasesweep/engine/ledger.py``.
     """
     return path.relative_to(SRC).as_posix()
 
@@ -111,8 +117,8 @@ def _relpath(path: Path) -> str:
 def _module_name(relpath: str) -> str:
     """Return the dotted import name for a ``src``-relative module path.
 
-    :param str relpath: Path such as ``phasesweep/engine/optuna.py``.
-    :return str: Dotted module name such as ``phasesweep.engine.optuna``.
+    :param str relpath: Path such as ``phasesweep/engine/ledger.py``.
+    :return str: Dotted module name such as ``phasesweep.engine.ledger``.
     """
     stem = relpath.removesuffix(".py")
     return stem.removesuffix("/__init__").replace("/", ".")

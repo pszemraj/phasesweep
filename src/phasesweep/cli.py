@@ -28,8 +28,8 @@ from phasesweep.engine import (
     config_status,
     run_config,
 )
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication import (
     _published_winner_path_for,
@@ -534,7 +534,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
         printing "(no winner yet)" beside a corrupt publication reads as a
         phase that simply has not run (review v0.5.18 / finding F4).
     """
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
     if publication.state == "permission_denied":
         raise _publication_access_error(

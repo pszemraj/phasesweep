@@ -7,7 +7,6 @@ from collections.abc import Mapping
 import optuna
 
 from phasesweep.config import Experiment
-from phasesweep.engine.artifact_roots import _load_and_check_artifact_roots
 from phasesweep.engine.attempts import (
     _preflight_active_attempts,
     _PreflightCleanupReport,
@@ -24,6 +23,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     TrialTargetRegressionError,
 )
+from phasesweep.engine.ledger import _load_and_check_artifact_roots
 from phasesweep.engine.study_policy import (
     _load_accepted_partial_decision,
     _validate_environment_cohort,

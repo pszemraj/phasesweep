@@ -36,11 +36,11 @@ _MAIN_MODULE = "__main__"
 # does, rather than narrowing the walk.
 _CONSTRUCTOR_ARGS: dict[str, tuple[object, ...]] = {}
 
-# ``RunRecoveryError`` should declare ``RUN_RECOVER_RUN``, but it lives in
-# phasesweep/mcp/recovery.py, which a concurrent storage refactor owns while
-# this contract lands. It is the one class permitted to reach the base fallback
-# by inheritance; declaring it is the first task of the follow-up commit.
-_DECLARATION_PENDING = frozenset({"RunRecoveryError"})
+# Subclasses permitted to reach the base ``INSPECT_LOGS`` fallback by
+# inheritance instead of declaring an action. Empty, and meant to stay that
+# way: the mechanism is kept so a future exemption has to be written down here,
+# with a reason, rather than passing unnoticed.
+_DECLARATION_PENDING: frozenset[str] = frozenset()
 
 # Classes proving the module sweep reached past the error modules themselves.
 # If an import ever stops happening, these vanish from the walk and say so.

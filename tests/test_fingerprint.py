@@ -43,7 +43,7 @@ from phasesweep.engine import (
 )
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
-    _validate_artifact_root_binding,
+    _check_artifact_root_binding,
 )
 from phasesweep.engine.artifacts import _load_winner, _save_winner
 from phasesweep.engine.attempts import _register_active_attempt
@@ -94,6 +94,7 @@ from tests.conftest import (
     assert_published_winner_evidence_local,
     drop_artifact_root_binding,
     make_experiment,
+    mark_current_format,
     write_constant_trainer,
     write_trainer,
     write_yaml,
@@ -1133,7 +1134,7 @@ def test_binding_claim_ignores_its_atomic_staging_file(tmp_path: Path) -> None:
         staging = list(binding_path.parent.glob(f".{binding_path.name}.*.tmp"))
         assert len(staging) == 1
 
-        _validate_artifact_root_binding(experiment, claim_fresh=True)
+        mark_current_format(experiment)
         staged.write(binding_path.read_text(encoding="utf-8"))
 
     assert binding_path.is_file()
@@ -1151,7 +1152,7 @@ def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
     (root / ".DS_Store").write_bytes(b"metadata")
     (root / "notes.md").write_text("operator notes\n", encoding="utf-8")
 
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
+    mark_current_format(experiment)
 
     assert _artifact_root_binding_path(experiment).is_file()
 
@@ -1176,7 +1177,7 @@ def test_unbound_known_phasesweep_state_names_the_blocking_entry(
         state_entry.mkdir()
 
     with pytest.raises(ArtifactRootConflictError, match=repr(entry)):
-        _validate_artifact_root_binding(experiment, claim_fresh=True)
+        _check_artifact_root_binding(experiment)
 
     assert not _artifact_root_binding_path(experiment).exists()
 
@@ -1427,7 +1428,7 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     studies would invent a binding for an invocation that never ran a trial
     (re-review v0.5.19 / blocker B3).
     """
-    import phasesweep.engine.artifact_roots as artifact_roots
+    import phasesweep.engine.ledger as ledger
 
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
@@ -1437,14 +1438,14 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
             study_name=f"t::{phase.name}", storage=storage, direction="minimize"
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    real_loader = artifact_roots._load_existing_phase_study
+    real_loader = ledger._load_existing_phase_study
 
     def _fail_for_lr(exp: Experiment, phase: Phase) -> optuna.Study | None:
         if phase.name == "lr":
             raise RuntimeError("storage went away")
         return real_loader(exp, phase)
 
-    monkeypatch.setattr(artifact_roots, "_load_existing_phase_study", _fail_for_lr)
+    monkeypatch.setattr(ledger, "_load_existing_phase_study", _fail_for_lr)
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)
@@ -1813,7 +1814,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     unpatched second invocation pins the same refusal for the ordinary
     wrong-root case: it conflicts before the registry scan can reap anything.
     """
-    import phasesweep.engine.artifact_roots as artifact_roots
+    import phasesweep.engine.ledger as ledger
 
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
@@ -1832,7 +1833,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     assert entry_path.is_file()
 
     experiment_b = experiment_a.model_copy(update={"workdir": str(tmp_path / "runs_b")})
-    real_loader = artifact_roots._load_existing_phase_study
+    real_loader = ledger._load_existing_phase_study
     calls = {"count": 0}
 
     def _fail_first_read(exp: Experiment, phase: Phase) -> optuna.Study | None:
@@ -1842,7 +1843,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
         return real_loader(exp, phase)
 
     with pytest.MonkeyPatch.context() as patched:
-        patched.setattr(artifact_roots, "_load_existing_phase_study", _fail_first_read)
+        patched.setattr(ledger, "_load_existing_phase_study", _fail_first_read)
         with pytest.raises(ProcessCleanupUncertainError) as excinfo:
             run_experiment(experiment_b)
 

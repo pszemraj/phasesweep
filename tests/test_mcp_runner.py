@@ -42,7 +42,6 @@ from phasesweep.engine import (
     read_status,
     run_experiment,
 )
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
@@ -75,7 +74,13 @@ from phasesweep.runtime.process import (
     read_boot_id,
 )
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import REPO, make_experiment, write_constant_trainer, write_trainer
+from tests.conftest import (
+    REPO,
+    make_experiment,
+    mark_current_format,
+    write_constant_trainer,
+    write_trainer,
+)
 from tests.mcp_helpers import (
     claim_runner_handle,
     make_mcp_app,
@@ -94,12 +99,6 @@ pytestmark = pytest.mark.skipif(
 # Persistent storage rejects an unseeded stochastic sampler; seeded random is
 # reproducible and resumable, so it needs no non-resumable acknowledgement.
 SEEDED_RANDOM = Sampler(type="random", seed=0)
-
-
-def _mark_current_study(experiment: Experiment, study: optuna.Study) -> None:
-    """Mark a manually constructed study/root as current-format test state."""
-    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
 @pytest.mark.integration
@@ -827,7 +826,7 @@ def test_terminal_snapshot_tolerates_missing_lifecycle_record(tmp_path: Path) ->
     whenever the best-effort write had failed (review v0.5.16 / blocker 2).
     """
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
+    mark_current_format(experiment)
     generation_path = _generation_path(experiment)
     generation_path.parent.mkdir(parents=True, exist_ok=True)
     generation_path.write_text("generation_id: prior-generation\n")
@@ -850,7 +849,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
         phases=[Phase(name="p", n_trials=1, sampler=SEEDED_RANDOM, search_space={})],
     )
     study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
-    _mark_current_study(experiment, study)
+    mark_current_format(experiment, study)
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "old-generation")
     trial.set_user_attr("phasesweep_attempt_id", "old-attempt")
@@ -1011,7 +1010,7 @@ def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: 
         ],
     )
     generation_id = "candidate-generation"
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
+    mark_current_format(experiment)
     published_summary = {
         "experiment": experiment.experiment,
         "generation_id": generation_id,
@@ -1136,7 +1135,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
         phases=[Phase(name="p", n_trials=2, sampler=SEEDED_RANDOM, search_space={})],
     )
     study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
-    _mark_current_study(experiment, study)
+    mark_current_format(experiment, study)
     identified = study.ask()
     identified.set_user_attr("phasesweep_generation_id", "current-generation")
     identified.set_user_attr("phasesweep_attempt_id", "current-attempt")

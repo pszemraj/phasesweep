@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import optuna
 
@@ -26,11 +26,16 @@ from phasesweep.engine.cleanup import (
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
 )
-from phasesweep.engine.errors import PublishedStudyMissingError, StudyStorageUnavailableError
-from phasesweep.engine.ledger import _load_existing_phase_study
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    PublishedStudyMissingError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
+from phasesweep.engine.ledger import open_existing_study, validate_ledger
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
@@ -52,6 +57,8 @@ from phasesweep.runtime.time import utc_now_iso
 
 class RunRecoveryError(PhaseSweepError):
     """An operator recovery request cannot be completed safely."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.RUN_RECOVER_RUN
 
 
 @dataclass(frozen=True)
@@ -499,20 +506,34 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
     When ownership storage was unavailable during the run, verifies the published phase history
     before allowing recovery to treat the run as having no owned trial.
 
+    Validation comes first and is read-only, so recovery refuses a tree bound
+    to another ledger, or a pre-cutover ledger, before it opens anything and
+    without changing a byte. Those two refusals are rewrapped rather than
+    rebuilt: the engine's own message is already the operator's instruction,
+    and ``rewrap`` carries its remediation across the layer boundary intact.
+
     :param Experiment config: Experiment defining phase names and storage locations.
     :param _RecoveryNeeds needs: Recovery decisions that may require published-history checks.
-    :raises RunRecoveryError: Required storage or published studies cannot be read.
+    :raises RunRecoveryError: The ledger is refused, or required storage or
+        published studies cannot be read.
     :return dict[str, optuna.Study]: Loadable phase studies keyed by phase name.
     """
+    unavailable_remedy = (
+        " Restore the original complete storage ledger and access "
+        "to it, then retry phasesweep mcp recover-run."
+    )
+    try:
+        ledger = validate_ledger(config)
+    except (ArtifactRootConflictError, StudySchemaMismatchError) as exc:
+        raise RunRecoveryError.rewrap(exc, str(exc)) from exc
+    except StudyStorageUnavailableError as exc:
+        raise RunRecoveryError(f"{exc}{unavailable_remedy}") from exc
     loaded_studies = {}
     for phase in config.phases:
         try:
-            study = _load_existing_phase_study(config, phase)
+            study = open_existing_study(ledger, phase)
         except StudyStorageUnavailableError as exc:
-            raise RunRecoveryError(
-                f"{exc} Restore the original complete storage ledger and access "
-                "to it, then retry phasesweep mcp recover-run."
-            ) from exc
+            raise RunRecoveryError(f"{exc}{unavailable_remedy}") from exc
         if study is not None:
             loaded_studies[phase.name] = study
     if needs.ownership_storage_unavailable:
