@@ -855,6 +855,7 @@ def test_launch_retries_run_id_collision_without_touching_existing_run(
     assert {path: path.read_bytes() for path in before} == before
 
 
+@pytest.mark.integration
 def test_runner_persists_spawned_handle_for_restart_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1044,6 +1045,7 @@ def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
     assert store.get(pending.run_id) is None
 
 
+@pytest.mark.integration
 def test_launch_terminates_real_runner_when_log_context_exit_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1766,6 +1768,7 @@ def test_launch_hardens_runner_interpreter_flags_and_environment(
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
+@pytest.mark.integration
 def test_spawned_runner_cannot_execute_project_local_code(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1954,6 +1957,7 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
+@pytest.mark.integration
 def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2234,6 +2238,7 @@ def _record_published_run_snapshot(
 
 
 @pytest.mark.parametrize("read_method", ["status", "winners"])
+@pytest.mark.integration
 def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2266,6 +2271,7 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
 
 
 @pytest.mark.parametrize("integrity", ["failed", "permission_denied"])
+@pytest.mark.integration
 def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2319,6 +2325,7 @@ def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_rea
 
 
 @pytest.mark.parametrize("integrity", ["failed", "permission_denied"])
+@pytest.mark.integration
 def test_mcp_winners_hide_unusable_live_publications(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2355,6 +2362,7 @@ def test_mcp_winners_hide_unusable_live_publications(
 
 
 @pytest.mark.parametrize("kind", ["wandb", "json"])
+@pytest.mark.integration
 def test_restored_reader_frozen_mcp_results_need_no_remote_access(
     tmp_path, monkeypatch, wandb_worker_sdk, kind
 ):
@@ -2389,6 +2397,7 @@ def test_restored_reader_frozen_mcp_results_need_no_remote_access(
     assert status.metric == results.metric
 
 
+@pytest.mark.integration
 def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     tmp_path: Path,
 ) -> None:
@@ -2416,6 +2425,7 @@ def test_published_results_keep_their_own_metric_after_a_catalog_metric_edit(
     assert results.winner_count == 1
 
 
+@pytest.mark.integration
 def test_run_scoped_snapshot_recomputes_config_drift_against_current_catalog(
     tmp_path: Path,
 ) -> None:
@@ -2436,6 +2446,7 @@ def test_run_scoped_snapshot_recomputes_config_drift_against_current_catalog(
     assert (results.metric.name, results.metric.goal) == ("x", "minimize")
 
 
+@pytest.mark.integration
 def test_run_scoped_snapshot_survives_later_artifact_corruption(tmp_path: Path) -> None:
     run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
@@ -2453,6 +2464,7 @@ def test_run_scoped_snapshot_survives_later_artifact_corruption(tmp_path: Path) 
     assert results.winner_count == 1
 
 
+@pytest.mark.integration
 def test_run_scoped_snapshot_keeps_captured_generation_pointers(tmp_path: Path) -> None:
     run_id, _trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     experiment = load_config(config)
@@ -2486,6 +2498,7 @@ def test_run_scoped_snapshot_keeps_captured_generation_pointers(tmp_path: Path) 
     assert after_publication.is_published is True
 
 
+@pytest.mark.integration
 def test_run_scoped_snapshot_survives_publication_pointer_removal(
     tmp_path: Path,
 ) -> None:
@@ -2505,6 +2518,7 @@ def test_run_scoped_snapshot_survives_publication_pointer_removal(
 
 
 @pytest.mark.parametrize("config_snapshot_damage", ["missing", "corrupt"])
+@pytest.mark.integration
 def test_run_scoped_snapshot_survives_artifact_tree_relocation(
     tmp_path: Path,
     config_snapshot_damage: str,
@@ -2538,6 +2552,7 @@ def test_run_scoped_snapshot_survives_artifact_tree_relocation(
 
 
 @pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+@pytest.mark.integration
 def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     tmp_path: Path,
     read_tool: str,
@@ -2574,6 +2589,7 @@ def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
 
 
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])
+@pytest.mark.integration
 def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
 ) -> None:
@@ -2616,6 +2632,7 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
 
 
 @pytest.mark.parametrize("read_tool", ["status", "winners", "await_run"])
+@pytest.mark.integration
 def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
 ) -> None:
@@ -2678,6 +2695,7 @@ def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
         ("await_run", "no_status_runner_exit"),
     ],
 )
+@pytest.mark.integration
 def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str, transition: str
 ) -> None:
@@ -2763,6 +2781,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
 
 
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])
+@pytest.mark.integration
 def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_tool: str
 ) -> None:
@@ -2803,6 +2822,7 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
         assert payload["reason"] == "recovery_required"
 
 
+@pytest.mark.integration
 def test_published_results_keep_their_objective_evidence_after_an_extractor_swap(
     tmp_path: Path,
 ) -> None:
@@ -2846,6 +2866,7 @@ def test_published_results_keep_their_objective_evidence_after_an_extractor_swap
     assert results.published_config_matches_current is False
 
 
+@pytest.mark.integration
 def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> None:
     """Renaming a phase must not delete the published result from the payload.
 
@@ -3071,6 +3092,7 @@ def test_launch_artifacts_and_audit_are_private_under_permissive_umask(
     assert file_mode(audit_path) == 0o600
 
 
+@pytest.mark.integration
 def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     config = _config(tmp_path)
     store = RunStore(tmp_path / "state")
@@ -3102,6 +3124,7 @@ def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     assert status["cleanup_confirmed"] is True
 
 
+@pytest.mark.integration
 def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
     config = tmp_path / "srv.yaml"
@@ -3176,6 +3199,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     assert winners["failure"]["code"] == "fingerprint_mismatch"
 
 
+@pytest.mark.integration
 def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     tmp_path: Path,
 ) -> None:
@@ -3239,6 +3263,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     assert "unsupported persistent study" in terminal["failure"]["remediation"]
 
 
+@pytest.mark.integration
 def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3279,6 +3304,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     assert status["cleanup_confirmed"] is False
 
 
+@pytest.mark.integration
 def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3354,6 +3380,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     assert status["failure"]["cause"]["stage"] == "execution"
 
 
+@pytest.mark.integration
 def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path) -> None:
     """A terminal trial missing its attempt id remains attributable to recover-run."""
     config = _config(tmp_path)
@@ -4692,6 +4719,7 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
         ),
     ],
 )
+@pytest.mark.integration
 def test_operator_recovery_clears_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4870,6 +4898,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
 
 
 @pytest.mark.parametrize("earlier_boot", [False, True])
+@pytest.mark.integration
 def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4975,6 +5004,7 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert not store.recovery_required(handle)
 
 
+@pytest.mark.integration
 def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_written(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -5117,6 +5147,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     assert store.live_runs() == []
 
 
+@pytest.mark.integration
 def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

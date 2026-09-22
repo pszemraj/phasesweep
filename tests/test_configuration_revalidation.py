@@ -52,6 +52,7 @@ def _experiment(path: Path, phase: Phase, **options: Any) -> Experiment:
 
 
 @pytest.mark.parametrize("explicitly_empty", [False, True])
+@pytest.mark.integration
 def test_revalidation_preserves_attached_gate(
     tmp_path: Path,
     explicitly_empty: bool,
@@ -69,6 +70,7 @@ def test_revalidation_preserves_attached_gate(
 
 
 @pytest.mark.parametrize("explicitly_empty", [False, True])
+@pytest.mark.integration
 def test_revalidation_preserves_attached_constraint(
     tmp_path: Path,
     explicitly_empty: bool,
@@ -91,6 +93,7 @@ def test_revalidation_preserves_attached_constraint(
 
 
 @pytest.mark.parametrize("explicitly_empty", [False, True])
+@pytest.mark.integration
 def test_revalidation_preserves_attached_fixed_override(
     tmp_path: Path,
     explicitly_empty: bool,
@@ -122,6 +125,7 @@ def test_revalidation_preserves_attached_fixed_override(
 
 
 @pytest.mark.parametrize("explicitly_empty", [False, True])
+@pytest.mark.integration
 def test_revalidation_preserves_attached_environment(
     tmp_path: Path,
     explicitly_empty: bool,

@@ -388,6 +388,7 @@ def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
         fcntl.flock(held, fcntl.LOCK_UN)
 
 
+@pytest.mark.integration
 def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> None:
     """A guardian retains the lock through FD scrubbing, parent death, and descendants."""
     locks = tmp_path / "locks"

@@ -10,12 +10,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from phasesweep import config_status, load_experiment, run_experiment
 from phasesweep.engine import read_status
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.run import experiment_status
 from tests.conftest import write_trainer, write_yaml
+
+# Every test here pins the status payload against a real completed sweep, so
+# each one pays for trainer subprocesses; the whole module is integration tier.
+pytestmark = pytest.mark.integration
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",

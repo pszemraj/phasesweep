@@ -96,5 +96,8 @@ known-third-party = ["wandb"]  # An ignored local wandb/ log directory is not a 
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -m 'not hardware'"
-markers = ["hardware: tests that query real host hardware and require explicit opt-in"]
+addopts = "-q -m 'not hardware' --strict-markers"
+markers = [
+    "hardware: tests that query real host hardware and require explicit opt-in",
+    "integration: spawns real processes, waits on wall-clock time, or drives a multi-step durable recovery workflow; excluded from the fast review tier (docs/development.md)",
+]

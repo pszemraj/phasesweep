@@ -190,6 +190,7 @@ def test_summary_readback_refusals_are_publication_commit_errors(
         )
 
 
+@pytest.mark.integration
 def test_precommit_validation_failure_keeps_prior_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -231,6 +232,7 @@ def test_precommit_validation_failure_keeps_prior_publication(
     assert published.generation_id == first_generation
 
 
+@pytest.mark.integration
 def test_pointer_commit_failure_keeps_prior_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -261,6 +263,7 @@ def test_pointer_commit_failure_keeps_prior_publication(
     assert _last_successful_generation_id(experiment) == first_generation
 
 
+@pytest.mark.integration
 def test_required_publication_sidecar_failure_prevents_pointer_commit(tmp_path: Path) -> None:
     """A detached-run snapshot that cannot become durable must block publication."""
     experiment = _stored_experiment(tmp_path)
@@ -293,6 +296,7 @@ def test_required_publication_sidecar_failure_prevents_pointer_commit(tmp_path: 
     assert _record_state(experiment, prepared_generation) == "publication_failed"
 
 
+@pytest.mark.integration
 def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) -> None:
     """Postcommit notification observes the pointer and cannot downgrade success."""
     experiment = _stored_experiment(tmp_path)
@@ -331,6 +335,7 @@ def test_publication_sidecar_is_notified_after_pointer_commit(tmp_path: Path) ->
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_record_write_failure_after_commit_leaves_run_successful(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -368,6 +373,7 @@ def test_record_write_failure_after_commit_leaves_run_successful(
     assert not _generation_record_path(experiment, second_generation).is_file()
 
 
+@pytest.mark.integration
 def test_cache_projection_failure_after_commit_leaves_run_successful(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -414,6 +420,7 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     assert published.generation_id == first_generation
 
 
+@pytest.mark.integration
 def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -438,6 +445,7 @@ def test_directory_fsync_failure_after_pointer_rename_still_publishes(
     assert _current_pointer_state(experiment) == "published"
 
 
+@pytest.mark.integration
 def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -466,6 +474,7 @@ def test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_su
     assert _current_pointer_state(experiment) == "published"
 
 
+@pytest.mark.integration
 def test_terminal_callback_control_flow_exception_cannot_replace_success(
     tmp_path: Path,
 ) -> None:
@@ -503,6 +512,7 @@ def test_terminal_callback_control_flow_exception_cannot_replace_failure(
         run_experiment(experiment, terminal_callback=interrupting_callback)
 
 
+@pytest.mark.integration
 def test_shutdown_signal_during_publication_is_absorbed_until_committed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -568,6 +578,7 @@ def test_execution_failure_leaves_current_pointer_terminal(tmp_path: Path) -> No
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_generation_record_is_write_once(tmp_path: Path) -> None:
     """A published generation's record can never be rewritten, even to the same state."""
     experiment = _stored_experiment(tmp_path)
@@ -604,6 +615,7 @@ def test_generation_record_is_write_once(tmp_path: Path) -> None:
     assert _generation_record_path(experiment, generation_id).read_bytes() == first_content
 
 
+@pytest.mark.integration
 def test_successful_publication_never_logs_a_record_refusal(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -635,6 +647,7 @@ def test_successful_publication_never_logs_a_record_refusal(
         pytest.param(_tamper_winner_artifact, "does not match its recorded hash", id="tampered"),
     ],
 )
+@pytest.mark.integration
 def test_publication_refuses_invalid_winner_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -668,6 +681,7 @@ def test_publication_refuses_invalid_winner_artifact(
 
 
 @pytest.mark.parametrize("identity_field", ["generation_id", "attempt_id"])
+@pytest.mark.integration
 def test_manifest_rejects_winner_source_identity_disagreement(
     tmp_path: Path,
     identity_field: str,
@@ -706,6 +720,7 @@ def test_manifest_rejects_winner_source_identity_disagreement(
         ("phase_fingerprint", 999),
     ],
 )
+@pytest.mark.integration
 def test_manifest_rejects_malformed_reanchored_winner_provenance(
     tmp_path: Path, field: str, value: object
 ) -> None:
@@ -735,6 +750,7 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
 
 
 @pytest.mark.parametrize("removed_artifact", ["promotion_decisions", "promotion.yaml"])
+@pytest.mark.integration
 def test_manifest_rejects_removed_promotion_artifacts(
     tmp_path: Path,
     removed_artifact: str,
@@ -762,6 +778,7 @@ def test_manifest_rejects_removed_promotion_artifacts(
     assert read_winner(experiment, "p") is None
 
 
+@pytest.mark.integration
 def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) -> None:
     """Strict resume rejects a linked winner from a current-format publication."""
     experiment = _stored_experiment(tmp_path)
@@ -790,6 +807,7 @@ def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) 
         pytest.param("experiment: other\ngeneration_id: {gid}\n", id="wrong-experiment"),
     ],
 )
+@pytest.mark.integration
 def test_pointer_validation_fails_closed(tmp_path: Path, tamper: str) -> None:
     """An invalid pointer is treated as nothing-published, not trusted for reads."""
     experiment = _stored_experiment(tmp_path)
@@ -807,6 +825,7 @@ def test_pointer_validation_fails_closed(tmp_path: Path, tamper: str) -> None:
     assert _resolve_publication_pointer(experiment).state == "failed"
 
 
+@pytest.mark.integration
 def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_path: Path) -> None:
     """A pointer whose target's own summary no longer names it fails closed.
 
@@ -829,6 +848,7 @@ def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_pa
     assert read_winner(experiment, "p") is None
 
 
+@pytest.mark.integration
 def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path: Path) -> None:
     """The record is informational only; publication status ignores its state entirely."""
     experiment = _stored_experiment(tmp_path)
@@ -855,6 +875,7 @@ def test_tampering_the_record_state_does_not_affect_publication_status(tmp_path:
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_publication_pointer_reports_ok_for_a_healthy_publication(tmp_path: Path) -> None:
     """A valid publication resolves ``ok`` with its generation id and no error."""
     experiment = _stored_experiment(tmp_path)
@@ -872,6 +893,7 @@ def test_publication_pointer_reports_ok_for_a_healthy_publication(tmp_path: Path
     assert status["published_generation_id"] == generation_id
 
 
+@pytest.mark.integration
 def test_experiment_pointer_anchors_the_exact_summary_bytes(tmp_path: Path) -> None:
     """The commit record stores the byte length and SHA-256 of the validated summary."""
     experiment = _stored_experiment(tmp_path)
@@ -885,6 +907,7 @@ def test_experiment_pointer_anchors_the_exact_summary_bytes(tmp_path: Path) -> N
     assert pointer["summary_sha256"] == hashlib.sha256(summary).hexdigest()
 
 
+@pytest.mark.integration
 def test_summary_digest_is_checked_before_the_summary_is_parsed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -923,6 +946,7 @@ def test_summary_digest_is_checked_before_the_summary_is_parsed(
     "tamper",
     ["phase_plan", "metric_goal", "objective_evidence", "config_fingerprint", "completion"],
 )
+@pytest.mark.integration
 def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     tmp_path: Path,
     tamper: str,
@@ -1000,6 +1024,7 @@ def test_unreadable_pointer_is_permission_denied_not_corruption(
     assert "permission denied" in verdict.error
 
 
+@pytest.mark.integration
 def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) -> None:
     """The F4 reproduction: a tampered winner must not read as "nothing published"."""
     experiment = _stored_experiment(tmp_path)
@@ -1039,6 +1064,7 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("delete_current_pointer", [False, True])
+@pytest.mark.integration
 def test_deleted_pointer_with_an_intact_namespace_reports_absent(
     tmp_path: Path, delete_current_pointer: bool
 ) -> None:
@@ -1063,6 +1089,7 @@ def test_deleted_pointer_with_an_intact_namespace_reports_absent(
     assert read_winner(experiment, "p") is None
 
 
+@pytest.mark.integration
 def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path) -> None:
     """A pointer whose whole target namespace is gone is corruption, not a fresh tree."""
     experiment = _stored_experiment(tmp_path)
@@ -1084,6 +1111,7 @@ def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path
     assert read_winner(experiment, "p") is None
 
 
+@pytest.mark.integration
 def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
     """The reporting verdict must not soften the raise the resume path depends on."""
     experiment = _stored_experiment(tmp_path)
@@ -1098,6 +1126,7 @@ def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
         _last_successful_generation_id(experiment, raise_on_manifest_error=True)
 
 
+@pytest.mark.integration
 def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Path) -> None:
     owner = _stored_experiment(tmp_path)
     pointer_path = _last_successful_generation_path(owner)
@@ -1116,6 +1145,7 @@ def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Pat
     assert current_path.read_bytes() == current
 
 
+@pytest.mark.integration
 def test_surviving_pointer_prevents_root_projection_fallback_after_generation_loss(
     tmp_path: Path,
 ) -> None:
@@ -1133,6 +1163,7 @@ def test_surviving_pointer_prevents_root_projection_fallback_after_generation_lo
     assert read_winner(experiment, "p") is None
 
 
+@pytest.mark.integration
 def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Path) -> None:
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
@@ -1158,6 +1189,7 @@ def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Pat
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_pinned_read_of_failed_publication_generation_reports_truthful_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1193,6 +1225,7 @@ def test_pinned_read_of_failed_publication_generation_reports_truthful_identity(
     assert status["phases"][0]["winner_present"] is True
 
 
+@pytest.mark.integration
 def test_read_status_single_captures_the_published_pointer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1240,6 +1273,7 @@ def test_read_status_single_captures_the_published_pointer(
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path) -> None:
     """A published generation keeps the canonical config that produced it, owner-only.
 
@@ -1274,6 +1308,7 @@ def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path
     assert phase["search_space"]["x"]["high"] == 10
 
 
+@pytest.mark.integration
 def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: Path) -> None:
     """The readable provenance record carries identity and digests, never config values."""
     experiment = _stored_experiment(tmp_path, env={"TRAINER_TOKEN": _SENTINEL_SECRET})
@@ -1331,6 +1366,7 @@ def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: P
     assert experiment.trial_command not in raw
 
 
+@pytest.mark.integration
 def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> None:
     """A launcher-granted identity survives in the artifact tree itself.
 
@@ -1359,6 +1395,7 @@ def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> Non
     assert generation_id_source(experiment, "launcher-granted-1") is None
 
 
+@pytest.mark.integration
 def test_generation_id_source_rejects_linked_provenance_record(tmp_path: Path) -> None:
     """A source claim is not trusted through a linked reproducibility record."""
     experiment = _stored_experiment(tmp_path)
@@ -1373,6 +1410,7 @@ def test_generation_id_source_rejects_linked_provenance_record(tmp_path: Path) -
     assert generation_id_source(experiment, generation_id) is None
 
 
+@pytest.mark.integration
 def test_generation_manifest_covers_the_provenance_files(tmp_path: Path) -> None:
     """Both provenance files are manifest-listed with their content hashes.
 
@@ -1400,6 +1438,7 @@ def test_generation_manifest_covers_the_provenance_files(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("filename", [_CONFIG_SNAPSHOT_NAME, _REPRODUCIBILITY_NAME])
+@pytest.mark.integration
 def test_read_side_rejects_generation_with_tampered_provenance_file(
     tmp_path: Path,
     filename: str,
@@ -1443,6 +1482,7 @@ def test_read_side_rejects_generation_with_tampered_provenance_file(
     reason="root reads any mode, so no PermissionError can be provoked",
 )
 @pytest.mark.parametrize("filename", [_CONFIG_SNAPSHOT_NAME, _REPRODUCIBILITY_NAME])
+@pytest.mark.integration
 def test_unreadable_provenance_file_reports_permission_denied_not_corruption(
     tmp_path: Path,
     filename: str,
@@ -1507,6 +1547,7 @@ def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) ->
     assert json.loads(repro_path.read_text())["generation_id"] == failed_generation
 
 
+@pytest.mark.integration
 def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_path: Path) -> None:
     """Half a provenance record is a current-format tamper, not valid state.
 
@@ -1554,6 +1595,7 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
         ),
     ],
 )
+@pytest.mark.integration
 def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     tmp_path: Path,
     filename: str,

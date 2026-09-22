@@ -64,6 +64,7 @@ def test_two_experiments_sharing_workdir_have_disjoint_output_trees(
 @pytest.mark.parametrize(
     ("workdir_name", "existing_workdir"), [("runs", False), ("runs", True), (".", True)]
 )
+@pytest.mark.integration
 def test_run_experiment_writes_summary_at_namespaced_path(
     tmp_path: Path, workdir_name: str, existing_workdir: bool
 ) -> None:

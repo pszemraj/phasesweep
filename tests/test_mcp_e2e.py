@@ -48,10 +48,13 @@ ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 MONITOR_DEADLINE_SECONDS = 300.0
 DISPATCH_DEADLINE_SECONDS = 30.0
 
-pytestmark = pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="detached runner + cancel rely on POSIX process groups + /proc liveness",
-)
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="detached runner + cancel rely on POSIX process groups + /proc liveness",
+    ),
+]
 
 
 def _chained_config(tmp_path: Path) -> str:

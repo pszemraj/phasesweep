@@ -50,6 +50,7 @@ def test_console_scripts_declare_importable_targets() -> None:
         assert callable(getattr(module, attribute)), f"{target} is not callable"
 
 
+@pytest.mark.integration
 def test_mcp_entrypoint_without_optional_sdk(tmp_path: Path) -> None:
     """Exercise the real entry point in a fresh process even with the dev extra installed."""
     result = subprocess.run(

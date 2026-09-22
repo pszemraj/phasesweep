@@ -453,6 +453,7 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
     assert "trial_number: 99" not in unpublished.output
 
 
+@pytest.mark.integration
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
     """Winner-only CLI reads enforce the artifact tree's reverse ownership."""
     trainer = write_trainer(tmp_path / "trainer.py", 'print("x=1.0")')
@@ -538,6 +539,7 @@ phases:
     assert winners["b"].effective_overrides["lr"] == winners["a"].params["lr"]
 
 
+@pytest.mark.integration
 def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     """``phasesweep status`` is read-only and reports study trial state counts."""
     trainer = write_trainer(
@@ -584,6 +586,7 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     assert status_obj["published_generation_id"] == status_obj["current_generation_id"]
 
 
+@pytest.mark.integration
 def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_path: Path) -> None:
     """An unreadable journal cannot be classified as current-format state."""
     ledger = tmp_path / "studies.journal"

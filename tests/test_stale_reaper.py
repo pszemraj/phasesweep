@@ -278,6 +278,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     assert fingerprint_called["flag"]
 
 
+@pytest.mark.integration
 def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) -> None:
     """A new generation starts only after every existing phase is recovered."""
     trainer = write_trainer(
@@ -573,6 +574,7 @@ def test_mixed_preflight_error_boundary(
         assert type(exc_info.value) is PhaseSweepError
 
 
+@pytest.mark.integration
 def test_kill_stale_group_escalates_to_sigkill():
     """A child that ignores SIGTERM must still be killed within the grace window."""
     if not Path("/proc/self/stat").exists():
@@ -613,6 +615,7 @@ def test_kill_stale_group_escalates_to_sigkill():
             proc.wait(timeout=2)
 
 
+@pytest.mark.integration
 def test_kill_stale_group_uses_pgid_when_root_pid_gone() -> None:
     """If the root PID has exited but pgid is known, reaper still kills the group.
 
@@ -934,6 +937,7 @@ def test_kill_stale_group_pid_pgid_decision_matrix(
     assert calls == list(case.expected_calls)
 
 
+@pytest.mark.integration
 def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -976,6 +980,7 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
     assert all(trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest for trial in trials)
 
 
+@pytest.mark.integration
 def test_allocation_context_covers_first_environment_write_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1144,6 +1149,7 @@ def _fabricate_stale_running_trial(
     return study, trial_dir, trial.number
 
 
+@pytest.mark.integration
 def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -> None:
     """A worker killed while queued for a GPU leaves 'allocated' and no identity.
 
@@ -1176,6 +1182,7 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
     assert optuna.trial.TrialState.COMPLETE in states.values()
 
 
+@pytest.mark.integration
 def test_exited_attempt_recovers_without_signalling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1507,6 +1514,7 @@ def test_relative_registry_storage_recovers_from_the_registration_cwd(
     assert not list(_attempts_dir(experiment).glob("*.json"))
 
 
+@pytest.mark.integration
 def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path) -> None:
     """A registry entry survives an Optuna failure before the first trial attr."""
     trainer = write_trainer(tmp_path, "print('x=1.0')")
@@ -1595,6 +1603,7 @@ def test_registry_generation_conflict_is_study_schema_mismatch(tmp_path: Path) -
         _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
 
+@pytest.mark.integration
 def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -> None:
     """The attempt registry finds stale work whose phase left the config.
 
@@ -1653,6 +1662,7 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
         stale.wait(timeout=5)
 
 
+@pytest.mark.integration
 def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
     tmp_path, monkeypatch, wandb_worker_sdk
 ):
@@ -1747,6 +1757,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("failure_site", ["lifecycle", "registry"])
+@pytest.mark.integration
 def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1837,6 +1848,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert not list(attempts_dir.glob("*.json"))
 
 
+@pytest.mark.integration
 def test_registry_entries_are_retired_after_normal_runs(tmp_path: Path) -> None:
     """A healthy run leaves no active-attempt registry entries behind."""
     trainer = write_trainer(tmp_path, "print('x=1.0')")

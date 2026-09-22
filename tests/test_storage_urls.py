@@ -68,6 +68,7 @@ def test_auto_storage_requires_persistent_contract(invalid: str) -> None:
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
+@pytest.mark.integration
 def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_jobs: int
 ) -> None:
@@ -100,6 +101,7 @@ def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
 @pytest.mark.parametrize("relocated", [False, True])
+@pytest.mark.integration
 def test_auto_backend_change_refuses_existing_tree(
     tmp_path: Path, n_jobs: int, relocated: bool
 ) -> None:
@@ -317,6 +319,7 @@ def test_storage_recovery_locator_freezes_relative_file_paths(
 
 
 @pytest.mark.parametrize("scheme", ["sqlite", "sqlite+pysqlite"])
+@pytest.mark.integration
 def test_literal_hash_sqlite_path_survives_status_resume_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scheme: str
 ) -> None:
@@ -342,6 +345,7 @@ def test_literal_hash_sqlite_path_survives_status_resume_and_recovery(
     assert len(study.trials) == 2
 
 
+@pytest.mark.integration
 def test_literal_tilde_sqlite_path_survives_status_resume_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

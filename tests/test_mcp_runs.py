@@ -219,6 +219,7 @@ def test_failed_pre_spawn_cleanup_retains_recoverable_lease(
     assert store.launch_inventory() == ([], set())
 
 
+@pytest.mark.integration
 def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
     tmp_path: Path,
 ) -> None:
@@ -1495,6 +1496,7 @@ def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     assert store.cleanup_uncertain(handle)
 
 
+@pytest.mark.integration
 def test_state_cleanup_uncertain_for_zombie_runner_without_status(tmp_path: Path) -> None:
     if not sys.platform.startswith("linux"):
         pytest.skip("zombie detection relies on /proc")

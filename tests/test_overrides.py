@@ -379,6 +379,7 @@ def test_json_file_rejects_non_json_values(value):
 
 
 @pytest.mark.parametrize("selector", ["hydra", "json_file"])
+@pytest.mark.integration
 def test_restored_input_real_consumer_inherits_and_replays(tmp_path, selector):
     from phasesweep.config import (
         CategoricalParam,
@@ -603,6 +604,7 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
 
 
 @pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+@pytest.mark.integration
 def test_effective_overrides_include_fixed(tmp_path, override_format):
     """The packaged trainer consumes dotted inherited CLI values in both supported forms."""
     trainer = copy_fake_train(tmp_path)

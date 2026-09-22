@@ -66,6 +66,10 @@ from phasesweep.engine.state import (
 )
 from tests.conftest import assert_published_winner_evidence_local, make_experiment, write_trainer
 
+# Every test here drives a real sweep through external trainer processes before
+# it can check what selection published, so the whole module is integration tier.
+pytestmark = pytest.mark.integration
+
 
 @pytest.mark.parametrize("mutation", ["changed", "deleted"])
 def test_json_primary_external_trainer_inherits_replays_and_verifies_source(tmp_path, mutation):

@@ -123,6 +123,7 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
     } == ledger_before
 
 
+@pytest.mark.integration
 def test_current_memory_output_records_deliberate_no_ledger_identity(tmp_path: Path) -> None:
     """Fresh memory runs receive the same output-format marker and can continue."""
     experiment = _experiment(tmp_path, storage=None)
@@ -139,6 +140,7 @@ def test_current_memory_output_records_deliberate_no_ledger_identity(tmp_path: P
     }
 
 
+@pytest.mark.integration
 def test_current_sqlite_format_continues_after_top_up(tmp_path: Path) -> None:
     """The early compatibility precheck preserves supported continuation."""
     storage = f"sqlite:///{tmp_path / 'current.db'}"
@@ -159,6 +161,7 @@ def test_current_sqlite_format_continues_after_top_up(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.parametrize("leftover_study", ["t::retired", "other_experiment::phase"])
+@pytest.mark.integration
 def test_bound_root_status_refuses_empty_stamped_legacy_studies(
     tmp_path: Path, backend: str, leftover_study: str
 ) -> None:
@@ -174,6 +177,7 @@ def test_bound_root_status_refuses_empty_stamped_legacy_studies(
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
+@pytest.mark.integration
 def test_startup_scans_the_ledger_format_once(
     tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -204,6 +208,7 @@ def test_startup_scans_the_ledger_format_once(
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
+@pytest.mark.integration
 def test_empty_unstamped_phase_study_can_resume_in_current_ledger(
     tmp_path: Path, backend: str
 ) -> None:

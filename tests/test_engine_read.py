@@ -131,6 +131,7 @@ def test_read_status_uses_one_sqlite_snapshot_per_phase(
     assert status["phases"][0]["trial_data_available"] is True
 
 
+@pytest.mark.integration
 def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -370,6 +371,7 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
 @pytest.mark.parametrize(
     "damage", ["missing-ledger", "missing-study", "empty-study", "corrupt", "stale-ledger"]
 )
+@pytest.mark.integration
 def test_published_status_distinguishes_absent_history_from_read_failure(
     tmp_path: Path, n_jobs: int, damage: str
 ) -> None:
@@ -622,6 +624,7 @@ def _drift_experiment(tmp_path: Path, **overrides: object) -> Experiment:
     return make_experiment(**defaults)  # type: ignore[arg-type]
 
 
+@pytest.mark.integration
 def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -> None:
     """Review v0.5.16 / blocker 4 reproduction: publish x/minimize, reload as y/maximize.
 
@@ -665,6 +668,7 @@ def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -
     assert winners[0].metric_goal == "minimize"
 
 
+@pytest.mark.integration
 def test_run_control_edits_keep_published_config_current(tmp_path: Path) -> None:
     """A top-up or comment edit is not semantic drift for a published result."""
     published = _drift_experiment(tmp_path)
@@ -698,6 +702,7 @@ def test_read_status_without_any_publication_uses_current_config(tmp_path: Path)
     assert status["metric"]["name"] == "x"
 
 
+@pytest.mark.integration
 def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path) -> None:
     """A phase renamed after publication must not hide the published winner.
 
@@ -743,6 +748,7 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
     assert (winner.metric_name, winner.metric_goal) == ("x", "minimize")
 
 
+@pytest.mark.integration
 def test_read_status_reuses_the_pointer_authenticated_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

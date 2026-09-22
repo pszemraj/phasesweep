@@ -31,6 +31,25 @@ console entry points outside the checkout, and exercises the starter's
 validation, dry run, execution, replay, and catalog scaffolding. It leaves no
 acceptance artifacts in the repository.
 
+### Test tiers
+
+Plain `pytest` above is the authoritative non-hardware suite and stays the
+merge and release check. While iterating, two subsets are available:
+
+```bash
+pytest -m "not hardware and not integration"   # fast review tier
+pytest -m "integration and not hardware"       # integration tier only
+```
+
+A test is `@pytest.mark.integration` when it spawns real processes, waits on
+wall-clock time, drives a multi-step durable recovery workflow, or is otherwise
+slow; everything else stays in the fast tier. `tests/tiers.py` recognizes the
+process and wall-clock primitives statically and `tests/conftest.py` fails
+collection when a test uses one without the marker, so the fast tier cannot
+quietly absorb a slow test. Note that a `-m` on the command line *replaces* the
+`-m 'not hardware'` in `addopts` rather than adding to it, which is why both
+commands above spell out `not hardware`.
+
 GitHub Actions intentionally has one Linux pull-request static-check job for
 Ruff linting, Ruff format checking, and mypy. The full suite and installed
 wheel check stay local to control CI cost. Hardware tests remain opt-in.

@@ -52,6 +52,11 @@ from phasesweep.runtime.process import (
 )
 from tests.conftest import is_pid_zombie, make_experiment, raise_after_first_successful_call
 
+# This module exists to observe POSIX signal delivery and descendant cleanup on
+# real process groups, so the whole file is an integration tier module: even the
+# cases that patch a spawn still assert against real signal and /proc semantics.
+pytestmark = pytest.mark.integration
+
 
 def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch group termination to clean up the group but report uncertainty."""

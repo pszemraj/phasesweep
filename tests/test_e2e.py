@@ -12,10 +12,15 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
 import yaml
 
 from phasesweep import load_experiment, run_experiment
 from tests.conftest import copy_fake_train
+
+# A full three-phase sweep against the real fake trainer: every test here spawns
+# trainer subprocesses and runs for seconds, not milliseconds.
+pytestmark = pytest.mark.integration
 
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLE_YAML = REPO / "examples" / "experiment.yaml"

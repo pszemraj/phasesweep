@@ -763,6 +763,7 @@ def test_in_memory_run_lock_is_keyed_by_workdir(
         assert set(paths_a).isdisjoint(paths_b)
 
 
+@pytest.mark.integration
 def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
     """A symlinked experiment leaf must share the target's output lock.
 

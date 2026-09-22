@@ -180,6 +180,7 @@ def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) ->
     )
 
 
+@pytest.mark.integration
 def test_fingerprint_mismatch_raises(tmp_path):
     """Changing phase config and re-running should fail, not silently mix results."""
     from tests.conftest import copy_fake_train
@@ -237,6 +238,7 @@ def test_in_memory_storage_does_not_require_provenance(storage: str) -> None:
     assert experiment.provenance == {}
 
 
+@pytest.mark.integration
 def test_late_child_fingerprint_failure_preserves_last_successful_results(
     tmp_path: Path,
 ) -> None:
@@ -270,6 +272,7 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
     ) == yaml.safe_load(before[_last_successful_generation_path(experiment)])
 
 
+@pytest.mark.integration
 def test_interrupted_first_publication_still_publishes_and_reads_resolve_correctly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -635,6 +638,7 @@ def _environment_cohort_experiment(
     )
 
 
+@pytest.mark.integration
 def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -655,6 +659,7 @@ def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
+@pytest.mark.integration
 def test_identical_semantic_environment_resumes_persistent_study(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -692,6 +697,7 @@ def test_identical_semantic_environment_resumes_persistent_study(
     } & set(base.values)
 
 
+@pytest.mark.integration
 def test_passthrough_token_rotation_resumes_persistent_study(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -711,6 +717,7 @@ def test_passthrough_token_rotation_resumes_persistent_study(
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
 
 
+@pytest.mark.integration
 def test_populated_study_without_environment_identity_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -795,6 +802,7 @@ def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
     assert _phase_fingerprint(ungated, ungated.phases[0], {}) not in set(fingerprints.values())
 
 
+@pytest.mark.integration
 def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     """End-to-end: run with n_trials=2, then n_trials=4 -> 4 total trials in same study."""
     trainer = write_trainer(
@@ -860,6 +868,7 @@ phases:
         ),
     ],
 )
+@pytest.mark.integration
 def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
     tmp_path: Path,
     sampler: Sampler,
@@ -933,6 +942,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
         ),
     ],
 )
+@pytest.mark.integration
 def test_stateful_sampler_completed_target_reruns_as_noop(
     tmp_path: Path,
     sampler: Sampler,
@@ -959,6 +969,7 @@ def test_stateful_sampler_completed_target_reruns_as_noop(
     assert rerun["p"].metric == first["p"].metric
 
 
+@pytest.mark.integration
 def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
@@ -989,6 +1000,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     assert _winner_path(experiment, "p").read_bytes() == winner_before
 
 
+@pytest.mark.integration
 def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path) -> None:
     """A bound child makes an ancestor top-up a non-destructive preflight refusal."""
     trainer = write_constant_trainer(tmp_path)
@@ -1058,6 +1070,7 @@ def _artifact_tree_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
+@pytest.mark.integration
 def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path: Path) -> None:
     """One persistent study cannot back two publication roots (review v0.5.19 / finding F5)."""
     trainer = write_constant_trainer(tmp_path)
@@ -1086,6 +1099,7 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
 
 
+@pytest.mark.integration
 def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> None:
     """An equal binding is a no-op: ordinary resume and top-up still work."""
     trainer = write_constant_trainer(tmp_path)
@@ -1167,6 +1181,7 @@ def test_unbound_known_phasesweep_state_names_the_blocking_entry(
     assert not _artifact_root_binding_path(experiment).exists()
 
 
+@pytest.mark.integration
 def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     """One tree cannot mix publication files from one DB with counts from another."""
     trainer = write_constant_trainer(tmp_path)
@@ -1212,6 +1227,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     assert owner_status["phases"][0]["trials"]["COMPLETE"] == 1
 
 
+@pytest.mark.integration
 def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1246,6 +1262,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
     assert _last_successful_generation_id(experiment) == generation_before
 
 
+@pytest.mark.integration
 def test_retargeted_experiment_symlink_is_rejected_before_claim(
     tmp_path: Path,
 ) -> None:
@@ -1303,6 +1320,7 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
     assert study.get_trials(deepcopy=False) == []
 
 
+@pytest.mark.integration
 def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     """A populated pre-cutover study is refused without mutation."""
     trainer = write_constant_trainer(tmp_path)
@@ -1439,6 +1457,7 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal", "auto"])
+@pytest.mark.integration
 def test_published_phase_rejects_a_missing_storage_ledger(
     tmp_path: Path,
     backend: str,
@@ -1488,6 +1507,7 @@ def test_published_phase_rejects_a_missing_storage_ledger(
 
 
 @pytest.mark.parametrize("replacement", ["absent", "empty"])
+@pytest.mark.integration
 def test_published_phase_rejects_a_missing_or_empty_named_study(
     tmp_path: Path,
     replacement: str,
@@ -1528,6 +1548,7 @@ def test_published_phase_rejects_a_missing_or_empty_named_study(
     } == generation_dirs_before
 
 
+@pytest.mark.integration
 def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> None:
     """A retained winner row alone cannot authorize replacement trials."""
     trainer = write_constant_trainer(tmp_path)
@@ -1577,6 +1598,7 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     } == generation_dirs_before
 
 
+@pytest.mark.integration
 def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1619,6 +1641,7 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
 
 @pytest.mark.parametrize("replacement", ["absent", "empty"])
 @pytest.mark.parametrize("missing_phase", ["arch", "lr"])
+@pytest.mark.integration
 def test_published_study_requirement_starts_at_from_phase(
     tmp_path: Path, replacement: str, missing_phase: str
 ) -> None:
@@ -1655,6 +1678,7 @@ def test_published_study_requirement_starts_at_from_phase(
 
 @pytest.mark.parametrize("tree_state", ["fresh", "published", "missing-ledger"])
 @pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.integration
 def test_invalid_from_phase_is_rejected_before_state_writes(
     tmp_path: Path, tree_state: str, dry_run: bool
 ) -> None:
@@ -1684,6 +1708,7 @@ def test_invalid_from_phase_is_rejected_before_state_writes(
         assert not (_experiment_dir(experiment) / "study.db").exists()
 
 
+@pytest.mark.integration
 def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1775,6 +1800,7 @@ def _fabricate_interrupted_attempt(
     return study_name, trial.number, _attempts_dir(experiment) / f"{attempt_id}.json"
 
 
+@pytest.mark.integration
 def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path) -> None:
     """A read that fails once must abort the run, not be retried into recovery.
 
@@ -1849,6 +1875,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     assert after_conflict.user_attrs[ARTIFACT_ROOT_ATTR] == root_a
 
 
+@pytest.mark.integration
 def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) -> None:
     """An unreadable database is never reported as study absence.
 
@@ -1909,6 +1936,7 @@ def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: P
 
 
 @pytest.mark.parametrize("storage", [None, "sqlite:///:memory:"])
+@pytest.mark.integration
 def test_fresh_and_repeated_in_memory_roots_record_explicit_no_ledger_bindings(
     tmp_path: Path, storage: str | None
 ) -> None:
@@ -1940,6 +1968,7 @@ def test_fresh_and_repeated_in_memory_roots_record_explicit_no_ledger_bindings(
 
 
 @pytest.mark.parametrize("in_memory_storage", [None, "sqlite:///:memory:"])
+@pytest.mark.integration
 def test_persistent_bound_root_rejects_an_in_memory_configuration(
     tmp_path: Path, in_memory_storage: str | None
 ) -> None:
@@ -1977,6 +2006,7 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(
     assert read_status(owner) == status_before
 
 
+@pytest.mark.integration
 def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
@@ -2022,6 +2052,7 @@ def test_version_audit_metadata_is_separate_from_fingerprint_schema() -> None:
     assert "phasesweep_version" not in payload
 
 
+@pytest.mark.integration
 def test_winner_yaml_contains_phase_fingerprint(tmp_path: Path) -> None:
     """Every saved winner carries the SHA-256 fingerprint of its producing
     phase config. ``--from-phase`` reuses winners only if this matches the
@@ -2056,6 +2087,7 @@ def test_winner_yaml_contains_phase_fingerprint(tmp_path: Path) -> None:
         ),
     ],
 )
+@pytest.mark.integration
 def test_from_phase_rejects_stale_parent_winner(
     tmp_path: Path,
     before: dict[str, object],
@@ -2072,6 +2104,7 @@ def test_from_phase_rejects_stale_parent_winner(
         run_experiment(exp_v2, from_phase="lr")
 
 
+@pytest.mark.integration
 def test_from_phase_accepts_skipped_winner_when_only_n_trials_changed(
     tmp_path: Path,
 ) -> None:
@@ -2091,6 +2124,7 @@ def test_from_phase_accepts_skipped_winner_when_only_n_trials_changed(
     assert "lr" in winners2
 
 
+@pytest.mark.integration
 def test_from_phase_ignores_lower_trial_target_on_skipped_phase(tmp_path: Path) -> None:
     """A skipped phase's run-control budget cannot block an unrelated resume."""
     trainer = write_constant_trainer(tmp_path)
@@ -2119,6 +2153,7 @@ def test_from_phase_ignores_lower_trial_target_on_skipped_phase(tmp_path: Path) 
     assert len(study.trials) == 3
 
 
+@pytest.mark.integration
 def test_from_phase_preflight_consumes_run_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2188,6 +2223,7 @@ def test_fresh_run_preflight_consumes_run_deadline(
         run_experiment(experiment)
 
 
+@pytest.mark.integration
 def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) -> None:
     """Resume names the corrupt artifact instead of claiming no run completed."""
     trainer = write_constant_trainer(tmp_path)
@@ -2209,6 +2245,7 @@ def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) ->
         run_experiment(exp, from_phase="lr")
 
 
+@pytest.mark.integration
 def test_winner_and_trial_attrs_record_trainer_environment_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2331,6 +2368,7 @@ def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
     assert fingerprint("First version") == fingerprint("Reworded later") == fingerprint(None)
 
 
+@pytest.mark.integration
 def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2370,6 +2408,7 @@ def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
     assert winners["p"].metric == pytest.approx(1.0)
 
 
+@pytest.mark.integration
 def test_zero_trial_crash_after_target_record_does_not_poison_fingerprint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2411,6 +2450,7 @@ def test_zero_trial_crash_after_target_record_does_not_poison_fingerprint(
     assert winners["p"].metric == pytest.approx(1.0)
 
 
+@pytest.mark.integration
 def test_fingerprint_mismatch_still_raises_once_a_trial_exists(tmp_path: Path) -> None:
     """The empty-study rebind must not weaken identity once results exist."""
     from tests.conftest import make_experiment, write_trainer

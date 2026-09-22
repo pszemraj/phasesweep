@@ -101,6 +101,7 @@ def _mark_current_study(experiment: Experiment, study: optuna.Study) -> None:
     _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
+@pytest.mark.integration
 def test_in_process_runner_helper_restores_host_signal_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -231,6 +232,7 @@ def test_runner_persists_terminal_evidence_before_snapshot_finalization(
     assert "result_snapshot" not in final
 
 
+@pytest.mark.integration
 def test_runner_defers_shutdown_until_snapshot_finalization_is_durable(tmp_path: Path) -> None:
     status_path = tmp_path / "status.json"
     child_code = """
@@ -314,6 +316,7 @@ def test_runner_finalizes_pre_captured_terminal_snapshot(tmp_path: Path) -> None
     assert final["result_snapshot"]["status"]["phases"][0]["phase"] == "p"
 
 
+@pytest.mark.integration
 def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
@@ -399,6 +402,7 @@ def test_attempt_registry_failure_requires_an_explicit_recovery_target() -> None
     assert "new experiment name" in failure["remediation"]
 
 
+@pytest.mark.integration
 def test_missing_published_study_is_an_operator_preflight_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -474,6 +478,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         ("journal", "permission-denied"),
     ],
 )
+@pytest.mark.integration
 def test_damaged_storage_recovery_restores_catalog_capacity(
     tmp_path: Path, backend: str, damage: str, history: str
 ) -> None:
@@ -702,6 +707,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     assert other_status["run"]["state"] == "succeeded"
 
 
+@pytest.mark.integration
 def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -754,6 +760,7 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     )
 
 
+@pytest.mark.integration
 def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path: Path) -> None:
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -908,6 +915,7 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
 
 
 @pytest.mark.parametrize("pointer_commits", [True, False], ids=["commit", "abort"])
+@pytest.mark.integration
 def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1046,6 +1054,7 @@ def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: 
     assert committed_phases["old-only"]["published_study_unavailable"] is False
 
 
+@pytest.mark.integration
 def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1222,6 +1231,7 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
     }
 
 
+@pytest.mark.integration
 def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1301,6 +1311,7 @@ phases:
     assert store.state(handle) == "succeeded"
 
 
+@pytest.mark.integration
 def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1380,6 +1391,7 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
 
 
 @pytest.mark.parametrize("from_phase", [None, "b"])
+@pytest.mark.integration
 def test_failed_fingerprint_preflight_preserves_published_results(
     tmp_path: Path,
     from_phase: str | None,
@@ -1915,6 +1927,7 @@ def test_unserializable_captured_snapshot_still_records_terminal_evidence(
     assert "result_snapshot" not in final
 
 
+@pytest.mark.integration
 def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1975,6 +1988,7 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
         pytest.param("after_pointer", 73, True, id="after-pointer-invalid-publication"),
     ),
 )
+@pytest.mark.integration
 def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2202,6 +2216,9 @@ def test_runner_refuses_to_persist_handle_without_linux_process_identity(
     assert RunStore(tmp_path / "state").get("r0") is None
 
 
+# Binds the persisted handle to the host's real process group and boot id, so
+# it needs an unconfined process namespace like the detached-runner tests.
+@pytest.mark.integration
 def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     started_at = utc_now_iso()
@@ -2230,6 +2247,7 @@ def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path)
     assert handle.visible_params_at_launch == ["lr"]
 
 
+@pytest.mark.integration
 def test_runner_enters_the_project_directory_after_its_identity_is_durable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2307,6 +2325,7 @@ def test_runner_enters_the_project_directory_after_its_identity_is_durable(
     assert handle is not None and handle.launch_state == "spawned"
 
 
+@pytest.mark.integration
 def test_runner_persists_identity_even_when_the_project_directory_is_gone(
     tmp_path: Path,
 ) -> None:
@@ -2346,6 +2365,7 @@ def test_runner_persists_identity_even_when_the_project_directory_is_gone(
     assert status["error_class"] == "FileNotFoundError"
 
 
+@pytest.mark.integration
 def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     config = _slow_config(tmp_path)
     store = RunStore(tmp_path / "state")
@@ -2412,6 +2432,7 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     assert not _process_group_alive(trial_pgid)
 
 
+@pytest.mark.integration
 def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: Path) -> None:
     """A cancel arriving before any trial starts must still write status.json.
 

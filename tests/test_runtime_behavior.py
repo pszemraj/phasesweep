@@ -140,6 +140,7 @@ def test_json_primary_invalid_evidence_fails_trial(tmp_path, payload):
 
 
 @pytest.mark.parametrize(("value", "state"), [(3, "COMPLETE"), (10**400, "FAIL")])
+@pytest.mark.integration
 def test_invalid_remote_constraint_fails_but_measured_violation_is_complete(
     tmp_path,
     wandb_worker_sdk,
@@ -203,6 +204,7 @@ def test_csv_snapshot_throttle_debounces_full_rewrites() -> None:
     assert throttle.should_write(finished=12, now=150.0)
 
 
+@pytest.mark.integration
 def test_seeded_random_sequence_is_stable_across_top_up_batches(tmp_path: Path) -> None:
     """Seeded random draws depend on durable trial identity, not process lifetime."""
     phase = Phase(
@@ -393,6 +395,7 @@ def _sleeping_score_experiment(
     )
 
 
+@pytest.mark.integration
 def test_parallel_trials_e2e(tmp_path):
     """Run a phase with n_jobs=4 on the synthetic trainer. Exercises:
     - JournalFileStorage via explicit journal:/// URL (review v0.5.2 / blocker 6)
@@ -441,6 +444,7 @@ phases:
     assert journal_path.exists(), "JournalFileStorage file should exist"
 
 
+@pytest.mark.integration
 def test_failed_trials_marked_fail_not_complete(tmp_path):
     """Process crashes should produce FAIL trials, not COMPLETE with inf."""
     db_path = tmp_path / "phases.db"
@@ -476,6 +480,7 @@ phases:
         )
 
 
+@pytest.mark.integration
 def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good_results(
     tmp_path: Path,
 ) -> None:
@@ -534,6 +539,7 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     assert {path: path.read_bytes() for path in protected} == protected
 
 
+@pytest.mark.integration
 def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -670,6 +676,7 @@ def test_terminal_callback_failure_cannot_fail_published_run(
     assert any("terminal callback failed" in record.message for record in caplog.records)
 
 
+@pytest.mark.integration
 def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     """Missing constraint output -> TrialState.FAIL, not COMPLETE+infeasible."""
     trainer = tmp_path / "trainer.py"
@@ -796,6 +803,7 @@ def test_non_finite_extracted_value_returns_failed_result(
     assert result.failure_reason == failure_reason
 
 
+@pytest.mark.integration
 def test_abort_after_gpu_acquire_prevents_queued_trials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -882,6 +890,7 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
     logging.getLogger().handlers.clear()
 
 
+@pytest.mark.integration
 def test_runtime_rejects_unexplained_trial_budget_shortfall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -952,6 +961,7 @@ phases:
     assert set(winners) == {"p"}
 
 
+@pytest.mark.integration
 def test_max_consecutive_failures_aborts_phase(tmp_path):
     """Trial command always fails -> phase aborts before running n_trials."""
     body = f"""
@@ -986,6 +996,7 @@ phases:
     assert n < 30, f"expected early abort, got {n} trials"
 
 
+@pytest.mark.integration
 def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) -> None:
     """A durable abort survives restart: the identical no-op re-run stays failed.
 
@@ -1033,6 +1044,7 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
     assert not _last_successful_generation_path(exp).exists()
 
 
+@pytest.mark.integration
 def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -1139,6 +1151,7 @@ def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch)
     ]
 
 
+@pytest.mark.integration
 def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path) -> None:
     """Raising n_trials after an abort is the explicit resume path.
 
@@ -1179,6 +1192,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
 
 
+@pytest.mark.integration
 def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) -> None:
     """A random-sampler top-up continues the durable failure streak."""
     trainer = write_trainer(
@@ -1223,6 +1237,7 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
     assert _last_successful_generation_path(_exp(4)).read_text() == published_before
 
 
+@pytest.mark.integration
 def test_outcome_ledger_recovers_when_abort_marker_write_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1291,6 +1306,7 @@ def _outcome_write_experiment(
     )
 
 
+@pytest.mark.integration
 def test_transient_trial_outcome_write_failure_is_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1329,6 +1345,7 @@ def test_transient_trial_outcome_write_failure_is_retried(
     )
 
 
+@pytest.mark.integration
 def test_outcome_retry_backoff_does_not_hold_completion_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1407,6 +1424,7 @@ def test_outcome_retry_backoff_does_not_hold_completion_lock(
         ),
     ],
 )
+@pytest.mark.integration
 def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1473,6 +1491,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     assert _load_phase_policy_state(study).max_sequence == 2
 
 
+@pytest.mark.integration
 def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1512,6 +1531,7 @@ def test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows(
 
 @pytest.mark.parametrize("cleanup_attr_persists", [True, False])
 @pytest.mark.parametrize("identity_persists", [True, False])
+@pytest.mark.integration
 def test_unsafe_cleanup_blocks_topup_until_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1631,6 +1651,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
 
 
+@pytest.mark.integration
 def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1692,6 +1713,7 @@ def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
     assert winners["p"].metric == pytest.approx(0.5)
 
 
+@pytest.mark.integration
 def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> None:
     """Two fast failures trip the abort before a slow later success can reset it.
 
@@ -1740,6 +1762,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
+@pytest.mark.integration
 def test_unexpected_objective_error_is_phase_fatal_and_durable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_jobs: int
 ) -> None:
@@ -1796,6 +1819,7 @@ def test_unexpected_objective_error_is_phase_fatal_and_durable(
     assert not _last_successful_generation_path(exp).exists()
 
 
+@pytest.mark.integration
 def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
     """A phase wallclock timeout must not bless the best partial trial by default."""
     exp = _sleeping_score_experiment(
@@ -1811,6 +1835,7 @@ def test_phase_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
         run_experiment(exp)
 
 
+@pytest.mark.integration
 def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
     """A phase wallclock timeout is a hard subprocess deadline, not only an Optuna scheduler timeout."""
     # The trainer would sleep 30s per trial; timing margins are deliberately
@@ -1838,6 +1863,7 @@ def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
     assert list(phase_dir.glob("trial_00000__*/r.json")) == []
 
 
+@pytest.mark.integration
 def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     # Two-sided timing margin: one 1s trial must finish well within the 6s
     # budget even on a loaded host, while all ten (>= 10s of sleeping alone)
@@ -1864,6 +1890,7 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
+@pytest.mark.integration
 def test_timeout_after_all_terminal_trials_is_complete_enough(
     tmp_path: Path,
     allow_incomplete_on_timeout: bool,
@@ -1922,6 +1949,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
     assert loaded.completion["incomplete"] is False
 
 
+@pytest.mark.integration
 def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Path) -> None:
     trainer = write_trainer(
         tmp_path,
@@ -1990,6 +2018,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
 
 
 @pytest.mark.parametrize("clock_elapses", [True, False])
+@pytest.mark.integration
 def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clock_elapses: bool
 ) -> None:
@@ -2139,6 +2168,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     assert len(launched_trials) == launch_count
 
 
+@pytest.mark.integration
 def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2225,6 +2255,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     assert winners["p"].metric == pytest.approx(0.5)
 
 
+@pytest.mark.integration
 def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2357,6 +2388,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     assert completion["reason"] == "timeout"
 
 
+@pytest.mark.integration
 def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: Path) -> None:
     accepted = _sleeping_score_experiment(
         tmp_path,
@@ -2379,6 +2411,7 @@ def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: P
         _load_winner(current, current.phases[0], {})
 
 
+@pytest.mark.integration
 def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
     exp = _sleeping_score_experiment(
         tmp_path,
@@ -2390,6 +2423,7 @@ def test_run_timeout_refuses_incomplete_winner(tmp_path: Path) -> None:
         run_experiment(exp)
 
 
+@pytest.mark.integration
 def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2434,6 +2468,7 @@ def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
     assert len(study.trials) == 1
 
 
+@pytest.mark.integration
 def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2487,6 +2522,7 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
     assert rerun["p"].metric == first["p"].metric
 
 
+@pytest.mark.integration
 def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
     tmp_path: Path,
 ) -> None:
@@ -2542,6 +2578,7 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
             signal.signal(sig, handler)
 
 
+@pytest.mark.integration
 def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_restore() -> None:
     """A signal pending at scope-exit must reach the restored HOST handler, not
     ``_shutdown_handler`` mid-restoration (review v0.5.15 / blocker 2A).
@@ -2790,6 +2827,7 @@ def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
             signal.signal(sig, handler)
 
 
+@pytest.mark.integration
 def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint() -> None:
     """A shutdown inside an absorb window is reported, not raised — then honored later.
 
@@ -3003,6 +3041,7 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
         run_experiment(experiment)
 
 
+@pytest.mark.integration
 def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3028,6 +3067,7 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
     assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unexpected_objective_exception"
 
 
+@pytest.mark.integration
 def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3108,6 +3148,7 @@ def _resolved_overrides_by_trial(phase_dir: Path) -> dict[int, dict[str, Any]]:
     return resolved
 
 
+@pytest.mark.integration
 def test_categorical_value_keeps_its_type_across_every_persisted_surface(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
