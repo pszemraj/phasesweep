@@ -146,6 +146,7 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 - [MCP operator reference](docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.
 - [Toy experiment and MCP catalog](examples/experiment.yaml): a checkout-local CLI example backed by the packaged fake trainer, plus an [MCP catalog](examples/catalog.yaml) whose detached-run state and experiment outputs use absolute scratch paths under `/tmp`.
 - [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer integration.
+- [Durability invariants](docs/invariants.md): the ordering rules the ledger, publication, and recovery paths must hold, and the test that owns each one.
 - [Development](docs/development.md): source checkout, contributor setup, and quality gates.
 
 ## License

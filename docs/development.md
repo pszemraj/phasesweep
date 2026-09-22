@@ -135,6 +135,9 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery);
 the CLI owns its arguments and rendering.
 
+The ordering rules these modules must hold, and the test that owns each one,
+are listed in [durability invariants](invariants.md).
+
 The ordinary control flow is:
 
 ```mermaid
@@ -184,3 +187,6 @@ flowchart TD
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if
   it preserves the current last-successful pointer and all cited winner
   provenance.
+- TODO(engine): keep docs/invariants.md in step with the ledger chokepoint; a
+  new storage constructor call site fails tests/test_ledger_contract.py and
+  needs a row here.
