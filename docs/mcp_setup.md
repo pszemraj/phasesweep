@@ -1,8 +1,11 @@
 # MCP agent setup
 
 PhaseSweep owns the MCP server and its operator-reviewed catalog. Your MCP
-client owns its configuration and any client-specific instructions; PhaseSweep
-does not create, edit, inspect, or remove client files.
+client owns its configuration and any client-specific instructions.
+
+> [!NOTE]
+> PhaseSweep does not create, edit, inspect, or remove client files. You add
+> the server entry to your client yourself in step 3.
 
 Requirements: Python 3.11+, the [MCP runtime requirements](mcp.md), a
 PhaseSweep experiment that passes validation, and a client with local stdio
@@ -35,10 +38,15 @@ phasesweep mcp init-catalog --from ./experiment.yaml
 ```
 
 The command writes `catalog.yaml`, validates it, and provisions a fresh
-[private state layout](mcp.md#fresh-mcp-state). Review the generated file
-against [the catalog fields and permission model](mcp.md#the-catalog) before
-connecting a client. Add another `--from` for each experiment; use `-o` for
-another catalog filename. The scaffold never replaces an existing catalog.
+[private state layout](mcp.md#fresh-mcp-state). Add another `--from` for each
+experiment; use `-o` for another catalog filename. The scaffold never replaces
+an existing catalog.
+
+> [!IMPORTANT]
+> Review the generated file against
+> [the catalog fields and permission model](mcp.md#the-catalog) before
+> connecting a client. The catalog decides which experiments an agent can see,
+> which sampled values it can read, and which side effects it may request.
 
 Validate the reviewed catalog with its absolute path:
 

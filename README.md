@@ -51,6 +51,13 @@ importing PhaseSweep.
 
 Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
 
+> [!IMPORTANT]
+> This breaking release accepts only fresh current-format state. When upgrading
+> from 0.3.1, use a fresh artifact root and local ledger (plus a fresh MCP state
+> directory when applicable); there is no migration, adoption, or repair path.
+> Use the preserved 0.3.1 environment for existing state. See the
+> [fresh-state cutover](docs/runtime.md#fresh-state-cutover) for the full scope.
+
 ```bash
 pip install git+https://github.com/pszemraj/phasesweep.git
 phasesweep --version
@@ -61,11 +68,8 @@ phasesweep validate experiment.yaml   # checks it without launching anything
 phasesweep run experiment.yaml        # four tiny trials, a few seconds
 ```
 
-This breaking release accepts only fresh current-format state. When upgrading
-from 0.3.1, use a fresh artifact root and local ledger (plus a fresh MCP state
-directory when applicable); there is no migration, adoption, or repair path.
-Use the preserved 0.3.1 environment for existing state. See the
-[fresh-state cutover](docs/runtime.md#fresh-state-cutover) for the full scope.
+`phasesweep init` never overwrites an existing file; use `-o PATH` for another
+destination.
 
 The run log shows the phase chaining directly (abridged):
 
@@ -98,6 +102,10 @@ effective_overrides:
 # ... completion state, fingerprints, and objective provenance follow
 ```
 
+The starter uses `storage: auto`, so its ledger and outputs live together under
+`<workdir>/<experiment>/`. See [runtime behavior](docs/runtime.md) for state
+layout, current-format requirements, locks, cleanup, GPU isolation, and resume.
+
 ## Use your own trainer
 
 Choose the input interface your trainer already accepts:
@@ -109,12 +117,19 @@ Choose the input interface your trainer already accepts:
 | Native Hydra overrides (`hydra`) | `{overrides}` produces `key=value` |
 | Nested overrides-only JSON (`json_file`) | `--overrides {overrides_path}` |
 
+> [!TIP]
+> `phasesweep run experiment.yaml --dry-run` prints one rendered command per
+> phase without launching work. Use it to check that your placeholders render
+> what the trainer expects.
+
 For ordinary JSON output, pass an output path under `{trial_dir}` to your
 trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`.
-For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT,
-metric_key: eval/loss}` and have the trainer honor the supplied W&B identity.
-Install W&B support with
-`python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"`.
+For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT, metric_key: eval/loss}`,
+have the trainer honor the supplied W&B identity, and install the extra:
+
+```bash
+python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+```
 
 `metric.goal` ranks each trial's selected scalar. Log matching selects the
 last observation by default; W&B selects an exact finished-summary key.
@@ -122,14 +137,7 @@ The trainer owns evaluation, early stopping, checkpoint selection, and
 aggregation. Inheritance transfers parameters, not model weights.
 
 See the [configuration guide](docs/config.md) for input types, reporting,
-credentials, and selection details. Preview one command per phase without
-launching work with `phasesweep run experiment.yaml --dry-run`.
-`phasesweep init` never overwrites an existing file; use `-o PATH` for another
-destination.
-
-The starter uses `storage: auto` under `<workdir>/<experiment>/`. See [runtime
-behavior](docs/runtime.md) for state layout, current-format requirements,
-locks, cleanup, GPU isolation, and resume. The [Tiny Decoder Enwik8
+credentials, and selection details. The [Tiny Decoder Enwik8
 example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer
 integration.
 

@@ -24,32 +24,39 @@ mypy src
 scripts/check_installed_wheel.sh
 ```
 
-Run `pytest` by itself, with no concurrent lint, type check, or build job:
-process-supervision and timeout tests are timing-sensitive. The installed-wheel
-script builds and installs into a temporary location, verifies the package and
-console entry points outside the checkout, and exercises the starter's
-validation, dry run, execution, replay, and catalog scaffolding. It leaves no
-acceptance artifacts in the repository.
+> [!IMPORTANT]
+> Run `pytest` by itself, with no concurrent lint, type check, or build job:
+> process-supervision and timeout tests are timing-sensitive.
+
+The installed-wheel script builds and installs into a temporary location,
+verifies the package and console entry points outside the checkout, and
+exercises the starter's validation, dry run, execution, replay, and catalog
+scaffolding. It leaves no acceptance artifacts in the repository.
 
 ### Git hooks
 
 The [hook configuration](../.pre-commit-config.yaml) calls the tools installed
-in the active environment and builds none of its own. The development extra
-provides `pre-commit` and `pathlint`; after installing it, enable the hooks once
-per clone:
+in the active environment and builds none of its own, so commit from a shell
+with that environment active. The development extra provides `pre-commit` and
+`pathlint`; after installing it, enable the hooks once per clone:
 
 ```bash
 pre-commit install
 ```
 
-Each commit runs `ruff check --fix`, `ruff format`, `pathlint` on changed
-`src/` and `tests/` Python files, and three contract tests:
-`tests/test_ledger_contract.py`, `tests/test_error_routing.py`, and
-`tests/test_tier_guard.py`. When the maintainer script
-`~/scripts/py/doc_check.py` exists, `doc-check` also runs it with `--strict` on
-changed `src/` files; otherwise the hook prints that it skipped. Each push runs
-`mypy src`. Commit from a shell with that environment active. When Ruff
-rewrites a file, the commit stops; stage the fix and commit again.
+| Hook | Stage | Runs on |
+| --- | --- | --- |
+| `ruff check --fix`, `ruff format` | commit | changed Python files |
+| `pathlint` | commit | changed `src/` and `tests/` Python files |
+| `doc-check` | commit | changed `src/` files, with `--strict` |
+| contract tests | commit | every commit |
+| `mypy src` | push | the whole package |
+
+The contract tests are `tests/test_ledger_contract.py`,
+`tests/test_error_routing.py`, and `tests/test_tier_guard.py`. `doc-check` runs
+the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the
+hook prints that it skipped. When Ruff rewrites a file, the commit stops; stage
+the fix and commit again.
 
 `pre-commit run --all-files` runs the commit hooks over the whole tree;
 add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain
@@ -65,14 +72,17 @@ pytest -m "not hardware and not integration"   # fast review tier
 pytest -m "integration and not hardware"       # integration tier only
 ```
 
+> [!NOTE]
+> A `-m` on the command line *replaces* the `-m 'not hardware'` in `addopts`
+> rather than adding to it, which is why both commands above spell out
+> `not hardware`.
+
 A test is `@pytest.mark.integration` when it spawns real processes, waits on
 wall-clock time, drives a multi-step durable recovery workflow, or is otherwise
 slow; everything else stays in the fast tier. `tests/tiers.py` recognizes the
 process and wall-clock primitives statically and `tests/conftest.py` fails
 collection when a test uses one without the marker, so the fast tier cannot
-quietly absorb a slow test. Note that a `-m` on the command line *replaces* the
-`-m 'not hardware'` in `addopts` rather than adding to it, which is why both
-commands above spell out `not hardware`.
+quietly absorb a slow test.
 
 GitHub Actions intentionally has one Linux pull-request static-check job for
 Ruff linting, Ruff format checking, mypy, and the same three contract tests the
@@ -153,6 +163,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 | --- | --- |
 | Experiment and phase orchestration | `run`, `phase` |
 | Resume selection and continuation preflight | `resume`, `study_policy`, `guards` |
+| Ledger storage: the only module that constructs Optuna or SQLite storage | `ledger` |
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
 | Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
@@ -169,7 +180,8 @@ The ordinary control flow is:
 ```mermaid
 flowchart TD
     cli["CLI or detached MCP runner"] --> run["run.run_experiment"]
-    run --> phase["phase._run_phase"]
+    run --> preflight["take experiment lock, check and bind artifact root and ledger, claim generation, preflight attempts"]
+    preflight --> phase["phase._run_phase"]
     phase --> optimize["Optuna optimize"]
     optimize --> launch["supervise trainer"]
     launch --> evidence["read configured scalar and gates"]
@@ -196,6 +208,10 @@ flowchart TD
 - `tests/test_storage_urls.py`, `tests/test_locking.py`,
   `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local
   storage, locks, format cutover, and output layout.
+- `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`,
+  `tests/test_error_routing.py`, and `tests/test_tier_guard.py`: the storage
+  chokepoint, read paths and recovery inspection against golden ledger
+  fixtures, operator-action routing, and the integration-marker guard.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots,
   detached launch, status, cancellation, and recovery.
 - `tests/test_init.py` and `tests/test_reporting.py`: starter creation,
@@ -215,4 +231,4 @@ flowchart TD
   provenance.
 - TODO(engine): keep docs/invariants.md in step with the ledger chokepoint; a
   new storage constructor call site fails tests/test_ledger_contract.py and
-  needs a row here.
+  needs a matching entry in that page.
