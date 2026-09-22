@@ -1,0 +1,27 @@
+{
+  "backend": "sqlite",
+  "binding_schema_version": null,
+  "derivation": "Delete artifact_root_binding.json; generations/ is left in place.",
+  "derived_from": "current-sqlite",
+  "expect": {
+    "tree": "root-conflict"
+  },
+  "experiment": "t",
+  "ledger": "ledger/study.db",
+  "modes": [
+    "tree"
+  ],
+  "n_trials": 2,
+  "name": "precutover-unmarked-tree-sqlite",
+  "notes": "Durable artifact state with no format marker at all.",
+  "phases": [
+    "p"
+  ],
+  "produced_by": {
+    "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
+    "optuna": "4.9.0",
+    "phasesweep_git": "v0.3.1-1-gb9933cc",
+    "python": "3.13.15",
+    "sqlite": "3.53.4"
+  }
+}

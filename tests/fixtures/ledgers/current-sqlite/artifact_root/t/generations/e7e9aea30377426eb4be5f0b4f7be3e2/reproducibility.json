@@ -1,0 +1,28 @@
+{
+  "config_fingerprint": "080d399169668cb3d66ea4c6daea6d93ff51a6dcbebb7583257f1269ae9c56e6",
+  "config_snapshot": {
+    "path": "config.snapshot.yaml",
+    "sha256": "7f55e0878de5b4c6337f9d0ee5fdbd5bace8948cd156af3a31a88ff25726c24d"
+  },
+  "experiment": "t",
+  "generation_id": "e7e9aea30377426eb4be5f0b4f7be3e2",
+  "generation_id_source": "engine",
+  "phase_config_fingerprints": [
+    {
+      "name": "p",
+      "sha256": "8fafcf3620928b3e6a68034eb691d8321e814371772d75e97c79d666c544a2d0"
+    }
+  ],
+  "phasesweep_version": "0.3.2.dev1+gb9933cc87",
+  "provenance": {
+    "revision": "golden-fixture-v1"
+  },
+  "schema_version": 2,
+  "schema_versions": {
+    "experiment_fingerprint": 5,
+    "generation_summary": 3,
+    "phase_fingerprint": 6,
+    "reproducibility": 2,
+    "study_storage": 3
+  }
+}

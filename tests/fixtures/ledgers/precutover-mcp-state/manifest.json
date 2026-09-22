@@ -1,0 +1,23 @@
+{
+  "backend": null,
+  "binding_schema_version": null,
+  "derivation": "Delete mcp_state/.phasesweep-format.json from a populated run store.",
+  "derived_from": null,
+  "expect": {},
+  "experiment": "t",
+  "ledger": null,
+  "modes": [],
+  "n_trials": 2,
+  "name": "precutover-mcp-state",
+  "notes": "Durable MCP run-store state with no format marker; RunStore refuses to open it.",
+  "phases": [
+    "p"
+  ],
+  "produced_by": {
+    "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
+    "optuna": "4.9.0",
+    "phasesweep_git": "v0.3.1-1-gb9933cc",
+    "python": "3.13.15",
+    "sqlite": "3.53.4"
+  }
+}
