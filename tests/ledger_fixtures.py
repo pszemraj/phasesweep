@@ -22,8 +22,12 @@ import yaml
 
 from phasesweep import load_experiment
 from phasesweep.config import Experiment
-from phasesweep.engine.artifact_roots import _artifact_root_binding_payload
+from phasesweep.engine.artifact_roots import (
+    _artifact_root_binding_payload,
+    _artifact_root_identity,
+)
 from phasesweep.engine.paths import _artifact_root_binding_path
+from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
 from tests.fixtures.make_ledger_fixtures import (
     LEDGER_FILENAME,
     experiment_payload,
@@ -215,6 +219,47 @@ def _rebind(experiment: Experiment, schema_version: int | None) -> None:
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _rebind_studies(experiment: Experiment, ledger: Path, backend: str) -> None:
+    """Point a copied ledger's study root bindings at the copied artifact root.
+
+    The reverse half of :func:`_rebind`. Each study records the absolute root
+    it publishes into, so a copied study still names the generation-time tree,
+    and a reader that checks per-study ownership would refuse the copy for a
+    reason unrelated to the format boundary under test. Only that recorded
+    value is rewritten. SQLite gets a single ``UPDATE``, and each journal op
+    is re-encoded exactly as Optuna writes it, so everything else stays
+    byte-identical.
+
+    :param Experiment experiment: Experiment owning the copied artifact root.
+    :param Path ledger: Copied ``study.db`` or ``study.journal``.
+    :param str backend: ``"sqlite"`` or ``"journal"``.
+    """
+    root = _artifact_root_identity(experiment)
+    if backend == "sqlite":
+        conn = sqlite3.connect(ledger)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE study_user_attributes SET value_json = ? WHERE key = ?",
+                    (json.dumps(root), ARTIFACT_ROOT_ATTR),
+                )
+        finally:
+            conn.close()
+        return
+    lines = ledger.read_text(encoding="utf-8").splitlines(keepends=True)
+    rebound: list[str] = []
+    for line in lines:
+        if ARTIFACT_ROOT_ATTR in line:
+            op = json.loads(line)
+            attrs = op.get("user_attr")
+            if "trial_id" not in op and isinstance(attrs, dict) and ARTIFACT_ROOT_ATTR in attrs:
+                attrs[ARTIFACT_ROOT_ATTR] = root
+                ending = line[len(line.rstrip("\n")) :]
+                line = json.dumps(op, separators=(",", ":")) + ending
+        rebound.append(line)
+    ledger.write_text("".join(rebound), encoding="utf-8")
+
+
 def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
     """Copy one fixture into ``tmp_path`` and build the config that reads it.
 
@@ -253,6 +298,7 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
     )
     if mode == "tree":
         _rebind(experiment, fixture.manifest["binding_schema_version"])
+        _rebind_studies(experiment, root / "ledger" / LEDGER_FILENAME[backend], backend)
     return Materialized(
         root=root,
         experiment=experiment,

@@ -13,7 +13,10 @@ what old bytes look like.
 preflight legitimately needs live ``Study`` objects, so it is not under the
 constructor ban. Its invariant is "validate before open, and refuse a
 pre-cutover ledger with the bytes unchanged", which it now satisfies by going
-through the ledger handle like every other read path.
+through the ledger handle like every other read path. Because it reaps through
+those live studies, it also refuses any study bound to another artifact root.
+That makes its ``ledger-only`` verdict over a current ledger a refusal where
+every pure read says ``ok``.
 """
 
 from __future__ import annotations
@@ -88,6 +91,14 @@ READ_PATHS = (*PURE_READ_PATHS, RECOVERY_READ_PATH)
 #: Operator-facing phrases that identify a refusal on a text-only surface.
 _SCHEMA_MISMATCH_PHRASE = "local storage ledger contains pre-cutover"
 _ROOT_CONFLICT_PHRASES = ("uses unsupported pre-cutover", "contains pre-cutover PhaseSweep state")
+_STUDY_OWNED_ELSEWHERE_PHRASE = "publishes into artifact root"
+
+#: The verdict recovery owes a ``ledger-only`` cell that every pure read path
+#: accepts. Recovery alone checks which artifact root owns each study it opens,
+#: because it reaps through them. A ``ledger-only`` read points the ledger at a
+#: workdir that never existed, so each study the ledger's own run bound belongs
+#: to another root, and recovering from there must refuse to touch it.
+_RECOVERY_LEDGER_ONLY_VERDICTS = {"ok": "study-owned-elsewhere"}
 
 
 def _classify_exception(exc: BaseException) -> str:
@@ -108,12 +119,15 @@ def _classify_message(message: str) -> str:
     """Map an operator-facing diagnostic to its fixture verdict.
 
     :param str message: Rendered diagnostic from the CLI boundary or recovery.
-    :return str: ``"schema-mismatch"``, ``"root-conflict"``, or ``"unclassified"``.
+    :return str: ``"schema-mismatch"``, ``"root-conflict"``,
+        ``"study-owned-elsewhere"``, or ``"unclassified"``.
     """
     if _SCHEMA_MISMATCH_PHRASE in message:
         return "schema-mismatch"
     if any(phrase in message for phrase in _ROOT_CONFLICT_PHRASES):
         return "root-conflict"
+    if _STUDY_OWNED_ELSEWHERE_PHRASE in message:
+        return "study-owned-elsewhere"
     return f"unclassified: {message}"
 
 
@@ -242,6 +256,8 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
     materialized = materialize(fixture_name, tmp_path, mode=mode)
 
     if read_path == RECOVERY_READ_PATH:
+        if mode == "ledger-only":
+            expected = _RECOVERY_LEDGER_ONLY_VERDICTS.get(expected, expected)
         verdict = _recover_inspect_verdict(materialized, tmp_path)
     else:
         attempts = forbid_file_backed_storage(monkeypatch)

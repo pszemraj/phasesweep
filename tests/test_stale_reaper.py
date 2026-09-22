@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import json
 import os
 import signal
@@ -65,6 +66,8 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
+from phasesweep.mcp.recovery import RunRecoveryError, recover_run
+from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
@@ -87,6 +90,8 @@ from tests.conftest import (
     patch_rejected_trial_user_attr,
     write_trainer,
 )
+from tests.ledger_fixtures import _write_config
+from tests.mcp_helpers import make_run_handle
 
 
 def _write_test_process_identity(
@@ -1252,6 +1257,61 @@ def test_exited_attempt_recovers_without_signalling(
 
     assert _reap_stale_trials(study, exp, "p") == 1
     assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
+
+
+def test_recovery_refuses_a_study_bound_to_another_artifact_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovering one workdir never reaps trials another workdir's run owns.
+
+    Workdir B's run bound ``t::p`` to root B and left a reapable RUNNING trial.
+    A run from workdir A on the same ledger was refused at claim, so tree A is
+    still unbound and its format checks pass. Recovering that run opens
+    ``t::p`` live; without the per-study ownership check ``claim_ledger``
+    applies, it would reap B's trial. It must refuse in the engine's own words
+    instead, leaving the shared ledger untouched.
+    """
+    ledger_dir = tmp_path / "shared-ledger"
+    ledger_dir.mkdir()
+    owner = _write_config(
+        tmp_path / "b.yaml", backend="sqlite", ledger_dir=ledger_dir, workdir=tmp_path / "b"
+    )
+    config_a = tmp_path / "a.yaml"
+    recovering = _write_config(
+        config_a, backend="sqlite", ledger_dir=ledger_dir, workdir=tmp_path / "a"
+    )
+    study, trial_dir, owned_number = _fabricate_stale_running_trial(
+        owner, "p", attempt_id="b-attempt"
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id="b-attempt", state="allocated")
+    ledger_file = ledger_dir / "study.db"
+    before = ledger_file.read_bytes()
+
+    state_dir = tmp_path / "mcp-state"
+    store = RunStore(state_dir)
+    run_id = "a-refused-run"
+    config_bytes = config_a.read_bytes()
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=recovering.experiment,
+        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(config_bytes)
+    store.mark_cleanup_uncertain(handle)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *_a, **_k: True)
+
+    with pytest.raises(RunRecoveryError) as excinfo:
+        recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
+
+    states = {trial.number: trial.state for trial in study.get_trials(deepcopy=False)}
+    assert states[owned_number] == optuna.trial.TrialState.RUNNING
+    assert ledger_file.read_bytes() == before
+    assert isinstance(excinfo.value.__cause__, ArtifactRootConflictError)
+    assert str(excinfo.value) == str(excinfo.value.__cause__)
+    assert f"publishes into artifact root {str(_experiment_dir(owner))!r}" in str(excinfo.value)
 
 
 def _fabricate_registered_attempt(

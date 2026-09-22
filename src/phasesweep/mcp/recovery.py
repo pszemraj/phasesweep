@@ -12,7 +12,10 @@ from typing import Any, ClassVar
 import optuna
 
 from phasesweep.config import Experiment
-from phasesweep.engine.artifact_roots import _check_published_phase_studies
+from phasesweep.engine.artifact_roots import (
+    _check_published_phase_studies,
+    _check_study_artifact_root,
+)
 from phasesweep.engine.attempts import (
     _inspect_active_attempts,
     _preflight_active_attempts,
@@ -508,14 +511,21 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
 
     Validation comes first and is read-only, so recovery refuses a tree bound
     to another ledger, or a pre-cutover ledger, before it opens anything and
-    without changing a byte. Those two refusals are rewrapped rather than
-    rebuilt: the engine's own message is already the operator's instruction,
-    and ``rewrap`` carries its remediation across the layer boundary intact.
+    without changing a byte. Each opened study then passes the read-only
+    ownership half of the check a run's claim applies, because recovery reaps
+    and tells trials through these live objects: a study bound to another
+    artifact root belongs to that root's runs, and recovering this tree must
+    not touch it. A study with no root claim yet is left unclaimed; recovery
+    never claims.
+    These refusals are rewrapped rather than rebuilt: the engine's own message
+    is already the operator's instruction, and ``rewrap`` carries its
+    remediation across the layer boundary intact.
 
     :param Experiment config: Experiment defining phase names and storage locations.
     :param _RecoveryNeeds needs: Recovery decisions that may require published-history checks.
-    :raises RunRecoveryError: The ledger is refused, or required storage or
-        published studies cannot be read.
+    :raises RunRecoveryError: The ledger is refused, a phase study belongs to
+        another artifact root, or required storage or published studies cannot
+        be read.
     :return dict[str, optuna.Study]: Loadable phase studies keyed by phase name.
     """
     unavailable_remedy = (
@@ -535,6 +545,10 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
         except StudyStorageUnavailableError as exc:
             raise RunRecoveryError(f"{exc}{unavailable_remedy}") from exc
         if study is not None:
+            try:
+                _check_study_artifact_root(study, config)
+            except ArtifactRootConflictError as exc:
+                raise RunRecoveryError.rewrap(exc, str(exc)) from exc
             loaded_studies[phase.name] = study
     if needs.ownership_storage_unavailable:
         try:

@@ -303,9 +303,9 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
         trials, so claiming the offered root is safe; ``False`` when it already
         records exactly that root.
     :raises ArtifactRootConflictError: The study is already bound to a different
-        artifact root, or carries a binding that is not a string.
+        artifact root, carries a binding that is not a string, or holds trials
+        without recording any root.
     """
-    offered = _artifact_root_identity(experiment)
     if ARTIFACT_ROOT_ATTR not in study.user_attrs:
         trial_count = len(study.get_trials(deepcopy=False))
         if trial_count:
@@ -316,9 +316,30 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
                 "environment to operate the existing state. Nothing was written."
             )
         return True
+    _check_study_artifact_root(study, experiment)
+    return False
+
+
+def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
+    """Refuse a study that records an artifact root other than this config's.
+
+    The ownership half of :func:`_artifact_root_claim_needed`, split out for
+    callers that use existing studies without ever claiming one (MCP recovery
+    reaps through them). A study that records no root passes, because it is
+    not bound to anyone else; whether it may be claimed is the claim's
+    question, not this one.
+
+    :param optuna.Study study: Phase study whose recorded binding is inspected.
+    :param Experiment experiment: Parsed experiment supplying the artifact root.
+    :raises ArtifactRootConflictError: The study is bound to a different
+        artifact root, or carries a binding that is not a string.
+    """
+    if ARTIFACT_ROOT_ATTR not in study.user_attrs:
+        return
+    offered = _artifact_root_identity(experiment)
     bound = study.user_attrs[ARTIFACT_ROOT_ATTR]
     if bound == offered:
-        return False
+        return
     raise ArtifactRootConflictError(
         f"Study {study.study_name!r} publishes into artifact root {bound!r}, but this "
         f"config offers {offered!r}. One persistent study backs exactly one publication "

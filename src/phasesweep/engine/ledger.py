@@ -105,10 +105,17 @@ class ValidatedLedger:
     (:attr:`format_verified` is ``False``) and proves only the binding check.
     Read paths need nothing more, so this handle is all they take.
 
-    It is deliberately *not* enough to open a live study for writing. That
-    needs a bound tree and root-claimed studies, which only a
-    :class:`ClaimedLedger` records; the type split is what stops a read path
-    from reaching an opener that mutates.
+    It is deliberately *not* enough to create or open a study to run trials
+    in. That needs a bound tree and root-claimed studies, which only a
+    :class:`ClaimedLedger` records, and :func:`open_phase_study` accepts
+    nothing else. The type split does not keep this handle away from live
+    storage, though: :func:`open_existing_study` takes it and returns a live,
+    writable study. Pure read paths never call that opener; they read through
+    :func:`read_phase_trial_stats`, which never constructs file-backed storage.
+    Outside this module, the one caller that opens existing studies live on
+    this handle is MCP recovery. Because it reaps and tells trials through
+    them, it applies the per-study artifact-root ownership check itself before
+    it uses any.
     """
 
     #: The exact config this handle was validated for. Study names, samplers,
@@ -147,8 +154,8 @@ class ClaimedLedger(ValidatedLedger):
     last write: :func:`claim_ledger` took a :class:`ValidatedLedger`, found
     every existing phase study in one strict pass, wrote the tree's ownership
     record, and only then claimed each study's artifact root. It is the only
-    handle :func:`open_phase_study` accepts, so live storage cannot be opened
-    for writing before that order completes.
+    handle :func:`open_phase_study` accepts, so no study can be created or
+    opened to run trials in before that order completes.
     """
 
     #: Every existing declared phase study, keyed by phase name, from the one
@@ -909,6 +916,15 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
     order, so no caller can load a study out of a ledger this release refuses.
     A handle whose scan did not complete is refused for the same reason: the
     study it would open sits in a ledger nothing has format-checked.
+
+    The study returned is live: it is built on the ledger's real backend and
+    can be written through, so this is not a read path's opener (those use
+    :func:`read_phase_trial_stats`). It never creates a study or a ledger
+    file, because absence is settled first by a read-only probe (SQLite
+    ``mode=ro``, or a complete journal snapshot). It checks nothing about
+    which artifact root owns the study. Its two callers do that before they
+    use the study: :func:`claim_ledger` before its first write, and MCP
+    recovery before it reaps anything.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param Phase | str phase: Phase or historical phase name whose study is opened.
