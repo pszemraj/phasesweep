@@ -36,12 +36,49 @@ from phasesweep.config import (
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import _read_proc_stat
+from tests.tiers import flagged_tests
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
 REPO = Path(__file__).resolve().parent.parent
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
+
+
+def pytest_collection_modifyitems(session, config, items) -> None:
+    """Refuse collection when a test spawns processes or sleeps without the integration marker.
+
+    The fast review tier is a marker expression, so it is only trustworthy if
+    every test that spawns a real process or waits on the wall clock actually
+    carries ``@pytest.mark.integration``. ``tests/tiers.py`` recognizes those
+    primitives statically; this hook applies it to whatever was collected and
+    fails loudly rather than letting an unmarked slow test silently slip into
+    the fast tier. There is no escape hatch: a test that matches the rules is
+    an integration test, and a test that should not match should stop using the
+    primitive.
+    """
+    scanned: dict[Path, dict[str, str]] = {}
+    offenders: dict[tuple[Path, str], str] = {}
+    for item in items:
+        if item.get_closest_marker("integration") or item.get_closest_marker("hardware"):
+            continue
+        module_path = getattr(item, "path", None)
+        if module_path is None or module_path.suffix != ".py":
+            continue
+        if module_path not in scanned:
+            scanned[module_path] = flagged_tests(module_path)
+        test_name = getattr(item, "originalname", None) or item.name
+        reason = scanned[module_path].get(test_name)
+        if reason is not None:
+            offenders.setdefault((module_path, test_name), f"{item.nodeid}: {reason}")
+    if offenders:
+        listed = "\n  ".join(offenders[key] for key in sorted(offenders))
+        raise pytest.UsageError(
+            "unmarked integration tests:\n  "
+            + listed
+            + "\n\nAdd @pytest.mark.integration (see docs/development.md, "
+            "'Quality gates') or stop using the primitive."
+        )
 
 
 def raise_after_first_successful_call(
