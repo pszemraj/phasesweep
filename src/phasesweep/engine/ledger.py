@@ -1,23 +1,47 @@
 """The single storage chokepoint: every Optuna/SQLite storage object is built here.
 
-No other module in ``phasesweep`` may name ``optuna.create_study``,
-``optuna.load_study``, ``RDBStorage``, ``JournalFileBackend``, or
-``sqlite3.connect``; ``tests/test_ledger_contract.py`` enforces that statically.
-Concentrating the constructors here is what makes the durability invariants
-checkable, because every path that touches a ledger has to come through this
-module and therefore through its fixed order:
+No other module in ``phasesweep`` may construct storage. It may not name
+``optuna.create_study``, ``optuna.load_study``, ``RDBStorage``,
+``JournalStorage`` or its file backend, ``sqlalchemy.create_engine``, or
+``sqlite3.connect``, and it may not call ``optuna.Study``.
+``tests/test_ledger_contract.py`` enforces that statically and holds the full
+list. Concentrating the constructors here is what makes the durability
+invariants checkable: every path that touches a ledger goes through this
+module's handles, in one fixed order.
 
-1. Take the experiment lock before touching any durable state.
-2. Validate read-only before writing anything: the artifact-root binding check
-   first (no writes, no storage), then the ledger format scan, then the tree
-   binding is written, then existing studies are claimed, and only then is live
-   file-backed storage opened.
-3. Pure read paths stop after step 2's scan: they never create a study and
-   never construct file-backed storage.
+1. Only mutating callers take the experiment lock, and they take it first.
+   There are two: a run (:func:`phasesweep.engine.run.run_experiment`, from
+   the CLI or the MCP runner, including its post-run reconciliation) and a
+   ``recover-run`` the operator confirms. ``status``, ``show-winners``, live
+   MCP reads, and ``recover-run`` inspection hold no lock, which is why
+   everything they reach writes nothing. A dry run reads no ledger at all: it
+   previews on an in-memory study (:func:`open_preview_study`).
+2. :func:`validate_ledger` checks the artifact-root binding, then scans the
+   ledger's format, writing nothing and constructing no file-backed storage.
+   On a bound tree an unreadable scan is tolerated and recorded on the
+   :class:`ValidatedLedger` it returns.
+3. Pure read paths stop there and read trial data through
+   :func:`read_phase_trial_stats`.
+4. :func:`claim_ledger` rescans strictly if the scan did not complete. It then
+   discovers every existing phase study by opening it on live storage
+   (:func:`open_existing_study`), checks each study's artifact root, re-reads
+   the tree binding, and only then writes: the tree binding first, then each
+   empty study's root claim. Discovery therefore opens live storage *before*
+   the claim. Only creating or opening a study to run trials in comes after
+   it, through :func:`open_phase_study`, which accepts nothing but the
+   :class:`ClaimedLedger` the claim returns.
 
-Read-only inspection uses SQLite ``mode=ro`` URIs and replayed journal
-snapshots (:class:`_JournalSnapshot`), never a live backend, so a status poll
-can never initialize, stamp, or recover a ledger it was only meant to observe.
+Outside this module, MCP recovery is the one caller that opens existing
+studies live on a :class:`ValidatedLedger`. It never claims, and it refuses a
+study bound to another artifact root before it reaps anything. A run's
+attempt-registry recovery reaches a foreign ledger only through
+:func:`open_registry_study`, which scans that ledger's format first and never
+creates it.
+
+Pure reads, the format scan, and every existence probe use SQLite ``mode=ro``
+URIs and replayed journal snapshots (:class:`_JournalSnapshot`), never a live
+backend, so a status poll can never initialize, stamp, or recover a ledger it
+was only meant to observe.
 """
 
 from __future__ import annotations

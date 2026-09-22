@@ -1,7 +1,7 @@
 """Every read path, against every golden ledger, writes nothing and refuses honestly.
 
 Two durability invariants meet here. A read path never creates a study, never
-constructs file-backed storage, and opens SQLite ``mode=ro`` (invariant 4); and
+constructs file-backed storage, and opens SQLite ``mode=ro`` (invariant 6); and
 it validates the artifact-root binding and then the ledger format *before* any
 bind, claim, or open, leaving the bytes untouched when it refuses (invariant 2).
 The golden fixtures under ``tests/fixtures/ledgers`` supply the pre-cutover

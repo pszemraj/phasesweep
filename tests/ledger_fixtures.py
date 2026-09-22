@@ -321,7 +321,7 @@ def ledger_file(materialized: Materialized, backend: str) -> Path:
 def forbid_file_backed_storage(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Make any file-backed storage construction fail, and record every attempt.
 
-    Durability invariant 4: a read path never creates a study and never builds
+    Durability invariant 6: a read path never creates a study and never builds
     file-backed storage, and its SQLite reads open the database ``mode=ro``.
     Three constructors can break that -- ``RDBStorage`` (which runs
     ``metadata.create_all`` and a version manager on open), ``JournalFileBackend``
