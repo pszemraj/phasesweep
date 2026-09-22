@@ -142,6 +142,21 @@ class RunResultSnapshotUnavailableError(McpToolError):
         )
 
 
+class RunPersistentStateUnavailableError(McpToolError):
+    """Raised when a live run's configured persistent state cannot be read safely."""
+
+    def __init__(self, run_id: str) -> None:
+        """Create a redacted persistent-state read failure.
+
+        :param str run_id: MCP run id whose configured study state is unreadable.
+        """
+        super().__init__(
+            f"run {run_id!r} cannot be read safely because its persistent study state is "
+            "unavailable or incompatible. Report this to the operator; do not retry, "
+            "launch a replacement, or substitute experiment-level results."
+        )
+
+
 class ExperimentBusyError(McpToolError):
     """Raised when a second launch is attempted while a run is already live."""
 
@@ -256,6 +271,7 @@ class ResumeNotReadyError(McpToolError):
         """
         super().__init__(
             f"cannot resume {experiment_id!r} from phase {from_phase!r}: "
-            f"earlier phase {missing_phase!r} {reason}. Call get_run_results "
-            "for the experiment and resume only after every earlier phase has a winner."
+            f"earlier phase {missing_phase!r} {reason}. Call get_latest_run({experiment_id!r}) "
+            "first; if it finds a run, call get_run_results with its run_id. Resume only after "
+            "every earlier phase has a winner."
         )

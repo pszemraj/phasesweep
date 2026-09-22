@@ -9,10 +9,10 @@ import logging
 import os
 import secrets
 import stat
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Any
+from typing import IO
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 from phasesweep.errors import LockBusyError, PhaseSweepError
@@ -34,7 +34,7 @@ SHARED_FILE_MODE = 0o660
 def ensure_artifact_dir(path: Path) -> None:
     """Create a self-ignoring artifact namespace without replacing its ignore file.
 
-    :param Path path: Managed experiment or suite directory, not its shared workdir.
+    :param Path path: Managed experiment directory, not its shared workdir.
     """
     path.mkdir(parents=True, exist_ok=True)
     try:
@@ -1131,21 +1131,18 @@ def storage_backend(storage: str | None) -> str | None:
     """Return the logical backend name for an Optuna storage URL.
 
     Args:
-        storage: An Optuna storage URL (e.g. ``"sqlite:///x.db"``,
-            ``"journal:///x.journal"``, ``"postgresql+psycopg2://..."``),
-            or ``None`` for in-memory storage.
+        storage: An Optuna storage URL (e.g. ``"sqlite:///x.db"`` or
+            ``"journal:///x.journal"``), or ``None`` for in-memory storage.
 
     Returns:
-        The dialect-collapsed scheme (``"sqlite"``, ``"journal"``,
-        ``"postgresql"``, ...), or ``None`` if ``storage`` is ``None``.
+        The dialect-collapsed scheme (``"sqlite"`` or ``"journal"``), or
+        ``None`` if ``storage`` is ``None``.
 
     Examples:
         >>> storage_backend("sqlite:///x.db")
         'sqlite'
         >>> storage_backend("sqlite+pysqlite:///x.db")
         'sqlite'
-        >>> storage_backend("postgresql+psycopg2://user@host/db")
-        'postgresql'
         >>> storage_backend("journal:///x.journal")
         'journal'
         >>> storage_backend(None) is None
@@ -1287,7 +1284,7 @@ def storage_is_in_memory(storage: str | None) -> bool:
     """Return whether ``storage`` names an in-memory Optuna backend.
 
     :param str | None storage: Optuna storage URL, SQLite sentinel, or ``None``.
-    :return bool: ``True`` when the storage has no durable file or external backend.
+    :return bool: ``True`` when the storage has no durable file-backed ledger.
     """
     if storage is None:
         return True
@@ -1365,10 +1362,7 @@ def storage_recovery_locator(storage: str | None) -> str | None:
 
     Relative SQLite and journal paths are invocation-relative. Active-attempt
     recovery can happen after the caller changes directories, so the durable
-    locator must resolve those paths while the attempt is registered. RDB URLs
-    are returned unchanged because their credentials and connection options are
-    operationally significant; callers persisting the result must use private
-    storage.
+    locator must resolve those paths while the attempt is registered.
 
     :param str | None storage: Configured Optuna storage URL.
     :return str | None: Operationally equivalent locator with file paths made
@@ -1382,12 +1376,9 @@ def storage_recovery_locator(storage: str | None) -> str | None:
         path = Path(file_url_path(storage)).expanduser().resolve()
         return local_storage_url(path, "journal")
     if backend != "sqlite":
-        return storage
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
 
-    from sqlalchemy.engine.url import make_url
-
-    url = make_url(storage)
-    database = url.database or ""
+    database = file_url_path(storage)
     if _sqlite_uri_filename_enabled(storage, database):
         uri_path = sqlite_uri_filename_path(storage)
         if uri_path is None:
@@ -1396,333 +1387,9 @@ def storage_recovery_locator(storage: str | None) -> str | None:
         frozen_database = "file:" + quote(str(Path(uri_path).resolve()), safe="/")
     else:
         frozen_database = str(Path(database).resolve())
-    return url.set(database=frozen_database).render_as_string(hide_password=False)
-
-
-# Default TCP ports per RDB dialect family, so `host/db` and `host:5432/db`
-# share one lock identity. Families absent here keep no port segment when the
-# URL omits the port.
-_RDB_DEFAULT_PORTS = {
-    "postgresql": 5432,
-    "mysql": 3306,
-    "mariadb": 3306,
-    "mssql": 1433,
-    "oracle": 1521,
-}
-
-# Query options that configure *how* we connect, not *what* we connect to.
-# Keep this policy conservative: wrongly excluding a target selector could
-# make different ledgers share both a lock and an artifact-root ownership key,
-# while retaining an unknown connection option only splits one target's identity.
-_RDB_CONNECTION_ONLY_OPTIONS = frozenset(
-    {
-        "applicationname",
-        "authentication",
-        "charset",
-        "driver",
-        "encrypt",
-        "hostnameincertificate",
-        "integratedsecurity",
-        "servercertificate",
-        "sslcert",
-        "sslkey",
-        "sslmode",
-        "sslrootcert",
-        "targetsessionattrs",
-        "tlsversion",
-        "trustedconnection",
-        "trustservercertificate",
-    }
-)
-_RDB_CONNECTION_ONLY_OPTION_PREFIXES = ("keepalives",)
-_RDB_CONNECTION_ONLY_OPTION_SUFFIXES = ("timeout",)
-
-# Authentication selects how a client reaches an RDB target, not which
-# database ledger it reaches. Normalize common spellings after stripping
-# punctuation so top-level URL parameters and nested ODBC fields share one
-# case-insensitive policy.
-_RDB_CREDENTIAL_OPTION_NAMES = frozenset(
-    {
-        "accesstoken",
-        "apikey",
-        "authtoken",
-        "passfile",
-        "password",
-        "passwd",
-        "pwd",
-        "token",
-        "uid",
-        "user",
-        "userid",
-        "username",
-    }
-)
-_RDB_CREDENTIAL_OPTION_SUFFIXES = ("password", "secret", "token")
-
-# Conventional target-selector order keeps identities readable while making
-# nested ODBC field order immaterial. Unknown retained fields follow these in
-# case-insensitive lexical order.
-_ODBC_TARGET_OPTION_ORDER = {
-    "dsn": 0,
-    "server": 1,
-    "host": 1,
-    "address": 1,
-    "addr": 1,
-    "networkaddress": 1,
-    "port": 2,
-    "instance": 3,
-    "database": 4,
-    "initialcatalog": 4,
-    "socket": 5,
-    "schema": 6,
-    "currentschema": 6,
-    "searchpath": 6,
-}
-
-
-def _normalize_rdb_option_name(key: str) -> str:
-    """Normalize an RDB option name for case-insensitive policy matching.
-
-    :param str key: Top-level query key or nested ODBC field name.
-    :return str: Lowercase alphanumeric option name.
-    """
-    return "".join(character for character in key.casefold() if character.isalnum())
-
-
-def _is_connection_only_rdb_option(key: str) -> bool:
-    """Return whether an RDB URL query key configures the connection, not the target.
-
-    :param str key: Query parameter name from an RDB storage URL.
-    :return bool: True when the option must be excluded from lock identity.
-    """
-    normalized = _normalize_rdb_option_name(key)
-    return (
-        normalized in _RDB_CONNECTION_ONLY_OPTIONS
-        or normalized.startswith(_RDB_CONNECTION_ONLY_OPTION_PREFIXES)
-        or normalized.endswith(_RDB_CONNECTION_ONLY_OPTION_SUFFIXES)
-    )
-
-
-def _is_rdb_credential_option(key: str) -> bool:
-    """Return whether a URL or DSN key carries authentication material.
-
-    :param str key: Top-level query key or nested ODBC field name.
-    :return bool: True when the key must not participate in target identity.
-    """
-    normalized = _normalize_rdb_option_name(key)
-    return normalized in _RDB_CREDENTIAL_OPTION_NAMES or normalized.endswith(
-        _RDB_CREDENTIAL_OPTION_SUFFIXES
-    )
-
-
-def _split_odbc_fields(value: str) -> list[str]:
-    """Split an ODBC connection string without splitting braced values.
-
-    A brace starts quoting only immediately after a field's first ``=``.
-    Inside a braced value, ``}}`` is an escaped closing brace.
-
-    :param str value: Decoded ``odbc_connect`` query value.
-    :return list[str]: Raw ``key=value`` fields in source order.
-    :raises ValueError: A braced field value is unterminated.
-    """
-    fields: list[str] = []
-    field_start = 0
-    in_braces = False
-    saw_separator = False
-    value_started = False
-    index = 0
-    while index < len(value):
-        character = value[index]
-        if in_braces:
-            if character == "}":
-                if index + 1 < len(value) and value[index + 1] == "}":
-                    index += 1
-                else:
-                    in_braces = False
-        elif character == ";":
-            fields.append(value[field_start:index])
-            field_start = index + 1
-            saw_separator = False
-            value_started = False
-        elif not saw_separator:
-            if character == "=":
-                saw_separator = True
-        elif not value_started:
-            value_started = True
-            if character == "{":
-                in_braces = True
-        index += 1
-    if in_braces:
-        raise ValueError(
-            "Malformed ODBC storage target: unterminated braced value in odbc_connect."
-        )
-    fields.append(value[field_start:])
-    return fields
-
-
-def _canonical_odbc_field_value(value: str) -> str:
-    """Return one ODBC value in a deterministic brace-safe spelling.
-
-    :param str value: Raw field value following its first ``=``.
-    :return str: Semantically equivalent value with canonical brace escaping.
-    :raises ValueError: A braced value has trailing text or an unescaped brace.
-    """
-    if value.startswith("{"):
-        if not value.endswith("}"):
-            raise ValueError("Malformed ODBC storage target: invalid braced value in odbc_connect.")
-        inner = value[1:-1]
-        decoded: list[str] = []
-        index = 0
-        while index < len(inner):
-            character = inner[index]
-            if character == "}":
-                if index + 1 >= len(inner) or inner[index + 1] != "}":
-                    raise ValueError(
-                        "Malformed ODBC storage target: unescaped closing brace in odbc_connect."
-                    )
-                decoded.append("}")
-                index += 2
-                continue
-            decoded.append(character)
-            index += 1
-        semantic_value = "".join(decoded)
-    else:
-        semantic_value = value
-
-    if (
-        ";" in semantic_value
-        or "}" in semantic_value
-        or semantic_value.startswith("{")
-        or semantic_value != semantic_value.strip()
-    ):
-        return "{" + semantic_value.replace("}", "}}") + "}"
-    return semantic_value
-
-
-def _odbc_identity_value(value: str) -> str:
-    """Canonicalize target fields in an ODBC connection string.
-
-    ODBC values may brace semicolon-containing field values, so splitting on
-    every semicolon would corrupt target selectors such as ``SERVER`` or
-    ``DATABASE``. Braced values and escaped closing braces are decoded and
-    emitted in one canonical spelling. Field names are case-normalized,
-    connection-only and credential fields are removed, and retained target
-    fields are ordered deterministically.
-
-    ODBC uses the first value when a keyword is repeated. Reject duplicate
-    retained target keys instead of sorting them and possibly changing which
-    target wins.
-
-    :param str value: Decoded ``odbc_connect`` query value.
-    :return str: Canonical connection string retaining only target fields.
-    :raises ValueError: A field is malformed or a retained target field occurs
-        more than once.
-    """
-    retained: dict[str, tuple[str, str]] = {}
-    for field in _split_odbc_fields(value):
-        if not field.strip():
-            continue
-        key, separator, field_value = field.partition("=")
-        if not separator:
-            raise ValueError("Malformed ODBC storage target: field without '=' in odbc_connect.")
-        key = key.strip()
-        if _is_rdb_credential_option(key) or _is_connection_only_rdb_option(key):
-            continue
-        canonical_key = _normalize_rdb_option_name(key)
-        if not canonical_key:
-            raise ValueError("Malformed ODBC storage target: empty field name in odbc_connect.")
-        if canonical_key in retained:
-            raise ValueError(
-                "Ambiguous ODBC storage target: duplicate field "
-                f"{key!r} in odbc_connect; specify each target selector once."
-            )
-        retained[canonical_key] = (
-            canonical_key.upper(),
-            _canonical_odbc_field_value(field_value),
-        )
-
-    ordered = sorted(
-        retained.items(),
-        key=lambda item: (
-            _ODBC_TARGET_OPTION_ORDER.get(_normalize_rdb_option_name(item[0]), 100),
-            item[0],
-        ),
-    )
-    canonical_fields = [f"{key}={field_value}" for _, (key, field_value) in ordered]
-    return ";".join(canonical_fields)
-
-
-def _rdb_identity_query_pairs(query: Mapping[str, Any]) -> list[tuple[str, str]]:
-    """Return the identity-bearing query pairs of an RDB URL, in stable order.
-
-    Connection-only and credential options are dropped; target selectors such
-    as libpq's ``host=/var/run/postgresql`` (unix socket), schema options, and
-    non-credential fields inside ``odbc_connect`` are retained.
-
-    :param Mapping[str, Any] query: SQLAlchemy ``URL.query`` mapping; a value may
-        be a tuple when the URL repeats a key.
-    :return list[tuple[str, str]]: Key/value pairs sorted deterministically.
-    """
-    pairs: list[tuple[str, str]] = []
-    for key, value in query.items():
-        if _is_connection_only_rdb_option(key) or _is_rdb_credential_option(key):
-            continue
-        values = value if isinstance(value, tuple | list) else (value,)
-        pairs.extend(
-            (
-                key,
-                _odbc_identity_value(str(item)) if key.lower() == "odbc_connect" else str(item),
-            )
-            for item in values
-        )
-    # Sorting only by key is deliberate: Python's stable sort keeps repeated
-    # target values in their configured order, since failover order may affect
-    # which ledger is reached.
-    return sorted(pairs, key=lambda pair: (pair[0].lower(), pair[0]))
-
-
-def _canonical_rdb_identity(storage: str) -> str:
-    """Canonicalize a non-file RDB URL into a same-host lock identity.
-
-    Equivalent spellings of one database must produce one identity, or the
-    same-host experiment lock silently splits and two orchestrators write the
-    same study (review v0.5.17 / blocker 5). Normalized away: authentication
-    material in the authority, query, or a nested ODBC connection string; the
-    driver
-    (``postgresql``/``postgresql+psycopg``/``postgresql+psycopg2`` collide on
-    the base dialect), host case, a port left implicit when it equals the
-    family default, query-parameter order, and connection-only query options.
-
-    Emitted form (each component percent-encoded so no separator is
-    ambiguous)::
-
-        rdb://<family>://<host>[:<port>]/<database>[?<sorted-query>]
-
-    :param str storage: A non-file Optuna storage URL (``postgresql://...``, ...).
-    :return str: The canonical identity, or ``storage`` unchanged when
-        SQLAlchemy cannot parse it.
-    :raises ValueError: A nested ODBC target repeats a normalized target field
-        or contains malformed field or brace syntax.
-    """
-    # Local import: SQLAlchemy ships with Optuna, but this module is on the
-    # `phasesweep --help` path and importing it costs ~80ms we only owe for
-    # the rare RDB storage URL.
-    from sqlalchemy.engine.url import make_url
-    from sqlalchemy.exc import ArgumentError
-
-    try:
-        url = make_url(storage)
-    except (ArgumentError, ValueError):
-        return storage
-
-    family = url.drivername.split("+", 1)[0].lower()
-    port = url.port if url.port is not None else _RDB_DEFAULT_PORTS.get(family)
-    port_segment = "" if port is None else f":{port}"
-    host = quote((url.host or "").lower(), safe="")
-    database = quote(url.database or "", safe="")
-    query = urlencode(_rdb_identity_query_pairs(url.query))
-    query_segment = f"?{query}" if query else ""
-    return f"rdb://{family}://{host}{port_segment}/{database}{query_segment}"
+    scheme = storage.split(":", 1)[0]
+    query = f"?{storage.split('?', 1)[1]}" if "?" in storage else ""
+    return f"{scheme}:///{frozen_database}{query}"
 
 
 def canonical_storage_identity(storage: str | None) -> str | None:
@@ -1734,28 +1401,17 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     SQLAlchemy dialect (``sqlite+pysqlite:///`` etc.) onto the canonical
     ``sqlite:///`` prefix so dialect choice never splits the lock.
 
-    Non-file RDB URLs (``postgresql://``, ``mysql://``, ...) are canonicalized
-    by :func:`_canonical_rdb_identity`: authentication material, driver suffix,
-    host case, implicit vs. explicit default port, query order, and
-    connection-only query options are all normalized away. DNS aliases and
-    ``CNAME``s, load-balancer or pgbouncer endpoints, ``PGSERVICE`` service
-    files, ``~/.pg_service.conf`` or environment-supplied defaults, and
-    ``localhost`` vs. ``127.0.0.1`` vs. a unix socket are not resolved. Those
-    can reach the same database under different identities, so operators using
-    ``allow_external_rdb_single_host: true`` must still spell the storage URL
-    consistently across configs that share one database.
-
     :param str | None storage: An Optuna storage URL, or ``None`` for in-memory
         storage.
     :return str | None: The canonical identity string used to derive the
         same-host storage lock path, or ``None`` for in-memory storage (no
-        shared backend to collide on). Storage strings SQLAlchemy cannot parse
-        are returned unchanged.
-    :raises ValueError: A nested ODBC target repeats a normalized target field
-        or contains malformed field or brace syntax.
+        shared backend to collide on).
+    :raises ValueError: ``storage`` does not select a retained local backend.
     """
     if storage is None:
         return None
+    if storage_is_in_memory(storage):
+        return "sqlite:///:memory:"
 
     backend = storage_backend(storage)
 
@@ -1782,6 +1438,4 @@ def canonical_storage_identity(storage: str | None) -> str | None:
         path = file_url_path(storage)
         return "journal:///" + str(Path(path).expanduser().resolve())
 
-    # RDB URLs (postgresql, mysql, ...): canonicalize so equivalent spellings of
-    # one database share a lock instead of splitting it (review v0.5.17 / blocker 5).
-    return _canonical_rdb_identity(storage)
+    raise ValueError(f"Unsupported local storage backend: {backend!r}.")

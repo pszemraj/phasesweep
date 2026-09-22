@@ -129,7 +129,7 @@ class SignalOwnershipUnavailableError(RuntimeError):
 
 
 class PhaseSweepShutdown(SystemExit):
-    """SystemExit carrying child process-group cleanup evidence."""
+    """SystemExit carrying cleanup evidence and post-publication state."""
 
     def __init__(self, signum: int, report: ShutdownCleanupReport) -> None:
         """Create a POSIX-style signaled exit with structured cleanup evidence.
@@ -144,6 +144,9 @@ class PhaseSweepShutdown(SystemExit):
         super().__init__(128 + signum)
         self.signum = signum
         self.report = report
+        # The engine sets this only when its post-publication checkpoint
+        # services a shutdown that was absorbed while committing results.
+        self.published_result_committed = False
 
 
 # Python-level shutdown deferral. Kernel signal masks are per-thread, but
@@ -599,9 +602,8 @@ def service_pending_shutdown() -> None:
     """Deliver a shutdown signal absorbed by an earlier one-way commit window.
 
     Explicit checkpoint counterpart to :func:`absorb_shutdown_signals`: a
-    caller that must not start new work after an absorbed shutdown (e.g. the
-    suite loop before its next study) calls this at its decision point. A
-    no-op when nothing is pending.
+    caller that must not start new work after an absorbed shutdown calls this
+    at its decision point. A no-op when nothing is pending.
 
     Raises:
         PhaseSweepShutdown: Via ``_shutdown_handler``, when an absorbed
@@ -1060,8 +1062,8 @@ def read_attempt_lifecycle(
         expected_attempt_id: Attempt identity stored on the Optuna trial.
 
     Returns:
-        The validated record, or ``None`` when no record exists (legacy
-        attempts written before this schema).
+        The validated record, or ``None`` when no record exists. Current
+        recovery callers decide whether absence is safe for their state.
 
     Raises:
         ValueError: The record is malformed, uses an unknown schema or state,

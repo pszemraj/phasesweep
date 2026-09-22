@@ -25,6 +25,7 @@ from phasesweep.engine.errors import (
     TrialTargetRegressionError,
 )
 from phasesweep.engine.study_policy import (
+    _load_accepted_partial_decision,
     _validate_environment_cohort,
     _validate_study_direction,
     _validate_study_schema,
@@ -56,9 +57,6 @@ def _preflight_existing_studies(
     :raises ArtifactRootConflictError: A phase's persistent study is already
         bound to a different artifact root than this config's workdir offers;
         raised before any inspection, reaping, or trial work.
-    :raises LegacyArtifactRootMigrationRequiredError: A populated phase study
-        predates artifact-root binding, so which workdir owns its evidence
-        cannot be inferred; raised on the same terms.
     :raises StudyStorageUnavailableError: A phase's persistent storage could not
         be inspected; raised before any claim, reaping, or registry recovery.
     :raises PublishedStudyMissingError: A reached phase has a published winner
@@ -74,7 +72,6 @@ def _preflight_existing_studies(
     :raises RuntimeError: Multiple studies failed and at least one error is an
         unexpected implementation failure that must retain traceback reporting.
     """
-    current_environment_digest = _environment_identity(experiment).digest
     report = cleanup_report or _PreflightCleanupReport()
     # Discovery, root checks, and claims happen in ONE strict pass, and its
     # study objects are the ones every later step operates on: an invocation
@@ -145,8 +142,18 @@ def _preflight_existing_studies(
             _validate_study_direction(study, experiment.metric.goal)
             _validate_study_schema(study)
             if reached:
-                _validate_environment_cohort(study, current_environment_digest)
                 _validate_trial_target(study, phase)
+                partial_decision = _load_accepted_partial_decision(study)
+                finished_trials = sum(
+                    trial.state.is_finished() for trial in study.get_trials(deepcopy=False)
+                )
+                needs_new_trials = phase.n_trials > finished_trials and not (
+                    partial_decision is not None and phase.n_trials == partial_decision.trial_target
+                )
+                if needs_new_trials:
+                    _validate_environment_cohort(
+                        study, _environment_identity(experiment, phase.name).digest
+                    )
         except Exception as exc:
             errors.append(exc)
     if errors:

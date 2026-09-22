@@ -23,10 +23,20 @@ import optuna
 import pytest
 import yaml
 
-import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.evidence as evidence_ops
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Phase, Promotion, Sampler
+from phasesweep.config import (
+    Constraint,
+    ExecutionContext,
+    Experiment,
+    IntParam,
+    JsonExtractor,
+    Metric,
+    Phase,
+    Sampler,
+    WandbExtractor,
+    WandbSummaryRequiredGate,
+)
 from phasesweep.engine import (
     NoFeasibleTrialError,
     TrialEvidenceMissingError,
@@ -43,6 +53,7 @@ from phasesweep.engine.paths import (
     _generations_dir,
     _last_successful_generation_path,
     _phase_dir,
+    _trial_dir_for,
 )
 from phasesweep.engine.publication import (
     _last_successful_generation_id,
@@ -54,6 +65,241 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
 )
 from tests.conftest import assert_published_winner_evidence_local, make_experiment, write_trainer
+
+
+@pytest.mark.parametrize("mutation", ["changed", "deleted"])
+def test_json_primary_external_trainer_inherits_replays_and_verifies_source(tmp_path, mutation):
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out", required=True)
+        parser.add_argument("--x", type=int)
+        parser.add_argument("--y", type=int, default=0)
+        args = parser.parse_args()
+        Path(args.out).write_text(json.dumps({
+            "eval": {"loss": (args.x - 2)**2 + args.y},
+            "parameters": {"x": args.x, "y": args.y},
+        }))
+    """,
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'json.db'}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="eval.loss")),
+        phases=[
+            Phase(
+                name="first",
+                n_trials=2,
+                sampler=Sampler(type="grid"),
+                search_space={"x": {"type": "categorical", "choices": [1, 2]}},
+            ),
+            Phase(
+                name="next",
+                n_trials=2,
+                inherits=["first"],
+                sampler=Sampler(type="grid"),
+                search_space={"y": {"type": "categorical", "choices": [0, 1]}},
+            ),
+        ],
+    )
+    winners = run_experiment(experiment)
+    assert winners["first"].metric == winners["next"].metric == 0
+    assert winners["next"].effective_overrides == {"x": 2, "y": 0}
+    for output in _phase_dir(experiment, "next").glob("trial_*/r.json"):
+        assert json.loads(output.read_text())["parameters"]["x"] == 2
+    replay = run_experiment(experiment, from_phase="next")
+    assert replay["first"].attempt_id == winners["first"].attempt_id
+    assert replay["next"].attempt_id == winners["next"].attempt_id
+    assert len(list((tmp_path / "runs" / "t").glob("*/trial_*"))) == 4
+    winner = winners["first"]
+    source = (
+        _trial_dir_for(
+            experiment,
+            "first",
+            winner.trial_number,
+            generation_id=winner.generation_id,
+            attempt_id=winner.attempt_id,
+        )
+        / "r.json"
+    )
+    if mutation == "changed":
+        source.write_text(source.read_text().replace('"loss": 0', '"loss": 9'))
+    else:
+        source.unlink()
+    with pytest.raises(TrialEvidenceMissingError):
+        run_experiment(experiment, from_phase="next")
+
+
+@pytest.mark.parametrize("consumers", ["primary", "constraint", "gate", "combined"])
+def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
+    tmp_path,
+    monkeypatch,
+    wandb_worker_sdk,
+    consumers,
+):
+    import sys
+
+    from phasesweep.engine import read_winners
+
+    calls_path = tmp_path / "remote-reads"
+    wandb_worker_sdk(f"""
+        from pathlib import Path
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                with Path({str(calls_path)!r}).open("a") as stream:
+                    stream.write(path + "\\n")
+                return type("Run", (), {{"state": "finished", "summary_metrics":
+                    {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted"}}}})()
+    """)
+    trainer = write_trainer(
+        tmp_path,
+        """
+        import argparse, json, os
+        from pathlib import Path
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--x", type=int)
+        parser.add_argument("--receipt", required=True)
+        args = parser.parse_args()
+        Path(args.receipt).write_text(json.dumps({
+            "x": args.x,
+            "identity": {name: os.environ.get(name) for name in
+                ["WANDB_RUN_ID", "WANDB_ENTITY", "WANDB_PROJECT", "WANDB_RESUME", "WANDB_BASE_URL"]},
+        }))
+        print("x=0.5")
+    """,
+    )
+    remote = WandbExtractor(
+        type="wandb",
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        metric_key="eval/loss",
+        poll_seconds=0.01,
+        timeout_seconds=5,
+    )
+    constraints = (
+        [
+            Constraint(
+                name="memory", extractor=remote.model_copy(update={"metric_key": "memory"}), max=5
+            )
+        ]
+        if consumers in {"constraint", "combined"}
+        else []
+    )
+    gates = (
+        [
+            WandbSummaryRequiredGate(
+                type="wandb_summary_required",
+                base_url="https://example.test",
+                entity="e",
+                project="p",
+                poll_seconds=0.01,
+                timeout_seconds=5,
+                keys=["complete"],
+            )
+        ]
+        if consumers in {"gate", "combined"}
+        else []
+    )
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'study.db'}",
+        trial_command=f"{sys.executable} {trainer} --receipt {{trial_dir}}/receipt.json {{overrides}}",
+        metric=Metric(extractor=remote) if consumers in {"primary", "combined"} else None,
+        constraints=constraints,
+        execution=ExecutionContext(inherit_env="none"),
+        phases=[
+            Phase(
+                name="first",
+                n_trials=1,
+                fixed_overrides={"x": 7},
+                gates=gates,
+                sampler=Sampler(type="random", seed=0),
+            ),
+            Phase(
+                name="next",
+                n_trials=1,
+                inherits=["first"],
+                gates=gates,
+                sampler=Sampler(type="random", seed=0),
+            ),
+        ],
+    )
+    # Ambient managed identity is normalized; no SDK/account authentication is needed by fixtures.
+    monkeypatch.setenv("WANDB_RUN_ID", "ambient-old-run")
+    monkeypatch.setenv("WANDB_PROJECT", "ambient-old-project")
+    winners = run_experiment(experiment)
+    assert winners["next"].effective_overrides == {"x": 7}
+    assert len(calls_path.read_text().splitlines()) == 2
+
+    for phase in experiment.phases:
+        winner = winners[phase.name]
+        capture = winner.objective_provenance["remote_capture"]
+        assert capture["run_id"] == winner.attempt_id
+        assert capture["run_state"] == "finished"
+        assert "secret" not in json.dumps(capture)
+        trial_dir = next(_phase_dir(experiment, phase.name).glob("trial_*"))
+        receipt = json.loads((trial_dir / "receipt.json").read_text())
+        assert receipt["x"] == 7
+        assert receipt["identity"] == {
+            "WANDB_RUN_ID": winner.attempt_id,
+            "WANDB_ENTITY": "e",
+            "WANDB_PROJECT": "p",
+            "WANDB_RESUME": "never",
+            "WANDB_BASE_URL": "https://example.test",
+        }
+        if consumers == "primary" and phase.name == "first":
+            from dataclasses import replace
+
+            for fields, replacement in [
+                (("source", "metric_key"), "wrong"),
+                (("remote_capture", "run_id"), "another-attempt"),
+                (("remote_capture", "project"), "another-project"),
+                (("remote_capture", "values", "eval/loss"), 9.0),
+                (("remote_capture", "constraint_keys"), {"undeclared": "eval/loss"}),
+            ]:
+                altered = deepcopy(winner.objective_provenance)
+                target = altered
+                for field in fields[:-1]:
+                    target = target[field]
+                target[fields[-1]] = replacement
+                with pytest.raises(TrialEvidenceMissingError):
+                    evidence_ops._verify_winner_objective_evidence(
+                        experiment, phase.name, replace(winner, objective_provenance=altered)
+                    )
+    # Remote deletion and unavailable credentials/SDK cannot affect frozen reads/replay.
+    wandb_worker_sdk("raise AssertionError('remote access after publication')")
+    monkeypatch.delenv("WANDB_API_KEY", raising=False)
+    monkeypatch.setitem(sys.modules, "wandb", None)
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
+    assert len(read_winners(experiment)) == 2
+    with monkeypatch.context() as replay_env:
+        replay_env.setenv("WANDB_MODE", "offline")
+        assert run_experiment(experiment)["next"].attempt_id == winners["next"].attempt_id
+    assert len(calls_path.read_text().splitlines()) == 2
+    if consumers == "primary":
+        from phasesweep.engine.state import TRIAL_TARGET_ATTR
+        from phasesweep.errors import PhaseSweepError
+
+        increased = experiment.model_copy(
+            update={
+                "phases": [
+                    experiment.phases[0],
+                    experiment.phases[1].model_copy(update={"n_trials": 2}),
+                ]
+            }
+        )
+        with pytest.raises(PhaseSweepError, match="optional SDK"):
+            run_experiment(increased)
+        study = optuna.load_study(study_name="t::next", storage=experiment.resolved_storage)
+        assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
+        assert len(study.trials) == 1
+
 
 # Every trial prints the same objective, so selection always ties and the tie
 # break (lowest trial number) makes trial 0 the winner no matter how many
@@ -104,9 +350,7 @@ def _evidence_experiment(
         trial_command = f"python {trainer} --out {{trial_dir}}/r.json --config {{config_path}}"
         trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
     elif override_format == "json_file":
-        trial_command = (
-            f"python {trainer} --out {{trial_dir}}/r.json --overrides {{overrides_path}}"
-        )
+        trial_command = f"python {trainer} --out {{trial_dir}}/r.json --input {{overrides_path}}"
         trainer_config = None
     else:
         trial_command = f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
@@ -208,9 +452,9 @@ def _pointer_bytes(experiment: Experiment) -> bytes:
     ("override_format", "filename"),
     [
         ("yaml_file", "trainer_config.yaml"),
-        ("json_file", "overrides.json"),
         ("argparse", "overrides_resolved.json"),
         ("hydra", "overrides_resolved.json"),
+        ("json_file", "overrides.json"),
     ],
 )
 def test_trial_records_the_exact_generated_trainer_input(
@@ -218,7 +462,7 @@ def test_trial_records_the_exact_generated_trainer_input(
     override_format: str,
     filename: str,
 ) -> None:
-    """Every input mode persists one format-independent historical record."""
+    """Every retained input mode persists a historical trainer-input record."""
     experiment = _evidence_experiment(tmp_path, override_format=override_format)
     run_experiment(experiment)
     input_path = _sole_trial_dir(experiment) / filename
@@ -265,7 +509,7 @@ def _published_winner_payload(experiment: Experiment, generation_id: str) -> dic
         ),
         pytest.param(
             "emptied",
-            "missing its 'overrides_resolved.json' audit artifact",
+            "has no attempt lifecycle record",
             id="same-named-empty-directory",
         ),
     ],
@@ -280,8 +524,8 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
     Each variant removes a different piece of the one completed trial's
     evidence: the whole directory, the resolved-overrides audit artifact, the
     objective source the metric was extracted from, and the directory replaced
-    by an empty one of the same name (which passes a bare existence check and
-    is caught by the audit artifacts instead).
+    by an empty one of the same name (which passes a bare existence check but
+    lacks the current-format lifecycle record).
     """
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
@@ -319,13 +563,12 @@ def test_topup_refuses_a_candidate_whose_evidence_left_the_tree(
         "file_without_digest",
         "file_with_parent_path",
         "file_with_absolute_path",
-        "wandb_without_address",
     ],
 )
 def test_present_incomplete_objective_provenance_blocks_selection(
     tmp_path: Path, damage: str
 ) -> None:
-    """Only absent provenance is legacy; partial current records cannot publish."""
+    """Partial current provenance records cannot publish."""
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
     study = optuna.load_study(
@@ -344,9 +587,6 @@ def test_present_incomplete_objective_provenance_blocks_selection(
         record["source"]["path"] = "../not-a-trial-file"
     elif damage == "file_with_absolute_path":
         record["source"]["path"] = "/not-a-trial-file"
-    else:
-        record["extractor"]["kind"] = "wandb"
-        record["source"] = {"kind": "wandb"}
     trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR] = json.dumps(record)
     study = optuna.create_study(direction="minimize")
     study.add_trial(trial)
@@ -376,6 +616,30 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     assert winners["p"].trial_number == 0
     assert read_status(topup)["publication_integrity"] == "ok"
     assert_published_winner_evidence_local(_experiment_dir(topup))
+
+
+def test_log_regex_evaluation_revision_change_blocks_study_reuse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import phasesweep.evidence.evaluation as evaluation_ops
+
+    experiment = _evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    pointer_before = _pointer_bytes(experiment)
+    monkeypatch.setattr(
+        evaluation_ops,
+        "LOG_REGEX_EVALUATION_REVISION",
+        evaluation_ops.LOG_REGEX_EVALUATION_REVISION + 1,
+    )
+
+    with pytest.raises(
+        TrialEvidenceMissingError,
+        match="extractor evaluation contract.*evaluator revision.*start a new experiment name",
+    ):
+        run_experiment(_evidence_experiment(tmp_path, n_trials=2))
+
+    assert _trial_count(experiment) == 1
+    assert _pointer_bytes(experiment) == pointer_before
 
 
 @pytest.mark.parametrize(
@@ -530,55 +794,6 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     resumed = run_experiment(experiment, from_phase="q")
 
     assert resumed["p"].trial_number == 0
-
-
-def test_from_phase_promotion_uses_the_baseline_source_evidence(tmp_path: Path) -> None:
-    """A promoted skipped winner resolves evidence from its baseline, not exposure phase."""
-    trainer = write_trainer(tmp_path / "promotion_trainer.py", _CONSTANT_TRAINER)
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        phases=[
-            Phase(name="base", n_trials=1, sampler=Sampler(type="random", seed=0)),
-            Phase(
-                name="candidate",
-                n_trials=1,
-                sampler=Sampler(type="random", seed=1),
-                promotion=Promotion(
-                    min_delta_vs="base", min_delta=1.0, on_fail="continue_baseline"
-                ),
-            ),
-            Phase(name="later", n_trials=1, sampler=Sampler(type="random", seed=2)),
-        ],
-    )
-    winners = run_experiment(experiment)
-    assert winners["candidate"].source is not None
-    assert winners["candidate"].source.phase == "base"
-    candidate_dir = _phase_dir(experiment, "candidate")
-    for trial_dir in candidate_dir.glob("trial_*"):
-        shutil.rmtree(trial_dir)
-    optuna.delete_study(
-        study_name=_phase_study_name(experiment, experiment.phases[1]),
-        storage=experiment.storage,
-    )
-
-    resumed = run_experiment(experiment, from_phase="later")
-
-    assert resumed["candidate"].source is not None
-    assert resumed["candidate"].source.phase == "base"
-
-
-def test_skipped_winner_evidence_uses_the_relocated_artifact_tree(tmp_path: Path) -> None:
-    """Historical evidence is reconstructed under the current relocated workdir."""
-    experiment, _marker = _from_phase_evidence_experiment(tmp_path)
-    run_experiment(experiment)
-    moved_workdir = tmp_path / "moved-runs"
-    Path(experiment.workdir).rename(moved_workdir)
-    moved = experiment.model_copy(update={"workdir": str(moved_workdir)})
-
-    winner = artifact_io._load_winner(moved, moved.phases[0], {})
-    evidence_ops._verify_skipped_winner_evidence(moved, moved.phases[0], winner)
 
 
 # --------------------------------------------------------------------------

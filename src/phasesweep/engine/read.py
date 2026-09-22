@@ -43,12 +43,12 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import (
     _last_successful_generation_id,
-    _published_summary_path_for,
     _published_winner_path,
     _published_winner_path_for,
     _resolve_publication_pointer,
 )
 from phasesweep.engine.state import (
+    GENERATION_SUMMARY_SCHEMA_VERSION,
     PublicationState,
     WinnerSource,
     WinnerSourceKind,
@@ -60,9 +60,8 @@ ResultContext: TypeAlias = Literal["represented_generation", "current_config"]
 
 ``"represented_generation"``: the labels come from the represented
 generation's own recorded summary, so they describe the result as it was
-produced. ``"current_config"``: the represented result recorded no semantics
-of its own (nothing published yet, or a pre-manifest legacy layout), so the
-currently loaded config describes it.
+produced. ``"current_config"``: no represented result is available, so the
+currently loaded config describes the status payload.
 """
 
 
@@ -86,7 +85,6 @@ class PhaseWinnerView:
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSource | None = None
-    promotion: dict[str, Any] | None = None
     # The metric semantics the winner itself recorded (review v0.5.16 /
     # blocker 4): a persisted winner is historical evidence, so its value is
     # reported under the name and goal it was optimized for, never relabeled
@@ -134,10 +132,9 @@ def _phase_status_payloads(
         trial identity could not be matched in the storage snapshot.
     :param str | None winner_scope_generation_id: Already-resolved generation id
         whose winner files are represented. When ``pinned`` is ``False``
-        (default), this is treated as an already-captured last-success id and
-        legacy-fallback semantics apply when it is ``None``. When ``pinned``
-        is ``True``, this is a caller-known generation id read directly with
-        no legacy fallback.
+        (default), this is an already-captured last-success id. When
+        ``pinned`` is ``True``, this is a caller-known generation id read
+        directly.
     :param bool pinned: Whether ``winner_scope_generation_id`` names an exact,
         caller-pinned generation rather than an already-captured last-success id.
     :return list[dict[str, Any]]: One status payload per phase in declaration order.
@@ -225,7 +222,11 @@ def _read_winner_path(path: Path | None, phase_name: str) -> PhaseWinnerView | N
         if not isinstance(source_data, Mapping):
             return None
         source_kind = source_data.get("kind")
-        if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
+        if source_kind != "phase_trial":
+            return None
+        if set(source_data) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
+            return None
+        if "promotion" in data:
             return None
         source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
         return PhaseWinnerView(
@@ -249,9 +250,6 @@ def _read_winner_path(path: Path | None, phase_name: str) -> PhaseWinnerView | N
                 else None
             ),
             source=source,
-            promotion=(
-                dict(data["promotion"]) if isinstance(data.get("promotion"), Mapping) else None
-            ),
         )
     except (KeyError, ValueError, TypeError, OSError, yaml.YAMLError):
         # Partially-written or malformed file (or unlinked between the is_file
@@ -366,7 +364,13 @@ def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None
         payload = yaml.safe_load(summary_path.read_text())
     except (OSError, yaml.YAMLError):
         return None
-    return payload if isinstance(payload, Mapping) else None
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
+        return None
+    if "promotion_decisions" in payload:
+        return None
+    return payload
 
 
 def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] | None:
@@ -384,9 +388,7 @@ def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] 
 
     :param Mapping[str, Any] | None summary_payload: Parsed generation summary, or ``None``.
     :return list[str] | None: Recorded phase names in execution order, or
-        ``None`` when the summary is absent or records no usable plan (every
-        pre-manifest legacy summary, whose caller must fall back to the current
-        config).
+        ``None`` when the summary is absent or records no usable plan.
     """
     if summary_payload is None:
         return None
@@ -404,27 +406,31 @@ def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] 
     return names
 
 
-def _recorded_objective_evidence(
-    candidate: object,
-    *,
-    fallback: dict[str, str | bool],
-) -> dict[str, str | bool]:
-    """Return a complete recorded assurance payload or the current fallback.
-
-    Result summaries are durable data and may predate or drift from the current
-    assurance schema. A partial/extra key set cannot safely be combined with
-    current guarantees, so treat the whole record as absent.
+def _recorded_objective_evidence(candidate: object) -> dict[str, str | bool] | None:
+    """Return a complete current-format assurance payload, if present.
 
     :param object candidate: Summary ``objective_evidence`` value.
-    :param dict[str, str | bool] fallback: Assurance derived from the current extractor.
-    :return dict[str, str | bool]: Complete recorded flags, or ``fallback``.
+    :return dict[str, str | bool] | None: Complete recorded flags, or ``None``.
     """
-    if not isinstance(candidate, Mapping) or set(candidate) != set(fallback):
-        return fallback
-    if candidate.get("kind") not in {"json_envelope", "log_regex", "wandb"}:
-        return fallback
+    expected = {
+        "kind",
+        "attempt_location_scoped",
+        "attempt_identity_bound",
+        "source_identity_keyed",
+        "objective_name_bound",
+        "split_bound",
+        "evaluation_policy_bound",
+        "checkpoint_declared",
+        "checkpoint_value_bound",
+        "expected_step_declared",
+        "expected_step_value_bound",
+    }
+    if not isinstance(candidate, Mapping) or set(candidate) != expected:
+        return None
+    if candidate.get("kind") not in {"json", "json_envelope", "log_regex", "wandb"}:
+        return None
     if any(type(candidate[key]) is not bool for key in candidate if key != "kind"):
-        return fallback
+        return None
     return dict(candidate)
 
 
@@ -452,32 +458,6 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     return None
 
 
-def _legacy_publication_present(experiment: Experiment) -> bool:
-    """Whether a pre-generation workdir already holds a published winner.
-
-    Layouts written before generation metadata existed have no current record or
-    immutable generation directory and so no last-success pointer to validate: their
-    per-phase ``winner.yaml`` *is* the publication. The pointer-identity
-    comparison that decides ``is_published`` everywhere else has nothing to
-    compare there and used to report "never published" beside a real winner
-    path, which an upgrading operator reads as data loss. Winner paths are
-    resolved through the same helper the per-phase payload uses, so
-    ``is_published`` and ``winner_present`` can never disagree.
-
-    :param Experiment experiment: Experiment whose legacy winner files are probed.
-    :return bool: ``True`` when the legacy fallback resolves at least one
-        existing ``winner.yaml``; ``False`` for an untouched workdir and for
-    every workdir with modern generation records (there the pointer, not
-        the compatibility projection, is authoritative, so an unpublished
-        generation stays unpublished).
-    """
-    return any(
-        (winner_path := _published_winner_path_for(experiment, None, phase.name)) is not None
-        and winner_path.is_file()
-        for phase in experiment.phases
-    )
-
-
 def read_status(
     experiment: Experiment,
     *,
@@ -494,7 +474,7 @@ def read_status(
     in ``phasesweep.mcp.redaction`` takes this function's default-mode output
     as already path-free and does not strip paths itself. The flag exists for
     :func:`phasesweep.engine.run.experiment_status` / ``config_status``, whose
-    CLI and suite consumers are trusted with local paths.
+    CLI consumers are trusted with local paths.
 
     Trial counts come from ``_phase_trial_stats``, which reports empty counts
     for a study that does not exist yet, never creates one as a side effect,
@@ -530,15 +510,8 @@ def read_status(
     - ``is_published``: ``True`` when ``represented_generation_id`` is not
       ``None`` and equals ``published_generation_id``. A pinned read of a
       failed-publication generation is ``is_published: False`` while still
-      showing that generation's own (unpublished) winners. The one case with
-      no generation identity to compare is a pre-generation legacy workdir
-      (no ``generation.yaml`` at all): there the compatibility
-      ``winner.yaml`` is the publication, so ``is_published`` follows
-      :func:`_legacy_publication_present` and stays consistent with the
-      ``winner_present`` reported beside it, while all three identity fields
-      remain ``None`` because no generation id exists to report. A workdir
-      that *does* have ``generation.yaml`` but no validated last-success
-      pointer is unpublished as before.
+      showing that generation's own (unpublished) winners. Without a
+      generation identity, status is unpublished.
     - ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"`` --
       *why* ``published_generation_id`` is what it is (review v0.5.18 /
@@ -595,7 +568,7 @@ def read_status(
         ``published_generation_id`` and ``generation_trials`` scopes to the
         captured ``current_generation_id``.
     :param Experiment | None comparison_experiment: Optional current config to
-        use only for drift comparison and current-extractor evidence fallback.
+        use only for drift comparison and the no-result status semantics.
         Artifact and trial reads still use ``experiment``. This lets a frozen
         run config locate its own tree while a run-scoped MCP read compares the
         represented result with the catalog config a future run would execute.
@@ -604,8 +577,7 @@ def read_status(
         ``False`` for any agent-visible caller: ``True`` puts absolute winner
         paths in the returned mapping.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
-        is bound to a different storage ledger or experiment. This includes
-        the legacy-tree migration subclass.
+        is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` is not a safe generation name.
     :return dict[str, Any]: A mapping with the experiment name, the four
         identity fields above, ``publication_integrity`` (plus
@@ -619,20 +591,21 @@ def read_status(
         current config only when no summary semantics exist
         (``result_context: "current_config"``) — a published x/minimize
         result is never relabeled by a config edited to y/maximize (review
-        v0.5.16 / blocker 4). A pre-manifest legacy summary that records a
-        name and goal but no ``objective_evidence`` still reports
-        ``"represented_generation"``, with the evidence assurance falling back
-        to the current extractor's: that is the only historical semantics such
-        a layout preserved. ``result_phase_plan`` is likewise the represented
+        v0.5.16 / blocker 4). ``result_phase_plan`` is likewise the represented
         generation's own recorded phase plan, falling back to the current
-        config's phase names when the summary records none — it is the plan
-        the publication's winners must be enumerated under, and equals the
-        ``phases`` list's names whenever the config has not been edited since.
+        config's phase names when no represented summary exists — it is the
+        plan the publication's winners must be enumerated under, and equals
+        the ``phases`` list's names whenever the config has not been edited
+        since.
         ``published_config_matches_current`` compares the summary's recorded
         config fingerprint against the current config's semantic fingerprint;
         ``None`` when the represented summary records no fingerprint.
     """
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    _validate_artifact_root_binding(
+        experiment,
+        claim_fresh=False,
+        validate_storage_format=False,
+    )
     current_generation_id = _current_pointer_generation_id(experiment)
     publication = _resolve_publication_pointer(experiment)
     published_generation_id = publication.generation_id if publication.state == "ok" else None
@@ -649,17 +622,10 @@ def read_status(
         winner_scope_generation_id = generation_id
         pinned = True
 
-    legacy_publication = False
-    if represented_generation_id is None:
-        # Only an unpinned read reaches here (a pinned read always represents
-        # its own id), so this is either a workdir with nothing published --
-        # ``False``, unchanged -- or a pre-generation legacy layout whose
-        # compatibility ``winner.yaml`` is itself the publication and has no
-        # pointer identity to compare against.
-        legacy_publication = _legacy_publication_present(experiment)
-        is_published = legacy_publication
-    else:
-        is_published = represented_generation_id == published_generation_id
+    is_published = (
+        represented_generation_id is not None
+        and represented_generation_id == published_generation_id
+    )
 
     published_trials = (
         _published_phase_trial_refs(publication.summary)
@@ -667,26 +633,28 @@ def read_status(
         else {}
     )
     phase_stats = {
-        phase.name: _phase_trial_stats(experiment, phase, published_trials.get(phase.name))
-        for phase in experiment.phases
+        phase.name: _phase_trial_stats(
+            experiment,
+            phase,
+            published_trials.get(phase.name),
+            validate_storage_format=index == 0,
+        )
+        for index, phase in enumerate(experiment.phases)
     }
-    summary_path: Path | None
-    if pinned:
-        assert winner_scope_generation_id is not None
-        summary_path = _generation_summary_path(experiment, winner_scope_generation_id)
-    else:
-        summary_path = _published_summary_path_for(experiment, winner_scope_generation_id)
+    summary_path = (
+        _generation_summary_path(experiment, winner_scope_generation_id)
+        if winner_scope_generation_id is not None
+        else None
+    )
 
     # The represented generation's winner/summary facts are historical
     # evidence, so the metric they are reported under must be the one that
     # generation actually optimized — never the metric the config supplied
     # today (review v0.5.16 / blocker 4). The generation's own summary is the
-    # source of that interpretation; only when it records none (nothing
-    # published yet, or a pre-manifest legacy summary without semantics) does
-    # the current config describe the result.
+    # source of that interpretation; only when it records none does the
+    # current config describe the result.
     comparison = comparison_experiment or experiment
     metric_payload = _metric_semantics_payload(comparison.metric)
-    current_objective_evidence = metric_payload["objective_evidence"]
     result_phase_plan = [phase.name for phase in experiment.phases]
     result_context: ResultContext = "current_config"
     published_config_matches_current: bool | None = None
@@ -709,18 +677,14 @@ def read_status(
             and isinstance(stored_metric.get("name"), str)
             and stored_metric.get("goal") in ("minimize", "maximize")
         ):
-            stored_evidence = stored_metric.get("objective_evidence")
-            metric_payload = {
-                "name": stored_metric["name"],
-                "goal": stored_metric["goal"],
-                "objective_evidence": (
-                    _recorded_objective_evidence(
-                        stored_evidence,
-                        fallback=current_objective_evidence,
-                    )
-                ),
-            }
-            result_context = "represented_generation"
+            stored_evidence = _recorded_objective_evidence(stored_metric.get("objective_evidence"))
+            if stored_evidence is not None:
+                metric_payload = {
+                    "name": stored_metric["name"],
+                    "goal": stored_metric["goal"],
+                    "objective_evidence": stored_evidence,
+                }
+                result_context = "represented_generation"
         stored_fingerprint = summary_payload.get("config_fingerprint")
         if isinstance(stored_fingerprint, str) and stored_fingerprint:
             published_config_matches_current = (
@@ -728,8 +692,6 @@ def read_status(
             )
 
     publication_state: PublicationState = publication.state
-    if publication_state == "absent" and legacy_publication:
-        publication_state = "ok"
 
     return {
         "experiment": experiment.experiment,

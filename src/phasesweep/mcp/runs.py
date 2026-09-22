@@ -70,6 +70,9 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".launch.lock",
     ".transition.lock",
 )
+MCP_STATE_FORMAT_VERSION = 1
+_STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
+_STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 
 
 def _strict_fsync_directory(path: Path) -> None:
@@ -291,9 +294,12 @@ class RunStore:
         :param Path state_dir: Root directory for runs, logs, config snapshots, and launch lock.
         """
         self._set_paths(state_dir)
+        needs_marker = self._inspect_format_boundary()
         ensure_private_dir(state_dir)
         ensure_private_dir(self._runs_dir)
         ensure_private_dir(self._logs_dir)
+        if needs_marker:
+            self._create_format_marker()
 
     @classmethod
     def open_existing(cls, state_dir: Path) -> RunStore:
@@ -322,6 +328,7 @@ class RunStore:
                 "not an existing MCP state directory; expected directories are missing: "
                 + ", ".join(missing)
             )
+        store._require_supported_format_marker()
         return store
 
     def _set_paths(self, state_dir: Path) -> None:
@@ -332,6 +339,110 @@ class RunStore:
         self._runs_dir = state_dir / "runs"
         self._logs_dir = state_dir / "logs"
         self._launch_lock_path = state_dir / ".launch.lock"
+        self._format_marker_path = state_dir / _STATE_FORMAT_MARKER_NAME
+
+    def _inspect_format_boundary(self) -> bool:
+        """Inspect an existing namespace before initialization can mutate it.
+
+        A marker is written only for a namespace with no durable run-store
+        evidence. A pre-marker state that already contains handles, logs,
+        leases, or audit records belongs to the preserved 0.3.1 runtime and
+        is refused by this release.
+
+        :return bool: Whether this fresh namespace needs its first marker.
+        :raises ValueError: The namespace contains unsupported or unmarked
+            durable state.
+        :raises UnsafePrivatePathError: An existing state path is unsafe.
+        """
+        try:
+            self._format_marker_path.parent.lstat()
+        except FileNotFoundError:
+            return True
+
+        validate_private_dir(self._format_marker_path.parent)
+        if self._path_entry_exists(self._format_marker_path):
+            self._require_supported_format_marker()
+            return False
+        if self._has_durable_state_evidence():
+            raise self._format_refusal("durable run data has no format marker")
+        return True
+
+    @staticmethod
+    def _path_entry_exists(path: Path) -> bool:
+        """Return whether a path entry exists without ignoring dangling links.
+
+        :param Path path: Entry to inspect without following it.
+        :return bool: Whether any filesystem entry is present at ``path``.
+        """
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _has_durable_state_evidence(self) -> bool:
+        """Return whether an unmarked namespace contains run-store evidence.
+
+        Empty ``runs/`` and ``logs/`` directories, as well as the catalog
+        scaffolder's root-level ``origin`` record, remain fresh. Any entry
+        below the run or log directories is durable evidence: interrupted
+        writes and unfamiliar records must fail closed rather than be
+        treated as an empty namespace.
+
+        :return bool: Whether durable pre-marker run-store evidence is present.
+        :raises UnsafePrivatePathError: A present run-store directory is unsafe.
+        """
+        if self._path_entry_exists(self._format_marker_path.parent / "audit.jsonl"):
+            return True
+        for directory in (self._runs_dir, self._logs_dir):
+            if not self._path_entry_exists(directory):
+                continue
+            validate_private_dir(directory)
+            try:
+                with os.scandir(directory) as entries:
+                    if next(entries, None) is not None:
+                        return True
+            except OSError as exc:
+                raise self._format_refusal("durable run data could not be inspected") from exc
+        return False
+
+    def _require_supported_format_marker(self) -> None:
+        """Require the exact current private namespace marker without writing it.
+
+        :raises ValueError: The marker is malformed or declares another format.
+        """
+        payload = _read_json_object(self._format_marker_path)
+        if (
+            payload is None
+            or set(payload) != {"schema_version"}
+            or type(payload["schema_version"]) is not int
+            or payload["schema_version"] != MCP_STATE_FORMAT_VERSION
+        ):
+            raise self._format_refusal("format marker is malformed or unsupported")
+
+    def _create_format_marker(self) -> None:
+        """Atomically claim the current format for a verified fresh namespace.
+
+        A concurrent fresh initializer can win the exclusive create; in that
+        case its marker is re-read and must be the exact supported record.
+        """
+        payload = json.dumps(_STATE_FORMAT_MARKER_PAYLOAD) + "\n"
+        try:
+            _strict_atomic_create_text(self._format_marker_path, payload)
+        except FileExistsError:
+            self._require_supported_format_marker()
+
+    def _format_refusal(self, detail: str) -> ValueError:
+        """Build the actionable refusal for pre-cutover MCP state.
+
+        :param str detail: Specific format-boundary failure observed.
+        :return ValueError: Refusal that directs the operator to a safe path.
+        """
+        return ValueError(
+            f"MCP state directory {self._format_marker_path.parent} {detail}; "
+            "use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime "
+            "for existing state."
+        )
 
     @contextlib.contextmanager
     def launch_lock(self) -> Iterator[bool]:
@@ -595,50 +706,6 @@ class RunStore:
             return None
         return self._load_handle(path, expected_run_id=run_id)
 
-    def handle_exists(self, run_id: str) -> bool:
-        """Return whether a persisted handle file exists for ``run_id``, decodable or not.
-
-        :meth:`get` collapses "no such run" and "handle present but
-        undecodable" into ``None``. Authority decisions must tell them apart:
-        an undecodable handle carries frozen launch authority that can no
-        longer be read and must fail closed. A missing handle alone does *not*
-        prove the id was never an MCP run -- the file may have been deleted
-        while other per-run files survive (:meth:`run_evidence_exists`), or
-        the whole state dir replaced, which only the generation's own
-        durable id-source record can reveal (PR #5 review / P2 missing-handle
-        authority).
-
-        :param str run_id: Agent-supplied run id to look up.
-        :return bool: ``True`` when a handle file exists for a well-shaped id.
-        """
-        if not SAFE_NAME_PATTERN.fullmatch(run_id):
-            return False
-        path = self._runs_dir / f"{run_id}.json"
-        return path.exists() or path.is_symlink()
-
-    def run_evidence_exists(self, run_id: str) -> bool:
-        """Return whether any durable per-run file besides the handle survives.
-
-        A deleted ``runs/<run_id>.json`` removes the frozen launch-authority
-        record but usually not its siblings: the per-run config snapshot,
-        terminal status, log, and cleanup markers all live under this same
-        state dir. Any survivor proves ``run_id`` *was* a launched MCP run
-        whose authority can no longer be read, so visibility decisions must
-        fail closed instead of treating the id as a never-MCP generation and
-        applying current catalog policy (PR #5 review / P2 missing-handle
-        authority).
-
-        :param str run_id: Agent-supplied run id to look up.
-        :return bool: ``True`` when any per-run file exists for a well-shaped id.
-        """
-        if not SAFE_NAME_PATTERN.fullmatch(run_id):
-            return False
-        for suffix in _RUN_EVIDENCE_SUFFIXES:
-            path = self._logs_dir / f"{run_id}{suffix}"
-            if path.exists() or path.is_symlink():
-                return True
-        return False
-
     def _scan_handles(self) -> tuple[list[RunHandle], set[str]]:
         """Load persisted handles and identify malformed handle records.
 
@@ -697,12 +764,11 @@ class RunStore:
     def is_pre_spawn_orphan(self, run_id: str) -> bool:
         """Return whether ``run_id`` is a provably abandoned preparation.
 
-        Legacy launches are recoverable only when their config snapshot is the
-        sole evidence. Transactional launches also carry a kernel lease across
-        ``Popen``. A free lease plus either no handle or a valid launching
-        handle proves that no runner can still cross the acknowledgement
-        boundary; a child that was created inherits and holds the lease until
-        it has durably replaced the handle with its process identity or exits.
+        Transactional launches carry a kernel lease across ``Popen``. A free
+        lease plus a valid launching handle proves that no runner can still
+        cross the acknowledgement boundary; a child that was created inherits
+        and holds the lease until it has durably replaced the handle with its
+        process identity or exits.
 
         :param str run_id: Candidate orphan run identity.
         :return bool: Whether the preparation is safe to remove automatically.
@@ -719,28 +785,7 @@ class RunStore:
             lease.close()
             return True
 
-        handle_path = self._runs_dir / f"{run_id}.json"
-        snapshot = self.config_snapshot_path(run_id)
-        terminal_evidence = (
-            self.status_path(run_id),
-            self.cleanup_uncertain_path(run_id),
-            self.cleanup_recovery_path(run_id),
-        )
-        if any(path.exists() or path.is_symlink() for path in terminal_evidence):
-            return False
-        if handle_path.exists() or handle_path.is_symlink():
-            return False
-        if self.log_path(run_id).exists() or self.log_path(run_id).is_symlink():
-            return False
-        directory_fd = open_directory_fd(self._logs_dir, create=False, private_final=True)
-        try:
-            try:
-                read_private_text_at(directory_fd, snapshot.name, snapshot)
-            except (OSError, UnsafePrivatePathError, UnicodeError):
-                return False
-        finally:
-            os.close(directory_fd)
-        return True
+        return False
 
     def _claim_abandoned_launch_lease(self, run_id: str) -> IO[str] | None:
         """Lock and revalidate one transactional pre-spawn preparation.
@@ -1126,19 +1171,6 @@ class RunStore:
         :return bool: Whether the recorded boot id is known and differs from this boot.
         """
         return identity_from_earlier_boot(self.cleanup_identity(handle).boot_id)
-
-    def live_run_for(self, experiment_id: str) -> RunHandle | None:
-        """Return the currently-running handle for an experiment, if any.
-
-        Used to reject a second launch before the engine's flock would.
-
-        :param str experiment_id: Catalog id whose live run should be found.
-        :return RunHandle | None: Currently-running handle, if one exists.
-        """
-        for handle in self.list_handles():
-            if handle.experiment_id == experiment_id and self.state(handle) == "running":
-                return handle
-        return None
 
     def latest_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the newest persisted handle for an experiment deterministically.

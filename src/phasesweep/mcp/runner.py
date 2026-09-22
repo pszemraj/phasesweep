@@ -142,10 +142,7 @@ def _base_failure_payload(
     if isinstance(error, ArtifactRootConflictError):
         # Not a fingerprint problem: the study is healthy but is not provably
         # this workdir's, and the fingerprint remediation (new experiment name
-        # / archive the study) would destroy the binding's value. The wording
-        # covers the subclass too: a study that predates the binding records no
-        # root at all, so "the workdir its studies are bound to" would name
-        # nothing (re-review v0.5.19 / blocker B1).
+        # / archive the study) would destroy the binding's value.
         return {
             "code": "artifact_root_conflict",
             "stage": failure_stage,
@@ -153,8 +150,7 @@ def _base_failure_payload(
             "actor": "operator",
             "remediation": (
                 "Ask the operator to run this experiment from the workdir that owns its "
-                "artifact tree, or to relocate/restore that tree and run "
-                "`phasesweep rebind-workdir` against it before retrying."
+                "artifact tree, or use a fresh artifact root and local storage."
             ),
         }
     if isinstance(error, (StudyFingerprintMismatchError, StudyContextConflictError)):
@@ -920,19 +916,20 @@ def main(argv: list[str] | None = None) -> int:
         )
     except PhaseSweepShutdown as exc:
         code = exc.code if isinstance(exc.code, int) else 1
-        status["returncode"] = code
-        status["error_class"] = "cancelled"
         status["cleanup_confirmed"] = (
             terminal_report.cleanup_confirmed
             if terminal_report is not None
             else exc.report.cleanup_confirmed
         )
-        primary, failure_stage = _terminal_error(terminal_report, exc)
-        status["failure"] = _terminal_failure_payload(
-            primary,
-            stage=failure_stage,
-            cleanup_confirmed=status["cleanup_confirmed"],
-        )
+        if terminal_report is None or terminal_report.primary_error is not None:
+            status["returncode"] = code
+            status["error_class"] = "cancelled"
+            primary, failure_stage = _terminal_error(terminal_report, exc)
+            status["failure"] = _terminal_failure_payload(
+                primary,
+                stage=failure_stage,
+                cleanup_confirmed=status["cleanup_confirmed"],
+            )
         raise
     except ProcessCleanupUncertainError as exc:
         status["returncode"] = 1

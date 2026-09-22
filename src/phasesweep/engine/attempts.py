@@ -821,8 +821,8 @@ def _attempt_lifecycle_for_reaping(
     :param optuna.trial.FrozenTrial trial: Trial being inspected for recovery.
     :param Path trial_dir: Persisted trial directory.
     :param str study_name: Study name, used only for diagnostics.
-    :return AttemptLifecycle | None: Validated record, or ``None`` for legacy
-        attempts that never wrote one.
+    :return AttemptLifecycle | None: Validated record, or ``None`` when the
+        current attempt has not written one.
     :raises ProcessCleanupUncertainError: The trial has no valid persisted
         attempt id, or the record is malformed or belongs to another attempt.
     """

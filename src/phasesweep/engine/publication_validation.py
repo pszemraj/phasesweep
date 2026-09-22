@@ -76,21 +76,19 @@ def _generation_artifact_manifest(
 
     Scans the namespace itself rather than reconstructing the set from
     in-memory bookkeeping so the manifest cannot omit an artifact the run
-    actually wrote (e.g. a prior promotion decision projected for a skipped
-    phase). The namespace is exclusively claimed by this invocation, so
+    actually wrote. The namespace is exclusively claimed by this invocation, so
     everything present is this run's own output.
 
     The namespace-root provenance files written at claim time
     (:func:`phasesweep.engine.provenance._write_generation_provenance`) are listed first, under entries
-    that carry ``path`` instead of ``phase``. They are absent -- and so
-    unlisted -- in generations published before finding F6.
+    that carry ``path`` instead of ``phase``. Both are mandatory for every
+    current-format generation.
 
     :param Experiment experiment: Experiment whose generation is summarized.
     :param str generation_id: Immutable generation namespace to scan.
     :return list[dict[str, str]]: One ``{"kind", "path", "sha256"}`` entry per
         namespace-root provenance file, then one ``{"kind", "phase",
-        "sha256"}`` entry per winner/promotion artifact ordered by phase then
-        kind.
+        "sha256"}`` entry per winner artifact ordered by phase.
     """
     generation_dir = path_ops._generation_dir(experiment, generation_id)
     items: list[dict[str, str]] = []
@@ -104,12 +102,11 @@ def _generation_artifact_manifest(
     for phase_dir in sorted(phases_dir.iterdir()):
         if not phase_dir.is_dir():
             continue
-        for kind in ("winner", "promotion"):
-            artifact = phase_dir / _ARTIFACT_FILENAMES[kind]
-            if artifact.is_file():
-                items.append(
-                    {"kind": kind, "phase": phase_dir.name, "sha256": file_sha256(artifact)}
-                )
+        artifact = phase_dir / _ARTIFACT_FILENAMES["winner"]
+        if artifact.is_file():
+            items.append(
+                {"kind": "winner", "phase": phase_dir.name, "sha256": file_sha256(artifact)}
+            )
     return items
 
 
@@ -150,13 +147,11 @@ def _validate_generation_manifest(
     manifest does not list. Runs both pre-commit (before the last-success
     pointer may advance) and on every read before a pointer target is trusted.
 
-    The manifest covers two kinds of artifact: phase-scoped winners and
-    promotion decisions (``kind`` + ``phase``), and the namespace-root
-    provenance files frozen at claim time (``kind`` + ``path``; see
+    The manifest covers phase-scoped winners (``kind`` + ``phase``) and the
+    namespace-root provenance files frozen at claim time (``kind`` + ``path``; see
     :func:`_validate_generation_provenance_files`, review v0.5.18 / finding
-    F6). Both obey the same listed-if-and-only-if-present rule, which is what
-    keeps a generation published before either existed valid without a schema
-    bump.
+    F6). Every current-format summary lists both provenance files, each of
+    which must exist and match its recorded hash.
 
     A winner carried forward from an earlier generation additionally has that
     generation resolved in this same tree
@@ -198,6 +193,8 @@ def _validate_generation_manifest(
 
     if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
         raise _fail(f"unsupported summary schema_version {summary.get('schema_version')!r}")
+    if "promotion_decisions" in summary:
+        raise _fail("summary contains removed promotion decisions")
     metric = summary.get("metric")
     if (
         not isinstance(metric, Mapping)
@@ -250,20 +247,6 @@ def _validate_generation_manifest(
         if ("winner", name) not in listed:
             raise _fail(f"phase {name!r} winner is not listed in the artifact manifest")
 
-    raw_decisions = summary.get("promotion_decisions")
-    if not isinstance(raw_decisions, list):
-        raise _fail("summary has no promotion decision list")
-    decision_items: dict[str, Mapping[str, Any]] = {}
-    for decision in raw_decisions:
-        if not isinstance(decision, Mapping) or not isinstance(decision.get("phase"), str):
-            raise _fail("summary promotion decision entry is malformed")
-        name = str(decision["phase"])
-        if name in decision_items:
-            raise _fail(f"duplicate promotion decision entry {name!r}")
-        decision_items[name] = decision
-        if ("promotion", name) not in listed:
-            raise _fail(f"phase {name!r} promotion decision is not listed in the artifact manifest")
-
     for kind, name in listed:
         if kind == "winner" and name not in phase_items:
             raise _fail(f"artifact manifest lists a winner for unknown phase {name!r}")
@@ -308,7 +291,6 @@ def _validate_generation_manifest(
                 "attempt_id",
                 "winner_source",
                 "trainer_input",
-                "promotion",
             ):
                 if (field in payload) != (field in item) or payload.get(field) != item.get(field):
                     raise _fail(f"winner for phase {name!r} disagrees with the summary {field}")
@@ -329,12 +311,14 @@ def _validate_generation_manifest(
             source = payload.get("winner_source")
             if not isinstance(source, Mapping):
                 raise _fail(f"winner for phase {name!r} has no valid winner_source")
-            if source.get("kind") not in ("phase_trial", "promotion_baseline", "suite_baseline"):
+            if source.get("kind") != "phase_trial":
                 raise _fail(f"winner for phase {name!r} has no valid winner_source kind")
+            if set(source) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
+                raise _fail(f"winner for phase {name!r} has a removed winner_source field")
             source_phase = source.get("phase")
             if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
                 raise _fail(f"winner for phase {name!r} has no valid winner_source phase")
-            if source.get("kind") == "phase_trial" and source_phase != name:
+            if source_phase != name:
                 raise _fail(f"winner for phase {name!r} names another winner_source phase")
             source_trial = source.get("trial_number")
             if (
@@ -343,11 +327,6 @@ def _validate_generation_manifest(
                 or source_trial != payload.get("trial_number")
             ):
                 raise _fail(f"winner for phase {name!r} has no valid winner_source trial_number")
-            source_study = source.get("study")
-            if source_study is not None and (not isinstance(source_study, str) or not source_study):
-                raise _fail(f"winner for phase {name!r} has no valid winner_source study")
-            if source.get("kind") == "suite_baseline" and not source_study:
-                raise _fail(f"winner for phase {name!r} has no valid winner_source study")
             for id_field in ("generation_id", "attempt_id"):
                 if source.get(id_field) != payload.get(id_field):
                     raise _fail(
@@ -366,50 +345,6 @@ def _validate_generation_manifest(
             )
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
-        elif name in decision_items:
-            if payload != decision_items[name]:
-                raise _fail(f"promotion decision for phase {name!r} disagrees with the summary")
-        else:
-            # Older schema-2 resumes listed projected promotions only in the
-            # manifest. Accept only a copy of the named earlier generation's
-            # decision; this generation's decisions must appear in its summary.
-            source_generation = payload.get("generation_id")
-            if (
-                not isinstance(source_generation, str)
-                or not SAFE_NAME_PATTERN.fullmatch(source_generation)
-                or source_generation == generation_id
-            ):
-                raise _fail(
-                    f"artifact manifest lists a promotion decision absent from the summary for phase {name!r}"
-                )
-            source_path = (
-                generation_dir.parent
-                / source_generation
-                / "phases"
-                / name
-                / _ARTIFACT_FILENAMES["promotion"]
-            )
-            try:
-                source_payload = yaml.safe_load(
-                    _read_unlinked_bytes(source_path, root=generation_dir.parent)
-                )
-            except PermissionError as exc:
-                raise _permission_fail(
-                    _unreadable_artifact_permission_detail(
-                        f"source promotion artifact for phase {name!r}"
-                    )
-                ) from exc
-            except (OSError, yaml.YAMLError) as exc:
-                raise _fail(
-                    f"promotion decision for phase {name!r} cites source generation "
-                    f"{source_generation!r} with no readable promotion artifact"
-                ) from exc
-            if source_payload != payload:
-                raise _fail(
-                    f"promotion decision for phase {name!r} disagrees with "
-                    f"source generation {source_generation!r}"
-                )
-
     phases_dir = generation_dir / "phases"
     if phases_dir.is_dir():
         for phase_dir in phases_dir.iterdir():
@@ -421,6 +356,10 @@ def _validate_generation_manifest(
                         f"namespace contains an unlisted {kind} artifact "
                         f"for phase {phase_dir.name!r}"
                     )
+            if (phase_dir / "promotion.yaml").is_file():
+                raise _fail(
+                    f"namespace contains removed promotion artifact for phase {phase_dir.name!r}"
+                )
 
 
 def _validate_winner_source_generation(
@@ -433,7 +372,7 @@ def _validate_winner_source_generation(
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
 ) -> None:
-    """Validate a carried or baseline winner against its source in this tree.
+    """Validate a carried winner against its source in this tree.
 
     A winner's own ``generation_id`` may legitimately name an earlier
     generation - a top-up that reselects an existing trial, or a ``--from-phase``
@@ -441,10 +380,8 @@ def _validate_winner_source_generation(
     checks that field for well-formedness only. That left the whole
     cross-generation claim unverified: a published winner could cite a
     generation that exists only in some *other* artifact tree, or no tree at
-    all, and the publication still validated as ``ok`` (PR #5 review /
-    reviewer 2, blocker 7). The cited namespace is where the evidence behind
-    that number lives, so it has to resolve here. A baseline exposure within
-    the publishing generation also has to match its cited source phase winner.
+    all, and the publication still validated as ``ok``. The cited namespace
+    is where the evidence behind that number lives, so it has to resolve here.
 
     Deviating deliberately from a blanket "the source must also hold a winner
     record for this phase": a crash between trial completion and publication
@@ -555,15 +492,12 @@ def _validate_winner_source_generation(
             raise fail(
                 f"source generation {source_generation!r} summary names a different generation"
             )
-        if "schema_version" in source_summary:
-            try:
-                _validate_generation_manifest(source_dir, source_generation, source_summary)
-            except PublicationAccessError as exc:
-                raise permission_fail(str(exc)) from exc
-            except PublicationIntegrityError as exc:
-                raise fail(
-                    f"source generation {source_generation!r} does not validate: {exc}"
-                ) from exc
+        try:
+            _validate_generation_manifest(source_dir, source_generation, source_summary)
+        except PublicationAccessError as exc:
+            raise permission_fail(str(exc)) from exc
+        except PublicationIntegrityError as exc:
+            raise fail(f"source generation {source_generation!r} does not validate: {exc}") from exc
     expected = {
         "phase": source_phase,
         "trial_number": payload.get("trial_number"),
@@ -576,8 +510,8 @@ def _validate_winner_source_generation(
                 f"winner for phase {phase_name!r} disagrees with the winner recorded by its "
                 f"source generation {source_generation!r} on {field_name}"
             )
-    # Completion, promotion, and phase fingerprint belong to the exposing
-    # phase; the fields below come from the cited source trial.
+    # Completion and phase fingerprint belong to the exposing phase; the
+    # fields below come from the cited source trial.
     for field_name in (
         "metric",
         "params",
@@ -609,9 +543,8 @@ def _validate_generation_provenance_files(
     to its recorded content, and the namespace holds nothing the manifest does
     not list -- onto ``config.snapshot.yaml`` and ``reproducibility.json``
     (review v0.5.18 / finding F6). The two are all-or-nothing: they are
-    written together at claim time, so a manifest that lists one without the
-    other has been edited. A generation published before those files existed
-    lists neither and holds neither, which passes every check here unchanged.
+    written together at claim time and every current-format summary must list
+    both. A missing file or manifest entry is therefore a format violation.
 
     Note that the snapshot is owner-only, so a reader who cannot read it
     cannot validate the publication at all -- the same fail-closed outcome as
@@ -638,10 +571,8 @@ def _validate_generation_provenance_files(
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
             raise fail(f"namespace contains an unlisted {kind} artifact")
-    if not listed_files:
-        return
     if set(listed_files) != _MANIFEST_GENERATION_FILE_KINDS:
-        raise fail("summary lists only part of the generation provenance record")
+        raise fail("summary does not list the complete generation provenance record")
 
     contents: dict[str, bytes] = {}
     digests: dict[str, str] = {}
@@ -732,7 +663,7 @@ def _read_pointer_target(
 
     :param Path pointer_path: Pointer YAML file to read.
     :param str id_key: Payload key holding the target generation id.
-    :param str owner_key: Payload key naming the owning experiment or suite.
+    :param str owner_key: Payload key naming the owning experiment.
     :param str owner_name: Expected owner name the pointer must record.
     :return _PointerTarget | None: A safe-name target and exact summary-byte identity, or
         ``None`` when the pointer is missing, unreadable, malformed, names
@@ -797,12 +728,12 @@ def _read_pointer_target_summary(
     schema-versioned summary additionally validate the complete artifact
     manifest (:func:`_validate_generation_manifest`; review v0.5.16 /
     blocker 3) — this helper only performs the identity gate common to
-    experiment and suite pointers.
+    experiment pointers.
 
     :param Path summary_path: Immutable generation summary YAML file to read.
     :param str id_key: Summary key holding the generation id.
     :param str target_id: Generation id the summary must name.
-    :param str owner_key: Summary key naming the owning experiment or suite.
+    :param str owner_key: Summary key naming the owning experiment.
     :param str owner_name: Expected owner name the summary must carry.
     :param int | None expected_size_bytes: Pointer-recorded exact summary byte length.
     :param str | None expected_sha256: Pointer-recorded SHA-256 of the exact summary bytes.
@@ -838,241 +769,3 @@ def _read_pointer_target_summary(
     ):
         return summary
     return None
-
-
-def _validate_suite_summary_integrity(
-    generation_id: str,
-    summary: Mapping[str, Any],
-) -> None:
-    """Validate a suite summary's winner facts against its recorded components.
-
-    Suite mirror of :func:`_validate_generation_manifest` (review v0.5.17 gap
-    hunt): the published suite summary is the authoritative read surface for
-    suite winners, so its per-study results must be anchored to hash-covered
-    component artifacts rather than trusted as bare text. Each study record
-    names its component generation summary by absolute path plus content
-    hash; the file must sit at ``generations/<component id>/summary.yaml``,
-    parse, and name the recorded experiment and generation — and every
-    exposed phase winner in the suite summary must match one of those verified
-    component summaries. A study's own winner matches its complete compact
-    payload. A promotion-adopted suite baseline matches the recorded source
-    phase and trial-derived payload (trial, metric, parameters, effective
-    overrides, constraints, gates, generation, and attempt), while its
-    completion/source/promotion metadata may legitimately describe the
-    candidate slot that exposes the clone. Runs pre-commit (before the suite
-    last-success pointer advances) and read-side (before a pointer target is
-    trusted).
-
-    :param str generation_id: Suite generation id, used for error text.
-    :param Mapping[str, Any] summary: Parsed suite summary payload.
-    :raises PublicationAccessError: A component summary or manifest artifact cannot be
-        read by the current user.
-    :raises PublicationIntegrityError: A study record is malformed, a component summary is
-        missing, altered, or misidentified, its generation manifest is invalid,
-        or an exposed winner is not anchored to a verified component.
-    """
-
-    def _fail(reason: str) -> PublicationIntegrityError:
-        """Build one uniformly labeled suite-integrity error.
-
-        :param str reason: Specific validation failure being reported.
-        :return PublicationIntegrityError: Error naming the suite generation and reason.
-        """
-        return PublicationIntegrityError(
-            f"Suite generation {generation_id!r} summary integrity validation failed: {reason}"
-        )
-
-    def _permission_fail(reason: str) -> PublicationAccessError:
-        """Build a permission-specific suite-validation error.
-
-        :param str reason: Permission failure being reported.
-        :return PublicationAccessError: Error naming the suite generation and reason.
-        """
-        return PublicationAccessError(
-            f"Suite generation {generation_id!r} summary validation could not run: {reason}"
-        )
-
-    records = summary.get("studies")
-    if not isinstance(records, list):
-        raise _fail("summary has no study records")
-
-    evidence_fields = (
-        "trial_number",
-        "metric",
-        "params",
-        "effective_overrides",
-        "constraints",
-        "gates",
-        "generation_id",
-        "attempt_id",
-    )
-    full_fields = (*evidence_fields, "completion", "winner_source", "promotion")
-
-    def _winner_key(
-        item: Mapping[str, Any],
-        *,
-        phase_name: str,
-        include_exposure_metadata: bool,
-    ) -> tuple[str, str]:
-        """Return a type-aware canonical key for one component winner.
-
-        :param Mapping[str, Any] item: One summary phase-winner entry.
-        :param str phase_name: Source component phase that produced the winner.
-        :param bool include_exposure_metadata: Include completion, source, and
-            promotion fields when the suite exposes its own component winner.
-        :raises PublicationIntegrityError: The winner payload cannot be represented as safe YAML.
-        :return tuple[str, str]: Source phase plus canonical winner payload.
-        """
-        fields = full_fields if include_exposure_metadata else evidence_fields
-        payload = {field: item[field] for field in fields if field in item}
-        try:
-            encoded = yaml.safe_dump(payload, sort_keys=True)
-        except yaml.YAMLError as exc:
-            raise _fail("summary contains an invalid winner payload") from exc
-        return phase_name, encoded
-
-    component_full_winners: set[tuple[str, str, str]] = set()
-    component_evidence_winners: set[tuple[str, str, str]] = set()
-    legacy_component_studies: set[str] = set()
-    for record in records:
-        if not isinstance(record, Mapping) or not isinstance(record.get("name"), str):
-            raise _fail("summary study record is malformed")
-        name = str(record["name"])
-        component_generation = record.get("experiment_generation_id")
-        recorded_path = record.get("component_summary_path")
-        recorded_sha = record.get("component_summary_sha256")
-        if (
-            not isinstance(component_generation, str)
-            or not component_generation
-            or not isinstance(recorded_path, str)
-            or not recorded_path
-            or not isinstance(recorded_sha, str)
-        ):
-            raise _fail(f"study {name!r} has no component summary reference")
-        target = Path(recorded_path)
-        expected_suffix = Path("generations") / component_generation / "summary.yaml"
-        if not target.is_absolute() or target.parts[-3:] != expected_suffix.parts:
-            raise _fail(
-                f"study {name!r} component summary path does not name its "
-                "recorded generation namespace"
-            )
-        try:
-            content = _read_unlinked_bytes(target, root=target.parent.parent)
-        except PermissionError as exc:
-            raise _permission_fail(
-                _unreadable_artifact_permission_detail(f"study {name!r} component summary")
-            ) from exc
-        except OSError as exc:
-            raise _fail(f"study {name!r} component summary is missing or unreadable") from exc
-        if hashlib.sha256(content).hexdigest() != recorded_sha:
-            raise _fail(f"study {name!r} component summary does not match its recorded hash")
-        try:
-            payload = yaml.safe_load(content)
-        except yaml.YAMLError as exc:
-            raise _fail(f"study {name!r} component summary is not parseable") from exc
-        if not isinstance(payload, Mapping):
-            raise _fail(f"study {name!r} component summary is not a mapping")
-        if (
-            payload.get("experiment") != record.get("experiment")
-            or payload.get("generation_id") != component_generation
-        ):
-            raise _fail(f"study {name!r} component summary names a different identity")
-        if "schema_version" not in payload:
-            # Pre-manifest legacy component summary: identity + hash anchor
-            # only, mirroring the legacy rule in the publication-time
-            # component-manifest chase. Its winners cannot be indexed for the
-            # membership check below.
-            legacy_component_studies.add(name)
-            continue
-        try:
-            _validate_generation_manifest(target.parent, component_generation, payload)
-        except PublicationAccessError as exc:
-            raise _permission_fail(
-                f"study {name!r} component manifest cannot be validated as this user ({exc})"
-            ) from exc
-        except PublicationIntegrityError as exc:
-            raise _fail(f"study {name!r} component manifest is invalid ({exc})") from exc
-        phases = payload.get("phases")
-        if not isinstance(phases, list):
-            raise _fail(f"study {name!r} component summary has no phase list")
-        for item in phases:
-            if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
-                raise _fail(f"study {name!r} component summary has a malformed phase entry")
-            phase_name = str(item["name"])
-            component_full_winners.add(
-                (
-                    name,
-                    *_winner_key(item, phase_name=phase_name, include_exposure_metadata=True),
-                )
-            )
-            component_evidence_winners.add(
-                (
-                    name,
-                    *_winner_key(item, phase_name=phase_name, include_exposure_metadata=False),
-                )
-            )
-
-    for record in records:
-        name = str(record["name"])
-        if name in legacy_component_studies:
-            continue
-        phases = record.get("phases")
-        if not isinstance(phases, list):
-            raise _fail(f"study {name!r} has no phase list")
-        for item in phases:
-            if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
-                raise _fail(f"study {name!r} has a malformed phase entry")
-            if type(item.get("exposed")) is not bool:
-                raise _fail(f"study {name!r} phase {item['name']!r} has no valid exposed flag")
-            if item.get("exposed") is not True:
-                continue
-            source = item.get("winner_source")
-            if isinstance(source, Mapping) and source.get("kind") == "suite_baseline":
-                source_phase = source.get("phase")
-                if not isinstance(source_phase, str) or not source_phase:
-                    raise _fail(
-                        f"study {name!r} exposed winner for phase {item['name']!r} "
-                        "has no baseline source phase"
-                    )
-                source_study = source.get("study")
-                if not isinstance(source_study, str) or not source_study:
-                    raise _fail(
-                        f"study {name!r} exposed winner for phase {item['name']!r} "
-                        "has no baseline source study"
-                    )
-                for identity_field in (
-                    "trial_number",
-                    "generation_id",
-                    "attempt_id",
-                ):
-                    if type(source.get(identity_field)) is not type(
-                        item.get(identity_field)
-                    ) or source.get(identity_field) != item.get(identity_field):
-                        raise _fail(
-                            f"study {name!r} exposed winner for phase {item['name']!r} "
-                            "does not match its baseline source identity"
-                        )
-                key = (
-                    source_study,
-                    *_winner_key(
-                        item,
-                        phase_name=source_phase,
-                        include_exposure_metadata=False,
-                    ),
-                )
-                anchored = key in component_evidence_winners
-            else:
-                key = (
-                    name,
-                    *_winner_key(
-                        item,
-                        phase_name=str(item["name"]),
-                        include_exposure_metadata=True,
-                    ),
-                )
-                anchored = key in component_full_winners
-            if not anchored:
-                raise _fail(
-                    f"study {name!r} exposed winner for phase {item['name']!r} does "
-                    "not match any verified component summary"
-                )

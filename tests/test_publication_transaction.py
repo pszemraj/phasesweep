@@ -7,9 +7,8 @@ or mismatched generation, a current pointer stuck at a non-terminal state, or
 a committed success downgraded by later bookkeeping. The per-generation
 lifecycle record is write-once and purely informational (written *after* the
 pointer commits); pointer validation instead reads back the generation's own
-immutable summary artifact. Suite manifests must name exactly the component
-generation that produced their winners, and terminal-state persistence
-failures must never replace the primary exception.
+immutable summary artifact, and terminal-state persistence failures must
+never replace the primary exception.
 """
 
 from __future__ import annotations
@@ -31,18 +30,14 @@ import yaml
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.publication_validation as validation_ops
-import phasesweep.engine.run as run_engine
-import phasesweep.engine.suite as suite_ops
-from phasesweep import load_config, run_experiment
-from phasesweep.cli import _show_suite_winners
-from phasesweep.config import Experiment, IntParam, Phase, Promotion, Sampler, Suite
+from phasesweep import run_experiment
+from phasesweep.config import Experiment, IntParam, Phase, Sampler
 from phasesweep.engine import (
     NoFeasibleTrialError,
     PublicationCommitError,
     PublicationIntegrityError,
     TerminalReport,
     Winner,
-    WinnerIntegrityError,
     generation_id_source,
     read_status,
     read_winner,
@@ -55,30 +50,21 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _generations_dir,
     _last_successful_generation_path,
-    _last_successful_suite_generation_path,
-    _suite_generation_path,
-    _suite_generation_record_path,
-    _suite_generation_summary_path,
-    _suite_generations_dir,
-    _suite_summary_path,
 )
 from phasesweep.engine.publication import (
     PublicationPointer,
     _last_successful_generation_id,
     _resolve_publication_pointer,
-    _resolve_suite_publication_pointer,
     _unresolvable_pointer,
 )
-from phasesweep.engine.suite import run_suite
 from phasesweep.runtime import process as runtime_process
-from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
+from phasesweep.runtime.process import PhaseSweepShutdown
 from tests.conftest import (
     make_experiment,
     patch_directory_fsync_failure,
     patch_path_method_failure,
     temporary_umask,
     write_trainer,
-    write_yaml,
 )
 
 
@@ -103,7 +89,7 @@ print(f"x={args.x}")
 
 # Provenance files frozen into every generation namespace at claim time
 # (review v0.5.18 / finding F6). Referenced by literal name on purpose: these
-# names are the documented on-disk contract in docs/runtime.md, so renaming
+# names are the documented on-disk interface in docs/runtime.md, so renaming
 # them must fail here rather than silently move an operator's evidence.
 _CONFIG_SNAPSHOT_NAME = "config.snapshot.yaml"
 _REPRODUCIBILITY_NAME = "reproducibility.json"
@@ -155,12 +141,6 @@ def _current_pointer_state(experiment) -> str | None:
 def _record_state(experiment, generation_id: str) -> str | None:
     """Read one generation's immutable record ``state`` label."""
     payload = yaml.safe_load(_generation_record_path(experiment, generation_id).read_text())
-    return payload.get("state") if isinstance(payload, dict) else None
-
-
-def _suite_record_state(suite: Suite, generation_id: str) -> str | None:
-    """Read one suite generation's immutable record ``state`` label."""
-    payload = yaml.safe_load(_suite_generation_record_path(suite, generation_id).read_text())
     return payload.get("state") if isinstance(payload, dict) else None
 
 
@@ -393,7 +373,7 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A legacy compatibility-cache projection failure must not fail the run.
+    """A convenience root-projection failure must not fail the run.
 
     Flips the pre-v0.5.15 behavior (projection failures used to precede and
     block the pointer commit): projections are now a post-commit, best-effort
@@ -418,11 +398,11 @@ def test_cache_projection_failure_after_commit_leaves_run_successful(
     assert second_generation != first_generation
     assert _record_state(experiment, second_generation) == "published"
     assert any(
-        "failed to refresh the current-generation pointer or compatibility caches" in r.message
+        "failed to refresh the current-generation pointer or convenience projections" in r.message
         for r in caplog.records
     )
     # Reads are unaffected: once a generation has published, they resolve the
-    # generation-scoped artifact directly rather than the stale legacy cache.
+    # generation-scoped artifact directly rather than a stale root projection.
     # The winning trial itself still belongs to the first generation (the
     # target trial count was already satisfied, so no new trial ran); what
     # matters is that the read resolves via the new last-success pointer
@@ -530,8 +510,8 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
     """A shutdown signal racing the publication transaction loses to the commit.
 
     The signal lands mid-transaction (during pre-commit validation); the
-    publication must still commit, the run must return success, and the
-    shutdown must be delivered at the next checkpoint — never rewritten into
+    publication must still commit and the shutdown must be delivered at the
+    next checkpoint — never rewritten into
     a ``failed``/``publication_failed`` state for the committed generation
     (review v0.5.16 / blocker 1, window 2).
     """
@@ -547,90 +527,16 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
     monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
 
     try:
-        winners = run_experiment(experiment)
+        with pytest.raises(PhaseSweepShutdown) as exc_info:
+            run_experiment(experiment)
 
-        assert set(winners) == {"p"}
+        assert exc_info.value.signum == signal.SIGTERM
+        assert exc_info.value.published_result_committed is True
         generation_id = _last_successful_generation_id(experiment)
         assert generation_id is not None
         assert _record_state(experiment, generation_id) == "published"
         assert _current_pointer_state(experiment) == "published"
-
-        # The absorbed shutdown is still honored before any new work starts.
-        with pytest.raises(PhaseSweepShutdown) as exc_info:
-            runtime_process.service_pending_shutdown()
-        assert exc_info.value.signum == signal.SIGTERM
-    finally:
-        runtime_process._deferred_shutdown_signum = None
-
-
-def test_shutdown_absorbed_during_component_publication_stops_suite_before_next_study(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A shutdown that loses to a component's publication still stops the suite.
-
-    The committed component publication wins its own race, but the absorbed
-    shutdown must be serviced before the next study starts — the suite must
-    not keep launching new work after the operator asked it to stop.
-    """
-    trainer = write_trainer(tmp_path / "trainer.py", _TRAINER_BODY)
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            f"""
-            suite: absorb_suite
-            defaults:
-              workdir: {tmp_path}/runs
-              storage: sqlite:///{tmp_path}/suite.db
-              provenance: {{revision: test-v1}}
-              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-              override_format: argparse
-              metric:
-                name: x
-                goal: minimize
-                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            studies:
-              - name: one
-                phases:
-                  - name: p
-                    n_trials: 1
-                    sampler: {{ type: random, seed: 0 }}
-                    search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-              - name: two
-                phases:
-                  - name: p
-                    n_trials: 1
-                    sampler: {{ type: random, seed: 0 }}
-                    search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-            """,
-        )
-    )
-    assert isinstance(config, Suite)
-
-    original_validate = generation_ops._validate_generation_publishable
-    signalled = {"done": False}
-
-    def validate_then_signal(*args: object, **kwargs: object) -> tuple[dict[str, Any], bytes]:
-        validated = original_validate(*args, **kwargs)
-        if not signalled["done"]:
-            signalled["done"] = True
-            os.kill(os.getpid(), signal.SIGTERM)
-        return validated
-
-    monkeypatch.setattr(generation_ops, "_validate_generation_publishable", validate_then_signal)
-
-    try:
-        with pytest.raises(PhaseSweepShutdown) as exc_info:
-            run_suite(config)
-        assert exc_info.value.signum == signal.SIGTERM
-
-        # Study one's component publication committed and survived.
-        component_one = config.experiment_for_study(config.studies[0])
-        assert _last_successful_generation_id(component_one) is not None
-        # Study two never started: no generation namespace was ever claimed.
-        component_two = config.experiment_for_study(config.studies[1])
-        assert _last_successful_generation_id(component_two) is None
-        assert not _generation_path(component_two).is_file()
+        assert runtime_process.service_pending_shutdown() is None
     finally:
         runtime_process._deferred_shutdown_signum = None
 
@@ -828,71 +734,48 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
     assert read_winner(experiment, "p") is None
 
 
-def test_read_side_accepts_legacy_summary_without_manifest(tmp_path: Path) -> None:
-    """A pre-manifest summary (no schema_version) keeps the identity-only gate."""
+@pytest.mark.parametrize("removed_artifact", ["promotion_decisions", "promotion.yaml"])
+def test_manifest_rejects_removed_promotion_artifacts(
+    tmp_path: Path,
+    removed_artifact: str,
+) -> None:
+    """Current-format publications cannot silently adopt removed promotion state."""
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
 
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
-        summary.pop(key, None)
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    if removed_artifact == "promotion_decisions":
+        summary_path = _generation_summary_path(experiment, generation_id)
+        summary = yaml.safe_load(summary_path.read_text())
+        summary[removed_artifact] = []
+        summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+        _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    else:
+        promotion_path = (
+            _generation_dir(experiment, generation_id) / "phases" / "p" / removed_artifact
+        )
+        promotion_path.write_text("removed: true\n")
 
-    assert _last_successful_generation_id(experiment) == generation_id
-    assert read_winner(experiment, "p") is not None
+    assert _resolve_publication_pointer(experiment).state == "failed"
+    assert read_status(experiment)["publication_integrity"] == "failed"
+    assert read_winner(experiment, "p") is None
 
 
-def test_load_winner_rejects_linked_winner_with_legacy_summary(tmp_path: Path) -> None:
-    """Strict resume rejects a linked winner even when legacy summaries lack a manifest."""
+def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) -> None:
+    """Strict resume rejects a linked winner from a current-format publication."""
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
-
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    for key in ("schema_version", "artifacts", "config_fingerprint", "phase_plan"):
-        summary.pop(key, None)
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     preserved_winner_path = winner_path.with_name("winner.original.yaml")
     winner_path.rename(preserved_winner_path)
     winner_path.symlink_to(preserved_winner_path.name)
 
-    with pytest.raises(WinnerIntegrityError, match="invalid or incomplete"):
+    with pytest.raises(PublicationIntegrityError, match="missing or unreadable"):
         artifact_io._load_winner(experiment, experiment.phases[0], {})
-
-
-def test_suite_publication_refuses_broken_component_manifest(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A suite must not publish when a recorded component's manifest no longer validates."""
-    suite = _stored_suite_config(tmp_path)
-    component = suite.experiment_for_study(suite.studies[0])
-
-    original = suite_ops._validate_suite_generation_publishable
-
-    def break_component_then_validate(suite_arg, generation_id: str, **kwargs) -> None:  # noqa: ANN001
-        component_generation = _last_successful_generation_id(component)
-        assert component_generation is not None
-        _generation_winner_path(component, component_generation, "p").unlink()
-        original(suite_arg, generation_id, **kwargs)
-
-    monkeypatch.setattr(
-        suite_ops, "_validate_suite_generation_publishable", break_component_then_validate
-    )
-
-    with pytest.raises(RuntimeError, match="component manifest is invalid"):
-        run_suite(suite)
-
-    assert _resolve_suite_publication_pointer(suite).state == "absent"
 
 
 # --------------------------------------------------------------------------
@@ -1084,55 +967,6 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     assert semantic_error in pointer.error
 
 
-@pytest.mark.parametrize("tamper", ["completion", "duplicate"])
-def test_summary_promotion_decisions_match_hashed_artifacts(
-    tmp_path: Path,
-    tamper: str,
-) -> None:
-    """A re-anchored summary cannot change or duplicate a promotion decision."""
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage="auto",
-        trial_command="echo x=-{trial_id}",
-        phases=[
-            Phase(
-                name=name,
-                n_trials=1,
-                allow_no_gpu_isolation=True,
-                sampler=Sampler(type="random", seed=0),
-                promotion=(
-                    Promotion(min_delta_vs="base", min_delta=100, on_fail="skip")
-                    if name == "candidate"
-                    else None
-                ),
-            )
-            for name in ("base", "candidate")
-        ],
-    )
-    run_experiment(experiment)
-    generation_id = _last_successful_generation_id(experiment)
-    assert generation_id is not None
-
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    decisions = summary["promotion_decisions"]
-    assert len(decisions) == 1
-    if tamper == "completion":
-        decisions[0]["candidate_completion"]["finished_trials"] = 0
-        decisions[0]["candidate_completion"]["completed_trials"] = 0
-        expected_error = "disagrees with the summary"
-    else:
-        decisions.append(dict(decisions[0]))
-        expected_error = "duplicate promotion decision"
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
-
-    pointer = _resolve_publication_pointer(experiment)
-    assert pointer.state == "failed"
-    assert pointer.error is not None
-    assert expected_error in pointer.error
-
-
 def test_publication_pointer_reports_absent_before_anything_publishes(tmp_path: Path) -> None:
     """A tree that never published is healthy, not corrupt."""
     experiment = _stored_experiment(tmp_path)
@@ -1191,7 +1025,7 @@ def test_corrupt_publication_is_reported_as_failed_not_absent(tmp_path: Path) ->
     assert status["represented_generation_id"] is None
     assert status["is_published"] is False
     assert status["phases"][0]["winner_present"] is False
-    # The boolean-blind wrapper keeps its fail-closed contract for path callers.
+    # The boolean-blind wrapper remains fail-closed for path callers.
     assert _last_successful_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
@@ -1264,154 +1098,25 @@ def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
         _last_successful_generation_id(experiment, raise_on_manifest_error=True)
 
 
-@pytest.mark.parametrize("damage", ["summary", "winner"])
-def test_suite_publication_pointer_reports_a_tampered_component_as_failed(
-    tmp_path: Path,
-    damage: str,
-) -> None:
-    """The suite pointer gets the same four-state verdict as the experiment pointer."""
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    generation_id = pointer.generation_id
-    assert generation_id is not None
-
-    assert _resolve_suite_publication_pointer(suite) == PublicationPointer(
-        state="ok", generation_id=generation_id, error=None
-    )
-
-    summary = yaml.safe_load(_suite_generation_summary_path(suite, generation_id).read_text())
-    component_path = Path(summary["studies"][0]["component_summary_path"])
-    if damage == "summary":
-        component_path.write_text(component_path.read_text() + "\n# tampered\n")
-    else:
-        component_winner = component_path.parent / "phases" / "p" / "winner.yaml"
-        component_winner.write_text(component_winner.read_text() + "\n# tampered\n")
-
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "failed"
-    assert pointer.generation_id == generation_id
-    assert pointer.error is not None
-
-
-def test_suite_pointer_anchors_the_exact_summary_bytes(tmp_path: Path) -> None:
-    """Suite commits carry the same exact-byte summary identity as experiments."""
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    generation_id = pointer.generation_id
-    assert generation_id is not None
-
-    summary = _suite_generation_summary_path(suite, generation_id).read_bytes()
-    payload = yaml.safe_load(_last_successful_suite_generation_path(suite).read_text())
-    assert payload["summary_size_bytes"] == len(summary)
-    assert payload["summary_sha256"] == hashlib.sha256(summary).hexdigest()
-
-
-@pytest.mark.parametrize("exposed", ["yes", None])
-def test_suite_pointer_rejects_nonboolean_exposure(tmp_path: Path, exposed: object) -> None:
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    assert pointer.generation_id is not None
-    summary_path = _suite_generation_summary_path(suite, pointer.generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    phase = summary["studies"][0]["phases"][0]
-    phase["exposed"] = exposed
-    phase["metric"] = 999.0
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reanchor_summary_pointer(_last_successful_suite_generation_path(suite), summary_path)
-
-    assert _resolve_suite_publication_pointer(suite).state == "failed"
-    with pytest.raises(PublicationIntegrityError):
-        _show_suite_winners(suite)
-    previous_success = _last_successful_suite_generation_path(suite).read_bytes()
-    previous_current = _suite_generation_path(suite).read_bytes()
-
-    with pytest.raises(PublicationIntegrityError):
-        run_suite(suite)
-
-    assert _last_successful_suite_generation_path(suite).read_bytes() == previous_success
-    assert _suite_generation_path(suite).read_bytes() == previous_current
-
-
-@pytest.mark.parametrize("tamper", ["generation_id", "summary_path"])
-def test_suite_component_map_is_pointer_anchored_and_cross_checked(
-    tmp_path: Path,
-    tamper: str,
-) -> None:
-    """Component generation identities and summary locations cannot be rewritten silently."""
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    generation_id = pointer.generation_id
-    assert generation_id is not None
-
-    summary_path = _suite_generation_summary_path(suite, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    record = summary["studies"][0]
-    if tamper == "generation_id":
-        record["experiment_generation_id"] = "different-generation"
-    else:
-        record["component_summary_path"] = f"{record['component_summary_path']}.other"
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-
-    assert _resolve_suite_publication_pointer(suite).state == "failed"
-
-    pointer_path = _last_successful_suite_generation_path(suite)
-    _reanchor_summary_pointer(pointer_path, summary_path)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "failed"
-    assert pointer.error is not None
-    assert "component summary" in pointer.error
-
-
-def test_suite_publication_pointer_reports_absent_before_anything_publishes(
-    tmp_path: Path,
-) -> None:
-    """A suite that never published reports absent, like the experiment pointer."""
-    suite = _stored_suite_config(tmp_path)
-
-    assert _resolve_suite_publication_pointer(suite) == PublicationPointer(
-        state="absent", generation_id=None, error=None
-    )
-
-
-@pytest.mark.parametrize("suite_owner", [False, True])
-def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(
-    tmp_path: Path, suite_owner: bool
-) -> None:
-    if suite_owner:
-        owner = _stored_suite_config(tmp_path)
-        run = run_suite
-        pointer_path = _last_successful_suite_generation_path(owner)
-        current_path = _suite_generation_path(owner)
-        resolve = _resolve_suite_publication_pointer
-    else:
-        owner = _stored_experiment(tmp_path)
-        run = run_experiment
-        pointer_path = _last_successful_generation_path(owner)
-        current_path = _generation_path(owner)
-        resolve = _resolve_publication_pointer
-    run(owner)
+def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Path) -> None:
+    owner = _stored_experiment(tmp_path)
+    pointer_path = _last_successful_generation_path(owner)
+    current_path = _generation_path(owner)
+    run_experiment(owner)
     current = current_path.read_bytes()
     pointer_path.unlink()
     pointer_path.symlink_to("missing-target.yaml")
     assert pointer_path.is_symlink() and not pointer_path.exists()
 
-    assert resolve(owner).state == "failed"
+    assert _resolve_publication_pointer(owner).state == "failed"
     with pytest.raises(PublicationIntegrityError):
-        run(owner)
+        run_experiment(owner)
 
     assert pointer_path.is_symlink()
     assert current_path.read_bytes() == current
 
 
-def test_surviving_pointer_prevents_legacy_fallback_after_generation_loss(
+def test_surviving_pointer_prevents_root_projection_fallback_after_generation_loss(
     tmp_path: Path,
 ) -> None:
     experiment = _stored_experiment(tmp_path)
@@ -1428,7 +1133,7 @@ def test_surviving_pointer_prevents_legacy_fallback_after_generation_loss(
     assert read_winner(experiment, "p") is None
 
 
-def test_dangling_generation_root_does_not_enable_legacy_winner(tmp_path: Path) -> None:
+def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Path) -> None:
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)
     assert read_winner(experiment, "p") is not None
@@ -1445,40 +1150,6 @@ def test_dangling_generation_root_does_not_enable_legacy_winner(tmp_path: Path) 
     assert status["is_published"] is False
     assert status["phases"][0]["winner_present"] is False
     assert read_winner(experiment, "p") is None
-
-
-def test_suite_deleted_pointers_do_not_expose_compatibility_summary(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    assert _suite_summary_path(suite).is_file()
-    _last_successful_suite_generation_path(suite).unlink()
-    _suite_generation_path(suite).unlink()
-
-    assert _resolve_suite_publication_pointer(suite).state == "absent"
-    _show_suite_winners(suite)
-    assert capsys.readouterr().out.strip() == "(no successful suite result yet)"
-
-
-def test_dangling_suite_generation_root_does_not_enable_legacy_summary(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    assert _suite_summary_path(suite).is_file()
-    _last_successful_suite_generation_path(suite).unlink()
-    _suite_generation_path(suite).unlink()
-    generations = _suite_generations_dir(suite)
-    generations.rename(generations.with_name("saved-suite-generations"))
-    generations.symlink_to("missing-suite-generations", target_is_directory=True)
-    assert generations.is_symlink() and not generations.exists()
-
-    assert _resolve_suite_publication_pointer(suite).state == "absent"
-    _show_suite_winners(suite)
-    assert capsys.readouterr().out.strip() == "(no successful suite result yet)"
 
 
 # --------------------------------------------------------------------------
@@ -1564,302 +1235,6 @@ def test_read_status_single_captures_the_published_pointer(
 
 
 # --------------------------------------------------------------------------
-# Suite equivalents for the core cases.
-# --------------------------------------------------------------------------
-
-
-def _stored_suite_config(tmp_path: Path) -> Suite:
-    trainer = write_trainer(tmp_path / "trainer.py", _TRAINER_BODY)
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            f"""
-            suite: pub_suite
-            defaults:
-              workdir: {tmp_path}/runs
-              storage: sqlite:///{tmp_path}/suite.db
-              provenance: {{revision: test-v1}}
-              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-              override_format: argparse
-              metric:
-                name: x
-                goal: minimize
-                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            studies:
-              - name: one
-                phases:
-                  - name: p
-                    n_trials: 1
-                    sampler: {{ type: random, seed: 0 }}
-                    search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-            """,
-        )
-    )
-    assert isinstance(config, Suite)
-    return config
-
-
-def test_suite_precommit_validation_failure_keeps_prior_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Suite mirror: a pre-commit validation failure keeps the prior suite publication."""
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    first_generation = pointer.generation_id
-    assert first_generation is not None
-
-    def fail_validation(*_args: object, **_kwargs: object) -> None:
-        raise RuntimeError("simulated suite validation failure")
-
-    monkeypatch.setattr(suite_ops, "_validate_suite_generation_publishable", fail_validation)
-
-    with pytest.raises(RuntimeError, match="simulated suite validation failure"):
-        run_suite(suite)
-
-    second_generation = yaml.safe_load(_suite_generation_path(suite).read_text())[
-        "suite_generation_id"
-    ]
-    assert second_generation != first_generation
-    assert _suite_record_state(suite, second_generation) == "publication_failed"
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    assert pointer.generation_id == first_generation
-
-
-def test_suite_cache_projection_failure_after_commit_leaves_run_successful(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Suite mirror: a post-commit projection failure must not fail the suite run."""
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    first_generation = pointer.generation_id
-    assert first_generation is not None
-
-    def fail_projection(*_args: object, **_kwargs: object) -> None:
-        raise OSError("simulated suite projection failure")
-
-    monkeypatch.setattr(generation_ops, "_copy_yaml_projection", fail_projection)
-
-    with caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"):
-        results = run_suite(suite)
-
-    assert set(results) == {"one"}
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    second_generation = pointer.generation_id
-    assert second_generation is not None
-    assert second_generation != first_generation
-    assert _suite_record_state(suite, second_generation) == "published"
-    assert any(
-        "failed to refresh the current suite-generation pointer or compatibility cache" in r.message
-        for r in caplog.records
-    )
-
-
-def test_suite_summary_winner_facts_are_anchored_to_component_artifacts(
-    tmp_path: Path,
-) -> None:
-    """An edited suite summary or component summary fails read-side integrity
-    validation instead of presenting altered results as published (review
-    v0.5.17 gap hunt): the suite summary's winner facts are anchored to the
-    hash-covered component summaries it recorded at publication. The
-    experiment path has enforced this since the v0.5.16 manifest work; the
-    suite path previously trusted the summary text on identity alone."""
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    generation_id = pointer.generation_id
-    assert generation_id is not None
-
-    summary_path = _suite_generation_summary_path(suite, generation_id)
-    original = summary_path.read_text()
-    summary = yaml.safe_load(original)
-    study = summary["studies"][0]
-    exposed = [item for item in study["phases"] if item.get("exposed")]
-    assert exposed, "test setup: suite must expose at least one winner"
-
-    # Spoof the published metric value in the suite summary itself.
-    exposed[0]["metric"] = exposed[0]["metric"] + 1.0
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    assert _resolve_suite_publication_pointer(suite).state == "failed"
-
-    # Parameters and effective overrides are published winner facts too.
-    summary = yaml.safe_load(original)
-    study = summary["studies"][0]
-    exposed = [item for item in study["phases"] if item.get("exposed")]
-    exposed[0]["params"]["x"] = exposed[0]["params"]["x"] + 1
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    assert _resolve_suite_publication_pointer(suite).state == "failed"
-
-    # Restore, then tamper the hash-anchored component summary instead.
-    summary_path.write_text(original)
-    assert _resolve_suite_publication_pointer(suite).generation_id == generation_id
-    component_path = Path(study["component_summary_path"])
-    component_original = component_path.read_text()
-    component_path.write_text(component_original + "\n# tampered\n")
-    assert _resolve_suite_publication_pointer(suite).state == "failed"
-
-    # Restoring both artifacts restores the published result.
-    component_path.write_text(component_original)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    assert pointer.generation_id == generation_id
-
-
-def test_suite_generation_record_is_write_once(tmp_path: Path) -> None:
-    """Suite mirror: a published suite generation's record can never be rewritten."""
-    suite = _stored_suite_config(tmp_path)
-    run_suite(suite)
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    generation_id = pointer.generation_id
-    assert generation_id is not None
-    record_path = _suite_generation_record_path(suite, generation_id)
-    first_content = record_path.read_bytes()
-
-    suite_ops._write_suite_generation_state(
-        suite,
-        generation_id=generation_id,
-        state="failed",
-        started_at="2020-01-01T00:00:00Z",
-        ended_at="2020-01-01T00:01:00Z",
-        error_class="OSError",
-    )
-
-    assert record_path.read_bytes() == first_content
-    pointer = _resolve_suite_publication_pointer(suite)
-    assert pointer.state == "ok"
-    assert pointer.generation_id == generation_id
-
-
-def test_suite_manifest_names_the_generation_that_produced_its_winners(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An interleaved external top-up cannot corrupt suite component provenance."""
-    trainer = write_trainer(tmp_path / "trainer.py", _TRAINER_BODY)
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            f"""
-            suite: provenance_suite
-            defaults:
-              workdir: {tmp_path}/runs
-              storage: sqlite:///{tmp_path}/suite.db
-              provenance: {{revision: test-v1}}
-              trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-              override_format: argparse
-              metric:
-                name: x
-                goal: minimize
-                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            studies:
-              - name: one
-                phases:
-                  - name: p
-                    n_trials: 1
-                    sampler: {{ type: random, seed: 0 }}
-                    search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-            """,
-        )
-    )
-    assert isinstance(config, Suite)
-    component = config.experiment_for_study(config.studies[0])
-    top_up = component.model_copy(
-        update={"phases": [component.phases[0].model_copy(update={"n_trials": 2})]}
-    )
-    original_promotion = suite_ops._apply_study_promotion
-
-    def interleave(**kwargs: object):
-        # Publish a newer component generation in the gap between the
-        # component run returning and the suite recording provenance.
-        run_experiment(top_up)
-        return original_promotion(**kwargs)
-
-    monkeypatch.setattr(suite_ops, "_apply_study_promotion", interleave)
-    results = run_suite(config)
-
-    summary = yaml.safe_load(_suite_summary_path(config).read_text())
-    recorded = summary["studies"][0]["experiment_generation_id"]
-    current = _last_successful_generation_id(component)
-
-    # The pointer moved on to the top-up's generation, but the manifest still
-    # names the generation whose immutable winners equal the suite's results.
-    assert recorded != current
-    assert recorded == results["one"]["p"].generation_id
-    assert _generation_winner_path(component, recorded, "p").is_file()
-
-
-def test_suite_state_write_failure_preserves_cancellation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A failed terminal-state write cannot replace SIGTERM cancellation."""
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            f"""
-            suite: masked_suite
-            defaults:
-              workdir: {tmp_path}/runs
-              trial_command: "echo {{overrides}}"
-              override_format: argparse
-              metric:
-                name: x
-                goal: minimize
-                extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            studies:
-              - name: one
-                phases:
-                  - name: p
-                    n_trials: 1
-                    search_space: {{}}
-            """,
-        )
-    )
-    assert isinstance(config, Suite)
-    shutdown = PhaseSweepShutdown(
-        signal.SIGTERM,
-        ShutdownCleanupReport(signum=signal.SIGTERM, cleanup_confirmed=True, child_pgids=()),
-    )
-
-    def cancel(*_args: object, **_kwargs: object):
-        raise shutdown
-
-    original_state = suite_ops._write_suite_generation_state
-
-    monkeypatch.setattr(run_engine, "_run_experiment_outcome", cancel)
-    monkeypatch.setattr(
-        suite_ops,
-        "_write_suite_generation_state",
-        _fail_terminal_generation_state(
-            original_state,
-            OSError("simulated suite state persistence failure"),
-        ),
-    )
-
-    with (
-        caplog.at_level(logging.ERROR, logger="phasesweep.engine.generation"),
-        pytest.raises(PhaseSweepShutdown) as exc_info,
-    ):
-        run_suite(config)
-
-    assert exc_info.value is shutdown
-    assert exc_info.value.signum == signal.SIGTERM
-    assert exc_info.value.code == 128 + signal.SIGTERM
-    assert any("failed to persist terminal failure state" in r.message for r in caplog.records)
-
-
-# --------------------------------------------------------------------------
 # Generation provenance: the configuration and identity that produced a
 # published result are frozen into its namespace (review v0.5.18 / finding F6).
 # --------------------------------------------------------------------------
@@ -1870,7 +1245,7 @@ def test_generation_namespace_freezes_the_config_that_produced_it(tmp_path: Path
 
     Before this, a generation kept only the config *fingerprint*: once the
     operator edited or lost the YAML, the digest could prove a mismatch but
-    could not reconstruct the search spaces, fixed overrides, contracts, env,
+    could not reconstruct the search spaces, fixed overrides, environment, or
     or trial command behind a published winner.
     """
     experiment = _stored_experiment(tmp_path, env={"TRAINER_TOKEN": _SENTINEL_SECRET})
@@ -2132,48 +1507,11 @@ def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) ->
     assert json.loads(repro_path.read_text())["generation_id"] == failed_generation
 
 
-def test_generation_published_before_provenance_files_existed_stays_valid(
-    tmp_path: Path,
-) -> None:
-    """A pre-F6 namespace -- no provenance files, no manifest entries -- still reads valid.
-
-    Replayed the way the other legacy-compat cases in this module are: publish
-    normally, then rewrite the namespace into the older shape. Dropping only
-    the manifest entries must fail (the namespace would hold unlisted
-    artifacts); dropping the files too is exactly the historical layout and
-    must publish-read cleanly.
-    """
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    generation_id = _last_successful_generation_id(experiment)
-    assert generation_id is not None
-    snapshot_path, repro_path = _provenance_paths(experiment, generation_id)
-
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    summary["artifacts"] = [
-        item for item in summary["artifacts"] if item["kind"] in ("winner", "promotion")
-    ]
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
-
-    # Files present but unlisted: the manifest no longer covers the namespace.
-    assert _last_successful_generation_id(experiment) is None
-
-    snapshot_path.unlink()
-    repro_path.unlink()
-
-    # Neither listed nor present -- the pre-F6 layout, still fully valid.
-    assert _last_successful_generation_id(experiment) == generation_id
-    assert read_winner(experiment, "p") is not None
-
-
-def test_partially_dropped_provenance_record_is_not_a_legacy_namespace(tmp_path: Path) -> None:
-    """Half a provenance record is an edit, not a historical layout.
+def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_path: Path) -> None:
+    """Half a provenance record is a current-format tamper, not valid state.
 
     The two files are written together at claim time, so a namespace that
-    keeps one and drops the other must fail rather than fall through the
-    pre-F6 compatibility path.
+    keeps one and drops the other must fail closed.
     """
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment)

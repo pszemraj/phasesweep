@@ -24,7 +24,6 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSourceKind,
     _parse_winner_source,
-    _winner_source_or_default,
 )
 from phasesweep.runtime.files import atomic_text_writer, fsync_directory
 
@@ -187,9 +186,7 @@ def _save_winner(
             in the persisted payload.
         phase_name: Name of the phase whose winner is being saved.
         winner: The winning trial.
-        generation_id: Immutable generation namespace to write into. The
-            legacy compatibility projection is produced separately by
-            :func:`phasesweep.engine.generation._copy_yaml_projection` once a generation is published.
+        generation_id: Immutable generation namespace to write into.
 
     """
     path = path_ops._generation_winner_path(experiment, generation_id, phase_name)
@@ -225,56 +222,33 @@ def _winner_common_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
         "winner_source": _winner_source_payload(winner, phase_name),
         "trainer_input": winner.trainer_input,
     }
-    if winner.promotion is not None:
-        payload["promotion"] = winner.promotion
     return payload
 
 
 def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
     """Serialize the concrete source trial for an exposed winner.
 
-    :param Winner winner: Winner whose recorded ``source`` is serialized; when
-        unset, a ``phase_trial`` source is synthesized from the winner's own fields.
-    :param str phase_name: Phase name used to synthesize a fallback source when
-        ``winner.source`` is unset.
+    :param Winner winner: Winner whose recorded ``source`` is serialized.
+    :param str phase_name: Phase exposed by the winner source.
     :return dict[str, Any]: JSON-serializable winner-source payload with
         ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
-        and ``study`` keys.
+        keys.
     """
-    source = _winner_source_or_default(winner, phase_name)
+    source = winner.source
+    if source is None:
+        raise WinnerIntegrityError("A persisted winner requires explicit source provenance.")
     return {
         "kind": source.kind,
         "phase": source.phase,
         "trial_number": source.trial_number,
         "generation_id": source.generation_id,
         "attempt_id": source.attempt_id,
-        "study": source.study,
     }
 
 
-def _save_promotion_decision(
-    experiment: Experiment,
-    phase_name: str,
-    decision: dict[str, Any],
-    *,
-    generation_id: str,
-) -> None:
-    """Persist a phase promotion decision into its immutable generation namespace.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str phase_name: Phase name whose promotion decision is being saved.
-    :param dict[str, Any] decision: Promotion decision payload to persist.
-    :param str generation_id: Immutable generation namespace to write into. The
-        legacy compatibility projection is produced separately by
-        :func:`phasesweep.engine.generation._copy_yaml_projection` once a generation is published.
-    """
-    path = path_ops._generation_promotion_decision_path(experiment, generation_id, phase_name)
-    _write_yaml_atomic(path, decision)
-
-
 # Warn-once keys for :func:`_warn_environment_drift`. A resume can load the
-# same winner twice (preflight, then the run itself) and a suite can inherit it
-# across studies; the operator needs the divergence once, not once per read.
+# same winner twice (preflight, then the run itself); the operator needs the
+# divergence once, not once per read.
 _ENVIRONMENT_DRIFT_WARNED: set[tuple[str, str, str]] = set()
 
 
@@ -301,7 +275,11 @@ def _warn_environment_drift(
     # read-only paths that import this module never need.
     from phasesweep.engine.trial import _environment_identity
 
-    current_digest = _environment_identity(experiment).digest
+    current_digest = _environment_identity(
+        experiment,
+        phase_name,
+        require_wandb_online=False,
+    ).digest
     if stored_digest == current_digest:
         return
     key = (experiment.experiment, phase_name, stored_digest)
@@ -334,7 +312,7 @@ def _load_winner(
 
     We re-compute the fingerprint of the current parent ``phase`` against the
     currently-resolved ``inherited_winners`` and refuse the load if either
-    (a) the stored winner has no fingerprint at all (legacy or hand-edited),
+    (a) the stored winner has no fingerprint, or
     or (b) the fingerprints disagree (review v0.5.6 / blocker 3).
 
     A recorded semantic environment digest that disagrees with this process is
@@ -413,16 +391,6 @@ def _load_winner(
         raise WinnerIntegrityError(f"Winner file {path} has an invalid phase_fingerprint.")
 
     if stored_fp != current_fp:
-        if revisions := fingerprint_ops._evaluation_semantics(experiment, phase):
-            evaluators = ", ".join(revisions)
-            raise StudyFingerprintMismatchError(
-                f"Skipped phase {phase.name!r} winner file {path} was produced by a "
-                f"different phase config or evaluator interpretation for {evaluators} "
-                f"(semantic fingerprint {stored_fp[:16]}... != "
-                f"current {current_fp[:16]}...). Carrying it forward could mix "
-                "incompatible evidence interpretations. Preserve the historical artifacts "
-                "and use a fresh experiment identity and ledger."
-            )
         raise StudyFingerprintMismatchError(
             f"Winner file {path} was produced by a different phase config "
             f"(stored fingerprint {stored_fp[:16]}... != current "
@@ -458,8 +426,14 @@ def _load_winner(
             f"Winner file {path} has no valid winner_source; refusing ambiguous provenance."
         )
     source_kind = source_data.get("kind")
-    if source_kind not in ("phase_trial", "promotion_baseline", "suite_baseline"):
+    if source_kind != "phase_trial":
         raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source kind.")
+    if set(source_data) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
+        raise WinnerIntegrityError(f"Winner file {path} has a removed winner_source field.")
+    if source_data.get("phase") != phase.name:
+        raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source phase.")
+    if "promotion" in data:
+        raise WinnerIntegrityError(f"Winner file {path} contains removed promotion data.")
 
     stored_env_digest = data.get("trainer_env_digest")
     if not isinstance(stored_env_digest, str) or not stored_env_digest:
@@ -479,7 +453,6 @@ def _load_winner(
             constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
-            promotion=data.get("promotion") if isinstance(data.get("promotion"), dict) else None,
             phase_fingerprint=str(stored_fp),
             generation_id=generation_id,
             attempt_id=attempt_id,

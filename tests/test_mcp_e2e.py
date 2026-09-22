@@ -318,9 +318,11 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     for safety_contract in (
         "When `recovery_required` is true, stop",
         "When `publication_integrity` is `failed`, stop",
-        "`result_context` is `represented_generation`",
+        "Use `run_id` for every lifecycle read",
         "Never edit an experiment config yourself",
         "Never open raw datasets",
+        "Never open W&B dashboards",
+        "`winner_generation`",
     ):
         assert safety_contract in initialization.instructions
     tools = asyncio.run(server.list_tools())
@@ -346,12 +348,6 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     }.items():
         for safety_contract in safety_contracts:
             assert safety_contract in descriptions[tool_name]
-    listed = server._tool_manager.get_tool(TOOL_LIST_EXPERIMENTS).fn()
-    assert listed.next_action == TOOL_INSPECT_EXPERIMENT
-    latest = asyncio.run(
-        server._tool_manager.get_tool(TOOL_GET_LATEST_RUN).fn(experiment_id="e2e_lm")
-    )
-    assert latest.next_action is None
     for tool_name in (
         TOOL_INSPECT_EXPERIMENT,
         TOOL_GET_LATEST_RUN,
@@ -372,12 +368,10 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert schemas[TOOL_LAUNCH_RUN]["required"] == ["experiment_id"]
     assert schemas[TOOL_LAUNCH_RUN]["properties"]["experiment_id"]["pattern"] == "^[A-Za-z0-9_-]+$"
     assert schemas[TOOL_LAUNCH_RUN]["properties"]["experiment_id"]["description"]
-    assert sorted(schemas[TOOL_GET_RUN_STATUS]["properties"]) == ["experiment_id", "run_id"]
-    assert schemas[TOOL_GET_RUN_STATUS].get("required") is None  # both optional
-    assert "oneOf" in schemas[TOOL_GET_RUN_STATUS]
-    assert sorted(schemas[TOOL_GET_RUN_RESULTS]["properties"]) == ["experiment_id", "run_id"]
-    assert schemas[TOOL_GET_RUN_RESULTS].get("required") is None  # both optional
-    assert "oneOf" in schemas[TOOL_GET_RUN_RESULTS]
+    assert sorted(schemas[TOOL_GET_RUN_STATUS]["properties"]) == ["run_id"]
+    assert schemas[TOOL_GET_RUN_STATUS]["required"] == ["run_id"]
+    assert sorted(schemas[TOOL_GET_RUN_RESULTS]["properties"]) == ["run_id"]
+    assert schemas[TOOL_GET_RUN_RESULTS]["required"] == ["run_id"]
     assert schemas[TOOL_CANCEL_RUN]["required"] == ["run_id"]
     assert schemas[TOOL_AWAIT_RUN]["required"] == ["run_id"]
     assert sorted(schemas[TOOL_AWAIT_RUN]["properties"]) == ["run_id", "timeout_seconds"]
@@ -403,7 +397,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert annotations[TOOL_CANCEL_RUN].idempotentHint is True
 
     output_schemas = {t.name: t.outputSchema for t in tools}
-    assert all("next_action" in schema["properties"] for schema in output_schemas.values())
+    assert all("next_action" not in schema["properties"] for schema in output_schemas.values())
     assert "changed" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "reason" in output_schemas[TOOL_AWAIT_RUN]["properties"]
     assert "recovery_required" in output_schemas[TOOL_AWAIT_RUN]["properties"]["reason"]["enum"]
@@ -415,6 +409,9 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
     assert "effective_overrides" not in json.dumps(output_schemas[TOOL_GET_RUN_STATUS])
     assert "params" in json.dumps(output_schemas[TOOL_GET_RUN_RESULTS])
+    assert "Whether this winner was selected in the represented generation" in json.dumps(
+        output_schemas[TOOL_GET_RUN_RESULTS]
+    )
     # Both result surfaces disclose which config labeled the result they show.
     results_properties = output_schemas[TOOL_GET_RUN_RESULTS]["properties"]
     status_properties = output_schemas[TOOL_GET_RUN_STATUS]["properties"]
@@ -439,8 +436,8 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert "<redacted>" in str(prompt)
 
 
-def test_inspect_experiment_never_chains_to_launch_run(tmp_path: Path) -> None:
-    """Only the user authorizes a launch, so inspection must not propose one."""
+def test_inspect_experiment_exposes_no_automatic_tool_transition(tmp_path: Path) -> None:
+    """Only the user authorizes a launch; result payloads do not suggest transitions."""
     pytest.importorskip("mcp")
     import asyncio
 
@@ -459,7 +456,7 @@ def test_inspect_experiment_never_chains_to_launch_run(tmp_path: Path) -> None:
     )
 
     assert inspected.capabilities.launch is True  # launching is catalog-permitted
-    assert inspected.next_action is None  # and still not suggested
+    assert "next_action" not in inspected.model_dump()
 
 
 @pytest.mark.parametrize("blocking_tool", [TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN])
@@ -475,20 +472,47 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
 
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
-    awaited = app.status(experiment_id="e2e_lm")
-    awaited.update(
-        {
-            "run": {
-                "run_id": "r1",
-                "state": "running",
-                "started_at": utc_now_iso(),
-                "recovery_required": False,
+    awaited = {
+        "experiment_id": "e2e_lm",
+        "result_source": "current_shared_study",
+        "current_generation_id": "r1",
+        "published_generation_id": None,
+        "represented_generation_id": "r1",
+        "is_published": False,
+        "publication_integrity": "absent",
+        "result_context": "current_config",
+        "published_config_matches_current": True,
+        "result_phase_plan": ["pretrain", "finetune"],
+        "metric": {
+            "name": "loss",
+            "goal": "minimize",
+            "objective_evidence": {
+                "kind": "json_envelope",
+                "attempt_location_scoped": True,
+                "attempt_identity_bound": True,
+                "source_identity_keyed": False,
+                "objective_name_bound": True,
+                "split_bound": True,
+                "evaluation_policy_bound": True,
+                "checkpoint_declared": False,
+                "checkpoint_value_bound": False,
+                "expected_step_declared": False,
+                "expected_step_value_bound": False,
             },
-            "elapsed_seconds": 0,
-            "changed": False,
-            "reason": "timeout",
-        }
-    )
+        },
+        "phases": [],
+        "summary_present": False,
+        "run": {
+            "run_id": "r1",
+            "state": "running",
+            "started_at": utc_now_iso(),
+            "recovery_required": False,
+            "failure": None,
+        },
+        "elapsed_seconds": 0,
+        "changed": False,
+        "reason": "timeout",
+    }
 
     class ManualClock:
         def __init__(self) -> None:

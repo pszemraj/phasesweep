@@ -1,26 +1,28 @@
-"""W&B polling helpers."""
+"""Capture one finished W&B summary in the existing supervised attempt slot."""
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
+import math
 import os
 import shlex
 import sys
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from math import ceil
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, cast
+from typing import Any
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+_WORKER_STDERR_LOG = "wandb-worker.stderr.log"
 
 
 @dataclass(frozen=True)
 class WandbPollTimeout(TimeoutError):
-    """Raised when a W&B run summary is not ready before the poll deadline."""
+    """The complete worker exhausted its summary visibility budget."""
 
     run_id: str
     timeout_seconds: float
@@ -29,7 +31,7 @@ class WandbPollTimeout(TimeoutError):
 
 @dataclass(frozen=True)
 class WandbRunTerminalError(RuntimeError):
-    """Raised when the attempt's W&B run terminates unsuccessfully."""
+    """The expected run terminated unsuccessfully."""
 
     run_id: str
     state: str
@@ -37,151 +39,97 @@ class WandbRunTerminalError(RuntimeError):
 
 @dataclass(frozen=True)
 class WandbSetupError(RuntimeError):
-    """Raised for permanent W&B setup or authentication failures.
-
-    A non-transport failure to construct the first client is classified this
-    way because bad credentials or broken settings will not improve by retrying.
-    W&B verifies credentials over the network during construction, so connection
-    failures, rate limits, and transient server errors — including ones wrapped
-    by ``AuthenticationError`` — remain polling errors and are retried within
-    the existing deadline.
-    HTTP 401 and 403 run-lookup failures are also setup errors.
-    """
+    """W&B rejected authentication or client configuration permanently."""
 
     run_id: str
     cause: str
 
 
-def _is_retryable_setup_error(exc: Exception) -> bool:
-    """Return whether the active exception chain contains a retryable failure.
+def require_wandb_sdk() -> None:
+    """Check the optional SDK without authenticating or making a network request.
 
-    Follow explicit causes and unsuppressed implicit contexts. W&B suppresses
-    a sidecar timeout when it raises ``WandbApiFailedError``, so recognize its
-    no-response and timeout status markers directly.
-
-    :param Exception exc: W&B client-construction failure to classify.
-    :return bool: Whether the failure should consume the bounded polling budget.
+    :raises PhaseSweepError: The W&B public API cannot be imported.
     """
     try:
-        from requests.exceptions import ConnectionError as RequestsConnectionError
-        from requests.exceptions import HTTPError as RequestsHTTPError
-        from requests.exceptions import Timeout as RequestsTimeout
-    except ImportError:  # pragma: no cover - installed W&B depends on requests
-        request_errors: tuple[type[BaseException], ...] = ()
-        request_http_errors: tuple[type[BaseException], ...] = ()
-    else:
-        request_errors = (RequestsConnectionError, RequestsTimeout)
-        request_http_errors = (RequestsHTTPError,)
+        importlib.import_module("wandb.apis.public")
+    except ImportError as exc:
+        from phasesweep.errors import PhaseSweepError
 
-    try:
-        from wandb.errors import CommError
-    except ImportError:  # pragma: no cover - W&B is optional
-        comm_errors: tuple[type[BaseException], ...] = ()
-    else:
-        comm_errors = (CommError,)
+        raise PhaseSweepError(
+            "W&B evidence requires the optional SDK in the PhaseSweep environment. "
+            'Install this distribution with its wandb extra: python -m pip install "phasesweep[wandb]".'
+        ) from exc
 
-    try:
-        from wandb.sdk.lib.service.service_connection import WandbApiFailedError
-    except ImportError:  # Older supported SDKs use requests errors inside CommError.
-        service_api_errors: tuple[type[BaseException], ...] = ()
-    else:
-        service_api_errors = (WandbApiFailedError,)
 
-    current: BaseException | None = exc
+def _error_chain(exc: BaseException) -> Iterable[BaseException]:
+    """Walk active SDK causes, including the public CommError wrapper."""
     seen: set[int] = set()
+    current: BaseException | None = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(
-            current,
-            (ConnectionError, TimeoutError, *request_errors),
-        ):
-            return True
-        if isinstance(current, service_api_errors):
-            response = cast(Any, current).response
-            status = response.http_status if response is not None else None
-            # Missing/zero status can also mean a core initialization failure.
-            # The SDK does not distinguish it from a lost response here, so
-            # ambiguous sidecar errors consume the bounded polling budget.
-            if status in (None, 0) or status in _RETRYABLE_HTTP_STATUSES:
-                return True
-        elif isinstance(current, request_http_errors):
-            response = cast(Any, current).response
-            status = response.status_code if response is not None else None
-            if status in _RETRYABLE_HTTP_STATUSES:
-                return True
+        yield current
         if current.__cause__ is not None:
             current = current.__cause__
         elif current.__context__ is not None and not current.__suppress_context__:
             current = current.__context__
-        elif isinstance(current, comm_errors):
-            current = cast(Any, current).exc
         else:
-            current = None
-    return False
+            wrapped = getattr(current, "exc", None)
+            current = wrapped if isinstance(wrapped, BaseException) else None
+
+
+def _http_status(exc: BaseException) -> int | None:
+    """Read requests or SDK transport response status without private imports."""
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if status is None:
+        status = getattr(response, "http_status", None)
+    return status if isinstance(status, int) else None
 
 
 def _is_nonretryable_authorization_error(exc: Exception) -> bool:
-    """Return whether a W&B API error reports an HTTP authentication denial.
+    """Recognize permanent HTTP authorization denial through SDK wrappers."""
+    return any(_http_status(error) in {401, 403} for error in _error_chain(exc))
 
-    Public API calls wrap the underlying service or requests error in ``CommError``.
-    Status 404 remains retriable because a newly created run may not be visible yet.
 
-    :param Exception exc: W&B public-API lookup failure.
-    :return bool: Whether the error has a 401 or 403 response status.
-    """
-    try:
-        from requests.exceptions import HTTPError
-        from wandb.errors import CommError
-    except ImportError:  # pragma: no cover - installed W&B depends on requests
+def _is_retryable_setup_error(exc: Exception) -> bool:
+    """Recognize temporary transport failures using public SDK/request errors."""
+    import requests.exceptions as request_errors  # type: ignore[import-not-found,import-untyped]
+
+    if _is_nonretryable_authorization_error(exc):
         return False
-
-    try:
-        from wandb.sdk.lib.service.service_connection import WandbApiFailedError
-    except ImportError:  # W&B 0.16 has CommError but no service API error class.
-        service_api_errors: tuple[type[BaseException], ...] = ()
-    else:
-        service_api_errors = (WandbApiFailedError,)
-
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        status: int | None = None
-        if isinstance(current, service_api_errors):
-            response = cast(Any, current).response
-            status = response.http_status if response is not None else None
-        elif isinstance(current, HTTPError):
-            response = current.response
-            status = response.status_code if response is not None else None
-        if status in (401, 403):
+    for error in _error_chain(exc):
+        if _http_status(error) in _RETRYABLE_HTTP_STATUSES or isinstance(
+            error,
+            (ConnectionError, TimeoutError, request_errors.ConnectionError, request_errors.Timeout),
+        ):
             return True
-        if current.__cause__ is not None:
-            current = current.__cause__
-        elif current.__context__ is not None and not current.__suppress_context__:
-            current = current.__context__
-        elif isinstance(current, CommError) and current.exc is not None:
-            current = current.exc
-        else:
-            current = None
+        # The supported SDK can suppress the original sidecar transport cause.
+        # Inspect its response protocol rather than importing its private class.
+        if (
+            type(error).__module__.startswith("wandb.")
+            and hasattr(error, "response")
+            and _http_status(error) in {None, 0}
+        ):
+            return True
     return False
 
 
-def _poll_worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
-    """Combine trainer W&B settings with the orchestrator's Python settings.
+def _error_detail(exc: Exception) -> str:
+    """Describe error type/status without copying secret-bearing SDK messages."""
+    statuses = [str(status) for error in _error_chain(exc) if (status := _http_status(error))]
+    suffix = f" (HTTP {', '.join(statuses)})" if statuses else ""
+    return f"{type(exc).__name__}{suffix}"
 
-    :param Mapping[str, str] | None environment: Composed trainer environment,
-        or ``None`` to reuse the current process environment.
-    :return dict[str, str]: Worker environment safe for the orchestrator's
-        Python interpreter.
-    """
+
+def _poll_worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
+    """Retain composed credentials and the orchestrator's Python bootstrap."""
     worker_environment = dict(os.environ if environment is None else environment)
     for name in set(worker_environment) | set(os.environ):
-        if not name.startswith("PYTHON"):
-            continue
-        if name in os.environ:
-            worker_environment[name] = os.environ[name]
-        else:
-            worker_environment.pop(name, None)
+        if name.startswith("PYTHON"):
+            if name in os.environ:
+                worker_environment[name] = os.environ[name]
+            else:
+                worker_environment.pop(name, None)
     return worker_environment
 
 
@@ -195,49 +143,42 @@ def poll_wandb_summary(
     poll_seconds: float,
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
-    wait_for_keys: bool = True,
+    presence_keys: Iterable[str] = (),
     environment: Mapping[str, str] | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
-    """Poll W&B after the trial's previous subprocess has been confirmed gone.
+    """Capture requested evidence after confirmed trainer cleanup.
 
-    The worker takes over the trial's durable process identity and lifecycle,
-    so normal attempt recovery can find it if polling is interrupted.
-
-    :param str base_url: Explicit W&B API endpoint for this evidence source.
-    :param str entity: W&B entity or team name.
-    :param str project: W&B project name.
-    :param str run_id: Immutable W&B run id assigned to this trial attempt.
-    :param Path trial_dir: Existing trial directory holding recovery records.
-    :param float poll_seconds: Delay between polling attempts.
-    :param float timeout_seconds: Maximum budget for worker startup, SDK
-        initialization, requests, and retries. Process cleanup may finish afterward.
-    :param Iterable[str] required_keys: Summary keys that must be present.
-    :param bool wait_for_keys: Whether to wait for all required keys before returning.
-    :param Mapping[str, str] | None environment: Environment composed for the
-        trainer. The worker reuses its W&B credentials and transport settings
-        while retaining the orchestrator's Python bootstrap settings. Direct
-        callers default to the current process environment.
-    :raises WandbSetupError: If the first API client fails for a non-transport
-        reason such as bad credentials or settings, or a run lookup reports HTTP
-        401 or 403. Connection failures, timeouts, rate limits, and transient
-        server errors are retried within the polling budget.
-    :raises WandbRunTerminalError: If the run crashes, fails, is killed, or is preempted.
-    :raises WandbPollTimeout: If the run summary is not ready before timeout.
-    :raises UnsafeProcessCleanupError: If the worker's cleanup is uncertain.
-    :raises RuntimeError: If the polling worker fails unexpectedly.
-    :return dict[str, Any]: Terminal run summary values.
+    :param str run_id: Immutable attempt ID, also used by process recovery.
+    :param Path trial_dir: Existing attempt directory and durable process slot.
+    :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
+    :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
+    :param Mapping[str, str] | None environment: Actual composed trainer environment.
+    :param float | None deadline: Absolute deadline including worker startup.
+    :return dict[str, Any]: Numeric values, present keys, and retrieval time.
+    :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget.
+    :raises WandbSetupError: Authentication or setup was denied.
+    :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
+    :raises ValueError: A requested scalar is invalid.
+    :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
     from phasesweep.errors import UnsafeProcessCleanupError
+    from phasesweep.runtime.files import private_atomic_write_text
     from phasesweep.runtime.process import PROCESS_IDENTITY_FILE, run_supervised
 
-    deadline = time.monotonic() + timeout_seconds
-    if timeout_seconds <= 0:
+    deadline = min(
+        time.monotonic() + timeout_seconds, deadline if deadline is not None else math.inf
+    )
+    if time.monotonic() >= deadline:
         raise WandbPollTimeout(run_id, timeout_seconds)
+    diagnostic_path: Path | None = None
     with TemporaryDirectory(prefix="phasesweep-wandb-") as directory:
         worker_dir = Path(directory)
         request_path = worker_dir / "request.json"
         response_path = worker_dir / "response.json"
-        request_path.write_text(
+        stderr_path = worker_dir / "stderr.log"
+        private_atomic_write_text(
+            request_path,
             json.dumps(
                 {
                     "base_url": base_url,
@@ -247,21 +188,17 @@ def poll_wandb_summary(
                     "poll_seconds": poll_seconds,
                     "timeout_seconds": timeout_seconds,
                     "required_keys": list(required_keys),
-                    "wait_for_keys": wait_for_keys,
+                    "presence_keys": list(presence_keys),
                     "deadline": deadline,
                 }
             ),
-            encoding="utf-8",
         )
         with (
             (worker_dir / "stdout.log").open("w", encoding="utf-8") as stdout,
-            (worker_dir / "stderr.log").open("w", encoding="utf-8") as stderr,
+            stderr_path.open("w", encoding="utf-8") as stderr,
         ):
-            # The preceding subprocess is already gone. Remove its identity
-            # before launching so a failed worker-identity write cannot leave
-            # recovery pointing at that earlier, safely exited process.
+            # Never let a previous safe trainer identity hide a failed worker launch.
             (trial_dir / PROCESS_IDENTITY_FILE).unlink(missing_ok=True)
-            # -P keeps this file's directory from shadowing the installed wandb package.
             result = run_supervised(
                 shlex.join(
                     [
@@ -276,49 +213,63 @@ def poll_wandb_summary(
                 stdout=stdout,
                 stderr=stderr,
                 timeout=max(0.0, deadline - time.monotonic()),
+                wallclock_deadline=deadline,
                 trial_dir=trial_dir,
                 attempt_id=run_id,
             )
         if not result.cleanup_confirmed:
             raise UnsafeProcessCleanupError(
-                f"W&B polling worker cleanup could not be confirmed for {run_id!r}. "
-                f"Recovery records remain in {trial_dir}."
+                f"W&B worker cleanup is uncertain for attempt {run_id!r}; recover {trial_dir}."
             )
-        if result.timed_out:
-            stderr_text = (worker_dir / "stderr.log").read_text(encoding="utf-8").strip()
-            response_diagnostic = ""
-            if response_path.is_file():
-                response_text = response_path.read_text(encoding="utf-8").strip()
-                if response_text:
-                    try:
-                        response = json.loads(response_text)
-                    except json.JSONDecodeError:
-                        response_diagnostic = response_text
-                    else:
-                        cause = response.get("cause")
-                        response_diagnostic = cause if isinstance(cause, str) else ""
-            diagnostic = response_diagnostic or stderr_text
-            last_error = RuntimeError(diagnostic) if diagnostic else None
-            raise WandbPollTimeout(run_id, timeout_seconds, last_error)
-        if result.return_code != 0 or result.failure_reason is not None:
-            diagnostic = (worker_dir / "stderr.log").read_text(encoding="utf-8").strip()
-            raise RuntimeError(
-                f"W&B polling worker failed for {run_id!r}: {result.failure_reason or diagnostic}"
-            )
-        response = json.loads(response_path.read_text(encoding="utf-8"))
-
-    if response["status"] == "import_error":
-        raise ImportError(response["cause"])
-    if response["status"] == "setup_error":
+        response = (
+            json.loads(response_path.read_text(encoding="utf-8")) if response_path.is_file() else {}
+        )
+        if not result.timed_out and (
+            result.return_code != 0
+            or result.failure_reason is not None
+            or response.get("status")
+            not in {
+                "summary",
+                "setup_error",
+                "terminal_error",
+                "invalid_evidence",
+                "import_error",
+                "timeout",
+            }
+        ):
+            diagnostic = stderr_path.read_text(encoding="utf-8", errors="replace")
+            if diagnostic:
+                diagnostic_path = trial_dir / _WORKER_STDERR_LOG
+                private_atomic_write_text(
+                    diagnostic_path,
+                    diagnostic,
+                    require_private_dir=False,
+                )
+    # Definite operational causes remain definite even if cleanup crossed a deadline.
+    if response.get("status") == "setup_error":
         raise WandbSetupError(run_id, response["cause"])
-    if response["status"] == "terminal_error":
+    if response.get("status") == "terminal_error":
         raise WandbRunTerminalError(run_id, response["state"])
-    if response["status"] == "timeout":
-        last_error = RuntimeError(response["cause"]) if response["cause"] is not None else None
-        raise WandbPollTimeout(run_id, timeout_seconds, last_error)
-    if time.monotonic() >= deadline:
-        raise WandbPollTimeout(run_id, timeout_seconds)
-    return response["summary"]
+    if response.get("status") == "invalid_evidence":
+        raise ValueError(response["cause"])
+    if response.get("status") == "import_error":
+        raise ImportError(
+            "W&B SDK is unavailable in the supervised worker; install phasesweep[wandb]."
+        )
+    if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
+        detail = response.get("cause")
+        raise WandbPollTimeout(run_id, timeout_seconds, RuntimeError(detail) if detail else None)
+    if (
+        result.return_code != 0
+        or result.failure_reason is not None
+        or response.get("status") != "summary"
+    ):
+        diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
+        raise RuntimeError(
+            f"W&B evidence worker failed for attempt {run_id!r} (exit {result.return_code})."
+            f"{diagnostic}"
+        )
+    return response["capture"]
 
 
 def _poll_wandb_summary(
@@ -330,107 +281,97 @@ def _poll_wandb_summary(
     poll_seconds: float,
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
-    wait_for_keys: bool = True,
+    presence_keys: Iterable[str] = (),
     deadline: float | None = None,
 ) -> dict[str, Any]:
-    """Run the polling loop inside the cancellable worker.
-
-    :param str base_url: Explicit W&B API endpoint.
-    :param str entity: W&B entity or team name.
-    :param str project: W&B project name.
-    :param str run_id: Immutable W&B run id for this attempt.
-    :param float poll_seconds: Delay between polling attempts.
-    :param float timeout_seconds: Original budget, used in timeout diagnostics.
-    :param Iterable[str] required_keys: Summary keys required before returning.
-    :param bool wait_for_keys: Whether to wait for every required key.
-    :param float | None deadline: Parent's monotonic deadline; defaults to a new budget.
-    :return dict[str, Any]: Finished run summary received before the deadline.
-    """
+    """Poll an exact run using refreshed SDK clients within the parent's deadline."""
     from wandb.apis.public import Api  # type: ignore[import-not-found]
+    from wandb.errors import AuthenticationError, UsageError  # type: ignore[import-not-found]
 
-    path = f"{entity}/{project}/{run_id}"
-    if deadline is None:
-        deadline = time.monotonic() + timeout_seconds
-    last_err: Exception | None = None
+    from phasesweep.evidence.evaluation import json_float
+    from phasesweep.runtime.time import utc_now_iso
+
+    deadline = time.monotonic() + timeout_seconds if deadline is None else deadline
+    last_error: Exception | None = None
     required = tuple(required_keys)
-    api_constructed = False
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            break
-        # W&B's integer HTTP timeout does not bound SDK retries. The parent
-        # supervises the whole worker against the deadline. Constructing per iteration
-        # means construction failures happen mid-poll too; the SDK's
-        # constructor performs a network round-trip, so connection and timeout
-        # failures must consume the polling budget even on the first attempt.
-        # Other first-construction failures still identify deterministic setup
-        # problems; after one successful construction, every failure is retried.
+    while time.monotonic() < deadline:
         try:
             api = Api(
                 overrides={"base_url": base_url},
-                timeout=max(1, ceil(remaining)),
+                timeout=max(1, math.ceil(deadline - time.monotonic())),
             )
-        except Exception as exc:  # noqa: BLE001 - classified into the typed error model
-            if not api_constructed and not _is_retryable_setup_error(exc):
-                raise WandbSetupError(run_id, str(exc)) from exc
-            last_err = exc
-            # The parent may terminate this worker before ``main`` serializes ``last_err``.
-            print(str(exc), file=sys.stderr, flush=True)
+        except Exception as exc:
+            if not _is_retryable_setup_error(exc):
+                raise WandbSetupError(run_id, _error_detail(exc)) from exc
+            last_error = RuntimeError(_error_detail(exc))
         else:
-            api_constructed = True
             if time.monotonic() >= deadline:
                 break
             try:
-                run = api.run(path)
-                if run.state in {"crashed", "failed", "killed", "preempted"}:
+                run = api.run(f"{entity}/{project}/{run_id}")
+            except Exception as exc:
+                if any(
+                    _http_status(error) in {400, 401, 403, 422} for error in _error_chain(exc)
+                ) or (
+                    isinstance(exc, (AuthenticationError, UsageError))
+                    and not _is_retryable_setup_error(exc)
+                ):
+                    raise WandbSetupError(run_id, _error_detail(exc)) from exc
+                last_error = RuntimeError(_error_detail(exc))
+            else:
+                if time.monotonic() >= deadline:
+                    break
+                if run.state in {"failed", "crashed", "killed", "preempted"}:
                     raise WandbRunTerminalError(run_id, run.state)
                 if run.state == "finished":
                     summary = run.summary_metrics
-                    if not wait_for_keys or all(key in summary for key in required):
+                    if all(key in summary for key in required):
+                        values = {}
+                        for key in required:
+                            value = json_float(summary[key], label=key)
+                            if not math.isfinite(value):
+                                raise ValueError(f"W&B metric {key!r} is non-finite.")
+                            values[key] = value
+                        capture = {
+                            "values": values,
+                            "present_keys": sorted(key for key in presence_keys if key in summary),
+                            "retrieved_at": utc_now_iso(timespec="microseconds"),
+                        }
                         if time.monotonic() >= deadline:
                             break
-                        return summary
-            except WandbRunTerminalError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                if _is_nonretryable_authorization_error(exc):
-                    raise WandbSetupError(run_id, str(exc)) from exc
-                last_err = exc
-                # The parent may terminate this worker before ``main`` serializes ``last_err``.
-                print(str(exc), file=sys.stderr, flush=True)
-        sleep_seconds = max(0.0, deadline - time.monotonic())
-        time.sleep(min(poll_seconds, sleep_seconds))
-    raise WandbPollTimeout(run_id, timeout_seconds, last_err)
+                        return capture
+        time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
+    raise WandbPollTimeout(run_id, timeout_seconds, last_error)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run one internal polling request and write its result for the parent.
+    """Run an internal request and return typed, bounded evidence to its owner."""
+    from phasesweep.runtime.files import private_atomic_write_text
 
-    :param list[str] | None argv: Arguments, defaulting to the process arguments.
-    :return int: Zero after writing a summary or an expected polling error.
-    """
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    parser.add_argument("request", type=Path, help="Internal polling request JSON")
-    parser.add_argument("response", type=Path, help="Internal polling response JSON")
+    parser.add_argument("request", type=Path, help="Private polling request")
+    parser.add_argument("response", type=Path, help="Private polling response")
     args = parser.parse_args(argv)
     request = json.loads(args.request.read_text(encoding="utf-8"))
     response: dict[str, Any]
     try:
-        response = {"status": "summary", "summary": _poll_wandb_summary(**request)}
-    except ImportError as exc:
-        response = {"status": "import_error", "cause": str(exc)}
+        response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
+    except ImportError:
+        response = {"status": "import_error"}
     except WandbSetupError as exc:
         response = {"status": "setup_error", "cause": exc.cause}
     except WandbRunTerminalError as exc:
         response = {"status": "terminal_error", "state": exc.state}
     except WandbPollTimeout as exc:
+        response = {"status": "timeout", "cause": str(exc.last_error) if exc.last_error else None}
+    except ValueError:
         response = {
-            "status": "timeout",
-            "cause": str(exc.last_error) if exc.last_error is not None else None,
+            "status": "invalid_evidence",
+            "cause": "Requested W&B summary evidence is not a finite JSON number.",
         }
-    args.response.write_text(json.dumps(response), encoding="utf-8")
+    private_atomic_write_text(args.response, json.dumps(response, allow_nan=False))
     return 0
 
 

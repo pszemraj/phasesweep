@@ -15,7 +15,6 @@ from uuid import uuid4
 import optuna
 
 from phasesweep.config import Experiment, Gate, Phase
-from phasesweep.config.models import _iter_fixed_override_layers
 from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.artifact_roots import _bind_study_artifact_root
 from phasesweep.engine.artifacts import _write_trials_csv
@@ -207,24 +206,19 @@ def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
 
 
 def _composed_overrides(
-    experiment: Experiment,
     phase: Phase,
     sampled: dict[str, Any],
     inherited_winners: dict[str, Winner],
 ) -> dict[str, Any]:
-    """Merge inherited winners, contracts, fixed overrides, and sampled params.
+    """Merge inherited winners, fixed overrides, and sampled params.
 
-    Args:
-        experiment: Parsed experiment; provides named contracts.
-        phase: The phase whose ``fixed_overrides`` and inheritance list apply.
-        sampled: The values Optuna just suggested for this trial.
-        inherited_winners: Parent-phase winners; their ``effective_overrides``
-            are the base layer (lowest priority).
-
-    Returns:
-        The fully-composed override dict that gets handed to the trial command.
-        Later layers (later keys in the merge order) overwrite earlier ones.
-
+    :param Phase phase: The phase whose ``fixed_overrides`` and inheritance list apply.
+    :param dict[str, Any] sampled: Values Optuna suggested for this trial.
+    :param dict[str, Winner] inherited_winners: Parent-phase winners supplying
+        the lowest-priority override layer.
+    :raises ValueError: If the sampled parameters try to replace an inherited
+        winner value.
+    :return dict[str, Any]: Fully composed overrides for the trainer command.
     """
     inherited_overrides: dict[str, Any] = {}
     for parent in phase.inherits:
@@ -235,24 +229,18 @@ def _composed_overrides(
             f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)}."
         )
     out = dict(inherited_overrides)
-    for _origin, fixed_overrides in _iter_fixed_override_layers(experiment, phase):
-        out.update(fixed_overrides)
+    out.update(phase.fixed_overrides)
     out.update(sampled)
     return out
 
 
-def _phase_gates(experiment: Experiment, phase: Phase) -> list[Gate]:
-    """Return contract gates followed by phase-local gates.
+def _phase_gates(phase: Phase) -> list[Gate]:
+    """Return a phase's local gates in declaration order.
 
-    :param Experiment experiment: Parsed experiment config containing named contracts.
-    :param Phase phase: Phase whose contract list and local gates are resolved.
-    :return list[Gate]: Gates in evaluation order.
+    :param Phase phase: Phase whose local gates are evaluated.
+    :return list[Gate]: Phase-local gates in evaluation order.
     """
-    gates: list[Gate] = []
-    for contract_name in phase.contracts:
-        gates.extend(experiment.contracts[contract_name].gates)
-    gates.extend(phase.gates)
-    return gates
+    return list(phase.gates)
 
 
 def _active_phase_abort(
@@ -393,9 +381,6 @@ def _run_phase(
             confirmed dead; phase hard-aborted (review v0.5.11).
         ArtifactRootConflictError: This phase's persistent study is bound to a
             different artifact root than the config's workdir offers.
-        LegacyArtifactRootMigrationRequiredError: This phase's persistent study
-            holds trials but predates artifact-root binding, so the workdir
-            that owns its evidence cannot be inferred.
         TrialEvidenceMissingError: The selected winner's evidence directory,
             audit artifacts, or objective source are missing or no longer match
             the provenance frozen at extraction.
@@ -422,11 +407,6 @@ def _run_phase(
     policy_state = None
     recovery_abort: dict[str, Any] | None = None
     partial_decision: _AcceptedPartialDecision | None = None
-    # The trainer environment is a property of this process and its config, not
-    # of any one trial, so it is composed once per phase execution and stamped
-    # onto every trial (review v0.5.18 / finding F3).
-    environment_identity = _environment_identity(experiment)
-
     if not dry_run:
         # A study this invocation just created was invisible to preflight, so
         # it claims its publication root here — before any inspection, reaping,
@@ -435,7 +415,6 @@ def _run_phase(
         _validate_study_direction(study, experiment.metric.goal)
         _validate_study_schema(study)
         _reap_stale_trials(study, experiment, phase.name)
-        _validate_environment_cohort(study, environment_identity.digest)
         policy_state = _load_phase_policy_state(study)
         phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
         _validate_trial_target(study, phase)
@@ -540,6 +519,19 @@ def _run_phase(
                 "timeout_scope": None,
             },
         )
+
+    # Compose and validate the launch environment only after recovery proves
+    # this phase has work remaining. Published/no-op replay must not require an
+    # online W&B environment, while every new allocation still joins the
+    # study's established semantic environment cohort.
+    environment_identity = _environment_identity(experiment, phase.name)
+    _validate_environment_cohort(study, environment_identity.digest)
+
+    from phasesweep.config.models import _wandb_query
+    from phasesweep.evidence.wandb import require_wandb_sdk
+
+    if _wandb_query(experiment, phase.gates) is not None:
+        require_wandb_sdk()
 
     gpu_pool = GpuPool.create(
         n_jobs=phase.n_jobs,
@@ -799,7 +791,7 @@ def _run_phase(
             raise optuna.TrialPruned("phase aborted")
 
         sampled = {name: _suggest(trial, name, p) for name, p in phase.search_space.items()}
-        overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
+        overrides = _composed_overrides(phase, sampled, inherited_winners)
 
         # Persist the resolved trial directory BEFORE launching the subprocess
         # so a later reaper can locate identity files even if the user moved
@@ -953,8 +945,7 @@ def _run_phase(
         result = extract_trial_result(
             experiment=experiment,
             executed=executed,
-            gates=_phase_gates(experiment, phase),
-            enforce_gates=phase.promotion is None or phase.promotion.requires_gates,
+            gates=_phase_gates(phase),
             deadline=optimize_deadline,
         )
         if result.deadline_exhausted:
@@ -1377,7 +1368,7 @@ def _select_phase_winner(
     # reads only Optuna, so nothing before this point has looked at whether the
     # winning trial's directory still holds the bytes its metric came from.
     _verify_winner_objective_evidence(experiment, phase.name, selected)
-    effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
+    effective = _composed_overrides(phase, selected.params, inherited_winners)
     return Winner(
         trial_number=selected.trial_number,
         params=selected.params,
@@ -1402,7 +1393,7 @@ def _select_phase_winner(
         ),
         # The digest comes from the winning TRIAL — a top-up can select a
         # trial an earlier invocation ran under another environment — while
-        # the contract is config, identical for every trial in the study
+        # the environment contract is config, identical for every trial in the study
         # because it is fingerprinted.
         trainer_env_digest=selected.trainer_env_digest,
         trainer_inherit_env=_inherit_env_contract(experiment),
@@ -1436,7 +1427,7 @@ def _dry_run_phase(
         sample_trial = study.ask()
         sampled = {name: _suggest(sample_trial, name, p) for name, p in phase.search_space.items()}
         study.tell(sample_trial, state=optuna.trial.TrialState.FAIL)
-        overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
+        overrides = _composed_overrides(phase, sampled, inherited_winners)
         preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
         cmd = render_command(
             experiment.trial_command,
@@ -1474,7 +1465,7 @@ def _placeholder_winner(
     Both paths include inherited effective overrides.
 
     Args:
-        experiment: Parsed experiment; supplies named contracts.
+        experiment: Parsed experiment supplying the execution environment.
         phase: The phase whose placeholder winner is needed.
         inherited_winners: Winners from earlier phases in the chain.
         sampled_params: Values used in the displayed preview command, or
@@ -1490,7 +1481,7 @@ def _placeholder_winner(
         if sampled_params is None
         else dict(sampled_params)
     )
-    effective = _composed_overrides(experiment, phase, placeholder_params, inherited_winners)
+    effective = _composed_overrides(phase, placeholder_params, inherited_winners)
     return Winner(
         trial_number=-1,
         params=placeholder_params,

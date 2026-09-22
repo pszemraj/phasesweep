@@ -14,7 +14,13 @@ from typing import Any
 import pytest
 import yaml
 
-from phasesweep.config import ExecutionContext, JsonEnvelopeExtractor, Metric
+from phasesweep.config import (
+    ExecutionContext,
+    JsonEnvelopeExtractor,
+    Metric,
+    WandbSummaryRequiredGate,
+)
+from phasesweep.engine.artifacts import _warn_environment_drift
 from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
 from phasesweep.runtime.process import ProcessResult
 from tests.conftest import make_experiment
@@ -79,7 +85,6 @@ def _capture_launch_env(
         gpu_lease_fds=gpu_lease_fds,
     )
     captured["trainer_input"] = executed.trainer_input
-    captured["wandb_environment"] = dict(executed.ctx.wandb_environment or {})
     return captured
 
 
@@ -193,7 +198,6 @@ def test_launch_trial_cuda_environment(
     assert env["PHASESWEEP_ATTEMPT_ID"] == "attempt-test"
     assert env["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(b"{}\n").hexdigest()
     assert env["PHASESWEEP_RUN_NAME"].endswith("-attempt-test")
-    assert env["WANDB_RUN_ID"] == "attempt-test"
     assert env["run_supervised_attempt_id"] == "attempt-test"
 
 
@@ -549,20 +553,47 @@ def test_passthrough_value_rotation_preserves_semantic_environment_digest(
     assert second.values["WANDB_API_KEY"] == "rotated-secret"
 
 
-def test_launch_trial_carries_composed_environment_to_wandb_evidence(
+def test_skipped_phase_drift_uses_that_phases_remote_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated W&B phase cannot block drift checks for a skipped local phase."""
+    base = make_experiment(execution=ExecutionContext(inherit_env="all"))
+    remote = base.phases[0].model_copy(
+        update={
+            "name": "remote",
+            "gates": [
+                WandbSummaryRequiredGate(
+                    type="wandb_summary_required",
+                    entity="entity",
+                    project="project",
+                    keys=["eval/loss"],
+                )
+            ],
+        }
+    )
+    local = base.phases[0].model_copy(update={"name": "local", "gates": []})
+    experiment = base.model_copy(update={"phases": [remote, local]})
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    stored = _environment_identity(experiment, "local").digest
+
+    _warn_environment_drift(experiment, "local", stored)
+
+
+def test_launch_trial_preserves_configured_and_passthrough_wandb_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The post-trainer poll worker receives configured and pass-through settings."""
+    """Configured and pass-through W&B variables stay ordinary trainer environment entries."""
     monkeypatch.setenv("WANDB_API_KEY", "ambient-token")
     captured = _capture_launch_env(
         tmp_path,
         monkeypatch,
-        experiment_env={"WANDB_MODE": "online"},
+        experiment_env={"WANDB_MODE": "online", "WANDB_RUN_ID": "operator-run-id"},
         execution=ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"]),
     )
 
-    assert captured["wandb_environment"]["WANDB_API_KEY"] == "ambient-token"
-    assert captured["wandb_environment"]["WANDB_MODE"] == "online"
+    assert captured["WANDB_API_KEY"] == "ambient-token"
+    assert captured["WANDB_MODE"] == "online"
+    assert captured["WANDB_RUN_ID"] == "operator-run-id"
 
 
 def test_configured_env_value_cannot_be_exempted_as_passthrough() -> None:

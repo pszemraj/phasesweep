@@ -31,7 +31,6 @@ from phasesweep.engine import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
-    LegacyArtifactRootMigrationRequiredError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     PublishedStudyMissingError,
@@ -42,6 +41,7 @@ from phasesweep.engine import (
     read_status,
     run_experiment,
 )
+from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.engine.paths import (
@@ -56,7 +56,10 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import (
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
     Winner,
+    WinnerSource,
 )
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
@@ -90,6 +93,12 @@ pytestmark = pytest.mark.skipif(
 # Persistent storage rejects an unseeded stochastic sampler; seeded random is
 # reproducible and resumable, so it needs no non-resumable acknowledgement.
 SEEDED_RANDOM = Sampler(type="random", seed=0)
+
+
+def _mark_current_study(experiment: Experiment, study: optuna.Study) -> None:
+    """Mark a manually constructed study/root as current-format test state."""
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
 def test_in_process_runner_helper_restores_host_signal_state(
@@ -394,9 +403,6 @@ def test_missing_published_study_is_an_operator_preflight_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A diagnosed absent ledger needs restoration, not process recovery."""
-    from phasesweep.mcp.redaction import status_payload
-    from phasesweep.mcp.server import GetRunStatusResult
-
     monkeypatch.chdir(tmp_path)
     experiment = make_experiment(
         workdir=tmp_path / "runs",
@@ -412,14 +418,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
 
     snapshot = mcp_runner.capture_result_snapshot(experiment)
     assert snapshot["status"]["phases"][0]["published_study_unavailable"] is True
-    payload = status_payload(
-        experiment_id="t",
-        status=read_status(experiment),
-        run=None,
-        result_source="current_shared_study",
-        elapsed_seconds=None,
-    )
-    assert GetRunStatusResult.model_validate(payload).phases[0].published_study_unavailable
+    assert read_status(experiment)["phases"][0]["published_study_unavailable"] is True
 
     store = RunStore(tmp_path / "state")
     run_id = "missing-published-study"
@@ -642,6 +641,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
                     study_name=f"t::{from_phase or 'p'}",
                     storage=_resolve_storage(experiment.resolved_storage),
                 )
+                study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
                 if replacement == "unrelated-trial":
                     trial = study.ask()
                     study.tell(trial, 0.5)
@@ -808,7 +808,6 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
         "trial_number": winner["trial_number"],
         "generation_id": winner["generation_id"],
         "attempt_id": winner["attempt_id"],
-        "study": None,
     }
 
 
@@ -820,8 +819,9 @@ def test_terminal_snapshot_tolerates_missing_lifecycle_record(tmp_path: Path) ->
     whenever the best-effort write had failed (review v0.5.16 / blocker 2).
     """
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     generation_path = _generation_path(experiment)
-    generation_path.parent.mkdir(parents=True)
+    generation_path.parent.mkdir(parents=True, exist_ok=True)
     generation_path.write_text("generation_id: prior-generation\n")
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -842,6 +842,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
         phases=[Phase(name="p", n_trials=1, sampler=SEEDED_RANDOM, search_space={})],
     )
     study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    _mark_current_study(experiment, study)
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "old-generation")
     trial.set_user_attr("phasesweep_attempt_id", "old-attempt")
@@ -893,6 +894,12 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     # imports its own study helpers: any study load at all fails the capture.
     monkeypatch.setattr(optuna, "load_study", fail_redundant_read)
 
+    if storage_kind == "corrupt-sqlite":
+        with pytest.raises(StudyStorageUnavailableError, match="could not be inspected"):
+            mcp_runner.capture_result_snapshot(experiment)
+        assert not _experiment_dir(experiment).exists()
+        return
+
     snapshot = mcp_runner.capture_result_snapshot(experiment)
 
     phase = snapshot["status"]["phases"][0]
@@ -921,6 +928,8 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
         experiment: Experiment,
         phase: Phase,
         published_trial: engine_optuna._TrialRef | None = None,
+        *,
+        validate_storage_format: bool = False,
     ) -> engine_optuna._PhaseTrialStats:
         nonlocal capture_reads
         if _generation_summary_path(experiment, generation_id).is_file():
@@ -931,8 +940,19 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_optuna.sqlite3, "connect", locked_connect)
-                return original_stats(experiment, phase, published_trial)
-        return original_stats(experiment, phase, published_trial)
+                return original_stats(
+                    experiment,
+                    phase,
+                    published_trial,
+                    validate_storage_format=validate_storage_format,
+                )
+
+        return original_stats(
+            experiment,
+            phase,
+            published_trial,
+            validate_storage_format=validate_storage_format,
+        )
 
     monkeypatch.setattr(engine_optuna, "_sqlite_phase_trial_stats", transient_capture_failure)
     if not pointer_commits:
@@ -972,8 +992,8 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
 
 
 def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: Path) -> None:
-    """Commit covers winners, skipped candidates, carried flags, and omitted phases."""
-    phase_names = ("carried", "new", "skipped", "old-only")
+    """Commit covers winners, carried flags, and omitted phases."""
+    phase_names = ("carried", "new", "old-only")
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         phases=[
@@ -982,6 +1002,7 @@ def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: 
         ],
     )
     generation_id = "candidate-generation"
+    _validate_artifact_root_binding(experiment, claim_fresh=True)
     published_summary = {
         "experiment": experiment.experiment,
         "generation_id": generation_id,
@@ -998,15 +1019,6 @@ def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: 
                 "generation_id": generation_id,
                 "attempt_id": "new-attempt",
             },
-        ],
-        "promotion_decisions": [
-            {
-                "phase": "skipped",
-                "action": "skip",
-                "candidate_trial_number": 1,
-                "candidate_generation_id": generation_id,
-                "candidate_attempt_id": "skipped-attempt",
-            }
         ],
     }
     summary_path = _generation_summary_path(experiment, generation_id)
@@ -1030,7 +1042,6 @@ def test_published_snapshot_rebinds_selected_phase_flags_from_summary(tmp_path: 
 
     committed_phases = {phase["phase"]: phase for phase in committed["status"]["phases"]}
     assert committed_phases["new"]["published_study_unavailable"] is True
-    assert committed_phases["skipped"]["published_study_unavailable"] is True
     assert committed_phases["carried"]["published_study_unavailable"] is True
     assert committed_phases["old-only"]["published_study_unavailable"] is False
 
@@ -1115,6 +1126,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
         phases=[Phase(name="p", n_trials=2, sampler=SEEDED_RANDOM, search_space={})],
     )
     study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    _mark_current_study(experiment, study)
     identified = study.ask()
     identified.set_user_attr("phasesweep_generation_id", "current-generation")
     identified.set_user_attr("phasesweep_attempt_id", "current-attempt")
@@ -1177,6 +1189,13 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
         completion={"incomplete": False},
         generation_id="engine-generation",
         attempt_id="engine-attempt",
+        source=WinnerSource(
+            kind="phase_trial",
+            phase="p",
+            trial_number=4,
+            generation_id="engine-generation",
+            attempt_id="engine-attempt",
+        ),
     )
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -1200,7 +1219,6 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
         "trial_number": 4,
         "generation_id": "engine-generation",
         "attempt_id": "engine-attempt",
-        "study": None,
     }
 
 
@@ -1371,7 +1389,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     The current-generation pointer legitimately moves to this new (failed)
     invocation -- a new invocation always overwrites it starting from
     "preflighting", and every outcome path must drive it to a terminal state
-    (review v0.5.15 / blocker 3) -- but the legacy compatibility caches and,
+    (review v0.5.15 / blocker 3) -- but the convenience root projections and,
     critically, the last-success pointer stay exactly as the prior successful
     publication left them.
     """
@@ -1393,7 +1411,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     first_generation = _last_successful_generation_id(experiment)
     assert first_generation is not None
 
-    # The legacy compatibility caches must stay untouched by a failed resume;
+    # The convenience root projections must stay untouched by a failed resume;
     # the current-generation pointer is deliberately excluded here since it
     # legitimately advances even on a preflight failure (see docstring).
     protected_paths = [
@@ -1450,7 +1468,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
         for phase in captured[0]["status"]["phases"]  # type: ignore[index]
     )
     assert captured[0]["winners"] == []
-    # Legacy compatibility caches are untouched, and the published pointer
+    # Convenience root projections are untouched, and the published pointer
     # still resolves to the prior successful generation.
     assert {path: path.read_bytes() for path in protected_paths} == before
     assert _last_successful_generation_id(experiment) == first_generation
@@ -1504,7 +1522,7 @@ def test_terminal_report_preserves_secondary_cleanup_uncertainty(
 
 @pytest.mark.parametrize(
     "error_type",
-    [OSError, ArtifactRootConflictError, LegacyArtifactRootMigrationRequiredError],
+    [OSError, ArtifactRootConflictError],
 )
 def test_terminal_report_marks_failed_root_discovery_uncertain(
     tmp_path: Path,
@@ -1991,6 +2009,8 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         captured_experiment: Experiment,
         phase: Phase,
         published_trial: engine_optuna._TrialRef | None = None,
+        *,
+        validate_storage_format: bool = False,
     ) -> engine_optuna._PhaseTrialStats:
         if _generation_summary_path(captured_experiment, run_id).is_file():
 
@@ -1999,8 +2019,19 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_optuna.sqlite3, "connect", locked_connect)
-                return original_stats(captured_experiment, phase, published_trial)
-        return original_stats(captured_experiment, phase, published_trial)
+                return original_stats(
+                    captured_experiment,
+                    phase,
+                    published_trial,
+                    validate_storage_format=validate_storage_format,
+                )
+
+        return original_stats(
+            captured_experiment,
+            phase,
+            published_trial,
+            validate_storage_format=validate_storage_format,
+        )
 
     monkeypatch.setattr(
         engine_optuna,
@@ -2458,7 +2489,7 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
 
 
 def test_artifact_root_conflict_is_not_reported_as_fingerprint_or_internal() -> None:
-    """A workdir conflict must carry its own code with the rebind remediation.
+    """A workdir conflict must carry its own code and fresh-state remediation.
 
     Mapping it to ``fingerprint_mismatch`` would steer the operator toward a
     new experiment name or archiving a healthy study; falling through to
@@ -2473,24 +2504,4 @@ def test_artifact_root_conflict_is_not_reported_as_fingerprint_or_internal() -> 
     assert payload["code"] == "artifact_root_conflict"
     assert payload["retryable"] is False
     assert payload["actor"] == "operator"
-    assert "rebind-workdir" in str(payload["remediation"])
-
-
-def test_legacy_artifact_root_migration_reports_the_conflict_category() -> None:
-    """The pre-binding migration refusal must classify as its parent conflict.
-
-    It is the same operator problem and the same remedy surface, so it must
-    not fall through to ``internal_error``; the remediation text also has to
-    fit a study that records no root at all (re-review v0.5.19 / blocker B1).
-    """
-    from phasesweep.engine.errors import LegacyArtifactRootMigrationRequiredError
-
-    payload = mcp_runner._base_failure_payload(
-        LegacyArtifactRootMigrationRequiredError("holds 2 trial(s) but records no artifact root"),
-        stage="preflight",
-    )
-
-    assert payload["code"] == "artifact_root_conflict"
-    assert payload["actor"] == "operator"
-    assert "rebind-workdir" in str(payload["remediation"])
-    assert "bound to" not in str(payload["remediation"])
+    assert "fresh artifact root and local storage" in str(payload["remediation"])

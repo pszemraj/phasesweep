@@ -1,8 +1,8 @@
 # PhaseSweep
 
-PhaseSweep runs phase-chained hyperparameter sweeps from one ordinary YAML file. That file contains your trainer's base configuration, the metric, and the search plan. PhaseSweep materializes a complete trainer YAML for every trial, decides what to try next, persists each phase winner, and carries selected values forward as fixed inputs to later phases.
+PhaseSweep runs phase-chained hyperparameter sweeps from one ordinary YAML file. That file contains your trainer configuration, the metric, and the search plan. PhaseSweep materializes the configured trainer input for every trial, decides what to try next, persists each phase winner, and carries selected values forward as fixed inputs to later phases.
 
-This is useful when a full joint sweep is too expensive or hard to interpret. For example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](docs/config.md#phase-keys) explains the inheritance model and its tradeoffs.
+This is useful when a full joint sweep is too expensive or hard to interpret. For example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](docs/config.md#phase-composition) explains the inheritance model and its tradeoffs.
 
 ![PhaseSweep phase DAG](docs/images/diagramA_dag.png)
 
@@ -43,7 +43,9 @@ phases:
       optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-The packaged fake trainer reports its objective through `report_objective(...)`.
+The packaged fake trainer uses the optional `report_objective(...)` envelope
+helper. Your own trainer can report through W&B, ordinary JSON, or logs without
+importing PhaseSweep.
 
 ## Install and try it
 
@@ -51,12 +53,19 @@ Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
 
 ```bash
 pip install git+https://github.com/pszemraj/phasesweep.git
+phasesweep --version
 
 mkdir phasesweep-demo && cd phasesweep-demo
 phasesweep init                       # writes the starter experiment.yaml
 phasesweep validate experiment.yaml   # checks it without launching anything
 phasesweep run experiment.yaml        # four tiny trials, a few seconds
 ```
+
+This breaking release accepts only fresh current-format state. When upgrading
+from 0.3.1, use a fresh artifact root and local ledger (plus a fresh MCP state
+directory when applicable); there is no migration, adoption, or repair path.
+Use the preserved 0.3.1 environment for existing state. See the
+[fresh-state cutover](docs/runtime.md#fresh-state-cutover) for the full scope.
 
 The run log shows the phase chaining directly (abridged):
 
@@ -91,31 +100,49 @@ effective_overrides:
 
 ## Use your own trainer
 
-Put your trainer's normal base configuration under `trainer_config`, point `trial_command` at its YAML entry point, and pass `{config_path}` where that entry point expects the file. Dotted search keys such as `model.depth` update the corresponding nested value; every other base setting is preserved.
+Choose the input interface your trainer already accepts:
 
-Follow the [trainer contract](docs/config.md#trainer-contract) for objective reporting and the [override formats](docs/config.md#override-formats) for other trainer interfaces.
+| Input | Command placeholder |
+| --- | --- |
+| Complete base-plus-overrides YAML (`yaml_file`, default) | `--config {config_path}` |
+| Command-line flags (`argparse`) | `{overrides}` produces `--key=value` |
+| Native Hydra overrides (`hydra`) | `{overrides}` produces `key=value` |
+| Nested overrides-only JSON (`json_file`) | `--overrides {overrides_path}` |
 
-Review before launching real workloads: `phasesweep run experiment.yaml --dry-run` prints one sampled command per phase without starting training, and `validate`, `status`, and `show-winners` never launch trials either. `phasesweep init` never overwrites an existing file; pass `-o PATH` to choose another destination.
+For ordinary JSON output, pass an output path under `{trial_dir}` to your
+trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`.
+For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT,
+metric_key: eval/loss}` and have the trainer honor the supplied W&B identity.
+Install W&B support with
+`python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"`.
 
-The starter keeps its database and artifacts under `<workdir>/<experiment>/` with `storage: auto`. See the [output layout](docs/runtime.md#output-layout) for storage placement, ignored artifacts, and relocation.
+`metric.goal` ranks each trial's selected scalar. Log matching selects the
+last observation by default; W&B selects an exact finished-summary key.
+The trainer owns evaluation, early stopping, checkpoint selection, and
+aggregation. Inheritance transfers parameters, not model weights.
 
-```bash
-phasesweep status experiment.yaml                           # durable progress, nothing launched
-phasesweep run experiment.yaml --from-phase learning_rate   # resume after prerequisites have valid winners
-```
+See the [configuration guide](docs/config.md) for input types, reporting,
+credentials, and selection details. Preview one command per phase without
+launching work with `phasesweep run experiment.yaml --dry-run`.
+`phasesweep init` never overwrites an existing file; use `-o PATH` for another
+destination.
 
-See [runtime behavior](docs/runtime.md) for locks, process cleanup, GPU isolation, fingerprints, resume, and output layout. The [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer integration.
+The starter uses `storage: auto` under `<workdir>/<experiment>/`. See [runtime
+behavior](docs/runtime.md) for state layout, current-format requirements,
+locks, cleanup, GPU isolation, and resume. The [Tiny Decoder Enwik8
+example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer
+integration.
 
 ## Connect an agent
 
-The optional MCP server connects an AI agent to experiments you have approved without exposing config or storage paths, trainer commands, environment values, or raw logs. Sampled winner values follow the catalog's `visible_params` policy. Follow the [MCP setup](docs/mcp_setup.md) to install the extra, review the catalog authority boundary, connect a supported client, and verify the result.
+The optional MCP server connects an AI agent to experiments you have approved without exposing config or storage paths, trainer commands, environment values, or raw logs. Sampled winner values follow the catalog's `visible_params` policy. Follow the [MCP setup](docs/mcp_setup.md) to install the extra, review the catalog authority boundary, configure a client-owned connection, and verify the result.
 
 ## Reference
 
-- [Configuration guide](docs/config.md): trainer contract, experiment and suite YAML, search spaces, inheritance, gates, promotion, and extractors.
+- [Configuration guide](docs/config.md): Experiment YAML, search spaces, inheritance, gates, and objective extractors.
 - [Configuration reference](docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
-- [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
-- [MCP setup](docs/mcp_setup.md): installed-package agent onboarding and client-file preservation.
+- [Runtime behavior](docs/runtime.md): filesystem layout, fresh-state cutover, locks, GPU leases, process supervision, fingerprints, and resume.
+- [MCP setup](docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.
 - [MCP operator reference](docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.
 - [Toy experiment and MCP catalog](examples/experiment.yaml): a checkout-local CLI example backed by the packaged fake trainer, plus an [MCP catalog](examples/catalog.yaml) whose detached-run state and experiment outputs use absolute scratch paths under `/tmp`.
 - [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer integration.

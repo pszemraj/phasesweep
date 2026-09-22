@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from phasesweep.config import Experiment, Suite
+from phasesweep.config import Experiment
 from phasesweep.engine.state import (
     GENERATION_CONFIG_SNAPSHOT_FILENAME,
     GENERATION_REPRODUCIBILITY_FILENAME,
@@ -168,20 +168,6 @@ def _generation_winner_path(experiment: Experiment, generation_id: str, phase_na
     return _generation_dir(experiment, generation_id) / "phases" / phase_name / "winner.yaml"
 
 
-def _generation_promotion_decision_path(
-    experiment: Experiment, generation_id: str, phase_name: str
-) -> Path:
-    """Return one generation's phase-promotion path.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str generation_id: Immutable generation namespace identifier.
-    :param str phase_name: Phase name whose generation-scoped promotion path is requested.
-    :return Path: Path to the phase's promotion-decision YAML file within the
-        generation namespace.
-    """
-    return _generation_dir(experiment, generation_id) / "phases" / phase_name / "promotion.yaml"
-
-
 def _last_successful_generation_path(experiment: Experiment) -> Path:
     """Return the pointer to the last fully published generation.
 
@@ -219,98 +205,3 @@ def _winner_path(experiment: Experiment, phase_name: str) -> Path:
     :return Path: Path to the persisted winner YAML file.
     """
     return _phase_dir(experiment, phase_name) / "winner.yaml"
-
-
-def _promotion_decision_path(experiment: Experiment, phase_name: str) -> Path:
-    """Path to the persisted phase promotion decision.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str phase_name: Phase name whose promotion decision path is
-        requested.
-    :return Path: Path to the persisted promotion decision YAML file.
-    """
-    return _phase_dir(experiment, phase_name) / "promotion.yaml"
-
-
-def _suite_dir(suite: Suite) -> Path:
-    """Filesystem namespace for suite-level summary/log artifacts.
-
-    :param Suite suite: Suite config with default artifact settings.
-    :return Path: Absolute directory for suite artifacts.
-    """
-    return Path(suite.defaults.workdir).expanduser().resolve() / suite.suite
-
-
-def _suite_summary_path(suite: Suite) -> Path:
-    """Path to a suite-level summary.
-
-    :param Suite suite: Suite config with artifact root details.
-    :return Path: Path to the suite summary YAML file.
-    """
-    return _suite_dir(suite) / "suite_summary.yaml"
-
-
-def _suite_generation_path(suite: Suite) -> Path:
-    """Return the current suite-generation lifecycle path.
-
-    :param Suite suite: Suite config with artifact root details.
-    :return Path: Path to the current suite-generation lifecycle YAML file.
-    """
-    return _suite_dir(suite) / "suite_generation.yaml"
-
-
-def _suite_generations_dir(suite: Suite) -> Path:
-    """Return the immutable suite-generation root.
-
-    :param Suite suite: Suite config with artifact root details.
-    :return Path: Directory containing all immutable per-suite-generation namespaces.
-    """
-    return _suite_dir(suite) / "suite_generations"
-
-
-def _suite_generation_dir(suite: Suite, generation_id: str) -> Path:
-    """Return one immutable suite-generation directory.
-
-    :param Suite suite: Suite config with artifact root details.
-    :param str generation_id: Immutable suite-generation namespace identifier.
-    :return Path: Directory scoped to the given suite generation.
-    """
-    return _suite_generations_dir(suite) / generation_id
-
-
-def _suite_generation_record_path(suite: Suite, generation_id: str) -> Path:
-    """Return one suite generation's lifecycle record path.
-
-    :param Suite suite: Suite config with artifact root details.
-    :param str generation_id: Immutable suite-generation namespace identifier.
-    :return Path: Path to the suite generation's lifecycle record YAML file.
-    """
-    return _suite_generation_dir(suite, generation_id) / "generation.yaml"
-
-
-def _suite_generation_summary_path(suite: Suite, generation_id: str) -> Path:
-    """Return one suite generation's immutable summary path.
-
-    :param Suite suite: Suite config with artifact root details.
-    :param str generation_id: Immutable suite-generation namespace identifier.
-    :return Path: Path to the suite generation's summary YAML file.
-    """
-    return _suite_generation_dir(suite, generation_id) / "summary.yaml"
-
-
-def _last_successful_suite_generation_path(suite: Suite) -> Path:
-    """Return the pointer to the last fully published suite generation.
-
-    :param Suite suite: Suite config with artifact root details.
-    :return Path: Path to the YAML file recording the last-successful suite generation id.
-    """
-    return _suite_dir(suite) / "last_successful_suite_generation.yaml"
-
-
-def _suite_log_path(suite: Suite) -> Path:
-    """Path to a suite-level run log.
-
-    :param Suite suite: Suite config with artifact root details.
-    :return Path: Path to the suite run log.
-    """
-    return _suite_dir(suite) / "run.log"

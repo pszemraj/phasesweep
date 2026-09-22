@@ -10,8 +10,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
-import yaml
-
 import phasesweep.engine.artifact_roots as artifact_root_ops
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
@@ -21,28 +19,57 @@ import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.guards as guard_ops
 import phasesweep.engine.locking as locking_ops
 import phasesweep.engine.paths as path_ops
-import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.resume as resume_ops
 from phasesweep._metadata import __version__
-from phasesweep.config import Config, Experiment, Suite
+from phasesweep.config import Config, Experiment
 from phasesweep.config.common import _validate_safe_name
-from phasesweep.config.models import _metric_semantics_payload
+from phasesweep.config.models import _metric_scoring_line, _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
-from phasesweep.engine.errors import (
-    PromotionError,
-    RunRequestError,
-    StudyStorageUnavailableError,
-)
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
 from phasesweep.engine.read import read_status
-from phasesweep.engine.selection import _apply_promotion, _winner_summary_item
+from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
-from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.engine.trial import (
+    ProcessCleanupUncertainError,
+    _preflight_trainer_environments,
+    _trainer_environment,
+)
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
-from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
+from phasesweep.runtime.process import (
+    PhaseSweepShutdown,
+    service_pending_shutdown,
+    signal_handler_scope,
+)
 
 log = logging.getLogger("phasesweep.engine.run")
+
+
+def _preflight_missing_reached_phase_environments(
+    experiment: Experiment,
+    existing_studies: Mapping[str, object],
+    *,
+    from_phase: str | None,
+) -> None:
+    """Validate launch environments for reached phases with no durable study.
+
+    A phase absent from an otherwise bound tree has no completed trial to
+    replay, so it must be able to launch before this invocation claims a
+    generation or tops up an earlier phase. Existing studies remain deferred to
+    recovery, which can distinguish new work from an offline-safe no-op.
+
+    :param Experiment experiment: Parsed experiment supplying phase environments.
+    :param Mapping[str, object] existing_studies: Durable studies found under the lock.
+    :param str | None from_phase: Optional first phase this invocation can execute.
+    :raises PhaseSweepError: A missing reached phase has an invalid launch environment.
+    """
+    reached = from_phase is None
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
+        if reached and phase.name not in existing_studies:
+            _trainer_environment(experiment, phase.name)
 
 
 @dataclass(frozen=True)
@@ -141,9 +168,9 @@ class ExperimentRunOutcome:
     """One published experiment invocation bound to its generation identity.
 
     The winners and the generation id that produced them are materialized
-    together while the experiment lock is still held, so consumers (suites,
-    provenance manifests) can record exact lineage without re-reading mutable
-    pointers after the lock is released — an interleaving external top-up
+    together while the experiment lock is still held, so provenance consumers
+    can record exact lineage without re-reading mutable pointers after the lock
+    is released — an interleaving external top-up
     would otherwise let a manifest name generation B while carrying winners
     from generation A (review v0.5.14 / blocker 2).
     """
@@ -158,75 +185,23 @@ def run_config(
     *,
     from_phase: str | None = None,
     dry_run: bool = False,
-) -> dict[str, Winner] | dict[str, dict[str, Winner]]:
-    """Run an experiment or suite config.
+) -> dict[str, Winner]:
+    """Run an experiment config through the sole execution implementation.
 
-    :param Config config: Parsed experiment or suite config.
-    :param str | None from_phase: Optional phase name to resume from for experiment configs.
+    :param Config config: Parsed experiment config.
+    :param str | None from_phase: Optional phase name to resume from.
     :param bool dry_run: If ``True``, preview commands without launching subprocesses.
-    :return dict[str, Winner] | dict[str, dict[str, Winner]]: Experiment winners, or suite
-        study winners keyed by study name.
-    :raises RunRequestError: ``from_phase`` was given for a suite config, which
-        has no single phase sequence to resume.
+    :return dict[str, Winner]: Experiment winners keyed by phase name.
     """
-    if isinstance(config, Suite):
-        if from_phase is not None:
-            raise RunRequestError("--from-phase is only supported for single experiment configs.")
-        from phasesweep.engine.suite import run_suite
-
-        return run_suite(config, dry_run=dry_run)
     return run_experiment(config, from_phase=from_phase, dry_run=dry_run)
 
 
 def config_status(config: Config) -> dict[str, Any]:
-    """Collect read-only status for an experiment or suite config.
+    """Collect read-only status through the sole experiment implementation.
 
-    For an :class:`~phasesweep.config.Experiment` this returns
-    :func:`experiment_status` verbatim. For a :class:`~phasesweep.config.Suite`
-    it returns ``{kind: "suite", suite, workdir, published_suite_generation_id,
-    publication_integrity, studies}`` — plus ``publication_error`` as the one
-    conditional key, exactly as the experiment payload carries it — where each
-    study is ``{name, depends_on, status}`` and ``status`` is that study's
-    compiled experiment status: the same payload, generation identity included,
-    that a standalone experiment reports.
-
-    The suite envelope reports the *suite* last-success pointer's own four-state
-    verdict (re-review v0.5.19 / observation N2). Reporting only the component
-    studies let a suite whose published summary no longer validated print
-    ``publication_integrity: "ok"`` for every component and exit 0, while
-    ``show-winners`` on the same tree correctly reported corruption — the
-    opposite of finding F4's contract that both surfaces escalate. As in the
-    experiment payload, ``published_suite_generation_id`` is populated only for
-    an ``"ok"`` verdict: a suite generation that failed validation is named in
-    the error, never presented as published.
-
-    :param Config config: Parsed experiment or suite config to inspect.
-    :return dict[str, Any]: Read-only status payload for the config.
+    :param Config config: Parsed experiment config to inspect.
+    :return dict[str, Any]: Read-only experiment status payload.
     """
-    if isinstance(config, Suite):
-        publication = publication_ops._resolve_suite_publication_pointer(config)
-        return {
-            "kind": "suite",
-            "suite": config.suite,
-            "workdir": str(path_ops._suite_dir(config)),
-            "published_suite_generation_id": (
-                publication.generation_id if publication.state == "ok" else None
-            ),
-            "publication_integrity": publication.state,
-            **(
-                {"publication_error": publication.error}
-                if publication.state in {"failed", "permission_denied"}
-                else {}
-            ),
-            "studies": [
-                {
-                    "name": study.name,
-                    "depends_on": study.depends_on,
-                    "status": experiment_status(config.experiment_for_study(study)),
-                }
-                for study in config.studies
-            ],
-        }
     return experiment_status(config)
 
 
@@ -285,7 +260,7 @@ def run_experiment(
             objective source no longer matches its frozen provenance.
         RunRequestError: A caller-supplied generation id already names an
             immutable generation in this experiment.
-        PhaseSweepError: An expected preflight, promotion, storage,
+        PhaseSweepError: An expected preflight, storage,
             publication, or recovery refusal requires operator action.
         RuntimeError: An internal engine invariant fails.
         ValueError: A caller-supplied generation id is not a safe filesystem name,
@@ -307,6 +282,11 @@ def run_experiment(
             dry_run=True,
             generation_id=None,
         )
+    # A fresh artifact tree cannot be a no-op replay, so validate its launch
+    # environments before creating state. Existing current-format trees defer
+    # the same check until recovery proves a phase has new work remaining.
+    if not path_ops._artifact_root_binding_path(experiment).exists():
+        _preflight_trainer_environments(experiment, from_phase=from_phase)
     outcome = _run_experiment_outcome(
         experiment,
         from_phase=from_phase,
@@ -314,6 +294,17 @@ def run_experiment(
         publication_hook=publication_hook,
         generation_id=generation_id,
     )
+    # Publication and its terminal callback are already durable/successful at
+    # this boundary. Deliver any shutdown absorbed by the one-way commit window
+    # before returning control or allowing a long-lived caller to start work.
+    try:
+        service_pending_shutdown()
+    except PhaseSweepShutdown as exc:
+        # This is the sole post-publication delivery point. Keep that fact on
+        # the control-flow exception so process frontends can explain the
+        # signalled exit without re-reading mutable publication pointers.
+        exc.published_result_committed = True
+        raise
     return dict(outcome.winners)
 
 
@@ -357,12 +348,10 @@ def _run_experiment_outcome(
     requested_generation_id = (
         None if generation_id is None else _validate_safe_name("generation", generation_id)
     )
-    path_ops._experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
     # signal_handler_scope() is the outermost context manager so shutdown-signal
     # ownership is scoped to this call tree and restored on every exit path,
     # not left installed on the host process forever (review v0.5.14 /
-    # blocker 6). A run_suite caller has already entered its own scope, so
-    # this one is a reentrant no-op that installs and restores nothing.
+    # blocker 6).
     with (
         signal_handler_scope(),
         locking_ops._experiment_lock(experiment),
@@ -386,6 +375,11 @@ def _run_experiment_outcome(
                 "Restore the original complete storage ledger and access to it before "
                 "retrying. For an MCP run, then run phasesweep mcp recover-run."
             ) from exc
+        _preflight_missing_reached_phase_environments(
+            experiment,
+            existing_studies,
+            from_phase=from_phase,
+        )
         ensure_artifact_dir(path_ops._experiment_dir(experiment))
         run_stack.enter_context(artifact_io._file_log_handler(path_ops._run_log_path(experiment)))
         generation_id = generation_ops._claim_generation(experiment, requested_generation_id)
@@ -423,11 +417,6 @@ def _run_experiment_outcome(
             # primary error, and publication on that path is covered by the
             # selection-time winner check.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
-            resume_ops._preflight_evaluation_semantics(
-                experiment,
-                from_phase=from_phase,
-                existing_studies=existing_studies,
-            )
             resume_ops._reject_bound_descendant_topups(
                 experiment,
                 from_phase=from_phase,
@@ -623,14 +612,12 @@ def _run_experiment_inner(
     Raises:
         TimeoutError: The whole-run wallclock deadline expired before a phase
             could start.
-        PromotionError: A phase's promotion decision was ``stop``.
         FileNotFoundError: A skipped phase has no persisted ``winner.yaml``
             (re-raised on non-dry-run; dry runs substitute a placeholder).
 
     """
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
-    promotion_decisions: dict[str, dict[str, Any]] = {}
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
@@ -638,6 +625,7 @@ def _run_experiment_inner(
         # Capability disclosure (review v0.5.18 / finding F7): restate the same
         # per-phase resume/reproduce contract `phasesweep validate` prints, in
         # the preview an operator reads immediately before committing to a run.
+        log.info("DRY RUN %s", _metric_scoring_line(experiment.metric))
         for previewed in experiment.phases:
             log.info("DRY RUN %s", sampler_capability_line(previewed))
 
@@ -670,22 +658,6 @@ def _run_experiment_inner(
                         winners[phase.name],
                         generation_id=generation_id,
                     )
-                    # Safe to re-resolve the published pointer per phase here, unlike
-                    # status reads: this runs under _experiment_lock, and this
-                    # experiment's pointer only advances at this run's final publish.
-                    prior_promotion = publication_ops._published_promotion_decision_path(
-                        experiment, phase.name
-                    )
-                    if prior_promotion is not None and prior_promotion.is_file():
-                        prior_promotion_payload = yaml.safe_load(prior_promotion.read_text())
-                        generation_ops._copy_yaml_projection(
-                            prior_promotion,
-                            path_ops._generation_promotion_decision_path(
-                                experiment, generation_id, phase.name
-                            ),
-                        )
-                        if isinstance(prior_promotion_payload, dict):
-                            promotion_decisions[phase.name] = prior_promotion_payload
                 log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
             else:
                 try:
@@ -708,22 +680,6 @@ def _run_experiment_inner(
             run_deadline=run_deadline,
         )
         if not dry_run:
-            promoted, promotion_decision = _apply_promotion(experiment, phase, winner, winners)
-            if promotion_decision is not None:
-                promotion_decision["generation_id"] = generation_id
-                promotion_decisions[phase.name] = promotion_decision
-                assert generation_id is not None
-                artifact_io._save_promotion_decision(
-                    experiment,
-                    phase.name,
-                    promotion_decision,
-                    generation_id=generation_id,
-                )
-            if promoted is None:
-                if promotion_decision is not None and promotion_decision["action"] == "stop":
-                    raise PromotionError(str(promotion_decision["message"]))
-                break
-            winner = promoted
             assert generation_id is not None
             artifact_io._save_winner(
                 experiment,
@@ -763,7 +719,6 @@ def _run_experiment_inner(
         "phase_plan": [
             {"name": phase.name, "comment": phase.comment} for phase in experiment.phases
         ],
-        "promotion_decisions": list(promotion_decisions.values()),
         "phases": [_winner_summary_item(pname, w) for pname, w in winners.items()],
         "artifacts": validation_ops._generation_artifact_manifest(experiment, generation_id),
     }
@@ -790,10 +745,8 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     artifacts (review v0.5.15 / blocker 3).
 
     The returned mapping is the single experiment status snapshot shared by
-    every caller: ``phasesweep status <experiment>`` renders it directly, and
-    :func:`config_status` embeds it unchanged under ``studies[*].status`` for a
-    suite, so a suite study reports the same generation identity a standalone
-    experiment does. Its keys are exactly, in order:
+    every caller, including ``phasesweep status <experiment>``. Its keys are
+    exactly, in order:
 
     * ``kind``: always ``"experiment"``.
     * ``experiment``: configured experiment name.
@@ -801,11 +754,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     * ``current_generation_id``, ``published_generation_id``,
       ``represented_generation_id``, ``is_published``: the identity split
       defined by :func:`phasesweep.engine.read.read_status` (unpinned mode, so
-      the represented generation is the published one). A pre-generation
-      legacy workdir has no generation ids to report and leaves all three
-      null, but its compatibility ``winner.yaml`` still counts as published,
-      so ``is_published`` never contradicts the ``winner`` path shown beside
-      it.
+      the represented generation is the published one). A fresh workdir with
+      no generation metadata leaves all three null; root-level winner
+      projections never establish publication authority.
     * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"``, and ``publication_error`` beside either failure
       verdict -- the one

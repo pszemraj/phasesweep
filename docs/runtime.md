@@ -1,228 +1,174 @@
 # Runtime behavior
 
-## Platform support
+PhaseSweep runs one ordered Experiment on a POSIX host. It uses same-host file
+locks and process groups to serialize a persistent experiment and clean up
+trainer subprocesses. GPUs are optional; the core CLI can run CPU-only work.
+The optional MCP server additionally requires Linux `/proc` process identity
+information for detached-run cancellation and recovery.
 
-Non-dry-run execution requires a POSIX platform such as Linux or macOS. PhaseSweep uses POSIX process groups for subprocess cleanup and `fcntl.flock` for same-host locks. Config validation and `--dry-run` do not launch subprocesses and do not take those locks, but real runs fail early on unsupported platforms.
+## Fresh-state cutover
 
-MCP operations that validate a catalog, start the server, install an MCP client entry, or recover a run require Linux with readable `/proc` process start times. Detached runner launch also requires a readable boot ID; cancellation and recovery refuse to signal a saved process group when either boot ID is unknown. Together these identities make cancellation and crash recovery PID-reuse-safe across reboots. Instruction-only client installation does not load a catalog and remains available without the MCP runtime. The core CLI remains available on supported POSIX platforms.
+This breaking release has one current on-disk format. Start it with all of the
+following:
+
+- a fresh artifact root (`<workdir>/<experiment>`), including for in-memory
+  storage;
+- a fresh local SQLite or Journal ledger, if the experiment is persistent; and
+- a fresh MCP `state_dir`, if the experiment is launched through MCP.
+
+The runtime checks an existing artifact root and local ledger before it creates
+or stamps state. It refuses missing, malformed, or unsupported PhaseSweep
+format records without modifying that namespace. An unmarked durable MCP state
+directory is likewise refused before it is initialized. A new experiment name
+or workdir does not make an old populated local ledger fresh.
+
+There is no migration, adoption, relocation, rebind, or repair path in this
+release. Operate an existing 0.3.1 output, ledger, or MCP state directory with
+the preserved 0.3.1 environment. Choose new paths for the consolidated
+release.
 
 ## Output layout
 
-When a real run creates or uses its artifact namespace, PhaseSweep adds a missing
-`.gitignore` containing `*` inside `<workdir>/<experiment>/` (and
-`<workdir>/<suite>/` for suite artifacts). Existing ignore files are preserved.
-The shared `workdir` itself is left alone, so using a repository root as the
-workdir does not hide unrelated source files. Validation, status, and engine
-dry runs do not create output directories.
-
-To commit selected summaries or winners, edit the namespace's `.gitignore` because its
-rules override root-level negations; `git clean -fdx` deletes ignored output,
-including any study database stored in the workdir.
-
-If an earlier version created a wildcard `.gitignore` directly in a shared
-workdir, review and remove that rule yourself; PhaseSweep preserves existing
-ignore files rather than guessing which rules you intended to keep.
-
-With `storage: auto`, each experiment keeps its database and artifacts in one namespace:
+For `workdir: ./runs` and `experiment: demo`, PhaseSweep writes under
+`./runs/demo/`:
 
 ```text
-runs/
-  tiny_lm_16mb/
-    .gitignore
-    study.db                 # study.journal when any phase has n_jobs > 1
-    depth/
-      trial_00000__generation_<generation-id>__attempt_<attempt-id>/
-        attempt_lifecycle.json
-        command.txt
-        trainer_config.yaml       # yaml_file only
-        overrides.json            # json_file only
-        overrides_resolved.json   # every override format
-        process_identity.json
-        result.json                # trainer-owned json_envelope evidence
-        stdout.log
-        stderr.log
-      trials.csv
-      winner.yaml
-    lr/
-    regularization/
-    generations/
-      <generation-id>/
-        config.snapshot.yaml
-        generation.yaml
-        reproducibility.json
-        summary.yaml
-        phases/<phase>/winner.yaml
-    generation.yaml
-    last_successful_generation.yaml
-    run.log
-    summary.yaml
-    attempts/
-      <attempt-id>.json
-    artifact_root_binding.json
+demo/
+  .gitignore
+  artifact_root_binding.json
+  run.log
+  study.db                        # storage: auto with sequential phases
+  generation.yaml
+  last_successful_generation.yaml
+  summary.yaml
+  attempts/
+  generations/
+    <generation-id>/
+      generation.yaml
+      config.snapshot.yaml
+      reproducibility.json
+      summary.yaml
+      phases/<phase>/winner.yaml
+  <phase>/
+    winner.yaml
+    trials.csv
+    trial_00000__generation_<id>__attempt_<id>/
+      attempt_lifecycle.json
+      process_identity.json
+      trainer_config.yaml       # yaml_file only
+      overrides.json            # json_file only; nested overrides
+      overrides_resolved.json
+      command.txt
+      stdout.log
+      stderr.log
+      result.json               # when produced by the trainer
 ```
 
-`storage: auto` places the ledger shown above beside the experiment artifacts. Suite studies use their compiled `<suite>__<study>` names. Explicit storage URLs keep their configured locations; omitted or null storage remains in-memory. A tree whose ledger uses an older explicit location such as `<workdir>/phases.db` must keep that setting; changing to `auto` selects a different ledger, and `rebind-workdir` does not migrate it.
-
-Every non-dry experiment invocation claims a generation ID, and each trial allocation mints one attempt ID. Both are stored in Optuna before trainer launch and included in the trial directory name, so a repeated in-memory study cannot read files left by an older trial with the same number. The trainer and any supervised W&B polling workers for that trial reuse the attempt ID while updating the process and lifecycle records. The owner-only `attempts/` registry (`0700`, entries `0600`) freezes each live attempt's recovery locator, including storage credentials; relative SQLite and journal paths become absolute so a later working-directory change cannot redirect recovery. Recovery normally uses that frozen locator, but when the current config has the same credential-free storage target identity it uses the current operational locator instead, so a rotated password or token cannot strand a stale attempt behind obsolete credentials even when its phase was renamed or removed. The ordinary `artifact_root_binding.json` contains only an opaque digest of the storage identity, never the operational URL or its query values. A generation namespace is claimed once under the experiment lock, and a reused caller-supplied ID is rejected before lifecycle or trial state changes.
-
-Each generation keeps its lifecycle record, summary, winners, and promotion decisions under `generations/<generation-id>/`. Claiming it also freezes the effective configuration before lifecycle state exists. `config.snapshot.yaml` is the canonical executed config: defaults materialized, key order normalized, an omitted `execution.cwd` replaced by the resolved invocation directory, and comments removed. It is the only artifact that preserves the embedded `trainer_config`, full search spaces, fixed overrides, contracts, `env`, and trial-command template after the operator YAML changes or disappears; rendered per-trial commands remain in `command.txt`. Because `env` may contain secrets, the snapshot is owner-only (`0600`). `reproducibility.json` is the shareable, umask-governed counterpart: PhaseSweep and schema versions, generation-ID source, experiment and phase digests, declared [provenance](config.md#experiment-keys), and the snapshot's SHA-256, but no config or environment values.
-
-`generation.yaml` is the mutable current-generation pointer and moves from `preflighting` to `running` and then `published`, `publication_failed`, or `failed`. `last_successful_generation.yaml` advances only after the immutable generation summary validates as a complete manifest: every winner, promotion, snapshot, and reproducibility artifact must be listed, exist, match its content hash and recorded identity, and leave no unlisted file in the namespace. Older generation manifests that omit snapshot and reproducibility artifacts remain valid when their namespaces omit both. Older schema-2 `--from-phase` publications can also list a carried-forward promotion only in the manifest, omitting it from the summary's decision list; these remain readable and resumable when the artifact matches the promotion in its named earlier generation. A subsequent resume includes the carried decision in its new summary, without requiring a full rerun. The pointer records the summary's exact byte length and SHA-256; reads verify both before parsing any historical field. Validation also cross-checks the summary's config fingerprint, phase plan, metric, and evidence semantics against the frozen reproducibility and config-snapshot artifacts. Pointer-backed reads repeat these checks, so an isolated summary edit reports failed publication integrity rather than changing historical meaning. Manifest reads validate each winner's phase fingerprint and concrete source fields before reporting a publication healthy. A baseline exposure matches its source phase's winner even within the same generation. A carried winner also validates its published source generation and matches the source trial's result and evidence fields; a source generation that crashed before publication still needs only its trial namespace. The same byte anchor and component-graph validation apply to suite summaries. The pointer commit runs with shutdown signals absorbed, so a racing signal cannot create an ambiguous publication: the commit stands, and shutdown is honored before later work begins. Modern generation records require a last-success pointer to expose a published result; compatibility projections alone never promote an orphaned generation. Phase-level winners and the root summary are compatibility projections of the last successful generation; failed work leaves them unchanged, while resume reads the immutable generation artifacts under the [fingerprint and resume rules](#fingerprints-and-resume).
-
-Each winner selected from a real trial also freezes its objective evidence provenance - in `winner.yaml` under `objective_provenance` and in the winning trial's study attributes at extraction time. The record carries the extractor kind and the SHA-256 of its evaluation contract (configuration plus the log-regex evaluation revision when applicable), the evidence identity - a whole-file digest for `json_envelope` or `log_regex` sources (plus the envelope's validated evaluation metadata, or the log line that supplied the selected value and how many matches were examined), or the frozen W&B endpoint/entity/project/run address and summary subset with the terminal run state and retrieval timestamp - and when the evidence was captured. Local result files and remote summaries can change after selection; the frozen record is what proves which exact source bytes or summary fields justified the published scalar. Winners persisted before this record simply lack the field. The frozen record covers the objective only: constraint values and gate results are persisted as observed values (`constraints:` and `gates:` in the winner file) without a digest of the bytes that produced them, so re-verifying *those* after the fact means re-reading the trial directory. A W&B extractor or gate uses its explicit, normalized `base_url`, which joins the evidence config fingerprint and is passed to the SDK independently of ambient `WANDB_BASE_URL`. Credentials still follow the SDK's normal environment/configuration lookup and may rotate as pass-through values.
-
-That frozen record is also enforced, not merely archived. Winner selection itself reads only the study, so PhaseSweep checks the tree on three occasions. Before launching any trial, a run verifies every trial that is currently eligible to win - completed, finite, feasible, with an execution identity - still has the evidence directory its own study record names, holding `overrides_resolved.json`, `command.txt`, any local objective source at the size the provenance recorded, and `attempt_lifecycle.json` for attempts created after that record was introduced; legacy attempts may lack the lifecycle file. Every new trial additionally stores a versioned `phasesweep_trainer_input` trial attribute naming the selected input format, trial-relative filename, byte length, and SHA-256. Candidate preflight uses that historical record rather than the current config to locate and content-hash the small generated input that the trainer received. Trials created before this record existed are not adopted because PhaseSweep cannot prove which historical bytes the trainer consumed; archive/delete that study or use a new experiment name. The directory is located structurally, under the phase directory of the workdir now configured, so a relocated tree is checked where it actually is, and rebind validates the same input record before accepting a copied tree. At selection, the trial that becomes the published winner additionally has its objective source re-hashed against the recorded SHA-256. Only the winner's objective source is digest-verified because the default source is the trainer's uncapped `stdout.log`, and re-hashing every candidate's log on every top-up would cost the study's whole log volume per resume; generated configuration files are small enough to hash for every candidate. Finally, a published winner carried forward from an earlier generation requires that generation to exist in this same tree and, when it published a result of its own, to hold an agreeing winner record for `winner_source.phase`; that recorded source phase can differ from the phase exposing a `continue_baseline` winner. A generation that crashed before publication has no such record and is legitimately cited without one, which keeps ordinary crash recovery publishable. Missing, wrong-sized, or same-length-altered generated input fails before any trial launches; a same-length objective-source edit fails if that candidate is selected, before publication. Neither case is silently skipped, because skipping changes which trial wins and would bias the published result.
-
-Every trial records the semantic identity of its composed base environment before PhaseSweep adds per-trial `PHASESWEEP_*` values, `WANDB_RUN_ID`, and GPU bindings. Inherited trial-bound keys are removed from the base because the trainer receives PhaseSweep's assigned values instead. The identity is the SHA-256 of sorted name-value pairs after excluding ambient names explicitly classified under `execution.passthrough_env`; other top-level configured `env` entries are always semantic and cannot be exempted. The digest and all sorted base variable names are written as trial attributes at allocation so failed trials carry them too. Before a populated persistent study can allocate another trial, every recorded trial must have that identity and its digest must equal the current semantic digest. A different value or an already-mixed cohort fails before consuming a trial number; a populated legacy study with a missing digest also fails closed instead of being guessed into the current cohort.
-
-The winner keeps the semantic digest plus the `inherit_env` contract in `winner.yaml` (`trainer_env_digest`, `trainer_inherit_env`); names stay trial-level. Ambient values are never stored by default. `execution.record_env: true` opts into an owner-only (0600) `environment.json` containing the digest, both inheritance classifications, and every composed base value; it is not a byte-for-byte dump of the final subprocess environment.
-
-Published suite results get the same anchoring as experiment generations: each study record in a suite summary (`schema_version: 3`) carries the path and content hash of the component generation summary it derives from; each phase's exposed flag must be boolean, and every exposed winner must match - by phase, trial number, metric value, and generation/attempt identity - a winner in one of those hash-verified component summaries (promotion-adopted winners match the baseline's). The check runs before the suite last-success pointer commits and whenever a read or later suite run trusts the prior publication, so an edited suite summary or component artifact is never read as a published number or hidden by a rerun - and, like the experiment pointer, is reported as a corrupt publication rather than as a suite that never published. Suite summaries published before v3 keep the identity-only gate.
-
-`overrides_resolved.json` records inherited, fixed, and sampled values for every [override format](config.md#override-formats). The versioned trainer-input record identifies `trainer_config.yaml` for `yaml_file`, `overrides.json` for `json_file`, and `overrides_resolved.json` for `argparse` or `hydra`. PhaseSweep serializes the selected input once, atomically publishes those exact bytes before launch, and uses the same bytes for the recorded size/SHA-256 and `PHASESWEEP_OVERRIDES_SHA256`. Promotion artifacts follow the [promotion rules](config.md#promotion). Files such as `result.json` are trainer-owned evidence written through the [trainer contract](config.md#trainer-contract).
-
-Trust boundary: `workdir` is operator-trusted. Engine-owned files inside it - including trial artifacts, `process_identity.json`, `attempt_lifecycle.json`, and the experiment-level attempt registry - use ordinary path handling and are not symlink-hardened; records that require crash-safe replacement are still written atomically. The directory is not required to be owner-only, since operators and tooling need ordinary access to logs, evidence, and resolved overrides. Two files inside it are hardened because they carry configured or ambient values verbatim: the opt-in `environment.json` in a trial directory, and every generation's `config.snapshot.yaml`. Both are written owner-only (0600) through the private atomic writer while their directories keep ordinary permissions, and PhaseSweep refuses to replace either if the existing file is not already a private, unshared regular file. Validated, `O_NOFOLLOW` handling is otherwise reserved for the runtime lock namespace and MCP `state_dir`, which live outside the experiment artifact tree.
-
-## Process management
-
-![trial state machine](images/diagramB_statemachine.png)
-
-Each trainer starts behind a ready/ack barrier. PhaseSweep starts a self-contained, stdlib-only supervisor with `python -I -S` and a `PATH`-only environment, so site hooks, trainer imports, and trainer environment settings cannot execute before process identity is durable. The supervisor clears its inherited shutdown-signal mask and forks a blocked trainer child; the child creates a new session and reports its identity. PhaseSweep atomically writes and fsyncs `process_identity.json` before sending the shell command, working directory, and full trainer environment. If the orchestrator exits before acknowledgment, EOF ends the child without starting training. The supervisor remains outside the trainer process group, retains the GPU leases, and waits until the group is gone.
-
-The latest supervised process identity is retained for recovery. The trial's `attempt_lifecycle.json` is written as `allocated` before attempt identity attributes are persisted or a process starts, then updated to `exited` with the return code and cleanup confirmation once group termination is confirmed. Recovery can therefore distinguish a cleanly finished trainer, a never-launched allocation, and an uncertain crash. An identity-persistence or payload-delivery failure terminates the blocked group before the trial fails.
-
-Timeouts and shutdown signals target the trainer's process group, so descendants such as launcher workers or dataloader processes are cleaned up with the root process.
-
-That guarantee is process-group-scoped, not descendant-scoped. A trainer - or anything it launches - that calls `setsid()` (the standard daemonization technique used by some launchers) leaves the supervised process group, and PhaseSweep's timeout, shutdown, and stale-reaping signals never reach it; cleanup can be reported confirmed while such a daemon still holds GPU memory or file handles. The trainer contract is therefore: do not daemonize out of the trial's process group, and treat anything that must outlive the trial as out of PhaseSweep's ownership. Containing deliberate escapees would require cgroup v2, a transient systemd scope, or subreaper-based descendant tracking, none of which PhaseSweep currently provides.
-
-`timeout_seconds_per_trial` is the normal per-trial subprocess cap. `timeout_seconds_per_phase` bounds each Optuna optimize invocation, including a later top-up, while top-level `timeout_seconds_per_run` bounds the current single-experiment invocation or one compiled study in a suite. A suite starts a fresh run budget for each study. PhaseSweep carries the absolute phase/run deadline through GPU lease acquisition, trainer launch preparation, and the entire supervised launch. Command rendering, artifact and environment writes, working-directory resolution, log opening, supervisor readiness, identity persistence, payload delivery, and the final process wait all consume the same budget. An expired deadline aborts the blocked supervisor before its trainer starts. The deadline stops new work and begins process-group termination; the SIGTERM/SIGKILL cleanup grace can finish after that deadline. If the detached lease guardian still cannot confirm group exit after its bounded cleanup allowance, the orchestrator reports cleanup uncertainty and aborts the phase while the guardian continues holding the GPU lease; it does not wait forever or reopen the device. A phase whose deadline (rather than its trainer) prevented any feasible trial reports `TimeoutError`, not a trainer failure. When a phase or run deadline stops the phase before the requested number of terminal trial attempts exists, PhaseSweep refuses to select a partial winner unless the phase sets `allow_incomplete_on_timeout: true`.
-
-If a wallclock timeout and `max_consecutive_failures` become true in the same phase, timeout handling takes precedence. A phase that has at least one completed feasible trial can therefore persist a timeout-marked partial winner when `allow_incomplete_on_timeout: true`, instead of having that winner masked by the consecutive-failure abort path. Without that opt-in, the same situation fails closed with `TimeoutError`, but the superseded failure abort is still consumed so retrying with a larger timeout remains possible.
-
-The consecutive-failure circuit breaker is reconstructed from an ordered outcome stored on every terminal trial. Its streak therefore continues across supported random/grid top-ups and process restarts, including failures produced when startup recovery safely reaps stale `RUNNING` trials. An abort cannot become a success just because the next invocation has no work left: the same `n_trials` target remains failed. Raising `n_trials` above the target accepted by the aborting invocation explicitly starts a new recovery streak for random/grid phases; TPE/CMA-ES continuation restrictions still apply. If writing the convenient study-level abort marker fails, the per-trial outcomes reconstruct the same decision on retry rather than silently publishing. The per-trial outcome itself is ordered ahead of any terminal Optuna transition, and Optuna refuses attribute writes on a finished trial, so a trial whose outcome cannot be written after a short bounded retry is deliberately left `RUNNING` rather than committed without one: the phase reports a retryable storage failure, and the next run's stale-attempt recovery records the outcome before marking that trial `FAIL`.
-
-Expected trainer and evidence failures count toward that circuit breaker. An unexpected exception in PhaseSweep's objective implementation is instead phase-fatal: the first exception stops peer launches and is re-raised with its original type, message, and traceback after parallel workers drain. An unexpected error while waiting for a supervised subprocess first terminates and reaps its process group. If that cleanup cannot be confirmed, PhaseSweep raises `UnsafeProcessCleanupError` with the original error as its cause and retains recovery authority. Its trial outcome and cause remain durable, so an identical retry cannot turn the mixed COMPLETE/FAIL study into a publication.
-
-Metric extraction and evidence gates run after the trainer process and outside the GPU lease, but inside the phase/run wallclock budget: the configured timeouts bound the whole trial, not just the trainer. Enforcement is cooperative at stage boundaries - before the metric extractor, before each constraint extractor, before each gate, and before the result is accepted - so a single blocking local stage can overrun by at most its own duration.
-
-W&B extractors and gates additionally cap their polling budget to the remaining phase/run budget. Each poll runs in a supervised worker; startup, SDK initialization, requests, and internal retries all consume that budget. Connection and timeout failures during the first SDK initialization are retried within the same budget, including transport failures wrapped as authentication errors. First-client setup failures and HTTP 401 or 403 run-lookup responses are reported immediately; a 404 remains retriable while a newly created run becomes visible. A run in `crashed`, `failed`, `killed`, or `preempted` state is also reported immediately, while `preempting` remains active. Expiry terminates the worker's process group, with the existing cleanup grace allowed afterward, and late summaries are rejected. Since the preceding trainer or polling worker has already been confirmed gone, each new worker replaces the trial's process identity and lifecycle records. Those records remain in the trial directory for normal attempt recovery. Unconfirmed worker cleanup aborts the run, retains the active-attempt registry entry, and blocks further work until recovery confirms cleanup.
-
-A trial whose trainer succeeded but whose evidence could not be evaluated within the budget is not selectable, and the phase reports a timeout rather than publishing a complete result. Its ordered policy outcome is `cancelled`, so a failure caused by the phase/run deadline cannot increment `max_consecutive_failures` or leave a durable failure abort behind. Timeout reporting is causal: PhaseSweep records whether a deadline blocked launch, capped and expired a subprocess or remote poll, failed a stage-boundary check, or stopped the scheduler short of its trial target. An unrelated trainer, extractor, or gate failure is not relabeled just because the clock happens to be past the deadline when it is observed. `allow_incomplete_on_timeout` applies only when a phase or run deadline leaves the phase short of its terminal-attempt budget; it does not turn an ordinary per-trial timeout into a selectable result.
-
-SIGTERM, SIGINT, and SIGHUP trigger shutdown cleanup. The handler sends SIGTERM to every active trial group at once, waits one shared grace window, sends SIGKILL to the survivors, confirms each group is gone, and exits with `128 + signum`. An interrupted active attempt is durably classified as orchestration cancellation, not a trainer failure, so cleanup recovery does not feed it into `max_consecutive_failures` or install an internal-error phase abort. The handler never waits on the direct child - a blocking `wait()` from a signal handler can deadlock against a concurrent wait in the main thread - so the bounded, unconditional direct-child reap that closes the poll-then-die zombie race runs on the normal (non-signal) cleanup paths instead. SIGKILL and hard OOM kills cannot be caught by Python.
-
-Cleanup is bounded but not immediate. Trial groups that ignore SIGTERM cost the full 10-second grace plus roughly 2 seconds to confirm the SIGKILL; on the signal path both windows are shared across all active groups, so shutdown latency stays near 12 seconds regardless of `n_jobs`. Normal per-trial cleanup adds up to 5 more seconds for the bounded direct-child reap: about 17 seconds worst case. A shutdown signal that arrives while a trial launch is still in flight is deferred until that launch finishes its own cleanup. If a supervisor never becomes ready, the launch can first consume its 10-second readiness timeout and then the 17-second cleanup bound, so an interactive Ctrl-C can take about 27 seconds worst case to return the prompt. It is not a hang; sending a second Ctrl-C only risks leaving the group behind.
-
-Shutdown-signal ownership follows an explicit contract, not handler-identity inference: a process-lifetime `install_signal_handlers()` call (the CLI and MCP entry points) owns SIGTERM/SIGINT/SIGHUP for the rest of the process, and every later `signal_handler_scope()` call - on any thread - is then a no-op. Absent that, the main thread may take temporary ownership for one call tree: the outermost `signal_handler_scope()` call installs the handlers and unblocks the signals, lexically nested calls on that same thread share the ownership and touch nothing, and the outermost call's exit restores the prior handlers and signal mask in a fixed order - block, then restore handlers, then restore the mask - so a shutdown signal pending at teardown cannot fire against a handler that is still mid-restoration. A `signal_handler_scope()` call from a thread that is neither the main thread nor covered by an existing owner raises `SignalOwnershipUnavailableError` instead of running unprotected. Calling `install_signal_handlers()` from inside an open scope is a handover, not a conflict: the scope sees the process-lifetime claim and leaves the handlers and mask installed on exit rather than restoring the host's, so the ownership the entry point just took is the ownership that survives.
-
-Launch uses signal deferral around the `Popen()` to registry window. A shutdown signal cannot land between process creation and registration and leave the child unsignalled; uncatchable parent death before identity commit cannot start the trainer because the supervisor still awaits the launch payload.
-
-If cleanup cannot prove the process group is gone, PhaseSweep fails closed with `UnsafeProcessCleanupError`. A `/proc` scan that is incomplete because of permissions or I/O failure is uncertainty, not evidence of death; only a complete scan showing zombie/exited members can override the kernel's still-existing process-group verdict. Under parallel Optuna execution, the orchestrator records a hard abort so no queued worker can reuse the released GPU lease before the error surfaces.
-
-## Stale trial reaping
-
-Before a new generation is published or any phase begins, PhaseSweep first scans the experiment-level `attempts/` registry independently of the current phase graph, then inspects every declared phase study that already exists. Each active-attempt entry binds the attempt ID to the phase, study, storage, trial number, and trial directory that produced it. Cleanup evidence from an entry can clear a terminal trial's uncertainty only when its attempt and generation identities match; a reused trial number alone is insufficient. A conflicting generation is refused, and a terminal trial that requires recovery but lacks either identity retains its entry and reports cleanup uncertainty. The entry is retired after the Optuna trial becomes terminal and its cleanup is resolved, so a renamed or removed phase, or a changed storage URL, cannot hide an older live process from preflight recovery.
-
-Creating a registry entry is a launch prerequisite, not a best-effort write. It happens before the GPU lease and before any subprocess, and a failure there fails the trial on the spot - no trainer was started and no lease was consumed - because the declared-phase scan the old best-effort behavior fell back on covers only attempts whose phase and storage the current config still names, which is exactly the case the registry exists for. The refusal is a durable fatal trial and phase abort at that invocation's accepted target, so restoring write access alone does not make an unchanged persistent config retryable: increase `n_trials` above that target when sampler continuation is supported, or use a new experiment name. Removing an entry once its trial is terminal stays best-effort: a retained entry names an already-exited attempt, so preflight resolves it against the durable lifecycle record, changes nothing, and garbage-collects the file.
-
-For every `RUNNING` trial reached through either path, PhaseSweep:
-
-1. Reads the persisted `phasesweep_trial_dir` user attribute, or falls back to the canonical trial directory when a crash left a pre-launch `RUNNING` trial before that attribute was written.
-2. Requires one complete atomic identity bound to the Optuna attempt. Missing, malformed, partial, or wrong-attempt identity leaves cleanup uncertain rather than proving absence.
-3. On Linux, matches boot ID plus PID and process start time to avoid PID- and reboot-reuse kills. A record from an earlier boot is safe to close without signalling because no process from that boot can remain. The boot ID identifies the host kernel, so restarting a container without rebooting its host is not treated as a reboot; PID and process start time still guard against reuse. When robust process-birth identity is unavailable, automatic stale signalling fails closed for operator recovery.
-4. Falls back to the verified PGID when the root PID is gone but descendants remain.
-5. Marks the trial `FAIL` only after cleanup is confirmed.
-
-Missing studies are not created by either recovery read. Both passes run before fingerprint checks, so a config mismatch or a later-phase orphan cannot leave old GPU-holding processes alive while earlier work starts.
-
-This recovery pass is deliberately not bounded by `timeout_seconds_per_run`: interrupting a stale-process kill to honor a clock would leave leaked GPU processes alive, so cleanup always finishes. It does run inside the invocation, before any phase starts, and each stale trial group that ignores SIGTERM costs the full escalation (about 12 seconds), serially. After an unclean shutdown of an `n_jobs > 1` phase, a tight run budget can therefore be consumed by recovery and expire before the first phase launches - the reaping is durable, so simply re-invoking (or raising the budget) proceeds normally.
-
-## Concurrency model
-
-PhaseSweep supports one orchestrator per experiment on one host. Inside one orchestrator, `n_jobs > 1` parallelizes trials in a phase.
-
-A run always takes same-host `flock`s. By default they live in the owner-only per-user directory `.cache/phasesweep/locks` under the effective user's OS account home:
-
-- Output lock: resolved `<workdir>/<experiment>/` path.
-- Storage lock: canonical Optuna storage identity plus experiment name when storage is persistent.
-
-![guard layer](images/diagramE_guardlayer.png)
-
-SQLite identities fold SQLAlchemy dialects, so `sqlite:///x.db` and `sqlite+pysqlite:///x.db` collide. File-backed storage lock identities ignore URL query options, so `sqlite:///x.db?timeout=30` and `sqlite:///x.db` share a lock. RDB target identities normalize authority credentials, query user/API-key fields and credential-name families ending in `password`, `secret`, or `token`, the driver suffix, host case, implicit default ports, query order, and connection-only options. Nested `odbc_connect` identities additionally normalize target-key case, punctuation, and field order while excluding credentials, driver revisions, encryption settings, and timeouts; duplicate target keys are rejected because ODBC gives their order meaning. Target selectors remain identity-bearing: host/server, port, database, DSN, instance, socket, schema/search-path options, and arbitrary retained query or ODBC fields. Credential rotation and equivalent ODBC spellings therefore cannot split the storage lock or artifact-root ownership, while a real target change still does. What is *not* resolved: DNS aliases, load-balancer or pooler endpoints, service files, and `localhost` vs. `127.0.0.1` - a shared RDB reaches the same database under those spellings but gets a different lock, so keep the URL spelling consistent across configs that share one database. Locks are taken in deterministic path order and a second process fails fast instead of corrupting output or storage.
-
-The private default coordinates every PhaseSweep process running as the same user. Cross-user coordination is opt-in: an administrator must provision an existing root-owned directory with the scheduler group, setgid and sticky bits, and mode `03770`, then set `PHASESWEEP_LOCK_DIR` for every cooperating process. PhaseSweep validates that directory and creates group-readable/writable `0660` lock files; it never creates or changes a shared namespace itself. An explicit owner-only `0700` directory is also accepted for custom per-user placement. Lock directory components and final lock files are opened without following symlinks, and existing files with unexpected ownership, links, or permissions are rejected before diagnostics are written.
-
-Upgrade note: older PhaseSweep builds used `/var/tmp/phasesweep-locks`, `PHASESWEEP_HOME/locks`, or `${XDG_CACHE_HOME:-~/.cache}/phasesweep/locks`. Stop active runs before upgrading if their lock location differs from the account-home default. A staged upgrade can use the same validated explicit `PHASESWEEP_LOCK_DIR` only when every cooperating version supports that override; builds predating it must be stopped first.
-
-Only `PHASESWEEP_LOCK_DIR` overrides the lock directory; an empty value uses the default. `HOME`, XDG settings, and `PHASESWEEP_HOME` do not change default experiment, storage, or GPU locks. The account home comes from the OS user database, so shells and MCP services running as the same user share a namespace even with different environments. Accounts without a writable home must use a provisioned `PHASESWEEP_LOCK_DIR`.
-
-Every cooperating orchestrator must use the same `PHASESWEEP_LOCK_DIR` override, if set; stop active runs before changing it. Small teams on one node keep separate private MCP state and use the administrator-provisioned shared directory above for cross-user coordination. MCP state placement and ownership requirements are described under [the catalog](mcp.md#the-catalog).
-
-CUDA device tokens also take per-device host locks. The policies are:
-
-- `single_per_trial` (default): lease explicit `gpu_ids`, explicit `gpu_devices`, top-level `env.CUDA_VISIBLE_DEVICES`, ambient `CUDA_VISIBLE_DEVICES` tokens, or auto-detected `nvidia-smi` numeric devices, even for `n_jobs == 1`. Configured `env` takes precedence over ambient visibility, matching the trainer environment. This prevents independent local PhaseSweep runs from double-booking the same GPU.
-- `whole_node`: require `n_jobs: 1` plus an explicit `gpu_ids` or `gpu_devices` list, lease every configured token, and expose the comma-joined set to the trainer for local DDP/FSDP/DeepSpeed-style launches. The set must be explicit because its size is the trainer's world size - a semantic input, not a throughput knob.
-- `none`: never change `CUDA_VISIBLE_DEVICES` or acquire GPU locks. Parallel use requires `allow_no_gpu_isolation: true` because isolation is delegated to the operator or an external scheduler.
-
-The [supervisor guardian](#process-management) retains the open file descriptor backing each assigned GPU lock outside the trainer process group. The orchestrator closes only its own copy, so a SIGKILL, OOM, or crash of the orchestrator cannot release the lock while its independently supervised trainer is still alive; arbitrary trainer code can close every unknown descriptor without touching the guardian's copy. The kernel releases the lock when the guardian exits after the trainer group is gone. This is descriptor inheritance, not a heartbeat, so it adds no stale timeout or polling state.
-
-GPU locks key on canonical physical-device identity. At pool construction PhaseSweep reads `nvidia-smi --query-gpu=index,uuid` plus `nvidia-smi -L` when MIG tokens are present, then resolves numeric indices and every case-insensitive `GPU-`/`MIG-` prefix to the inventory's canonical UUID before deriving lock names. A run configured with `gpu_ids: [0]` and one configured with `gpu_devices: ["gpu-<uuid of 0>"]` (or inheriting that UUID through ambient `CUDA_VISIBLE_DEVICES`) then contend for the same lock file instead of both leasing the card. Numeric indices remain numeric in the trainer environment; GPU/MIG aliases are rebound to the inventory's canonical spelling because CUDA consumers such as PyTorch reject lowercase prefixes. UUID and MIG identities use sanitized, hashed lock names. Under `single_per_trial`, two pool tokens that resolve to one physical device are leased once. Under `whole_node`, exact repeated tokens are rejected during config loading and aliases that resolve to one physical device fail when the pool is created, because silently deduplicating them would reduce the semantic world size.
-
-Resolution has three relevant edge cases:
-
-- If `nvidia-smi` provides no usable UUID inventory (missing binary, timeout, nonzero exit, or placeholder UUID fields), every configured or ambient numeric/UUID token fails closed. An index-form fallback would not exclude a concurrent run's UUID-form lock for the same card, and a nonexistent index would expose no CUDA device while holding an unrelated lock. Auto-detection likewise fails when `/proc/driver/nvidia/gpus` reports hardware, even for `n_jobs: 1`; otherwise the trainer could run on real GPUs without a verified physical-device lock. `allow_no_gpu_isolation: true` is the explicit escape hatch for accepting CPU-pinned execution after an ambient-token failure or unrestricted execution after auto-detection fails. A CPU-only single-job host proceeds without a GPU lease.
-- Every `GPU-`/`MIG-` token, whether abbreviated, full length, uppercase, or lowercase, must match exactly one inventory identity. An ambiguous or nonexistent token fails instead of exposing an empty CUDA visibility set while leaving the real GPUs unlocked.
-- A `MIG-...` token locks the MIG instance itself. PhaseSweep does not bind it to the parent GPU, so a run holding a MIG instance and one holding the whole parent device do not exclude each other. `whole_node` accepts exactly one MIG token but rejects any larger world containing MIG: CUDA enumeration varies by driver and permits at most one compute instance per GPU instance, while the UUID inventory used here does not expose the parent GPU-instance relationship needed to prove that token count equals world size.
-
-An explicitly configured malformed visibility value fails. An unsupported ambient `CUDA_VISIBLE_DEVICES` value such as a scheduler's `NoDevFiles` sentinel is instead treated as an empty visibility set with a warning and pinned as `CUDA_VISIBLE_DEVICES=''` in trial environments; it does not silently fall through to auto-detection. Explicit `""` and `-1` are intentional CPU-only requests and behave the same way without requiring `allow_no_gpu_isolation`, including when `n_jobs > 1`.
-
-Upgrade note: builds before UUID canonicalization locked numeric devices under `gpu_<index>.lock`; this build locks the same card under its UUID-derived name, so the two lock namespaces do not exclude each other. Running an old and a new PhaseSweep concurrently on one host can therefore double-book a GPU - the exact failure canonicalization prevents within one version. Upgrade every PhaseSweep installation on a host together; leftover `gpu_<index>.lock` files from old builds are inert and safe to delete.
-
-When an assigned `CUDA_VISIBLE_DEVICES` set contains a numeric token, the child environment forces `CUDA_DEVICE_ORDER=PCI_BUS_ID`. That keeps the numeric token pointing at the card whose UUID the host lock covers (`nvidia-smi` enumerates by PCI bus), even if ambient or configured environment values requested `FASTEST_FIRST`. An assignment containing only GPU/MIG UUIDs does not depend on index ordering and preserves an explicit `CUDA_DEVICE_ORDER`.
-
-> [!WARNING]
-> Multi-host writers against one shared study are unsupported. The stale-trial reaper owns all visible `RUNNING` trials, so two hosts could fail each other's live work. Safe multi-host orchestration would need per-trial leases, heartbeats, and host-aware stale-trial reaping.
->
-> An `Experiment.storage` URL that resolves to any backend other than SQLite or Journal (an RDB URL such as `postgresql://...` or `mysql://...`) is rejected unless `allow_external_rdb_single_host: true` is also set. Set that acknowledgement only when every process that will ever touch the configured `storage` and `workdir` runs on a single host - e.g. using an RDB backend for durable storage or dashboard access from one PhaseSweep orchestrator, not for actual multi-host coordination.
-
-## Fingerprints and resume
-
-Each phase study stores a semantic fingerprint. Throughput, timeout, failure-policy, and other run-control fields are excluded; top-level identity, storage, workdir, and run timeout are also excluded. Under `gpu_policy: whole_node`, the configured device-set size is the exception because it is the trainer's world size, while the device tokens remain run-control. The [config reference](config_reference.yaml) identifies every fingerprinted and run-control field.
-
-`workdir` is excluded so a result tree stays movable, but that mobility is explicit rather than implicit: each persistent phase study records the one resolved `<workdir>/<experiment>` artifact root it publishes into, under the study user attribute `phasesweep_artifact_root_v1`. The check runs at preflight under the experiment lock, before stale reaping and before any trial work, and covers every declared phase before any of them claims anything - so a refused multi-phase run leaves no study bound to the root it rejected. An absent binding is claimed on first contact only when the study holds no trials, mirroring the zero-trial fingerprint rebind; an equal binding proceeds; and a different binding is refused before any reaping, trial, or publication, so the bound tree is left exactly as it was. A study that holds trials but records no binding predates the attribute, and an ordinary run is refused rather than adopting it: which workdir owns those trials' evidence cannot be inferred, and guessing would let two trees each report an intact publication of the same study. Migrate it with `phasesweep rebind-workdir CONFIG` against a config whose `workdir` names its *original*, complete tree. Without any of this, running one config against a second `workdir` would match every fingerprint, top up or re-select against trial directories living under the first root, and publish a second, divergent result tree. In-memory studies never create a binding and may reuse their own artifact trees, but an in-memory config cannot run against or inspect a tree that already records a persistent storage binding. Restore the owning storage setting or use a new experiment name or workdir.
-
-To relocate a tree, move it first and then run `phasesweep rebind-workdir CONFIG` against the config that already names the new location. It takes the same locks a run does and validates the destination before writing anything: the namespace must exist; every trial in the study ledger that persisted a trial directory must still have that directory under the destination, which is what rejects a stale copy taken before the ledger advanced; no trial may be `RUNNING` and no attempt registry entry may be unresolved, because stale-attempt recovery follows the absolute paths those attempts persisted and cannot follow them after a move; and, when the studies record completed trials, the destination's last-success pointer and generation manifest must validate there. The one `RUNNING` exception is adopting a pre-binding study in place: when the interrupted trial's persisted paths (and any registry entry's) already resolve exactly under the offered workdir - proof the destination is the original root rather than a copy - the binding is written with the trial and its registry entry left as-is, and the next ordinary run recovers it through the standard stale-attempt protocol, which is the one implementation that records the durable failure outcome the study schema requires. It rejects unsafe phase suffixes found under the experiment study-name prefix before any path inspection or binding write. Only then does it update the root-to-storage record and every retained phase-study binding in the persistent ledger, including phases the current config no longer declares, before printing each old root and new root. A valid published suite, including one with in-memory components, can be adopted at its original tree, but cannot be moved; an unreadable or invalid suite publication entry blocks rebind before any component binding changes because its summary pins each study to the absolute path of the component summary it derives from. A suite whose every study completed a trial while the destination holds no suite pointer is also refused, since a lost pointer and a suite that never published are indistinguishable; component-level rebinds still work for a suite that never published one. It refuses, changing nothing, when every existing study is unbound and empty (an ordinary run binds those), when storage is in-memory, or when any destination check fails. Copying a tree with its database creates an independent ledger; rebinding the copy does not revoke the original tree's bindings. Everything else in the durable state graph - trial directories, the attempt registry, suite summaries - still stores absolute paths, which is why the command refuses these cases instead of repairing them; see the tracked relocation TODO in [development](development.md).
-
-The same semantic exclusions govern a single experiment's published-config fingerprint. A suite fingerprint is stricter: it includes each fully compiled study plus study names, dependencies, and promotion rules. Changing a phase comment, trial target, or throughput setting therefore marks an existing suite result historical even when the component phase study remains reusable.
-
-The payload starts with an explicit fingerprint-schema version and covers the complete semantic trainer, evidence, search, and inheritance contract described in the [config reference](config_reference.yaml). Evaluator interpretation revisions participate only when a phase uses a log-regex objective or constraint, or a directory-size gate directly or through a contract; unchanged JSON-envelope and file-size-only histories keep their identities. A pre-fix study with evaluator-derived outcomes, including evaluator-caused FAIL rows, or a carried winner cannot be resumed under the repaired interpretation: use a fresh experiment identity and ledger, leaving the historical artifacts intact. Failed trials whose recorded causes preceded the affected evaluators may recover under the exact legacy configuration. Reached studies record the active evaluator revisions separately so preflight can refuse a later incompatible phase before an unrelated earlier phase adds trials. The carried-winner check still works without the earlier study ledger. Each generation records the installed PhaseSweep version for diagnostics, but the package version is not semantic experiment identity. Earlier published generations remain readable and report config drift when the current config differs.
-
-With persistent storage, re-running the same YAML reuses a study and tops it up when the fingerprint matches. `--from-phase <name>` skips earlier phases by loading their `winner.yaml` files after stale reaping and fingerprint verification, even when storage is in-memory. Library calls reject undeclared `from_phase` names before writing any state, including during dry-run. Promotion is applied before `winner.yaml` is written, so `continue_baseline` resumes from the exposed baseline winner. A persisted incomplete timeout winner only loads when the current skipped phase still sets `allow_incomplete_on_timeout: true`.
-
-A valid published result identifies the completed local trial that its phase selected, including its trial number, generation, and attempt, plus the terminal and complete trial counts at selection. Before executing a published phase, PhaseSweep requires that exact trial and at least those counts in persistent storage. A missing ledger, deleted or empty study, or readable stale backup that lost, replaced, or retained the published trial while omitting later terminal rows is refused before claiming a generation or launching a trainer; otherwise a rerun could replace a better published result with a worse one. For `continue_baseline` and `skip` promotions, history checks follow the local candidate identity and its recorded terminal and complete counts; the exposed baseline or absent winner is not substituted. Restore the original complete ledger and study, or use a new experiment identity for a fresh run. A phase newly appended after the published generation is unaffected because that publication contains no winner for it yet. `--from-phase` still permits lost history for earlier phases that load validated saved winners instead of executing. A confirmed missing, replaced, or incomplete published history raises `PublishedStudyMissingError` without implying process cleanup uncertainty; a genuine storage inspection failure still leaves cleanup unknown. `rebind-workdir` applies the same history check to every published phase.
-
-Fingerprint equality is necessary but not sufficient for a persistent top-up: the semantic environment cohort described above must also match before trial allocation. Existing non-W&B studies that carry environment digests may resume under the same environment when `passthrough_env` remains empty. Trials created before environment identity was recorded require a new experiment name or archive/delete migration; PhaseSweep does not assign them to the current shell. Narrowing or reclassifying `inherit_env` also requires a new experiment identity. A populated W&B study created before `base_url` was explicit requires a new identity because its old ambient endpoint cannot be inferred.
-
-Every top-up attaches the sampler declared by the phase rather than the Optuna default. Seeded random sampling derives each draw from the durable study name, trial number, and parameter name, so one uninterrupted invocation and arbitrarily batched top-ups produce the same parameter sequence. Grid sampling resumes from stored grid assignments; its deterministic traversal order is not the order of `choices` in the YAML, so trial numbers do not express preference. TPE and CMA-ES phases are restartable only before their first terminal trial or after reaching their accepted target. Optuna storage does not preserve process-local sampler state, so a fresh process would restart the seeded suggestion stream and could re-evaluate identical suggestions; PhaseSweep therefore rejects resuming an interrupted stateful phase mid-target and raising `n_trials` for these samplers across invocations. An accepted partial-timeout decision is terminal at its original target: an identical rerun replays selection without launching suggestions, even for a stateful sampler or after a descendant has bound the published winner. Use a new experiment name, optionally with a stateless random or grid sampler, or run the full target in one uninterrupted invocation. The [persistent-storage sampler contract](config.md#sampler-capability-on-persistent-storage) defines the required seed and acknowledgement and shows the capability output printed before trial launch.
-
-A random or grid phase can be topped up in place while nothing downstream is bound to its winner. Each persistent study records its highest accepted terminal-trial target; lowering `n_trials` is rejected so a current config cannot relabel an over-target historical winner. Once a dependent phase study has been run, PhaseSweep rejects further top-ups of that reached ancestor before launching any trial. A phase depends on an earlier one through either semantic edge - `inherits`, or `promotion.min_delta_vs`, which is only required to name a *prior* phase - and reachability follows both transitively, so `arch --promotion--> mid --inherits--> final` protects `arch` even when `mid` inherits nothing. For an inherited dependency, a new upstream winner would change the dependent's semantic fingerprint while its stored study name still identifies the old inherited context. For a promotion baseline it would re-decide the promotion against a different baseline: `continue_baseline` republishes the baseline's own effective overrides in the promoted phase's slot (invalidating any study that inherited it), `stop` fails the run after the upstream study was already mutated, and `skip` publishes a generation that silently omits the promoted phase and everything after it while advancing the last-success pointer. Use a new experiment name for a larger upstream budget. `--from-phase` does not apply this restriction to skipped ancestors because they are not mutated.
-
-Persistent studies also carry a PhaseSweep storage-schema version. An empty study can be initialized in place, but a populated study without the current schema is rejected before its rows count toward a trial budget. The error names the study and affected trial numbers; use a new experiment name or archive/delete the incompatible study rather than silently mixing unscoped historical trials. Upgrade note: storage schema 2 adds the ordered trial outcomes required to reconstruct failure policy safely. Populated schema-1 studies (and older unversioned studies) cannot be resumed or reused because their historical completion order is unknowable; archive them, use a new experiment name, and rerun the affected phases. The same new-name/archive rule still applies to `winner.yaml` files created before generation/attempt provenance.
-
-## Validation and dry-run
-
-`phasesweep validate` loads the config and checks schema, graph, sampler/search-space compatibility, override-key composition, and command-template placeholders. It does not check trainer or path existence, parser compatibility, storage connectivity, environment behavior, evidence production, GPU availability, or runtime promotion outcomes.
-
-Every command reports failures through one process-level boundary with a fixed exit taxonomy. `2` is bad input: a usage error, a config that cannot be loaded - a non-UTF-8 file, a YAML syntax error, a duplicate mapping key, or a schema violation - or `init` refusing to overwrite an existing destination. Config errors always name the file that failed, including the YAML scanner and parser errors PyYAML would otherwise label `in "<unicode string>"`. `1` is an expected operational failure - the run itself failed, an environmental I/O operation failed, or `init` could not write a new destination. `70` is a PhaseSweep bug. `130` is an interrupt taken before the shutdown handlers ran; a shutdown signal handled during a run exits with `128 + signum` instead, as described under [Process management](#process-management). Only `70` always prints a traceback with a report request. Expected run failures normally print a `phasesweep: ...` diagnostic, `init` uses `phasesweep init: ...`, Click formats its own usage errors, and `run -v` adds a traceback behind an exit-`1` diagnostic without changing the exit code.
-
-`phasesweep run --dry-run` additionally composes and serializes one complete sampled trainer configuration per phase using fresh in-memory Optuna studies, then displays the command that would receive its `trainer_config.yaml` path. The displayed sample becomes the hypothetical winner inherited by downstream preview commands, so one preview forms a coherent chain. Dry-run does not read persistent trial progress, create the referenced trial directories or generated trainer-input files, display the final environment, launch subprocesses, extract evidence, evaluate gates or promotion, exercise suite dependencies, write files, touch configured storage, or take runtime locks.
+The root `summary.yaml` and per-phase `winner.yaml` files are convenience
+projections. `last_successful_generation.yaml` points to the immutable
+generation that authoritatively represents the latest successful result. A
+failed invocation does not replace that pointer.
+
+`config.snapshot.yaml` is the executed configuration, including materialized
+defaults and the resolved invocation context. It is private because it can
+contain command and environment values. `reproducibility.json` is the
+shareable generation identity record. Trial directories retain local evidence
+and attempt lifecycle information used for supported continuation and winner
+validation.
+
+PhaseSweep writes a `.gitignore` containing `*` in a new experiment namespace;
+it does not replace an existing ignore file. Keep generated outputs, ledgers,
+and MCP state out of commits.
+
+## Storage and locks
+
+`storage: null` is in-memory and ends with the process. Persistent local
+storage is one of:
+
+- `sqlite:///...` for sequential phases;
+- `journal:///...` for same-host parallel phases; or
+- `auto`, which chooses a sibling `study.db` or `study.journal` according to
+  whether any phase has `n_jobs > 1`.
+
+The selected artifact root and ledger are bound to each other. A reused root
+cannot combine a second ledger's trial counts with the first ledger's
+publication. If changing `n_jobs` would make `auto` choose the other backend,
+the run is refused; restore the prior setting or start a fresh namespace.
+
+Persistent phases use same-host locks. A concurrent CLI or MCP launch for the
+same experiment waits or fails safely according to the operation; it never
+merges two active orchestrators. SQLite is sequential at the PhaseSweep
+configuration level. Journal storage supports local parallel trials. External
+database backends are not part of the runtime.
+
+## Trial execution and evidence
+
+Each trial has an attempt-scoped directory and process group. The runtime
+captures `stdout.log` and `stderr.log`, prepares the configured input, and
+supervises cleanup. YAML input identifies the complete generated configuration;
+JSON identifies the nested overrides file. Argparse and Hydra retain the
+resolved-overrides identity together with the command. Historical inputs are
+verified using their saved format.
+
+W&B polling starts only after successful trainer cleanup and GPU-lease release.
+It uses the same durable attempt slot and process supervisor, so recovery can
+find the reader after abrupt parent exit, even if its phase was removed.
+Uncertain cleanup blocks further work. One absolute polling deadline covers
+worker startup, SDK construction, requests, retries, and summary visibility;
+phase/run deadlines can shorten it, while cleanup grace stays separate.
+Trainer return code and duration remain trainer measurements.
+
+Finished W&B captures freeze only the requested numeric values and gate-presence
+evidence, with target, attempt, retrieval time, selected key, and consumer
+bindings. Published results and no-op replay need no SDK, credentials, or
+network reads. New remote work checks SDK availability after recognized-state
+recovery and before accepting a larger target. Missing/invalid evidence fails a
+trial; a measured constraint violation remains complete but infeasible.
+See the [configuration guide](config.md) for scoring and environment details.
+
+## GPU isolation
+
+By default, `gpu_policy: single_per_trial` leases one visible CUDA device per
+parallel trial. Explicit `gpu_ids` or `gpu_devices` define the available
+tokens; otherwise the runtime uses numeric, GPU UUID, or MIG tokens from
+`CUDA_VISIBLE_DEVICES`, or falls back to host discovery. The lease controls
+visibility and same-host locking, not GPU memory allocation.
+
+`gpu_policy: whole_node` requires `n_jobs: 1` and a unique explicit device
+list. `gpu_policy: none` disables PhaseSweep's GPU isolation and cannot be
+combined with an explicit device list; parallel use requires the explicit
+`allow_no_gpu_isolation: true` acknowledgement. For CPU-only parallel work,
+make that acknowledgement deliberately rather than relying on failed device
+detection.
+
+## Timeouts, cleanup, and continuation
+
+Trial, phase, and experiment timeouts are cooperative run controls. On a
+trial timeout PhaseSweep terminates the supervised process group and records a
+terminal failed attempt after cleanup. The `max_consecutive_failures` threshold
+also stops a broken phase. `n_trials` counts terminal attempts, so failed and
+pruned attempts consume the configured target.
+
+Before a supported continuation, PhaseSweep reconciles stale active attempts,
+checks the current artifact/ledger binding, verifies recorded trial evidence,
+and applies sampler continuation rules. `--from-phase` is valid only when the
+earlier phase winners remain valid; reused winners keep their original source
+provenance. TPE and CMA-ES persistent targets cannot resume mid-target, while
+grid and seeded random phases can top up their local study.
+
+An interrupted or failed generation leaves its immutable record for inspection
+but does not advance `last_successful_generation.yaml`. Signals are absorbed
+across the final publication commit so the authority pointer is never left
+ambiguous.
 
 ## Inspection commands
 
-For a single experiment, `phasesweep status CONFIG` reports read-only current-generation, published-generation, and represented-generation identity plus publication state, study trial counts, and phase state. For a suite, it reports the suite workdir, the suite's own published generation identity and publication state, and each compiled study's full experiment status, including component generation identities. Cross-process counts require persistent storage; a completed in-memory run has no study state for a later process to inspect. Each phase's `published_study_unavailable` flag reports when its published local trial identity or recorded completion boundary cannot be matched in persistent storage, including a readable stale or replaced ledger with nonzero counts. Read it alongside `trial_data_available`, which is included in both CLI and MCP status: `true` means the counts are known, including confirmed missing, incomplete, or empty studies; `false` means inspection failed or no persistent observation is available. When both flags are `true`, restore the missing history or skip the earlier phase under the [resume rules](#fingerprints-and-resume). Publication integrity describes the saved artifacts separately and can still be `ok` in either case. MCP-specific run state and operator recovery are described under [run state and recovery](mcp.md#run-state-and-recovery).
+Use `validate`, `run --dry-run`, `status`, and `show-winners` to review an
+experiment without launching work; an ordinary `run` invocation launches
+trials. `--from-phase` requires valid earlier winners. These reads inspect only
+the current-format local experiment; use the original 0.3.1 environment for
+existing 0.3.1 state.
 
-`publication_integrity` says *why* `published_generation_id` is what it is, with five values: `ok`, `absent`, `failed`, `permission_denied`, or `unknown`. `absent` means nothing has ever published here - the normal, healthy state of a fresh tree. `failed` means a last-success pointer entry exists but its contents or target do not validate, including a dangling symlink. `permission_denied` means validation could not read required evidence as the current user; it is not evidence of corruption, which matters because each generation's `config.snapshot.yaml` is deliberately owner-only. `unknown` is limited to an MCP terminal placeholder that could not inspect the tree after a snapshot failure; it exposes no winners and must not be mistaken for a fresh unpublished experiment. The unusable states report null published identity and no winner paths. A `failed` diagnostic tells the operator to inspect or restore the pointer and immutable generation evidence; experiment and suite reruns refuse to advance it until it validates. A `permission_denied` diagnostic instead says to read as the publishing user or restore read permission, and explicitly does not recommend `rebind-workdir`. An `unknown` MCP result reports the accompanying snapshot-unavailable failure. A suite carries the same verified verdicts for its own last-success pointer, and a component's unusable publication still fails the suite read on its own.
-
-`phasesweep show-winners CONFIG` reads the authoritative last successful publication from the configured workdir. It remains useful after an in-memory run because publication artifacts are persisted even though the Optuna study is not. It applies the same fail-closed check to the suite last-success pointer, so a suite whose published summary or a recorded component artifact was edited reports corruption instead of "no successful suite result yet", while a permission denial remains distinguishable from corruption.
-
-Both inspection commands are read-only. SQL status reads use SELECT queries without constructing Optuna storage or initializing its schema. Journal status captures a bounded byte snapshot and delegates its complete replay to Optuna. A confirmed missing SQLite or journal file, or an absent named study in a readable snapshot, reports known zero counts; a failed read, including an unreadable SQL schema or an incomplete journal record, reports unavailable trial data. A journal append still in progress can therefore be unavailable on one poll and readable on the next. Preflight and stale-attempt recovery use the same journal check before writing; an unreadable ledger retains its recovery entries instead of being treated as an absent study. In contrast, `phasesweep rebind-workdir CONFIG` moves each phase study's artifact-root binding to the workdir the config now declares after you have relocated the tree yourself (see [fingerprints and resume](#fingerprints-and-resume)).
+For operator-managed detached runs, see [the MCP operator guide](mcp.md).
+Terminal MCP run results are frozen snapshots associated with a run ID; they
+are not a replacement for CLI inspection of an arbitrary experiment tree.

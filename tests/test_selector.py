@@ -29,6 +29,23 @@ from phasesweep.engine.state import (
 from tests.conftest import make_experiment
 
 
+def _objective_provenance_json() -> str:
+    """Return a structurally valid current-format local objective record."""
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "extractor": {"kind": "log_regex", "config_sha256": "0" * 64},
+            "recorded_at": "2026-01-01T00:00:00+00:00",
+            "source": {
+                "kind": "file",
+                "path": "stdout.log",
+                "size_bytes": 0,
+                "sha256": "0" * 64,
+            },
+        }
+    )
+
+
 def _make_exp(constraints=None, *, goal: str = "minimize"):
     exp = make_experiment(
         storage=":memory:",
@@ -62,6 +79,7 @@ def _add_trial(
         FEASIBLE_ATTR: feasible,
         GENERATION_ID_ATTR: "generation-test",
         ATTEMPT_ID_ATTR: f"attempt-{len(study.trials)}",
+        OBJECTIVE_PROVENANCE_ATTR: _objective_provenance_json(),
     }
     if env_digest is not None:
         user_attrs[TRAINER_ENV_DIGEST_ATTR] = env_digest
@@ -228,8 +246,7 @@ def test_selection_is_quiet_when_candidates_share_one_environment(caplog):
     study = _make_study()
     _add_trial(study, 1.0, params={"x": 0}, env_digest="a" * 64)
     _add_trial(study, 0.5, params={"x": 1}, env_digest="a" * 64)
-    # A trial recorded before the digest existed carries no digest and must not
-    # be counted as a second environment.
+    # A candidate without an optional digest must not count as a second environment.
     _add_trial(study, 0.9, params={"x": 2})
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
@@ -239,7 +256,7 @@ def test_selection_is_quiet_when_candidates_share_one_environment(caplog):
 
 
 def test_rejects_nan_constraint_values_defensively(tmp_path):
-    """If a NaN somehow made it into user_attrs (legacy study), selector must reject."""
+    """If a NaN somehow reaches user_attrs, the selector must reject it."""
     db = tmp_path / "s.db"
     storage = f"sqlite:///{db}"
     study = optuna.create_study(study_name="t", storage=storage, direction="minimize")
@@ -249,14 +266,16 @@ def test_rejects_nan_constraint_values_defensively(tmp_path):
     t0.set_user_attr(FEASIBLE_ATTR, True)
     t0.set_user_attr(GENERATION_ID_ATTR, "generation-test")
     t0.set_user_attr(ATTEMPT_ID_ATTR, "attempt-0")
+    t0.set_user_attr(OBJECTIVE_PROVENANCE_ATTR, _objective_provenance_json())
     t0.set_user_attr(constraint_attr("size"), 100.0)
     study.tell(t0, 0.5)
 
-    # Trial 1: legacy NaN constraint value but mistakenly marked feasible.
+    # Trial 1: NaN constraint value but mistakenly marked feasible.
     t1 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})
     t1.set_user_attr(FEASIBLE_ATTR, True)
     t1.set_user_attr(GENERATION_ID_ATTR, "generation-test")
     t1.set_user_attr(ATTEMPT_ID_ATTR, "attempt-1")
+    t1.set_user_attr(OBJECTIVE_PROVENANCE_ATTR, _objective_provenance_json())
     t1.set_user_attr(constraint_attr("size"), float("nan"))
     study.tell(t1, 0.1)  # Better metric, but invalid.
 

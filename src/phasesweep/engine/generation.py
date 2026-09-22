@@ -36,7 +36,7 @@ def _claim_generation(experiment: Experiment, requested_id: str | None) -> str:
     freezes ``config.snapshot.yaml`` and ``reproducibility.json`` before this
     returns (review v0.5.18 / finding F6), so a generation that later fails
     preflight, execution, or publication still says what search spaces, fixed
-    overrides, contracts, env, and trial command produced it. A failure
+    overrides, execution context, env, and trial command produced it. A failure
     writing them fails the claim rather than starting a run whose
     configuration would be unrecoverable. The record also freezes whether the
     id was caller-supplied, so a generation launched under an external
@@ -169,9 +169,7 @@ def _write_generation_record_once(
 ) -> None:
     """Create one generation's immutable terminal record exactly once.
 
-    Shared write-once core for :func:`_write_generation_state` and
-    :func:`phasesweep.engine.suite._write_suite_generation_state` (review
-    v0.5.15 / blocker 3, item B): the per-generation record is written only for a terminal state
+    The per-generation record is written only for a terminal state
     (``published`` / ``publication_failed`` / ``failed``), and only ever
     once. A second attempt for any generation -- even a same-state rewrite --
     is refused and logged; the first content is never touched. Progress
@@ -179,12 +177,12 @@ def _write_generation_record_once(
     see the ``state in _TERMINAL_GENERATION_STATES`` guard in the callers.
 
     :param Path record_path: Immutable per-generation lifecycle record path.
-    :param str generation_id: Immutable generation (or suite generation)
-        namespace being recorded; used only for the refusal log message.
+    :param str generation_id: Immutable generation namespace being recorded;
+        used only for the refusal log message.
     :param str state: Terminal lifecycle state label being written.
     :param dict[str, Any] payload: Full record payload to persist.
     :param str label: Human label identifying the record kind in the refusal
-        log message (e.g. ``"generation"``, ``"suite generation"``).
+        log message.
     """
     if artifact_io._write_yaml_exclusive(record_path, payload):
         return
@@ -255,10 +253,10 @@ def _write_generation_state(
 
 
 def _copy_yaml_projection(source: Path, destination: Path) -> None:
-    """Atomically project one immutable YAML artifact to its compatibility path.
+    """Atomically project one immutable YAML artifact to its convenience path.
 
     :param Path source: Immutable generation-scoped YAML file to read.
-    :param Path destination: Legacy compatibility path to atomically overwrite.
+    :param Path destination: Convenience projection path to atomically overwrite.
     """
     payload = yaml.safe_load(source.read_text())
     artifact_io._write_yaml_atomic(destination, payload)
@@ -275,9 +273,8 @@ def _validate_publishable_summary(
 ) -> tuple[dict[str, Any], bytes]:
     """Parse back one generation's own immutable summary before its publication commit.
 
-    Shared pre-commit validation core (item A, review v0.5.15) for
-    :func:`_validate_generation_publishable` and
-    :func:`phasesweep.engine.suite._validate_suite_generation_publishable`. This runs *before* the
+    Pre-commit validation core for :func:`_validate_generation_publishable`.
+    This runs *before* the
     last-success pointer commits and before the per-generation lifecycle
     record is ever written for this generation, so it cannot check that
     record (it does not exist yet); it instead confirms the immutable summary
@@ -285,12 +282,11 @@ def _validate_publishable_summary(
     it so the caller can validate the complete manifest without re-reading.
 
     :param Path summary_path: Immutable summary YAML path to read back.
-    :param str owner_key: Summary key naming the owning experiment or suite.
+    :param str owner_key: Summary key naming the owning experiment.
     :param str owner_value: Expected owner name the summary must carry.
-    :param str id_key: Summary key holding the generation (or suite generation) id.
+    :param str id_key: Summary key holding the generation id.
     :param str id_value: Expected id the summary must name.
-    :param str label: Human label for error text (e.g. ``"Generation"``,
-        ``"Suite generation"``).
+    :param str label: Human label for error text.
     :raises PublicationCommitError: The summary cannot be read back as a correctly
         named mapping; the last-success pointer must not advance to it.
     :return tuple[dict[str, Any], bytes]: Parsed summary and the exact bytes validated.
@@ -323,7 +319,7 @@ def _validate_generation_publishable(
     Checks the generation's immutable summary names this exact experiment and
     generation id, then validates the versioned artifact manifest end to end
     (:func:`phasesweep.engine.publication_validation._validate_generation_manifest`, review
-    v0.5.16 / blocker 3): every winner and promotion artifact the summary
+    v0.5.16 / blocker 3): every winner artifact the summary
     claims must exist, hash to its recorded content, parse, and cross-check
     against the summary's own winner facts (trial number, metric name, value,
     goal, source identity fields, completion metadata) — and the namespace
@@ -371,7 +367,7 @@ def _publish_generation(
     This is the publication transaction (review v0.5.15 / blocker 3), in
     strict order:
 
-    1. Immutable generation-scoped artifacts (winners/promotions/summary) are
+    1. Immutable generation-scoped artifacts (winners/summary) are
        already written by the time this runs.
     2. Pre-commit validation (:func:`_validate_generation_publishable`, item
        A): parse this generation's own summary and winner files back and
@@ -395,10 +391,10 @@ def _publish_generation(
     5. Best-effort, notify the prepared sidecar that the pointer committed.
     6. Write the immutable per-generation record once, state ``"published"``.
     7. Best-effort, diagnostic-only: drive the current pointer to
-       ``"published"``, then refresh the legacy compatibility projections
-       (root ``winner.yaml`` / ``promotion.yaml`` / ``summary.yaml``; review
-       v0.5.15 / item D). These are post-commit caches for humans and legacy
-       tooling only -- no reader re-derives them, and once any generation has
+       ``"published"``, then refresh the convenience projections
+       (root ``winner.yaml`` / ``summary.yaml``; review
+       v0.5.15 / item D). These are post-commit caches for humans only -- no
+       reader derives publication authority from them, and once any generation has
        published, reads resolve the generation-scoped artifacts directly (see
        :func:`phasesweep.engine.publication._published_winner_path_for`), so a
        failure projecting them never affects what callers actually see.
@@ -413,7 +409,7 @@ def _publish_generation(
     cancelled. The race has a deterministic winner — a shutdown delivered
     before this window opens cancels the run with nothing published; one
     delivered inside it is absorbed until the publication is durably
-    classified and then honored at the next checkpoint (the suite loop, the
+    classified and then honored at the next checkpoint (the
     next trial launch, or the MCP runner's terminal status write) before any
     new work starts.
 
@@ -484,7 +480,7 @@ def _publish_generation(
         )
 
         def _refresh_published_pointer_and_projections() -> None:
-            """Step 7: drive the pointer to ``published``, refresh legacy projections (best-effort)."""
+            """Drive the current pointer and refresh convenience projections."""
             _write_generation_state(
                 experiment,
                 generation_id=generation_id,
@@ -503,15 +499,6 @@ def _publish_generation(
                 else:
                     projected_winner.unlink(missing_ok=True)
 
-                source_promotion = path_ops._generation_promotion_decision_path(
-                    experiment, generation_id, phase.name
-                )
-                projected_promotion = path_ops._promotion_decision_path(experiment, phase.name)
-                if source_promotion.is_file():
-                    _copy_yaml_projection(source_promotion, projected_promotion)
-                else:
-                    projected_promotion.unlink(missing_ok=True)
-
             _copy_yaml_projection(
                 path_ops._generation_summary_path(experiment, generation_id),
                 path_ops._summary_path(experiment),
@@ -519,7 +506,7 @@ def _publish_generation(
 
         _log_on_failure(
             _refresh_published_pointer_and_projections,
-            "failed to refresh the current-generation pointer or compatibility caches "
+            "failed to refresh the current-generation pointer or convenience projections "
             "after publication; the published result is unaffected",
         )
 

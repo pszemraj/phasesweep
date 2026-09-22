@@ -2,7 +2,7 @@
 
 Split into two phases:
   launch_trial  — needs GPU lease, runs subprocess
-  extract_trial — no GPU needed, reads result files / polls W&B
+  extract_trial — no GPU needed, reads result files
 """
 
 from __future__ import annotations
@@ -12,12 +12,16 @@ import json
 import logging
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, check_bounds
+from phasesweep.config.models import _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
+from phasesweep.errors import (
+    PhaseSweepError,
+)
 from phasesweep.errors import (
     ProcessCleanupUncertainError as ProcessCleanupUncertainError,
 )
@@ -32,7 +36,7 @@ from phasesweep.evidence.evaluation import (
     evaluate_gates,
     run_extractor,
 )
-from phasesweep.evidence.models import JsonEnvelopeExtractor
+from phasesweep.evidence.models import JsonEnvelopeExtractor, compose_wandb_environment
 from phasesweep.runtime.commands import (
     dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
@@ -123,7 +127,6 @@ _TRIAL_BOUND_ENV = (
     "PHASESWEEP_ATTEMPT_ID",
     "PHASESWEEP_OVERRIDES_SHA256",
     "PHASESWEEP_OBJECTIVE_PATH",
-    "WANDB_RUN_ID",
 )
 
 # Warn-once keys for :func:`_warn_dropped_cuda_visibility`, so a narrowed
@@ -131,7 +134,12 @@ _TRIAL_BOUND_ENV = (
 _DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
 
 
-def _trainer_environment(experiment: Experiment) -> dict[str, str]:
+def _trainer_environment(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    require_wandb_online: bool = True,
+) -> dict[str, str]:
     """Compose the trainer environment per the execution contract.
 
     ``inherit_env: all`` preserves the historical full-inheritance behavior.
@@ -142,6 +150,9 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
     PhaseSweep assigns for each attempt.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
+    :param str phase_name: Phase whose remote consumers manage W&B identity.
+    :param bool require_wandb_online: Reject offline/disabled W&B modes when the
+        caller is preparing new remote work.
     :return dict[str, str]: The composed trainer environment.
     """
     contract = experiment.execution.inherit_env
@@ -158,7 +169,46 @@ def _trainer_environment(experiment: Experiment) -> dict[str, str]:
     # recorded. Ambient copies cannot affect the trainer or its study cohort.
     for name in _TRIAL_BOUND_ENV:
         env.pop(name, None)
+    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    query = _wandb_query(experiment, phase.gates)
+    if query is not None:
+        try:
+            env = compose_wandb_environment(
+                query,
+                experiment.env,
+                env,
+                require_online=require_wandb_online,
+            )
+        except ValueError as exc:
+            raise PhaseSweepError(str(exc)) from exc
+    elif "WANDB_RUN_ID" not in experiment.env:
+        # Without a remote evidence consumer, an explicitly configured run ID
+        # remains trainer-owned. An ambient/inherited ID is not stable trial
+        # semantics and must not split the persistent-study cohort.
+        env.pop("WANDB_RUN_ID", None)
     return env
+
+
+def _preflight_trainer_environments(
+    experiment: Experiment, *, from_phase: str | None = None
+) -> None:
+    """Validate environments for phases that a fresh artifact tree would launch.
+
+    Existing current-format trees defer this check until recovered study state
+    proves that a phase has new work. A fresh tree has no trials to replay, so
+    every reached phase can be checked before any execution artifact is created.
+
+    :param Experiment experiment: Parsed experiment supplying phase contracts.
+    :param str | None from_phase: Optional first phase to execute.
+    :raises PhaseSweepError: A composed runtime environment disables required
+        remote evidence or conflicts with its managed identity.
+    """
+    reached = from_phase is None
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
+        if reached:
+            _trainer_environment(experiment, phase.name)
 
 
 def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
@@ -191,7 +241,12 @@ class EnvironmentIdentity:
     values: dict[str, str]
 
 
-def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
+def _environment_identity(
+    experiment: Experiment,
+    phase_name: str | None = None,
+    *,
+    require_wandb_online: bool = True,
+) -> EnvironmentIdentity:
     """Fingerprint the semantic part of the composed trainer environment.
 
     Values named by ``execution.passthrough_env`` are deliberately excluded:
@@ -213,10 +268,22 @@ def _environment_identity(experiment: Experiment) -> EnvironmentIdentity:
     themselves never enter config metadata.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
+    :param str | None phase_name: Phase whose remote consumers normalize W&B
+        defaults. May be omitted only for a single-phase experiment.
+    :param bool require_wandb_online: Reject offline/disabled W&B modes when the
+        caller is preparing new remote work.
     :return EnvironmentIdentity: Digest, sorted variable names, and the
         composed name-to-value mapping the digest covers.
     """
-    env = _trainer_environment(experiment)
+    if phase_name is None:
+        if len(experiment.phases) != 1:
+            raise ValueError("phase_name is required for a multi-phase environment identity.")
+        phase_name = experiment.phases[0].name
+    env = _trainer_environment(
+        experiment,
+        phase_name,
+        require_wandb_online=require_wandb_online,
+    )
     passthrough = set(experiment.execution.passthrough_env) - set(experiment.env)
     items = sorted((name, value) for name, value in env.items() if name not in passthrough)
     encoded = json.dumps(items, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -352,6 +419,7 @@ def _failed_trial(
     constraints: dict[str, float] | None = None,
     gate_results: list[GateResult] | None = None,
     deadline_exhausted: bool = False,
+    objective_provenance: dict[str, Any] | None = None,
 ) -> TrialResult:
     """Build a ``TrialResult`` representing a failed trial.
 
@@ -367,6 +435,7 @@ def _failed_trial(
         constraints: Constraint readings collected before the failure, if any.
         gate_results: Evidence gate results collected before the failure, if any.
         deadline_exhausted: Whether the phase/run deadline caused the failure.
+        objective_provenance: Frozen evidence already captured before a later gate failed.
 
     Returns:
         A :class:`TrialResult` with ``metric=None`` and ``feasible=False``.
@@ -381,6 +450,7 @@ def _failed_trial(
         failure_reason=failure_reason,
         gate_results=gate_results,
         deadline_exhausted=deadline_exhausted,
+        objective_provenance=objective_provenance,
     )
 
 
@@ -396,8 +466,8 @@ def prepare_trainer_input(
     """Atomically write and identify the exact input one trainer will consume.
 
     One serialized byte string is used for the atomic write, environment
-    digest, and durable trial record. CLI modes consume the resolved-overrides
-    audit file; file modes consume their generated YAML or JSON file.
+    digest, and durable trial record. Argparse mode consumes the resolved-
+    overrides audit file; YAML mode consumes the generated trainer config.
 
     :param Experiment experiment: Experiment supplying format and base config.
     :param str phase_name: Phase label used for runtime placeholders.
@@ -408,10 +478,7 @@ def prepare_trainer_input(
     :return PreparedTrainerInput: Materialized input bytes and historical identity.
     """
     trial_dir.mkdir(parents=True, exist_ok=True)
-    resolved_text = _json_dump_overrides(
-        overrides,
-        strict=experiment.override_format in {"json_file", "yaml_file"},
-    )
+    resolved_text = _json_dump_overrides(overrides)
     resolved_path = trial_dir / "overrides_resolved.json"
     atomic_write_text(resolved_path, resolved_text)
 
@@ -547,9 +614,18 @@ def launch_trial(
     # subprocess receives, and the opt-in raw record is written before any
     # per-trial binding is layered on, so the file stays the digest's exact
     # preimage (review v0.5.18 / finding F3).
-    identity = _environment_identity(experiment)
+    identity = _environment_identity(experiment, phase_name)
     _record_trainer_environment(experiment, identity, workdir)
     env = dict(identity.values)
+    phase = next(
+        (phase for phase in experiment.phases if phase.name == phase_name), experiment.phases[0]
+    )
+    wandb_query = _wandb_query(experiment, phase.gates)
+    if wandb_query is not None:
+        env["WANDB_RUN_ID"] = attempt_id
+    # Without a W&B evidence consumer, monitoring remains trainer-owned: keep
+    # any configured/ambient W&B identity unchanged. Trainers can still bind
+    # monitoring to this attempt explicitly through PHASESWEEP_ATTEMPT_ID.
     trainer_cwd = _resolved_execution_cwd(experiment)
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
@@ -558,12 +634,11 @@ def launch_trial(
     env["PHASESWEEP_GENERATION_ID"] = generation_id
     env["PHASESWEEP_ATTEMPT_ID"] = attempt_id
     env["PHASESWEEP_OVERRIDES_SHA256"] = overrides_sha256
-    env["WANDB_RUN_ID"] = attempt_id
     if isinstance(experiment.metric.extractor, JsonEnvelopeExtractor):
         env["PHASESWEEP_OBJECTIVE_PATH"] = str(workdir / experiment.metric.extractor.path)
     else:
         # This is a reserved, extractor-dependent value. Do not let an ambient
-        # variable direct a log- or W&B-backed trial to an unrelated path.
+        # variable direct a log-backed trial to an unrelated path.
         env.pop("PHASESWEEP_OBJECTIVE_PATH", None)
 
     if gpu_id is not None:
@@ -611,7 +686,8 @@ def launch_trial(
         run_name=run_name,
         return_code=proc_result.return_code,
         duration_seconds=proc_result.duration_seconds,
-        wandb_environment=dict(env),
+        wandb_environment=env if wandb_query is not None else None,
+        wandb_query=wandb_query,
     )
 
     return ExecutedTrial(
@@ -626,7 +702,6 @@ def extract_trial_result(
     experiment: Experiment,
     executed: ExecutedTrial,
     gates: list[Gate] | None = None,
-    enforce_gates: bool = True,
     deadline: float | None = None,
 ) -> TrialResult:
     """Extract metrics from a completed trial. Call AFTER releasing the GPU lease.
@@ -652,9 +727,6 @@ def extract_trial_result(
         executed: Output of :func:`launch_trial`; provides the trial context
             and the :class:`ProcessResult`.
         gates: Evidence gates that must pass for the trial to count.
-        enforce_gates: If ``True``, failed gates fail the trial. If ``False``,
-            gates are advisory and are recorded without changing the metric
-            result.
         deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
             ``timeout_seconds_per_phase`` / ``timeout_seconds_per_run`` bound
             the *whole* trial — extraction and gates included, not just the
@@ -671,6 +743,9 @@ def extract_trial_result(
     """
     import time
 
+    executed = replace(
+        executed, ctx=replace(executed.ctx, wandb_query=_wandb_query(experiment, gates or []))
+    )
     rc = executed.process.return_code
     duration = executed.process.duration_seconds
     failure_reason = executed.process.failure_reason
@@ -818,8 +893,10 @@ def extract_trial_result(
             feasible = False
 
     gate_results = evaluate_gates(executed.ctx, gates or [], deadline=deadline)
+    if executed.ctx.wandb_capture:
+        objective_provenance["remote_capture"] = dict(executed.ctx.wandb_capture)
     failed_gates = [gate for gate in gate_results if not gate.passed]
-    if failed_gates and enforce_gates:
+    if failed_gates:
         detail = "; ".join(gate.detail for gate in failed_gates)
         log.warning(
             "[%s/trial_%d] evidence gate(s) failed: %s",
@@ -831,6 +908,7 @@ def extract_trial_result(
             rc=rc,
             duration=duration,
             failure_reason=f"evidence gates failed: {detail}",
+            objective_provenance=objective_provenance,
             constraints=constraint_values,
             gate_results=gate_results,
             deadline_exhausted=any(gate.deadline_exhausted for gate in failed_gates),
@@ -857,26 +935,14 @@ def extract_trial_result(
     )
 
 
-def _json_dump_overrides(overrides: dict[str, Any], *, strict: bool) -> str:
+def _json_dump_overrides(overrides: dict[str, Any]) -> str:
     """Serialize resolved overrides to indented JSON for ``overrides_resolved.json``.
 
     Args:
         overrides: The composed (inherited + fixed + sampled) overrides dict.
-        strict: When ``True`` (``yaml_file`` or ``json_file`` format), use the
-            canonical strict serializer. This keeps the audit record in the
-            portable value domain accepted by complete trainer YAML and makes
-            it byte-faithful to the JSON compatibility wire. Load-time
-            validation guarantees this succeeds. When ``False`` (a scalar/list
-            CLI format), non-JSON scalars fall back through ``default=str``
-            (Path, etc.) — there is no JSON wire artifact for those formats to
-            diverge from.
 
     Returns:
         Trailing-newline-terminated, sorted, two-space-indented JSON.
 
     """
-    from phasesweep.runtime.commands import dump_overrides_json
-
-    if strict:
-        return dump_overrides_json(overrides) + "\n"
-    return json.dumps(overrides, indent=2, sort_keys=True, default=str) + "\n"
+    return json.dumps(overrides, indent=2, sort_keys=True, allow_nan=False) + "\n"

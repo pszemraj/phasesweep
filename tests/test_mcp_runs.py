@@ -37,6 +37,23 @@ def _earlier_boot_id() -> str:
     return other if other != current else "11111111-1111-1111-1111-111111111111"
 
 
+def _state_tree_snapshot(state_dir: Path) -> dict[Path, tuple[int, bytes | None]]:
+    """Capture durable state entries so refusal tests can prove no mutation.
+
+    :param Path state_dir: MCP state root to snapshot.
+    :return dict[Path, tuple[int, bytes | None]]: Relative path, mode, and file bytes.
+    """
+    snapshot: dict[Path, tuple[int, bytes | None]] = {}
+    for path in (state_dir, *sorted(state_dir.rglob("*"))):
+        info = path.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        snapshot[path.relative_to(state_dir)] = (
+            mode,
+            path.read_bytes() if stat.S_ISREG(info.st_mode) else None,
+        )
+    return snapshot
+
+
 def test_create_get_roundtrip(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(
@@ -72,7 +89,6 @@ def test_launching_handle_reserves_concurrency_until_outcome_is_known(tmp_path: 
     assert store.state(loaded) == "running"
     assert store.recovery_required(loaded)
     assert store.live_runs() == [loaded]
-    assert store.live_run_for("exp") == loaded
 
 
 def test_create_refuses_existing_identity_without_replacement(tmp_path: Path) -> None:
@@ -103,7 +119,7 @@ def test_create_serializes_before_reserving_the_final_path(
     with pytest.raises(TypeError, match="serialization"):
         store.create(handle)
 
-    assert not store.handle_exists(handle.run_id)
+    assert store.get(handle.run_id) is None
     assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
 
 
@@ -133,7 +149,7 @@ def test_create_fsync_failure_rolls_back_the_reserved_identity(
         store.create(handle)
 
     assert failed
-    assert not store.handle_exists(handle.run_id)
+    assert store.get(handle.run_id) is None
     assert list((tmp_path / "state" / "runs").glob("*.tmp")) == []
     store.create(handle)
     assert store.get(handle.run_id) == handle
@@ -200,7 +216,7 @@ def test_failed_pre_spawn_cleanup_retains_recoverable_lease(
     monkeypatch.setattr(mcp_runs, "_strict_unlink", real_unlink)
     assert store.is_pre_spawn_orphan(handle.run_id)
     store.clear_pre_spawn_orphan(handle.run_id)
-    assert not store.run_evidence_exists(handle.run_id)
+    assert store.launch_inventory() == ([], set())
 
 
 def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
@@ -263,7 +279,7 @@ def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
 
     assert store.is_pre_spawn_orphan(handle.run_id)
     store.clear_pre_spawn_orphan(handle.run_id)
-    assert not store.run_evidence_exists(handle.run_id)
+    assert store.launch_inventory() == ([], set())
 
 
 def test_free_launch_lease_cannot_override_missing_handle_with_runner_log(
@@ -344,29 +360,6 @@ def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path
         store.update(replace(spawned, pid=os.getppid(), pgid=os.getppid()))
 
 
-def test_legacy_handle_missing_launch_authority_loads_fail_closed(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    payload = asdict(
-        make_run_handle(
-            run_id="exp-legacy",
-            allow_cancel=True,
-            visible_params_at_launch="all",
-        )
-    )
-    payload.pop("allow_cancel")
-    payload.pop("visible_params_at_launch")
-    private_atomic_write_text(
-        tmp_path / "state" / "runs" / "exp-legacy.json",
-        json.dumps(payload),
-    )
-
-    loaded = store.get("exp-legacy")
-
-    assert loaded is not None
-    assert loaded.allow_cancel is False
-    assert loaded.visible_params_at_launch is None
-
-
 def test_write_status_file_replaces_existing_status_without_temp_files(tmp_path: Path) -> None:
     status_path = tmp_path / "state" / "logs" / "exp-1.status.json"
 
@@ -392,6 +385,7 @@ def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> N
     assert file_mode(tmp_path / "state") == 0o700
     assert file_mode(tmp_path / "state" / "runs") == 0o700
     assert file_mode(tmp_path / "state" / "logs") == 0o700
+    assert file_mode(tmp_path / "state" / ".phasesweep-format.json") == 0o600
     assert file_mode(tmp_path / "state" / "runs" / "exp-1.json") == 0o600
     assert file_mode(tmp_path / "state" / "logs" / "exp-1.status.json") == 0o600
     assert file_mode(tmp_path / "state" / "logs" / "exp-1.cleanup_uncertain.json") == 0o600
@@ -416,6 +410,99 @@ def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: 
     assert {
         path: file_mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
     } == before_modes
+
+
+def test_run_store_marks_fresh_scaffolded_state(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    state_dir.chmod(0o700)
+    private_atomic_write_text(state_dir / "origin", "catalog.yaml\n")
+
+    RunStore(state_dir)
+
+    marker = state_dir / ".phasesweep-format.json"
+    assert json.loads(marker.read_text()) == {"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION}
+    assert file_mode(marker) == 0o600
+    assert (state_dir / "origin").read_text() == "catalog.yaml\n"
+    assert (state_dir / "runs").is_dir()
+    assert (state_dir / "logs").is_dir()
+
+
+@pytest.mark.parametrize(
+    ("marker_text", "match"),
+    [
+        ("not json\n", "malformed or unsupported"),
+        ('{"schema_version": 0}\n', "malformed or unsupported"),
+        ('{"schema_version": 1, "unexpected": true}\n', "malformed or unsupported"),
+    ],
+)
+def test_run_store_rejects_invalid_format_marker_without_mutation(
+    tmp_path: Path,
+    marker_text: str,
+    match: str,
+) -> None:
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    marker = state_dir / ".phasesweep-format.json"
+    private_atomic_write_text(marker, marker_text)
+    before = _state_tree_snapshot(state_dir)
+
+    with pytest.raises(ValueError, match=match):
+        RunStore(state_dir)
+
+    assert _state_tree_snapshot(state_dir) == before
+
+
+@pytest.mark.parametrize("evidence_kind", ["handle", "status", "log", "lease", "audit"])
+def test_run_store_refuses_unmarked_durable_state_before_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence_kind: str,
+) -> None:
+    state_dir = tmp_path / "state"
+    store = RunStore(state_dir)
+    run_id = "exp-1"
+    if evidence_kind == "handle":
+        store.create(make_run_handle(run_id=run_id))
+    elif evidence_kind == "status":
+        write_status_file(store.status_path(run_id), {"run_id": run_id, "returncode": 0})
+    elif evidence_kind == "log":
+        private_atomic_write_text(store.log_path(run_id), "runner output\n")
+    elif evidence_kind == "lease":
+        private_atomic_write_text(store.launch_lease_path(run_id), "")
+    else:
+        private_atomic_write_text(state_dir / "audit.jsonl", '{"tool":"launch_run"}\n')
+    marker = state_dir / ".phasesweep-format.json"
+    marker.unlink()
+    before = _state_tree_snapshot(state_dir)
+    initialized: list[Path] = []
+
+    def fail_if_initialized(path: Path) -> None:
+        initialized.append(path)
+        raise AssertionError("unmarked durable state must not be initialized")
+
+    monkeypatch.setattr(mcp_runs, "ensure_private_dir", fail_if_initialized)
+
+    with pytest.raises(ValueError, match="no format marker.*fresh MCP state directory.*0.3.1"):
+        RunStore(state_dir)
+
+    assert initialized == []
+    assert _state_tree_snapshot(state_dir) == before
+
+
+def test_open_existing_requires_supported_format_marker_without_mutation(tmp_path: Path) -> None:
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    marker = state_dir / ".phasesweep-format.json"
+    marker.unlink()
+    before = _state_tree_snapshot(state_dir)
+
+    with pytest.raises(
+        ValueError, match="malformed or unsupported.*fresh MCP state directory.*0.3.1"
+    ):
+        RunStore.open_existing(state_dir)
+
+    assert _state_tree_snapshot(state_dir) == before
 
 
 @pytest.mark.parametrize(
@@ -469,9 +556,6 @@ def test_launch_inventory_reports_malformed_and_orphaned_run_authority(tmp_path:
         "run:exp-orphan",
         "run:exp-transition",
     }
-    assert store.run_evidence_exists("exp-dangling")
-    assert store.run_evidence_exists("exp-directory")
-    assert store.run_evidence_exists("exp-transition")
 
 
 def test_get_skips_malformed_handle(tmp_path: Path) -> None:
@@ -486,7 +570,6 @@ def test_dangling_handle_still_reserves_launch_authority(tmp_path: Path) -> None
     handle_path.symlink_to("missing-handle.json")
 
     assert store.get("dangling") is None
-    assert store.handle_exists("dangling")
     assert store.launch_inventory() == ([], {"run:dangling"})
 
 
@@ -536,7 +619,7 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
 
     if record_kind == "handle":
         assert store.get(handle.run_id) is None
-        assert store.handle_exists(handle.run_id)
+        assert store.launch_inventory() == ([], {f"run:{handle.run_id}"})
     elif record_kind == "status":
         assert store.recorded_terminal_status(handle) is None
         assert store.state(handle) == "running"
@@ -708,7 +791,6 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     assert store.snapshot_recovery_required(handle)
     assert store.recovery_required(handle)
     assert store.live_runs() == [handle]
-    assert store.live_run_for("exp") == handle
 
     write_run_status(
         store,
@@ -724,7 +806,6 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     assert not store.snapshot_recovery_required(handle)
     assert not store.recovery_required(handle)
     assert store.live_runs() == []
-    assert store.live_run_for("exp") is None
 
 
 def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) -> None:
@@ -844,7 +925,6 @@ def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) ->
 
     assert store.state(handle) == "failed"
     assert store.live_runs() == []
-    assert store.live_run_for("exp") is None
 
 
 def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
@@ -1192,7 +1272,6 @@ def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
     assert store.state(handle) == "failed"
     assert store.cleanup_recovery_required(handle)
     assert store.recovery_required(handle)
-    assert store.live_run_for("exp") is None
 
 
 def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> None:
@@ -1257,7 +1336,6 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
 
     assert store.state(handle) == "running"
     assert store.live_runs() == [handle]
-    assert store.live_run_for("exp") == handle
 
     private_atomic_write_text(
         store.cleanup_recovery_path("exp-1"),
@@ -1272,7 +1350,6 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
 
     assert store.state(handle) == "failed"
     assert store.live_runs() == []
-    assert store.live_run_for("exp") is None
 
 
 def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> None:
@@ -1416,18 +1493,6 @@ def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     handle = make_run_handle(run_id="exp-x", pid=os.getpid(), starttime=live_starttime + 99_999)
     assert store.state(handle) == "running"
     assert store.cleanup_uncertain(handle)
-
-
-def test_live_run_for_ignores_terminal_runs(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    store.create(make_run_handle(run_id="exp-run", experiment_id="exp"))
-    store.create(make_run_handle(run_id="exp-done", experiment_id="exp"))
-    write_run_status(store, "exp-done", returncode=0)  # terminal: succeeded
-
-    live = store.live_run_for("exp")
-    assert live is not None
-    assert live.run_id == "exp-run"
-    assert store.live_run_for("other-experiment") is None
 
 
 def test_state_cleanup_uncertain_for_zombie_runner_without_status(tmp_path: Path) -> None:

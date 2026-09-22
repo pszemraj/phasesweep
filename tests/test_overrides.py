@@ -2,23 +2,24 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import shlex
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from phasesweep import load_config, load_experiment, run_experiment
-from phasesweep.config import Phase, Suite
+from phasesweep import load_experiment, run_experiment
+from phasesweep.config import JsonEnvelopeExtractor, Metric, Phase
 from phasesweep.runtime.commands import (
     compose_trainer_config,
-    dump_overrides_json,
+    dump_json_file_overrides,
     dump_trainer_config_yaml,
     format_argparse,
     format_hydra,
     render_command,
-    write_json_file,
 )
 from tests.conftest import (
     assert_invalid_experiment_yaml,
@@ -26,40 +27,6 @@ from tests.conftest import (
     make_experiment,
     write_yaml,
 )
-
-
-@pytest.mark.parametrize(
-    ("overrides", "expected"),
-    [
-        pytest.param({"n_layers": 8, "lr": 3e-4}, "n_layers=8 lr=0.0003", id="basic"),
-        pytest.param({"model.n_layers": 12}, "model.n_layers=12", id="dotted-key"),
-        pytest.param({"flag": True, "off": False}, "flag=true off=false", id="booleans"),
-    ],
-)
-def test_hydra_scalar_rendering(overrides: dict[str, object], expected: str) -> None:
-    assert format_hydra(overrides) == expected
-
-
-def test_hydra_quotes_string_values_for_hydra_grammar():
-    s = format_hydra({"optimizer": "adam,w", "tags": ["a,b", "c[d]"], "mode": "true"})
-
-    assert shlex.split(s) == [
-        'optimizer="adam,w"',
-        'tags=["a,b","c[d]"]',
-        'mode="true"',
-    ]
-
-
-def test_hydra_rejects_structured_values():
-    with pytest.raises(TypeError, match="json_file"):
-        format_hydra({"model": {"depth": 2}})
-
-
-@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
-def test_hydra_rejects_non_finite_values(value: float) -> None:
-    """The renderer must not admit values the semantic JSON dump collapses."""
-    with pytest.raises(TypeError, match="finite floats"):
-        format_hydra({"x": [value]})
 
 
 def test_argparse():
@@ -115,39 +82,8 @@ def test_argparse_rendering_rejects_values_outside_the_wire_contract(value):
     """Defense in depth behind the config validator: str()-ing a mapping or a
     date into a command line is how two different commands end up sharing one
     fingerprint (PR #5 review / reviewer 2, blocker 3)."""
-    with pytest.raises(TypeError, match="json_file"):
+    with pytest.raises(TypeError, match="yaml_file"):
         format_argparse({"model": value})
-
-
-def test_render_command_hydra(tmp_path):
-    cmd = render_command(
-        "python train.py {overrides} --out {trial_dir}/r.json",
-        {"n_layers": 8},
-        "hydra",
-        trial_dir=tmp_path,
-        trial_id=3,
-        phase="depth",
-        run_name="x-depth-3",
-    )
-    assert "n_layers=8" in cmd
-    assert str(tmp_path) in cmd
-
-
-def test_render_command_json_file(tmp_path):
-    cmd = render_command(
-        "python train.py --overrides-path {overrides_path}",
-        {"a.b": 1, "a.c": 2, "d": "x"},
-        "json_file",
-        trial_dir=tmp_path,
-        trial_id=0,
-        phase="p",
-        run_name="r",
-    )
-    assert "overrides.json" in cmd
-    import json
-
-    data = json.loads((tmp_path / "overrides.json").read_text())
-    assert data == {"a": {"b": 1, "c": 2}, "d": "x"}
 
 
 def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> None:
@@ -292,36 +228,288 @@ def test_compatibility_format_rejects_ignored_trainer_config() -> None:
         )
 
 
-def test_validate_rejects_structured_hydra_fixed_override(tmp_path):
+@pytest.mark.parametrize("selector", ["hydra", "json_file"])
+def test_restored_override_format_is_validated_without_artifacts(
+    tmp_path: Path, selector: str
+) -> None:
     p = write_yaml(
         tmp_path,
-        """
+        f"""
         experiment: t
-        trial_command: "echo {overrides}"
-        override_format: hydra
+        workdir: {tmp_path / "runs"}
+        trial_command: "echo {{{"overrides_path" if selector == "json_file" else "overrides"}}}"
+        override_format: {selector}
         metric:
           name: x
           goal: minimize
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides:
-              model: { depth: 2 }
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases: [{{name: p, n_trials: 1}}]
         """,
     )
 
-    with pytest.raises(ValidationError, match="override_format='hydra'.*yaml_file"):
-        load_experiment(p)
+    assert load_experiment(p).override_format == selector
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        True,
+        False,
+        3,
+        -4,
+        2.5,
+        -1e-5,
+        "null",
+        "true",
+        "3",
+        "2.5",
+        "",
+        "two words",
+        "quote\"and'quote",
+        "C:\\data\\file",
+        "trailing\\",
+        'backslash\\"quote',
+        "two\\\\slashes",
+        "a,b",
+        "{a: b}",
+        "$money",
+        "unicode café",
+        [None, "false", [True, "a,b", "C:\\data"]],
+    ],
+)
+def test_hydra_values_round_trip_real_parser_and_omegaconf(value):
+    from hydra.core.override_parser.overrides_parser import OverridesParser
+    from omegaconf import OmegaConf
+
+    argument = shlex.split(format_hydra({"value": value}))[0]
+    parsed = OverridesParser.create().parse_override(argument)
+    assert not parsed.is_sweep_override()
+    actual = OmegaConf.to_container(OmegaConf.create({"value": parsed.value()}), resolve=True)[
+        "value"
+    ]
+    assert actual == value
+    assert type(actual) is type(value)
+    assert json.dumps(actual) == json.dumps(value)
+
+
+@pytest.mark.parametrize("value", ["${oc.env:HOME}", "literal ${other}", ["${x}"], "line\nbreak"])
+def test_hydra_unsupported_literals_fail_before_artifacts(tmp_path, value):
+    with pytest.raises(ValueError, match=r"Hydra cannot pass literal strings.*interpolation"):
+        make_experiment(
+            workdir=str(tmp_path / "runs"),
+            override_format="hydra",
+            trial_command="echo {overrides}",
+            phases=[Phase(name="p", n_trials=1, fixed_overrides={"value": value})],
+        )
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize("value", ["${oc.env:HOME}", "line\nbreak"])
+def test_hydra_unsupported_categorical_literals_fail_before_artifacts(tmp_path, value):
+    with pytest.raises(
+        ValueError,
+        match=r"categorical search_space key 'value'.*Hydra cannot pass literal strings.*interpolation",
+    ):
+        make_experiment(
+            workdir=str(tmp_path / "runs"),
+            override_format="hydra",
+            trial_command="echo {overrides}",
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=1,
+                    search_space={"value": {"type": "categorical", "choices": ["ok", value]}},
+                )
+            ],
+        )
+    assert not (tmp_path / "runs").exists()
+
+
+def test_yaml_exponent_scalars_preserve_declared_types(tmp_path):
+    """YAML's scalar typing remains visible to fixed and categorical overrides."""
+    experiment = load_experiment(
+        write_yaml(
+            tmp_path,
+            """
+            experiment: exponent_scalars
+            workdir: runs
+            trial_command: "python train.py {overrides}"
+            override_format: argparse
+            metric:
+              name: loss
+              goal: minimize
+              extractor: {type: json_envelope, objective_name: loss, split: validation, policy: final}
+            phases:
+              - name: p
+                n_trials: 1
+                fixed_overrides:
+                  plain_exponent: 1e-3
+                  decimal_exponent: 1.0e-3
+                search_space:
+                  learning_rate:
+                    type: categorical
+                    choices: [1e-3, 1.0e-3]
+            """,
+        )
+    )
+
+    phase = experiment.phases[0]
+    assert phase.fixed_overrides["plain_exponent"] == "1e-3"
+    assert type(phase.fixed_overrides["plain_exponent"]) is str
+    assert phase.fixed_overrides["decimal_exponent"] == 0.001
+    assert type(phase.fixed_overrides["decimal_exponent"]) is float
+    choices = phase.search_space["learning_rate"].choices
+    assert choices == ["1e-3", 0.001]
+    assert type(choices[0]) is str
+    assert type(choices[1]) is float
+
+
+@pytest.mark.parametrize("overrides", [{"x": 1, "x.y": 2}, {"x.y": 2, "x": 1}, {"x": {}, "x.y": 2}])
+def test_json_file_rejects_dotted_collisions(overrides):
+    with pytest.raises(ValueError, match="parent key"):
+        dump_json_file_overrides(overrides)
+
+
+@pytest.mark.parametrize("value", [float("inf"), datetime.date(2024, 1, 1), {1: "value"}, (1, 2)])
+def test_json_file_rejects_non_json_values(value):
+    with pytest.raises((TypeError, ValueError)):
+        dump_json_file_overrides({"value": value})
+
+
+@pytest.mark.parametrize("selector", ["hydra", "json_file"])
+def test_restored_input_real_consumer_inherits_and_replays(tmp_path, selector):
+    from phasesweep.config import (
+        CategoricalParam,
+        ExecutionContext,
+        LogRegexExtractor,
+        Metric,
+        Sampler,
+    )
+
+    trainer = tmp_path / "trainer.py"
+    if selector == "hydra":
+        (tmp_path / "config.yaml").write_text(
+            "model: {depth: 0}\nrate: 0.0\ntag: ''\n", encoding="utf-8"
+        )
+        trainer.write_text(
+            "import hydra, json, os\nfrom pathlib import Path\n"
+            "from omegaconf import OmegaConf\n"
+            "@hydra.main(version_base=None, config_path='.', config_name='config')\n"
+            "def main(cfg):\n"
+            "    values = OmegaConf.to_container(cfg, resolve=True)\n"
+            "    Path(os.environ['PHASESWEEP_TRIAL_DIR'], 'consumed.json').write_text(json.dumps(values))\n"
+            "    print('loss=' + str(10 - values['model']['depth']))\n"
+            "main()\n",
+            encoding="utf-8",
+        )
+        placeholder = "{overrides} hydra.run.dir={trial_dir}/hydra hydra.output_subdir=null"
+    else:
+        trainer.write_text(
+            "import json, sys, os\nfrom pathlib import Path\n"
+            "values = json.loads(Path(sys.argv[1]).read_text())\n"
+            "Path(os.environ['PHASESWEEP_TRIAL_DIR'], 'consumed.json').write_text(json.dumps(values))\n"
+            "print('loss=' + str(10 - values['model']['depth']))\n",
+            encoding="utf-8",
+        )
+        placeholder = "{overrides_path}"
+    experiment = make_experiment(
+        workdir=str(tmp_path / "runs"),
+        storage="auto",
+        provenance={"trainer": "fixture"},
+        override_format=selector,
+        execution=ExecutionContext(inherit_env="none"),
+        trial_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(trainer))} {placeholder}",
+        metric=Metric(
+            name="loss",
+            goal="minimize",
+            extractor=LogRegexExtractor(type="log_regex", pattern=r"loss=(?P<value>[0-9.]+)"),
+        ),
+        phases=[
+            Phase(
+                name="depth",
+                n_trials=2,
+                gpu_policy="none",
+                sampler=Sampler(type="grid"),
+                fixed_overrides={"tag": 'space,quote"backslash\\'},
+                search_space={"model.depth": CategoricalParam(type="categorical", choices=[2, 4])},
+            ),
+            Phase(
+                name="rate",
+                inherits=["depth"],
+                n_trials=2,
+                gpu_policy="none",
+                sampler=Sampler(type="grid"),
+                search_space={"rate": CategoricalParam(type="categorical", choices=[0.1, 0.2])},
+            ),
+        ],
+    )
+    winners = run_experiment(experiment)
+    root = Path(experiment.workdir) / experiment.experiment
+    receipts = sorted((root / "rate").glob("trial_*/consumed.json"))
+    assert len(receipts) == 2
+    for receipt in receipts:
+        consumed = json.loads(receipt.read_text())
+        assert consumed["model"]["depth"] == 4
+        assert type(consumed["model"]["depth"]) is int
+        assert consumed["tag"] == 'space,quote"backslash\\'
+    run_experiment(experiment, from_phase="rate")
+    assert sorted((root / "rate").glob("trial_*/consumed.json")) == receipts
+    assert winners["depth"].effective_overrides["model.depth"] == 4
+
+
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_packaged_fake_trainer_consumes_dotted_cli_overrides(
+    tmp_path: Path, override_format: str
+) -> None:
+    trainer = copy_fake_train(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        override_format=override_format,
+        trial_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(trainer))} {{overrides}}",
+        metric=Metric(
+            name="eval_loss",
+            goal="minimize",
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope",
+                path="result.json",
+                objective_name="eval_loss",
+                split="validation",
+                policy="synthetic",
+            ),
+        ),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                fixed_overrides={
+                    "model.n_layers": 6,
+                    "optimizer.lr": 0.001,
+                    "optimizer.weight_decay": 0.2,
+                    "model.dropout": 0.25,
+                },
+            )
+        ],
+    )
+
+    run_experiment(experiment)
+
+    (result_path,) = (Path(experiment.workdir) / experiment.experiment / "p").glob(
+        "trial_*/result.json"
+    )
+    assert json.loads(result_path.read_text())["config"] == {
+        "n_layers": 6,
+        "lr": 0.001,
+        "weight_decay": 0.2,
+        "dropout": 0.25,
+    }
 
 
 def _override_yaml(tmp_path, override_format: str, body: str):
     """Write a minimal override config with caller-supplied phase/contract body."""
-    trial_command = {
-        "json_file": "python train.py --overrides {overrides_path}",
-        "argparse": "python train.py {overrides}",
-        "hydra": "python train.py {overrides}",
-    }[override_format]
+    assert override_format == "argparse"
+    trial_command = "python train.py {overrides}"
     return write_yaml(
         tmp_path,
         f"""
@@ -335,111 +523,6 @@ def _override_yaml(tmp_path, override_format: str, body: str):
 {body}
         """,
     )
-
-
-def test_write_json_file_uses_the_canonical_strict_serializer(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The wire artifact and the load-time check must share one encoder."""
-    encodings: list[str | None] = []
-    real_write_text = Path.write_text
-
-    def capture_encoding(path: Path, text: str, *, encoding: str | None = None) -> int:
-        encodings.append(encoding)
-        return real_write_text(path, text, encoding=encoding)
-
-    monkeypatch.setattr(Path, "write_text", capture_encoding)
-    path = write_json_file({"a.b": 1, "c": "x"}, tmp_path)
-
-    assert path.read_text() == dump_overrides_json({"a": {"b": 1}, "c": "x"})
-    assert encodings == ["utf-8"]
-    with pytest.raises(TypeError):
-        dump_overrides_json({"cutoff": datetime.date(2024, 1, 1)})
-    with pytest.raises(TypeError):
-        write_json_file({"cutoff": datetime.date(2024, 1, 1)}, tmp_path)
-
-
-@pytest.mark.parametrize(
-    "value",
-    [float("inf"), float("-inf"), float("nan")],
-    ids=["inf", "-inf", "nan"],
-)
-def test_dump_overrides_json_and_write_json_file_reject_non_finite_floats(tmp_path, value):
-    """allow_nan=False must reject values ``json.dumps`` would otherwise render as the
-    non-standard Infinity/-Infinity/NaN tokens ``strict_json_loads`` refuses to parse
-    (review v0.5.17 / finding B)."""
-    with pytest.raises(ValueError):
-        dump_overrides_json({"x": value})
-    with pytest.raises(ValueError):
-        write_json_file({"x": value}, tmp_path)
-
-
-@pytest.mark.parametrize(
-    ("literal", "expected"),
-    [
-        pytest.param("2024-01-01", r"'knob'.*cannot encode.*type date", id="yaml-date"),
-        pytest.param(".inf", r"'knob'.*cannot encode.*non-finite", id="non-finite-float"),
-    ],
-)
-def test_validate_rejects_invalid_json_file_fixed_override(
-    tmp_path, literal: str, expected: str
-) -> None:
-    """The canonical strict JSON serializer rejects unsupported fixed values at load time."""
-    p = _override_yaml(
-        tmp_path,
-        "json_file",
-        "        phases:\n"
-        "          - name: p\n"
-        "            n_trials: 1\n"
-        "            fixed_overrides:\n"
-        f"              knob: {literal}\n",
-    )
-
-    with pytest.raises(ValidationError, match=expected):
-        load_experiment(p)
-
-
-@pytest.mark.parametrize(
-    ("override_format", "body"),
-    [
-        pytest.param(
-            "json_file",
-            """
-        contracts:
-          frozen:
-            fixed_overrides:
-              cutoff: 2024-01-01
-        phases:
-          - name: p
-            n_trials: 1
-            contracts: [frozen]
-        """,
-            id="json-file",
-        ),
-        pytest.param(
-            "argparse",
-            "        contracts:\n"
-            "          frozen:\n"
-            "            fixed_overrides:\n"
-            "              knob: {1: x}\n"
-            "        phases:\n"
-            "          - name: t\n"
-            "            n_trials: 1\n"
-            "            contracts: [frozen]\n",
-            id="argparse",
-        ),
-    ],
-)
-def test_validate_rejects_unrenderable_contract_override(
-    tmp_path: Path,
-    override_format: str,
-    body: str,
-) -> None:
-    """Contract values must serialize through the selected trainer-input format."""
-    config = _override_yaml(tmp_path, override_format, body)
-    with pytest.raises(ValidationError, match="contract 'frozen' fixed_overrides"):
-        load_experiment(config)
 
 
 # ``knob`` holds a value with no faithful argparse wire form in every case:
@@ -475,55 +558,6 @@ def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, 
         load_experiment(p)
 
 
-@pytest.mark.parametrize("literal", [".nan", ".inf", "-.inf"])
-@pytest.mark.parametrize("origin", ["phase", "contract"])
-@pytest.mark.parametrize("nested", [False, True])
-def test_validate_rejects_non_finite_hydra_fixed_override(
-    tmp_path, literal: str, origin: str, nested: bool
-) -> None:
-    """Hydra wire values must remain distinguishable in semantic fingerprints."""
-    value = f"[{literal}]" if nested else literal
-    if origin == "phase":
-        body = (
-            "        phases:\n"
-            "          - name: t\n"
-            "            n_trials: 1\n"
-            "            fixed_overrides:\n"
-            f"              knob: {value}\n"
-        )
-        expected = r"fixed_overrides.*'knob'"
-    else:
-        body = (
-            "        contracts:\n"
-            "          frozen:\n"
-            "            fixed_overrides:\n"
-            f"              knob: {value}\n"
-            "        phases:\n"
-            "          - name: t\n"
-            "            n_trials: 1\n"
-            "            contracts: [frozen]\n"
-        )
-        expected = r"contract 'frozen' fixed_overrides.*'knob'"
-
-    with pytest.raises(ValidationError, match=expected):
-        load_experiment(_override_yaml(tmp_path, "hydra", body))
-
-
-def test_validate_accepts_finite_hydra_fixed_override(tmp_path) -> None:
-    config = _override_yaml(
-        tmp_path,
-        "hydra",
-        "        phases:\n"
-        "          - name: t\n"
-        "            n_trials: 1\n"
-        "            fixed_overrides:\n"
-        "              knob: [1.5, -2.0]\n",
-    )
-
-    experiment = load_experiment(config)
-    assert experiment.phases[0].fixed_overrides["knob"] == [1.5, -2.0]
-
-
 def test_validate_rejects_argparse_categorical_wire_collision(tmp_path: Path) -> None:
     """Distinct categorical points must not launch byte-identical argparse values."""
     config = _override_yaml(
@@ -539,23 +573,6 @@ def test_validate_rejects_argparse_categorical_wire_collision(tmp_path: Path) ->
 
     with pytest.raises(ValidationError, match="both render as '1'.*override_format='argparse'"):
         load_experiment(config)
-
-
-def test_validate_accepts_hydra_categorical_values_with_distinct_wires(tmp_path: Path) -> None:
-    """Hydra preserves the numeric-versus-string distinction in this grid."""
-    config = _override_yaml(
-        tmp_path,
-        "hydra",
-        "        phases:\n"
-        "          - name: t\n"
-        "            n_trials: 2\n"
-        "            sampler: {type: grid}\n"
-        "            search_space:\n"
-        "              knob: {type: categorical, choices: [1, '1']}\n",
-    )
-
-    experiment = load_experiment(config)
-    assert experiment.phases[0].search_space["knob"].choices == [1, "1"]
 
 
 def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_path):
@@ -582,75 +599,12 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
     assert len(set(fingerprints.values())) == len(fingerprints)
 
 
-def test_suite_argparse_study_rejects_a_shared_structured_contract_value(tmp_path):
-    """A contract shared between a json_file study and an argparse study is only
-    legal for the json_file one; loading rejects the whole invalid suite."""
-    path = write_yaml(
-        tmp_path,
-        """
-            suite: mixed_formats
-            defaults:
-              trial_command: "echo {overrides}"
-              override_format: argparse
-              metric:
-                name: x
-                goal: minimize
-                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
-              contracts:
-                frozen:
-                  fixed_overrides:
-                    model: {depth: 2}
-            studies:
-              - name: structured
-                override_format: json_file
-                trial_command: "echo {overrides_path}"
-                phases: [{name: p, n_trials: 1, contracts: [frozen]}]
-              - name: flat
-                override_format: argparse
-                phases: [{name: p, n_trials: 1, contracts: [frozen]}]
-            """,
-    )
-
-    with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):
-        load_config(path)
-    config = Suite.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
-    structured, flat = config.studies
-    config.experiment_for_study(structured)
-    with pytest.raises(ValidationError, match="override_format='argparse'.*type dict"):
-        config.experiment_for_study(flat)
-
-
-@pytest.mark.parametrize(
-    ("literal", "expected"),
-    [
-        pytest.param('"2024-01-01"', "2024-01-01", id="quoted-date"),
-        pytest.param("{depth: 2}", {"depth": 2}, id="mapping"),
-    ],
-)
-def test_validate_accepts_json_file_fixed_override(
-    tmp_path, literal: str, expected: object
-) -> None:
-    """The explicit JSON compatibility wire retains its structured value support."""
-    p = _override_yaml(
-        tmp_path,
-        "json_file",
-        "        phases:\n"
-        "          - name: p\n"
-        "            n_trials: 1\n"
-        "            fixed_overrides:\n"
-        f"              knob: {literal}\n",
-    )
-
-    exp = load_experiment(p)
-
-    assert exp.phases[0].fixed_overrides["knob"] == expected
-
-
 # ---- migrated from version-named files ----
 
 
-def test_effective_overrides_include_fixed(tmp_path):
-    """Winner's effective_overrides must include parent's fixed_overrides, not just sampled params."""
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_effective_overrides_include_fixed(tmp_path, override_format):
+    """The packaged trainer consumes dotted inherited CLI values in both supported forms."""
     trainer = copy_fake_train(tmp_path)
 
     db_path = tmp_path / "phases.db"
@@ -660,7 +614,7 @@ storage: sqlite:///{db_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} {{overrides}}"
-override_format: argparse
+override_format: {override_format}
 metric:
   name: eval_loss
   goal: minimize
@@ -668,29 +622,36 @@ metric:
 phases:
   - name: arch
     fixed_overrides:
-      model_family: llama
+      model.dropout: 0.2
     n_trials: 2
     sampler: {{ type: grid }}
     search_space:
-      n_layers: {{ type: categorical, choices: [4, 8] }}
+      model.n_layers: {{ type: categorical, choices: [4, 8] }}
   - name: opt
     inherits: [arch]
-    n_trials: 4
-    sampler: {{ type: tpe, seed: 0, acknowledge_nonresumable: true }}
+    n_trials: 2
+    sampler: {{ type: grid }}
     search_space:
-      lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }}
+      optimizer.lr: {{ type: categorical, choices: [1.0e-5, 0.0003] }}
 """
     yaml_path = tmp_path / "exp.yaml"
     yaml_path.write_text(yaml_text)
     exp = load_experiment(yaml_path)
     winners = run_experiment(exp)
 
-    # The opt phase winner should have model_family in effective_overrides
+    # The opt phase winner should have the parent's fixed override and sampled
+    # dotted key. The 1e-5 categorical value is rendered in exponent form,
+    # which the fake trainer must parse on both compatibility wires.
     opt_winner = winners["opt"]
-    assert "model_family" in opt_winner.effective_overrides
-    assert opt_winner.effective_overrides["model_family"] == "llama"
-    # And also the inherited n_layers
-    assert "n_layers" in opt_winner.effective_overrides
+    assert opt_winner.effective_overrides["model.dropout"] == 0.2
+    assert opt_winner.effective_overrides["model.n_layers"] == 8
+    assert opt_winner.effective_overrides["optimizer.lr"] == 0.0003
+
+    result_paths = sorted((Path(exp.workdir) / exp.experiment / "opt").glob("trial_*/result.json"))
+    assert len(result_paths) == 2
+    consumed = [json.loads(path.read_text())["config"] for path in result_paths]
+    assert {values["lr"] for values in consumed} == {1e-5, 0.0003}
+    assert {values["n_layers"] for values in consumed} == {8}
 
 
 def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
@@ -727,126 +688,6 @@ def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
         load_experiment(p)
 
 
-def test_promotion_fallback_key_cannot_be_resampled_by_descendant(tmp_path: Path) -> None:
-    """Fallback exports make the baseline's keys immutable to descendants."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: depth
-            n_trials: 1
-            search_space:
-              depth: {{ type: int, low: 8, high: 8 }}
-          - name: learning_rate
-            n_trials: 1
-            search_space:
-              lr: {{ type: int, low: 3, high: 3 }}
-            promotion:
-              min_delta_vs: depth
-              min_delta: 1
-              on_fail: continue_baseline
-          - name: regularization
-            inherits: [learning_rate]
-            n_trials: 1
-            search_space:
-              depth: {{ type: int, low: 16, high: 16 }}
-        """,
-    )
-
-    with pytest.raises(ValidationError, match="re-samples key"):
-        load_experiment(p)
-
-
-@pytest.mark.parametrize(
-    ("phases", "match"),
-    [
-        pytest.param(
-            """
-              - name: base
-                n_trials: 1
-                fixed_overrides: { depth: 8 }
-              - name: first
-                n_trials: 1
-                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
-              - name: second
-                n_trials: 1
-                promotion: { min_delta_vs: first, min_delta: 1, on_fail: continue_baseline }
-              - name: child
-                inherits: [second]
-                n_trials: 1
-                search_space: { depth: { type: int, low: 16, high: 16 } }
-            """,
-            "re-samples key",
-            id="transitive-fallback",
-        ),
-        pytest.param(
-            """
-              - name: base
-                n_trials: 1
-                fixed_overrides: { depth: 8 }
-              - name: fallback
-                n_trials: 1
-                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
-              - name: other
-                n_trials: 1
-                fixed_overrides: { depth: 16 }
-              - name: child
-                inherits: [fallback, other]
-                n_trials: 1
-            """,
-            "conflicting locked key",
-            id="multi-parent-conflict",
-        ),
-        pytest.param(
-            """
-              - name: base
-                n_trials: 1
-                fixed_overrides: { model: base }
-              - name: fallback
-                n_trials: 1
-                promotion: { min_delta_vs: base, min_delta: 1, on_fail: continue_baseline }
-              - name: child
-                inherits: [fallback]
-                n_trials: 1
-                search_space: { model.depth: { type: int, low: 8, high: 8 } }
-            """,
-            "dotted-key namespace collision",
-            id="dotted-key-collision",
-        ),
-    ],
-)
-def test_promotion_fallback_keys_reach_all_descendant_validators(
-    tmp_path: Path, phases: str, match: str
-) -> None:
-    """Possible fallback exports participate in every descendant key check."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-        {phases}
-        """,
-    )
-
-    with pytest.raises(ValidationError, match=match):
-        load_experiment(p)
-
-
 def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
     """The runtime keeps malformed or stale configs from replacing inherited winners."""
     from phasesweep.engine.phase import _composed_overrides
@@ -870,44 +711,7 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
     }
 
     with pytest.raises(ValueError, match="re-samples inherited winner key"):
-        _composed_overrides(experiment, stale_child, {"depth": 16}, inherited)
-
-
-def test_correlated_promotion_outcomes_can_rejoin_through_two_parents() -> None:
-    """A diamond may reuse one promotion branch without combining both branches."""
-    experiment = make_experiment(
-        trial_command="echo {config_path}",
-        override_format="yaml_file",
-        phases=[
-            Phase(name="base", n_trials=1, fixed_overrides={"model": {"depth": 8}}),
-            Phase(
-                name="choice",
-                n_trials=1,
-                fixed_overrides={"model.depth": 16},
-                promotion={
-                    "min_delta_vs": "base",
-                    "min_delta": 1,
-                    "on_fail": "continue_baseline",
-                },
-            ),
-            Phase(name="left", n_trials=1, inherits=["choice"], fixed_overrides={"left": 1}),
-            Phase(name="right", n_trials=1, inherits=["choice"], fixed_overrides={"right": 1}),
-            Phase(
-                name="later",
-                n_trials=1,
-                inherits=["left", "right"],
-                fixed_overrides={"lr": 0.01},
-            ),
-        ],
-    )
-
-    assert [phase.name for phase in experiment.phases] == [
-        "base",
-        "choice",
-        "left",
-        "right",
-        "later",
-    ]
+        _composed_overrides(stale_child, {"depth": 16}, inherited)
 
 
 @pytest.mark.parametrize(
@@ -920,7 +724,7 @@ def test_correlated_promotion_outcomes_can_rejoin_through_two_parents() -> None:
     ],
 )
 def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: str, valid: bool):
-    """A child must explicitly resolve a key locked by multiple parents."""
+    """A child must explicitly resolve a key from independent parent origins."""
     p = write_yaml(
         tmp_path,
         f"""
@@ -949,29 +753,9 @@ def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: st
         """,
     )
     if not valid:
-        with pytest.raises(ValidationError, match="conflicting locked key"):
+        with pytest.raises(ValidationError, match="conflicting key"):
             load_experiment(p)
         return
     exp = load_experiment(p)
     child = exp.phases[-1]
     assert child.fixed_overrides["lr"] == 5.0e-4
-
-    # Exercise the runtime merge too: inherited winners are the lowest layer,
-    # the explicit fixed resolution replaces both, and sampled keys remain the
-    # final layer.
-    from phasesweep.engine.phase import _composed_overrides
-    from phasesweep.engine.state import Winner
-
-    inherited = {
-        name: Winner(
-            trial_number=index,
-            params={"lr": value},
-            effective_overrides={"lr": value},
-            metric=value,
-        )
-        for index, (name, value) in enumerate((("a", 1.0e-4), ("b", 2.0e-4)))
-    }
-    assert _composed_overrides(exp, child, {"dropout": 0.25}, inherited) == {
-        "lr": 5.0e-4,
-        "dropout": 0.25,
-    }

@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any, assert_never
 
 import optuna
-import sqlalchemy
 from optuna.exceptions import ExperimentalWarning
 from optuna.storages import JournalStorage
 from optuna.storages.journal import BaseJournalBackend
@@ -29,8 +28,13 @@ from phasesweep.config import (
     SearchParam,
     grid_search_space,
 )
-from phasesweep.engine.errors import StudyStorageUnavailableError
-from phasesweep.engine.state import ATTEMPT_ID_ATTR, GENERATION_ID_ATTR
+from phasesweep.engine.errors import StudySchemaMismatchError, StudyStorageUnavailableError
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    GENERATION_ID_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+)
 from phasesweep.runtime.files import (
     file_url_path,
     sqlite_database_path,
@@ -81,45 +85,21 @@ class _PhaseTrialStats:
 def _published_phase_trial_refs(
     summary: Mapping[str, Any] | None,
 ) -> dict[str, _TrialRef | None]:
-    """Return each published phase's local winning or promotion-candidate identity.
-
-    A continued baseline belongs to an earlier phase. Its promotion record
-    identifies the local candidate whose history must survive in this phase.
-    A skipped candidate has no exposed winner; its identity is retained in
-    the summary's promotion decisions instead.
+    """Return each published phase's local winning-trial identity.
 
     :param Mapping[str, Any] | None summary: Already-resolved publication summary.
     :return dict[str, _TrialRef | None]: Local trial identities by phase, with
         their known terminal-count boundary; None when a published phase does
         not record a complete identity.
     """
-    phase_items = {
-        item["name"]: item
-        for item in (summary or {}).get("phases", ())
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    for decision in (summary or {}).get("promotion_decisions", ()):
-        if (
-            isinstance(decision, Mapping)
-            and decision.get("action") == "skip"
-            and isinstance(decision.get("phase"), str)
-        ):
-            phase_items.setdefault(
-                decision["phase"],
-                {
-                    "name": decision["phase"],
-                    "promotion": decision,
-                    "completion": decision.get("candidate_completion"),
-                },
-            )
     refs: dict[str, _TrialRef | None] = {}
-    for name, item in phase_items.items():
-        promotion = item.get("promotion")
-        source = promotion if isinstance(promotion, Mapping) else item
-        prefix = "candidate_" if isinstance(promotion, Mapping) else ""
-        number = source.get(f"{prefix}trial_number")
-        generation = source.get(f"{prefix}generation_id")
-        attempt = source.get(f"{prefix}attempt_id")
+    for item in (summary or {}).get("phases", ()):
+        if not isinstance(item, Mapping) or not isinstance(item.get("name"), str):
+            continue
+        name = item["name"]
+        number = item.get("trial_number")
+        generation = item.get("generation_id")
+        attempt = item.get("attempt_id")
         completion = item.get("completion")
         finished_trials = (
             completion.get("finished_trials")
@@ -310,8 +290,7 @@ def _resolve_storage(url: str | None) -> Any:
         (not resumable).
       * ``journal:///path.journal`` -> Optuna ``JournalStorage(JournalFileBackend(path))``.
         Safe for parallel ``n_jobs`` on a single host.
-      * Anything else (``sqlite:///``, ``postgresql://``, ``mysql://``, ...) -> passed to
-        Optuna unchanged.
+      * ``sqlite:///path.db`` -> passed to Optuna unchanged.
 
     ``Experiment.resolved_storage`` selects the URL for ``storage: auto`` before
     this helper is called. Explicit SQLite URLs are never rewritten; validation
@@ -323,8 +302,7 @@ def _resolve_storage(url: str | None) -> Any:
 
     Returns:
         ``None`` for in-memory; a configured ``JournalStorage`` for the
-        ``journal:///`` scheme; the URL string unchanged otherwise (passed
-        through to Optuna's RDB-aware loader).
+        ``journal:///`` scheme; the SQLite URL unchanged otherwise.
 
     """
     if url is None or storage_is_in_memory(url):
@@ -381,12 +359,10 @@ def _load_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Stud
     :return optuna.Study: Existing Optuna study for the phase.
     """
     assert experiment.resolved_storage is not None
-    storage = (
-        _resolve_storage(experiment.resolved_storage)
-        if storage_backend(experiment.resolved_storage) == "journal"
-        else optuna.storages.RDBStorage(experiment.resolved_storage, skip_table_creation=True)
+    return optuna.load_study(
+        study_name=_phase_study_name(experiment, phase),
+        storage=_resolve_storage(experiment.resolved_storage),
     )
-    return optuna.load_study(study_name=_phase_study_name(experiment, phase), storage=storage)
 
 
 def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
@@ -438,36 +414,6 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
         raise StudyStorageUnavailableError(
             f"SQLite storage {database} exists but could not be read while checking for "
             f"study {_phase_study_name(experiment, phase)!r}."
-        ) from exc
-    return row is not None
-
-
-def _rdb_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
-    """Return whether external RDB storage contains a phase study.
-
-    :param Experiment experiment: Parsed experiment with external RDB storage.
-    :param Phase | str phase: Phase or historical phase name to check.
-    :return bool: ``True`` when the storage contains the named study, ``False`` when its
-        Optuna ``studies`` table does not exist or contains no matching row.
-    :raises StudyStorageUnavailableError: The storage or its study table could not be read.
-    """
-    assert experiment.resolved_storage is not None
-    try:
-        engine = sqlalchemy.create_engine(experiment.resolved_storage)
-        try:
-            if not sqlalchemy.inspect(engine).has_table("studies"):
-                return False
-            with engine.connect() as connection:
-                row = connection.execute(
-                    sqlalchemy.text("SELECT 1 FROM studies WHERE study_name = :study_name"),
-                    {"study_name": _phase_study_name(experiment, phase)},
-                ).fetchone()
-        finally:
-            engine.dispose()
-    except Exception as exc:  # noqa: BLE001 - mutating preflight must fail closed
-        raise StudyStorageUnavailableError(
-            f"External RDB storage could not be read while checking for study "
-            f"{_phase_study_name(experiment, phase)!r}."
         ) from exc
     return row is not None
 
@@ -591,26 +537,144 @@ def _existing_phase_study_names(experiment: Experiment) -> tuple[str, ...]:
                 "Journal storage could not be replayed while listing phase studies."
             ) from exc
     else:
-        try:
-            engine = sqlalchemy.create_engine(experiment.resolved_storage)
-            try:
-                if not sqlalchemy.inspect(engine).has_table("studies"):
-                    return ()
-                with engine.connect() as connection:
-                    names = [
-                        row[0]
-                        for row in connection.execute(
-                            sqlalchemy.text("SELECT study_name FROM studies")
-                        )
-                    ]
-            finally:
-                engine.dispose()
-        except Exception as exc:  # noqa: BLE001 - rebind planning cannot guess omitted studies
-            raise StudyStorageUnavailableError(
-                "External RDB storage could not be read while listing phase studies."
-            ) from exc
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     prefix = f"{experiment.experiment}::"
     return tuple(sorted(name[len(prefix) :] for name in names if name.startswith(prefix)))
+
+
+def _validate_local_storage_format(experiment: Experiment) -> None:
+    """Reject pre-cutover PhaseSweep studies without mutating local storage.
+
+    The check covers every PhaseSweep-shaped study in the selected local
+    ledger, not only studies belonging to the current experiment name. This
+    prevents a new experiment name or output directory from treating a
+    populated pre-cutover ledger as fresh. SQLite is opened read-only and a
+    journal is replayed from an observational snapshot before Optuna can
+    initialize, stamp, recover, or otherwise mutate the live backend.
+
+    :param Experiment experiment: Experiment whose resolved local ledger is inspected.
+    :raises StudyStorageUnavailableError: An existing local ledger cannot be
+        inspected without mutation.
+    :raises StudySchemaMismatchError: A populated PhaseSweep study is unmarked,
+        or a PhaseSweep study uses a pre-cutover/unsupported schema.
+    """
+    storage = experiment.resolved_storage
+    if storage_is_in_memory(storage):
+        return
+    assert storage is not None
+    backend = storage_backend(storage)
+    versions: list[tuple[str, object, bool]] = []
+    if backend == "sqlite":
+        database = sqlite_database_path(storage)
+        uri = sqlite_readonly_uri(storage)
+        if database is None or uri is None or not database.exists():
+            return
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=0.1)
+            try:
+                tables = {
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if "studies" not in tables:
+                    return
+                studies = [
+                    (int(study_id), str(name))
+                    for study_id, name in conn.execute(
+                        "SELECT study_id, study_name FROM studies"
+                    ).fetchall()
+                    if "::" in str(name)
+                ]
+                if not studies:
+                    return
+                attrs: dict[str, object] = {}
+                if "study_user_attributes" in tables:
+                    rows = conn.execute(
+                        """
+                        SELECT studies.study_name, study_user_attributes.value_json
+                        FROM studies
+                        JOIN study_user_attributes
+                          ON studies.study_id = study_user_attributes.study_id
+                        WHERE study_user_attributes.key = ?
+                        """,
+                        (STUDY_SCHEMA_ATTR,),
+                    ).fetchall()
+                    for study_name, value_json in rows:
+                        try:
+                            attrs[str(study_name)] = json.loads(value_json)
+                        except (TypeError, json.JSONDecodeError):
+                            attrs[str(study_name)] = value_json
+                populated_study_ids = (
+                    {
+                        int(study_id)
+                        for (study_id,) in conn.execute(
+                            "SELECT DISTINCT study_id FROM trials"
+                        ).fetchall()
+                    }
+                    if "trials" in tables
+                    else set()
+                )
+                versions = [
+                    (name, attrs.get(name), study_id in populated_study_ids)
+                    for study_id, name in studies
+                ]
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            raise StudyStorageUnavailableError(
+                f"SQLite storage {database} could not be inspected for its PhaseSweep "
+                "format without mutation."
+            ) from exc
+    elif backend == "journal":
+        snapshot = _journal_snapshot_storage(storage, "the PhaseSweep format boundary")
+        if snapshot is None:
+            return
+        try:
+            versions = [
+                (
+                    study.study_name,
+                    study.user_attrs.get(STUDY_SCHEMA_ATTR),
+                    bool(snapshot.get_all_trials(study._study_id, deepcopy=False)),
+                )
+                for study in snapshot.get_all_studies()
+                if "::" in study.study_name
+            ]
+        except Exception as exc:
+            raise StudyStorageUnavailableError(
+                "Journal storage could not be replayed while checking its PhaseSweep format."
+            ) from exc
+    else:
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
+
+    _validate_storage_versions(versions)
+
+
+def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> None:
+    """Reject unsupported PhaseSweep study versions from one storage snapshot.
+
+    :param Iterable[tuple[str, object, bool]] versions: Study name, decoded schema
+        version, and whether the study contains trials.
+    :raises StudySchemaMismatchError: A populated study is unmarked or any study
+        carries an unsupported explicit schema version.
+    """
+    # Match _validate_study_schema: create_study can survive an interruption
+    # before the first schema stamp, and an empty unmarked study is claimable.
+    unsupported = [
+        (name, version)
+        for name, version, has_trials in versions
+        if (type(version) is not int or version != STUDY_SCHEMA_VERSION)
+        and (version is not None or has_trials)
+    ]
+    if unsupported:
+        detail = ", ".join(f"{name!r} ({version!r})" for name, version in unsupported)
+        raise StudySchemaMismatchError(
+            "The selected local storage ledger contains pre-cutover or unsupported "
+            f"PhaseSweep study state: {detail}. Use a fresh local storage ledger and "
+            "artifact root with this PhaseSweep release, or use the preserved PhaseSweep "
+            "0.3.1 environment to operate the existing state. Nothing was written."
+        )
 
 
 def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study | None:
@@ -642,9 +706,8 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> op
         # Preflight verified a complete snapshot. Mutating callers still use
         # Optuna's normal backend, including its concurrent-append semantics.
         return _load_phase_study(experiment, phase)
-    elif not _rdb_study_exists(experiment, phase):
-        # Optuna initializes its schema even when load_study finds no study.
-        return None
+    else:
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     try:
         return _load_phase_study(experiment, phase)
     except KeyError:
@@ -672,31 +735,69 @@ _PHASE_TRIAL_STATS_SQL = """
         SELECT trials.number,
                trials.state,
                generation.value_json AS generation_json,
-               attempt.value_json AS attempt_json
+               attempt.value_json AS attempt_json,
+               schema.value_json AS schema_json
         FROM trials
         JOIN studies ON trials.study_id = studies.study_id
         LEFT JOIN trial_user_attributes AS generation
           ON trials.trial_id = generation.trial_id AND generation.key = :generation_key
         LEFT JOIN trial_user_attributes AS attempt
           ON trials.trial_id = attempt.trial_id AND attempt.key = :attempt_key
+        LEFT JOIN study_user_attributes AS schema
+          ON studies.study_id = schema.study_id AND schema.key = :study_schema_key
         WHERE studies.study_name = :study_name
+    ),
+    unsupported_study AS (
+        SELECT studies.study_name,
+               schema.value_json AS schema_json,
+               EXISTS(
+                   SELECT 1 FROM trials AS ledger_trials
+                   WHERE ledger_trials.study_id = studies.study_id
+               ) AS has_trials
+        FROM studies
+        LEFT JOIN study_user_attributes AS schema
+          ON studies.study_id = schema.study_id AND schema.key = :study_schema_key
+        WHERE :validate_storage_format = 1
+          AND instr(studies.study_name, '::') > 0
+          AND (
+              (
+                  schema.value_json IS NULL
+                  AND EXISTS(
+                      SELECT 1 FROM trials AS ledger_trials
+                      WHERE ledger_trials.study_id = studies.study_id
+                  )
+              )
+              OR (
+                  schema.value_json IS NOT NULL
+                  AND schema.value_json != :expected_study_schema_json
+              )
+          )
+        ORDER BY studies.study_id
+        LIMIT 1
     )
-    SELECT 'count', NULL, state, generation_json, NULL, COUNT(*)
+    SELECT 'count', NULL, state, generation_json, NULL, COUNT(*), schema_json
     FROM phase_trials
-    GROUP BY state, generation_json
+    GROUP BY state, generation_json, schema_json
     UNION ALL
-    SELECT 'running', number, state, generation_json, attempt_json, 1
+    SELECT 'running', number, state, generation_json, attempt_json, 1, schema_json
     FROM phase_trials
     WHERE state = 'RUNNING'
     UNION ALL
-    SELECT 'published', number, state, generation_json, attempt_json, 1
+    SELECT 'published', number, state, generation_json, attempt_json, 1, schema_json
     FROM phase_trials
     WHERE number = :published_trial_number
+    UNION ALL
+    SELECT 'schema', NULL, study_name, NULL, NULL, has_trials, schema_json
+    FROM unsupported_study
 """
 
 
 def _phase_trial_stats_params(
-    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None
+    experiment: Experiment,
+    phase: Phase,
+    published_trial: _TrialRef | None,
+    *,
+    validate_storage_format: bool,
 ) -> dict[str, str | int]:
     """Return bind parameters for the observational phase-trial SQL query.
 
@@ -704,12 +805,17 @@ def _phase_trial_stats_params(
     :param Phase phase: Phase whose study is queried.
     :param _TrialRef | None published_trial: Published local trial whose number is included,
         or ``None`` to bind ``published_trial_number`` to ``-1``.
+    :param bool validate_storage_format: Whether this snapshot must also reject
+        unsupported studies anywhere in the ledger.
     :return dict[str, str | int]: Attribute keys, study name, and published trial number;
         only the trial number from ``published_trial`` is used.
     """
     return {
         "generation_key": GENERATION_ID_ATTR,
         "attempt_key": ATTEMPT_ID_ATTR,
+        "study_schema_key": STUDY_SCHEMA_ATTR,
+        "expected_study_schema_json": json.dumps(STUDY_SCHEMA_VERSION),
+        "validate_storage_format": int(validate_storage_format),
         "study_name": _phase_study_name(experiment, phase),
         "published_trial_number": published_trial.trial_number if published_trial else -1,
     }
@@ -720,9 +826,6 @@ def _unavailable_phase_trial_stats(
 ) -> _PhaseTrialStats:
     """Log a storage-read failure and return an unavailable phase-trial snapshot.
 
-    External RDB URLs and driver messages can contain credentials, so those
-    warnings report only the backend and exception type.
-
     :param Experiment experiment: Config whose storage backend or local path is reported.
     :param Phase phase: Phase whose status read failed.
     :param BaseException exc: Read exception whose direct cause is reported when present.
@@ -730,27 +833,22 @@ def _unavailable_phase_trial_stats(
         ``available=False``.
     """
     cause = exc.__cause__ or exc
-    backend = storage_backend(experiment.resolved_storage)
-    if backend in {"sqlite", "journal"}:
-        log.warning(
-            "could not read status trial data from storage %s for phase %s: %s: %s",
-            experiment.resolved_storage,
-            phase.name,
-            type(cause).__name__,
-            cause,
-        )
-    else:
-        log.warning(
-            "could not read status trial data from %s storage for phase %s: %s",
-            backend,
-            phase.name,
-            type(cause).__name__,
-        )
+    log.warning(
+        "could not read status trial data from storage %s for phase %s: %s: %s",
+        experiment.resolved_storage,
+        phase.name,
+        type(cause).__name__,
+        cause,
+    )
     return _PhaseTrialStats({}, False, {}, None)
 
 
 def _sqlite_phase_trial_stats(
-    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+    experiment: Experiment,
+    phase: Phase,
+    published_trial: _TrialRef | None = None,
+    *,
+    validate_storage_format: bool = False,
 ) -> _PhaseTrialStats:
     """Return trial-state counts and RUNNING identities in one SQLite read.
 
@@ -772,6 +870,8 @@ def _sqlite_phase_trial_stats(
     :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
     :param Phase phase: Phase whose stable Optuna study name is counted.
     :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
+    :param bool validate_storage_format: Whether this same snapshot must also
+        reject unsupported studies anywhere in the ledger.
     :return _PhaseTrialStats: Counts, RUNNING identities, and an availability
         flag; counts are empty, running attempts ``None``, and availability
         false when the DB cannot be read safely.
@@ -793,39 +893,16 @@ def _sqlite_phase_trial_stats(
         try:
             rows = conn.execute(
                 _PHASE_TRIAL_STATS_SQL,
-                _phase_trial_stats_params(experiment, phase, published_trial),
+                _phase_trial_stats_params(
+                    experiment,
+                    phase,
+                    published_trial,
+                    validate_storage_format=validate_storage_format,
+                ),
             ).fetchall()
         finally:
             conn.close()
     except sqlite3.Error as exc:
-        return _unavailable_phase_trial_stats(experiment, phase, exc)
-    return _trial_stats_from_rows(
-        rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
-    )
-
-
-def _rdb_phase_trial_stats(
-    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
-) -> _PhaseTrialStats:
-    """Inspect external SQL storage without Optuna's schema-initializing loader.
-
-    :param Experiment experiment: Config containing the external storage URL.
-    :param Phase phase: Phase whose trial counts and running identities are read.
-    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
-    :return _PhaseTrialStats: One snapshot, or an unavailable observation on read failure.
-    """
-    assert experiment.resolved_storage is not None
-    try:
-        engine = sqlalchemy.create_engine(experiment.resolved_storage)
-        try:
-            with engine.connect() as connection:
-                rows = connection.execute(
-                    sqlalchemy.text(_PHASE_TRIAL_STATS_SQL),
-                    _phase_trial_stats_params(experiment, phase, published_trial),
-                ).fetchall()
-        finally:
-            engine.dispose()
-    except Exception as exc:  # noqa: BLE001 - status reports unavailable on any connection/read failure
         return _unavailable_phase_trial_stats(experiment, phase, exc)
     return _trial_stats_from_rows(
         rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
@@ -846,8 +923,21 @@ def _trial_stats_from_rows(
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
     published_trial_available = False
-    for row_kind, number, state, generation_json, attempt_json, tally in rows:
+    study_schema: object = None
+    storage_versions: list[tuple[str, object, bool]] = []
+    for row_kind, number, state, generation_json, attempt_json, tally, schema_json in rows:
+        try:
+            decoded_schema = (
+                json.loads(schema_json) if isinstance(schema_json, str) else schema_json
+            )
+        except (TypeError, json.JSONDecodeError):
+            decoded_schema = schema_json
         state_name = str(state)
+        if row_kind == "schema":
+            storage_versions.append((state_name, decoded_schema, bool(tally)))
+            continue
+        if study_schema is None:
+            study_schema = decoded_schema
         generation_id = _decoded_string_attr(generation_json)
         if row_kind == "count":
             count = int(tally)
@@ -883,13 +973,23 @@ def _trial_stats_from_rows(
                 attempt_id=_decoded_string_attr(attempt_json),
             )
         )
+    _validate_storage_versions(storage_versions)
+    if counts and (type(study_schema) is not int or study_schema != STUDY_SCHEMA_VERSION):
+        raise StudySchemaMismatchError(
+            f"Study {study_name!r} uses pre-cutover or unsupported schema "
+            f"{study_schema!r}; expected {STUDY_SCHEMA_VERSION}."
+        )
     return _PhaseTrialStats(
         counts, True, generation_counts, running_attempts, published_trial_available
     )
 
 
 def _phase_trial_stats(
-    experiment: Experiment, phase: Phase, published_trial: _TrialRef | None = None
+    experiment: Experiment,
+    phase: Phase,
+    published_trial: _TrialRef | None = None,
+    *,
+    validate_storage_format: bool = False,
 ) -> _PhaseTrialStats:
     """Read counts and RUNNING identities without creating a missing study.
 
@@ -902,22 +1002,55 @@ def _phase_trial_stats(
     :param Experiment experiment: Parsed experiment config containing storage settings.
     :param Phase phase: Phase whose existing study is inspected.
     :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
+    :param bool validate_storage_format: Whether this snapshot must also reject
+        unsupported studies anywhere in the ledger.
     :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
     if experiment.resolved_storage is None:
         return _PhaseTrialStats({}, False, {}, None)
     backend = storage_backend(experiment.resolved_storage)
     if backend == "sqlite":
-        return _sqlite_phase_trial_stats(experiment, phase, published_trial)
-    if backend != "journal":
-        return _rdb_phase_trial_stats(experiment, phase, published_trial)
-    try:
-        study = _load_journal_study_snapshot(
-            experiment.resolved_storage, _phase_study_name(experiment, phase)
+        return _sqlite_phase_trial_stats(
+            experiment,
+            phase,
+            published_trial,
+            validate_storage_format=validate_storage_format,
         )
-        if study is None:
+    if backend != "journal":
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
+    try:
+        snapshot = _journal_snapshot_storage(
+            experiment.resolved_storage,
+            f"study {_phase_study_name(experiment, phase)!r}",
+        )
+        if snapshot is None:
+            return _PhaseTrialStats({}, True, {}, [])
+        if validate_storage_format:
+            _validate_storage_versions(
+                (
+                    study.study_name,
+                    study.user_attrs.get(STUDY_SCHEMA_ATTR),
+                    bool(snapshot.get_all_trials(study._study_id, deepcopy=False)),
+                )
+                for study in snapshot.get_all_studies()
+                if "::" in study.study_name
+            )
+        try:
+            study = optuna.load_study(
+                study_name=_phase_study_name(experiment, phase),
+                storage=snapshot,
+            )
+        except KeyError:
             return _PhaseTrialStats({}, True, {}, [])
         trials = study.get_trials(deepcopy=False)
+        schema = study.user_attrs.get(STUDY_SCHEMA_ATTR)
+        if trials and (type(schema) is not int or schema != STUDY_SCHEMA_VERSION):
+            raise StudySchemaMismatchError(
+                f"Study {study.study_name!r} uses pre-cutover or unsupported schema "
+                f"{schema!r}; expected {STUDY_SCHEMA_VERSION}."
+            )
+    except StudySchemaMismatchError:
+        raise
     except Exception as exc:  # noqa: BLE001
         return _unavailable_phase_trial_stats(experiment, phase, exc)
     counts: dict[str, int] = {}

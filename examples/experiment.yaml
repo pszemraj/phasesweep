@@ -19,6 +19,8 @@ trainer_config:
     weight_decay: 0.05
 
 metric:
+  # The packaged toy trainer uses envelopes. Ordinary JSON, logs, and finished
+  # W&B summaries also work as primary objectives without a reporter import.
   name: eval_loss
   goal: minimize
   extractor:

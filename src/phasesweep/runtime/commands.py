@@ -36,8 +36,7 @@ class _OverrideValueError(TypeError):
             f"override_format={fmt!r} supports null, booleans, integers, finite "
             f"floats, strings, and lists of those; got{where} "
             f"{type(value).__name__}: {value!r}. Use the default "
-            "override_format='yaml_file' for structured trainer configuration, "
-            "or explicit override_format='json_file' for an overrides-only file."
+            "override_format='yaml_file' for structured trainer configuration."
         )
 
 
@@ -62,7 +61,16 @@ def _render_override_value(
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        return value if fmt == "argparse" else json.dumps(value)
+        if fmt == "argparse":
+            return value
+        # OmegaConf resolves interpolations even inside Hydra quoted strings.
+        # Literal interpolation syntax is deliberately outside this wire contract.
+        if "${" in value or any(ord(char) < 32 for char in value):
+            raise _OverrideValueError(fmt, value, position)
+        # Hydra only unescapes backslashes preceding a quote (including the
+        # closing quote). JSON escaping changes other backslashes and Unicode.
+        escaped = re.sub(r'\\+(?="|$)', lambda match: match.group() * 2, value)
+        return '"' + escaped.replace('"', '\\"') + '"'
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
@@ -91,23 +99,60 @@ def _render_override_value(
 
 
 def format_hydra(overrides: dict[str, Any]) -> str:
-    """Hydra-style: ``key=value``, each token unconditionally quoted.
+    """Render native Hydra arguments without importing the trainer's SDK.
 
-    Args:
-        overrides: Mapping from override key to value.
-
-    Returns:
-        A single space-separated string of shell-quoted ``key=value`` tokens.
-
-    Raises:
-        TypeError: A value is outside the shared CLI override contract (see
-            :func:`_render_override_value`).
-
+    :param dict[str, Any] overrides: Scalar/list values keyed by dotted parameter names.
+    :return str: Shell-quoted native ``key=value`` tokens.
+    :raises TypeError: A literal has no faithful supported Hydra representation.
     """
-    parts: list[str] = []
-    for k, v in overrides.items():
-        parts.append(shlex.quote(f"{k}={_render_override_value(v, 'hydra')}"))
-    return " ".join(parts)
+    return " ".join(
+        shlex.quote(f"{key}={_render_override_value(value, 'hydra')}")
+        for key, value in overrides.items()
+    )
+
+
+def dump_overrides_json(payload: Any) -> str:
+    """Encode only JSON-compatible values using the trainer's strict wire format.
+
+    :param Any payload: JSON-compatible scalar, list, or string-keyed mapping.
+    :return str: Deterministic JSON text.
+    :raises TypeError: A value is outside the JSON data model.
+    :raises ValueError: A value is non-finite or recursive.
+    """
+    _validate_trainer_config_value(payload, position="JSON overrides")
+    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
+
+
+def dump_json_file_overrides(overrides: dict[str, Any]) -> str:
+    """Expand dotted keys and serialize the overrides-only trainer input.
+
+    :param dict[str, Any] overrides: Resolved overrides, without a base configuration.
+    :return str: Exact text to write to ``overrides.json``.
+    :raises ValueError: A key collides with another key's namespace.
+    :raises TypeError: A value cannot be represented as JSON.
+    """
+    nested: dict[str, Any] = {}
+    for key, value in overrides.items():
+        parts = key.split(".")
+        if any(".".join(parts[:index]) in overrides for index in range(1, len(parts))):
+            raise ValueError(f"Cannot expand override {key!r}: a parent key is also overridden.")
+        current = nested
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+        current[parts[-1]] = value
+    return dump_overrides_json(nested)
+
+
+def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
+    """Write the nested overrides-only JSON consumed by the trainer.
+
+    :param dict[str, Any] overrides: Resolved dotted overrides.
+    :param Path trial_dir: Attempt directory.
+    :return Path: Written trainer input.
+    """
+    path = trial_dir / "overrides.json"
+    path.write_text(dump_json_file_overrides(overrides), encoding="utf-8")
+    return path
 
 
 def format_argparse(overrides: dict[str, Any]) -> str:
@@ -129,88 +174,6 @@ def format_argparse(overrides: dict[str, Any]) -> str:
     for k, v in overrides.items():
         parts.append(shlex.quote(f"--{k}={_render_override_value(v, 'argparse')}"))
     return " ".join(parts)
-
-
-def dump_overrides_json(payload: Any) -> str:
-    """Serialize an override payload with the canonical strict JSON encoder.
-
-    This is the single definition of "representable as a phasesweep override on
-    the ``json_file`` wire". :func:`write_json_file` writes exactly this text,
-    and config load runs every statically-known override value through the same
-    call so a YAML scalar that PyYAML turned into a non-JSON Python object (an
-    unquoted ``2024-01-01`` becomes :class:`datetime.date`) is rejected by
-    ``phasesweep validate`` instead of by ``json.dumps`` inside the first real
-    trial (review v0.5.17 / finding B). Keep the encoder options here and
-    nowhere else — a second, laxer serializer is how the audit artifact and the
-    wire artifact drift apart.
-
-    :param Any payload: Value or mapping to serialize.
-    :raises TypeError: The payload contains something the strict encoder cannot
-        represent (``default=`` is deliberately not set).
-    :raises ValueError: The payload contains a non-finite float (``inf``,
-        ``-inf``, or ``nan``) — ``allow_nan=False`` rejects the values Python's
-        ``json.dumps`` would otherwise render as the non-standard
-        ``Infinity``/``-Infinity``/``NaN`` tokens, which this repo's own
-        :func:`phasesweep.runtime.json.strict_json_loads` refuses to parse.
-    :return str: Sorted, two-space-indented JSON text with no trailing newline.
-    """
-    return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
-
-
-def dump_json_file_overrides(overrides: dict[str, Any]) -> str:
-    """Serialize JSON-file overrides after expanding dotted keys.
-
-    Args:
-        overrides: Mapping from override key (may contain dots) to value.
-
-    Returns:
-        The exact UTF-8 text for ``overrides.json``.
-
-    Raises:
-        ValueError: A dotted key collides with an existing scalar or would
-            replace a nested object built by another key, or the payload
-            contains a non-finite float.
-        TypeError: The payload contains a value the strict encoder cannot
-            represent.
-
-    """
-    nested: dict[str, Any] = {}
-    for k, v in overrides.items():
-        cur = nested
-        parts = k.split(".")
-        for part in parts[:-1]:
-            next_value = cur.setdefault(part, {})
-            if not isinstance(next_value, dict):
-                raise ValueError(f"Cannot expand override {k!r}: {part!r} is already scalar.")
-            cur = next_value
-        if parts[-1] in cur and isinstance(cur[parts[-1]], dict):
-            raise ValueError(f"Cannot expand override {k!r}: it would replace a nested object.")
-        cur[parts[-1]] = v
-    return dump_overrides_json(nested)
-
-
-def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
-    """Write a JSON overrides file with dotted keys expanded into nested dicts.
-
-    Args:
-        overrides: Mapping from override key (may contain dots) to value.
-        trial_dir: Per-trial directory; the file is written as
-            ``<trial_dir>/overrides.json``.
-
-    Returns:
-        The path to the written ``overrides.json`` file.
-
-    Raises:
-        ValueError: A dotted key collides with an existing scalar or would
-            replace a nested object built by another key, or the payload
-            contains a non-finite float.
-        TypeError: The payload contains a value the strict encoder cannot
-            represent.
-
-    """
-    path = trial_dir / "overrides.json"
-    path.write_text(dump_json_file_overrides(overrides), encoding="utf-8")
-    return path
 
 
 def compose_trainer_config(
@@ -415,19 +378,16 @@ def render_command(
 ) -> str:
     """Substitute placeholders in the user's trial_command template.
 
-    Path-like substitutions (``{trial_dir}``, ``{config_path}``,
-    ``{overrides_path}``) are shell-quoted.
+    Path substitutions (``{trial_dir}``, ``{config_path}``, ``{overrides_path}``)
+    are shell-quoted.
 
     Args:
         template: The user's ``trial_command`` template with ``{...}``
-            placeholders. Supported keys: ``config_path``, ``overrides``,
-            ``overrides_path``, ``trial_dir``, ``trial_id``, ``phase``,
-            ``run_name``.
+            placeholders. Supported keys: ``config_path``, ``overrides``, ``overrides_path``,
+            ``trial_dir``, ``trial_id``, ``phase``, ``run_name``.
         overrides: The composed overrides for this trial.
-        fmt: One of ``"yaml_file"``, ``"argparse"``, ``"json_file"``,
-            ``"hydra"``.
-        trial_dir: Per-trial directory used for ``{trial_dir}`` and for the
-            ``overrides.json`` file when ``fmt == "json_file"``.
+        fmt: One of ``yaml_file``, ``argparse``, ``hydra``, or ``json_file``.
+        trial_dir: Per-trial directory used for ``{trial_dir}``.
         trial_id: Numeric trial number, used for ``{trial_id}``.
         phase: Phase name, used for ``{phase}``.
         run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>``
@@ -435,8 +395,8 @@ def render_command(
         trainer_config: Base trainer configuration embedded in the PhaseSweep
             YAML. Used only by ``yaml_file``.
         write_files: When ``False``, render paths without writing
-            ``trainer_config.yaml`` or ``overrides.json``. Used by dry-run
-            previews so they are filesystem-pure.
+            ``trainer_config.yaml``. Used by dry-run previews so they are
+            filesystem-pure.
         materialized_input_path: Exact generated input already written by the
             launch path. When supplied for a file mode, command rendering uses
             this path without serializing or rewriting the input.
@@ -454,6 +414,7 @@ def render_command(
 
     """
     config_path = ""
+    overrides_path = ""
     if fmt == "yaml_file":
         base = {} if trainer_config is None else trainer_config
         config_substitutions = {
@@ -481,30 +442,26 @@ def render_command(
             dump_trainer_config_yaml(payload)
             config_path = str(trial_dir / "trainer_config.yaml")
         overrides_str = ""
-        overrides_path = ""
     elif fmt == "argparse":
         overrides_str = format_argparse(overrides)
-        overrides_path = ""
-    elif fmt == "json_file":
-        overrides_str = ""
-        if materialized_input_path is not None:
-            overrides_path = str(materialized_input_path)
-        else:
-            overrides_path = str(
-                write_json_file(overrides, trial_dir)
-                if write_files
-                else trial_dir / "overrides.json"
-            )
     elif fmt == "hydra":
         overrides_str = format_hydra(overrides)
-        overrides_path = ""
+    elif fmt == "json_file":
+        if materialized_input_path is not None:
+            overrides_path = str(materialized_input_path)
+        elif write_files:
+            overrides_path = str(write_json_file(overrides, trial_dir))
+        else:
+            dump_json_file_overrides(overrides)
+            overrides_path = str(trial_dir / "overrides.json")
+        overrides_str = ""
     else:
         raise ValueError(f"Unknown override_format: {fmt}")
 
     return template.format(
         config_path=shlex.quote(config_path) if config_path else "",
-        overrides=overrides_str,
         overrides_path=shlex.quote(overrides_path) if overrides_path else "",
+        overrides=overrides_str,
         trial_dir=shlex.quote(str(trial_dir)),
         trial_id=str(trial_id),
         phase=shlex.quote(phase),

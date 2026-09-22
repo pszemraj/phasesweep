@@ -1,4 +1,4 @@
-"""Cross-process locking for experiments and suites."""
+"""Cross-process locking for experiments."""
 
 from __future__ import annotations
 
@@ -9,17 +9,13 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from phasesweep.config import Experiment, Suite
+from phasesweep.config import Experiment
 from phasesweep.engine.errors import (
     ExperimentLockBusyError,
 )
-from phasesweep.engine.paths import (
-    _experiment_dir,
-    _suite_dir,
-)
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.runtime.files import (
     canonical_storage_identity,
-    exclusive_lock,
     storage_is_in_memory,
     try_lock_file,
     unlock_file,
@@ -181,25 +177,3 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
         # acquire-A-then-B / release-B-then-A discipline.
         for handle in reversed(handles):
             unlock_file(handle)
-
-
-@contextlib.contextmanager
-def _suite_lock(suite: Suite) -> Iterator[None]:
-    """Take a same-host lock for suite-level log and summary artifacts.
-
-    :param Suite suite: Parsed suite config whose output directory names the lock.
-    :return Iterator[None]: Context manager yielding ``None`` while the suite lock is held.
-    """
-    # Resolve the leaf as well as the workdir, just like experiment output
-    # ownership. Both the digest and filename prefix must agree for aliases.
-    directory = _suite_dir(suite).resolve()
-    material = {"kind": "suite", "suite_dir": str(directory)}
-    path = _lock_path_from_material(directory.name, material, "suite")
-    with exclusive_lock(
-        path,
-        busy_message=(
-            f"Another phasesweep suite process appears to be using {suite.suite!r} "
-            f"(lock file: {path})."
-        ),
-    ):
-        yield

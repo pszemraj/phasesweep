@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import optuna
 
 from phasesweep.config import Experiment, Phase
+from phasesweep.config.models import _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
 )
@@ -24,9 +25,21 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
     Winner,
+    constraint_attr,
 )
-from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
-from phasesweep.evidence.models import _validate_trial_file_path
+from phasesweep.evidence.evaluation import (
+    EVIDENCE_PROVENANCE_SCHEMA_VERSION,
+    extractor_config_fingerprint,
+    json_float,
+)
+from phasesweep.evidence.models import (
+    JsonExtractor,
+    ObjectiveExtractor,
+    WandbExtractor,
+    WandbQuery,
+    _validate_trial_file_path,
+    _WandbSummarySource,
+)
 from phasesweep.runtime.files import (
     file_sha256,
 )
@@ -49,9 +62,9 @@ _TRIAL_EVIDENCE_REMEDY = (
 _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
 _TRAINER_INPUT_FILENAMES = {
     "yaml_file": "trainer_config.yaml",
-    "json_file": "overrides.json",
     "argparse": "overrides_resolved.json",
     "hydra": "overrides_resolved.json",
+    "json_file": "overrides.json",
 }
 
 
@@ -89,17 +102,19 @@ def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str,
     return generation_id, attempt_id
 
 
-def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, Any] | None:
+def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, Any]:
     """Decode a trial's frozen objective-evidence provenance record.
 
     :param optuna.trial.FrozenTrial trial: Trial whose provenance attr is read.
-    :return dict[str, Any] | None: The parsed record, or ``None`` when the
-        trial predates the record (review v0.5.17 / finding F).
-    :raises TrialEvidenceMissingError: A present provenance record is corrupt
-        or has an unsupported shape.
+    :return dict[str, Any]: The parsed record.
+    :raises TrialEvidenceMissingError: The record is absent, corrupt, or has an
+        unsupported shape.
     """
     if OBJECTIVE_PROVENANCE_ATTR not in trial.user_attrs:
-        return None
+        raise TrialEvidenceMissingError(
+            f"Trial {trial.number} has no {OBJECTIVE_PROVENANCE_ATTR!r} evidence. "
+            f"{_TRIAL_EVIDENCE_REMEDY}"
+        )
     raw = trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR]
     if not isinstance(raw, str) or not raw:
         raise TrialEvidenceMissingError(
@@ -162,19 +177,48 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     source = provenance.get("source")
     if not isinstance(source, Mapping):
         fail("missing source")
-    if kind == "wandb":
-        if source.get("kind") != "wandb" or any(
-            not isinstance(source.get(field), str) or not source[field]
-            for field in ("base_url", "entity", "project", "run_id", "retrieved_at")
-        ):
-            fail("missing W&B source address")
+    capture = provenance.get("remote_capture")
+    if capture is not None:
+        if not isinstance(capture, Mapping) or capture.get("kind") != "wandb":
+            fail("invalid remote capture")
+        for field in ("base_url", "entity", "project", "run_id", "retrieved_at"):
+            if not isinstance(capture.get(field), str) or not capture[field]:
+                fail(f"missing remote {field}")
+        try:
+            target = _WandbSummarySource(
+                base_url=capture["base_url"], entity=capture["entity"], project=capture["project"]
+            )
+        except ValueError:
+            fail("invalid remote target")
+        if target.base_url != capture["base_url"] or capture.get("run_state") != "finished":
+            fail("remote target is not normalized or run is not finished")
+        values = capture.get("values")
+        present = capture.get("present_keys")
         if (
-            source.get("run_state") != "finished"
-            or not isinstance(source.get("summary"), Mapping)
-            or not source["summary"]
+            not isinstance(values, Mapping)
+            or not isinstance(present, list)
+            or any(not isinstance(key, str) or not key for key in present)
         ):
-            fail("missing W&B terminal summary")
-    elif (
+            fail("invalid remote summary subset")
+        for key, value in values.items():
+            try:
+                valid = (
+                    isinstance(key, str)
+                    and bool(key)
+                    and math.isfinite(json_float(value, label=key))
+                )
+            except ValueError:
+                valid = False
+            if not valid:
+                fail("invalid remote numeric evidence")
+    if kind == "wandb":
+        if source.get("kind") != "wandb" or not isinstance(capture, Mapping):
+            fail("W&B objective has no remote capture")
+        key = source.get("metric_key")
+        if not isinstance(key, str) or not key or key not in capture["values"]:
+            fail("W&B objective has no captured metric key")
+        return
+    if (
         source.get("kind") != "file"
         or not isinstance(source.get("path"), str)
         or not source["path"]
@@ -197,12 +241,10 @@ def _verify_objective_source_evidence(
     subject: str,
     verify_digest: bool,
 ) -> None:
-    """Require a trial's frozen objective source to still be on disk as recorded.
+    """Verify the retained local source or the frozen remote capture.
 
-    An absent provenance record is tolerated for trials persisted before the
-    record existed (see :class:`phasesweep.engine.selection.SelectedTrial`). A
-    present record must be complete. A valid ``wandb`` source names a remote
-    run, not a file in this tree.
+    Local records name a file in this trial tree. Remote records are validated
+    without contacting the service again.
 
     :param Path trial_dir: Structurally translated directory for the trial.
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
@@ -210,15 +252,17 @@ def _verify_objective_source_evidence(
     :param bool verify_digest: Also re-hash the source and compare it against
         the recorded ``sha256``. Reserved for the winner (see
         :func:`_verify_winner_objective_evidence`).
-    :raises TrialEvidenceMissingError: A present record is malformed, or its
-        file source is missing, unreadable, or no longer the recorded bytes.
+    :raises TrialEvidenceMissingError: The record is absent or malformed, or
+        its file source is missing, unreadable, or no longer the recorded bytes.
     """
     if provenance is None:
-        return
+        raise TrialEvidenceMissingError(
+            f"{subject} has no objective provenance record. {_TRIAL_EVIDENCE_REMEDY}"
+        )
     _validate_objective_provenance(provenance, subject=subject)
     source = provenance["source"]
     assert isinstance(source, Mapping)  # required by _validate_objective_provenance
-    if source.get("kind") == "wandb":
+    if source["kind"] == "wandb":
         return
     raw_path = str(source["path"])
     candidate = Path(raw_path)
@@ -350,7 +394,10 @@ def _verify_trial_evidence_dir(
     provenance: Mapping[str, Any] | None,
     trainer_input: Any,
     verify_objective_digest: bool,
-    verify_trainer_input: bool = True,
+    extractor: ObjectiveExtractor,
+    metric_value: float,
+    wandb_query: WandbQuery | None,
+    constraints: Mapping[str, Any],
 ) -> None:
     """Require one trial's evidence directory and audit artifacts to still exist.
 
@@ -359,17 +406,11 @@ def _verify_trial_evidence_dir(
     (:func:`_verify_winner_objective_evidence`), so the two can never drift
     apart on what "this trial's evidence is intact" means.
 
-    ``trial_dir`` is always the *structurally translated* directory - the
-    current config's phase directory plus the trial's own directory name -
-    never the absolute path a trial persisted, which a relocated or rebound
-    tree leaves pointing at the old root (same principle as
-    :func:`phasesweep.engine.relocation._validate_relocated_trial_evidence`).
-
-    A trial with no ``attempt_lifecycle.json`` is tolerated (legacy
-    pre-lifecycle attempts), and a present record's ``state`` is deliberately
-    not constrained: the transition to ``exited`` is documented best-effort, so
-    an ``allocated`` record is an ordinary outcome for a trial that completed.
-    Only a malformed or foreign record fails.
+    ``trial_dir`` is always the structurally translated directory: the current
+    config's phase directory plus the trial's own directory name. A lifecycle
+    record is required, but its ``state`` is deliberately not constrained: the
+    transition to ``exited`` is best-effort, so an ``allocated`` record is an
+    ordinary outcome for a completed trial.
 
     :param Path trial_dir: Translated evidence directory for the trial.
     :param str subject: Caller-built label naming the study, phase, and trial.
@@ -377,7 +418,10 @@ def _verify_trial_evidence_dir(
     :param Mapping[str, Any] | None provenance: Parsed objective provenance.
     :param Any trainer_input: Versioned historical generated-input record.
     :param bool verify_objective_digest: Re-hash the objective source as well.
-    :param bool verify_trainer_input: Content-verify the generated trainer input.
+    :param ObjectiveExtractor extractor: Configured primary evidence reader.
+    :param float metric_value: Selected scalar recorded by the study or winner.
+    :param WandbQuery | None wandb_query: Shared remote evidence binding for this phase.
+    :param Mapping[str, Any] constraints: Saved constraint measurements.
     :raises TrialEvidenceMissingError: The directory, an audit artifact, the
         generated trainer input, or recorded objective source is missing,
         foreign, or altered.
@@ -387,26 +431,86 @@ def _verify_trial_evidence_dir(
             f"{subject} has no evidence directory at {str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
         )
     try:
-        read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
+        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
     except ValueError as exc:
         raise TrialEvidenceMissingError(
             f"{subject} has an attempt lifecycle record that is malformed or belongs to "
             f"another attempt ({exc}). {_TRIAL_EVIDENCE_REMEDY}"
         ) from exc
+    if lifecycle is None:
+        raise TrialEvidenceMissingError(
+            f"{subject} has no attempt lifecycle record. {_TRIAL_EVIDENCE_REMEDY}"
+        )
     for filename in _REQUIRED_TRIAL_EVIDENCE_FILES:
         if not (trial_dir / filename).is_file():
             raise TrialEvidenceMissingError(
                 f"{subject} is missing its {filename!r} audit artifact under "
                 f"{str(trial_dir)!r}. {_TRIAL_EVIDENCE_REMEDY}"
             )
-    if verify_trainer_input:
-        _verify_trainer_input_evidence(trial_dir, trainer_input, subject=subject)
+    _verify_trainer_input_evidence(trial_dir, trainer_input, subject=subject)
     _verify_objective_source_evidence(
         trial_dir,
         provenance,
         subject=subject,
         verify_digest=verify_objective_digest,
     )
+    assert provenance is not None
+    recorded_extractor = provenance["extractor"]
+    if recorded_extractor["kind"] != extractor.type or recorded_extractor[
+        "config_sha256"
+    ] != extractor_config_fingerprint(extractor):
+        raise TrialEvidenceMissingError(
+            f"{subject} objective evidence no longer matches its configured extractor "
+            "evaluation contract. The extractor configuration or evaluator revision "
+            "changed after this trial ran, or the saved provenance was altered. "
+            f"{_TRIAL_EVIDENCE_REMEDY}"
+        )
+    capture = provenance.get("remote_capture")
+    if capture is not None and capture["run_id"] != attempt_id:
+        raise TrialEvidenceMissingError(f"{subject} W&B capture belongs to another attempt.")
+    if wandb_query is not None:
+        if (
+            capture is None
+            or any(
+                capture[field] != getattr(wandb_query.source, field)
+                for field in ("base_url", "entity", "project")
+            )
+            or set(capture["values"]) != set(wandb_query.numeric_keys)
+            or capture.get("constraint_keys") != dict(wandb_query.constraint_keys)
+            or capture.get("gate_keys")
+            != {identity: list(keys) for identity, keys in wandb_query.gate_keys}
+            or any(
+                capture["values"].get(key) != constraints.get(name)
+                for name, key in wandb_query.constraint_keys
+            )
+            or not set(wandb_query.presence_keys).issubset(capture["present_keys"])
+        ):
+            raise TrialEvidenceMissingError(
+                f"{subject} W&B capture disagrees with its shared constraint/gate evidence."
+            )
+    elif capture is not None:
+        raise TrialEvidenceMissingError(f"{subject} has undeclared W&B evidence.")
+    if isinstance(extractor, WandbExtractor):
+        source = provenance["source"]
+        if (
+            capture is None
+            or any(
+                capture[field] != getattr(extractor, field)
+                for field in ("base_url", "entity", "project")
+            )
+            or source.get("metric_key") != extractor.metric_key
+            or capture["values"].get(extractor.metric_key) != metric_value
+        ):
+            raise TrialEvidenceMissingError(
+                f"{subject} W&B evidence disagrees with its configured source or selected scalar."
+            )
+    if isinstance(extractor, JsonExtractor) and (
+        provenance["source"].get("path") != extractor.path
+        or provenance["source"].get("key") != extractor.key
+    ):
+        raise TrialEvidenceMissingError(
+            f"{subject} JSON evidence disagrees with its configured path/key."
+        )
 
 
 def _validate_selection_evidence(
@@ -447,6 +551,7 @@ def _validate_selection_evidence(
             if identity is None:
                 continue
             generation_id, attempt_id = identity
+            assert trial.value is not None
             subject = (
                 f"Study {study.study_name!r} phase {phase_name!r} trial {trial.number} "
                 "is eligible to win selection but"
@@ -481,6 +586,16 @@ def _validate_selection_evidence(
                 provenance=_trial_objective_provenance(trial),
                 trainer_input=trial.user_attrs.get(TRAINER_INPUT_ATTR),
                 verify_objective_digest=False,
+                extractor=experiment.metric.extractor,
+                metric_value=float(trial.value),
+                wandb_query=_wandb_query(
+                    experiment,
+                    next(phase.gates for phase in experiment.phases if phase.name == phase_name),
+                ),
+                constraints={
+                    c.name: trial.user_attrs.get(constraint_attr(c.name))
+                    for c in experiment.constraints
+                },
             )
 
 
@@ -528,6 +643,12 @@ def _verify_winner_objective_evidence(
         provenance=selected.objective_provenance,
         trainer_input=selected.trainer_input,
         verify_objective_digest=True,
+        extractor=experiment.metric.extractor,
+        metric_value=selected.metric,
+        wandb_query=_wandb_query(
+            experiment, next(phase.gates for phase in experiment.phases if phase.name == phase_name)
+        ),
+        constraints=selected.constraints,
     )
 
 
@@ -539,15 +660,9 @@ def _verify_skipped_winner_evidence(
     """Content-verify a skipped winner against its concrete source trial.
 
     ``--from-phase`` has no reason to require the prior phase's Optuna study:
-    the authenticated winner artifact contains the source phase, trial, generation,
-    attempt, objective provenance, and (for new publications) generated-input
-    identity needed to inspect the source tree directly. This matters for a
-    promotion fallback, whose exposed phase did not run the selected trial.
-
-    Older winner artifacts predate serialized ``trainer_input``. Their explicit
-    compatibility policy is to retain structural and objective-content verification
-    while omitting only the generated-input hash check that the historical artifact
-    cannot supply; no ledger lookup is used to fill that gap.
+    the authenticated winner artifact contains the source phase, trial,
+    generation, attempt, objective provenance, and generated-input identity
+    needed to inspect the source tree directly.
 
     :param Experiment experiment: Experiment owning the artifact tree.
     :param Phase phase: Exposed skipped phase whose winner is being carried.
@@ -588,5 +703,8 @@ def _verify_skipped_winner_evidence(
         provenance=winner.objective_provenance,
         trainer_input=winner.trainer_input,
         verify_objective_digest=True,
-        verify_trainer_input=winner.trainer_input is not None,
+        extractor=experiment.metric.extractor,
+        metric_value=winner.metric,
+        wandb_query=_wandb_query(experiment, phase.gates),
+        constraints=winner.constraints,
     )

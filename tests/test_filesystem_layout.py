@@ -14,13 +14,11 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
-    Suite,
 )
-from phasesweep.engine import run_experiment, run_suite
+from phasesweep.engine import run_experiment
 from phasesweep.engine.paths import (
     _experiment_dir,
     _phase_dir,
-    _suite_dir,
     _summary_path,
 )
 from phasesweep.engine.run import experiment_status
@@ -135,30 +133,6 @@ def test_inspection_does_not_create_workdir(tmp_path: Path) -> None:
     run_experiment(exp, dry_run=True)
     experiment_status(exp)
     assert not Path(exp.workdir).exists()
-
-
-def test_suite_creates_self_ignoring_artifact_namespaces(tmp_path: Path) -> None:
-    exp = make_experiment(
-        workdir=str(tmp_path / "component"), trial_command="echo x=0.5 {overrides}", n_trials=1
-    )
-    payload = exp.model_dump(mode="json")
-    payload.pop("experiment")
-    phases = payload.pop("phases")
-    suite = Suite.model_validate(
-        {
-            "suite": "suite",
-            "defaults": {**payload, "workdir": str(tmp_path / "runs")},
-            "studies": [{"name": "study", "phases": phases, "workdir": exp.workdir}],
-        }
-    )
-    run_suite(suite, dry_run=True)
-    assert not (tmp_path / "runs").exists()
-    run_suite(suite)
-    compiled = suite.experiment_for_study(suite.studies[0])
-    for artifact_dir in (_suite_dir(suite), _experiment_dir(compiled)):
-        assert (artifact_dir / ".gitignore").read_text() == "*\n"
-    for workdir in (tmp_path / "runs", Path(exp.workdir)):
-        assert not (workdir / ".gitignore").exists()
 
 
 @pytest.mark.parametrize(

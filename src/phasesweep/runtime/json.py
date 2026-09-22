@@ -1,4 +1,4 @@
-"""Strict JSON parsing shared by result evidence and installer edits."""
+"""Strict JSON parsing shared by result evidence and runtime state."""
 
 from __future__ import annotations
 

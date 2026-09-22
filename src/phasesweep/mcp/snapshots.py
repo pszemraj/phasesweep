@@ -12,7 +12,6 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import PhaseWinnerView, read_status, read_winners
-from phasesweep.engine.artifacts import _winner_source_or_default
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
@@ -96,7 +95,7 @@ class StatusSnapshot(_SnapshotModel):
 
     ``current_generation_id`` and ``published_generation_id`` record the
     mutable/last-success pointers at capture time. Run-scoped MCP reads keep
-    them frozen so a later artifact relocation or generation cannot rewrite
+    them frozen so a later generation cannot rewrite
     this run's historical result.
     ``represented_generation_id`` is the generation whose winner/summary facts
     this snapshot shows. ``is_published`` records that relationship at capture
@@ -108,26 +107,22 @@ class StatusSnapshot(_SnapshotModel):
     published_generation_id: str | None = None
     represented_generation_id: str | None = None
     is_published: bool = False
-    publication_integrity: McpPublicationState = "absent"
+    publication_integrity: McpPublicationState
     """Publication verdict at capture time.
 
-    Defaults to ``"absent"`` so snapshots frozen before this field existed
-    still parse, pairing with the ``is_published: False`` default they already
-    carry: a legacy snapshot recorded no verdict, and inventing ``"ok"`` for it
-    would be the fail-open answer.
+    This is captured explicitly, so a snapshot never invents a publication
+    verdict while being read.
     """
 
     metric: MetricSnapshot
     phases: list[PhaseStatusSnapshot]
     summary_present: bool
 
-    result_context: ResultContext = "current_config"
+    result_context: ResultContext
     """Whether ``metric`` and ``result_phase_plan`` are the represented
     generation's own recorded semantics or the executing config's.
 
-    Defaults to ``"current_config"`` so snapshots frozen before this field
-    existed still parse. That is the conservative reading: such a snapshot
-    recorded no proof that its labels came from the generation's own summary.
+    This is captured explicitly with the result labels.
     """
 
     published_config_matches_current: bool | None = None
@@ -138,14 +133,8 @@ class StatusSnapshot(_SnapshotModel):
     fingerprint existed parse as ``None``.
     """
 
-    result_phase_plan: list[str] | None = None
-    """Phase plan the represented generation published under, or ``None``.
-
-    ``None`` for snapshots frozen before this field existed; readers fall back
-    to this snapshot's own ``phases`` names, which for every runner-captured
-    snapshot is the same plan (the capture is pinned to the generation the
-    executing config just produced).
-    """
+    result_phase_plan: list[str]
+    """Phase plan the represented generation published under."""
 
 
 class WinnerSourceSnapshot(_SnapshotModel):
@@ -156,7 +145,6 @@ class WinnerSourceSnapshot(_SnapshotModel):
     trial_number: int
     generation_id: str | None = None
     attempt_id: str | None = None
-    study: str | None = None
 
 
 class WinnerSnapshot(_SnapshotModel):
@@ -171,7 +159,6 @@ class WinnerSnapshot(_SnapshotModel):
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSourceSnapshot
-    promotion: dict[str, Any] | None = None
 
 
 def _winner_source_snapshot(
@@ -181,22 +168,19 @@ def _winner_source_snapshot(
 ) -> WinnerSourceSnapshot:
     """Return the concrete source model for a stored or engine-returned winner.
 
-    Falls back to a ``"phase_trial"`` source built from the winner's own
-    phase/trial/generation/attempt identity when ``winner.source`` is unset
-    (winners persisted before source tracking was added have no ``source``).
-
     :param PhaseWinnerView | Winner winner: Winner whose source should be captured.
     :param str phase: Phase under which the winner is exposed.
     :return WinnerSourceSnapshot: Concrete, validated source snapshot.
     """
-    source = _winner_source_or_default(winner, phase)
+    source = winner.source
+    if source is None:
+        raise RuntimeError("Current-format winner is missing source provenance.")
     return WinnerSourceSnapshot(
         kind=source.kind,
         phase=source.phase,
         trial_number=source.trial_number,
         generation_id=source.generation_id,
         attempt_id=source.attempt_id,
-        study=source.study,
     )
 
 
@@ -228,7 +212,6 @@ def _winner_snapshot(
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
         source=_winner_source_snapshot(winner, phase=phase),
-        promotion=winner.promotion,
     )
 
 
@@ -250,19 +233,11 @@ class RunResultSnapshot(_SnapshotModel):
     def status_payload(self) -> dict[str, Any]:
         """Return the stored status in the engine reader's path-free shape.
 
-        A snapshot frozen before ``result_phase_plan`` existed reports its own
-        frozen phase names instead: a runner capture is always pinned to the
-        generation its config just produced, so those names *are* that
-        generation's plan. The key is always present so payload builders can
-        read one shape for live and frozen reads alike.
-
         :return dict[str, Any]: Status mapping accepted by the MCP payload builder.
         """
         payload = self.status.model_dump(mode="json")
         for phase in payload["phases"]:
             phase.pop("running_attempts", None)
-        if payload["result_phase_plan"] is None:
-            payload["result_phase_plan"] = [phase.phase for phase in self.status.phases]
         return payload
 
     def winner_views(self) -> list[PhaseWinnerView]:
@@ -287,9 +262,7 @@ class RunResultSnapshot(_SnapshotModel):
                     trial_number=winner.source.trial_number,
                     generation_id=winner.source.generation_id,
                     attempt_id=winner.source.attempt_id,
-                    study=winner.source.study,
                 ),
-                promotion=winner.promotion,
             )
             for winner in self.winners
         ]
@@ -472,7 +445,7 @@ def mark_result_snapshot_published(
 
     Detached MCP runs capture and persist their exact generation before the
     engine advances the last-success pointer. Once that pointer commits, this
-    transition updates the frozen publication relationship and rebinds each
+    transition updates the frozen publication relationship and updates each
     phase's storage-availability verdict to the committed summary. It never
     rereads shared study state or reconstructs winner facts.
 

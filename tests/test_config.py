@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from phasesweep import load_config, load_experiment
 from phasesweep.config import (
     ConfigError,
+    Constraint,
     ExecutionContext,
     Experiment,
     JsonExtractor,
@@ -16,135 +17,253 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
-    StudySpec,
-    Suite,
+    WandbExtractor,
+    WandbSummaryRequiredGate,
 )
 from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
 
 
-def test_suite_study_names_are_unique_case_insensitively() -> None:
-    phase = Phase(name="p", n_trials=1)
-    with pytest.raises(ValidationError, match="'Foo' and 'foo'.*case-insensitively"):
-        Suite(suite="s", studies=[StudySpec(name=name, phases=[phase]) for name in ("Foo", "foo")])
-    suite = Suite(
-        suite="s", studies=[StudySpec(name=name, phases=[phase]) for name in ("Foo", "Bar")]
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("base_url", "https://another.test"),
+        ("entity", "another"),
+        ("project", "another"),
+        ("poll_seconds", 3),
+        ("timeout_seconds", 5),
+    ],
+)
+def test_wandb_consumers_must_agree_per_phase(field, value):
+    objective = WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss")
+    conflicting = objective.model_copy(update={field: value, "metric_key": "memory"})
+    with pytest.raises(ValueError, match=rf"constraints\[0\].extractor.{field}.*metric.extractor"):
+        make_experiment(
+            metric=Metric(extractor=objective),
+            constraints=[Constraint(name="memory", extractor=conflicting, max=5)],
+        )
+
+
+def test_wandb_query_normalizes_targets_and_collects_exact_keys():
+    from phasesweep.config.models import _wandb_query
+
+    objective = WandbExtractor(
+        type="wandb",
+        base_url="https://API.WANDB.AI/",
+        entity="e",
+        project="p",
+        metric_key="eval/loss",
     )
-    assert [study.name for study in suite.studies] == ["Foo", "Bar"]
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="e", project="p", keys=["complete"]
+    )
+    experiment = make_experiment(metric=Metric(extractor=objective), gates=[gate])
+    query = _wandb_query(experiment, experiment.phases[0].gates)
+    assert query.source.base_url == "https://api.wandb.ai"
+    assert query.numeric_keys == ("eval/loss",)
+    assert query.presence_keys == ("complete",)
 
 
-def _branching_phases(width: int) -> list[Phase]:
-    return [
-        Phase(name="base", n_trials=1),
-        *[
+def test_wandb_gate_query_identity_ignores_gate_list_order():
+    from phasesweep.config.models import _wandb_query
+
+    first = WandbSummaryRequiredGate(
+        type="wandb_summary_required", entity="e", project="p", keys=["complete"]
+    )
+    second = first.model_copy(update={"keys": ["artifact_ready"]})
+    experiment = make_experiment(gates=[first, second])
+
+    ordered = _wandb_query(experiment, [first, second])
+    reordered = _wandb_query(experiment, [second, first])
+
+    assert ordered is not None
+    assert reordered is not None
+    assert dict(ordered.gate_keys) == dict(reordered.gate_keys)
+
+
+def test_wandb_gate_query_identity_uses_only_target_and_required_keys():
+    from phasesweep.config.models import _wandb_query
+
+    gate = WandbSummaryRequiredGate(
+        type="wandb_summary_required",
+        base_url="https://API.WANDB.AI/",
+        entity="e",
+        project="p",
+        keys=["complete", "artifact_ready"],
+        poll_seconds=2,
+        timeout_seconds=120,
+    )
+    operational_change = gate.model_copy(
+        update={
+            "keys": ["artifact_ready", "complete"],
+            "poll_seconds": 5,
+            "timeout_seconds": 300,
+        }
+    )
+    target_change = gate.model_copy(update={"project": "another"})
+    keys_change = gate.model_copy(update={"keys": ["complete"]})
+
+    def gate_keys(candidate: WandbSummaryRequiredGate) -> tuple[tuple[str, tuple[str, ...]], ...]:
+        experiment = make_experiment(gates=[candidate])
+        query = _wandb_query(experiment, experiment.phases[0].gates)
+        assert query is not None
+        return query.gate_keys
+
+    assert gate_keys(operational_change) == gate_keys(gate)
+    assert gate_keys(target_change) != gate_keys(gate)
+    assert gate_keys(keys_change) != gate_keys(gate)
+
+
+def test_wandb_environment_identity_can_bind_offline_mode_without_launch():
+    from phasesweep.config.models import _wandb_query
+    from phasesweep.evidence.models import compose_wandb_environment
+
+    experiment = make_experiment(
+        metric=Metric(
+            extractor=WandbExtractor(type="wandb", entity="e", project="p", metric_key="loss")
+        )
+    )
+    query = _wandb_query(experiment, experiment.phases[0].gates)
+    assert query is not None
+
+    with pytest.raises(ValueError, match="requires online"):
+        compose_wandb_environment(query, {}, {"WANDB_MODE": "offline"})
+
+    environment = compose_wandb_environment(
+        query, {}, {"WANDB_MODE": "offline"}, require_online=False
+    )
+    assert environment["WANDB_MODE"] == "offline"
+    assert environment["WANDB_PROJECT"] == "p"
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"WANDB_RUN_ID": "foreign"},
+        {"WANDB_RESUME": "allow"},
+        {"WANDB_PROJECT": "foreign"},
+        {"WANDB_ENTITY": "foreign"},
+        {"WANDB_BASE_URL": "https://foreign.test"},
+        {"WANDB_MODE": "offline"},
+        {"WANDB_MODE": "disabled"},
+        {"WANDB_DISABLED": "true"},
+    ],
+)
+def test_wandb_managed_conflicts_fail_during_config_validation(env):
+    with pytest.raises(ValueError, match="W&B|WANDB"):
+        make_experiment(
+            env=env,
+            metric=Metric(
+                extractor=WandbExtractor(
+                    type="wandb", entity="e", project="p", metric_key="eval/loss"
+                )
+            ),
+        )
+
+
+def test_phase_composition_accepts_a_linear_chain() -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"model.depth": 8}),
             Phase(
-                name=f"branch{i}",
+                name="tune",
                 n_trials=1,
-                promotion={
-                    "min_delta_vs": "base",
-                    "on_fail": "continue_baseline",
-                },
-            )
-            for i in range(width)
-        ],
-        Phase(name="join", n_trials=1, inherits=[f"branch{i}" for i in range(width)]),
-    ]
-
-
-def test_promotion_validation_has_an_experiment_wide_work_bound(monkeypatch) -> None:
-    import phasesweep.config.models as models
-
-    original = models._consume_outcome_expansions
-    spent = 0
-
-    def counted(phase_name, count, remaining_expansions):
-        nonlocal spent
-        remaining = original(phase_name, count, remaining_expansions)
-        spent += count
-        assert spent <= 4096
-        return remaining
-
-    monkeypatch.setattr(models, "_consume_outcome_expansions", counted)
-    make_experiment(phases=_branching_phases(3))
-    spent = 0
-    with pytest.raises(
-        ValidationError, match="Phase 'join'.*supported validation complexity.*4,096"
-    ):
-        make_experiment(phases=_branching_phases(13))
-    # A fresh validation gets its own budget; a prior failure cannot poison it.
-    spent = 0
-    make_experiment(phases=_branching_phases(3))
-    spent = 0
-    phases = _branching_phases(10)
-    parents = phases[-1].inherits
-    phases.append(Phase(name="join2", n_trials=1, inherits=parents))
-    with pytest.raises(ValidationError, match="Phase 'join2'.*supported validation complexity"):
-        make_experiment(phases=phases)
-
-    # Baseline-only promotions can copy the join's large outcome set without
-    # any parent combinations of their own. They must spend the same budget.
-    spent = 0
-    phases = _branching_phases(10)
-    phases.extend(
-        Phase(
-            name=f"fallback{i}",
-            n_trials=1,
-            promotion={"min_delta_vs": "join", "on_fail": "continue_baseline"},
-        )
-        for i in (1, 2)
-    )
-    original_outcome = models._ConcreteOverrideOutcome
-    fallback_allocations = {"fallback1": 0, "fallback2": 0}
-
-    def track_fallback_allocation(**kwargs):
-        for name, branch in kwargs.get("decisions", ()):
-            if name in fallback_allocations and branch == "fallback":
-                fallback_allocations[name] += 1
-        return original_outcome(**kwargs)
-
-    monkeypatch.setattr(models, "_ConcreteOverrideOutcome", track_fallback_allocation)
-    with pytest.raises(ValidationError, match="Phase 'fallback2'.*supported validation complexity"):
-        make_experiment(phases=phases)
-    assert spent == 3080  # 10 base fallbacks + 2,046 parent candidates + 1,024 fallbacks.
-    assert fallback_allocations == {"fallback1": 1024, "fallback2": 0}
-
-
-def test_promotion_validation_charges_rejected_combinations(monkeypatch) -> None:
-    import phasesweep.config.models as models
-
-    # Only 64 of the 64*64 pairs are compatible. The rejected pairs still cost
-    # work, so the second expansion cannot fit after spending 64 on the first.
-    outcomes = tuple(
-        models._ConcreteOverrideOutcome(
-            keys=frozenset(),
-            decisions=(("choice", str(i)),),
-        )
-        for i in range(64)
-    )
-    original = models._merge_override_outcomes
-    attempts = 0
-
-    def counted(candidate):
-        nonlocal attempts
-        attempts += 1
-        return original(candidate)
-
-    monkeypatch.setattr(models, "_merge_override_outcomes", counted)
-    with pytest.raises(ValueError, match="Phase 'join'.*supported validation complexity"):
-        models._compatible_parent_outcome_combinations(
-            ["left", "right"],
-            {"left": outcomes, "right": outcomes},
-            phase_name="join",
-            remaining_expansions=4096,
-        )
-    assert attempts == 64  # Refused before allocating/evaluating the next layer.
-    phases = _branching_phases(6)
-    phases.extend(
-        [
-            Phase(name="copy", n_trials=1, inherits=["join"]),
-            Phase(name="rejoin", n_trials=1, inherits=["join", "copy"]),
+                inherits=["base"],
+                search_space={"learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3}},
+            ),
+            Phase(name="final", n_trials=1, inherits=["tune"], fixed_overrides={"seed": 0}),
         ]
     )
-    with pytest.raises(ValidationError, match="Phase 'rejoin'.*supported validation complexity"):
+
+    assert [phase.name for phase in experiment.phases] == ["base", "tune", "final"]
+
+
+def test_phase_composition_accepts_a_same_origin_diamond() -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"depth": 8}),
+            Phase(name="left", n_trials=1, inherits=["base"], fixed_overrides={"left": 1}),
+            Phase(name="right", n_trials=1, inherits=["base"], fixed_overrides={"right": 1}),
+            Phase(name="join", n_trials=1, inherits=["left", "right"]),
+        ]
+    )
+
+    assert experiment.phases[-1].inherits == ["left", "right"]
+
+
+def test_phase_composition_accepts_child_fixed_resolution_as_new_origin() -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(name="left", n_trials=1, fixed_overrides={"learning_rate": 1e-4}),
+            Phase(name="right", n_trials=1, fixed_overrides={"learning_rate": 2e-4}),
+            Phase(
+                name="resolved",
+                n_trials=1,
+                inherits=["left", "right"],
+                fixed_overrides={"learning_rate": 5e-4},
+            ),
+            Phase(name="branch_a", n_trials=1, inherits=["resolved"]),
+            Phase(name="branch_b", n_trials=1, inherits=["resolved"]),
+            Phase(name="join", n_trials=1, inherits=["branch_a", "branch_b"]),
+        ]
+    )
+
+    assert experiment.phases[2].fixed_overrides == {"learning_rate": 5e-4}
+
+
+@pytest.mark.parametrize(
+    ("phases", "match"),
+    [
+        pytest.param(
+            [
+                Phase(name="left", n_trials=1, fixed_overrides={"lr": 1e-4}),
+                Phase(name="right", n_trials=1, fixed_overrides={"lr": 2e-4}),
+                Phase(name="join", n_trials=1, inherits=["left", "right"]),
+            ],
+            "inherits conflicting key",
+            id="unresolved-origins",
+        ),
+        pytest.param(
+            [
+                Phase(name="base", n_trials=1, fixed_overrides={"lr": 1e-4}),
+                Phase(
+                    name="child",
+                    n_trials=1,
+                    inherits=["base"],
+                    search_space={"lr": {"type": "float", "low": 1e-5, "high": 1e-3}},
+                ),
+            ],
+            "re-samples key",
+            id="inherited-resampling",
+        ),
+        pytest.param(
+            [
+                Phase(
+                    name="invalid",
+                    n_trials=1,
+                    fixed_overrides={"lr": 1e-4},
+                    search_space={"lr": {"type": "float", "low": 1e-5, "high": 1e-3}},
+                )
+            ],
+            "both fixed_overrides and search_space",
+            id="local-fixed-sampled",
+        ),
+        pytest.param(
+            [
+                Phase(name="base", n_trials=1, fixed_overrides={"model": "small"}),
+                Phase(
+                    name="child",
+                    n_trials=1,
+                    inherits=["base"],
+                    search_space={"model.depth": {"type": "int", "low": 1, "high": 2}},
+                ),
+            ],
+            "dotted-key namespace collision",
+            id="dotted-collision",
+        ),
+    ],
+)
+def test_phase_composition_rejects_invalid_origins(phases: list[Phase], match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
         make_experiment(phases=phases)
 
 
@@ -391,144 +510,6 @@ def test_execution_rejects_ambiguous_environment_classification() -> None:
         ExecutionContext(inherit_env=["HF_TOKEN"], passthrough_env=["HF_TOKEN"])
 
 
-def test_suite_execution_is_inherited_or_replaced_wholesale(tmp_path: Path) -> None:
-    """``defaults.execution`` reaches studies that omit it; a study that
-    declares its own block replaces the default *wholesale* rather than
-    merging per key, and an explicit null resets to the built-in default
-    (see ``Suite.experiment_for_study``).
-    """
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            """
-            suite: execution_suite
-            defaults:
-              trial_command: "echo"
-              override_format: argparse
-              metric:
-                name: x
-                goal: minimize
-                extractor: {type: log_regex, pattern: 'x=(?P<value>[0-9.]+)'}
-              execution:
-                inherit_env: none
-            studies:
-              - name: inherited
-                phases: [{name: p, n_trials: 1}]
-              - name: replaced_cwd
-                execution: {cwd: /srv/trainer}
-                phases: [{name: p, n_trials: 1}]
-              - name: replaced_names
-                execution: {inherit_env: [WANDB_API_KEY, HF_TOKEN]}
-                phases: [{name: p, n_trials: 1}]
-              - name: reset
-                execution: null
-                phases: [{name: p, n_trials: 1}]
-            """,
-        )
-    )
-
-    assert isinstance(config, Suite)
-    inherited, replaced_cwd, replaced_names, reset = (
-        config.experiment_for_study(study) for study in config.studies
-    )
-
-    assert inherited.execution == ExecutionContext(inherit_env="none")
-
-    # Wholesale replacement: the study's block does not keep the suite's
-    # inherit_env: none — the unset field falls back to the field default.
-    assert replaced_cwd.execution == ExecutionContext(cwd="/srv/trainer")
-    assert replaced_cwd.execution.inherit_env == "all"
-    assert replaced_names.execution == ExecutionContext(inherit_env=["WANDB_API_KEY", "HF_TOKEN"])
-    assert replaced_names.execution.cwd is None
-
-    # Explicit null is not "inherit the default block" — it is a reset.
-    assert reset.execution == ExecutionContext()
-    assert reset.execution.inherit_env == "all"
-
-
-def test_suite_trainer_config_is_inherited_replaced_or_cleared(tmp_path: Path) -> None:
-    """Suites preserve the one-YAML trainer boundary without implicit deep merges."""
-    config = load_config(
-        write_yaml(
-            tmp_path,
-            """
-            suite: trainer_config_suite
-            defaults:
-              trial_command: "python train.py {config_path}"
-              trainer_config:
-                model: {depth: 4, width: 128}
-                optimizer: {lr: 0.001}
-              metric:
-                name: loss
-                goal: minimize
-                extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}
-            studies:
-              - name: inherited
-                phases: [{name: p, n_trials: 1}]
-              - name: replaced
-                trainer_config:
-                  model: {depth: 8}
-                phases: [{name: p, n_trials: 1}]
-              - name: cleared
-                trainer_config: null
-                phases: [{name: p, n_trials: 1}]
-            """,
-        )
-    )
-
-    assert isinstance(config, Suite)
-    inherited, replaced, cleared = (config.experiment_for_study(study) for study in config.studies)
-    assert inherited.override_format == "yaml_file"
-    assert inherited.trainer_config == {
-        "model": {"depth": 4, "width": 128},
-        "optimizer": {"lr": 0.001},
-    }
-    assert replaced.trainer_config == {"model": {"depth": 8}}
-    assert cleared.trainer_config == {}
-
-
-@pytest.mark.parametrize(
-    "candidate_metric",
-    [
-        "{name: accuracy, goal: minimize, "
-        "extractor: {type: log_regex, pattern: 'accuracy=(?P<value>[0-9.]+)'}}",
-        "{name: loss, goal: maximize, "
-        "extractor: {type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}",
-        "{name: loss, goal: minimize, "
-        "extractor: {type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.]+)'}}",
-    ],
-    ids=["name", "goal", "extractor"],
-)
-def test_suite_promotion_requires_identical_metric_contracts(
-    tmp_path: Path, candidate_metric: str
-) -> None:
-    """Reject cross-study promotion when the compared scalars mean different things."""
-    config = f"""
-    suite: incompatible_metrics
-    defaults:
-      trial_command: "echo"
-      metric:
-        name: loss
-        goal: minimize
-        extractor: {{type: log_regex, pattern: 'loss=(?P<value>[0-9.]+)'}}
-    studies:
-      - name: baseline
-        phases: [{{name: baseline_eval, n_trials: 1}}]
-      - name: candidate
-        metric: {candidate_metric}
-        promotion:
-          min_delta_vs: baseline
-        phases: [{{name: candidate_eval, n_trials: 1}}]
-    """
-
-    with pytest.raises(
-        ValidationError,
-        match=r"promotion against 'baseline' requires the same resolved metric contract.*"
-        r"Put the shared metric in suite.defaults",
-    ):
-        load_config(write_yaml(tmp_path, config))
-
-
 # ---- migrated from version-named files ----
 
 
@@ -668,29 +649,24 @@ phases:
     assert exp.phases[0].max_consecutive_failures == 5
 
 
-def test_plain_json_extractor_is_not_a_primary_objective() -> None:
-    with pytest.raises(ValidationError, match="json_envelope"):
-        Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))
+def test_plain_json_extractor_is_a_primary_objective() -> None:
+    metric = Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))
+    assert metric.extractor.type == "json"
 
 
-def test_suite_and_study_names_reject_double_underscore() -> None:
-    """'<suite>__<study>' compilation is injective only when neither part can
-    contain the separator: suite 'sweep' / study 'bert__lr' and suite
-    'sweep__bert' / study 'lr' would otherwise share one artifact namespace,
-    study identity, and fingerprint (review v0.5.17 gap hunt)."""
-    from phasesweep.config import IntParam, StudySpec
-
-    phase = Phase(
-        name="p",
-        n_trials=1,
-        search_space={"x": IntParam(type="int", low=0, high=1)},
+def test_suite_config_is_rejected_before_artifacts(tmp_path: Path) -> None:
+    """The removed top-level selector must not be ignored as an experiment field."""
+    path = write_yaml(
+        tmp_path,
+        """
+        suite: retired
+        defaults: {}
+        studies: []
+        """,
     )
 
-    with pytest.raises(ValidationError, match="must not contain '__'"):
-        StudySpec(name="bert__lr", phases=[phase])
-
-    with pytest.raises(ValidationError, match="must not contain '__'"):
-        Suite(suite="sweep__bert", studies=[StudySpec(name="lr", phases=[phase])])
+    with pytest.raises(ConfigError, match="suite configs are no longer supported"):
+        load_config(path)
 
 
 def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:

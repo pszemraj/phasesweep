@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shlex
 import signal
 import threading
 import time
@@ -18,7 +17,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from phasesweep import load_config, load_experiment, run_experiment, run_suite
+from phasesweep import load_experiment, run_experiment
 from phasesweep.config import (
     CategoricalParam,
     Constraint,
@@ -29,7 +28,6 @@ from phasesweep.config import (
     Metric,
     Phase,
     Sampler,
-    WandbExtractor,
     WandbSummaryRequiredGate,
 )
 from phasesweep.engine import (
@@ -50,6 +48,7 @@ from phasesweep.engine.optuna import (
 )
 from phasesweep.engine.paths import (
     _attempts_dir,
+    _generation_path,
     _last_successful_generation_path,
     _summary_path,
     _winner_path,
@@ -62,6 +61,8 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     PHASE_ABORT_ATTR,
     PHASE_DECISION_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
@@ -74,7 +75,6 @@ from phasesweep.engine.trial import (
     TrialExecutionError,
     extract_trial_result,
 )
-from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import (
@@ -89,11 +89,94 @@ from phasesweep.runtime.process import (
 from tests.conftest import (
     copy_fake_train,
     make_experiment,
+    make_trial_context,
     patch_rejected_trial_user_attr,
     write_constant_trainer,
     write_trainer,
     write_yaml,
 )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        b"not-json",
+        b"\xff",
+        b'{"other": 1}',
+        b'{"loss": true}',
+        b'{"loss": "0.2"}',
+        b'{"loss": null}',
+        b'{"loss": []}',
+        b'{"loss": {}}',
+        b'{"loss": NaN}',
+        b'{"loss": 1e400}',
+        json.dumps({"loss": 10**400}).encode(),
+        "unreadable",
+    ],
+)
+def test_json_primary_invalid_evidence_fails_trial(tmp_path, payload):
+    source = tmp_path / "r.json"
+    if payload == "unreadable":
+        source.write_text('{"loss": 0.2}')
+        source.chmod(0)
+    elif payload is not None:
+        source.write_bytes(payload)
+    experiment = make_experiment(
+        metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="loss"))
+    )
+    executed = ExecutedTrial(
+        ctx=make_trial_context(tmp_path),
+        process=ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1),
+    )
+    try:
+        result = extract_trial_result(experiment=experiment, executed=executed)
+        assert result.metric is None
+        assert not result.feasible
+        assert result.failure_reason.startswith("metric extractor")
+    finally:
+        if source.exists():
+            source.chmod(0o600)
+
+
+@pytest.mark.parametrize(("value", "state"), [(3, "COMPLETE"), (10**400, "FAIL")])
+def test_invalid_remote_constraint_fails_but_measured_violation_is_complete(
+    tmp_path,
+    wandb_worker_sdk,
+    value,
+    state,
+):
+    from phasesweep.config import WandbExtractor
+
+    wandb_worker_sdk(f"""
+        class Api:
+            def __init__(self, **kwargs): pass
+            def run(self, path):
+                return type("Run", (), {{"state": "finished", "summary_metrics": {{"memory": {value!r}}}}})()
+    """)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path / 'study.db'}",
+        trial_command="echo {overrides} x=0.25",
+        n_trials=1,
+        constraints=[
+            Constraint(
+                name="memory",
+                max=1,
+                extractor=WandbExtractor(
+                    type="wandb", entity="e", project="p", metric_key="memory", timeout_seconds=5
+                ),
+            )
+        ],
+    )
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+    trial = optuna.load_study(study_name="t::p", storage=experiment.resolved_storage).trials[0]
+    assert trial.state.name == state
+    if state == "COMPLETE":
+        assert trial.value == 0.25
+    else:
+        assert "numeric evidence" in json.dumps(trial.user_attrs)
 
 
 def test_run_experiment_revalidates_programmatically_copied_config(tmp_path: Path) -> None:
@@ -244,7 +327,8 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
         workdir=tmp_path / "runs",
         phases=[phase],
     )
-    _create_phase_study(exp, phase)
+    study = _create_phase_study(exp, phase)
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     observed: dict[str, object] = {}
 
     def inspect_optimize(study: optuna.Study, objective, **kwargs) -> None:
@@ -448,6 +532,49 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     second_trial_dir = next(path for path in trial_dirs if path != first_trial_dir)
     assert not (second_trial_dir / "r.json").exists()
     assert {path: path.read_bytes() for path in protected} == protected
+
+
+def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A newly reached W&B phase must validate before an existing phase can top up."""
+    trainer = write_constant_trainer(tmp_path)
+    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    local = Phase(name="local", n_trials=1, sampler=Sampler(type="random", seed=0))
+    initial = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        override_format="argparse",
+        phases=[local],
+    )
+    run_experiment(initial)
+    generation_before = _generation_path(initial).read_bytes()
+
+    remote = Phase(
+        name="remote",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        gates=[
+            WandbSummaryRequiredGate(
+                type="wandb_summary_required",
+                entity="entity",
+                project="project",
+                keys=["complete"],
+            )
+        ],
+    )
+    expanded = initial.model_copy(
+        update={"phases": [local.model_copy(update={"n_trials": 2}), remote]}
+    )
+    monkeypatch.setenv("WANDB_MODE", "offline")
+
+    with pytest.raises(PhaseSweepError, match="requires online"):
+        run_experiment(expanded)
+
+    assert _generation_path(initial).read_bytes() == generation_before
+    study = optuna.load_study(study_name="t::local", storage=storage)
+    assert len(study.get_trials(deepcopy=False)) == 1
 
 
 def test_terminal_callback_reports_success_evidence(
@@ -1504,138 +1631,6 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
 
 
-@pytest.mark.parametrize("wandb_source", ["metric", "gate"])
-def test_wandb_cleanup_uncertainty_blocks_topup_until_recovery(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    wandb_source: str,
-) -> None:
-    """An uncertain W&B worker remains recoverable through the trial root."""
-    db = tmp_path / "wandb-abort.db"
-    trainer = write_trainer(tmp_path / "noop.py", "print('x=0.5')")
-
-    def _exp(n_trials: int) -> Experiment:
-        wandb = {
-            "entity": "team",
-            "project": "project",
-            "poll_seconds": 0.01,
-            "timeout_seconds": 1.0,
-        }
-        metric = Metric(extractor=WandbExtractor(type="wandb", metric_key="eval/loss", **wandb))
-        if wandb_source == "metric":
-            gates = []
-        else:
-            gates = [
-                WandbSummaryRequiredGate(type="wandb_summary_required", keys=["gate"], **wandb)
-            ]
-        return make_experiment(
-            workdir=tmp_path / "runs",
-            storage=f"sqlite:///{db}",
-            trial_command=f"python {trainer} {{overrides}}",
-            override_format="argparse",
-            metric=metric,
-            phases=[
-                Phase(
-                    name="p",
-                    n_trials=n_trials,
-                    gpu_policy="none",
-                    sampler=Sampler(type="random", seed=7),
-                    gates=gates,
-                )
-            ],
-        )
-
-    real_worker_supervisor = runtime_process.run_supervised
-    cleanup_safe = {"value": False}
-    worker_calls = {"count": 0}
-    reports: list[TerminalReport] = []
-    failure_call = 1 if wandb_source == "metric" else 2
-
-    def supervise_wandb_worker(command: str, **kwargs: Any) -> ProcessResult:
-        worker_calls["count"] += 1
-        response_path = Path(shlex.split(command)[-1])
-        result = real_worker_supervisor("true", **kwargs)
-        if worker_calls["count"] == failure_call:
-            result.cleanup_confirmed = False
-            trial_dir = Path(kwargs["trial_dir"])
-            write_attempt_lifecycle(
-                trial_dir,
-                attempt_id=str(kwargs["attempt_id"]),
-                state="launching",
-            )
-        else:
-            response_path.write_text(
-                json.dumps(
-                    {
-                        "status": "summary",
-                        "summary": {"eval/loss": 0.5, "gate": "present"},
-                    }
-                ),
-                encoding="utf-8",
-            )
-        return result
-
-    # ``poll_wandb_summary`` imports this name dynamically. The trainer keeps
-    # the original alias from ``engine.trial``, so it still has a real
-    # supervised process of its own before the W&B worker takes over the
-    # durable identity in the same trial directory.
-    monkeypatch.setattr("phasesweep.runtime.process.run_supervised", supervise_wandb_worker)
-    monkeypatch.setattr(
-        "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: cleanup_safe["value"],
-    )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
-        lambda _identity: cleanup_safe["value"],
-    )
-
-    with pytest.raises(UnsafeProcessCleanupError, match="W&B polling worker cleanup"):
-        run_experiment(_exp(1), terminal_callback=reports.append)
-
-    # The gate case completes the metric poll before its own worker takes over
-    # the same durable identity and leaves cleanup uncertain.
-    assert worker_calls["count"] == failure_call
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
-    unsafe_trial = study.get_trials(deepcopy=False)[0]
-    unsafe_attempt_id = unsafe_trial.user_attrs[ATTEMPT_ID_ATTR]
-    unsafe_trial_dir = Path(str(unsafe_trial.user_attrs[TRIAL_DIR_ATTR]))
-    assert isinstance(unsafe_attempt_id, str)
-    assert len(reports) == 1
-    assert reports[0].cleanup_confirmed is False
-    assert reports[0].uncertain_attempt_ids == frozenset({unsafe_attempt_id})
-    assert unsafe_trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
-    assert unsafe_trial.user_attrs[TRIAL_OUTCOME_ATTR]["policy"] == "unsafe_process_cleanup"
-    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unsafe_process_cleanup"
-    assert (unsafe_trial_dir / runtime_process.PROCESS_IDENTITY_FILE).is_file()
-    active_attempts = list(_attempts_dir(_exp(1)).glob("*.json"))
-    assert len(active_attempts) == 1
-    active_attempt = json.loads(active_attempts[0].read_text(encoding="utf-8"))
-    assert active_attempt["attempt_id"] == unsafe_attempt_id
-
-    # Raising the target is not cleanup authority, so the second invocation
-    # must stop before creating a new trial or worker.
-    before = len(study.trials)
-    with pytest.raises(ProcessCleanupUncertainError):
-        run_experiment(_exp(2))
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
-    assert len(study.trials) == before
-    assert worker_calls["count"] == failure_call
-    assert list(_attempts_dir(_exp(2)).glob("*.json")) == active_attempts
-
-    cleanup_safe["value"] = True
-    winners = run_experiment(_exp(2))
-
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
-    assert winners["p"].metric == pytest.approx(0.5)
-    assert worker_calls["count"] == (2 if wandb_source == "metric" else 4)
-    assert [trial.state for trial in study.get_trials(deepcopy=False)] == [
-        optuna.trial.TrialState.FAIL,
-        optuna.trial.TrialState.COMPLETE,
-    ]
-    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
-    assert list(_attempts_dir(_exp(2)).glob("*.json")) == []
-
-
 def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2263,8 +2258,10 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
         return real_launch_trial(**kwargs)
 
     monkeypatch.setattr(phase_mod, "launch_trial", interrupt_first_launch)
-    with pytest.raises(PhaseSweepShutdown):
+    with pytest.raises(PhaseSweepShutdown) as exc_info:
         run_experiment(exp)
+
+    assert exc_info.value.published_result_committed is False
 
     study = optuna.load_study(study_name="t::p", storage=exp.storage)
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
@@ -2641,75 +2638,6 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
             assert signal.getsignal(sig) is sentinel_handlers[sig]
     finally:
         monkeypatch.undo()
-        for sig, handler in prior_handlers.items():
-            signal.signal(sig, handler)
-
-
-def test_run_suite_installs_signal_handlers_once_for_all_components(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A multi-study suite installs shutdown handlers once, not once per component.
-
-    Each component experiment enters its own nested ``signal_handler_scope()``
-    call; because the suite's outer scope already owns the shutdown signals,
-    every nested entry must be a reentrant no-op (review v0.5.14 / blocker 6)
-    — exactly one install and one restore for the whole suite, never one pair
-    per study.
-    """
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
-    try:
-        # Clean slate: nothing already owns the shutdown signals here,
-        # regardless of what an earlier test in this session left installed.
-        # install_signal_handlers() now checks OS ground truth, so resetting
-        # the actual handlers is sufficient to make it see "not installed".
-        for sig in runtime_process._SHUTDOWN_SIGNALS:
-            signal.signal(sig, signal.SIG_DFL)
-
-        signal_calls: list[int] = []
-        original_signal = signal.signal
-
-        def counting_signal(signalnum: int, handler: object) -> object:
-            signal_calls.append(signalnum)
-            return original_signal(signalnum, handler)
-
-        monkeypatch.setattr(runtime_process.signal, "signal", counting_signal)
-
-        trainer = write_constant_trainer(tmp_path)
-        config = load_config(
-            write_yaml(
-                tmp_path,
-                f"""
-                suite: nesting_suite
-                defaults:
-                  workdir: {tmp_path}/runs
-                  trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-                  override_format: argparse
-                  metric:
-                    name: x
-                    goal: minimize
-                    extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-                studies:
-                  - name: one
-                    phases:
-                      - name: p
-                        n_trials: 1
-                        search_space: {{}}
-                  - name: two
-                    phases:
-                      - name: p
-                        n_trials: 1
-                        search_space: {{}}
-                """,
-            )
-        )
-
-        run_suite(config)
-
-        # One install (len(_SHUTDOWN_SIGNALS) calls) and one restore (another
-        # len(_SHUTDOWN_SIGNALS) calls) for the whole suite — never doubled by
-        # the two nested per-study scopes.
-        assert len(signal_calls) == 2 * len(runtime_process._SHUTDOWN_SIGNALS)
-    finally:
         for sig, handler in prior_handlers.items():
             signal.signal(sig, handler)
 

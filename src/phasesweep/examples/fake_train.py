@@ -14,29 +14,37 @@ from phasesweep import report_objective
 
 
 def _parse_kv(tokens: list[str]) -> dict[str, Any]:
-    """Parse optional ``key=value`` compatibility tokens with light type inference.
+    """Parse the toy trainer's supported argparse/Hydra override tokens.
 
-    :param list[str] tokens: Extra CLI tokens such as ``lr=0.001`` or ``use_amp=true``.
-    :return dict[str, Any]: Parsed override values keyed by override name.
+    :param list[str] tokens: Remaining ``key=value`` or ``--key=value`` tokens.
+    :raises ValueError: A token or key is unsupported by this trainer.
+    :return dict[str, Any]: Parsed numeric values keyed by trainer config path.
     """
-    out: dict[str, Any] = {}
-    for tok in tokens:
-        if "=" not in tok:
-            continue
-        k, v = tok.split("=", 1)
+    integer_keys = {"n_layers", "model.n_layers"}
+    float_keys = {
+        "lr",
+        "optimizer.lr",
+        "weight_decay",
+        "optimizer.weight_decay",
+        "dropout",
+        "model.dropout",
+    }
+    overrides: dict[str, Any] = {}
+    for raw_token in tokens:
+        token = raw_token[2:] if raw_token.startswith("--") else raw_token
+        if "=" not in token:
+            raise ValueError(f"Unsupported trainer argument {raw_token!r}; expected key=value.")
+        key, raw_value = token.split("=", 1)
+        if key not in integer_keys | float_keys:
+            raise ValueError(f"Unsupported fake-trainer override {key!r}.")
         try:
-            if "." in v or "e" in v or "E" in v:
-                out[k] = float(v)
-            else:
-                out[k] = int(v)
-        except ValueError:
-            if v.lower() == "true":
-                out[k] = True
-            elif v.lower() == "false":
-                out[k] = False
-            else:
-                out[k] = v
-    return out
+            value = int(raw_value) if key in integer_keys else float(raw_value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Fake-trainer override {key!r} must be numeric, got {raw_value!r}."
+            ) from exc
+        overrides[key] = value
+    return overrides
 
 
 def _load_config(path: Path) -> dict[str, Any]:
@@ -86,10 +94,8 @@ def main() -> None:
         default=None,
         help="seconds to sleep before writing result (simulates a long trial; used by tests)",
     )
-    args, rest = p.parse_known_args()
+    args, remaining = p.parse_known_args()
 
-    # Preserve this packaged toy's explicit argparse/Hydra compatibility so
-    # those PhaseSweep boundary modes remain independently demonstrable.
     config: dict[str, Any] = {}
     if args.config_path is not None:
         config = _load_config(Path(args.config_path))
@@ -101,8 +107,7 @@ def main() -> None:
         "dropout": args.dropout,
     }
     overrides = {k: v for k, v in overrides.items() if v is not None}
-    overrides.update(_parse_kv(rest))
-
+    overrides.update(_parse_kv(remaining))
     sleep_seconds = float(
         args.sleep if args.sleep is not None else _get(config, "runtime.sleep", 0.0)
     )
