@@ -10,7 +10,13 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config import Experiment
-from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError, read_status
+from phasesweep.engine import (
+    ArtifactRootConflictError,
+    ProcessCleanupUncertainError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+    read_status,
+)
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _artifact_root_binding_payload,
@@ -19,12 +25,13 @@ from phasesweep.engine.ledger import (
     ClaimedLedger,
     _resolve_storage,
     claim_ledger,
+    open_existing_study,
     open_phase_study,
     validate_ledger,
 )
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from tests.conftest import make_experiment, write_constant_trainer
+from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
 from tests.ledger_fixtures import _tree_bytes
 
 
@@ -334,6 +341,141 @@ def test_claim_ledger_writes_tree_binding_before_claiming_studies(
     assert sorted(reclaimed.studies) == ["p", "q"]
     for study in reclaimed.studies.values():
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == reclaimed.artifact_root
+
+
+def _bound_tree_with_legacy_study(tmp_path: Path, *, legacy: bool = True) -> Experiment:
+    """Build a bound current-format tree whose ledger may also hold pre-cutover state.
+
+    The phase study is current-format and root-claimed, so every refusal these
+    tests observe comes from the ledger-wide format scan and its handling, not
+    from the phase study itself.
+
+    :param Path tmp_path: Test-owned directory for the tree and the ledger.
+    :param bool legacy: Add a populated, unmarked ``legacy::p`` study, which
+        only a completed format scan can see.
+    :return Experiment: Experiment whose tree is bound to that ledger.
+    """
+    storage = f"sqlite:///{tmp_path / 'current.db'}"
+    experiment = _experiment(tmp_path, storage=storage)
+    study = optuna.create_study(study_name="t::p", storage=storage)
+    study.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment).resolve()))
+    mark_current_format(experiment, study)
+    if legacy:
+        old = optuna.create_study(study_name="legacy::p", storage=storage)
+        old.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    return experiment
+
+
+def _scan_fails(monkeypatch: pytest.MonkeyPatch, *, times: int) -> list[str | None]:
+    """Make the ledger-wide format scan fail as if the ledger were briefly locked.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture that owns the patch.
+    :param int times: Number of leading scans that fail before scans run for real.
+    :return list[str | None]: Storage URL of every scan attempted, in order.
+    """
+    import phasesweep.engine.ledger as ledger_module
+
+    real_scan = ledger_module._scan_ledger_format
+    attempts: list[str | None] = []
+
+    def flaky_scan(storage: str | None) -> None:
+        attempts.append(storage)
+        if len(attempts) <= times:
+            raise StudyStorageUnavailableError("injected: the ledger was briefly locked")
+        real_scan(storage)
+
+    monkeypatch.setattr(ledger_module, "_scan_ledger_format", flaky_scan)
+    return attempts
+
+
+def test_inconclusive_scan_on_a_bound_tree_never_reports_unchecked_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Status reports trial data unavailable rather than counts no scan checked.
+
+    A bound tree tolerates an unreadable scan so publication data stays
+    readable, but the ledger may hold state this release refuses, and only a
+    completed scan can tell. Counts read around that gap would present the
+    ledger as current-format when nothing verified it.
+    """
+    experiment = _bound_tree_with_legacy_study(tmp_path)
+    with pytest.raises(StudySchemaMismatchError, match="'legacy::p'"):
+        read_status(experiment)
+    _scan_fails(monkeypatch, times=1)
+
+    status = read_status(experiment)
+
+    phase = status["phases"][0]
+    assert phase["trial_data_available"] is False
+    assert phase["running_attempts"] is None
+    assert not any(phase["trials"].values())
+
+
+def test_unverified_handle_records_the_gap_and_opens_nothing_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tolerated scan failure is on the handle, and no live opener accepts it.
+
+    Recovery opens existing studies through the validated handle, so an
+    unverified handle must not open one: it would read and then reap studies
+    in a ledger whose format nothing checked.
+    """
+    experiment = _bound_tree_with_legacy_study(tmp_path)
+    _scan_fails(monkeypatch, times=1)
+
+    ledger = validate_ledger(experiment)
+
+    assert ledger.binding_state == "bound"
+    assert ledger.format_verified is False
+    with pytest.raises(StudyStorageUnavailableError, match="briefly locked"):
+        open_existing_study(ledger, experiment.phases[0])
+
+
+@pytest.mark.parametrize("second_scan", ["completes", "fails-again"])
+def test_claim_rescans_an_unverified_ledger_before_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, second_scan: str
+) -> None:
+    """A run never proceeds on a ledger whose format scan did not complete.
+
+    Claiming mutates the tree and studies, so the scan validation tolerated has
+    to complete before discovery: the pre-cutover study then refuses the run,
+    and a second unreadable scan stops it as unavailable storage. Nothing is
+    written either way.
+    """
+    experiment = _bound_tree_with_legacy_study(tmp_path)
+    ledger_file = tmp_path / "current.db"
+    before = ledger_file.read_bytes()
+    scans = _scan_fails(monkeypatch, times=1 if second_scan == "completes" else 2)
+
+    if second_scan == "completes":
+        with pytest.raises(StudySchemaMismatchError, match="'legacy::p'"):
+            run_experiment(experiment)
+    else:
+        with pytest.raises(ProcessCleanupUncertainError) as exc_info:
+            run_experiment(experiment)
+        assert isinstance(exc_info.value.__cause__, StudyStorageUnavailableError)
+
+    assert len(scans) == 2
+    assert ledger_file.read_bytes() == before
+
+
+def test_verified_handle_reads_and_claims_after_one_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed scan is trusted as before: counts are real and claim scans no more."""
+    experiment = _bound_tree_with_legacy_study(tmp_path, legacy=False)
+    scans = _scan_fails(monkeypatch, times=0)
+
+    ledger = validate_ledger(experiment)
+    status = read_status(experiment)
+    claimed = claim_ledger(ledger)
+
+    assert ledger.format_verified is True
+    assert claimed.format_verified is True
+    assert status["phases"][0]["trial_data_available"] is True
+    assert status["phases"][0]["trials"]["COMPLETE"] == 1
+    assert len(scans) == 2  # one for this handle, one for read_status's own; none in claim
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])

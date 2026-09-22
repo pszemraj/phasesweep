@@ -338,12 +338,15 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     study.tell(trial, 0.5)
     mark_current_format(experiment, study)
     complete = ledger.read_bytes()
+    expected = engine_optuna._TrialRef(0, "generation", "attempt")
+    # The handle's format scan also captures the journal. Take it on the whole
+    # journal, before the damage and the patch, so the handle is verified and
+    # the one capture the file changes under is the phase snapshot's. A handle
+    # scanned over the partial record would report every read unavailable.
+    handle = engine_ledger.validate_ledger(experiment)
+    assert handle.format_verified
     if change == "finish-partial":
         ledger.write_bytes(complete[:-1])
-    expected = engine_optuna._TrialRef(0, "generation", "attempt")
-    # The handle's format scan also captures the journal. Take it before the
-    # patch so the one capture the file changes under is the phase snapshot's.
-    handle = engine_ledger.validate_ledger(experiment)
     real_fstat = engine_ledger.os.fstat
 
     def change_after_capture(fd):

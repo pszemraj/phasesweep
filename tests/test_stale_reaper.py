@@ -203,6 +203,7 @@ def _claimed_over(
         ledger_path=validated.ledger_path,
         artifact_root=validated.artifact_root,
         binding_state="bound",
+        format_scan_failure=None,
         studies=MappingProxyType(dict(studies)),  # type: ignore[arg-type]
     )
 

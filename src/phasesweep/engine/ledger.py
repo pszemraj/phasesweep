@@ -27,7 +27,7 @@ import logging
 import os
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -100,8 +100,10 @@ class ValidatedLedger:
     Holding one of these is the proof that step two of the fixed order ran:
     :func:`validate_ledger` checked the artifact-root binding first and only
     then scanned the ledger's format, and it did both without creating a study,
-    constructing file-backed storage, or writing a byte. Read paths need
-    nothing more, so this handle is all they take.
+    constructing file-backed storage, or writing a byte. On a bound tree the
+    scan may have been unable to read the ledger; the handle then says so
+    (:attr:`format_verified` is ``False``) and proves only the binding check.
+    Read paths need nothing more, so this handle is all they take.
 
     It is deliberately *not* enough to open a live study for writing. That
     needs a bound tree and root-claimed studies, which only a
@@ -120,6 +122,21 @@ class ValidatedLedger:
     ledger_path: Path | None
     artifact_root: str
     binding_state: BindingState
+    #: Why the ledger-wide format scan did not complete, or ``None`` when it
+    #: did. Only a bound tree tolerates an unreadable scan, so publication data
+    #: stays readable; nothing that depends on the ledger's format may treat
+    #: such a handle as scanned (see :attr:`format_verified`).
+    format_scan_failure: StudyStorageUnavailableError | None
+
+    @property
+    def format_verified(self) -> bool:
+        """Whether the ledger-wide format scan completed for this handle.
+
+        :return bool: ``True`` when the scan ran to completion and found no
+            refused state; ``False`` when a bound tree tolerated a scan that
+            could not read the ledger.
+        """
+        return self.format_scan_failure is None
 
 
 @dataclass(frozen=True, slots=True)
@@ -826,6 +843,7 @@ def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> Val
         ledger_path=ledger_path,
         artifact_root=_artifact_root_identity(experiment),
         binding_state=binding_state,
+        format_scan_failure=None,
     )
 
 
@@ -845,12 +863,16 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     no recorded owner, "the ledger is unavailable" and "the ledger is empty and
     fresh" are different facts and must not collapse into one. Once the tree is
     ``"bound"`` its record already proves which ledger owns it, so a transient
-    read failure is left to the caller's own tolerant snapshot to report, and
-    mutating callers fail in their strict discovery pass instead. A
-    :class:`StudySchemaMismatchError` always propagates.
+    read failure is tolerated, letting frozen publication data stay readable,
+    but it is recorded on the handle rather than hidden. A handle whose scan did
+    not complete never stands in for one that did: trial-data reads report the
+    ledger unavailable, :func:`open_existing_study` refuses it, and
+    :func:`claim_ledger` runs the scan again, strictly, before it writes
+    anything. A :class:`StudySchemaMismatchError` always propagates.
 
     :param Experiment experiment: Experiment whose tree and ledger must agree.
-    :return ValidatedLedger: Handle proving both checks ran, in that order.
+    :return ValidatedLedger: Handle proving both checks ran, in that order, and
+        recording whether the format scan completed.
     :raises ArtifactRootConflictError: The tree records a different owner, is
         unreadable, or holds unmarked pre-cutover PhaseSweep state.
     :raises StudySchemaMismatchError: The ledger holds pre-cutover or otherwise
@@ -860,12 +882,22 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     """
     binding_state = _check_artifact_root_binding(experiment)
     ledger = _describe_ledger(experiment, binding_state)
-    if ledger.backend != "memory":
-        try:
-            _scan_ledger_format(ledger.storage_url)
-        except StudyStorageUnavailableError:
-            if binding_state == "unbound":
-                raise
+    if ledger.backend == "memory":
+        return ledger
+    try:
+        _scan_ledger_format(ledger.storage_url)
+    except StudyStorageUnavailableError as exc:
+        if binding_state == "unbound":
+            raise
+        cause = exc.__cause__ or exc
+        log.info(
+            "format scan of storage %s did not complete; its trial data is reported "
+            "unavailable and any claim rescans first: %s: %s",
+            ledger.storage_url,
+            type(cause).__name__,
+            cause,
+        )
+        return replace(ledger, format_scan_failure=exc)
     return ledger
 
 
@@ -875,13 +907,20 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
     Taking the handle rather than a bare config is the point: reaching this
     opener at all proves the binding check and the format scan already ran, in
     order, so no caller can load a study out of a ledger this release refuses.
+    A handle whose scan did not complete is refused for the same reason: the
+    study it would open sits in a ledger nothing has format-checked.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param Phase | str phase: Phase or historical phase name whose study is opened.
     :return optuna.Study | None: Existing study, or ``None`` when none exists.
-    :raises StudyStorageUnavailableError: Persistent storage exists but could
-        not be read, so whether the study exists cannot be determined.
+    :raises StudyStorageUnavailableError: The handle's format scan did not
+        complete, or persistent storage exists but could not be read, so
+        whether the study exists cannot be determined.
     """
+    if ledger.format_scan_failure is not None:
+        raise StudyStorageUnavailableError(
+            str(ledger.format_scan_failure)
+        ) from ledger.format_scan_failure
     return _load_existing_phase_study(ledger.experiment, phase)
 
 
@@ -896,9 +935,10 @@ def read_phase_trial_stats(
     ``available=False`` rather than raising -- because the ledger's *format* was
     already settled by :func:`validate_ledger` before this handle existed. That
     is why no format argument appears here: the scan is not this read's job.
-    The phase's own study still answers to the same cutover rule, because on a
-    bound tree an unreadable scan is tolerated and this snapshot may be the
-    first read to see that study's rows.
+    When the scan did not complete, the phase is reported unavailable without
+    being read, since counts read around that gap would present the ledger as
+    current-format when nothing verified it. The phase's own study still
+    answers to the same cutover rule as a second line of defence.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param Phase phase: Phase whose existing study is inspected.
@@ -909,6 +949,8 @@ def read_phase_trial_stats(
     :raises StudySchemaMismatchError: The phase's own study is populated under
         a pre-cutover or unsupported schema.
     """
+    if ledger.format_scan_failure is not None:
+        return _unavailable_phase_trial_stats(ledger.experiment, phase, ledger.format_scan_failure)
     return _phase_trial_stats(ledger.experiment, phase, published_trial)
 
 
@@ -943,17 +985,27 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     write, because that re-read is cheap and a tree modified outside the lock
     must be refused rather than overwritten.
 
+    A handle whose format scan did not complete (a bound tree tolerated an
+    unreadable ledger) is scanned again here, strictly, before discovery: a
+    mutating caller must never proceed on a ledger whose foreign studies were
+    not format-checked, so the returned handle is always verified.
+
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param str | None from_phase: Resume point; earlier phases will not execute.
     :return ClaimedLedger: Bound handle carrying every existing phase study.
-    :raises StudyStorageUnavailableError: A phase's persistent storage could
-        not be inspected.
+    :raises StudyStorageUnavailableError: The ledger's format could still not
+        be scanned, or a phase's persistent storage could not be inspected.
+    :raises StudySchemaMismatchError: The rescan found pre-cutover or otherwise
+        unsupported PhaseSweep study state.
     :raises PublishedStudyMissingError: A phase to execute has a published
         result whose local trial identity is missing from durable storage.
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, carries a binding that is not a string, or the
         tree's ownership record changed after validation.
     """
+    if not ledger.format_verified:
+        _scan_ledger_format(ledger.storage_url)
+        ledger = replace(ledger, format_scan_failure=None)
     experiment = ledger.experiment
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
@@ -998,6 +1050,7 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
         ledger_path=ledger.ledger_path,
         artifact_root=ledger.artifact_root,
         binding_state="bound",
+        format_scan_failure=None,
         studies=MappingProxyType(loaded),
     )
 
