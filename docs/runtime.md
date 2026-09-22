@@ -86,6 +86,27 @@ validation.
 > file, so keep generated outputs, ledgers, and MCP state out of commits
 > yourself.
 
+### Trust boundary
+
+The workdir is operator-trusted. By default its directories and files are not
+owner-only: new files take the process umask and a rewrite keeps the mode the
+file already had, so operators and tooling keep ordinary access to logs,
+evidence, winners, and resolved overrides. Engine records such as trial
+artifacts, `process_identity.json`, and `attempt_lifecycle.json` use ordinary
+path handling and are not symlink-hardened; records that need crash-safe
+replacement, including those two, are written to a temporary file and renamed
+into place atomically.
+
+Three things inside the tree are hardened. `config.snapshot.yaml` (the warning
+above explains why) and the `environment.json` a trial writes when
+`execution.record_env` is set are created owner-only (`0600`) while their
+directories keep ordinary permissions, and PhaseSweep refuses to replace either
+unless the existing file is already an owner-only regular file with no other
+hard links. The attempt registry under `attempts/` is an owner-only (`0700`)
+directory of `0600` entries, and PhaseSweep refuses to read it through a
+symlink or with shared permissions. The same validated, no-follow path handling
+protects the runtime lock namespace and the MCP `state_dir`.
+
 ## Storage and locks
 
 `storage: null` is in-memory and ends with the process. Persistent local
