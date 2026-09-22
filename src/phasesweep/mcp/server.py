@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal, NoReturn, TypeVar, cast
+from typing import Annotated, Any, Literal, NoReturn, TypeVar
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -1058,7 +1058,6 @@ class PhaseSweepMCP:
                 run_id=run_id,
             )
             read_seconds = time.monotonic() - read_started
-            run = cast(dict[str, Any], run)
             snapshot = _await_snapshot(
                 run["state"],
                 run["recovery_required"],

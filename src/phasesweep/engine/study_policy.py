@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal, TypedDict
 
 import optuna
 
@@ -58,6 +58,14 @@ class _AcceptedPartialDecision:
     completed_trials: int
     timeout_scope: str
     recovered_abort_sequence: int | None
+
+
+class _AllocationRecord(TypedDict):
+    """One validated pre-Optuna allocation boundary and its trainer environment."""
+
+    generation_id: str
+    first_trial_number: int
+    trainer_environment: str
 
 
 def _load_accepted_partial_decision(
@@ -407,11 +415,11 @@ def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
         study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
 
 
-def _allocation_contexts(study: optuna.Study) -> list[dict[str, Any]]:
+def _allocation_contexts(study: optuna.Study) -> list[_AllocationRecord]:
     """Return valid pre-Optuna allocation records from a study's durable context.
 
     :param optuna.Study study: Study holding the allocation context.
-    :return list[dict[str, Any]]: Valid allocation records, ordered by creation.
+    :return list[_AllocationRecord]: Valid allocation records, ordered by creation.
     """
     raw = study.user_attrs.get(_ALLOCATION_CONTEXT_ATTR)
     if not isinstance(raw, dict) or raw.get("schema_version") != _ALLOCATION_CONTEXT_SCHEMA_VERSION:
@@ -419,7 +427,7 @@ def _allocation_contexts(study: optuna.Study) -> list[dict[str, Any]]:
     allocations = raw.get("allocations")
     if not isinstance(allocations, list):
         return []
-    records: list[dict[str, Any]] = []
+    records: list[_AllocationRecord] = []
     for record in allocations:
         if (
             not isinstance(record, dict)
@@ -431,7 +439,13 @@ def _allocation_contexts(study: optuna.Study) -> list[dict[str, Any]]:
             or not record["trainer_environment"]
         ):
             continue
-        records.append(record)
+        records.append(
+            {
+                "generation_id": record["generation_id"],
+                "first_trial_number": record["first_trial_number"],
+                "trainer_environment": record["trainer_environment"],
+            }
+        )
     return records
 
 

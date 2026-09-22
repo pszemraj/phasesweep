@@ -1,6 +1,6 @@
 """Typed engine failures used for safe orchestration decisions."""
 
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import PhaseSweepError as PhaseSweepError
 
 
 class StudyFingerprintMismatchError(PhaseSweepError):

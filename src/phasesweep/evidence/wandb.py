@@ -93,7 +93,7 @@ def _is_nonretryable_authorization_error(exc: Exception) -> bool:
 
 def _is_retryable_setup_error(exc: Exception) -> bool:
     """Recognize temporary transport failures using public SDK/request errors."""
-    import requests.exceptions as request_errors  # type: ignore[import-not-found,import-untyped]
+    import requests.exceptions as request_errors
 
     if _is_nonretryable_authorization_error(exc):
         return False
@@ -269,7 +269,12 @@ def poll_wandb_summary(
             f"W&B evidence worker failed for attempt {run_id!r} (exit {result.return_code})."
             f"{diagnostic}"
         )
-    return response["capture"]
+    capture = response["capture"]
+    if not isinstance(capture, dict):
+        raise RuntimeError(
+            f"W&B evidence worker returned a malformed capture for attempt {run_id!r}."
+        )
+    return capture
 
 
 def _poll_wandb_summary(
@@ -285,8 +290,8 @@ def _poll_wandb_summary(
     deadline: float | None = None,
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline."""
-    from wandb.apis.public import Api  # type: ignore[import-not-found]
-    from wandb.errors import AuthenticationError, UsageError  # type: ignore[import-not-found]
+    from wandb.apis.public import Api
+    from wandb.errors import AuthenticationError, UsageError
 
     from phasesweep.evidence.evaluation import json_float
     from phasesweep.runtime.time import utc_now_iso

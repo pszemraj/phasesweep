@@ -462,7 +462,7 @@ def nofollow_flag() -> int:
         ``O_NOFOLLOW``, so private files cannot be opened without following
         symlinks.
     """
-    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nofollow: int | None = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise PlatformCapabilityError(
             "This platform cannot safely access private files without following symlinks."
