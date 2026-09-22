@@ -4,116 +4,328 @@ PhaseSweep's local ledger, artifact-root binding, publication transaction, and
 operator recovery are the only places where a wrong ordering silently destroys
 work. Three review passes found bugs only here, because the ordering rules
 lived in comments. This page is the enforceable version: every rule names the
-function that holds it and the test that fails when it stops holding.
+code that holds it and the test that fails when it stops holding.
 
 ## Agent handoff
 
+Paste this block into the instructions of any agent that changes the engine or
+the MCP layer.
+
+```text
+1. Mutating paths (a run, and recover-run when confirmed) take the experiment lock before they touch the artifact tree or the ledger. Read paths and recovery inspection take no lock, so they must write nothing.
+2. Validate, then claim, then open. validate_ledger checks the artifact-root binding, then scans the ledger format, and writes nothing; on a bound tree an unreadable scan is tolerated and recorded on the handle. claim_ledger rescans strictly if that scan did not complete, loads every existing phase study, checks every study's root before any write, writes the tree binding, then claims empty studies. Only the ClaimedLedger it returns reaches open_phase_study.
+3. Pure read paths (read_status, read_winners, CLI status and show-winners, the MCP result snapshot) never construct file-backed storage and never write bytes. Recovery inspection validates binding and format before any open and refuses a pre-cutover ledger with the bytes unchanged.
+4. Only src/phasesweep/engine/ledger.py may construct Optuna or sqlite3 storage, and no other module imports its private names. tests/test_ledger_contract.py enforces both, and its ratchets are empty, so a new site anywhere else fails.
 ```
-1. Take the experiment lock before touching any durable state.
-2. Validate read-only before writing anything: binding check, then format scan, then bind the tree, then claim studies, then open live storage. The order is fixed and the typed handle proves it ran.
-3. Pure read paths (read_status, read_winners, CLI status/show-winners, MCP snapshot) never construct file-backed storage and never write bytes. Recovery inspect validates binding+format before any open and refuses a pre-cutover ledger with bytes unchanged.
-4. Only src/phasesweep/engine/ledger.py may construct Optuna or sqlite3 storage. tests/test_ledger_contract.py enforces this with equality ratchets that you update in the same change.
-5. Error text is authoritative; wraps preserve the operator's remediation; never fix a failing test by weakening a message match or an ordering assertion.
-```
+
+> [!IMPORTANT]
+> Error text is authoritative, and a wrap preserves the operator's remediation.
+> Never fix a failing test by weakening a message match or an ordering
+> assertion.
 
 ## Invariants
 
-Rows marked `(this PR)` in the Enforced-by cell name the chokepoint API that
-the ledger milestone introduces; the rest cite code that exists today.
+Module paths below drop the `phasesweep.` prefix; test paths are relative to
+the repository root.
 
-| # | Invariant | Enforced by | Owning test |
-| --- | --- | --- | --- |
-| 1 | The experiment lock is held before any durable state is read or written. | `phasesweep.engine.locking._experiment_lock`, entered as the outermost durable-state context in `phasesweep.engine.run._run_experiment_outcome` | `tests/test_locking.py::test_run_experiment_holds_experiment_lock_for_duration` |
-| 2 | Validation is read-only and completes before anything is bound: binding check, then format scan. | `phasesweep.engine.ledger.validate_ledger` (this PR) | `tests/test_format_cutover.py::test_live_openers_reject_unvalidated_storage` |
-| 3 | The chokepoint order is validate, bind tree, claim, open live, and the typed handle proves it: `open_phase_study` accepts only a `ClaimedLedger`. | `phasesweep.engine.ledger.validate_ledger` returning `ValidatedLedger`, `claim_ledger` returning `ClaimedLedger`, `open_phase_study` requiring `ClaimedLedger` (this PR) | `tests/test_format_cutover.py::test_claim_ledger_binds_tree_then_returns_bound_handle`, `tests/test_ledger_contract.py::test_storage_constructors_are_called_only_in_the_ledger_module` |
-| 4 | Both ownership directions are resolved before a generation is claimed: the root binding names the ledger and every study's artifact-root attribute names the root. | `phasesweep.engine.ledger.validate_ledger` then `claim_ledger` (this PR), over `phasesweep.engine.artifact_roots._check_artifact_root_binding` and `_artifact_root_claim_needed` | `tests/test_fingerprint.py::test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched` |
-| 5 | The tree binding is written before any study is root-claimed, so a crash cannot leave a study pointing at a tree that does not name the same ledger. | `phasesweep.engine.ledger.claim_ledger` (this PR) writes through `phasesweep.engine.artifact_roots._write_artifact_root_binding` before its `_claim_study_artifact_root` loop | `tests/test_fingerprint.py::test_refused_multi_phase_binding_claims_nothing` |
-| 6 | Pure read paths (`read_status`, `read_winners`, CLI `status` and `show-winners`, MCP snapshot) never construct file-backed storage and never write bytes. | `phasesweep.engine.ledger.read_phase_trial_stats`, `open_existing_study`, `open_registry_study` (this PR) | `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes` |
-| 7 | Recovery inspect validates binding and format before any open, and refuses a pre-cutover ledger with the bytes unchanged. | `phasesweep.mcp.recovery._load_recovery_studies` routed through `phasesweep.engine.ledger.validate_ledger` and `open_existing_study` (this PR) | `tests/test_ledger_read_paths.py::test_recovery_inspect_never_writes_to_a_golden_ledger` |
-| 8 | The attempt registry is scanned first, and an attempt is durably registered before its process is launched. | `phasesweep.engine.attempts._preflight_active_attempts` (driven by `phasesweep.engine.guards._preflight_existing_studies`), then `phasesweep.engine.attempts._register_active_attempt` before the GPU lease and launch | `tests/test_stale_reaper.py::test_unpersistable_attempt_refuses_to_launch_its_trainer` |
-| 9 | Preflight completes before a claim: environment preflight before the generation claim, and the full continuation chain before any attempt is registered or the generation is marked running. | `phasesweep.engine.run._preflight_missing_reached_phase_environments` before `phasesweep.engine.generation._claim_generation`; `phasesweep.engine.guards._preflight_existing_studies`, `phasesweep.engine.resume._preflight_skipped_winners`, `phasesweep.engine.resume._preflight_reached_fingerprint` before `phasesweep.engine.attempts._register_active_attempt` | `tests/test_runtime_behavior.py::test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup` |
-| 10 | No Optuna trial reaches a terminal state without its durable outcome record; a failed outcome write leaves the trial RUNNING. | `phasesweep.engine.phase._run_phase` writes the trial outcome attribute before any terminal transition and raises `phasesweep.engine.phase._TrialOutcomeUnrecordedAbort` instead | `tests/test_runtime_behavior.py::test_persistent_outcome_write_failure_leaves_trial_running_until_recovery` |
-| 11 | An unreadable ledger means cleanup is uncertain, never that cleanup is confirmed. | `phasesweep.engine.cleanup._reap_stale_trials` raises `ProcessCleanupUncertainError`, `phasesweep.engine.attempts._registry_attempt_fail_stale_trial` retains the entry, and `phasesweep.engine.guards._preflight_existing_studies` marks the report uncertain | `tests/test_stale_reaper.py::test_registry_storage_failure_marks_cleanup_report_uncertain` |
-| 12 | Publication is a transaction: the immutable generation is durable first, the pointer commits second, and shutdown signals are absorbed until the commit lands. | `phasesweep.engine.generation._publish_generation` running inside `phasesweep.runtime.process.absorb_shutdown_signals`, with `_validate_generation_publishable` before the pointer write and `_write_generation_record_once` for the immutable record | `tests/test_publication_transaction.py::test_shutdown_signal_during_publication_is_absorbed_until_committed` |
-| 13 | A stale PID is never authority: identity is PID plus start time plus boot id, and a differing boot id settles a reboot without signalling anything. | `phasesweep.mcp.runs.identity_from_earlier_boot`, `phasesweep.mcp.runs.RunStore.from_earlier_boot`, `phasesweep.runtime.process.is_same_live_process`, `phasesweep.runtime.process.cleanup_stale_trial_process` | `tests/test_mcp_runs.py::test_state_cleanup_uncertain_on_pid_reuse_mismatch`, `tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling` |
-| 14 | A dead runner with no terminal status stays in the live set until `recover-run` decides; liveness alone never concludes the run. | `phasesweep.mcp.runs.RunStore.state`, `_settle_dead_runner`, `recovery_required`, resolved only by `phasesweep.mcp.recovery.recover_run` | `tests/test_mcp_runs.py::test_dead_runner_without_status_stays_live_until_recovery_evidence` |
-| 15 | Every operator-facing error declares its remediation, and a wrap preserves it rather than replacing it with the wrapper's own advice. | `phasesweep.errors.PhaseSweepError.action`, `phasesweep.errors.PhaseSweepError.rewrap`, `phasesweep.errors.OperatorAction` (this PR) | `tests/test_error_routing.py::test_every_operator_error_declares_its_action`, `tests/test_error_routing.py::test_operator_action_survives_wrap`, `tests/test_mcp_runner.py::test_cleanup_uncertain_remediation_follows_the_operator_action` |
-| 16 | The refusals are tested against real ledgers produced by the public API and by the preserved 0.3.1 tag, and read paths run under a monkeypatch that raises if a storage constructor is called. | `tests/fixtures/make_ledger_fixtures.py`, `tests/ledger_fixtures.py::forbid_file_backed_storage` (this PR) | `tests/test_ledger_read_paths.py::test_current_fixture_carries_this_release_format`, `tests/test_ledger_read_paths.py::test_required_ledger_fixtures_are_present` |
+### Lock and ledger order
 
-Row 5 has no fault-injection test that crashes between the tree write and the
-study claim; `test_refused_multi_phase_binding_claims_nothing` covers the
-weaker "a refused check claims nothing" guarantee on the same code path. Row 9
-is stated as the code actually orders things: `_claim_generation` runs before
-the continuation preflight chain, so the chain's guarantee is against the
-attempt claim and the running-state transition, not against the generation
-claim.
+Every path into the ledger passes through `engine.ledger`, and the handle each
+step returns is the proof the earlier steps ran. The diagram shows where each
+caller enters and where it must stop.
+
+```mermaid
+flowchart TD
+    run["run: CLI or MCP runner"] --> lock["experiment lock"]
+    recover["recover-run"] -->|"confirmed"| lock
+    recover -->|"inspection, no lock"| check
+    reads["status, show-winners, MCP reads"] -->|"no lock"| check
+    lock --> check
+    subgraph validate["validate_ledger: writes nothing"]
+        check["artifact-root binding check"] --> scan["ledger format scan<br/>unreadable is tolerated only on a bound tree"]
+    end
+    scan --> handle["ValidatedLedger<br/>records whether the scan completed"]
+    handle -->|"read paths stop here"| ro["read_phase_trial_stats<br/>phase unavailable if the scan did not complete"]
+    handle -->|"recover-run, never claims"| existing["open_existing_study<br/>refuses a scan that did not complete"]
+    handle -->|"run"| rescan
+    subgraph claim["claim_ledger"]
+        rescan["strict rescan if the scan did not complete"] --> discover["load every existing phase study"]
+        discover --> roots["check every study's root, all phases before any write"]
+        roots --> recheck["re-check the tree binding is unchanged"]
+        recheck --> bind["write the tree binding if unbound"]
+        bind --> claimst["claim empty studies for this root"]
+    end
+    claimst --> claimed["ClaimedLedger"]
+    claimed --> pre["environment preflight, generation claim,<br/>continuation preflight"]
+    pre --> open["open_phase_study: open or create the study that runs trials"]
+    check -.->|"tree names another ledger"| refused["refused, nothing written"]
+    scan -.->|"wrong format, or unreadable on an unbound tree"| refused
+    roots -.->|"a study names another root"| refused
+```
+
+#### 1. Mutations hold the experiment lock
+
+A run, and a `recover-run` the operator confirms, hold the experiment lock
+before they read or write the artifact tree or the ledger.
+
+**Held by:** `engine.locking._experiment_lock`, entered as the outermost
+durable-state context in `engine.run._run_experiment_outcome`, and in
+`mcp.recovery.recover_run` only when the operator confirms\
+**Test:** `tests/test_locking.py::test_run_experiment_holds_experiment_lock_for_duration`
+
+#### 2. Validation writes nothing
+
+`validate_ledger` checks the artifact-root binding, then scans the ledger
+format, and writes nothing; on a bound tree an unreadable scan is tolerated and
+recorded on the handle, and on an unbound tree it is refused.
+
+**Held by:** `engine.ledger.validate_ledger`, running
+`engine.artifact_roots._check_artifact_root_binding` before
+`engine.ledger._scan_ledger_format` and returning a `ValidatedLedger` whose
+`format_verified` and `format_scan_failure` record the outcome\
+**Tests:** `tests/test_format_cutover.py::test_validate_ledger_on_a_fresh_root_creates_nothing`,
+`tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
+`tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`
+(its `release-0.3.1` cells pin the binding check before the format scan)
+
+#### 3. Only a claimed ledger runs trials
+
+Only a `ClaimedLedger` can open a study that runs new trials, and
+`claim_ledger` rescans strictly before it trusts a scan that did not complete.
+
+**Held by:** `engine.ledger.claim_ledger` returning `ClaimedLedger`;
+`engine.ledger.open_phase_study`, which raises `TypeError` for any other
+handle; `engine.ledger.open_preview_study`, which is in-memory and serves dry
+runs\
+**Tests:** `tests/test_format_cutover.py::test_live_openers_reject_unvalidated_storage`,
+`tests/test_format_cutover.py::test_claim_ledger_binds_tree_then_returns_bound_handle`,
+`tests/test_format_cutover.py::test_claim_rescans_an_unverified_ledger_before_discovery`,
+`tests/test_ledger_contract.py::test_storage_constructors_are_called_only_in_the_ledger_module`
+
+#### 4. Both ownership directions agree before any write
+
+The tree binding must name this ledger and every existing phase study must
+name this root, checked for all phases before anything is written.
+
+**Held by:** `engine.artifact_roots._check_artifact_root_binding` in
+`validate_ledger`, then `engine.artifact_roots._artifact_root_claim_needed`
+for every loaded study and a re-check of the binding in `claim_ledger`\
+**Tests:** `tests/test_fingerprint.py::test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched`,
+`tests/test_fingerprint.py::test_refused_multi_phase_binding_claims_nothing`
+
+#### 5. The tree is bound before any study
+
+`claim_ledger` writes the tree binding before it claims any study, so a crash
+between the two cannot leave a study naming a tree that does not name its
+ledger.
+
+**Held by:** `engine.ledger.claim_ledger`, calling
+`engine.artifact_roots._write_artifact_root_binding` before its
+`_claim_study_artifact_root` loop\
+**Test:** `tests/test_format_cutover.py::test_claim_ledger_writes_tree_binding_before_claiming_studies`
+
+#### 6. Read paths construct and write nothing
+
+`read_status`, `read_winners`, CLI `status` and `show-winners`, and the MCP
+result snapshot build no file-backed storage, write no bytes, and report a
+phase whose format scan did not complete as unavailable rather than counting
+its trials.
+
+**Held by:** `engine.ledger.validate_ledger` and
+`engine.ledger.read_phase_trial_stats`, under `engine.read.read_status`,
+`engine.read.read_winners`, and `mcp.snapshots.capture_result_snapshot`\
+**Tests:** `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`,
+`tests/test_format_cutover.py::test_inconclusive_scan_on_a_bound_tree_never_reports_unchecked_counts`
+
+#### 7. Recovery validates before it opens
+
+Recovery validates the binding and the format before it opens any study, never
+claims, and refuses a pre-cutover ledger or an incomplete scan with the bytes
+unchanged.
+
+**Held by:** `mcp.recovery._load_recovery_studies`, through
+`engine.ledger.validate_ledger` and then `engine.ledger.open_existing_study`,
+which refuses a handle whose scan did not complete\
+**Tests:** `tests/test_ledger_read_paths.py::test_recovery_inspect_never_writes_to_a_golden_ledger`,
+`tests/test_ledger_read_paths.py::test_recovery_study_load_rewraps_the_engine_refusal`,
+`tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`
+
+### Attempts and trial outcomes
+
+#### 8. Attempts are registered before launch
+
+The attempt registry is scanned before anything else in preflight, and each
+attempt is durably registered before its trainer is launched.
+
+**Held by:** `engine.attempts._preflight_active_attempts`, run first by
+`engine.guards._preflight_existing_studies`; then
+`engine.attempts._register_active_attempt`, called in `engine.phase` before
+the GPU lease and the launch\
+**Test:** `tests/test_stale_reaper.py::test_unpersistable_attempt_refuses_to_launch_its_trainer`
+
+#### 9. Preflight finishes before the claims it guards
+
+Environment preflight finishes before the generation claim, and the
+continuation preflight finishes before the generation is marked running or any
+attempt is registered.
+
+**Held by:** `engine.run._run_experiment_outcome`, which calls
+`_preflight_missing_reached_phase_environments` before
+`engine.generation._claim_generation`, then
+`engine.guards._preflight_existing_studies`,
+`engine.resume._preflight_skipped_winners`, and
+`engine.resume._preflight_reached_fingerprint` before the running state\
+**Test:** `tests/test_runtime_behavior.py::test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup`
+
+`claim_ledger` runs before environment preflight, and the generation claim
+runs before the continuation chain, so the chain guards the running state and
+the attempts, not either claim.
+
+#### 10. No terminal trial without its outcome record
+
+No Optuna trial reaches a terminal state before its durable outcome record is
+written; a failed outcome write leaves the trial `RUNNING` for recovery.
+
+**Held by:** `engine.phase._run_phase`, which writes the outcome attribute
+before any terminal transition and raises
+`engine.phase._TrialOutcomeUnrecordedAbort` when it cannot\
+**Test:** `tests/test_runtime_behavior.py::test_persistent_outcome_write_failure_leaves_trial_running_until_recovery`
+
+#### 11. An unreadable ledger means cleanup is uncertain
+
+A ledger that cannot be read makes cleanup uncertain, never confirmed, and the
+attempt stays registered for a later retry.
+
+**Held by:** `engine.cleanup._reap_stale_trials`, which raises
+`ProcessCleanupUncertainError`; `engine.attempts._registry_attempt_fail_stale_trial`,
+which opens through `engine.ledger.open_registry_study` and retains the entry
+when storage is unreachable; `engine.guards._preflight_existing_studies`,
+which marks the cleanup report uncertain\
+**Tests:** `tests/test_stale_reaper.py::test_registry_storage_failure_marks_cleanup_report_uncertain`,
+`tests/test_stale_reaper.py::test_registry_retains_attempt_when_journal_snapshot_is_unreadable`
+
+### Publication
+
+#### 12. Publication is a transaction
+
+The generation's own summary and winners are read back and validated before
+`last_successful_generation.yaml` commits, a failure before the commit leaves
+the prior pointer authoritative, and shutdown signals are absorbed until the
+commit lands.
+
+**Held by:** `engine.generation._publish_generation`, running inside
+`runtime.process.absorb_shutdown_signals`, with
+`engine.generation._validate_generation_publishable` before the pointer
+write\
+**Test:** `tests/test_publication_transaction.py::test_shutdown_signal_during_publication_is_absorbed_until_committed`
+
+### MCP runs
+
+#### 13. A PID alone is never authority
+
+A process is identified by PID, start time, and boot id together, and a
+differing boot id settles a reboot without signalling anything.
+
+**Held by:** `mcp.runs.identity_from_earlier_boot`,
+`mcp.runs.RunStore.from_earlier_boot`, `runtime.process.is_same_live_process`,
+`runtime.process.cleanup_stale_trial_process`\
+**Tests:** `tests/test_mcp_runs.py::test_state_cleanup_uncertain_on_pid_reuse_mismatch`,
+`tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`
+
+#### 14. A dead runner stays live until recovery decides
+
+A dead runner with no terminal status stays in the live set until `recover-run`
+decides; liveness alone never concludes a run.
+
+**Held by:** `mcp.runs.RunStore.state`, `RunStore._settle_dead_runner`, and
+`RunStore.recovery_required`, resolved only by `mcp.recovery.recover_run`\
+**Test:** `tests/test_mcp_runs.py::test_dead_runner_without_status_stays_live_until_recovery_evidence`
+
+### Errors and fixtures
+
+#### 15. Wraps keep the operator's remediation
+
+Every operator-facing error declares its remediation, and a wrap preserves it
+instead of replacing it with the wrapper's own advice.
+
+**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.action`,
+`errors.PhaseSweepError.rewrap`\
+**Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`,
+`tests/test_error_routing.py::test_operator_action_survives_wrap`,
+`tests/test_mcp_runner.py::test_cleanup_uncertain_remediation_follows_the_operator_action`
+
+#### 16. Refusals are tested against real ledgers
+
+Refusals are tested against ledgers produced by the public API and by the
+preserved `v0.3.1` tag, and read paths run under a patch that records and
+raises on any file-backed storage construction.
+
+**Held by:** `tests/fixtures/make_ledger_fixtures.py`,
+`tests/ledger_fixtures.py::forbid_file_backed_storage`\
+**Tests:** `tests/test_ledger_read_paths.py::test_current_fixture_carries_this_release_format`,
+`tests/test_ledger_read_paths.py::test_required_ledger_fixtures_are_present`,
+`tests/test_ledger_read_paths.py::test_every_ledger_fixture_is_documented`
 
 ## Decision record: recovery machinery
 
 Three pieces of machinery exist only to survive a hard exit. Each is cheap to
-delete and expensive to be wrong about, so the cost is written down here rather
-than rediscovered by the next reviewer.
+delete and expensive to be wrong about, so the cost is written down here
+rather than rediscovered by the next reviewer.
+
+| Machinery | Failure it prevents | Cost |
+| --- | --- | --- |
+| `recover-run` | A leaked capacity slot after a hard exit | About 950 lines |
+| Runner boot identity | Signalling an unrelated process after a reboot | About 160 lines |
+| Persisted spawned handle | A duplicate sweep after a server restart | About 270 lines |
+
+Their tests stay in the fast tier except the ones that spawn a real runner,
+and that split is enforced rather than chosen: the collection guard fails any
+test that spawns a real process without the `integration` marker (see
+[test tiers](development.md#test-tiers)).
 
 ### `recover-run`
 
-Prevents a catalog capacity-slot leak after a hard exit. When a detached runner
-is SIGKILLed or the host crashes, the run handle survives with no terminal
-status. `RunStore.state` deliberately keeps that run live (invariant 14),
-because a dead runner with no status is indistinguishable from one whose trials
-are still being reaped, so the run holds one of the experiment's capacity slots
-and no later launch can proceed. `recover-run` is the only path that reads the
-durable evidence and decides.
+When a detached runner is SIGKILLed or the host crashes, the run handle
+survives with no terminal status. `RunStore.state` deliberately keeps that run
+live (invariant 14), because a dead runner with no status is indistinguishable
+from one whose trials are still being reaped, so the run holds one of the
+experiment's capacity slots and no later launch can proceed. `recover-run` is
+the only path that reads the durable evidence and decides. It opens studies
+only through `validate_ledger` and `open_existing_study`, so it validates the
+binding and the format before it opens anything (invariant 7).
 
-Cost: 880 lines in `src/phasesweep/mcp/recovery.py` (whole module) plus about
-55 lines of Click wiring for `phasesweep mcp recover-run` in
-`src/phasesweep/cli.py`, roughly 950 lines.
-
-This PR makes that cost deliberate: `_load_recovery_studies` stops borrowing
-the storage-private `_load_existing_phase_study` and opens through
-`phasesweep.engine.ledger.open_existing_study`, so recovery validates the
-binding and the format before it opens anything (invariant 7), and the
-recovery tests that spawn a real runner carry the `integration` marker and run
-outside the fast tier.
+The cost is all of `src/phasesweep/mcp/recovery.py` (901 lines) plus the
+50-line `mcp_recover_run` command in `src/phasesweep/cli.py`.
 
 ### Runner boot identity
 
-Prevents killing an unrelated process after a reboot. PID plus `/proc` start
-time is unique only within one boot: the kernel restarts both counters, so a
-saved pair can name a process the host started after rebooting, and a cancel
-or a cleanup would signal it. A recorded boot id settles the question in the
-safe direction. A differing boot id proves nothing from that boot survives, so
-cleanup is complete without sending a signal; an unknown boot id on either side
-refuses to signal at all.
+PID plus `/proc` start time is unique only within one boot: the kernel restarts
+both counters, so a saved pair can name a process the host started after
+rebooting, and a cancel or a cleanup would signal it. A recorded boot id
+settles the question in the safe direction. A differing boot id proves nothing
+from that boot survives, so cleanup is complete without sending a signal; an
+unknown boot id on either side refuses to signal at all.
 
-Cost: about 180 lines. Counted as function spans in `src/phasesweep/mcp/runs.py`:
-`identity_from_earlier_boot` (21), `ProcessIdentity` (8), `cleanup_identity`
-(23), `RunStore.from_earlier_boot` (11), `_read_cleanup_identity` (71), and
-`_valid_optional_boot_id` (14), which is 148; plus about 30 lines in
-`src/phasesweep/mcp/runner.py` where the runner reads the boot id and refuses
-to persist a launch receipt without one.
-
-This PR makes that cost deliberate on the tier side: `mcp.runs` never
-constructs storage, so the chokepoint does not touch it, but the runner tests
-that spawn a real subprocess to exercise the identity carry the `integration`
-marker and leave the fast tier.
+The cost is 148 lines of function spans in `src/phasesweep/mcp/runs.py`
+(`identity_from_earlier_boot` 21, `ProcessIdentity` 8, `cleanup_identity` 23,
+`RunStore.from_earlier_boot` 11, `_read_cleanup_identity` 71,
+`_valid_optional_boot_id` 14), plus 9 lines in `_persist_spawned_handle` in
+`src/phasesweep/mcp/runner.py` that read the boot id, refuse to persist a
+handle without one, and record it. `mcp.runs` never constructs storage, so the
+ledger chokepoint does not touch it.
 
 ### MCP restart recovery and the persisted spawned handle
 
-Prevents a duplicate launch after the server restarts. A detached runner
-outlives its parent by design. If the server restarts with no handle on disk,
-it has no record of that runner and a second `launch_run` spawns a duplicate
-sweep against the same ledger. The handle is created before `Popen`, replaced
-by the runner's own receipt once the runner has persisted its identity, and
-confirmed through a ready/ack handshake, so no child ever exists without a
-durable handle naming it.
+A detached runner outlives its parent by design. If the server restarts with
+no handle on disk, it has no record of that runner, and a second `launch_run`
+spawns a duplicate sweep against the same ledger. The handle is created before
+`Popen`, replaced by the runner's own receipt once the runner has persisted its
+identity, and confirmed through a ready/ack handshake, so no child ever exists
+without a durable handle naming it.
 
-Cost: about 270 lines in `src/phasesweep/mcp/server.py`, counted as function
-spans: `PhaseSweepMCP._spawn` (179), `_terminate_failed_spawn` (66), and
+The cost is 268 lines of function spans in `src/phasesweep/mcp/server.py`:
+`PhaseSweepMCP._spawn` (179), `_terminate_failed_spawn` (66), and
 `_pending_handle` (23).
-
-This PR makes that cost deliberate on the tier side as well: every test that
-actually spawns the runner to prove the handshake carries the `integration`
-marker.
 
 ### Rejected: removing any of the three
 
@@ -121,39 +333,20 @@ Removing `recover-run` leaves the leaked capacity slot with no owner, because
 the state machine is deliberately unable to conclude a dead runner on its own.
 Removing boot identity means signalling a PID a reboot may have reassigned,
 which is killing an unrelated process on the operator's host. Removing the
-persisted spawned handle means two sweeps writing into one ledger. Each
-removal converts a bounded amount of code into an unbounded class of silent
+persisted spawned handle means two sweeps writing into one ledger. Each removal
+converts a bounded amount of code into an unbounded class of silent
 corruption, so all three stay.
 
 ## Test tiers and gates
 
-Plain `pytest` is authoritative and stays the merge and release check. The fast
-review tier is:
-
-```bash
-pytest -m "not hardware and not integration"
-```
-
-A test is `@pytest.mark.integration` when it spawns real processes, waits on
-wall-clock time, or drives a multi-step durable recovery workflow. That marker
-is not a convention: `tests/tiers.py` recognizes the process and wall-clock
-primitives statically, resolving through same-module helpers and fixtures, and
-the `pytest_collection_modifyitems` hook in `tests/conftest.py` fails
-collection when a test uses one without the marker. There is no escape hatch,
-so the fast tier cannot quietly absorb a slow test.
+The fast tier, the `integration` marker, and the quality gates are described in
+[test tiers](development.md#test-tiers).
 
 `tests/test_ledger_contract.py` is the static contract behind invariant 3. It
-parses every module under `src/phasesweep` and compares the set of banned
-storage references against a ratchet dict for equality, not containment, so
-adding a call site fails and removing one fails until the ratchet is tightened
-in the same commit. Its three tests are
-`test_storage_constructors_are_called_only_in_the_ledger_module`,
-`test_ledger_private_names_are_not_imported_outside_the_ledger_module`, and
-`test_ledger_public_api_returns_concrete_types`.
-
-The remaining gates are `mypy src` under the explicit `[tool.mypy]` config in
-`pyproject.toml`, `ruff check .`, and `ruff format --check .`. The last
-milestone of this PR adds a `.pre-commit-config.yaml` that runs ruff, pathlint,
-doc-check, and those three contract tests at commit time, and `mypy` at push
-time, so the cheap static gates fire before a reviewer sees the change and the
-slower type check fires before the branch leaves the machine.
+parses every module under `src/phasesweep` and compares the banned storage
+references it finds against two ratchets for equality, not containment.
+Both ratchets, `_LEGACY_SITES` and `_LEGACY_PRIVATE_IMPORTS`, are empty, so
+any storage constructor or private ledger import outside `engine/ledger.py`
+fails the test. The pre-commit hook and CI run it with
+`tests/test_error_routing.py` and `tests/test_tier_guard.py`, the three
+contract test files.
