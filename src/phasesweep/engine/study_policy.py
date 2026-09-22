@@ -11,6 +11,7 @@ from phasesweep.config import Phase
 from phasesweep.config.search import NON_RESUMABLE_SAMPLERS
 from phasesweep.engine.attempts import _parsed_trial_outcome
 from phasesweep.engine.errors import (
+    OperatorAction,
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -277,7 +278,8 @@ def _validate_study_schema(study: optuna.Study) -> None:
         f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
         f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
         "Use a fresh artifact root and fresh local storage with this PhaseSweep release, "
-        "or use the preserved PhaseSweep 0.3.1 environment to operate existing state."
+        "or use the preserved PhaseSweep 0.3.1 environment to operate existing state.",
+        action=OperatorAction.USE_PRIOR_RELEASE,
     )
 
 
@@ -328,7 +330,8 @@ def _accepted_trial_target(study: optuna.Study) -> int:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}. "
             "Use a fresh local ledger and artifact root, or use the preserved PhaseSweep "
-            "0.3.1 environment to operate the existing state."
+            "0.3.1 environment to operate the existing state.",
+            action=OperatorAction.USE_PRIOR_RELEASE,
         )
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(
@@ -561,7 +564,8 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
             f"Study {study.study_name!r} contains populated trial(s) without a "
             f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
             "which environment cohort owns those results. Use a new experiment name, or "
-            "use the preserved PhaseSweep 0.3.1 environment to operate the existing state."
+            "use the preserved PhaseSweep 0.3.1 environment to operate the existing state.",
+            action=OperatorAction.USE_PRIOR_RELEASE,
         )
     if recorded != {current_digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))

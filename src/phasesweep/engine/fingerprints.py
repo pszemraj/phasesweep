@@ -12,6 +12,7 @@ import optuna
 
 from phasesweep.config import Experiment, Phase
 from phasesweep.engine.errors import (
+    OperatorAction,
     StudyFingerprintMismatchError,
 )
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
@@ -239,7 +240,8 @@ def _verify_fingerprint(
                 f"Phase {phase.name!r} study {study.study_name!r} has no semantic "
                 "fingerprint. Its populated state is unsupported by this release. Use a "
                 "fresh local ledger and artifact root, or use the preserved PhaseSweep "
-                "0.3.1 environment to operate the existing state."
+                "0.3.1 environment to operate the existing state.",
+                action=OperatorAction.USE_PRIOR_RELEASE,
             )
         study.set_user_attr(PHASE_FINGERPRINT_ATTR, fp)
     elif existing != fp:

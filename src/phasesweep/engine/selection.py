@@ -6,13 +6,13 @@ import json
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
 
 import optuna
 
 from phasesweep.config import Experiment, check_bounds
 from phasesweep.engine.artifacts import _winner_common_payload
-from phasesweep.engine.errors import PhaseSweepError, TrialEvidenceMissingError
+from phasesweep.engine.errors import OperatorAction, PhaseSweepError, TrialEvidenceMissingError
 from phasesweep.engine.evidence import _trial_objective_provenance
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -55,6 +55,8 @@ class SelectedTrial:
 
 class NoFeasibleTrialError(PhaseSweepError):
     """Raised when no trial in a completed phase satisfies all constraints."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
 
 def select_winner(

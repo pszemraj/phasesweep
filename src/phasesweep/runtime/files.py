@@ -12,10 +12,10 @@ import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, ClassVar
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
-from phasesweep.errors import LockBusyError, PhaseSweepError
+from phasesweep.errors import LockBusyError, OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.runtime.files")
 
@@ -61,13 +61,19 @@ def file_sha256(path: Path) -> str:
 class UnsafeLockPathError(PhaseSweepError):
     """Raised when a lock directory or file is not safe to trust."""
 
+    default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
+
 
 class UnsafePrivatePathError(PhaseSweepError):
     """Raised when a private directory or file is not safe to mutate."""
 
+    default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
+
 
 class PlatformCapabilityError(PhaseSweepError):
     """Raised when the host lacks a capability required for safe operation."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 
 
 @dataclass(frozen=True)

@@ -20,6 +20,7 @@ from phasesweep.config import Experiment, Gate, check_bounds
 from phasesweep.config.models import _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
+    OperatorAction,
     PhaseSweepError,
 )
 from phasesweep.errors import (
@@ -180,7 +181,7 @@ def _trainer_environment(
                 require_online=require_wandb_online,
             )
         except ValueError as exc:
-            raise PhaseSweepError(str(exc)) from exc
+            raise PhaseSweepError(str(exc), action=OperatorAction.FIX_CONFIG) from exc
     elif "WANDB_RUN_ID" not in experiment.env:
         # Without a remote evidence consumer, an explicitly configured run ID
         # remains trainer-owned. An ambient/inherited ID is not stable trial
