@@ -16,6 +16,7 @@ from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_constant_trainer
+from tests.ledger_fixtures import _tree_bytes
 
 
 def _experiment(tmp_path: Path, *, storage: str | None) -> Experiment:
@@ -28,15 +29,6 @@ def _experiment(tmp_path: Path, *, storage: str | None) -> Experiment:
         override_format="argparse",
         n_trials=1,
     )
-
-
-def _tree_bytes(root: Path) -> dict[str, bytes]:
-    """Return the exact regular-file contents below ``root``."""
-    return {
-        str(path.relative_to(root)): path.read_bytes()
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
 
 
 @pytest.mark.parametrize("durable_entry", ["generations", "attempts"])
