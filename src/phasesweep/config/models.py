@@ -85,7 +85,11 @@ def _metric_semantics_payload(metric: Metric) -> dict[str, Any]:
 
 
 def _metric_scoring_line(metric: Metric) -> str:
-    """Describe the scalar source, within-trial selection, and between-trial goal."""
+    """Describe the scalar source, within-trial selection, and between-trial goal.
+
+    :param Metric metric: Configured optimization metric.
+    :return str: One line naming the metric, its goal, and its extractor config.
+    """
     return (
         f"metric={metric.name!r} goal={metric.goal} "
         f"extractor={metric.extractor.model_dump(mode='json', exclude_none=True)}"
@@ -883,6 +887,14 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     )
 
     def validation_error(location: str, exc: _OverrideValueError) -> ValueError:
+        """Build the load-time error for one value the CLI renderer rejected.
+
+        :param str location: Where the offending value sits in the phase config.
+        :param _OverrideValueError exc: Renderer rejection carrying the offending
+            value and its nested position.
+        :return ValueError: Error naming the phase, location, and value, with a
+            hint for the offending value's kind.
+        """
         offender = exc.value
         if isinstance(offender, Mapping):
             hint = (

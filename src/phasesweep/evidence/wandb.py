@@ -62,7 +62,12 @@ def require_wandb_sdk() -> None:
 
 
 def _error_chain(exc: BaseException) -> Iterable[BaseException]:
-    """Walk active SDK causes, including the public CommError wrapper."""
+    """Walk active SDK causes, including the public CommError wrapper.
+
+    :param BaseException exc: Outermost error raised by the SDK or transport.
+    :return Iterable[BaseException]: ``exc`` and each distinct cause, context, or
+        wrapped ``exc`` attribute behind it, outermost first.
+    """
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
@@ -78,7 +83,11 @@ def _error_chain(exc: BaseException) -> Iterable[BaseException]:
 
 
 def _http_status(exc: BaseException) -> int | None:
-    """Read requests or SDK transport response status without private imports."""
+    """Read requests or SDK transport response status without private imports.
+
+    :param BaseException exc: Error that may carry a transport ``response``.
+    :return int | None: HTTP status code, or ``None`` when none is attached.
+    """
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     if status is None:
@@ -87,12 +96,20 @@ def _http_status(exc: BaseException) -> int | None:
 
 
 def _is_nonretryable_authorization_error(exc: Exception) -> bool:
-    """Recognize permanent HTTP authorization denial through SDK wrappers."""
+    """Recognize permanent HTTP authorization denial through SDK wrappers.
+
+    :param Exception exc: Error raised while creating the client or reading the run.
+    :return bool: Whether any error in the chain carries HTTP 401 or 403.
+    """
     return any(_http_status(error) in {401, 403} for error in _error_chain(exc))
 
 
 def _is_retryable_setup_error(exc: Exception) -> bool:
-    """Recognize temporary transport failures using public SDK/request errors."""
+    """Recognize temporary transport failures using public SDK/request errors.
+
+    :param Exception exc: Error raised while creating the client or reading the run.
+    :return bool: Whether the failure is transient and polling should continue.
+    """
     import requests.exceptions as request_errors
 
     if _is_nonretryable_authorization_error(exc):
@@ -115,14 +132,24 @@ def _is_retryable_setup_error(exc: Exception) -> bool:
 
 
 def _error_detail(exc: Exception) -> str:
-    """Describe error type/status without copying secret-bearing SDK messages."""
+    """Describe error type/status without copying secret-bearing SDK messages.
+
+    :param Exception exc: Error to describe.
+    :return str: Exception type name plus any HTTP statuses found in its chain.
+    """
     statuses = [str(status) for error in _error_chain(exc) if (status := _http_status(error))]
     suffix = f" (HTTP {', '.join(statuses)})" if statuses else ""
     return f"{type(exc).__name__}{suffix}"
 
 
 def _poll_worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
-    """Retain composed credentials and the orchestrator's Python bootstrap."""
+    """Retain composed credentials and the orchestrator's Python bootstrap.
+
+    :param Mapping[str, str] | None environment: Composed trainer environment, or
+        ``None`` for the orchestrator's own environment.
+    :return dict[str, str]: Worker environment whose ``PYTHON*`` variables match
+        the orchestrator's exactly.
+    """
     worker_environment = dict(os.environ if environment is None else environment)
     for name in set(worker_environment) | set(os.environ):
         if name.startswith("PYTHON"):
@@ -149,8 +176,13 @@ def poll_wandb_summary(
 ) -> dict[str, Any]:
     """Capture requested evidence after confirmed trainer cleanup.
 
+    :param str base_url: Normalized W&B API endpoint.
+    :param str entity: W&B entity that owns the project.
+    :param str project: W&B project containing the run.
     :param str run_id: Immutable attempt ID, also used by process recovery.
     :param Path trial_dir: Existing attempt directory and durable process slot.
+    :param float poll_seconds: Delay between summary polls.
+    :param float timeout_seconds: Visibility budget for the whole capture.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
@@ -289,7 +321,23 @@ def _poll_wandb_summary(
     presence_keys: Iterable[str] = (),
     deadline: float | None = None,
 ) -> dict[str, Any]:
-    """Poll an exact run using refreshed SDK clients within the parent's deadline."""
+    """Poll an exact run using refreshed SDK clients within the parent's deadline.
+
+    :param str base_url: Normalized W&B API endpoint.
+    :param str entity: W&B entity that owns the project.
+    :param str project: W&B project containing the run.
+    :param str run_id: Exact W&B run ID to read.
+    :param float poll_seconds: Delay between summary polls.
+    :param float timeout_seconds: Budget used when no ``deadline`` is given.
+    :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
+    :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
+    :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
+    :return dict[str, Any]: Numeric values, present keys, and retrieval time.
+    :raises WandbPollTimeout: The run did not finish with the required keys in time.
+    :raises WandbSetupError: Authentication or setup was denied.
+    :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
+    :raises ValueError: A requested scalar is invalid or non-finite.
+    """
     from wandb.apis.public import Api
     from wandb.errors import AuthenticationError, UsageError
 
@@ -350,7 +398,12 @@ def _poll_wandb_summary(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run an internal request and return typed, bounded evidence to its owner."""
+    """Run an internal request and return typed, bounded evidence to its owner.
+
+    :param list[str] | None argv: Request and response paths; ``None`` reads
+        ``sys.argv``.
+    :return int: Process exit status, ``0`` once the response file is written.
+    """
     from phasesweep.runtime.files import private_atomic_write_text
 
     parser = argparse.ArgumentParser(
