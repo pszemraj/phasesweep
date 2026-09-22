@@ -19,8 +19,12 @@ following:
 The runtime checks an existing artifact root and local ledger before it creates
 or stamps state. It refuses missing, malformed, or unsupported PhaseSweep
 format records without modifying that namespace. An unmarked durable MCP state
-directory is likewise refused before it is initialized. A new experiment name
-or workdir does not make an old populated local ledger fresh.
+directory is likewise refused before it is initialized.
+
+> [!NOTE]
+> A new experiment name or workdir does not make an old populated local ledger
+> fresh: the format check covers every PhaseSweep study in the ledger, not only
+> the current experiment's.
 
 There is no migration, adoption, relocation, rebind, or repair path in this
 release. Operate an existing 0.3.1 output, ledger, or MCP state directory with
@@ -70,15 +74,17 @@ generation that authoritatively represents the latest successful result. A
 failed invocation does not replace that pointer.
 
 `config.snapshot.yaml` is the executed configuration, including materialized
-defaults and the resolved invocation context. It is private because it can
-contain command and environment values. `reproducibility.json` is the
+defaults and the resolved invocation context. `reproducibility.json` is the
 shareable generation identity record. Trial directories retain local evidence
 and attempt lifecycle information used for supported continuation and winner
 validation.
 
-PhaseSweep writes a `.gitignore` containing `*` in a new experiment namespace;
-it does not replace an existing ignore file. Keep generated outputs, ledgers,
-and MCP state out of commits.
+> [!WARNING]
+> `config.snapshot.yaml` is private because it can contain command and
+> environment values. PhaseSweep writes a `.gitignore` containing `*` whenever
+> the experiment namespace lacks one, but it never replaces an existing ignore
+> file, so keep generated outputs, ledgers, and MCP state out of commits
+> yourself.
 
 ## Storage and locks
 
@@ -90,10 +96,32 @@ storage is one of:
 - `auto`, which chooses a sibling `study.db` or `study.journal` according to
   whether any phase has `n_jobs > 1`.
 
-The selected artifact root and ledger are bound to each other. A reused root
-cannot combine a second ledger's trial counts with the first ledger's
-publication. If changing `n_jobs` would make `auto` choose the other backend,
-the run is refused; restore the prior setting or start a fresh namespace.
+The selected artifact root and ledger are bound to each other in both
+directions:
+
+```mermaid
+flowchart LR
+    root["artifact root<br/>workdir/experiment"]
+    ledger["local ledger<br/>SQLite or Journal"]
+    root -->|"artifact_root_binding.json names this ledger"| ledger
+    ledger -->|"each phase study names this root"| root
+    other_ledger["a second ledger"] -.->|"refused: the root names another ledger"| root
+    other_root["a second workdir"] -.->|"refused: the studies name another root"| ledger
+```
+
+A reused root therefore cannot combine a second ledger's trial counts with the
+first ledger's publication, and a reused ledger cannot publish into a second
+tree. Both refusals happen before any trial runs and write nothing. If changing
+`n_jobs` would make `auto` choose the other backend, the run is refused;
+restore the prior setting or start a fresh namespace.
+
+No command writes to the artifact root or its ledger until it has checked the
+tree's binding and then the ledger's format. When a check fails, the command
+stops and leaves both byte-for-byte as they were. Read-only commands,
+including `status`, `show-winners`, and `run --dry-run`, never create a missing
+ledger or its directory. Contributors will find the ordering rules behind these
+guarantees, and the tests that hold them, in
+[durability invariants](invariants.md).
 
 Persistent phases use same-host locks. A concurrent CLI or MCP launch for the
 same experiment waits or fails safely according to the operation; it never
@@ -149,12 +177,13 @@ terminal failed attempt after cleanup. The `max_consecutive_failures` threshold
 also stops a broken phase. `n_trials` counts terminal attempts, so failed and
 pruned attempts consume the configured target.
 
-Before a supported continuation, PhaseSweep reconciles stale active attempts,
-checks the current artifact/ledger binding, verifies recorded trial evidence,
-and applies sampler continuation rules. `--from-phase` is valid only when the
-earlier phase winners remain valid; reused winners keep their original source
-provenance. TPE and CMA-ES persistent targets cannot resume mid-target, while
-grid and seeded random phases can top up their local study.
+Before a supported continuation, PhaseSweep first checks the artifact-root and
+ledger binding, then reconciles stale active attempts, and only then verifies
+recorded trial evidence and applies sampler continuation rules. `--from-phase`
+is valid only when the earlier phase winners remain valid; reused winners keep
+their original source provenance. TPE and CMA-ES persistent targets cannot
+resume mid-target, while grid and seeded random phases can top up their local
+study.
 
 An interrupted or failed generation leaves its immutable record for inspection
 but does not advance `last_successful_generation.yaml`. Signals are absorbed
@@ -168,6 +197,10 @@ experiment without launching work; an ordinary `run` invocation launches
 trials. `--from-phase` requires valid earlier winners. These reads inspect only
 the current-format local experiment; use the original 0.3.1 environment for
 existing 0.3.1 state.
+
+> [!TIP]
+> `status` and `show-winners` take no lock and never write to the artifact root
+> or ledger, so they are safe to run while a sweep is active.
 
 For operator-managed detached runs, see [the MCP operator guide](mcp.md).
 Terminal MCP run results are frozen snapshots associated with a run ID; they
