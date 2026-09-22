@@ -1,0 +1,54 @@
+# Every hook is `repo: local` with `language: system`: it runs the tool already
+# installed in the active development environment (`pip install -e ".[dev]"`),
+# so pre-commit builds no per-hook environments, needs no network, and uses the
+# same tool versions as manual runs. Activate that environment before
+# committing or pushing.
+minimum_pre_commit_version: "3.2.0"
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check
+        entry: ruff check --force-exclude --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format
+        entry: ruff format --force-exclude
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
+      - id: pathlint
+        name: pathlint
+        entry: pathlint
+        language: system
+        files: ^(src|tests)/.*\.py$
+      # doc_check.py is a maintainer script outside the repository; without it
+      # the hook reports the skip and passes. Its report prints only on failure.
+      - id: doc-check
+        name: doc-check (strict)
+        entry: >-
+          bash -c 'script="$HOME/scripts/py/doc_check.py";
+          [ -f "$script" ] || { echo "doc_check.py not found; skipped"; exit 0; };
+          out=$(python "$script" --strict "$@") || { printf "%s\n" "$out"; exit 1; }' --
+        language: system
+        files: ^src/.*\.py$
+        verbose: true
+      # Runs on every commit: the contracts span all of src/ and the pytest
+      # configuration, and the run takes about a second.
+      - id: contract-tests
+        name: contract tests
+        entry: pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py -q -p no:cacheprovider
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: mypy
+        name: mypy
+        entry: mypy src
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

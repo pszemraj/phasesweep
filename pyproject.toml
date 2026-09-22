@@ -48,6 +48,8 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
     "mcp>=1.27,<1.28",
+    "pre-commit>=3.2",
+    "pathlint>=0.2",
 ]
 
 [project.scripts]

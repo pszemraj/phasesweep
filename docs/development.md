@@ -31,6 +31,30 @@ console entry points outside the checkout, and exercises the starter's
 validation, dry run, execution, replay, and catalog scaffolding. It leaves no
 acceptance artifacts in the repository.
 
+### Git hooks
+
+The [hook configuration](../.pre-commit-config.yaml) calls the tools installed
+in the active environment and builds none of its own. The development extra
+provides `pre-commit` and `pathlint`; after installing it, enable the hooks once
+per clone:
+
+```bash
+pre-commit install
+```
+
+Each commit runs `ruff check --fix`, `ruff format`, `pathlint` on changed
+`src/` and `tests/` Python files, and three contract tests:
+`tests/test_ledger_contract.py`, `tests/test_error_routing.py`, and
+`tests/test_tier_guard.py`. When the maintainer script
+`~/scripts/py/doc_check.py` exists, `doc-check` also runs it with `--strict` on
+changed `src/` files; otherwise the hook prints that it skipped. Each push runs
+`mypy src`. Commit from a shell with that environment active. When Ruff
+rewrites a file, the commit stops; stage the fix and commit again.
+
+`pre-commit run --all-files` runs the commit hooks over the whole tree;
+add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain
+`pytest` remains the full gate.
+
 ### Test tiers
 
 Plain `pytest` above is the authoritative non-hardware suite and stays the
@@ -51,8 +75,10 @@ quietly absorb a slow test. Note that a `-m` on the command line *replaces* the
 commands above spell out `not hardware`.
 
 GitHub Actions intentionally has one Linux pull-request static-check job for
-Ruff linting, Ruff format checking, and mypy. The full suite and installed
-wheel check stay local to control CI cost. Hardware tests remain opt-in.
+Ruff linting, Ruff format checking, mypy, and the same three contract tests the
+commit hook runs, imported from `src/` without building the package. The full
+suite and installed wheel check stay local to control CI cost. Hardware tests
+remain opt-in.
 
 The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
 read-only inspection behavior depends on that range; do not widen it without
