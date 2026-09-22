@@ -581,9 +581,10 @@ def launch_trial(
     # Every engine artifact under ``workdir``, including process-control
     # records written later, shares this operator-trusted boundary. These
     # files use ordinary paths rather than the validated O_NOFOLLOW helpers
-    # reserved for the lock namespace and MCP state; forcing trial dirs
-    # private would break normal operator/tool visibility into logs and
-    # resolved overrides. See docs/runtime.md's trust-boundary note.
+    # reserved for the lock namespace, the attempt registry, and MCP state;
+    # forcing trial dirs private would break normal operator/tool visibility
+    # into logs and resolved overrides. See docs/runtime.md's trust-boundary
+    # section.
     run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
     trainer_input = prepared_input or prepare_trainer_input(
         experiment=experiment,
