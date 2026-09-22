@@ -1894,8 +1894,9 @@ def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) 
         n_trials=1,
     )
     run_experiment(experiment)
-    phase = experiment.phases[0]
-    assert _sqlite_study_exists(experiment, phase) is True
+    storage = experiment.resolved_storage
+    study_name = f"{experiment.experiment}::{experiment.phases[0].name}"
+    assert _sqlite_study_exists(storage, study_name) is True
 
     # BEGIN EXCLUSIVE holds the write lock until this connection closes, and
     # the probe connects with timeout=0.1, so the refusal is deterministic.
@@ -1903,11 +1904,11 @@ def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) 
     try:
         locker.execute("BEGIN EXCLUSIVE")
         with pytest.raises(StudyStorageUnavailableError):
-            _sqlite_study_exists(experiment, phase)
+            _sqlite_study_exists(storage, study_name)
     finally:
         locker.close()
 
-    assert _sqlite_study_exists(experiment, phase) is True
+    assert _sqlite_study_exists(storage, study_name) is True
 
 
 def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: Path) -> None:
@@ -1922,7 +1923,7 @@ def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: P
         n_trials=1,
     )
     assert not (tmp_path / "never-created.db").exists()
-    assert _sqlite_study_exists(never_created, never_created.phases[0]) is False
+    assert _sqlite_study_exists(never_created.resolved_storage, "t::p") is False
 
     schemaless_path = tmp_path / "schemaless.db"
     sqlite3.connect(schemaless_path).close()
@@ -1933,7 +1934,7 @@ def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: P
         trial_command=trial_command,
         n_trials=1,
     )
-    assert _sqlite_study_exists(schemaless, schemaless.phases[0]) is False
+    assert _sqlite_study_exists(schemaless.resolved_storage, "t::p") is False
 
 
 @pytest.mark.parametrize("storage", [None, "sqlite:///:memory:"])

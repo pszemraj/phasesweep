@@ -11,9 +11,9 @@ The chokepoint is ``phasesweep/engine/ledger.py``. Two ratchet dicts
 (:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) record what is still
 reachable from outside it. They are compared for *equality*, not containment:
 adding a call site fails, and removing one fails until the ratchet is tightened
-in the same commit. :data:`_LEGACY_SITES` is already empty; the remaining M2
-stages replace the private-helper imports with the ledger's public handle API
-and empty :data:`_LEGACY_PRIVATE_IMPORTS` too.
+in the same commit. Both are empty: every storage constructor and every
+storage-private helper is reached only through the ledger's public handle API,
+so any entry added to either one is a new bypass that needs a stated reason.
 
 Out of scope on purpose, because no static reader can follow them: dynamic
 attribute access such as ``getattr(optuna, "create_study")``, and anything
@@ -51,9 +51,9 @@ BANNED_LEAVES: dict[str, frozenset[str]] = {
     "sqlite3": frozenset({"connect"}),
 }
 
-#: Every private helper :data:`CHOKEPOINT` defines. The remaining M2 stages
-#: re-export these behind the public ledger API and the private-import ratchet
-#: empties out.
+#: Every private helper :data:`CHOKEPOINT` defines. Each assumes its caller
+#: already ran the validate-before-open order, so none may be imported outside
+#: the ledger; the public API reaches them only after that order holds.
 STORAGE_PRIVATE_NAMES = frozenset(
     {
         "_resolve_storage",
@@ -66,6 +66,7 @@ STORAGE_PRIVATE_NAMES = frozenset(
         "_sqlite_phase_trial_stats",
         "_sqlite_study_exists",
         "_load_journal_study_snapshot",
+        "_require_replay_matches_snapshot",
         "_journal_snapshot_storage",
         "_JournalSnapshot",
         "_trial_stats_from_rows",
@@ -80,13 +81,11 @@ _LEGACY_SITES: dict[str, set[str]] = {}
 
 #: Private ledger helpers still imported outside the chokepoint.
 #:
-#: Read paths hold a :class:`ValidatedLedger` and the write side holds a
-#: :class:`ClaimedLedger`; both call the public API. What is left is
-#: ``attempts.py``, which still replays a journal snapshot for foreign-ledger
-#: recovery.
-_LEGACY_PRIVATE_IMPORTS: dict[str, set[str]] = {
-    "phasesweep/engine/attempts.py": {"_load_journal_study_snapshot"},
-}
+#: Read paths hold a :class:`ValidatedLedger`, the write side holds a
+#: :class:`ClaimedLedger`, and foreign-ledger recovery goes through
+#: ``open_registry_study``; nothing outside the ledger reaches past its public
+#: API.
+_LEGACY_PRIVATE_IMPORTS: dict[str, set[str]] = {}
 
 
 def _source_files() -> list[Path]:
@@ -335,8 +334,8 @@ def test_ledger_public_api_returns_concrete_types() -> None:
             ]
     if exported is None:
         pytest.skip(
-            f"{CHOKEPOINT} has no __all__; M2 introduces phasesweep/engine/ledger.py "
-            "with an explicit public API and this test starts enforcing it."
+            f"{CHOKEPOINT} has no __all__, so its public API is undeclared and there "
+            "is nothing for this test to check."
         )
 
     definitions = {

@@ -202,8 +202,8 @@ def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> op
     )
 
 
-def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
-    """Return whether a SQLite storage already contains the phase study.
+def _sqlite_study_exists(storage_url: str, study_name: str) -> bool:
+    """Return whether a SQLite storage already contains the named study.
 
     Strict and tri-state on purpose (PR #5 review / reviewer 2, issue 1):
     callers use this verdict to decide whether root-binding and recovery
@@ -216,17 +216,16 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
     reader (:func:`_sqlite_phase_trial_stats`), where ``available: false`` is
     part of the contract.
 
-    :param Experiment experiment: Parsed experiment config with SQLite storage.
-    :param Phase | str phase: Phase or historical phase name to check.
+    :param str storage_url: SQLite storage URL to probe.
+    :param str study_name: Study whose existence is checked.
     :return bool: ``True`` when the database contains the study, ``False``
         when the database or its schema does not exist.
     :raises StudyStorageUnavailableError: The database file exists but could
         not be read (locked, corrupt, permission-denied, ...), so whether the
         study exists cannot be determined.
     """
-    assert experiment.resolved_storage is not None
-    uri = sqlite_readonly_uri(experiment.resolved_storage)
-    database = sqlite_database_path(experiment.resolved_storage)
+    uri = sqlite_readonly_uri(storage_url)
+    database = sqlite_database_path(storage_url)
     if uri is None or database is None or not database.exists():
         return False
     try:
@@ -234,7 +233,7 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
         try:
             row = conn.execute(
                 "SELECT 1 FROM studies WHERE study_name = ? LIMIT 1",
-                (_phase_study_name(experiment, phase),),
+                (study_name,),
             ).fetchone()
         finally:
             conn.close()
@@ -245,12 +244,12 @@ def _sqlite_study_exists(experiment: Experiment, phase: Phase | str) -> bool:
             return False
         raise StudyStorageUnavailableError(
             f"SQLite storage {database} exists but could not be read while checking for "
-            f"study {_phase_study_name(experiment, phase)!r}."
+            f"study {study_name!r}."
         ) from exc
     except sqlite3.Error as exc:
         raise StudyStorageUnavailableError(
             f"SQLite storage {database} exists but could not be read while checking for "
-            f"study {_phase_study_name(experiment, phase)!r}."
+            f"study {study_name!r}."
         ) from exc
     return row is not None
 
@@ -330,7 +329,7 @@ def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.St
         return None
 
 
-def _scan_ledger_format(experiment: Experiment) -> None:
+def _scan_ledger_format(storage: str | None) -> None:
     """Reject pre-cutover PhaseSweep studies without mutating local storage.
 
     The check covers every PhaseSweep-shaped study in the selected local
@@ -340,13 +339,13 @@ def _scan_ledger_format(experiment: Experiment) -> None:
     journal is replayed from an observational snapshot before Optuna can
     initialize, stamp, recover, or otherwise mutate the live backend.
 
-    :param Experiment experiment: Experiment whose resolved local ledger is inspected.
+    :param str | None storage: Resolved storage URL of the ledger to inspect,
+        or an in-memory sentinel.
     :raises StudyStorageUnavailableError: An existing local ledger cannot be
         inspected without mutation.
     :raises StudySchemaMismatchError: A populated PhaseSweep study is unmarked,
         or a PhaseSweep study uses a pre-cutover/unsupported schema.
     """
-    storage = experiment.resolved_storage
     if storage_is_in_memory(storage):
         return
     assert storage is not None
@@ -487,7 +486,7 @@ def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> op
     backend = storage_backend(storage)
     study_name = _phase_study_name(experiment, phase)
     if backend == "sqlite":
-        if not _sqlite_study_exists(experiment, phase):
+        if not _sqlite_study_exists(storage, study_name):
             return None
     elif backend == "journal":
         if _load_journal_study_snapshot(storage, study_name) is None:
@@ -863,7 +862,7 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     ledger = _describe_ledger(experiment, binding_state)
     if ledger.backend != "memory":
         try:
-            _scan_ledger_format(experiment)
+            _scan_ledger_format(ledger.storage_url)
         except StudyStorageUnavailableError:
             if binding_state == "unbound":
                 raise
@@ -1056,19 +1055,93 @@ def open_preview_study(experiment: Experiment, phase: Phase) -> optuna.Study:
     return _build_phase_study(experiment, phase, None)
 
 
-def open_registry_study(locator: str, study_name: str) -> optuna.Study:
+def _require_replay_matches_snapshot(
+    snapshot: optuna.Study, live: optuna.Study, locator: str
+) -> None:
+    """Refuse a live journal replay that disagrees with the snapshot taken first.
+
+    The snapshot is the complete, verified read; the live replay is what a
+    caller will write through. Appends between the two are normal, but every
+    trial the snapshot holds must still be there under the same identity, or
+    the journal was truncated or replaced mid-inspection and the snapshot's
+    evidence no longer describes what the caller would change.
+
+    :param optuna.Study snapshot: Study replayed from the complete snapshot.
+    :param optuna.Study live: Same study replayed from the live journal.
+    :param str locator: Journal storage URL, named in the refusal.
+    :raises StudyStorageUnavailableError: A snapshot trial is missing from the
+        live replay, or carries a different trial id, generation, or attempt.
+    """
+    current = {trial.number: trial for trial in live.get_trials(deepcopy=False)}
+    for captured in snapshot.get_trials(deepcopy=False):
+        replayed = current.get(captured.number)
+        if (
+            replayed is None
+            or replayed._trial_id != captured._trial_id
+            or any(
+                captured.user_attrs.get(key) is not None
+                and replayed.user_attrs.get(key) != captured.user_attrs[key]
+                for key in (GENERATION_ID_ATTR, ATTEMPT_ID_ATTR)
+            )
+        ):
+            raise StudyStorageUnavailableError(
+                f"Journal storage {Path(file_url_path(locator)).expanduser()} changed while "
+                f"study {snapshot.study_name!r} was being opened: trial {captured.number} "
+                "no longer matches the complete snapshot read first."
+            )
+
+
+def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
     """Open a study named by an attempt-registry entry, on any ledger it names.
 
     The attempt registry can point at a ledger this process never configured -
     a run that moved its storage, or a foreign locator recorded by an earlier
     orchestrator - so this is the one opener that takes a bare locator instead
-    of a validated handle. It keeps the registry recovery semantics it was
-    extracted from: a missing study surfaces as :class:`KeyError`, which the
-    caller resolves differently for SQLite and journal ledgers.
+    of a validated handle, and it does the validation itself, first: the
+    locator's whole ledger is scanned for pre-cutover state before any study in
+    it is opened. This release wrote the registry entry, so the ledger it names
+    was current-format when the attempt registered; pre-cutover state there now
+    means the locator no longer names that ledger, and reaping through it would
+    write into state this release refuses.
+
+    Absence is confirmed without creating anything. A missing database or
+    journal, or a ledger that holds no such study, returns ``None``; Optuna's
+    own loaders would instead create the missing file and then report the
+    study absent from it. A journal is opened live only after a complete
+    read-only snapshot proves the study exists, and the live replay must then
+    agree with that snapshot, because a journal that loses trials between the
+    two reads is uncertain, not absent.
 
     :param str locator: Storage URL recorded in (or recovered for) the entry.
     :param str study_name: Study the registry entry names.
-    :return optuna.Study: The study recorded under ``study_name``.
-    :raises KeyError: ``locator`` holds no study called ``study_name``.
+    :return optuna.Study | None: The live study, or ``None`` when the ledger
+        confirms it does not hold one called ``study_name``.
+    :raises StudySchemaMismatchError: The ledger holds pre-cutover or
+        unsupported PhaseSweep study state.
+    :raises StudyStorageUnavailableError: The ledger exists but could not be
+        read completely, or a journal changed while the study was being opened.
     """
-    return optuna.load_study(study_name=study_name, storage=_resolve_storage(locator))
+    if storage_is_in_memory(locator):
+        # An in-memory study died with the orchestrator that held it.
+        return None
+    _scan_ledger_format(locator)
+    if storage_backend(locator) == "sqlite":
+        if not _sqlite_study_exists(locator, study_name):
+            return None
+        try:
+            return optuna.load_study(study_name=study_name, storage=_resolve_storage(locator))
+        except KeyError:
+            return None
+    # The scan refused every other backend, so this is a journal.
+    snapshot = _load_journal_study_snapshot(locator, study_name)
+    if snapshot is None:
+        return None
+    try:
+        live = optuna.load_study(study_name=study_name, storage=_resolve_storage(locator))
+    except KeyError as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {Path(file_url_path(locator)).expanduser()} lost study "
+            f"{study_name!r} between its complete snapshot and the live replay."
+        ) from exc
+    _require_replay_matches_snapshot(snapshot, live, locator)
+    return live

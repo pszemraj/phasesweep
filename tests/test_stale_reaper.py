@@ -1298,6 +1298,7 @@ def _fabricate_registered_journal_attempt(
         storage=engine_ledger._resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
+    mark_current_format(experiment, study)
     trial = study.ask()
     trial_dir = _trial_dir_for(
         experiment,
@@ -1342,21 +1343,19 @@ def test_registry_retains_attempt_when_live_journal_loses_snapshotted_trial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A later live replay cannot erase snapshot-proven recovery evidence."""
-    import phasesweep.engine.attempts as attempts_mod
-
     experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
         tmp_path, attempt_id="changed-journal-attempt"
     )
     create_study_only = ledger.read_bytes().splitlines(keepends=True)[0]
     entry_before = entry_path.read_bytes()
-    real_snapshot = attempts_mod._load_journal_study_snapshot
+    real_snapshot = engine_ledger._load_journal_study_snapshot
 
     def snapshot_then_truncate(storage_url: str, study_name: str):
         snapshot = real_snapshot(storage_url, study_name)
         ledger.write_bytes(create_study_only)
         return snapshot
 
-    monkeypatch.setattr(attempts_mod, "_load_journal_study_snapshot", snapshot_then_truncate)
+    monkeypatch.setattr(engine_ledger, "_load_journal_study_snapshot", snapshot_then_truncate)
 
     _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
@@ -1375,6 +1374,95 @@ def test_registry_discards_attempt_for_a_confirmed_missing_journal_study(tmp_pat
     _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
     assert not entry_path.exists()
+
+
+def test_registry_discards_attempt_whose_sqlite_ledger_is_gone_without_recreating_it(
+    tmp_path: Path,
+) -> None:
+    """A deleted SQLite locator is confirmed absent, and inspecting it creates nothing.
+
+    Optuna's own loader would create the missing database before reporting the
+    study absent from it, leaving an empty ledger at a locator recovery was
+    only inspecting. A missing file already proves the study is gone.
+    """
+
+    def _exp(db_name: str) -> Experiment:
+        return make_experiment(
+            experiment="gone-ledger",
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{tmp_path / db_name}",
+            n_trials=1,
+        )
+
+    gone = tmp_path / "gone.db"
+    _study, trial_dir, _number = _fabricate_registered_attempt(
+        _exp("gone.db"), "p", attempt_id="gone-attempt"
+    )
+    write_attempt_lifecycle(trial_dir, attempt_id="gone-attempt", state="allocated")
+    entry_path = _attempts_dir(_exp("gone.db")) / "gone-attempt.json"
+    gone.unlink()
+
+    report = _PreflightCleanupReport()
+    _preflight_active_attempts(_exp("current.db"), report)
+
+    assert not entry_path.exists()
+    assert not gone.exists()
+    assert report.cleanup_confirmed is True
+    assert report.recovered_attempt_ids == set()
+
+
+def test_registry_refuses_a_foreign_ledger_holding_pre_cutover_state(tmp_path: Path) -> None:
+    """A registry entry cannot reap through a ledger this release refuses.
+
+    This release wrote the entry, so the ledger it names was current-format
+    when the attempt registered. Pre-cutover state there now means the locator
+    no longer names that ledger, so the run stops with the entry and the
+    foreign ledger's bytes both intact instead of marking a trial FAIL in it.
+    """
+
+    def _exp(db_name: str) -> Experiment:
+        return make_experiment(
+            experiment="foreign-ledger",
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{tmp_path / db_name}",
+            n_trials=1,
+        )
+
+    current = _exp("current.db")
+    foreign_db = tmp_path / "foreign.db"
+    foreign_url = f"sqlite:///{foreign_db}"
+    # The tree belongs to the configured ledger, so the run passes its own
+    # validation and claim and reaches the registry scan.
+    mark_current_format(current)
+    stale = optuna.create_study(
+        study_name="foreign-ledger::p", storage=foreign_url, direction="minimize"
+    )
+    stale.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    stale_trial = stale.ask()
+    legacy = optuna.create_study(study_name="legacy::p", storage=foreign_url)
+    legacy.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    trial_dir = tmp_path / "foreign-attempt"
+    trial_dir.mkdir()
+    write_attempt_lifecycle(trial_dir, attempt_id="foreign-attempt", state="allocated")
+    # Registered through the foreign config, so the entry records that ledger.
+    _register_active_attempt(
+        _exp("foreign.db"),
+        attempt_id="foreign-attempt",
+        phase_name="p",
+        study_name="foreign-ledger::p",
+        trial_number=stale_trial.number,
+        trial_dir=trial_dir,
+        generation_id="old-generation",
+    )
+    entry_path = _attempts_dir(current) / "foreign-attempt.json"
+    entry_before = entry_path.read_bytes()
+    ledger_before = foreign_db.read_bytes()
+
+    with pytest.raises(StudySchemaMismatchError, match=r"pre-cutover.*'legacy::p'"):
+        run_experiment(current)
+
+    assert entry_path.read_bytes() == entry_before
+    assert foreign_db.read_bytes() == ledger_before
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
@@ -1408,6 +1496,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     # the registry entry's attempt. Recovery must inspect that trial itself.
     storage = engine_ledger._resolve_storage(experiment.resolved_storage)
     study = optuna.create_study(study_name="terminal-identity::p", storage=storage)
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     trial = study.ask()
     new_dir = tmp_path / "ledger-attempt"
     new_dir.mkdir()

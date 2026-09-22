@@ -19,10 +19,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
-from phasesweep.engine.ledger import (
-    _load_journal_study_snapshot,
-    open_registry_study,
-)
+from phasesweep.engine.ledger import open_registry_study
 from phasesweep.engine.paths import _attempts_dir, _trial_dir_for
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -41,7 +38,6 @@ from phasesweep.runtime.files import (
     open_directory_fd,
     private_atomic_write_text,
     read_private_text_at,
-    storage_backend,
     storage_recovery_locator,
 )
 from phasesweep.runtime.json import strict_json_loads
@@ -596,7 +592,8 @@ def _registry_attempt_fail_stale_trial(
         or ``"unreachable"`` when the recorded storage could not be read
         and the entry must be retained for a later retry.
     :raises StudySchemaMismatchError: The registry and trial record
-        conflicting generation identities.
+        conflicting generation identities, or the ledger the entry names
+        holds pre-cutover or unsupported PhaseSweep study state.
     :raises ProcessCleanupUncertainError: A terminal trial lacks the identity
         needed to attribute confirmed cleanup to the registry's attempt.
     :raises StudyStorageUnavailableError: The stale RUNNING trial could not be
@@ -612,32 +609,18 @@ def _registry_attempt_fail_stale_trial(
     if storage_url is None:
         # In-memory storage died with its orchestrator; nothing to update.
         return "terminal"
-    captured_trial = None
     try:
-        journal = storage_backend(storage_url) == "journal"
-        if journal:
-            snapshot = _load_journal_study_snapshot(storage_url, entry["study_name"])
-            if snapshot is None:
-                return "terminal"
-            captured_trial = next(
-                (
-                    trial
-                    for trial in snapshot.get_trials(deepcopy=False)
-                    if trial.number == entry["trial_number"]
-                ),
-                None,
-            )
-            if captured_trial is None:
-                return "terminal"
-        try:
-            study = open_registry_study(storage_url, entry["study_name"])
-        except KeyError:
-            if journal:
-                # The captured journal contained the study. A later replay or
-                # lookup failure is uncertainty, not proof that recovery is done.
-                raise
+        study = open_registry_study(storage_url, entry["study_name"])
+        if study is None:
+            # The ledger confirmed the study is gone without being recreated
+            # by the lookup, so nothing remains for this entry to repair.
             return "terminal"
         trials = study.get_trials(deepcopy=False)
+    except StudySchemaMismatchError:
+        # The entry was written by this release, so its ledger was current
+        # when the attempt registered. Pre-cutover state there now is not
+        # something to reap through; it stops the run with the entry intact.
+        raise
     except Exception:  # noqa: BLE001 - unreachable storage keeps the entry for retry
         log.warning(
             "Attempt registry entry %s references storage that cannot be "
@@ -646,21 +629,6 @@ def _registry_attempt_fail_stale_trial(
         )
         return "unreachable"
     trial = next((t for t in trials if t.number == entry["trial_number"]), None)
-    if captured_trial is not None and (
-        trial is None
-        or trial._trial_id != captured_trial._trial_id
-        or any(
-            captured_trial.user_attrs.get(key) is not None
-            and trial.user_attrs.get(key) != captured_trial.user_attrs[key]
-            for key in (GENERATION_ID_ATTR, ATTEMPT_ID_ATTR)
-        )
-    ):
-        log.warning(
-            "Attempt registry entry %s changed in storage during recovery inspection; "
-            "retaining the entry for a later retry.",
-            entry_path,
-        )
-        return "unreachable"
     if trial is None:
         return "terminal"
     stored_attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)

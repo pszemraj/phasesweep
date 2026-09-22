@@ -350,7 +350,7 @@ def test_startup_scans_the_ledger_format_once(
     real_load = ledger._load_existing_phase_study
     calls = 0
 
-    def counted_validate(candidate: Experiment) -> None:
+    def counted_validate(candidate: str | None) -> None:
         nonlocal calls
         calls += 1
         real_validate(candidate)
