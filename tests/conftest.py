@@ -567,15 +567,12 @@ def write_trainer(path: Path, body: str) -> Path:
     return path
 
 
-def write_constant_trainer(tmp_path: Path) -> Path:
-    """Drop a minimal trainer that writes and logs a constant objective.
-
-    Cheap enough for tests that need a real subprocess run before mutating
-    the parent config and re-running with ``--from-phase``.
-    """
+def write_constant_trainer(tmp_path: Path, *, key: str = "x", value: float = 0.5) -> Path:
+    """Drop a trainer that writes ``{key: value}`` to ``--out`` and logs ``key=value``."""
+    logged = f"{key}={value!r}"
     return write_trainer(
         tmp_path / "trainer.py",
-        """
+        f"""
         import argparse, json
         from pathlib import Path
         ap = argparse.ArgumentParser()
@@ -583,7 +580,54 @@ def write_constant_trainer(tmp_path: Path) -> Path:
         args, _ = ap.parse_known_args()
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps({"x": 0.5}))
+        out.write_text(json.dumps({{{key!r}: {value!r}}}))
+        print({logged!r})
+        """,
+    )
+
+
+def write_param_echo_trainer(tmp_path: Path) -> Path:
+    """Drop a trainer that logs ``x=<--x>``, so each trial's objective is its own sampled value."""
+    return write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--out")
+        parser.add_argument("--x", type=int, default=0)
+        args, _ = parser.parse_known_args()
+        print(f"x={args.x}")
+        """,
+    )
+
+
+def write_trial_zero_trainer(tmp_path: Path, *, otherwise: str) -> Path:
+    """Drop a trainer whose trial 0 writes and logs ``x=1.0`` and whose other trials run ``otherwise``."""
+    return write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse, json, os, sys, time
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--out", required=True)
+        args, _ = ap.parse_known_args()
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            with open(args.out, "w") as f:
+                json.dump({{"x": 1.0}}, f)
+            print("x=1.0")
+        else:
+            {otherwise}
+        """,
+    )
+
+
+def write_flag_gated_trainer(tmp_path: Path, flag: Path) -> Path:
+    """Drop a trainer that exits 1 until ``flag`` exists, then logs ``x=0.5``."""
+    return write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import pathlib, sys
+        if not pathlib.Path({str(flag)!r}).exists():
+            sys.exit(1)
         print("x=0.5")
         """,
     )
