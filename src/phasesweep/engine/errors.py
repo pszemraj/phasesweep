@@ -133,6 +133,19 @@ class LedgerTransactionInterruptedError(StudyStorageUnavailableError):
     default_action: ClassVar[OperatorAction] = OperatorAction.RUN_RECOVER_RUN
 
 
+class IncompleteJournalRecordError(StudyStorageUnavailableError):
+    """Raised before a write when a journal ledger ends with a partial record.
+
+    Reads skip that record as Optuna does, but an append after it would be
+    glued onto it and corrupt the journal for good. The record may belong to
+    another experiment's append still in flight, so nothing repairs it
+    automatically: the message names the byte to truncate the journal at once
+    no process uses it, which is the ledger repair this routes to.
+    """
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER
+
+
 class PublishedStudyMissingError(PhaseSweepError):
     """Raised before launch when a published phase's local trial is absent or replaced."""
 

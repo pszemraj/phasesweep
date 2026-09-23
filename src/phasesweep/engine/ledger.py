@@ -78,6 +78,7 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    IncompleteJournalRecordError,
     LedgerTransactionInterruptedError,
     OperatorAction,
     StudySchemaMismatchError,
@@ -114,6 +115,7 @@ __all__ = [
     "open_preview_study",
     "open_registry_study",
     "read_phase_trial_stats",
+    "require_complete_journal",
     "roll_back_interrupted_transaction",
     "validate_ledger",
 ]
@@ -349,36 +351,117 @@ class _JournalSnapshot(BaseJournalBackend):
         raise RuntimeError("A journal snapshot is read-only.")
 
 
-def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | None:
-    """Capture a complete journal as a read-only in-memory storage.
+def _capture_journal(path: Path) -> bytes | None:
+    """Read a journal's bytes as of one moment, without writing anything.
 
-    Optuna tolerates an undecodable final record while another writer appends.
-    Such a snapshot is incomplete, so inspection cannot claim known counts or
-    confirmed absence.
+    :param Path path: Journal file to read.
+    :return bytes | None: The file's bytes at the size it had when opened, or
+        ``None`` when it does not exist.
+    :raises OSError: The journal exists but could not be read.
+    :raises ValueError: The journal shrank while it was being read.
+    """
+    try:
+        with path.open("rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            data = source.read(size)
+    except FileNotFoundError:
+        return None
+    if len(data) != size:
+        raise ValueError("The journal was truncated while its snapshot was being read.")
+    return data
+
+
+def _journal_records(data: bytes) -> tuple[list[dict[str, Any]], int]:
+    """Decode captured journal bytes exactly as Optuna's own reader does.
+
+    Optuna 4.9's ``JournalFileBackend.read_logs`` skips a final line that
+    lacks its newline or does not decode as JSON, because a writer may still
+    be appending it, and raises on such a line anywhere another line follows.
+    Keeping the same rule means a read here reports what a run would load.
+
+    :param bytes data: Journal bytes from :func:`_capture_journal`.
+    :return tuple[list[dict[str, Any]], int]: Every complete record, and the
+        byte offset just past the last of them, which is ``len(data)`` unless
+        a final line was skipped.
+    :raises ValueError: A line that another line follows is incomplete or
+        undecodable, or a line is not UTF-8.
+    """
+    lines = data.split(b"\n")
+    records: list[dict[str, Any]] = []
+    end = 0
+    for index, line in enumerate(lines[:-1]):
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            if index == len(lines) - 2 and not lines[-1]:
+                return records, end
+            raise
+        end += len(line) + 1
+    return records, end
+
+
+def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | None:
+    """Capture a journal's complete records as a read-only in-memory storage.
+
+    A final line Optuna would skip is skipped here too (:func:`_journal_records`),
+    so a read reports the records a live load would see. Writing after that
+    line is a different matter, and every mutating path first refuses it
+    through :func:`require_complete_journal`.
 
     :param str storage_url: Journal storage URL to inspect.
     :param str label: Study or experiment named in an inspection failure.
     :return JournalStorage | None: Snapshot storage, or ``None`` when absent.
-    :raises StudyStorageUnavailableError: The snapshot is unreadable or incomplete.
+    :raises StudyStorageUnavailableError: The journal is unreadable, changed
+        while it was read, or holds a malformed record before its last line.
     """
     path = _journal_path(storage_url)
     try:
-        try:
-            with path.open("rb") as source:
-                size = os.fstat(source.fileno()).st_size
-                data = source.read(size)
-        except FileNotFoundError:
+        data = _capture_journal(path)
+        if data is None:
             return None
-        if len(data) != size:
-            raise ValueError("The journal was truncated while its snapshot was being read.")
-        if data and not data.endswith(b"\n"):
-            raise ValueError("The journal ends with an incomplete record.")
-        records = [json.loads(line) for line in data.split(b"\n")[:-1]]
+        records, _end = _journal_records(data)
         return JournalStorage(_JournalSnapshot(records))
     except Exception as exc:
         raise StudyStorageUnavailableError(
             f"Journal storage {path} could not be completely read while checking for {label}."
         ) from exc
+
+
+def _require_complete_journal(storage_url: str) -> None:
+    """Refuse to write through a journal whose final record is incomplete.
+
+    Optuna appends with no separator check, so its next record would be glued
+    onto the partial line: that record is lost, and once a later record follows
+    it, every reader, Optuna's included, fails on the journal for good. The
+    partial line is never truncated here. Two experiments can share one
+    journal under different experiment locks, so the line may be another
+    run's append still in flight, and removing it would destroy a live record.
+
+    :param str storage_url: Journal storage URL a caller is about to write through.
+    :raises IncompleteJournalRecordError: The journal ends with a line Optuna
+        would skip.
+    :raises StudyStorageUnavailableError: The journal could not be read
+        completely.
+    """
+    path = _journal_path(storage_url)
+    try:
+        data = _capture_journal(path)
+        if data is None:
+            return
+        _records, end = _journal_records(data)
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {path} could not be completely read before writing to it."
+        ) from exc
+    if end == len(data):
+        return
+    raise IncompleteJournalRecordError(
+        f"Journal storage {path} ends with an incomplete record: a writer crashed while "
+        "appending it or, rarely, is appending it right now. Appending after it would "
+        "corrupt the journal permanently. Once no process uses this journal, truncate it "
+        f"after its last complete line, at byte {end} (for example `truncate -s {end} "
+        f"{path}`), then run again. Nothing was written."
+    )
 
 
 def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.Study | None:
@@ -1071,6 +1154,29 @@ def roll_back_interrupted_transaction(ledger: ValidatedLedger) -> ValidatedLedge
     return replace(ledger, format_scan_failure=None)
 
 
+def require_complete_journal(ledger: ValidatedLedger) -> None:
+    """Refuse a journal ledger whose final record a crash, or a live writer, left partial.
+
+    Reads tolerate that record exactly as Optuna does, but nothing may append
+    after it, so every path that may write refuses it before any live open:
+    :func:`claim_ledger`, :func:`open_registry_study`, and MCP recovery, whose
+    inspection previews the confirmed write and so refuses it too. The check
+    only reads. Unlike a SQLite hot journal, which SQLite rolls back under its
+    own lock, the partial record is never repaired here (see
+    :func:`_require_complete_journal`). A handle whose format scan did not
+    complete is left to the openers, which refuse it in the scan's own words.
+
+    :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
+    :raises IncompleteJournalRecordError: The journal ends with an incomplete
+        record; the message names the byte to truncate it at.
+    :raises StudyStorageUnavailableError: The journal could not be read.
+    """
+    if ledger.backend != "journal" or not ledger.format_verified:
+        return
+    assert ledger.storage_url is not None
+    _require_complete_journal(ledger.storage_url)
+
+
 def read_phase_trial_stats(
     ledger: ValidatedLedger,
     phase: Phase,
@@ -1138,14 +1244,16 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     not format-checked, so the returned handle is always verified. When the
     scan stopped at a transaction a crash interrupted, SQLite first rolls it
     back (:func:`roll_back_interrupted_transaction`); the caller's lock is
-    what allows that write.
+    what allows that write. A journal whose final record is partial is
+    refused before discovery opens it live (:func:`require_complete_journal`).
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param str | None from_phase: Resume point; earlier phases will not execute.
     :return ClaimedLedger: Bound handle carrying every existing phase study.
     :raises StudyStorageUnavailableError: SQLite could not roll back an
         interrupted transaction, the ledger's format could still not be
-        scanned, or a phase's persistent storage could not be inspected.
+        scanned, a journal's final record is incomplete, or a phase's
+        persistent storage could not be inspected.
     :raises StudySchemaMismatchError: The rescan found pre-cutover or otherwise
         unsupported PhaseSweep study state.
     :raises PublishedStudyMissingError: A phase to execute has a published
@@ -1158,6 +1266,7 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     if not ledger.format_verified:
         _scan_ledger_format(ledger.storage_url)
         ledger = replace(ledger, format_scan_failure=None)
+    require_complete_journal(ledger)
     experiment = ledger.experiment
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
@@ -1311,7 +1420,8 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
     write into state this release refuses. A SQLite transaction a crash
     interrupted is rolled back before that scan is repeated, as
     :func:`claim_ledger` does: every caller already holds the experiment lock
-    and is about to write through the study anyway.
+    and is about to write through the study anyway. A journal whose final
+    record is partial is refused instead (:func:`require_complete_journal`).
 
     Absence is confirmed without creating anything. A missing database or
     journal, or a ledger that holds no such study, returns ``None``; Optuna's
@@ -1348,6 +1458,7 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
         except KeyError:
             return None
     # The scan refused every other backend, so this is a journal.
+    _require_complete_journal(locator)
     snapshot = _load_journal_study_snapshot(locator, study_name)
     if snapshot is None:
         return None

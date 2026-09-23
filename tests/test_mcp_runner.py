@@ -619,8 +619,13 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         for confirmation in ([], ["--confirm"]):
             blocked = CliRunner().invoke(cli_main, [*recovery_args, *confirmation])
             assert blocked.exit_code != 0
-            assert "could not be" in blocked.output
-            assert "Restore the original complete storage ledger" in blocked.output
+            if backend == "journal" and damage != "permission-denied":
+                # A bad last line is repaired by truncating it, never by recovery.
+                assert "ends with an incomplete record" in blocked.output
+                assert f"truncate -s {len(healthy)} " in blocked.output
+            else:
+                assert "could not be" in blocked.output
+                assert "Restore the original complete storage ledger" in blocked.output
             if damage == "permission-denied":
                 assert ledger.stat().st_mode & 0o777 == 0
             else:

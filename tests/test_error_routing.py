@@ -46,6 +46,7 @@ import phasesweep.engine.ledger as engine_ledger
 from phasesweep.config import Experiment, IntParam, Phase, WandbSummaryRequiredGate
 from phasesweep.engine import (
     ArtifactRootConflictError,
+    IncompleteJournalRecordError,
     LedgerTransactionInterruptedError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
@@ -381,6 +382,12 @@ def _truncated(path: Path) -> None:
     path.write_bytes(path.read_bytes()[:-8])
 
 
+def _middle_record_corrupted(path: Path) -> None:
+    """Put an undecodable line before the journal's last record, which nothing skips."""
+    *earlier, last = path.read_bytes().rstrip(b"\n").split(b"\n")
+    path.write_bytes(b"\n".join([*earlier, b"not a journal record", last]) + b"\n")
+
+
 def _trials_deleted(path: Path) -> None:
     """Drop every trial row while the study keeps its current format stamp."""
     with contextlib.closing(sqlite3.connect(path)) as conn, conn:
@@ -483,12 +490,16 @@ def _validate_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
 
 
 def _recovery_studies_damaged(
-    mode: str, damage: Callable[[Path], None], *, ownership_storage_unavailable: bool = False
+    mode: str,
+    damage: Callable[[Path], None],
+    *,
+    ownership_storage_unavailable: bool = False,
+    fixture: str = "current-sqlite",
 ) -> Trigger:
-    """Load recovery's studies from the current SQLite golden ledger after damage."""
+    """Load recovery's studies from a current golden ledger after damage."""
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        materialized = _materialize_damaged(tmp_path, "current-sqlite", mode, damage)
+        materialized = _materialize_damaged(tmp_path, fixture, mode, damage)
         needs = _recovery_needs(ownership_storage_unavailable=ownership_storage_unavailable)
         return _load_recovery_studies(materialized.experiment, needs)
 
@@ -879,12 +890,24 @@ WRAP_CASES = (
         message=_SQLITE_SCAN,
     ),
     WrapCase(
-        id="journal_truncated",
-        trigger=_validate_damaged("current-journal", _truncated),
+        # A cut-short last record is skipped on reads, as Optuna skips it; a bad
+        # line that another line follows is what a read refuses.
+        id="journal_middle_record_corrupt",
+        trigger=_validate_damaged("current-journal", _middle_record_corrupted),
         outbound=StudyStorageUnavailableError,
         action=OperatorAction.RESTORE_LEDGER,
-        cause=ValueError,
+        cause=json.JSONDecodeError,
         message="could not be completely read while checking for the PhaseSweep format boundary.",
+    ),
+    WrapCase(
+        # Inspection previews the confirmed write, so it refuses a cut-short
+        # last record with the repair, not recover-run's usual restore remedy.
+        id="recovery_studies_journal_incomplete_record",
+        trigger=_recovery_studies_damaged("tree", _truncated, fixture="current-journal"),
+        outbound=RunRecoveryError,
+        action=OperatorAction.RESTORE_LEDGER,
+        cause=IncompleteJournalRecordError,
+        message="truncate it after its last complete line",
     ),
     WrapCase(
         id="cleanup_reap_inspect",
@@ -1268,6 +1291,12 @@ def _claim_after_interrupted_commit_write_protected(
     return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
 
 
+def _claim_after_torn_journal_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Claim a journal ledger whose last append a crash cut short."""
+    materialized = _materialize_damaged(tmp_path, "current-journal", "tree", _truncated)
+    return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
+
+
 def _validate_tree_bound_to_another_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
@@ -1481,6 +1510,13 @@ ORIGIN_CASES = (
         raised=LedgerTransactionInterruptedError,
         action=OperatorAction.RUN_RECOVER_RUN,
         message="`phasesweep mcp recover-run --confirm` holds the experiment lock",
+    ),
+    OriginCase(
+        id="journal_final_record_incomplete",
+        trigger=_claim_after_torn_journal_append,
+        raised=IncompleteJournalRecordError,
+        action=OperatorAction.RESTORE_LEDGER,
+        message="Once no process uses this journal, truncate it after its last complete line",
     ),
     OriginCase(
         id="sqlite_rollback_refused",

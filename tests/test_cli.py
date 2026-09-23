@@ -588,9 +588,13 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
 
 @pytest.mark.integration
 def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_path: Path) -> None:
-    """An unreadable journal cannot be classified as current-format state."""
+    """An unreadable journal cannot be classified as current-format state.
+
+    Only a bad line that another line follows is unreadable: a bad last line
+    alone is skipped on reads, as Optuna's own reader skips it.
+    """
     ledger = tmp_path / "studies.journal"
-    ledger.write_text("not a journal record\n")
+    ledger.write_text("not a journal record\nanother bad record\n")
     experiment = make_experiment(
         storage=f"journal:///{ledger}",
         workdir=tmp_path / "runs",

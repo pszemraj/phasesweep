@@ -102,12 +102,23 @@ existing file that cannot create it. Read paths never make that open; they
 report the ledger unavailable with that reason and leave the ledger and its
 journal byte-identical.
 
+A journal ledger's last line that lacks its newline or does not decode is
+skipped exactly as Optuna's reader skips it, so status, winners, and the
+result snapshot report the complete records. Every path that may write refuses
+it before any live open, naming the byte to truncate at, and so does recovery,
+inspection or confirmed, because inspection previews a mutation. Nothing
+repairs it automatically: unlike SQLite, whose own lock makes its rollback
+safe, a journal shared by two experiments under different experiment locks may
+be mid-append, and truncating that line would destroy a live record.
+
 **Held by:** `engine.ledger.validate_ledger`, running
 `engine.artifact_roots._check_artifact_root_binding` before
 `engine.ledger._scan_ledger_format` and returning a `ValidatedLedger` whose
 `format_verified` and `format_scan_failure` record the outcome;
 `engine.ledger.roll_back_interrupted_transaction`, called by `claim_ledger` and
-confirmed recovery, and the same open in `engine.ledger.open_registry_study`\
+confirmed recovery, and the same open in `engine.ledger.open_registry_study`;
+`engine.ledger._journal_records` for the tolerated line and
+`engine.ledger.require_complete_journal` for the refusal\
 **Tests:** `tests/test_format_cutover.py::test_validate_ledger_on_a_fresh_root_creates_nothing`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`
@@ -116,7 +127,10 @@ confirmed recovery, and the same open in `engine.ledger.open_registry_study`\
 `tests/test_format_cutover.py::test_run_rolls_back_an_interrupted_transaction_and_continues`,
 `tests/test_format_cutover.py::test_claim_on_an_unbound_tree_rolls_back_a_shared_ledger`,
 `tests/test_format_cutover.py::test_registry_opener_rolls_back_an_interrupted_transaction`,
-`tests/test_format_cutover.py::test_rollback_open_never_creates_a_missing_ledger`
+`tests/test_format_cutover.py::test_rollback_open_never_creates_a_missing_ledger`,
+`tests/test_engine_read.py::test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes`,
+`tests/test_engine_read.py::test_journal_malformed_record_before_its_end_never_means_absent`,
+`tests/test_format_cutover.py::test_writers_refuse_a_partial_final_journal_record_and_leave_it`
 
 The scan may read a missing SQLite file as an absent ledger only because every
 accepted SQLite URL names a local file: config load refuses a URI filename
@@ -179,11 +193,13 @@ claims, refuses a study bound to another artifact root before it reaps
 anything, and refuses a pre-cutover ledger or an incomplete scan with the bytes
 unchanged. A confirmed recovery holds the experiment lock, so it lets SQLite
 roll back an interrupted transaction before it rescans; inspection reports
-that transaction and never does.
+that transaction and never does. Both refuse a journal whose last line is
+partial, with the same message, because inspection previews the write.
 
 **Held by:** `mcp.recovery._load_recovery_studies`, through
 `engine.ledger.validate_ledger`, then, when confirmed,
-`engine.ledger.roll_back_interrupted_transaction`, and then
+`engine.ledger.roll_back_interrupted_transaction`, then
+`engine.ledger.require_complete_journal`, and then
 `engine.ledger.open_existing_study`, which refuses a handle whose scan did not
 complete, with `engine.artifact_roots._check_study_artifact_root` on every
 opened study\
@@ -191,7 +207,8 @@ opened study\
 `tests/test_ledger_read_paths.py::test_recovery_study_load_rewraps_the_engine_refusal`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_stale_reaper.py::test_recovery_refuses_a_study_bound_to_another_artifact_root`,
-`tests/test_format_cutover.py::test_confirmed_recovery_rolls_back_an_interrupted_transaction`
+`tests/test_format_cutover.py::test_confirmed_recovery_rolls_back_an_interrupted_transaction`,
+`tests/test_format_cutover.py::test_writers_refuse_a_partial_final_journal_record_and_leave_it`
 
 ### Attempts and trial outcomes
 

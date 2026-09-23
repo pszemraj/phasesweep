@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import optuna
 import pytest
@@ -264,15 +265,14 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     assert cause in warnings[0]
 
 
-@pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
-@pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
-@pytest.mark.parametrize("damage", ["garbage", "partial-json", "missing-newline", "operation"])
-def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
-    tmp_path: Path, published: bool, keep_prefix: bool, damage: str
-) -> None:
-    from phasesweep.engine import ProcessCleanupUncertainError, StudyStorageUnavailableError
-    from phasesweep.mcp.redaction import status_payload
+def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment, Path]:
+    """Return an experiment whose journal holds a current study, run or only created.
 
+    :param Path tmp_path: Test-owned directory for the tree and the journal.
+    :param bool published: Run the experiment once, so the journal holds a
+        published trial, instead of only creating and stamping its study.
+    :return tuple[Experiment, Path]: The experiment and its journal file.
+    """
     ledger = tmp_path / "study.journal"
     experiment = make_experiment(
         workdir=tmp_path / "runs",
@@ -287,20 +287,18 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
             study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
         )
         mark_current_format(experiment, study)
-    original = ledger.read_bytes()
-    tail = {
-        "garbage": b"not a journal record\n",
-        "partial-json": b"{",
-        "missing-newline": original.rstrip(b"\n").split(b"\n")[-1],
-        "operation": b"{}\n",
-    }[damage]
-    damaged = (original if keep_prefix else b"") + tail
-    ledger.write_bytes(damaged)
-    root = tmp_path / "runs" / "t"
-    root.mkdir(parents=True, exist_ok=True)
-    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    return experiment, ledger
 
-    status = read_status(experiment)
+
+def _tree_files(root: Path) -> dict[Path, bytes]:
+    """Return every file under ``root`` with its bytes."""
+    return {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def _status_phases(experiment: Experiment, status: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the first phase of every status surface a journal read feeds."""
+    from phasesweep.mcp.redaction import status_payload
+
     mcp_status = status_payload(
         "exp",
         status,
@@ -308,8 +306,33 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
         result_source="current_shared_study",
         elapsed_seconds=None,
     )
-    for payload in (status, experiment_status(experiment), mcp_status):
-        phase = payload["phases"][0]
+    return [payload["phases"][0] for payload in (status, experiment_status(experiment), mcp_status)]
+
+
+@pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
+@pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
+@pytest.mark.parametrize("damage", ["operation", "middle-garbage"])
+def test_journal_malformed_record_before_its_end_never_means_absent(
+    tmp_path: Path, published: bool, keep_prefix: bool, damage: str
+) -> None:
+    """A record Optuna cannot replay, or a bad line another line follows, is refused everywhere."""
+    from phasesweep.engine import ProcessCleanupUncertainError, StudyStorageUnavailableError
+
+    experiment, ledger = _journal_experiment(tmp_path, published=published)
+    original = ledger.read_bytes()
+    last_record = original.rstrip(b"\n").split(b"\n")[-1] + b"\n"
+    tail = {
+        "operation": b"{}\n",
+        "middle-garbage": b"not a journal record\n" + last_record,
+    }[damage]
+    damaged = (original if keep_prefix else b"") + tail
+    ledger.write_bytes(damaged)
+    root = tmp_path / "runs" / "t"
+    root.mkdir(parents=True, exist_ok=True)
+    before = _tree_files(root)
+
+    status = read_status(experiment)
+    for phase in _status_phases(experiment, status):
         assert phase["trial_data_available"] is False
         assert phase["published_study_unavailable"] is published
         assert not any(phase["trials"].values())
@@ -320,7 +343,60 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
         run_experiment(experiment)
 
     assert ledger.read_bytes() == damaged
-    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+    assert _tree_files(root) == before
+
+
+@pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
+@pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
+@pytest.mark.parametrize("damage", ["garbage", "partial-json", "missing-newline"])
+def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
+    tmp_path: Path, published: bool, keep_prefix: bool, damage: str
+) -> None:
+    """Reads skip a bad final line exactly as Optuna does; a run refuses to append after it.
+
+    Optuna's reader skips a final line that lacks its newline or does not
+    decode, so status reports the complete records a live load would see. Its
+    writer would glue the next record onto that line, so the run refuses
+    before any live open, names the byte to truncate the journal at, and
+    writes nothing.
+    """
+    from phasesweep.engine import IncompleteJournalRecordError, ProcessCleanupUncertainError
+
+    experiment, ledger = _journal_experiment(tmp_path, published=published)
+    original = ledger.read_bytes()
+    complete = _status_phases(experiment, read_status(experiment))
+    tail = {
+        "garbage": b"not a journal record\n",
+        "partial-json": b"{",
+        "missing-newline": original.rstrip(b"\n").split(b"\n")[-1],
+    }[damage]
+    prefix = original if keep_prefix else b""
+    ledger.write_bytes(prefix + tail)
+    root = tmp_path / "runs" / "t"
+    root.mkdir(parents=True, exist_ok=True)
+    before = _tree_files(root)
+
+    for phase, undamaged in zip(
+        _status_phases(experiment, read_status(experiment)), complete, strict=True
+    ):
+        assert phase["trial_data_available"] is True
+        if keep_prefix:
+            assert phase["trials"] == undamaged["trials"]
+            assert phase["published_study_unavailable"] is False
+        else:
+            # Nothing before the bad line: Optuna reads no study at all.
+            assert not any(phase["trials"].values())
+            assert phase["published_study_unavailable"] is published
+    loaded = engine_ledger._load_existing_phase_study(experiment, experiment.phases[0])
+    assert (loaded is not None) is keep_prefix
+    with pytest.raises(ProcessCleanupUncertainError) as refused:
+        run_experiment(experiment)
+
+    cause = refused.value.__cause__
+    assert isinstance(cause, IncompleteJournalRecordError)
+    assert f"truncate -s {len(prefix)} {ledger}" in str(cause)
+    assert ledger.read_bytes() == prefix + tail
+    assert _tree_files(root) == before
 
 
 @pytest.mark.parametrize("change", ["append", "finish-partial", "truncate"])
@@ -332,11 +408,13 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     study = optuna.create_study(
         study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
     )
+    # Stamped first, as the engine does, so the journal's last record is the
+    # trial's completion: a partial copy of it reads as a RUNNING trial.
+    mark_current_format(experiment, study)
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     study.tell(trial, 0.5)
-    mark_current_format(experiment, study)
     complete = ledger.read_bytes()
     expected = engine_optuna._TrialRef(0, "generation", "attempt")
     # The handle's format scan also captures the journal. Take it on the whole
@@ -365,12 +443,23 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
         first = engine_ledger.read_phase_trial_stats(handle, experiment.phases[0], expected)
     second = engine_ledger.read_phase_trial_stats(handle, experiment.phases[0], expected)
 
-    assert first.available is (change == "append")
-    assert first.published_trial_available is (change == "append")
-    assert first.counts == ({"COMPLETE": 1} if change == "append" else {})
-    assert first.running_attempts == ([] if change == "append" else None)
-    assert second.available is (change != "append")
-    assert second.published_trial_available is (change == "finish-partial")
+    # The first read sees only the bytes present when it opened the file: all
+    # of them, the journal less its final newline (a partial last record,
+    # skipped as Optuna skips it), or a file that shrank under it.
+    assert (
+        first.available,
+        first.counts,
+        first.running_attempts,
+        first.published_trial_available,
+    ) == {
+        "append": (True, {"COMPLETE": 1}, [], True),
+        "finish-partial": (True, {"RUNNING": 1}, [expected], False),
+        "truncate": (False, {}, None, False),
+    }[change]
+    # The second read sees the finished change; a partial record appended
+    # after the complete trial is skipped the same way.
+    assert second.available is True
+    assert second.published_trial_available is (change != "truncate")
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])

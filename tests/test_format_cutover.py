@@ -17,6 +17,7 @@ from phasesweep import run_experiment
 from phasesweep.config import Experiment
 from phasesweep.engine import (
     ArtifactRootConflictError,
+    IncompleteJournalRecordError,
     LedgerTransactionInterruptedError,
     ProcessCleanupUncertainError,
     StudySchemaMismatchError,
@@ -752,6 +753,49 @@ def test_rollback_open_never_creates_a_missing_ledger(tmp_path: Path) -> None:
     assert type(refused.value) is StudyStorageUnavailableError
     assert refused.value.actions == (OperatorAction.RESTORE_LEDGER,)
     assert not database.exists()
+
+
+_PARTIAL_FINAL_RECORDS = {
+    "torn": b'{"op_code": 5, "worker_id": "crashed',
+    "undecodable": b"not a journal record\n",
+}
+
+
+@pytest.mark.parametrize("damage", sorted(_PARTIAL_FINAL_RECORDS))
+def test_writers_refuse_a_partial_final_journal_record_and_leave_it(
+    tmp_path: Path, damage: str
+) -> None:
+    """Every path that may write refuses a bad last journal line, names the repair, writes nothing.
+
+    Reads skip that line as Optuna does, so the format scan passes. Optuna's
+    next append would be glued onto it, though, and the line may be another
+    experiment's append still in flight, so nothing truncates it. Recovery
+    inspection previews the confirmed write and refuses in the same words.
+    """
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment = materialized.experiment
+    journal = ledger_file(materialized, "journal")
+    complete = journal.read_bytes()
+    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS[damage])
+    before = _tree_bytes(materialized.root)
+    assert experiment.resolved_storage is not None
+
+    assert validate_ledger(experiment).format_verified is True
+    with pytest.raises(IncompleteJournalRecordError) as claimed:
+        claim_ledger(validate_ledger(experiment))
+    with pytest.raises(IncompleteJournalRecordError) as registry:
+        open_registry_study(experiment.resolved_storage, "t::p")
+    with pytest.raises(RunRecoveryError) as inspected:
+        _load_recovery_studies(experiment, _recovery_needs())
+    with _experiment_lock(experiment), pytest.raises(RunRecoveryError) as confirmed:
+        _load_recovery_studies(experiment, _recovery_needs(), confirm=True)
+
+    assert str(inspected.value) == str(confirmed.value) == str(claimed.value)
+    for refusal in (claimed.value, registry.value, inspected.value, confirmed.value):
+        assert "ends with an incomplete record" in str(refusal)
+        assert f"truncate -s {len(complete)} {journal}" in str(refusal)
+        assert refusal.actions == (OperatorAction.RESTORE_LEDGER,)
+    assert _tree_bytes(materialized.root) == before
 
 
 @pytest.mark.integration
