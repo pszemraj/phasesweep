@@ -63,6 +63,7 @@ from tests.conftest import (
     make_experiment,
     patch_directory_fsync_failure,
     patch_path_method_failure,
+    requires_nonroot,
     temporary_umask,
     write_trainer,
 )
@@ -1478,10 +1479,7 @@ def test_read_side_rejects_generation_with_tampered_provenance_file(
     assert read_winner(experiment, "p") is None
 
 
-@pytest.mark.skipif(
-    os.geteuid() == 0,
-    reason="root reads any mode, so no PermissionError can be provoked",
-)
+@requires_nonroot
 @pytest.mark.parametrize("filename", [_CONFIG_SNAPSHOT_NAME, _REPRODUCIBILITY_NAME])
 @pytest.mark.integration
 def test_unreadable_provenance_file_reports_permission_denied_not_corruption(

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import stat
 import subprocess
@@ -49,6 +48,7 @@ from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
     make_experiment,
+    requires_nonroot,
     write_trainer,
     write_yaml,
 )
@@ -782,10 +782,7 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     assert "Traceback" not in winners_captured.err
 
 
-@pytest.mark.skipif(
-    os.geteuid() == 0,
-    reason="root reads any mode, so no PermissionError can be provoked",
-)
+@requires_nonroot
 def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -55,12 +55,7 @@ from phasesweep.engine.paths import (
     _winner_path,
 )
 from phasesweep.engine.publication import _last_successful_generation_id
-from phasesweep.engine.state import (
-    STUDY_SCHEMA_ATTR,
-    STUDY_SCHEMA_VERSION,
-    Winner,
-    WinnerSource,
-)
+from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION, Winner, WinnerSource
 from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
@@ -74,6 +69,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     reaped_pid,
+    requires_nonroot,
     write_constant_trainer,
     write_trainer,
 )
@@ -477,7 +473,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         ("sqlite", "header"),
         ("journal", "garbage"),
         ("journal", "truncated"),
-        ("journal", "permission-denied"),
+        pytest.param("journal", "permission-denied", marks=requires_nonroot),
     ],
 )
 @pytest.mark.integration

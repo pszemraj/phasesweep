@@ -23,7 +23,7 @@ from phasesweep.config import (
 )
 from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.evaluation import extractor_config_fingerprint
-from tests.conftest import make_trial_context
+from tests.conftest import make_trial_context, requires_nonroot
 
 
 def _wandb_poll(**kwargs):
@@ -641,10 +641,9 @@ def test_log_regex_reports_no_matches(tmp_path):
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
+@requires_nonroot
 def test_artifact_size_directory_gate_rejects_unreadable_subtree(tmp_path: Path) -> None:
     """An incomplete traversal cannot establish a checkpoint-size bound."""
-    if os.geteuid() == 0:
-        pytest.skip("Permission-denial reproduction requires an unprivileged user")
     private = tmp_path / "checkpoint" / "weights"
     private.mkdir(parents=True)
     (private / "model.bin").write_bytes(b"x" * 16_384)

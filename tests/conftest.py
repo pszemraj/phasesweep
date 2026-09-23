@@ -48,6 +48,12 @@ REPO = Path(__file__).resolve().parent.parent
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
 
+#: Skip marker for a test or parametrized case that needs the kernel to deny a
+#: permission. Root bypasses file modes, so there the denial never happens.
+requires_nonroot = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root bypasses file permissions, so no denial can be provoked"
+)
+
 
 def pytest_collection_modifyitems(session, config, items) -> None:
     """Refuse collection when a test manages processes or sleeps directly without the marker.

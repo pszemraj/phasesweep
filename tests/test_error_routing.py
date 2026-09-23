@@ -1,24 +1,21 @@
 """Contract tests for the operator actions every PhaseSweepError carries.
 
-``actions`` is a *routing* attribute: it names the remediation an operator
-should carry out, so a caller can steer a failure without parsing prose. The
-message text stays authoritative about what went wrong, and these tests pin
-that separation down in both directions -- every operator-facing error resolves
-to real ``OperatorAction`` steps, and attaching them never edits the message.
+``actions`` is a *routing* attribute: it names the remediation an operator should carry out, so a
+caller can steer a failure without parsing prose. The message text stays authoritative about what
+went wrong, and these tests pin that separation down in both directions -- every operator-facing
+error resolves to real ``OperatorAction`` steps, and attaching them never edits the message.
 
 The class walk below is deliberately exhaustive rather than a hand-maintained
 list: it imports every module in the package and then recurses through
 ``PhaseSweepError.__subclasses__()``, so a subclass added in some far corner of
 the tree is covered the moment it exists.
 
-The wrap table near the end carries the same contract across layer boundaries: a
-remediation survives each translation unless the site deliberately composes or
-replaces it, and every such site is driven for real rather than in isolation.
-The origin table after it holds raises whose message names its own remedy to the
-action that routes it. The MCP runner's failure payload, where routing reaches
-an agent, must then say exactly the steps a raise routes. The last test keeps
-multi-step remediations rare: every raise that requires more than one step must
-be on an explicit allowlist.
+The wrap table near the end carries the same contract across layer boundaries: a remediation
+survives each translation unless the site deliberately composes or replaces it, and every such site
+is driven for real rather than in isolation. The origin table after it holds raises whose message
+names its own remedy to the action that routes it. The MCP runner's failure payload, where routing
+reaches an agent, must then say exactly the steps a raise routes. The last test keeps multi-step
+remediations rare: every raise that requires more than one step must be on an explicit allowlist.
 """
 
 from __future__ import annotations
@@ -117,7 +114,7 @@ from phasesweep.runtime.files import (
     phasesweep_home,
 )
 from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, write_attempt_lifecycle
-from tests.conftest import make_experiment, reaped_pid
+from tests.conftest import make_experiment, reaped_pid, requires_nonroot
 from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
 from tests.mcp_helpers import make_run_handle, write_run_status
 
@@ -342,12 +339,11 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
     )
 
 
-# A wrap translates one failure into another at a layer boundary. Each row below
-# drives a real wrap site through its real entry point, faulting only the call
-# beneath it, and pins what the operator receives: the outbound type, the action
-# it routes to, the cause it keeps, and a stable piece of today's message. A row
-# whose action differs from its outbound class default is the evidence that the
-# site preserves or composes the remediation rather than replacing it.
+# A wrap translates one failure into another at a layer boundary. Each row below drives a real wrap
+# site through its real entry point, faulting only the call beneath it, and pins what the operator
+# receives: the outbound type, the action it routes to, the cause it keeps, and a stable piece of
+# today's message. A row whose action differs from its outbound class default is the evidence that
+# the site preserves or composes the remediation rather than replacing it.
 
 Trigger = Callable[[Path, pytest.MonkeyPatch], object]
 
@@ -366,6 +362,7 @@ class WrapCase:
     cause: type[BaseException] | None
     #: Stable substring of the operator text the site raises today.
     message: str
+    marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
 def _raiser(error: BaseException) -> Callable[..., object]:
@@ -726,9 +723,8 @@ def _moved_workdir(materialized: Materialized, tmp_path: Path) -> Experiment:
 def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Inspect recovery after the symlink a run's pinned workdir names was retargeted.
 
-    recover-run reads the run's digest-pinned config snapshot, so the workdir
-    can stop resolving to the studies' root only through the filesystem, as
-    when a volume behind a symlink moves.
+    recover-run reads the run's digest-pinned config snapshot, so the workdir can stop resolving to
+    the studies' root only through the filesystem, as when a volume behind a symlink moves.
     """
     materialized = materialize("current-sqlite", tmp_path, mode="tree")
     link = tmp_path / "data"
@@ -892,6 +888,7 @@ WRAP_CASES = (
         action=OperatorAction.RESTORE_LEDGER,
         cause=LedgerTransactionInterruptedError,
         message="its directory before retrying. Cleanup state is therefore unknown. For an MCP",
+        marks=(requires_nonroot,),
     ),
     WrapCase(
         # Composed: the cleanup refusal's own repair survives the replacement.
@@ -1149,7 +1146,7 @@ WRAP_CASES = (
 )
 
 
-@pytest.mark.parametrize("case", WRAP_CASES, ids=lambda case: case.id)
+@pytest.mark.parametrize("case", [pytest.param(c, id=c.id, marks=c.marks) for c in WRAP_CASES])
 def test_operator_action_survives_wrap(
     case: WrapCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1183,6 +1180,7 @@ class OriginCase:
     action: OperatorAction | tuple[OperatorAction, ...]
     #: Stable substring of the remedy the message gives today.
     message: str
+    marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
 def _auto_storage_experiment(workdir: Path, n_jobs: int) -> Experiment:
@@ -1853,6 +1851,7 @@ ORIGIN_CASES = (
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
         message="Restore it or access to it before retrying recovery.",
+        marks=(requires_nonroot,),
     ),
     OriginCase(
         id="recover_config_snapshot_altered",
@@ -1941,6 +1940,7 @@ ORIGIN_CASES = (
         raised=LedgerTransactionInterruptedError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Restore write access to the ledger and its directory before retrying.",
+        marks=(requires_nonroot,),
     ),
     OriginCase(
         id="ledger_directory_path_unusable",
@@ -1955,6 +1955,7 @@ ORIGIN_CASES = (
         raised=PhaseSweepError,
         action=OperatorAction.RESTORE_TREE,
         message="Restore write access to the directory that holds it, then run again.",
+        marks=(requires_nonroot,),
     ),
     OriginCase(
         id="environment_cohort_changed",
@@ -1966,7 +1967,7 @@ ORIGIN_CASES = (
 )
 
 
-@pytest.mark.parametrize("case", ORIGIN_CASES, ids=lambda case: case.id)
+@pytest.mark.parametrize("case", [pytest.param(c, id=c.id, marks=c.marks) for c in ORIGIN_CASES])
 def test_origin_raises_route_by_their_message_remedy(
     case: OriginCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2019,9 +2020,8 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
 ) -> None:
     """A bug inside recovery is not an operator refusal with a remedy to route.
 
-    Only a PhaseSweepError, or an OSError from recovery's own filesystem
-    writes, becomes a RunRecoveryError; anything else reaches the CLI's
-    internal-error boundary as itself.
+    Only a PhaseSweepError, or an OSError from recovery's own filesystem writes, becomes a
+    RunRecoveryError; anything else reaches the CLI's internal-error boundary as itself.
     """
     with pytest.raises(defect) as excinfo:
         trigger(tmp_path, monkeypatch)

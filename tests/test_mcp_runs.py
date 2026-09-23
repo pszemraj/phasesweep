@@ -24,7 +24,7 @@ from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
-from tests.conftest import file_mode, is_pid_zombie, reaped_pid
+from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
 from tests.mcp_helpers import make_run_handle, write_run_status
 
 
@@ -606,7 +606,12 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
         # The marker is there, so the directory is the state directory and the
         # missing, shared, or unreadable part of it is damage to restore.
         (_logs_deleted, OperatorAction.RESTORE_TREE, "has its format marker but is missing"),
-        (_marker_mode(0o000), OperatorAction.RESTORE_TREE, "cannot be read"),
+        pytest.param(
+            _marker_mode(0o000),
+            OperatorAction.RESTORE_TREE,
+            "cannot be read",
+            marks=requires_nonroot,
+        ),
         (_marker_mode(0o644), OperatorAction.RESTORE_TREE, "with mode 0600; found"),
         (_marker_text("not json\n"), OperatorAction.RESTORE_TREE, "is malformed"),
         (
@@ -638,7 +643,12 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
         (_regular_file, OperatorAction.FIX_CONFIG, "expected directories are missing"),
         # A walk that fails above state_dir never reached a state directory.
         (_below_regular_file, OperatorAction.FIX_CONFIG, "is not reachable through real"),
-        (_under_unsearchable_dir, OperatorAction.FIX_CONFIG, "is not reachable through real"),
+        pytest.param(
+            _under_unsearchable_dir,
+            OperatorAction.FIX_CONFIG,
+            "is not reachable through real",
+            marks=requires_nonroot,
+        ),
     ],
     ids=[
         "logs-deleted",

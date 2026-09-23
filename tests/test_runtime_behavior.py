@@ -71,11 +71,7 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.study_policy import _load_phase_policy_state
-from phasesweep.engine.trial import (
-    ExecutedTrial,
-    TrialExecutionError,
-    extract_trial_result,
-)
+from phasesweep.engine.trial import ExecutedTrial, TrialExecutionError, extract_trial_result
 from phasesweep.errors import OperatorAction
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime import shutdown as runtime_shutdown
@@ -93,6 +89,7 @@ from tests.conftest import (
     make_experiment,
     make_trial_context,
     patch_rejected_trial_user_attr,
+    requires_nonroot,
     write_constant_trainer,
     write_trainer,
     write_yaml,
@@ -114,7 +111,7 @@ from tests.conftest import (
         b'{"loss": NaN}',
         b'{"loss": 1e400}',
         json.dumps({"loss": 10**400}).encode(),
-        "unreadable",
+        pytest.param("unreadable", marks=requires_nonroot),
     ],
 )
 def test_json_primary_invalid_evidence_fails_trial(tmp_path, payload):
