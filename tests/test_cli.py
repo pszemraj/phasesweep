@@ -1060,14 +1060,7 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
     assert not (tmp_path / "runs").exists()
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        LockBusyError("another experiment process holds the lock"),
-    ],
-)
 def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
-    error: PhaseSweepError,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1076,6 +1069,7 @@ def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
 
     Runtime lock configuration goes through the real validator in the next test.
     """
+    error = LockBusyError("another experiment process holds the lock")
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, error)

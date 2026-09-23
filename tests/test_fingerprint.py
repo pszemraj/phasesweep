@@ -1384,18 +1384,8 @@ def _unbound_two_phase_studies(
     lr.set_user_attr(ARTIFACT_ROOT_ATTR, bound_root)
 
 
-@pytest.mark.parametrize(
-    ("arch_trials", "expected"),
-    [
-        (0, ArtifactRootConflictError),
-        (1, ArtifactRootConflictError),
-    ],
-)
-def test_refused_multi_phase_binding_claims_nothing(
-    tmp_path: Path,
-    arch_trials: int,
-    expected: type[Exception],
-) -> None:
+@pytest.mark.parametrize("arch_trials", [0, 1])
+def test_refused_multi_phase_binding_claims_nothing(tmp_path: Path, arch_trials: int) -> None:
     """A refused run must not leave an earlier phase bound to the rejected root.
 
     Claiming inside the check loop bound every phase examined before the
@@ -1410,7 +1400,7 @@ def test_refused_multi_phase_binding_claims_nothing(
         bound, storage, bound_root=str(_experiment_dir(bound)), arch_trials=arch_trials
     )
 
-    with pytest.raises(expected):
+    with pytest.raises(ArtifactRootConflictError):
         run_experiment(offered)
 
     arch = optuna.load_study(study_name="t::arch", storage=storage)
