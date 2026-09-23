@@ -429,12 +429,18 @@ def copy_fake_train(tmp_path: Path) -> Path:
     return trainer
 
 
+#: The command every runnable-trainer experiment uses, ``trainer`` still to fill in.
+_RUNNABLE_TRIAL_COMMAND = "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
+
+
 def make_experiment(
     *,
     experiment: str = "t",
     workdir: str | Path | None = None,
     storage: str | None = None,
-    trial_command: str = "echo {overrides}",
+    persistent: Path | None = None,
+    trainer: Path | None = None,
+    trial_command: str | None = None,
     override_format: str = "argparse",
     trainer_config: dict[str, Any] | None = None,
     metric: Metric | None = None,
@@ -453,7 +459,33 @@ def make_experiment(
     With persistent ``storage`` and no caller-supplied sampler, that default
     phase uses ``Sampler(type="random", seed=0)`` so it satisfies the
     persistent-storage sampler policy.
+
+    ``persistent`` names a directory that holds the SQLite ledger
+    ``studies.db`` and the workdir ``runs/``; an explicit ``workdir`` or
+    ``storage`` overrides that half. ``trainer`` makes each trial run that
+    script as ``python <trainer> --out {trial_dir}/r.json {overrides}``.
+
+    :raises TypeError: ``trainer`` and ``trial_command`` are both given, or
+        ``phases`` is given with phase keywords it would silently drop.
     """
+    if trainer is not None and trial_command is not None:
+        raise TypeError("pass trainer= or trial_command=, not both")
+    if phases is not None and phase_overrides:
+        raise TypeError(
+            f"phase keywords {sorted(phase_overrides)} apply only to the default phase, "
+            "not to explicit phases="
+        )
+    if persistent is not None:
+        if workdir is None:
+            workdir = persistent / "runs"
+        if storage is None:
+            storage = f"sqlite:///{persistent / 'studies.db'}"
+    if trial_command is None:
+        trial_command = (
+            "echo {overrides}"
+            if trainer is None
+            else _RUNNABLE_TRIAL_COMMAND.format(trainer=trainer)
+        )
     if phases is None:
         base: dict[str, Any] = dict(
             name="p",
