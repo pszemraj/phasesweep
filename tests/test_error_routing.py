@@ -23,6 +23,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import optuna
 import pytest
@@ -1633,11 +1634,10 @@ _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
 )
 
 
-def _assert_payload_follows(error: PhaseSweepError) -> None:
-    """Assert the runner's failure payload for ``error`` says exactly what it routes."""
-    failure = mcp_runner._safe_failure_payload(error, stage="preflight")
+def _assert_payload_follows(failure: Mapping[str, Any], routed: list[OperatorAction]) -> None:
+    """Assert a runner failure payload says exactly the ``routed`` steps, in order."""
     remediation = failure["remediation"]
-    steps = [] if error.action is OperatorAction.RETRY else [error.action]
+    steps = [step for step in routed if step is not OperatorAction.RETRY]
     if failure["code"] == "cleanup_uncertain":
         # The server launches nothing more for such a run until recover-run
         # confirms it, so recover-run is how it is retried.
@@ -1655,13 +1655,61 @@ def _assert_payload_follows(error: PhaseSweepError) -> None:
     if OperatorAction.RESTORE_TREE in steps:
         # The payload carries no message, so it keeps the safety condition.
         assert "only if certain nothing is running" in remediation
+    # A step whose specifics are in the message points at the run log holding it.
+    self_contained = {OperatorAction.RUN_RECOVER_RUN, OperatorAction.INSPECT_LOGS}
+    points_at_log = remediation.endswith("The error in the PhaseSweep run log gives the details.")
+    assert points_at_log is not self_contained.issuperset(steps), remediation
+
+
+def _cleanup_refusal(action: OperatorAction | None, cause: BaseException | None) -> Exception:
+    """Return a cleanup refusal routing ``action`` whose chained cause is ``cause``."""
+    refusal = ProcessCleanupUncertainError("cleanup could not be proven", action=action)
+    refusal.__cause__ = cause
+    return refusal
+
+
+_LEDGER, _TREE = OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE
+_LEDGER_LOST = StudyStorageUnavailableError("ledger unreadable")
+_SHARED_REGISTRY = ProcessCleanupUncertainError("registry shared", action=_TREE)
+
+# An unconfirmed cleanup, as (primary error, recorded cleanup error, routed
+# repairs): the primary's repair where it is a cleanup refusal or a storage
+# failure, then the one the recorded cleanup error routes, then recover-run.
+# A chained cause never adds a repair.
+_UNCONFIRMED_CLEANUPS = (
+    (_SHARED_REGISTRY, None, [_TREE]),
+    (_cleanup_refusal(_LEDGER, _LEDGER_LOST), None, [_LEDGER]),
+    (_cleanup_refusal(_LEDGER, OSError("ledger unreadable")), None, [_LEDGER]),
+    (_cleanup_refusal(None, _LEDGER_LOST), None, []),
+    (_cleanup_refusal(None, None), None, []),
+    (NoFeasibleTrialError("trainer failed"), _SHARED_REGISTRY, [_TREE]),
+    (NoFeasibleTrialError("trainer failed"), OSError("root is gone"), []),
+    (_LEDGER_LOST, None, [_LEDGER]),
+    (_LEDGER_LOST, _SHARED_REGISTRY, [_LEDGER, _TREE]),
+)
 
 
 def test_runner_payload_follows_the_routed_steps() -> None:
     # The payload depends only on an error's type and action, and the tables
     # above prove each trigger raises exactly its row's, so each row's
     # declared routing stands in for driving its trigger again.
-    for cls in _operator_error_classes():
-        _assert_payload_follows(cls("boom"))
-    for case in CASES:
-        _assert_payload_follows(case.raised("boom", action=case.action))
+    errors = [cls("boom") for cls in _operator_error_classes()]
+    errors += [case.raised("boom", action=case.action) for case in CASES]
+    for error in errors:
+        failure = mcp_runner._safe_failure_payload(error, stage="preflight")
+        _assert_payload_follows(failure, [error.action])
+    for primary, recorded, routed in _UNCONFIRMED_CLEANUPS:
+        failure = mcp_runner._terminal_failure_payload(
+            primary, stage="execution", cleanup_confirmed=False, cleanup_error=recorded
+        )
+        assert failure["code"] == "cleanup_uncertain"
+        # The durable payload schema is unchanged: the action routes, it is not stored.
+        assert "action" not in failure
+        _assert_payload_follows(failure, routed)
+    # The last, composed remediation, word for word.
+    assert failure["remediation"] == (
+        "Ask the operator to restore or repair the storage ledger and access to it, and repair "
+        "the experiment tree's files and permissions, deleting a file only if certain nothing "
+        "is running, then run phasesweep mcp recover-run before another launch. The error in "
+        "the PhaseSweep run log gives the details."
+    )

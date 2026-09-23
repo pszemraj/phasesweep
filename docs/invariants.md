@@ -332,11 +332,11 @@ steps only from the action, so no error type gives the agent advice of its
 own; unconfirmed cleanup adds recover-run after the repair.
 
 **Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.action`,
-`errors.PhaseSweepError.rewrap`, `mcp.runner._OPERATOR_STEPS`\
+`errors.PhaseSweepError.rewrap`, `mcp.runner._OPERATOR_STEPS`,
+`mcp.runner._cleanup_steps`\
 **Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`,
 `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`,
-`tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`,
-`tests/test_mcp_runner.py::test_cleanup_uncertain_remediation_follows_the_operator_action`
+`tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`
 
 #### 16. Refusals are tested against real ledgers
 

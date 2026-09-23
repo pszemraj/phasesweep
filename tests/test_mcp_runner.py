@@ -56,7 +56,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION, Winner, WinnerSource
-from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
 from phasesweep.mcp.runs import RunHandle, RunStore
@@ -1587,110 +1587,6 @@ def test_cleanup_uncertainty_outer_failure_controls_a_cancelled_cause() -> None:
     assert failure["cause"]["code"] == "cancelled"
     assert failure["cause"]["actor"] == "agent"
     assert failure["cause"]["retryable"] is True
-
-
-_RUN_LOG_DETAILS = " The error in the PhaseSweep run log gives the details."
-_RESTORE_LEDGER_FIRST = (
-    "Ask the operator to restore or repair the storage ledger and access to it, "
-    "then run phasesweep mcp recover-run before another launch." + _RUN_LOG_DETAILS
-)
-_RECOVER_RUN_ONLY = "Ask the operator to run phasesweep mcp recover-run before another launch."
-_RESTORE_TREE_FIRST = (
-    "Ask the operator to repair the experiment tree's files and permissions, deleting a "
-    "file only if certain nothing is running, then run phasesweep mcp recover-run before "
-    "another launch." + _RUN_LOG_DETAILS
-)
-_RESTORE_BOTH_FIRST = (
-    "Ask the operator to restore or repair the storage ledger and access to it, "
-    "and repair the experiment tree's files and permissions, deleting a file only if "
-    "certain nothing is running, then run phasesweep mcp recover-run before another "
-    "launch." + _RUN_LOG_DETAILS
-)
-
-
-@pytest.mark.parametrize(
-    ("action", "cause", "remediation"),
-    [
-        pytest.param(OperatorAction.RESTORE_TREE, None, _RESTORE_TREE_FIRST, id="restore-tree"),
-        pytest.param(
-            OperatorAction.RESTORE_LEDGER,
-            StudyStorageUnavailableError("ledger unreadable"),
-            _RESTORE_LEDGER_FIRST,
-            id="restore-ledger-storage-cause",
-        ),
-        pytest.param(
-            OperatorAction.RESTORE_LEDGER,
-            OSError("ledger unreadable"),
-            _RESTORE_LEDGER_FIRST,
-            id="restore-ledger-other-cause",
-        ),
-        pytest.param(
-            None,
-            StudyStorageUnavailableError("ledger unreadable"),
-            _RECOVER_RUN_ONLY,
-            id="default-storage-cause",
-        ),
-        pytest.param(None, None, _RECOVER_RUN_ONLY, id="default-no-cause"),
-    ],
-)
-def test_cleanup_uncertain_remediation_follows_the_operator_action(
-    action: OperatorAction | None,
-    cause: BaseException | None,
-    remediation: str,
-) -> None:
-    """The raise site's action picks the remedy; the chained cause's type does not."""
-    error = ProcessCleanupUncertainError("cleanup could not be proven", action=action)
-    error.__cause__ = cause
-
-    failure = mcp_runner._terminal_failure_payload(
-        error, stage="preflight", cleanup_confirmed=False
-    )
-
-    assert failure["code"] == "cleanup_uncertain"
-    assert failure["remediation"] == remediation
-    # The durable payload schema is unchanged: the action routes, it is not stored.
-    assert "action" not in failure
-
-
-@pytest.mark.parametrize(
-    ("primary", "cleanup_error", "remediation"),
-    [
-        pytest.param(
-            NoFeasibleTrialError("trainer failed"),
-            ProcessCleanupUncertainError("registry shared", action=OperatorAction.RESTORE_TREE),
-            _RESTORE_TREE_FIRST,
-            id="cleanup-repair",
-        ),
-        pytest.param(
-            NoFeasibleTrialError("trainer failed"),
-            OSError("root is gone"),
-            _RECOVER_RUN_ONLY,
-            id="no-specific-repair",
-        ),
-        pytest.param(
-            StudyStorageUnavailableError("ledger write failed"),
-            None,
-            _RESTORE_LEDGER_FIRST,
-            id="storage-primary",
-        ),
-        pytest.param(
-            StudyStorageUnavailableError("ledger write failed"),
-            ProcessCleanupUncertainError("registry shared", action=OperatorAction.RESTORE_TREE),
-            _RESTORE_BOTH_FIRST,
-            id="storage-primary-and-cleanup-repair",
-        ),
-    ],
-)
-def test_unconfirmed_cleanup_keeps_the_recorded_cleanup_repairs(
-    primary: BaseException, cleanup_error: BaseException | None, remediation: str
-) -> None:
-    """The engine's recorded cleanup error, not a fresh default, names the repairs."""
-    failure = mcp_runner._terminal_failure_payload(
-        primary, stage="execution", cleanup_confirmed=False, cleanup_error=cleanup_error
-    )
-
-    assert failure["code"] == "cleanup_uncertain"
-    assert failure["remediation"] == remediation
 
 
 def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
