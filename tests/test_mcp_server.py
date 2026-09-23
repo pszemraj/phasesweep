@@ -2057,17 +2057,6 @@ def _write_experiment_config(config: Path, experiment: Experiment) -> None:
     config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
 
 
-def _publish_drift_experiment(tmp_path: Path) -> tuple[Path, Path, Path]:
-    """Publish one real generation and return its trainer, config, and catalog."""
-    trainer = write_constant_trainer(tmp_path)
-    config = tmp_path / "srv.yaml"
-    published = _drift_experiment(tmp_path, trainer)
-    _write_experiment_config(config, published)
-    catalog = _catalog(tmp_path, config)
-    run_experiment(published)
-    return trainer, config, catalog
-
-
 def _record_published_run_snapshot(
     tmp_path: Path,
     *,
