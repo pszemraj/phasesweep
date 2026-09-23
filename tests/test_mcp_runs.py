@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event, Thread
@@ -18,6 +19,8 @@ from threading import Event, Thread
 import pytest
 
 import phasesweep.mcp.runs as mcp_runs
+from phasesweep.errors import OperatorAction
+from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.process import read_boot_id, read_proc_starttime
@@ -512,18 +515,160 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
 
 
 def test_open_existing_requires_supported_format_marker_without_mutation(tmp_path: Path) -> None:
+    """Without a marker, run handles mark preserved-release state; no handles, a wrong path."""
     state_dir = tmp_path / "state"
-    RunStore(state_dir)
+    store = RunStore(state_dir)
     marker = state_dir / ".phasesweep-format.json"
     marker.unlink()
     before = _state_tree_snapshot(state_dir)
 
+    with pytest.raises(ValueError, match="no format marker and no run handles") as wrong:
+        RunStore.open_existing(state_dir)
+    assert not isinstance(wrong.value, mcp_runs.UnsupportedStateFormatError)
+    assert _state_tree_snapshot(state_dir) == before
+
+    private_atomic_write_text(
+        marker, json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION})
+    )
+    store.create(make_run_handle(run_id="exp-1"))
+    marker.unlink()
+    before = _state_tree_snapshot(state_dir)
+
     with pytest.raises(
-        ValueError, match="malformed or unsupported.*fresh MCP state directory.*0.3.1"
+        mcp_runs.UnsupportedStateFormatError,
+        match="no format marker.*fresh MCP state directory.*0.3.1",
     ):
         RunStore.open_existing(state_dir)
-
     assert _state_tree_snapshot(state_dir) == before
+
+
+def _logs_deleted(tmp_path: Path) -> Path:
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    (state_dir / "logs").rmdir()
+    return state_dir
+
+
+def _shared_project_dir(tmp_path: Path, mode: int) -> Path:
+    project = tmp_path / "project"
+    for path in (project, project / "runs", project / "logs"):
+        path.mkdir(exist_ok=True)
+        path.chmod(mode)
+    return project
+
+
+def _marker_mode(mode: int) -> Callable[[Path], Path]:
+    def build(tmp_path: Path) -> Path:
+        state_dir = tmp_path / "state"
+        RunStore(state_dir)
+        (state_dir / ".phasesweep-format.json").chmod(mode)
+        return state_dir
+
+    return build
+
+
+def _marker_text(text: str) -> Callable[[Path], Path]:
+    def build(tmp_path: Path) -> Path:
+        state_dir = tmp_path / "state"
+        RunStore(state_dir)
+        private_atomic_write_text(state_dir / ".phasesweep-format.json", text)
+        return state_dir
+
+    return build
+
+
+def _regular_file(tmp_path: Path) -> Path:
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text("x: 1\n")
+    return catalog
+
+
+def _below_regular_file(tmp_path: Path) -> Path:
+    return _regular_file(tmp_path) / "state"
+
+
+def _symlink_to_state_dir(tmp_path: Path) -> Path:
+    RunStore(tmp_path / "real")
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    return tmp_path / "link"
+
+
+def _under_unsearchable_dir(tmp_path: Path) -> Path:
+    locked = tmp_path / "someone-elses-home"
+    locked.mkdir()
+    locked.chmod(0o000)
+    return locked / "state"
+
+
+@pytest.mark.parametrize(
+    ("build", "action", "message"),
+    [
+        # The marker is there, so the directory is the state directory and the
+        # missing, shared, or unreadable part of it is damage to restore.
+        (_logs_deleted, OperatorAction.RESTORE_TREE, "has its format marker but is missing"),
+        (_marker_mode(0o000), OperatorAction.RESTORE_TREE, "cannot be read"),
+        (_marker_mode(0o644), OperatorAction.RESTORE_TREE, "with mode 0600; found"),
+        (_marker_text("not json\n"), OperatorAction.RESTORE_TREE, "is malformed"),
+        (
+            _marker_text('{"schema_version": 1, "unexpected": true}\n'),
+            OperatorAction.RESTORE_TREE,
+            "is malformed",
+        ),
+        # The CLI resolves a symlinked state_dir first; through the API the
+        # marker is reached, so the link standing in for the directory is damage.
+        (_symlink_to_state_dir, OperatorAction.RESTORE_TREE, "is not a real directory"),
+        # A readable marker naming another format is another release's state.
+        (
+            _marker_text('{"schema_version": 0}\n'),
+            OperatorAction.USE_PRIOR_RELEASE,
+            "declares unsupported format 0",
+        ),
+        # No marker and no run handles: the path names some other directory,
+        # whatever its layout or permissions, and no chmod turns it into state.
+        (
+            lambda tmp_path: _shared_project_dir(tmp_path, 0o755),
+            OperatorAction.FIX_CONFIG,
+            "no format marker and no run handles",
+        ),
+        (
+            lambda tmp_path: _shared_project_dir(tmp_path, 0o700),
+            OperatorAction.FIX_CONFIG,
+            "no format marker and no run handles",
+        ),
+        (_regular_file, OperatorAction.FIX_CONFIG, "expected directories are missing"),
+        # A walk that fails above state_dir never reached a state directory.
+        (_below_regular_file, OperatorAction.FIX_CONFIG, "is not reachable through real"),
+        (_under_unsearchable_dir, OperatorAction.FIX_CONFIG, "is not reachable through real"),
+    ],
+    ids=[
+        "logs-deleted",
+        "marker-mode-000",
+        "marker-mode-0644",
+        "marker-not-json",
+        "marker-extra-field",
+        "symlinked-state-dir",
+        "marker-other-format",
+        "shared-project-dir",
+        "private-project-dir",
+        "regular-file",
+        "below-regular-file",
+        "under-unsearchable-dir",
+    ],
+)
+def test_recovery_tells_a_wrong_state_dir_from_a_damaged_one(
+    tmp_path: Path, build: Callable[[Path], Path], action: OperatorAction, message: str
+) -> None:
+    """recover-run routes a wrong path to fixing it and a damaged state dir to restoring it."""
+    state_dir = build(tmp_path)
+    locked = tmp_path / "someone-elses-home"
+    try:
+        with pytest.raises(RunRecoveryError) as excinfo:
+            recover_run(state_dir, "exp-1", confirm=False, emit=lambda _message: None)
+    finally:
+        if locked.exists():
+            locked.chmod(0o700)
+    assert excinfo.value.actions == (action,)
+    assert message in str(excinfo.value)
 
 
 @pytest.mark.parametrize(

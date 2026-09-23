@@ -542,9 +542,9 @@ def _recover_over_invalid_publication(tmp_path: Path, monkeypatch: pytest.Monkey
 
 
 def _recover_over_pre_cutover_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover from a state directory the 0.3.1 runtime left without a format marker."""
+    """Recover from a state directory the 0.3.1 runtime left: run handles, no format marker."""
     state_dir = tmp_path / "mcp-state"
-    RunStore(state_dir)
+    RunStore(state_dir).create(make_run_handle(run_id="wrap-recover"))
     (state_dir / _STATE_FORMAT_MARKER_NAME).unlink()
     return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 

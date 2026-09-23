@@ -24,6 +24,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
+    absolute_path,
     ensure_private_dir,
     open_directory_fd,
     open_lock_file,
@@ -321,39 +322,112 @@ class RunStore:
         create a new state tree or change permissions on an unrelated
         directory.
 
+        The format marker decides what a failure means. With a marker, the
+        path is a state directory and anything else wrong with it is damage.
+        Without one, run handles make it state from the preserved release, and
+        their absence means the path names some other directory. A path whose
+        ancestors cannot be walked never reaches a state directory at all.
+
         :param Path state_dir: Existing MCP state directory containing ``runs/``
             and ``logs/`` subdirectories.
         :return RunStore: Store bound to the recognized existing layout.
-        :raises UnsupportedStateFormatError: The layout exists but its format
-            marker is missing, malformed, or declares another format.
-        :raises UnsafePrivatePathError: The layout exists but one of its
-            directories is shared, symlinked, or not a real directory.
+        :raises UnsupportedStateFormatError: The marker names another format,
+            or run handles exist without a marker.
+        :raises UnsafePrivatePathError: The marker is present but it, or a
+            directory of the layout, is missing, unreadable, malformed, shared,
+            symlinked, or not a real directory.
         :raises ValueError: If ``state_dir`` is not an MCP run-store layout.
         """
         store = cls.__new__(cls)
         store._set_paths(state_dir)
+        wrong_path = ". Pass the state_dir from the catalog the MCP server runs with."
+        parent = absolute_path(state_dir).parent
+        if parent != parent.parent:
+            try:
+                os.close(open_directory_fd(parent, create=False, private_final=False))
+            except (OSError, UnsafePrivatePathError) as exc:
+                raise ValueError(
+                    f"not an existing MCP state directory; {state_dir} is not reachable "
+                    f"through real directories: {exc}{wrong_path}"
+                ) from None
+        try:
+            os.lstat(store._format_marker_path)
+        except (FileNotFoundError, NotADirectoryError):
+            if store._has_run_handles():
+                raise store._format_refusal("durable run data has no format marker") from None
+            missing = [
+                str(path)
+                for path in (state_dir, store._runs_dir, store._logs_dir)
+                if not path.is_dir()
+            ]
+            detail = (
+                "expected directories are missing: " + ", ".join(missing)
+                if missing
+                else f"it has no format marker and no run handles under {store._runs_dir}"
+            )
+            raise ValueError(f"not an existing MCP state directory; {detail}{wrong_path}") from None
+        except OSError:
+            # The directory exists but cannot be searched, so whether it holds
+            # a marker is unknown; validating it below reports that damage.
+            pass
         missing = []
-        unsafe: UnsafePrivatePathError | None = None
         for path in (state_dir, store._runs_dir, store._logs_dir):
             try:
                 validate_private_dir(path)
-            except UnsafePrivatePathError as exc:
-                unsafe = unsafe or exc
-            except OSError:
+            except FileNotFoundError:
                 missing.append(str(path))
-        # A missing layout means this is not the state directory at all, even if
-        # the path is some other shared directory; only a complete layout makes
-        # a privacy failure the directory's own damage rather than a wrong path.
         if missing:
-            raise ValueError(
-                "not an existing MCP state directory; expected directories are missing: "
-                + ", ".join(missing)
-                + ". Pass the state_dir from the catalog the MCP server runs with."
+            raise UnsafePrivatePathError(
+                f"MCP state directory {state_dir} has its format marker but is missing "
+                f"{', '.join(missing)}. Restore the state directory before retrying recovery."
             )
-        if unsafe is not None:
-            raise unsafe
-        store._require_supported_format_marker()
+        store._require_current_marker_for_recovery()
         return store
+
+    def _has_run_handles(self) -> bool:
+        """Return whether ``runs/`` holds any run handle, without validating it.
+
+        :return bool: Whether a ``*.json`` handle entry is present.
+        """
+        try:
+            with os.scandir(self._runs_dir) as entries:
+                return any(entry.name.endswith(".json") for entry in entries)
+        except OSError:
+            return False
+
+    def _require_current_marker_for_recovery(self) -> None:
+        """Require a readable marker naming this release's format, telling damage apart.
+
+        A marker that reads and names another format is state for another
+        release. One that cannot be read, or reads as anything but a format
+        record, is this state directory's own damage.
+
+        :raises UnsupportedStateFormatError: The marker names another format.
+        :raises UnsafePrivatePathError: The marker is unreadable, unsafe, or malformed.
+        """
+        marker = self._format_marker_path
+        directory_fd = open_directory_fd(marker.parent, create=False, private_final=True)
+        try:
+            raw = read_private_text_at(directory_fd, marker.name, marker)
+        except (OSError, UnicodeError) as exc:
+            raise UnsafePrivatePathError(
+                f"MCP state directory {marker.parent} format marker {marker} cannot be "
+                f"read: {exc}. Restore it and access to it before retrying recovery."
+            ) from exc
+        finally:
+            os.close(directory_fd)
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = None
+        version = payload.get("schema_version") if isinstance(payload, dict) else None
+        if type(version) is int and version != MCP_STATE_FORMAT_VERSION:
+            raise self._format_refusal(f"format marker declares unsupported format {version}")
+        if type(version) is not int or set(cast(dict[str, object], payload)) != {"schema_version"}:
+            raise UnsafePrivatePathError(
+                f"MCP state directory {marker.parent} format marker {marker} is malformed. "
+                "Restore it before retrying recovery."
+            )
 
     def _set_paths(self, state_dir: Path) -> None:
         """Bind store paths without touching the filesystem.
