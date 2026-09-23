@@ -25,6 +25,7 @@ from phasesweep.engine.attempts import (
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
+    OperatorAction,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -343,7 +344,8 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: dict[str, Any]) -> None
         f"Phase {phase.name!r} previously aborted at its accepted n_trials={trial_target}: "
         f"{abort_record['cause']} Refusing to reinterpret those terminal attempts as a "
         f"successful phase. Increase n_trials above {trial_target} to explicitly schedule "
-        "new recovery attempts, or use a new experiment name."
+        "new recovery attempts, or use a new experiment name.",
+        action=OperatorAction.FIX_CONFIG,
     )
 
 

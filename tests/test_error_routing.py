@@ -38,6 +38,7 @@ from types import MappingProxyType, SimpleNamespace
 
 import optuna
 import pytest
+import yaml
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
@@ -51,6 +52,7 @@ from phasesweep.engine import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    WinnerIntegrityError,
     fingerprints,
     guards,
     run_experiment,
@@ -58,6 +60,7 @@ from phasesweep.engine import (
     trial,
 )
 from phasesweep.engine.artifact_roots import _write_artifact_root_binding
+from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.attempts import (
     _preflight_active_attempts,
     _PreflightCleanupReport,
@@ -69,14 +72,19 @@ from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
     _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
 )
+from phasesweep.engine.phase import _failure_policy_abort_record
 from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
+    PHASE_ABORT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
 )
@@ -597,6 +605,18 @@ def _recover_over_malformed_registry_entry(
     return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
+def _moved_workdir(materialized: Materialized, tmp_path: Path) -> Experiment:
+    """Return the fixture's config pointed at a workdir its studies never published into."""
+    return materialized.experiment.model_copy(update={"workdir": str(tmp_path / "moved")})
+
+
+def _recovery_studies_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Load recovery's studies through a config whose workdir moved away from them."""
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    needs = _recovery_needs(ownership_storage_unavailable=False)
+    return _load_recovery_studies(_moved_workdir(materialized, tmp_path), needs)
+
+
 def _accepted_target_study(name: str, target: int) -> optuna.Study:
     """Return an empty current-format study that already accepted ``target`` trials."""
     study = optuna.create_study(study_name=name)
@@ -794,6 +814,14 @@ WRAP_CASES = (
         action=OperatorAction.RESTORE_TREE,
         cause=None,
         message="delete the entry file if you are certain nothing is running.",
+    ),
+    WrapCase(
+        id="recovery_studies_root_moved",
+        trigger=_recovery_studies_from_moved_workdir,
+        outbound=RunRecoveryError,
+        action=OperatorAction.FIX_CONFIG,
+        cause=ArtifactRootConflictError,
+        message="Restore the original workdir, or use a fresh artifact root",
     ),
     WrapCase(
         id="sqlite_unopenable",
@@ -1123,6 +1151,90 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     )
 
 
+def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Re-run a phase whose study durably aborted at its current trial target."""
+    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    phase = experiment.phases[0]
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study.set_user_attr(
+        PHASE_ABORT_ATTR,
+        _failure_policy_abort_record(
+            phase, consecutive_failures=2, completion_sequence=2, trial_target=phase.n_trials
+        ),
+    )
+    return run_experiment(experiment)
+
+
+def _republish_as_incomplete(experiment: Experiment) -> None:
+    """Reseal the fixture's publication as a partial result an earlier config accepted.
+
+    The winner, the summary entry that mirrors it, the summary's hash of it,
+    and the pointer's hash of the summary change together, so the publication
+    still validates and the load reaches the partial-result policy.
+    """
+    generation = _last_successful_generation_id(experiment)
+    assert generation is not None
+    winner = _generation_winner_path(experiment, generation, "p")
+    summary = _generation_summary_path(experiment, generation)
+    complete_digest = hashlib.sha256(winner.read_bytes()).hexdigest()
+    for path in (winner, summary):
+        path.write_text(path.read_text().replace("incomplete: false", "incomplete: true"))
+    partial_digest = hashlib.sha256(winner.read_bytes()).hexdigest()
+    summary.write_text(summary.read_text().replace(complete_digest, partial_digest))
+    pointer_path = _last_successful_generation_path(experiment)
+    pointer = yaml.safe_load(pointer_path.read_text())
+    pointer["summary_size_bytes"] = len(summary.read_bytes())
+    pointer["summary_sha256"] = hashlib.sha256(summary.read_bytes()).hexdigest()
+    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
+
+
+def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Skip a phase whose published winner is a partial result this config does not accept."""
+    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    _republish_as_incomplete(experiment)
+    return _load_winner(experiment, experiment.phases[0], {})
+
+
+def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Skip a phase whose search space changed after its winner was published."""
+    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    edited = experiment.phases[0].model_copy(
+        update={"search_space": {"a": IntParam(type="int", low=0, high=20)}}
+    )
+    return _load_winner(experiment.model_copy(update={"phases": [edited]}), edited, {})
+
+
+def _claim_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Claim the fixture's ledger through a config whose workdir moved away from it."""
+    moved = _moved_workdir(materialize("current-sqlite", tmp_path, mode="tree"), tmp_path)
+    return engine_ledger.claim_ledger(engine_ledger.validate_ledger(moved))
+
+
+def _validate_tree_bound_to_another_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Validate a config over a tree that a different storage ledger bound."""
+    owner = make_experiment(workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'a.db'}")
+    _artifact_root_binding_path(owner).parent.mkdir(parents=True)
+    _write_artifact_root_binding(owner)
+    other = make_experiment(workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'b.db'}")
+    return engine_ledger.validate_ledger(other)
+
+
+def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Validate a study whose recorded trial ran under another trainer environment."""
+    study = optuna.create_study(study_name="t::p")
+    study.add_trial(
+        optuna.trial.create_trial(
+            value=1.0,
+            params={},
+            distributions={},
+            user_attrs={TRAINER_ENV_DIGEST_ATTR: "e" * 64},
+        )
+    )
+    return study_policy._validate_environment_cohort(study, "d" * 64)
+
+
 _DELETE_ENTRY_IF_IDLE = "Delete the entry file only if you are certain no process"
 
 
@@ -1266,6 +1378,48 @@ ORIGIN_CASES = (
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
         message="runner still appears live; use cancel_run first",
+    ),
+    OriginCase(
+        id="prior_phase_abort",
+        trigger=_rerun_aborted_phase,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Increase n_trials above 2 to explicitly schedule new recovery attempts",
+    ),
+    OriginCase(
+        id="winner_incomplete_without_opt_in",
+        trigger=_resume_over_incomplete_winner,
+        raised=WinnerIntegrityError,
+        action=OperatorAction.FIX_CONFIG,
+        message="unless the current config sets allow_incomplete_on_timeout: true.",
+    ),
+    OriginCase(
+        id="winner_phase_config_changed",
+        trigger=_resume_after_phase_edit,
+        raised=StudyFingerprintMismatchError,
+        action=OperatorAction.FIX_CONFIG,
+        message="or restore the matching config before resuming.",
+    ),
+    OriginCase(
+        id="study_root_workdir_moved",
+        trigger=_claim_from_moved_workdir,
+        raised=ArtifactRootConflictError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Restore the original workdir, or use a fresh artifact root",
+    ),
+    OriginCase(
+        id="tree_bound_to_another_ledger",
+        trigger=_validate_tree_bound_to_another_ledger,
+        raised=ArtifactRootConflictError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Use the config that owns this current-format tree",
+    ),
+    OriginCase(
+        id="environment_cohort_changed",
+        trigger=_top_up_from_another_environment,
+        raised=StudyFingerprintMismatchError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Restore the original semantic environment",
     ),
 )
 

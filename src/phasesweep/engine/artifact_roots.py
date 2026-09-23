@@ -257,7 +257,8 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
             f"ledger or experiment than {experiment.experiment!r}. Use the config that owns "
             "this current-format tree, or use a fresh artifact root and local storage. "
-            "Nothing was written."
+            "Nothing was written.",
+            action=OperatorAction.FIX_CONFIG,
         )
     return "bound"
 
@@ -354,7 +355,8 @@ def _check_study_artifact_root(study: optuna.Study, experiment: Experiment) -> N
         "root; running it against a second workdir would top up trials whose artifacts "
         "live under the bound root and publish a divergent result tree. Restore the "
         "original workdir, or use a fresh artifact root and local storage. No trial ran "
-        "and nothing was published."
+        "and nothing was published.",
+        action=OperatorAction.FIX_CONFIG,
     )
 
 

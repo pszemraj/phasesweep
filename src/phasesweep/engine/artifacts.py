@@ -19,7 +19,11 @@ import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.publication_validation as publication_validation_ops
 from phasesweep.config import Experiment, Phase
-from phasesweep.engine.errors import StudyFingerprintMismatchError, WinnerIntegrityError
+from phasesweep.engine.errors import (
+    OperatorAction,
+    StudyFingerprintMismatchError,
+    WinnerIntegrityError,
+)
 from phasesweep.engine.state import (
     Winner,
     WinnerSourceKind,
@@ -395,7 +399,8 @@ def _load_winner(
             f"Winner file {path} was produced by a different phase config "
             f"(stored fingerprint {stored_fp[:16]}... != current "
             f"{current_fp[:16]}...). Re-run phase {phase.name!r}, change the "
-            f"experiment name, or restore the matching config before resuming."
+            f"experiment name, or restore the matching config before resuming.",
+            action=OperatorAction.FIX_CONFIG,
         )
 
     completion = data.get("completion")
@@ -408,7 +413,8 @@ def _load_winner(
         raise WinnerIntegrityError(
             f"Winner file {path} records an incomplete phase result. Refusing to "
             f"use it for skipped phase {phase.name!r} unless the current config "
-            "sets allow_incomplete_on_timeout: true."
+            "sets allow_incomplete_on_timeout: true.",
+            action=OperatorAction.FIX_CONFIG,
         )
     generation_id = data.get("generation_id")
     attempt_id = data.get("attempt_id")

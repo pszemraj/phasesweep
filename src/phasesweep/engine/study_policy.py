@@ -574,5 +574,6 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
             f"environment cohort(s) [{rendered}], but this invocation composes "
             f"{current_digest[:12]}. No trial was allocated. Restore the original "
             "semantic environment, classify rotating credentials under "
-            "execution.passthrough_env, or use a new experiment name."
+            "execution.passthrough_env, or use a new experiment name.",
+            action=OperatorAction.FIX_CONFIG,
         )
