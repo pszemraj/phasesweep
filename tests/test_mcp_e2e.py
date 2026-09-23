@@ -15,13 +15,8 @@ import pytest
 
 from phasesweep import __version__
 from phasesweep.mcp import agent_prompt_text
-from phasesweep.mcp.server import (
-    AWAIT_DEFAULT_TIMEOUT_SECONDS,
-    AWAIT_MAX_TIMEOUT_SECONDS,
-    AWAIT_MIN_TIMEOUT_SECONDS,
-    CATALOG_RESOURCE_URI,
-    DEFAULT_LIST_LIMIT,
-    PROMPT_RUN_AND_MONITOR,
+from phasesweep.mcp.server import CATALOG_RESOURCE_URI, PROMPT_RUN_AND_MONITOR
+from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
     TOOL_GET_LATEST_RUN,
@@ -30,6 +25,12 @@ from phasesweep.mcp.server import (
     TOOL_INSPECT_EXPERIMENT,
     TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
+)
+from phasesweep.mcp.tools import (
+    AWAIT_DEFAULT_TIMEOUT_SECONDS,
+    AWAIT_MAX_TIMEOUT_SECONDS,
+    AWAIT_MIN_TIMEOUT_SECONDS,
+    DEFAULT_LIST_LIMIT,
 )
 from tests.conftest import copy_fake_train
 from tests.mcp_helpers import (

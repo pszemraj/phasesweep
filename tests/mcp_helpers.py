@@ -15,8 +15,9 @@ from typing import Any
 
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
+from phasesweep.mcp.run_control import _runner_protocol_argv
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
-from phasesweep.mcp.server import PhaseSweepMCP, _runner_protocol_argv
+from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
@@ -372,5 +373,5 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         captured["env"] = kwargs.get("env")
         return DummyProc()
 
-    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", fake_popen)
     return captured

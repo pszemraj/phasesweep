@@ -411,8 +411,8 @@ spawns a duplicate sweep against the same ledger. The handle is created before
 identity, and confirmed through a ready/ack handshake, so no child ever exists
 without a durable handle naming it.
 
-The cost is three methods in `src/phasesweep/mcp/server.py`:
-`PhaseSweepMCP._spawn`, `_terminate_failed_spawn`, and `_pending_handle`.
+The cost is three methods in `src/phasesweep/mcp/run_control.py`:
+`RunControl._spawn`, `_terminate_failed_spawn`, and `_pending_handle`.
 
 ### Rejected: removing any of the three
 

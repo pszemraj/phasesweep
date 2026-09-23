@@ -240,8 +240,6 @@ flowchart TD
 - TODO(mcp): Replace the private FastMCP strict-schema patch when the SDK
   exposes a tested public closed-input-schema API; keep behavior-level request
   validation as the safety net until then.
-- TODO(mcp): Split `mcp/server.py` after the MCP SDK surface stabilizes, without
-  changing its run-handle or snapshot semantics.
 - TODO(runtime): Design an explicit completion-budget mode only if its attempt
   accounting, failure cap, and timeout semantics are specified separately.
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if

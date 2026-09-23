@@ -14,8 +14,8 @@ from phasesweep.engine.state import WinnerSource
 from phasesweep.mcp.redaction import intersect_visible_params, winners_payload
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunStore
-from phasesweep.mcp.server import PhaseSweepMCP
 from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.mcp_helpers import (
     assert_no_sensitive,
     patch_popen_capture,
@@ -165,7 +165,7 @@ def test_run_workflow_payloads_never_leak_sensitive_fields(
         )
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
     cancelled = app.cancel(run_id)
     terminal_status = app.status(run_id=run_id)
     awaited = asyncio.run(app.await_run(run_id))

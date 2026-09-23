@@ -2283,7 +2283,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     app, _registry, _store = make_mcp_app(
         write_mcp_catalog(tmp_path, {crash_boundary: config_path})
     )
-    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
     for payload in (
         app.status(run_id=run_id),
         asyncio.run(app.await_run(run_id, timeout_seconds=0)),

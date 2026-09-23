@@ -24,9 +24,9 @@ import yaml
 from click.testing import CliRunner
 
 import phasesweep.mcp.recovery as mcp_recovery
+import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
-import phasesweep.mcp.server as mcp_server
 from phasesweep._metadata import __version__
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
@@ -103,14 +103,14 @@ from phasesweep.mcp.errors import (
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
 from phasesweep.mcp.server import (
-    TOOL_LAUNCH_RUN,
     AwaitRunResult,
     GetRunResultsResult,
     GetRunStatusResult,
-    PhaseSweepMCP,
     _safe_tool,
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
+from phasesweep.mcp.tool_names import TOOL_LAUNCH_RUN
+from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.process import (
     PROCESS_IDENTITY_FILE,
@@ -975,7 +975,7 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     def fail_popen(*args: object, **kwargs: object) -> None:
         raise OSError("runner executable is unavailable")
 
-    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fail_popen)
+    monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", fail_popen)
 
     with pytest.raises(OSError, match="runner executable"):
         app.launch("srv")
@@ -1025,8 +1025,8 @@ def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
         def fail_status(*args: object, **kwargs: object) -> None:
             raise OSError("status directory is unavailable")
 
-        faults.setattr(mcp_server.subprocess, "Popen", fail_popen)
-        faults.setattr(mcp_server, "write_status_file_if_absent", fail_status)
+        faults.setattr(mcp_run_control.subprocess, "Popen", fail_popen)
+        faults.setattr(mcp_run_control, "write_status_file_if_absent", fail_status)
 
         with pytest.raises(OSError, match="runner executable"):
             app.launch("srv")
@@ -1050,7 +1050,7 @@ def test_launch_terminates_real_runner_when_log_context_exit_fails(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     real_popen = subprocess.Popen
-    real_open_private_text = mcp_server.open_private_text
+    real_open_private_text = mcp_run_control.open_private_text
     spawned: list[subprocess.Popen[Any]] = []
 
     @contextlib.contextmanager
@@ -1082,8 +1082,8 @@ def test_launch_terminates_real_runner_when_log_context_exit_fails(
         spawned.append(proc)
         return proc
 
-    monkeypatch.setattr(mcp_server, "open_private_text", fail_log_close)
-    monkeypatch.setattr(mcp_server.subprocess, "Popen", sleeping_popen)
+    monkeypatch.setattr(mcp_run_control, "open_private_text", fail_log_close)
+    monkeypatch.setattr(mcp_run_control.subprocess, "Popen", sleeping_popen)
     try:
         with pytest.raises(OSError, match="log context exit"):
             app.launch("srv")
@@ -1137,9 +1137,9 @@ def test_launch_records_real_cleanup_result_when_process_identity_read_fails(
         cleanup_calls.append((pid, saved_starttime, pgid))
         return cleanup_confirmed
 
-    monkeypatch.setattr(mcp_server, "kill_stale_group", fake_cleanup)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", fake_cleanup)
     monkeypatch.setattr(
-        mcp_server,
+        mcp_run_control,
         "read_proc_starttime" if failing_reader == "starttime" else "read_boot_id",
         fail_identity_read,
     )
@@ -1182,8 +1182,8 @@ def test_launch_cleans_up_when_identity_bookkeeping_is_interrupted(
         cleanup_calls.append((pid, saved_starttime, pgid))
         return True
 
-    monkeypatch.setattr(mcp_server, "read_boot_id", interrupt_boot_id)
-    monkeypatch.setattr(mcp_server, "kill_stale_group", fake_cleanup)
+    monkeypatch.setattr(mcp_run_control, "read_boot_id", interrupt_boot_id)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", fake_cleanup)
 
     with pytest.raises(KeyboardInterrupt):
         app.launch("srv")
@@ -1276,8 +1276,10 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
     class UnreadyProc:
         pid = os.getppid()
 
-    monkeypatch.setattr(mcp_server.subprocess, "Popen", lambda *_args, **_kwargs: UnreadyProc())
-    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        mcp_run_control.subprocess, "Popen", lambda *_args, **_kwargs: UnreadyProc()
+    )
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *_args, **_kwargs: True)
 
     with pytest.raises(RuntimeError, match="did not persist its launch receipt"):
         app.launch("srv")
@@ -1314,8 +1316,8 @@ def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
         cleanup_calls.append((pid, starttime, pgid))
         return True
 
-    monkeypatch.setattr(mcp_server.os, "write", fail_ack)
-    monkeypatch.setattr(mcp_server, "kill_stale_group", confirm_cleanup)
+    monkeypatch.setattr(mcp_run_control.os, "write", fail_ack)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", confirm_cleanup)
 
     with pytest.raises(OSError, match="acknowledgement"):
         app.launch("srv")
@@ -1357,8 +1359,8 @@ def test_interruption_after_ack_keeps_spawn_cleanup_reserved(
         cleanup_calls.append((pid, starttime, pgid))
         return True
 
-    monkeypatch.setattr(mcp_server.os, "write", interrupt_after_ack)
-    monkeypatch.setattr(mcp_server, "kill_stale_group", confirm_runner_group_cleanup)
+    monkeypatch.setattr(mcp_run_control.os, "write", interrupt_after_ack)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", confirm_runner_group_cleanup)
 
     with pytest.raises(KeyboardInterrupt):
         app.launch("srv")
@@ -1449,7 +1451,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         return True
 
     monkeypatch.setattr(store, "state", complete_launch_after_state_read)
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", kill_runner)
+    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", kill_runner)
 
     cancelled = app.cancel(pending.run_id)
 
@@ -1483,8 +1485,8 @@ def test_launch_refuses_runner_without_linux_process_identity(
         cleanup_calls.append((pid, saved_starttime, pgid))
         return cleanup_confirmed
 
-    monkeypatch.setattr("phasesweep.mcp.server.read_proc_starttime", lambda _pid: None)
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_cleanup)
+    monkeypatch.setattr("phasesweep.mcp.run_control.read_proc_starttime", lambda _pid: None)
+    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_cleanup)
 
     with pytest.raises(RuntimeError, match="has no Linux /proc start time"):
         app.launch("srv")
@@ -1521,7 +1523,7 @@ def test_launch_terminates_spawned_runner_when_handle_update_fails(
         return True
 
     monkeypatch.setattr(store, "update", fail_update)
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
 
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
@@ -1560,7 +1562,7 @@ def test_launch_interrupt_during_handle_update_terminates_runner(
         return True
 
     monkeypatch.setattr(store, "update", interrupt_update)
-    monkeypatch.setattr(mcp_server, "kill_stale_group", fake_cleanup)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", fake_cleanup)
 
     with pytest.raises(KeyboardInterrupt):
         app.launch("srv")
@@ -1594,7 +1596,9 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
 
     monkeypatch.setattr(store, "update", fail_update)
     monkeypatch.setattr(store, "mark_cleanup_uncertain", fail_marker)
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        "phasesweep.mcp.run_control.kill_stale_group", lambda *args, **kwargs: False
+    )
     caplog.set_level(logging.ERROR, logger="phasesweep.mcp.server")
 
     with pytest.raises(OSError, match="runs directory"):
@@ -1626,7 +1630,7 @@ def test_post_ack_launch_failure_does_not_clear_reservation_from_runner_group_on
 
     monkeypatch.setattr(store, "update", fail_update)
     monkeypatch.setattr(store, "clear_cleanup_uncertain", track_clear)
-    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *args, **kwargs: True)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *args, **kwargs: True)
 
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
@@ -1654,7 +1658,7 @@ def _launch_with_poison_project(
     into the server's own environment. Each writes a marker file naming itself.
 
     The patches are undone before returning so callers can spawn real children:
-    patching ``phasesweep.mcp.server.subprocess.Popen`` patches the one shared
+    patching ``phasesweep.mcp.run_control.subprocess.Popen`` patches the one shared
     ``subprocess`` module.
 
     :param Path tmp_path: Test-scoped directory.
@@ -1822,9 +1826,9 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    monkeypatch.setattr(mcp_server, "read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
     monkeypatch.setattr("tests.mcp_helpers.read_boot_id", lambda: None)
-    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *_args, **_kwargs: True)
 
     with pytest.raises(RuntimeError, match="boot id"):
         app.launch("srv")
@@ -1899,7 +1903,7 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
         signalled.append(args)
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", record_kill)
+    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", record_kill)
     assert store.state(handle) == "running"
 
     result = app.cancel("srv-boot")
@@ -1935,14 +1939,14 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
     store.create(handle)
     if unknown_side == "current":
         monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
-        monkeypatch.setattr(mcp_server, "read_boot_id", lambda: None)
+        monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
     signalled: list[object] = []
 
     def record_signal(*args: object, **kwargs: object) -> bool:
         signalled.append((args, kwargs))
         return True
 
-    monkeypatch.setattr(mcp_server, "kill_stale_group", record_signal)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", record_signal)
 
     result = app.cancel(handle.run_id)
 
@@ -2611,7 +2615,7 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
         return run
 
     monkeypatch.setattr(app, "_run_payload", finish_after_run_payload)
-    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     payload = (
         asyncio.run(app.await_run(run_id, timeout_seconds=0))
@@ -2651,7 +2655,7 @@ def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
         return False
 
     monkeypatch.setattr(store, "_runner_is_live", finish_before_reporting_exit)
-    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     payload = (
         app.winners(run_id=run_id)
@@ -2728,7 +2732,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
         return status
 
     monkeypatch.setattr(app, "_live_status_payload", finish_during_live_read)
-    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     lock = (
         store.transition_lock(handle)
@@ -2802,7 +2806,7 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
         return run
 
     monkeypatch.setattr(app, "_run_payload", reserve_after_run_payload)
-    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     payload = (
         asyncio.run(app.await_run(run_id, timeout_seconds=0))
@@ -3554,7 +3558,7 @@ def test_cancel_decataloged_run_uses_launch_time_permission(
         )
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
 
     result = app.cancel(run_id)
 
@@ -3632,7 +3636,7 @@ def test_cancel_cleanup_confirmation_policy(
             )
         return runner_group_gone
 
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
 
     result = app.cancel(run_id)
 
@@ -3682,7 +3686,7 @@ def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
                 )
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", fake_kill_stale_group)
+    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda _index: app.cancel(run_id), range(2)))
@@ -3918,7 +3922,7 @@ def test_launch_bookkeeping_failure_preserves_runner_status(
         raise KeyboardInterrupt
 
     monkeypatch.setattr(store, "update", interrupted_update)
-    monkeypatch.setattr(mcp_server, "kill_stale_group", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *_args, **_kwargs: True)
     with pytest.raises(KeyboardInterrupt):
         app.launch("srv")
     (handle,) = store.list_handles()
@@ -3946,7 +3950,7 @@ def test_launch_failure_cannot_replace_status_published_during_write(
         "returncode": 0,
         "cleanup_confirmed": True,
         "result_snapshot_state": "failed",
-        "ended_at": mcp_server.utc_now_iso(),
+        "ended_at": mcp_run_control.utc_now_iso(),
     }
     original_write = mcp_runs.write_status_file
     original_link = mcp_runs.os.link
@@ -3960,7 +3964,7 @@ def test_launch_failure_cannot_replace_status_published_during_write(
             original_write(store.status_path(pending.run_id), runner_status)
         original_link(src, dst, **kwargs)
 
-    monkeypatch.setattr(mcp_server, "write_status_file", racing_write, raising=False)
+    monkeypatch.setattr(mcp_run_control, "write_status_file", racing_write, raising=False)
     monkeypatch.setattr(mcp_runs.os, "link", racing_link)
     app._record_launch_failure(pending, cleanup_confirmed=True, error_class="Injected")
 
@@ -4120,7 +4124,7 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     assert not store.recovery_required(handle)
     assert store.live_runs() == []
 
-    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
     status = app.status(run_id=run_id)
     winners = app.winners(run_id=run_id)
     awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
@@ -4301,7 +4305,7 @@ def test_read_tools_use_live_view_while_result_snapshot_is_pending(
 
     status = app.status(run_id=run_id)
     winners = app.winners(run_id=run_id)
-    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
     awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
 
     for payload in (status, awaited):
@@ -5059,13 +5063,15 @@ def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_wri
     assert frozen_status["run"]["recovery_required"] is True
     assert frozen_status["result_source"] == "frozen_run_snapshot"
     assert frozen_status["phases"][0]["trials"]["RUNNING"] == 1
-    monkeypatch.setattr("phasesweep.mcp.server.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
     awaited = asyncio.run(app.await_run(run_id, timeout_seconds=0))
     assert awaited["result_source"] == "frozen_run_snapshot"
     assert json.loads(store.status_path(run_id).read_text())["result_snapshot_state"] == "complete"
     assert store.cleanup_recovery_path(run_id).is_file()
     assert store.cleanup_uncertain_path(run_id).is_file()
-    monkeypatch.setattr("phasesweep.mcp.server.kill_stale_group", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        "phasesweep.mcp.run_control.kill_stale_group", lambda *_args, **_kwargs: True
+    )
     cancelled = app.cancel(run_id)
     assert cancelled["state"] == "running"
     assert cancelled["recovery_required"] is True

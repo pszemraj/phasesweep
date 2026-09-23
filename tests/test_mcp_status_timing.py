@@ -16,14 +16,14 @@ from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
-from phasesweep.mcp.server import (
+from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.tools import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
     AWAIT_RECHECK_SECONDS,
     _run_elapsed_seconds,
 )
-from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import mark_current_format
 from tests.mcp_helpers import (
@@ -233,8 +233,8 @@ def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
         clock["sleeps"] += seconds
         clock["pauses"] += 1
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", advance)
     return clock
 
 
@@ -310,8 +310,8 @@ def test_await_run_reports_failed_trial_progress_at_timeout(
         mark_current_format(experiment, study)
         study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_fail_trial)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", sleep_then_fail_trial)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
 
@@ -381,8 +381,8 @@ def _await_with_timed_reads(
     async def advance(seconds: float) -> None:
         clock["now"] += seconds
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", advance)
     monkeypatch.setattr(app, "_read_status_target", timed_read)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
@@ -434,8 +434,8 @@ def test_await_run_returns_when_phase_gains_winner(
         winner.parent.mkdir(parents=True, exist_ok=True)
         winner.write_text("{}\n")
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_write_winner)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", sleep_then_write_winner)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS))
     assert result["reason"] == "phase_completed"
@@ -465,8 +465,8 @@ def test_await_run_returns_when_run_fails_mid_wait(
             ),
         )
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_fail)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", sleep_then_fail)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS))
 
@@ -556,7 +556,7 @@ def test_await_run_is_cancellable_during_recheck_pause(
             entered_sleep.set()
             await asyncio.Event().wait()
 
-        monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", wait_forever)
+        monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", wait_forever)
         task = asyncio.create_task(app.await_run("r1"))
         await entered_sleep.wait()
         task.cancel()
