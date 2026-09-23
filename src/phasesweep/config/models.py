@@ -43,6 +43,7 @@ from phasesweep.evidence.models import (
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     local_storage_url,
+    sqlite_database_path,
     storage_backend,
     storage_is_in_memory,
 )
@@ -606,6 +607,12 @@ class Experiment(_Frozen):
             raise ValueError(
                 "storage must be in-memory, sqlite:///, journal:///, or auto; "
                 f"got backend {backend!r}."
+            )
+        # A URI filename naming another host resolves to no file here; SQLite
+        # refuses to open it only after a run has bound the tree to it.
+        if backend == "sqlite" and value is not None and sqlite_database_path(value) is None:
+            raise ValueError(
+                f"SQLite storage must name a local database file; {value!r} names a remote host."
             )
         canonical_storage_identity(value)
         return value

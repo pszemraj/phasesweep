@@ -257,6 +257,20 @@ def test_external_storage_is_rejected_at_config_load(tmp_path: Path, storage: st
         load_experiment(path)
 
 
+def test_sqlite_uri_with_remote_authority_is_rejected_at_config_load(tmp_path: Path) -> None:
+    """A SQLite URI filename naming another host maps to no local ledger file.
+
+    Accepting it would let a run bind the artifact tree to a ledger SQLite then
+    refuses to open, so config load stops it before anything is written.
+    """
+    path = _storage_policy_config(
+        tmp_path, storage="sqlite:///file://db-host/runs/study.db?uri=true", n_jobs=1
+    )
+
+    with pytest.raises(ValidationError, match="SQLite storage must name a local database file"):
+        load_experiment(path)
+
+
 def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     """File-based backends resolve to absolute paths so equivalent URL spellings
     (relative paths, ``..`` segments) produce one stable lock identity. None
