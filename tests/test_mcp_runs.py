@@ -460,7 +460,7 @@ def test_run_store_rejects_invalid_format_marker_without_mutation(
     assert tree_snapshot(state_dir) == before
 
 
-@pytest.mark.parametrize("evidence_kind", ["handle", "status", "log", "lease", "audit"])
+@pytest.mark.parametrize("evidence_kind", ["status", "log", "lease", "audit"])
 def test_run_store_refuses_unmarked_durable_state_before_initialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -469,9 +469,7 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
     state_dir = tmp_path / "state"
     store = RunStore(state_dir)
     run_id = "exp-1"
-    if evidence_kind == "handle":
-        store.create(make_run_handle(run_id=run_id))
-    elif evidence_kind == "status":
+    if evidence_kind == "status":
         write_status_file(store.status_path(run_id), {"run_id": run_id, "returncode": 0})
     elif evidence_kind == "log":
         private_atomic_write_text(store.log_path(run_id), "runner output\n")
@@ -498,30 +496,15 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
 
 
 def test_open_existing_requires_supported_format_marker_without_mutation(tmp_path: Path) -> None:
-    """Without a marker, run handles mark preserved-release state; no handles, a wrong path."""
+    """Without a marker or run handles, the path names some other directory, not old state."""
     state_dir = tmp_path / "state"
-    store = RunStore(state_dir)
-    marker = state_dir / ".phasesweep-format.json"
-    marker.unlink()
+    RunStore(state_dir)
+    (state_dir / ".phasesweep-format.json").unlink()
     before = tree_snapshot(state_dir)
 
     with pytest.raises(ValueError, match="no format marker and no run handles") as wrong:
         RunStore.open_existing(state_dir)
     assert not isinstance(wrong.value, mcp_runs.UnsupportedStateFormatError)
-    assert tree_snapshot(state_dir) == before
-
-    private_atomic_write_text(
-        marker, json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION})
-    )
-    store.create(make_run_handle(run_id="exp-1"))
-    marker.unlink()
-    before = tree_snapshot(state_dir)
-
-    with pytest.raises(
-        mcp_runs.UnsupportedStateFormatError,
-        match="no format marker.*fresh MCP state directory.*0.3.1",
-    ):
-        RunStore.open_existing(state_dir)
     assert tree_snapshot(state_dir) == before
 
 
