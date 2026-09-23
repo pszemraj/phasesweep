@@ -252,7 +252,8 @@ def _recover_pre_spawn_orphan(
     with store.launch_lock() as acquired:
         if not acquired:
             raise RunRecoveryError(
-                "another MCP launch is in progress; wait for it to finish and retry"
+                "another MCP launch is in progress; wait for it to finish and retry",
+                action=OperatorAction.RETRY,
             )
         if store.is_pre_spawn_orphan(run_id):
             if not confirm:
@@ -312,7 +313,8 @@ def _resolve_launch_state(
                 "pre-spawn failure from a child that has not persisted its process identity. "
                 "The run remains reserved. Wait briefly and retry; if this persists after a "
                 "server crash, inspect the host because automated recovery cannot safely "
-                "declare that no runner was spawned."
+                "declare that no runner was spawned.",
+                action=OperatorAction.RETRY,
             )
     return handle, terminal_status
 
@@ -420,8 +422,12 @@ def _require_dead_runner(
             "runner process identity has no Linux /proc start time; refusing automated "
             "recovery because PID reuse cannot be ruled out"
         )
+    # The live runner holds the run: once cancel_run stops it, the same request
+    # can proceed, while another recover-run would stop at this same check.
     if not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise RunRecoveryError("runner still appears live; use cancel_run first")
+        raise RunRecoveryError(
+            "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
+        )
 
 
 def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
@@ -468,7 +474,9 @@ def _cleanup_runner(
     # Keep the lock from this liveness check through every signal, study
     # mutation, and recovery-state write in recover_run.
     if confirm and not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise RunRecoveryError("runner still appears live; use cancel_run first")
+        raise RunRecoveryError(
+            "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
+        )
     if (
         needs.cleanup_needed
         and confirm

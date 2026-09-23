@@ -81,13 +81,14 @@ from phasesweep.engine.state import (
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
+    _cleanup_runner,
     _finalize_stored_terminal_result_snapshot,
     _load_recovery_studies,
     _publication_recovery_action,
     _RecoveryNeeds,
     recover_run,
 )
-from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunStore
+from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
@@ -976,6 +977,57 @@ def _lock_dir_with_relative_account_home(tmp_path: Path, monkeypatch: pytest.Mon
     return lock_dir()
 
 
+def _recover_during_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover a run id while another MCP launch holds the launch lock."""
+    state_dir = tmp_path / "mcp-state"
+    with RunStore(state_dir).launch_lock() as acquired:
+        assert acquired
+        return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
+
+
+def _recover_unsettled_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover a launch whose preparation still holds its lease."""
+    state_dir = tmp_path / "mcp-state"
+    pending = make_run_handle(run_id="wrap-recover", launch_state="launching")
+    preparation = RunStore(state_dir).prepare_launch(pending, b"experiment: t\n")
+    try:
+        return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
+    finally:
+        preparation.close()
+
+
+def _live_uncertain_run(state_dir: Path) -> tuple[RunStore, RunHandle]:
+    """Record a cleanup-uncertain run whose runner is this live test process.
+
+    ``make_run_handle`` gives the runner a process group no test owns, so a
+    regressed liveness check still cannot signal pytest.
+    """
+    store = RunStore(state_dir)
+    handle = make_run_handle(run_id="wrap-recover")
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+    return store, handle
+
+
+def _recover_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Inspect recovery of a run whose runner is still alive."""
+    state_dir = tmp_path / "mcp-state"
+    _live_uncertain_run(state_dir)
+    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
+
+
+def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Re-check, as confirmed recovery does under its lock, a runner that is alive."""
+    store, handle = _live_uncertain_run(tmp_path / "mcp-state")
+    return _cleanup_runner(
+        store.cleanup_identity(handle),
+        _recovery_needs(ownership_storage_unavailable=False),
+        confirm=True,
+        earlier_boot=False,
+        cleanup_recorded=False,
+    )
+
+
 ORIGIN_CASES = (
     OriginCase(
         id="auto_storage_backend_switch",
@@ -1039,6 +1091,34 @@ ORIGIN_CASES = (
         raised=UnsafeLockPathError,
         action=(OperatorAction.RESTORE_TREE, OperatorAction.FIX_CONFIG),
         message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
+    ),
+    OriginCase(
+        id="recover_during_launch",
+        trigger=_recover_during_launch,
+        raised=RunRecoveryError,
+        action=OperatorAction.RETRY,
+        message="wait for it to finish and retry",
+    ),
+    OriginCase(
+        id="recover_unsettled_launch",
+        trigger=_recover_unsettled_launch,
+        raised=RunRecoveryError,
+        action=OperatorAction.RETRY,
+        message="Wait briefly and retry",
+    ),
+    OriginCase(
+        id="recover_live_runner",
+        trigger=_recover_live_runner,
+        raised=RunRecoveryError,
+        action=OperatorAction.RETRY,
+        message="runner still appears live; use cancel_run first",
+    ),
+    OriginCase(
+        id="recover_recheck_live_runner",
+        trigger=_recheck_live_runner,
+        raised=RunRecoveryError,
+        action=OperatorAction.RETRY,
+        message="runner still appears live; use cancel_run first",
     ),
 )
 
