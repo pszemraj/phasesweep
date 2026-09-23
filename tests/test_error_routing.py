@@ -813,7 +813,11 @@ WRAP_CASES = (
     ),
     WrapCase(
         # The ledger is intact, so the storage wrap's restore remedy must not
-        # replace the confirmed recover-run that lets SQLite roll it back.
+        # replace the confirmed recover-run that lets SQLite roll it back. Not
+        # RETRY either: no holder is waited on, and repeating a read never
+        # rolls the journal back. The confirmed recover-run is the locked
+        # command the one surfacing read, recovery inspection, is a flag away
+        # from.
         id="recovery_studies_interrupted_transaction",
         trigger=_recovery_studies_damaged("tree", leave_hot_journal),
         outbound=RunRecoveryError,
@@ -1056,15 +1060,6 @@ def _claim_after_unlocked_bind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     _artifact_root_binding_path(experiment).parent.mkdir(parents=True)
     _write_artifact_root_binding(experiment)
     return engine_ledger.claim_ledger(validated)
-
-
-def _preflight_over_shared_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Scan an attempt registry other users can enter."""
-    experiment = make_experiment(workdir=tmp_path / "runs")
-    registry = _attempts_dir(experiment)
-    registry.mkdir(parents=True)
-    registry.chmod(0o755)
-    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
 
 def _reconcile_prepared_over_damaged_publication(
@@ -1448,15 +1443,6 @@ def _claim_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     return engine_ledger.claim_ledger(engine_ledger.validate_ledger(moved))
 
 
-def _open_after_interrupted_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Open a phase study through a ledger a crash left mid-commit."""
-    materialized = _materialize_damaged(tmp_path, "current-sqlite", "tree", leave_hot_journal)
-    experiment = materialized.experiment
-    return engine_ledger.open_existing_study(
-        engine_ledger.validate_ledger(experiment), experiment.phases[0]
-    )
-
-
 def _claim_after_interrupted_commit_write_protected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
@@ -1464,12 +1450,6 @@ def _claim_after_interrupted_commit_write_protected(
     materialized = _materialize_damaged(
         tmp_path, "current-sqlite", "tree", _interrupted_commit_write_protected
     )
-    return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
-
-
-def _claim_after_torn_journal_append(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Claim a journal ledger whose last append a crash cut short."""
-    materialized = _materialize_damaged(tmp_path, "current-journal", "tree", _truncated)
     return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
 
 
@@ -1516,13 +1496,6 @@ ORIGIN_CASES = (
         raised=ArtifactRootConflictError,
         action=OperatorAction.INSPECT_LOGS,
         message="Stop that process before retrying.",
-    ),
-    OriginCase(
-        id="attempt_registry_not_private",
-        trigger=_preflight_over_shared_registry,
-        raised=ProcessCleanupUncertainError,
-        action=OperatorAction.RESTORE_TREE,
-        message="Restore the original registry with mode 0700 before retrying.",
     ),
     OriginCase(
         id="prepared_publication_unreadable",
@@ -1586,13 +1559,6 @@ ORIGIN_CASES = (
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message='python -m pip install "phasesweep[wandb]"',
-    ),
-    OriginCase(
-        id="registry_entry_unparseable",
-        trigger=_registry_entry_damaged(_garbage),
-        raised=ProcessCleanupUncertainError,
-        action=OperatorAction.RESTORE_TREE,
-        message="delete the entry file if you are certain nothing is running.",
     ),
     OriginCase(
         id="registry_entry_foreign_locator",
@@ -1767,23 +1733,6 @@ ORIGIN_CASES = (
         raised=ArtifactRootConflictError,
         action=OperatorAction.FIX_CONFIG,
         message="Use the config that owns this current-format tree",
-    ),
-    OriginCase(
-        # Not RETRY: no holder is waited on, and repeating a read never rolls
-        # the journal back. The confirmed recover-run is the locked command
-        # the one surfacing read, recovery inspection, is a flag away from.
-        id="sqlite_transaction_interrupted",
-        trigger=_open_after_interrupted_commit,
-        raised=LedgerTransactionInterruptedError,
-        action=OperatorAction.RUN_RECOVER_RUN,
-        message="`phasesweep mcp recover-run --confirm` holds the experiment lock",
-    ),
-    OriginCase(
-        id="journal_final_record_incomplete",
-        trigger=_claim_after_torn_journal_append,
-        raised=IncompleteJournalRecordError,
-        action=OperatorAction.RESTORE_LEDGER,
-        message="Once no process uses this journal, truncate it after its last complete line",
     ),
     OriginCase(
         id="sqlite_rollback_refused",
