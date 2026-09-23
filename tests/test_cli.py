@@ -17,7 +17,15 @@ from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import Experiment, LogRegexExtractor, Metric, Sampler
+from phasesweep.config import (
+    Experiment,
+    FloatParam,
+    JsonEnvelopeExtractor,
+    LogRegexExtractor,
+    Metric,
+    Phase,
+    Sampler,
+)
 from phasesweep.engine import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
@@ -49,9 +57,8 @@ from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
     requires_nonroot,
+    write_constant_trainer,
     write_param_echo_trainer,
-    write_trainer,
-    write_yaml,
 )
 from tests.ledger_fixtures import materialize
 from tests.recovery_helpers import recover_run_cli
@@ -439,29 +446,32 @@ def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
     """Dry-run should preview one coherent chain without launching anything."""
 
     caplog.set_level(logging.INFO)
-    body = f"""
-experiment: dry
-storage: sqlite:///{tmp_path}/dry.db
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path}/runs
-trial_command: "false {{overrides}}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: {{ type: json_envelope, objective_name: loss, split: test, policy: test }}
-phases:
-  - name: a
-    n_trials: 5
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }} }}
-  - name: b
-    inherits: [a]
-    n_trials: 5
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ wd: {{ type: float, low: 0, high: 0.3 }} }}
-"""
-    exp = load_experiment(write_yaml(tmp_path, body))
+    exp = make_experiment(
+        experiment="dry",
+        persistent=tmp_path,
+        trial_command="false {overrides}",
+        metric=Metric(
+            name="loss",
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope", objective_name="loss", split="test", policy="test"
+            ),
+        ),
+        phases=[
+            Phase(
+                name="a",
+                n_trials=5,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-2, log=True)},
+            ),
+            Phase(
+                name="b",
+                inherits=["a"],
+                n_trials=5,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"wd": FloatParam(type="float", low=0, high=0.3)},
+            ),
+        ],
+    )
     monkeypatch.setattr(
         "phasesweep.engine.phase._suggest",
         lambda _trial, _name, param: param.low,
@@ -487,37 +497,15 @@ phases:
 @pytest.mark.integration
 def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     """``phasesweep status`` is read-only and reports study trial state counts."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        ap=argparse.ArgumentParser(); ap.add_argument('--out', required=True)
-        args,_=ap.parse_known_args(); open(args.out, 'w').write(json.dumps({'x': 1.0}))
-        print('x=1.0')
-        """,
+    experiment = make_experiment(
+        experiment="status_test",
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path, value=1.0),
+        n_trials=1,
     )
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: status_test
-        storage: sqlite:///{tmp_path}/status.db
-        provenance: {{revision: test-fixture-v1}}
-        workdir: {tmp_path}/runs
-        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-        """,
-    )
-    exp = load_experiment(p)
-    run_experiment(exp)
+    p = tmp_path / "exp.yaml"
+    p.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+    run_experiment(load_experiment(p))
 
     result = CliRunner().invoke(cli_main, ["status", str(p)])
     assert result.exit_code == 0

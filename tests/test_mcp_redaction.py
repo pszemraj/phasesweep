@@ -8,7 +8,9 @@ import asyncio
 from pathlib import Path
 
 import pytest
+import yaml
 
+from phasesweep.config import FloatParam, JsonEnvelopeExtractor, Metric
 from phasesweep.engine import PhaseWinnerView
 from phasesweep.engine.state import WinnerSource
 from phasesweep.mcp.redaction import intersect_visible_params, winners_payload
@@ -16,6 +18,7 @@ from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
+from tests.conftest import make_experiment
 from tests.mcp_helpers import (
     assert_no_sensitive,
     patch_popen_capture,
@@ -46,30 +49,31 @@ def _write_catalog(
     *,
     allow: dict[str, bool] | None = None,
 ) -> Path:
-    # A config whose dangerous fields contain unmistakable sentinels.
-    config = tmp_path / "exp.yaml"
-    config.write_text(
-        f"""\
-experiment: redact_me
-storage: sqlite:///{tmp_path}/SECRET_DB.db
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path}/SECRET_WORKDIR
-trial_command: "python /opt/secret/train.py --token DANGER_TOKEN --out {{trial_dir}}/r.json {{overrides}}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: r.json, objective_name: loss, split: test, policy: test }}
-env:
-  HF_TOKEN: SECRET_ENV_VALUE
-phases:
-  - name: p
-    n_trials: 1
-    sampler: {{ type: random, seed: 0 }}
-    search_space:
-      lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
-"""
+    # Dangerous fields carry unmistakable sentinels so a leak is unambiguous.
+    experiment = make_experiment(
+        experiment="redact_me",
+        workdir=tmp_path / "SECRET_WORKDIR",
+        storage=f"sqlite:///{tmp_path}/SECRET_DB.db",
+        trial_command=(
+            "python /opt/secret/train.py --token DANGER_TOKEN --out {trial_dir}/r.json {overrides}"
+        ),
+        metric=Metric(
+            name="loss",
+            goal="minimize",
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope",
+                path="r.json",
+                objective_name="loss",
+                split="test",
+                policy="test",
+            ),
+        ),
+        env={"HF_TOKEN": "SECRET_ENV_VALUE"},
+        n_trials=1,
+        search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
     )
+    config = tmp_path / "exp.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
     return write_mcp_catalog(tmp_path, {"redact_me": config}, allow=allow)
 
 
