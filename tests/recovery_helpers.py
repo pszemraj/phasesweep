@@ -1,4 +1,4 @@
-"""Durable state that stale-trial recovery acts on, built the way a crashed run leaves it."""
+"""Durable state that stale-trial recovery acts on, and the operator command that acts on it."""
 
 from __future__ import annotations
 
@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import NamedTuple
 
 import optuna
+from click.testing import CliRunner, Result
 
+from phasesweep.cli import cli as cli_main
 from phasesweep.config import Experiment, load_config
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
@@ -229,3 +231,9 @@ def load_only_recovery_needs(*, ownership_storage_unavailable: bool = False) -> 
         snapshot_unavailable=False,
         snapshot_finalize_needed=False,
     )
+
+
+def recover_run_cli(state_dir: Path | str, run_id: str, *, confirm: bool = False) -> Result:
+    """Return the outcome of ``phasesweep mcp recover-run`` run in-process as the operator types it."""
+    argv = ["mcp", "recover-run", "--state-dir", str(state_dir), "--run-id", run_id]
+    return CliRunner().invoke(cli_main, [*argv, "--confirm"] if confirm else argv)
