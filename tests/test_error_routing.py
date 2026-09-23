@@ -1375,6 +1375,14 @@ ORIGIN_CASES = (
         message="Restore it before retrying recovery.",
     ),
     RoutingCase(
+        id="recover_config_snapshot_unreadable",
+        trigger=_recover_with_config_snapshot(lambda path: path.chmod(0o000)),
+        raised=RunRecoveryError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Restore it or access to it before retrying recovery.",
+        marks=(requires_nonroot,),
+    ),
+    RoutingCase(
         # No mechanical remedy: the host cannot rule out PID reuse.
         id="recover_boot_id_unavailable",
         trigger=_recover_without_boot_id,
