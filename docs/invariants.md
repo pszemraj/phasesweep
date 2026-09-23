@@ -374,8 +374,8 @@ the only path that reads the durable evidence and decides. It opens studies
 only through `validate_ledger` and `open_existing_study`, so it validates the
 binding and the format before it opens anything (invariant 7).
 
-The cost is all of `src/phasesweep/mcp/recovery.py` (929 lines) plus the
-50-line `mcp_recover_run` command in `src/phasesweep/cli.py`.
+The cost is all of `src/phasesweep/mcp/recovery.py` plus the `mcp_recover_run`
+command in `src/phasesweep/cli.py`.
 
 ### Runner boot identity
 
@@ -386,10 +386,10 @@ settles the question in the safe direction. A differing boot id proves nothing
 from that boot survives, so cleanup is complete without sending a signal; an
 unknown boot id on either side refuses to signal at all.
 
-The cost is 148 lines of function spans in `src/phasesweep/mcp/runs.py`
-(`identity_from_earlier_boot` 21, `ProcessIdentity` 8, `cleanup_identity` 23,
-`RunStore.from_earlier_boot` 11, `_read_cleanup_identity` 71,
-`_valid_optional_boot_id` 14), plus 9 lines in `_persist_spawned_handle` in
+The cost is six definitions in `src/phasesweep/mcp/runs.py`
+(`identity_from_earlier_boot`, `ProcessIdentity`, `cleanup_identity`,
+`RunStore.from_earlier_boot`, `_read_cleanup_identity`,
+`_valid_optional_boot_id`), plus the lines in `_persist_spawned_handle` in
 `src/phasesweep/mcp/runner.py` that read the boot id, refuse to persist a
 handle without one, and record it. `mcp.runs` never constructs storage, so the
 ledger chokepoint does not touch it.
@@ -403,9 +403,8 @@ spawns a duplicate sweep against the same ledger. The handle is created before
 identity, and confirmed through a ready/ack handshake, so no child ever exists
 without a durable handle naming it.
 
-The cost is 268 lines of function spans in `src/phasesweep/mcp/server.py`:
-`PhaseSweepMCP._spawn` (179), `_terminate_failed_spawn` (66), and
-`_pending_handle` (23).
+The cost is three methods in `src/phasesweep/mcp/server.py`:
+`PhaseSweepMCP._spawn`, `_terminate_failed_spawn`, and `_pending_handle`.
 
 ### Rejected: removing any of the three
 
