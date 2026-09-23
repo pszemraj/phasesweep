@@ -75,6 +75,9 @@ _GUARDIAN_EXIT_TIMEOUT_SECONDS = (
 # real-world readiness lands in ~30ms. 10s stays generous headroom for a
 # loaded host, not a tight bound.
 _SUPERVISOR_READY_TIMEOUT_SECONDS = 10.0
+# poll() takes its timeout as a C int of milliseconds, about 24.8 days, and a
+# trial timeout may be longer.
+_POLL_MAX_MILLISECONDS = 2**31 - 1
 
 
 def _supervisor_script_path() -> str:
@@ -542,7 +545,9 @@ def fd_ready(fd: int, *, timeout: float, write: bool = False) -> bool:
     ``select.select`` refuses descriptors at or above ``FD_SETSIZE`` (1024 on
     Linux), which a process holding many open files reaches; ``poll`` has no
     such limit. A hang-up or error counts as ready, as it does for ``select``,
-    so the caller's read or write then reports the EOF or the error itself.
+    so the caller's read or write then reports the EOF or the error itself. A
+    wait longer than one ``poll`` call accepts continues in further calls
+    against the same deadline.
 
     :param int fd: Open file descriptor to wait on.
     :param float timeout: Longest wait in seconds; zero or less checks once.
@@ -550,12 +555,20 @@ def fd_ready(fd: int, *, timeout: float, write: bool = False) -> bool:
     :return bool: Whether ``fd`` became ready within ``timeout``.
     :raises OSError: If ``fd`` is not an open descriptor.
     """
+    import time
+
+    deadline = time.monotonic() + timeout
     poller = select.poll()
     poller.register(fd, select.POLLOUT if write else select.POLLIN)
-    events = poller.poll(max(0, math.ceil(timeout * 1000)))
-    if any(mask & select.POLLNVAL for _, mask in events):
-        raise OSError(errno.EBADF, os.strerror(errno.EBADF))
-    return bool(events)
+    while True:
+        remaining_ms = max(0, math.ceil((deadline - time.monotonic()) * 1000))
+        events = poller.poll(min(remaining_ms, _POLL_MAX_MILLISECONDS))
+        if events:
+            if any(mask & select.POLLNVAL for _, mask in events):
+                raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+            return True
+        if time.monotonic() >= deadline:
+            return False
 
 
 def _write_all(

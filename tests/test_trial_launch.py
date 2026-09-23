@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import resource
+import select
 import shlex
 import stat
 from pathlib import Path
@@ -638,7 +639,8 @@ def test_launch_pipe_waits_accept_descriptors_past_select_limit() -> None:
         assert not fd_ready(high_read, timeout=0)
         assert fd_ready(high_write, timeout=0, write=True)
         os.write(high_write, b"x")
-        assert fd_ready(high_read, timeout=1)
+        # A 30-day trial timeout is longer than one poll() call accepts.
+        assert fd_ready(high_read, timeout=30 * 86400)
         assert os.read(high_read, 1) == b"x"
         os.close(high_write)
         # A hang-up is ready, so the caller's read sees EOF itself.
@@ -650,3 +652,21 @@ def test_launch_pipe_waits_accept_descriptors_past_select_limit() -> None:
             os.close(high_write)
     with pytest.raises(OSError):
         fd_ready(high_read, timeout=0)
+
+
+def test_launch_pipe_wait_outlasts_one_poll_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wait past poll()'s millisecond limit keeps waiting instead of timing out."""
+    waits: list[int] = []
+
+    class _Poller:
+        def register(self, fd: int, events: int) -> None:
+            pass
+
+        def poll(self, timeout_ms: int) -> list[tuple[int, int]]:
+            waits.append(timeout_ms)
+            return [(7, select.POLLIN)] if len(waits) == 2 else []
+
+    monkeypatch.setattr(select, "poll", _Poller)
+    assert fd_ready(7, timeout=30 * 86400)
+    assert len(waits) == 2
+    assert max(waits) <= 2**31 - 1
