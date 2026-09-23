@@ -222,7 +222,9 @@ def recover_run(
     except RunRecoveryError:
         raise
     except RuntimeError as exc:
-        raise RunRecoveryError(str(exc)) from None
+        # The chain is suppressed but the remedy is not: a lock held elsewhere
+        # or a damaged publication keeps the action its own raise site chose.
+        raise RunRecoveryError.rewrap(exc, str(exc)) from None
 
 
 def _recover_pre_spawn_orphan(
@@ -528,6 +530,8 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
         be read.
     :return dict[str, optuna.Study]: Loadable phase studies keyed by phase name.
     """
+    # A storage refusal gains a recover-run retry here, but that retry cannot
+    # succeed until the ledger is back, so these wraps route to restoring it.
     unavailable_remedy = (
         " Restore the original complete storage ledger and access "
         "to it, then retry phasesweep mcp recover-run."
@@ -537,13 +541,17 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
     except (ArtifactRootConflictError, StudySchemaMismatchError) as exc:
         raise RunRecoveryError.rewrap(exc, str(exc)) from exc
     except StudyStorageUnavailableError as exc:
-        raise RunRecoveryError(f"{exc}{unavailable_remedy}") from exc
+        raise RunRecoveryError(
+            f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
+        ) from exc
     loaded_studies = {}
     for phase in config.phases:
         try:
             study = open_existing_study(ledger, phase)
         except StudyStorageUnavailableError as exc:
-            raise RunRecoveryError(f"{exc}{unavailable_remedy}") from exc
+            raise RunRecoveryError(
+                f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
+            ) from exc
         if study is not None:
             try:
                 _check_study_artifact_root(study, config)
@@ -565,7 +573,8 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
             raise RunRecoveryError(
                 f"{exc} Restore the original complete storage ledger "
                 "and study with access to it, then retry "
-                "phasesweep mcp recover-run."
+                "phasesweep mcp recover-run.",
+                action=OperatorAction.RESTORE_LEDGER,
             ) from exc
     return loaded_studies
 

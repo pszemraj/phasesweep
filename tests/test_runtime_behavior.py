@@ -76,6 +76,7 @@ from phasesweep.engine.trial import (
     TrialExecutionError,
     extract_trial_result,
 )
+from phasesweep.errors import OperatorAction
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime import process as runtime_process
 from phasesweep.runtime.process import (
@@ -1603,8 +1604,11 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: cleanup_safe["value"],
     )
-    with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
+    with pytest.raises(
+        ProcessCleanupUncertainError, match="cleanup could not be confirmed"
+    ) as excinfo:
         run_experiment(_exp(2))
+    assert excinfo.value.action is OperatorAction.RUN_RECOVER_RUN
 
     study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
     record = study.user_attrs[PHASE_ABORT_ATTR]

@@ -74,6 +74,7 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    OperatorAction,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -521,7 +522,8 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
             "The selected local storage ledger contains pre-cutover or unsupported "
             f"PhaseSweep study state: {detail}. Use a fresh local storage ledger and "
             "artifact root with this PhaseSweep release, or use the preserved PhaseSweep "
-            "0.3.1 environment to operate the existing state. Nothing was written."
+            "0.3.1 environment to operate the existing state. Nothing was written.",
+            action=OperatorAction.USE_PRIOR_RELEASE,
         )
 
 
@@ -1065,8 +1067,8 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
         try:
             study = open_existing_study(ledger, phase)
         except Exception as exc:
-            unavailable = StudyStorageUnavailableError(
-                f"Could not inspect persistent study storage for phase {phase.name!r}."
+            unavailable = StudyStorageUnavailableError.rewrap(
+                exc, f"Could not inspect persistent study storage for phase {phase.name!r}."
             )
             raise unavailable from exc
         if study is not None:

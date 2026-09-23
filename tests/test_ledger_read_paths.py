@@ -310,7 +310,7 @@ def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_p
     re-explain the failure. So the original refusal text has to survive intact,
     and the remediation has to survive with it: ``rewrap`` carries the cause's
     ``action`` across the layer boundary so a routing caller still learns that
-    the fix is a fresh namespace, not "run recover-run again".
+    the fix is the preserved prior release, not "run recover-run again".
     """
     materialized = materialize(fixture_name, tmp_path, mode="tree")
     needs = _RecoveryNeeds(
@@ -331,7 +331,7 @@ def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_p
     assert _SCHEMA_MISMATCH_PHRASE in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, StudySchemaMismatchError)
     assert str(excinfo.value) == str(excinfo.value.__cause__)
-    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE
+    assert excinfo.value.action is OperatorAction.USE_PRIOR_RELEASE
     assert materialized.unchanged(), materialized.changes()
 
 

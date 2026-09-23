@@ -182,25 +182,32 @@ def _preflight_existing_studies(
         message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
             str(error) for error in errors
         )
+        # A typed aggregate carries the action of the error it is chained from,
+        # so several refusals of one kind route exactly as a single one would.
         if all(isinstance(error, StudySchemaMismatchError) for error in errors):
-            raise StudySchemaMismatchError(message) from first
+            raise StudySchemaMismatchError.rewrap(first, message) from first
         if all(isinstance(error, StudyFingerprintMismatchError) for error in errors):
-            raise StudyFingerprintMismatchError(message) from first
+            raise StudyFingerprintMismatchError.rewrap(first, message) from first
         if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
-            raise StudyStorageUnavailableError(message) from first
+            raise StudyStorageUnavailableError.rewrap(first, message) from first
         if all(isinstance(error, TrialTargetRegressionError) for error in errors):
-            raise TrialTargetRegressionError(message) from first
+            raise TrialTargetRegressionError.rewrap(first, message) from first
         cleanup_error = next(
             (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
             None,
         )
         if cleanup_error is not None:
-            raise ProcessCleanupUncertainError(message) from cleanup_error
+            raise ProcessCleanupUncertainError.rewrap(cleanup_error, message) from cleanup_error
         unexpected = next(
             (error for error in errors if not isinstance(error, PhaseSweepError)),
             None,
         )
         if unexpected is not None:
             raise RuntimeError(message) from unexpected
-        raise PhaseSweepError(message) from first
+        # No single error speaks for a mixed aggregate: it routes to an action
+        # only when every collected error names the same one, and otherwise
+        # falls back to the base default of reading the refusals it lists.
+        actions = {error.action for error in errors if isinstance(error, PhaseSweepError)}
+        shared = actions.pop() if len(actions) == 1 else None
+        raise PhaseSweepError(message, action=shared) from first
     return studies

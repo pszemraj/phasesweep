@@ -26,7 +26,7 @@ from phasesweep.config import Config, Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import _metric_scoring_line, _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
-from phasesweep.engine.errors import StudyStorageUnavailableError
+from phasesweep.engine.errors import OperatorAction, StudyStorageUnavailableError
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
@@ -369,12 +369,14 @@ def _run_experiment_outcome(
             # The ledger may contain attempts from an earlier orchestrator. A
             # failed ownership read cannot prove those processes are resolved,
             # even though this invocation has not claimed a generation or
-            # launched anything of its own.
+            # launched anything of its own. Recovery cannot read the ledger
+            # either, so restoring it is the first step the message names.
             raise ProcessCleanupUncertainError(
                 "Artifact ownership could not be checked because required persistent "
                 f"study state is unavailable: {exc} Cleanup state is therefore unknown. "
                 "Restore the original complete storage ledger and access to it before "
-                "retrying. For an MCP run, then run phasesweep mcp recover-run."
+                "retrying. For an MCP run, then run phasesweep mcp recover-run.",
+                action=OperatorAction.RESTORE_LEDGER,
             ) from exc
         _preflight_missing_reached_phase_environments(
             experiment,
@@ -546,9 +548,11 @@ def _run_experiment_outcome(
                 and control_error is None
             ):
                 # Cleanup uncertainty intentionally becomes the actionable error;
-                # the original failure remains chained for diagnosis but is unsafe to handle alone.
+                # the original failure remains chained for diagnosis but is unsafe to handle alone,
+                # so its action is replaced too: recovery has to settle cleanup before its remedy.
                 raise ProcessCleanupUncertainError(
-                    "The run failed and subsequent process cleanup could not be confirmed."
+                    "The run failed and subsequent process cleanup could not be confirmed.",
+                    action=OperatorAction.RUN_RECOVER_RUN,
                 ) from primary_error
             if control_error is not None:
                 raise control_error from exc

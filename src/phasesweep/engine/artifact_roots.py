@@ -14,6 +14,7 @@ import optuna
 from phasesweep.config import Experiment
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    OperatorAction,
     PublicationAccessError,
     PublicationIntegrityError,
     PublishedStudyMissingError,
@@ -185,7 +186,8 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         return None
     except OSError as exc:
         raise ArtifactRootConflictError(
-            f"Cannot inspect artifact root {_artifact_root_identity(experiment)!r}: {exc}."
+            f"Cannot inspect artifact root {_artifact_root_identity(experiment)!r}: {exc}.",
+            action=OperatorAction.RESTORE_TREE,
         ) from exc
 
 
@@ -222,26 +224,30 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
                 f"PhaseSweep state entry {durable_entry!r} but no supported format marker. "
                 "Use a fresh artifact root and fresh local storage with this PhaseSweep "
                 "release, or use the preserved PhaseSweep 0.3.1 environment to operate "
-                "the existing state. Nothing was written."
+                "the existing state. Nothing was written.",
+                action=OperatorAction.USE_PRIOR_RELEASE,
             ) from None
         return "unbound"
     except PermissionError as exc:
         raise ArtifactRootConflictError(
             f"Artifact-root binding {path} cannot be validated as the current user "
             "(permission denied). Use the user that owns this artifact tree or restore "
-            "read permission before using this artifact root."
+            "read permission before using this artifact root.",
+            action=OperatorAction.RESTORE_TREE,
         ) from exc
     except (OSError, ValueError) as exc:
         raise ArtifactRootConflictError(
             f"Artifact-root binding {path} is unreadable or malformed: {exc}. Refusing "
-            "to combine this tree with an unverified storage ledger."
+            "to combine this tree with an unverified storage ledger.",
+            action=OperatorAction.RESTORE_TREE,
         ) from exc
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} uses unsupported pre-cutover "
             f"PhaseSweep format {raw.get('schema_version')!r}. Use a fresh artifact root "
             "and fresh local storage with this PhaseSweep release, or use the preserved "
-            "PhaseSweep 0.3.1 environment to operate the existing state. Nothing was written."
+            "PhaseSweep 0.3.1 environment to operate the existing state. Nothing was written.",
+            action=OperatorAction.USE_PRIOR_RELEASE,
         )
     if raw != expected:
         backend_conflict = _auto_storage_backend_conflict(experiment, raw)
@@ -275,7 +281,8 @@ def _write_artifact_root_binding(experiment: Experiment) -> None:
     except OSError as exc:
         raise ArtifactRootConflictError(
             f"Could not bind fresh artifact root {expected['artifact_root']!r} to "
-            f"its storage ledger: {exc}. No trial ran and nothing was published."
+            f"its storage ledger: {exc}. No trial ran and nothing was published.",
+            action=OperatorAction.RESTORE_TREE,
         ) from exc
 
 
@@ -313,7 +320,8 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
                 f"Study {study.study_name!r} holds {trial_count} trial(s) but records no "
                 "artifact root and is pre-cutover state. Use a fresh artifact root and "
                 "local storage with this release, or use the preserved PhaseSweep 0.3.1 "
-                "environment to operate the existing state. Nothing was written."
+                "environment to operate the existing state. Nothing was written.",
+                action=OperatorAction.USE_PRIOR_RELEASE,
             )
         return True
     _check_study_artifact_root(study, experiment)
@@ -427,9 +435,10 @@ def _check_published_phase_studies(
                             missing += f", {expected.completed_trials} complete"
                         missing += ")"
             except Exception as exc:
-                raise StudyStorageUnavailableError(
+                raise StudyStorageUnavailableError.rewrap(
+                    exc,
                     "Could not inspect persistent study storage for published phase "
-                    f"{phase_name!r}."
+                    f"{phase_name!r}.",
                 ) from exc
             if not matched:
                 if not trials:
