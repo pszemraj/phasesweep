@@ -39,6 +39,7 @@ from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
     ExperimentLockBusyError,
+    OperatorAction,
     PublishedStudyMissingError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
@@ -238,6 +239,8 @@ def _base_failure_payload(
             ),
         }
     if isinstance(error, ProcessCleanupUncertainError):
+        # Whether the ledger must come back before recover-run is the raise
+        # site's decision, carried as its action; the chained cause is history.
         return {
             "code": "cleanup_uncertain",
             "stage": "cleanup",
@@ -246,7 +249,7 @@ def _base_failure_payload(
             "remediation": (
                 "Ask the operator to restore the original complete storage ledger and "
                 "access to it, then run phasesweep mcp recover-run before another launch."
-                if isinstance(error.__cause__, StudyStorageUnavailableError)
+                if error.action is OperatorAction.RESTORE_LEDGER
                 else "Ask the operator to run phasesweep mcp recover-run before another launch."
             ),
         }

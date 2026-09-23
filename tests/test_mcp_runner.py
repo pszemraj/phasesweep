@@ -1581,6 +1581,56 @@ def test_cleanup_uncertainty_outer_failure_controls_a_cancelled_cause() -> None:
     assert failure["cause"]["retryable"] is True
 
 
+_RESTORE_LEDGER_FIRST = (
+    "Ask the operator to restore the original complete storage ledger and access to it, "
+    "then run phasesweep mcp recover-run before another launch."
+)
+_RECOVER_RUN_ONLY = "Ask the operator to run phasesweep mcp recover-run before another launch."
+
+
+@pytest.mark.parametrize(
+    ("action", "cause", "remediation"),
+    [
+        pytest.param(
+            OperatorAction.RESTORE_LEDGER,
+            StudyStorageUnavailableError("ledger unreadable"),
+            _RESTORE_LEDGER_FIRST,
+            id="restore-ledger-storage-cause",
+        ),
+        pytest.param(
+            OperatorAction.RESTORE_LEDGER,
+            OSError("ledger unreadable"),
+            _RESTORE_LEDGER_FIRST,
+            id="restore-ledger-other-cause",
+        ),
+        pytest.param(
+            None,
+            StudyStorageUnavailableError("ledger unreadable"),
+            _RECOVER_RUN_ONLY,
+            id="default-storage-cause",
+        ),
+        pytest.param(None, None, _RECOVER_RUN_ONLY, id="default-no-cause"),
+    ],
+)
+def test_cleanup_uncertain_remediation_follows_the_operator_action(
+    action: OperatorAction | None,
+    cause: BaseException | None,
+    remediation: str,
+) -> None:
+    """The raise site's action picks the remedy; the chained cause's type does not."""
+    error = ProcessCleanupUncertainError("cleanup could not be proven", action=action)
+    error.__cause__ = cause
+
+    failure = mcp_runner._terminal_failure_payload(
+        error, stage="preflight", cleanup_confirmed=False
+    )
+
+    assert failure["code"] == "cleanup_uncertain"
+    assert failure["remediation"] == remediation
+    # The durable payload schema is unchanged: the action routes, it is not stored.
+    assert "action" not in failure
+
+
 def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
