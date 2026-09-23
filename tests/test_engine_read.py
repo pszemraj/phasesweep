@@ -21,7 +21,6 @@ from phasesweep.config import (
     JsonExtractor,
     LogRegexExtractor,
     Metric,
-    Phase,
     Sampler,
     WandbExtractor,
 )
@@ -32,8 +31,8 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
-from tests.conftest import make_experiment, mark_current_format, write_trainer
-from tests.ledger_fixtures import tree_snapshot
+from tests.conftest import make_experiment, mark_current_format
+from tests.ledger_fixtures import materialize, tree_snapshot
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -648,79 +647,46 @@ def test_objective_evidence_assurance_attempt_triple_by_kind(
 # --------------------------------------------------------------------------
 # Published results are rendered under their own historical semantics, never
 # reinterpreted through whatever config is loaded today (review v0.5.16 /
-# blocker 4).
+# blocker 4). The golden fixture publishes phase ``p`` under the metric
+# ``objective`` (minimize); each test edits the config that reads it.
 # --------------------------------------------------------------------------
 
-_DRIFT_TRAINER = """
-import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument("--out")
-parser.add_argument("--x", type=int, default=0)
-args, _ = parser.parse_known_args()
-print(f"x={args.x}")
-"""
+
+def _published(tmp_path: Path) -> Experiment:
+    """Return the config that reads the golden fixture's published tree."""
+    return materialize("current-sqlite", tmp_path, mode="tree").experiment
 
 
-def _drift_experiment(tmp_path: Path, **overrides: object) -> Experiment:
-    trainer = write_trainer(tmp_path / "trainer.py", _DRIFT_TRAINER)
-    defaults: dict[str, object] = dict(
-        experiment="drift_t",
-        workdir=tmp_path / "wd",
-        storage=f"sqlite:///{tmp_path / 'drift.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            name="x",
-            goal="minimize",
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
-        ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                comment="original hypothesis",
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
-    )
-    defaults.update(overrides)
-    return make_experiment(**defaults)  # type: ignore[arg-type]
+def _edited(experiment: Experiment, metric: Metric | None = None, **phase: object) -> Experiment:
+    """Return ``experiment`` with its one phase, and optionally its metric, edited."""
+    update: dict[str, object] = {"phases": [experiment.phases[0].model_copy(update=phase)]}
+    if metric is not None:
+        update["metric"] = metric
+    return experiment.model_copy(update=update)
 
 
-@pytest.mark.integration
 def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -> None:
-    """Review v0.5.16 / blocker 4 reproduction: publish x/minimize, reload as y/maximize.
+    """Review v0.5.16 / blocker 4 reproduction: publish objective/minimize, reload as y/maximize.
 
     Pre-fix, status labeled the official generation with the *current*
     metric name and inverted goal, and winner parsing silently dropped the
     actual winner because the current metric key was absent from the
     historical file.
     """
-    published = _drift_experiment(tmp_path)
-    run_experiment(published)
-
-    drifted = _drift_experiment(
-        tmp_path,
-        metric=Metric(
+    drifted = _edited(
+        _published(tmp_path),
+        Metric(
             name="y",
             goal="maximize",
             extractor=LogRegexExtractor(type="log_regex", pattern=r"y=(?P<value>[0-9.eE+-]+)"),
         ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                comment="new hypothesis",
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=100, high=110)},
-            )
-        ],
+        comment="new hypothesis",
+        search_space={"a": IntParam(type="int", low=100, high=110)},
     )
 
     status = read_status(drifted)
     assert status["is_published"] is True
-    assert status["metric"]["name"] == "x"
+    assert status["metric"]["name"] == "objective"
     assert status["metric"]["goal"] == "minimize"
     assert status["result_context"] == "represented_generation"
     assert status["published_config_matches_current"] is False
@@ -728,45 +694,31 @@ def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -
 
     winners = read_winners(drifted)
     assert len(winners) == 1
-    assert winners[0].metric_name == "x"
+    assert winners[0].metric_name == "objective"
     assert winners[0].metric_goal == "minimize"
 
 
-@pytest.mark.integration
 def test_run_control_edits_keep_published_config_current(tmp_path: Path) -> None:
     """A top-up or comment edit is not semantic drift for a published result."""
-    published = _drift_experiment(tmp_path)
-    run_experiment(published)
-
-    topped_up = _drift_experiment(
-        tmp_path,
-        phases=[
-            Phase(
-                name="p",
-                n_trials=2,
-                comment="reworded documentation",
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
+    published = _published(tmp_path)
+    topped_up = _edited(
+        published, n_trials=published.phases[0].n_trials + 1, comment="reworded documentation"
     )
 
     status = read_status(topped_up)
     assert status["published_config_matches_current"] is True
-    assert status["metric"]["name"] == "x"
+    assert status["metric"]["name"] == "objective"
 
 
 def test_read_status_without_any_publication_uses_current_config(tmp_path: Path) -> None:
     """With nothing published there is no historical context to render."""
-    experiment = _drift_experiment(tmp_path)
-    status = read_status(experiment)
+    status = read_status(_experiment(tmp_path))
     assert status["result_context"] == "current_config"
     assert status["published_config_matches_current"] is None
     assert status["result_phase_plan"] == ["p"]
-    assert status["metric"]["name"] == "x"
+    assert status["metric"]["name"] == "loss"
 
 
-@pytest.mark.integration
 def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path) -> None:
     """A phase renamed after publication must not hide the published winner.
 
@@ -775,21 +727,7 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
     plan the publication actually used, so a reader can enumerate it instead
     of concluding the publication is empty (review v0.5.16 / blocker 4).
     """
-    published = _drift_experiment(tmp_path)
-    run_experiment(published)
-
-    renamed = _drift_experiment(
-        tmp_path,
-        phases=[
-            Phase(
-                name="q",
-                n_trials=1,
-                comment="renamed phase",
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
-    )
+    renamed = _edited(_published(tmp_path), name="q", comment="renamed phase")
 
     status = read_status(renamed)
     assert status["is_published"] is True
@@ -809,17 +747,15 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
         phase_names=status["result_phase_plan"],
     )
     assert winner.phase == "p"
-    assert (winner.metric_name, winner.metric_goal) == ("x", "minimize")
+    assert (winner.metric_name, winner.metric_goal) == ("objective", "minimize")
 
 
-@pytest.mark.integration
 def test_read_status_reuses_the_pointer_authenticated_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A status snapshot never reopens summary bytes after authenticating its pointer."""
-    experiment = _drift_experiment(tmp_path)
-    run_experiment(experiment)
+    experiment = _published(tmp_path)
     publication = _resolve_publication_pointer(experiment)
     assert publication.state == "ok"
     generation_id = publication.generation_id
@@ -837,7 +773,7 @@ def test_read_status_reuses_the_pointer_authenticated_summary(
     status = read_status(experiment)
     assert status["publication_integrity"] == "ok"
     assert status["result_phase_plan"] == ["p"]
-    assert status["metric"]["name"] == "x"
+    assert status["metric"]["name"] == "objective"
     assert _resolve_publication_pointer(experiment).state == "failed"
 
 
