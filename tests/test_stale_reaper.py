@@ -326,24 +326,12 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
     try:
         starttime = read_proc_starttime(stale.pid)
         assert starttime is not None
-        study = optuna.create_study(
-            study_name="cross_phase_orphan::b", storage=storage, direction="minimize"
+        # The env names the orphan before the trial is fabricated, so its
+        # recorded trainer-env identity matches the run that must reap it.
+        experiment = experiment.model_copy(update={"env": {"STALE_PID": str(stale.pid)}})
+        study, trial_dir, stale_number = fabricate_stale_trial(
+            experiment, "b", attempt_id="old-attempt"
         )
-        mark_current_format(experiment, study)
-        stamp_artifact_root(study, experiment)
-        study.set_user_attr(TRIAL_TARGET_ATTR, experiment.phases[1].n_trials)
-        trial = study.ask()
-        trial_dir = _trial_dir_for(
-            experiment,
-            "b",
-            trial.number,
-            generation_id="old-generation",
-            attempt_id="old-attempt",
-        )
-        trial_dir.mkdir(parents=True)
-        trial.set_user_attr(GENERATION_ID_ATTR, "old-generation")
-        trial.set_user_attr(ATTEMPT_ID_ATTR, "old-attempt")
-        trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
         write_trial_identity(
             trial_dir,
             attempt_id="old-attempt",
@@ -351,15 +339,10 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
             pgid=os.getpgid(stale.pid),
             starttime=starttime,
         )
-
-        experiment = experiment.model_copy(update={"env": {"STALE_PID": str(stale.pid)}})
         study.set_user_attr(
             PHASE_FINGERPRINT_ATTR,
             _phase_fingerprint(experiment, experiment.phases[1], {}),
         )
-        identity = _environment_identity(experiment, "b")
-        trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
-        trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
         run_experiment(experiment)
 
         marker = next(
@@ -367,7 +350,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         )
         assert marker.read_text() == "False"
         assert stale.poll() == -signal.SIGTERM
-        assert study.get_trials(deepcopy=False)[trial.number].state == optuna.trial.TrialState.FAIL
+        assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
     finally:
         if stale.poll() is None:
             os.killpg(stale.pid, signal.SIGKILL)
