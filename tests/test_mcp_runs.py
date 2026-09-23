@@ -25,6 +25,7 @@ from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
+from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import make_run_handle, write_run_status
 
 
@@ -38,23 +39,6 @@ def _earlier_boot_id() -> str:
         pytest.skip("boot id unavailable on this platform")
     other = "00000000-0000-0000-0000-000000000000"
     return other if other != current else "11111111-1111-1111-1111-111111111111"
-
-
-def _state_tree_snapshot(state_dir: Path) -> dict[Path, tuple[int, bytes | None]]:
-    """Capture durable state entries so refusal tests can prove no mutation.
-
-    :param Path state_dir: MCP state root to snapshot.
-    :return dict[Path, tuple[int, bytes | None]]: Relative path, mode, and file bytes.
-    """
-    snapshot: dict[Path, tuple[int, bytes | None]] = {}
-    for path in (state_dir, *sorted(state_dir.rglob("*"))):
-        info = path.lstat()
-        mode = stat.S_IMODE(info.st_mode)
-        snapshot[path.relative_to(state_dir)] = (
-            mode,
-            path.read_bytes() if stat.S_ISREG(info.st_mode) else None,
-        )
-    return snapshot
 
 
 def test_create_get_roundtrip(tmp_path: Path) -> None:
@@ -469,12 +453,12 @@ def test_run_store_rejects_invalid_format_marker_without_mutation(
     RunStore(state_dir)
     marker = state_dir / ".phasesweep-format.json"
     private_atomic_write_text(marker, marker_text)
-    before = _state_tree_snapshot(state_dir)
+    before = tree_snapshot(state_dir)
 
     with pytest.raises(ValueError, match=match):
         RunStore(state_dir)
 
-    assert _state_tree_snapshot(state_dir) == before
+    assert tree_snapshot(state_dir) == before
 
 
 @pytest.mark.parametrize("evidence_kind", ["handle", "status", "log", "lease", "audit"])
@@ -498,7 +482,7 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
         private_atomic_write_text(state_dir / "audit.jsonl", '{"tool":"launch_run"}\n')
     marker = state_dir / ".phasesweep-format.json"
     marker.unlink()
-    before = _state_tree_snapshot(state_dir)
+    before = tree_snapshot(state_dir)
     initialized: list[Path] = []
 
     def fail_if_initialized(path: Path) -> None:
@@ -511,7 +495,7 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
         RunStore(state_dir)
 
     assert initialized == []
-    assert _state_tree_snapshot(state_dir) == before
+    assert tree_snapshot(state_dir) == before
 
 
 def test_open_existing_requires_supported_format_marker_without_mutation(tmp_path: Path) -> None:
@@ -520,26 +504,26 @@ def test_open_existing_requires_supported_format_marker_without_mutation(tmp_pat
     store = RunStore(state_dir)
     marker = state_dir / ".phasesweep-format.json"
     marker.unlink()
-    before = _state_tree_snapshot(state_dir)
+    before = tree_snapshot(state_dir)
 
     with pytest.raises(ValueError, match="no format marker and no run handles") as wrong:
         RunStore.open_existing(state_dir)
     assert not isinstance(wrong.value, mcp_runs.UnsupportedStateFormatError)
-    assert _state_tree_snapshot(state_dir) == before
+    assert tree_snapshot(state_dir) == before
 
     private_atomic_write_text(
         marker, json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION})
     )
     store.create(make_run_handle(run_id="exp-1"))
     marker.unlink()
-    before = _state_tree_snapshot(state_dir)
+    before = tree_snapshot(state_dir)
 
     with pytest.raises(
         mcp_runs.UnsupportedStateFormatError,
         match="no format marker.*fresh MCP state directory.*0.3.1",
     ):
         RunStore.open_existing(state_dir)
-    assert _state_tree_snapshot(state_dir) == before
+    assert tree_snapshot(state_dir) == before
 
 
 def _logs_deleted(tmp_path: Path) -> Path:
