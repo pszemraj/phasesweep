@@ -43,9 +43,11 @@ from phasesweep.evidence.models import (
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     local_storage_url,
+    sqlalchemy_sqlite_path,
     sqlite_database_path,
     storage_backend,
     storage_is_in_memory,
+    storage_url_query_keys,
 )
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
@@ -597,23 +599,32 @@ class Experiment(_Frozen):
         """Allow only in-memory, local SQLite, local Journal, and auto storage.
 
         :param str | None value: Configured Optuna storage locator.
-        :raises ValueError: The locator selects an unsupported storage backend.
+        :raises ValueError: The locator selects an unsupported storage backend,
+            or a SQLite URL names a different database to PhaseSweep than to
+            the SQLAlchemy engine Optuna opens it through.
         :return str | None: The validated locator, unchanged.
         """
-        if value == "auto" or storage_is_in_memory(value):
-            return value
         backend = storage_backend(value)
+        if (
+            value is None
+            or value == "auto"
+            or (storage_is_in_memory(value) and backend != "sqlite")
+        ):
+            return value
         if backend not in {"sqlite", "journal"}:
             raise ValueError(
                 "storage must be in-memory, sqlite:///, journal:///, or auto; "
                 f"got backend {backend!r}."
             )
-        # A URI filename naming another host resolves to no file here; SQLite
-        # refuses to open it only after a run has bound the tree to it.
-        if backend == "sqlite" and value is not None and sqlite_database_path(value) is None:
-            raise ValueError(
-                f"SQLite storage must name a local database file; {value!r} names a remote host."
-            )
+        if backend == "sqlite":
+            # A URI filename naming another host resolves to no file here; SQLite
+            # refuses to open it only after a run has bound the tree to it.
+            if not storage_is_in_memory(value) and sqlite_database_path(value) is None:
+                raise ValueError(
+                    f"SQLite storage must name a local database file; {value!r} names a "
+                    "remote host."
+                )
+            _require_one_sqlite_database(value)
         canonical_storage_identity(value)
         return value
 
@@ -781,6 +792,52 @@ class Experiment(_Frozen):
         if len(names) != 1 + len(self.constraints):
             raise ValueError("Metric and constraint names must all be distinct.")
         return self
+
+
+def _require_one_sqlite_database(storage: str) -> None:
+    """Refuse a SQLite URL whose database PhaseSweep and SQLAlchemy read differently.
+
+    PhaseSweep maps the URL to a file itself for its read-only scans, probes,
+    storage identity, and locks, while Optuna opens it through SQLAlchemy's
+    SQLite dialect. Wherever the two parsers disagree, every check guards one
+    file while trials are written to another, so only URLs that name the same
+    database to both, compared as resolved absolute paths, are accepted. A
+    repeated option and a SQLite ``vfs`` are refused outright: SQLAlchemy
+    turns the first into a tuple, and the second can keep the ledger out of
+    the file every check reads.
+
+    :param str storage: SQLite storage URL that already names a local file or memory.
+    :raises ValueError: The URL repeats an option, selects a VFS, cannot be
+        parsed by SQLAlchemy, or names a different database to each parser.
+    """
+    keys = [key.lower() for key in storage_url_query_keys(storage)]
+    repeated = sorted({key for key in keys if keys.count(key) > 1})
+    if repeated:
+        raise ValueError(
+            f"SQLite storage must set each URL option once; {storage!r} repeats "
+            f"{', '.join(repeated)}."
+        )
+    if "vfs" in keys:
+        raise ValueError(
+            f"SQLite storage must use SQLite's default file access; {storage!r} selects a vfs."
+        )
+    try:
+        opened = sqlalchemy_sqlite_path(storage)
+    except ValueError as exc:
+        raise ValueError(
+            f"SQLite storage must be a URL SQLAlchemy can open; {storage!r} is not: {exc}"
+        ) from exc
+    checked = sqlite_database_path(storage)
+    targets = [
+        "an in-memory database" if path is None else str(path.resolve())
+        for path in (checked, opened)
+    ]
+    if targets[0] != targets[1]:
+        raise ValueError(
+            f"SQLite storage must name one database file to PhaseSweep and to SQLAlchemy; "
+            f"{storage!r} names {targets[0]} to PhaseSweep but {targets[1]} to SQLAlchemy, "
+            "which Optuna opens it through."
+        )
 
 
 def _validate_storage_policy(storage: str | None, phase: Phase) -> None:

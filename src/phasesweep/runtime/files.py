@@ -1240,6 +1240,15 @@ def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
     return parse_qsl(query, keep_blank_values=True)
 
 
+def storage_url_query_keys(storage: str) -> list[str]:
+    """Return a storage URL's query keys as spelled, repeats included, in order.
+
+    :param str storage: Storage URL whose query string should be inspected.
+    :return list[str]: Every query key, unchanged.
+    """
+    return [key for key, _value in _url_query_pairs(storage)]
+
+
 def storage_url_query_options(storage: str) -> dict[str, str]:
     """Return lower-cased URL query options for storage policy checks.
 
@@ -1342,6 +1351,44 @@ def sqlite_database_path(storage: str) -> Path | None:
         uri_path = sqlite_uri_filename_path(storage)
         return Path(uri_path) if uri_path is not None else None
     return Path(database)
+
+
+def sqlalchemy_sqlite_path(storage: str) -> Path | None:
+    """Return the database file Optuna's SQLAlchemy engine opens for a SQLite URL.
+
+    Optuna hands a SQLite URL to SQLAlchemy, so SQLAlchemy's reading of it,
+    not :func:`sqlite_database_path`'s, decides which file holds the ledger.
+    This runs the same URL parsing and ``create_connect_args`` the engine
+    runs, then applies SQLite's rule to the filename that produces: it is a
+    ``file:`` URI only when the connect arguments enable URIs and it starts
+    with ``file:``, and otherwise a plain filename.
+
+    :param str storage: SQLite storage URL.
+    :return Path | None: Absolute database path, or ``None`` when SQLite opens
+        an in-memory or temporary database instead of a file.
+    :raises ValueError: SQLAlchemy cannot parse the URL or build its connect
+        arguments, or the URI filename names another host.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        url = make_url(storage)
+        arguments, options = url.get_dialect()().create_connect_args(url)
+    except (SQLAlchemyError, TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    database = str(arguments[0])
+    if not options.get("uri"):
+        return None if database == ":memory:" else Path(database).absolute()
+    if not database.startswith("file:"):
+        return None if database in {"", ":memory:"} else Path(database).absolute()
+    parsed = urlsplit(database)
+    if parsed.netloc not in {"", "localhost"}:
+        raise ValueError(f"the URI filename names host {parsed.netloc!r}")
+    path = unquote(parsed.path)
+    if path in {"", ":memory:"} or ("mode", "memory") in parse_qsl(parsed.query):
+        return None
+    return Path(path).absolute()
 
 
 def sqlite_readonly_uri(storage: str) -> str | None:

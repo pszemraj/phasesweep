@@ -119,6 +119,11 @@ storage is one of:
 - `auto`, which chooses a sibling `study.db` or `study.journal` according to
   whether any phase has `n_jobs > 1`.
 
+A SQLite URL must name the same database file to PhaseSweep and to the
+SQLAlchemy engine Optuna opens it through. Config load refuses spellings the
+two read differently, such as `?uri=true` without a `file:` filename, a
+repeated option, a `vfs`, or `..` after a symlink.
+
 The selected artifact root and ledger are bound to each other in both
 directions:
 

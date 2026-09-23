@@ -136,6 +136,11 @@ The scan may read a missing SQLite file as an absent ledger only because every
 accepted SQLite URL names a local file: config load refuses a URI filename
 that names another host (`config.models.Experiment._storage_is_local`, tested
 by `tests/test_storage_urls.py::test_sqlite_uri_with_remote_authority_is_rejected_at_config_load`).
+The file it names is also the one Optuna writes: config load refuses a URL
+that SQLAlchemy's SQLite dialect maps to a different database than
+`runtime.files.sqlite_database_path` does, as well as a repeated option and a
+`vfs` (`config.models._require_one_sqlite_database`, tested by
+`tests/test_storage_urls.py::test_sqlite_url_read_differently_by_sqlalchemy_is_rejected_at_config_load`).
 
 #### 3. Only a claimed ledger runs trials
 
