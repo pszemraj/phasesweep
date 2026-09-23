@@ -555,21 +555,32 @@ def _recover_over_malformed_registry_entry(
 _NO_NOFOLLOW = "O_NOFOLLOW is unavailable."
 
 
-def _registry_scan_without_capability(helper: str) -> Trigger:
-    """Preflight a registry of one entry while ``helper`` lacks a platform capability."""
+def _scan_registry(
+    damage: Callable[[Path], None] = lambda _entry: None,
+    patch: Callable[[pytest.MonkeyPatch], None] = lambda _monkeypatch: None,
+) -> Trigger:
+    """Preflight a registry of one entry for a real trial directory, after ``damage`` and ``patch``.
+
+    ``damage`` receives the entry file; ``patch`` faults the scan itself, after registration,
+    so the entry is written by the real code either way.
+    """
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
         experiment = make_experiment(workdir=tmp_path / "runs")
         trial_dir = tmp_path / "attempt"
         trial_dir.mkdir()
-        _registered_entry(experiment, trial_dir)
-        monkeypatch.setattr(
-            f"phasesweep.engine.attempts.{helper}",
-            _raiser(PlatformCapabilityError(_NO_NOFOLLOW)),
-        )
+        damage(_registered_entry(experiment, trial_dir))
+        patch(monkeypatch)
         return _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
     return trigger
+
+
+def _lacks_capability(helper: str) -> Callable[[pytest.MonkeyPatch], None]:
+    """Return a patch under which the registry's ``helper`` lacks a platform capability."""
+    return lambda monkeypatch: monkeypatch.setattr(
+        f"phasesweep.engine.attempts.{helper}", _raiser(PlatformCapabilityError(_NO_NOFOLLOW))
+    )
 
 
 def _moved_workdir(materialized: Materialized, tmp_path: Path) -> Experiment:
@@ -852,14 +863,14 @@ WRAP_CASES = (
     RoutingCase(
         # Not a damaged registry: the missing capability keeps its own routing.
         id="registry_open_platform_capability",
-        trigger=_registry_scan_without_capability("open_directory_fd"),
+        trigger=_scan_registry(patch=_lacks_capability("open_directory_fd")),
         raised=PlatformCapabilityError,
         action=OperatorAction.FIX_CONFIG,
         message=_NO_NOFOLLOW,
     ),
     RoutingCase(
         id="registry_entry_platform_capability",
-        trigger=_registry_scan_without_capability("read_private_text_at"),
+        trigger=_scan_registry(patch=_lacks_capability("read_private_text_at")),
         raised=PlatformCapabilityError,
         action=OperatorAction.FIX_CONFIG,
         message=_NO_NOFOLLOW,
@@ -955,15 +966,7 @@ def _preflight_registered_trial_without_attempt(
     attempt_dir = tmp_path / "attempt"
     attempt_dir.mkdir()
     write_attempt_lifecycle(attempt_dir, attempt_id="attempt", state="allocated")
-    _register_active_attempt(
-        experiment,
-        attempt_id="attempt",
-        phase_name="p",
-        study_name="t::p",
-        trial_number=0,
-        trial_dir=attempt_dir,
-        generation_id="generation",
-    )
+    _registered_entry(experiment, attempt_dir)
     storage = engine_ledger._resolve_storage(experiment.resolved_storage)
     study = optuna.create_study(study_name="t::p", storage=storage)
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
@@ -1023,32 +1026,13 @@ def _field_dropped(entry: Path) -> None:
     entry.write_text(json.dumps(payload))
 
 
-def _registry_entry_damaged(damage: Callable[[Path], None]) -> Trigger:
-    """Preflight a registry whose one entry, for a real trial directory, was damaged."""
-
-    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        experiment = make_experiment(workdir=tmp_path / "runs")
-        trial_dir = tmp_path / "attempt"
-        trial_dir.mkdir()
-        damage(_registered_entry(experiment, trial_dir))
-        return _preflight_active_attempts(experiment, _PreflightCleanupReport())
-
-    return trigger
+def _trial_dir_removed(entry: Path) -> None:
+    """Remove the trial directory a registry entry names."""
+    Path(json.loads(entry.read_text())["trial_dir"]).rmdir()
 
 
-def _preflight_entry_without_trial_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Preflight a registry entry whose trial directory is gone."""
-    experiment = make_experiment(workdir=tmp_path / "runs")
-    _registered_entry(experiment, tmp_path / "gone")
-    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
-
-
-def _preflight_unenumerable_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Preflight a private registry whose directory listing fails."""
-    experiment = make_experiment(workdir=tmp_path / "runs")
-    trial_dir = tmp_path / "attempt"
-    trial_dir.mkdir()
-    _registered_entry(experiment, trial_dir)
+def _fd_listing_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make listing a directory by descriptor fail, as the private registry scan lists it."""
     real_listdir = os.listdir
 
     def listdir(path: object = ".") -> list[str]:
@@ -1057,7 +1041,6 @@ def _preflight_unenumerable_registry(tmp_path: Path, monkeypatch: pytest.MonkeyP
         return real_listdir(path)  # type: ignore[call-overload]
 
     monkeypatch.setattr(os, "listdir", listdir)
-    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
 
 def _reap_running_trial(tmp_path: Path, **attrs: object) -> object:
@@ -1311,14 +1294,14 @@ ORIGIN_CASES = (
     ),
     RoutingCase(
         id="registry_entry_partial_schema",
-        trigger=_registry_entry_damaged(_field_dropped),
+        trigger=_scan_registry(damage=_field_dropped),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message="Delete the entry file only if you are certain no process",
     ),
     RoutingCase(
         id="registry_entry_trial_dir_missing",
-        trigger=_preflight_entry_without_trial_dir,
+        trigger=_scan_registry(damage=_trial_dir_removed),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message="Delete the entry file only if you are certain nothing is running.",
@@ -1327,7 +1310,7 @@ ORIGIN_CASES = (
     # of these may route back to it.
     RoutingCase(
         id="registry_unenumerable",
-        trigger=_preflight_unenumerable_registry,
+        trigger=_scan_registry(patch=_fd_listing_fails),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message="Restore the original registry and access to it before retrying.",
