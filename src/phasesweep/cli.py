@@ -47,7 +47,7 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import report_objective
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
-from phasesweep.runtime.process import (
+from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
 )

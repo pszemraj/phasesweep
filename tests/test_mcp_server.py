@@ -112,14 +112,13 @@ from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_sn
 from phasesweep.mcp.tool_names import TOOL_LAUNCH_RUN
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import open_private_text
-from phasesweep.runtime.process import (
+from phasesweep.runtime.process import _write_process_identity, write_attempt_lifecycle
+from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
-    _write_process_identity,
     read_boot_id,
     read_proc_starttime,
-    write_attempt_lifecycle,
 )
 from tests.conftest import file_mode, make_experiment, mark_current_format, write_constant_trainer
 from tests.mcp_helpers import (

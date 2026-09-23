@@ -23,7 +23,7 @@ from phasesweep.errors import OperatorAction
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
-from phasesweep.runtime.process import read_boot_id, read_proc_starttime
+from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from tests.conftest import file_mode, is_pid_zombie
 from tests.mcp_helpers import make_run_handle, write_run_status
 

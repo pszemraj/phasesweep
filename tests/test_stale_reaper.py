@@ -68,22 +68,20 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
-from phasesweep.runtime.process import (
+from phasesweep.runtime.process import _write_process_identity, write_attempt_lifecycle
+from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
-    PhaseSweepShutdown,
-    ShutdownCleanupReport,
     StaleProcessIdentity,
     _read_proc_stat,
-    _write_process_identity,
     cleanup_stale_trial_process,
     is_same_live_process,
     kill_stale_group,
     read_boot_id,
     read_proc_starttime,
     read_stale_process_identity,
-    write_attempt_lifecycle,
 )
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
     make_experiment,
     mark_current_format,
@@ -620,7 +618,7 @@ def test_kill_stale_group_escalates_to_sigkill():
     try:
         # Give it a moment to install the handler.
         time.sleep(0.3)
-        from phasesweep.runtime.process import read_proc_starttime
+        from phasesweep.runtime.reaper import read_proc_starttime
 
         st = read_proc_starttime(proc.pid)
         assert st is not None
@@ -743,9 +741,9 @@ def test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling(
         proc_starttime=111,
         boot_id="old-boot",
     )
-    monkeypatch.setattr("phasesweep.runtime.process.read_boot_id", lambda: "current-boot")
+    monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "current-boot")
     monkeypatch.setattr(
-        "phasesweep.runtime.process.kill_stale_group",
+        "phasesweep.runtime.reaper.kill_stale_group",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("a prior-boot identity must never signal current processes")
         ),
@@ -765,7 +763,7 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
         proc_starttime=None,
         boot_id=None,
     )
-    monkeypatch.setattr("phasesweep.runtime.process.read_boot_id", lambda: None)
+    monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: None)
 
     assert cleanup_stale_trial_process(identity) is False
 
@@ -777,10 +775,10 @@ def test_kill_stale_group_refuses_live_pid_without_starttime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[int] = []
-    monkeypatch.setattr("phasesweep.runtime.process.is_pid_alive", lambda _pid: True)
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda _pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.reaper.is_pid_alive", lambda _pid: True)
+    monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda _pgid: True)
     monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
+        "phasesweep.runtime.reaper._terminate_process_group",
         lambda pgid, *, grace_seconds: calls.append(pgid) or True,
     )
 
@@ -925,33 +923,33 @@ def test_kill_stale_group_pid_pgid_decision_matrix(
     calls: list[int] = []
     if case.pid_alive is not _MISSING:
         monkeypatch.setattr(
-            "phasesweep.runtime.process.is_pid_alive",
+            "phasesweep.runtime.reaper.is_pid_alive",
             lambda _pid, value=case.pid_alive: value,
         )
     if case.proc_starttime is not _MISSING:
         monkeypatch.setattr(
-            "phasesweep.runtime.process.read_proc_starttime",
+            "phasesweep.runtime.reaper.read_proc_starttime",
             lambda _pid, value=case.proc_starttime: value,
         )
     if case.group_exists is not _MISSING:
         monkeypatch.setattr(
-            "phasesweep.runtime.process._process_group_exists",
+            "phasesweep.runtime.reaper._process_group_exists",
             lambda _pgid, value=case.group_exists: value,
         )
     if case.proc_stat is not _MISSING:
         monkeypatch.setattr(
-            "phasesweep.runtime.process._read_proc_stat",
+            "phasesweep.runtime.reaper._read_proc_stat",
             lambda _entry, value=case.proc_stat: value,
         )
     if case.group_alive is not _MISSING:
         monkeypatch.setattr(
-            "phasesweep.runtime.process._process_group_alive",
+            "phasesweep.runtime.reaper._process_group_alive",
             lambda _pgid, value=case.group_alive: value,
         )
     if case.derived_pgid is not _MISSING:
         monkeypatch.setattr("os.getpgid", lambda _pid, value=case.derived_pgid: value)
     monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_group",
+        "phasesweep.runtime.reaper._terminate_process_group",
         lambda pgid, *, grace_seconds: calls.append(pgid) or True,
     )
 
@@ -1838,7 +1836,7 @@ def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
     tmp_path, monkeypatch, wandb_worker_sdk
 ):
     """The existing registry owns the polling worker after the trainer exits."""
-    from phasesweep.runtime.process import read_stale_process_identity
+    from phasesweep.runtime.reaper import read_stale_process_identity
 
     old = make_experiment(
         workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'study.db'}", n_trials=1

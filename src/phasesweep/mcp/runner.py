@@ -58,13 +58,12 @@ from phasesweep.mcp.snapshots import (
     finalize_result_snapshot,
     mark_result_snapshot_published,
 )
-from phasesweep.runtime.process import (
+from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
+from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     absorb_shutdown_signals,
     defer_shutdown_signals,
     install_signal_handlers,
-    read_boot_id,
-    read_proc_starttime,
 )
 from phasesweep.runtime.time import utc_now_iso
 

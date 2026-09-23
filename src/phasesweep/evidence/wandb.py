@@ -197,7 +197,8 @@ def poll_wandb_summary(
     """
     from phasesweep.errors import UnsafeProcessCleanupError
     from phasesweep.runtime.files import private_atomic_write_text
-    from phasesweep.runtime.process import PROCESS_IDENTITY_FILE, run_supervised
+    from phasesweep.runtime.process import run_supervised
+    from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 
     deadline = min(
         time.monotonic() + timeout_seconds, deadline if deadline is not None else math.inf

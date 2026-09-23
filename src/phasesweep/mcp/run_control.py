@@ -49,7 +49,7 @@ from phasesweep.mcp.runs import (
 )
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
-from phasesweep.runtime.process import kill_stale_group, read_boot_id, read_proc_starttime
+from phasesweep.runtime.reaper import kill_stale_group, read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 
 # The tools log on the server's channel, so one logger name covers everything served.

@@ -39,7 +39,7 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.evidence import TrialContext
-from phasesweep.runtime.process import _read_proc_stat
+from phasesweep.runtime.reaper import _read_proc_stat
 from tests.tiers import SLOW_CALL_SECONDS, excludes_integration, flagged_tests, slow_unmarked
 
 # Repository root, derived from the conftest location. Tests that copy/edit
@@ -275,7 +275,7 @@ def isolate_host_gpu_detection(
 def isolate_signal_ownership_tokens() -> Iterator[None]:
     """Snapshot and restore PhaseSweep's process-level signal state per test.
 
-    ``phasesweep.runtime.process._process_lifetime_owner`` and ``_scope_depth``
+    ``phasesweep.runtime.shutdown._process_lifetime_owner`` and ``_scope_depth``
     are plain module globals (review v0.5.15 / blocker 2B), deliberately not
     re-derived from OS ground truth the way the actual signal handlers are.
     A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
@@ -285,25 +285,25 @@ def isolate_signal_ownership_tokens() -> Iterator[None]:
     PhaseSweep's shutdown handler instead of pytest's. Restore the kernel mask,
     OS handlers, and ownership bookkeeping as one fixture-level transaction.
     """
-    import phasesweep.runtime.process as process
+    import phasesweep.runtime.shutdown as shutdown
 
     restore_signal = signal.signal
     restore_mask = getattr(signal, "pthread_sigmask", None)
-    prior_owner = process._process_lifetime_owner
-    prior_depth = process._scope_depth
-    prior_handlers = {sig: signal.getsignal(sig) for sig in process._SHUTDOWN_SIGNALS}
+    prior_owner = shutdown._process_lifetime_owner
+    prior_depth = shutdown._scope_depth
+    prior_handlers = {sig: signal.getsignal(sig) for sig in shutdown._SHUTDOWN_SIGNALS}
     prior_mask = restore_mask(signal.SIG_BLOCK, set()) if restore_mask is not None else None
     try:
         yield
     finally:
         if restore_mask is not None and prior_mask is not None:
-            restore_mask(signal.SIG_BLOCK, set(process._SHUTDOWN_SIGNALS))
+            restore_mask(signal.SIG_BLOCK, set(shutdown._SHUTDOWN_SIGNALS))
         for sig, handler in prior_handlers.items():
             restore_signal(sig, handler)
         if restore_mask is not None and prior_mask is not None:
             restore_mask(signal.SIG_SETMASK, prior_mask)
-        process._process_lifetime_owner = prior_owner
-        process._scope_depth = prior_depth
+        shutdown._process_lifetime_owner = prior_owner
+        shutdown._scope_depth = prior_depth
 
 
 def copy_fake_train(tmp_path: Path) -> Path:

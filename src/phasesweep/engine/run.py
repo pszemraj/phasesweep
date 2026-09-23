@@ -43,7 +43,7 @@ from phasesweep.engine.trial import (
 )
 from phasesweep.errors import RERUN_CLEANUP_RECOVERY
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
-from phasesweep.runtime.process import (
+from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     service_pending_shutdown,
     signal_handler_scope,

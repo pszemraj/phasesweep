@@ -57,8 +57,8 @@ from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     _unresolvable_pointer,
 )
-from phasesweep.runtime import process as runtime_process
-from phasesweep.runtime.process import PhaseSweepShutdown
+from phasesweep.runtime import shutdown as runtime_shutdown
+from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
     make_experiment,
     patch_directory_fsync_failure,
@@ -546,9 +546,9 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
         assert generation_id is not None
         assert _record_state(experiment, generation_id) == "published"
         assert _current_pointer_state(experiment) == "published"
-        assert runtime_process.service_pending_shutdown() is None
+        assert runtime_shutdown.service_pending_shutdown() is None
     finally:
-        runtime_process._deferred_shutdown_signum = None
+        runtime_shutdown._deferred_shutdown_signum = None
 
 
 # --------------------------------------------------------------------------

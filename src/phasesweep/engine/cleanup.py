@@ -31,7 +31,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import _restore_prelaunch_environment_identity
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.errors import RERUN_CLEANUP_RECOVERY
-from phasesweep.runtime.process import (
+from phasesweep.runtime.reaper import (
     StaleProcessIdentity,
     cleanup_stale_trial_process,
 )

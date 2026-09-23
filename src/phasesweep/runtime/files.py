@@ -312,7 +312,7 @@ def open_lock_file(path: Path) -> IO[str]:
         the leaf name is unsafe, or the file fails the regular-file/ownership/
         mode checks.
     """
-    from phasesweep.runtime.process import defer_shutdown_signals
+    from phasesweep.runtime.shutdown import defer_shutdown_signals
 
     with defer_shutdown_signals():
         return _open_lock_file(path)
@@ -603,7 +603,7 @@ def open_directory_fd(
     owner/mode policy, and only when ``private_final`` is true.
 
     The walk runs with shutdown signals deferred (see
-    :func:`phasesweep.runtime.process.defer_shutdown_signals`), so
+    :func:`phasesweep.runtime.shutdown.defer_shutdown_signals`), so
     ``PhaseSweepShutdown`` cannot land between the per-component descriptor
     handoffs and strand an intermediate descriptor. A shutdown that arrives
     mid-walk is serviced when the walk finishes: the just-opened final
@@ -629,7 +629,7 @@ def open_directory_fd(
         pre-open stat and the open, or the final component fails the
         private policy when ``private_final`` is true.
     """
-    from phasesweep.runtime.process import defer_shutdown_signals
+    from phasesweep.runtime.shutdown import defer_shutdown_signals
 
     result_fd = -1
     try:
@@ -838,7 +838,7 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     :raises ValueError: If ``mode`` is unsupported.
     :raises UnsafePrivatePathError: If the file or its parent path is unsafe.
     """
-    from phasesweep.runtime.process import defer_shutdown_signals
+    from phasesweep.runtime.shutdown import defer_shutdown_signals
 
     if mode not in {"w", "a", "x"}:
         raise ValueError(f"unsupported private text mode: {mode!r}")

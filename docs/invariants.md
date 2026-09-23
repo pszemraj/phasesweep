@@ -289,7 +289,7 @@ the prior pointer authoritative, and shutdown signals are absorbed until the
 commit lands.
 
 **Held by:** `engine.generation._publish_generation`, running inside
-`runtime.process.absorb_shutdown_signals`, with
+`runtime.shutdown.absorb_shutdown_signals`, with
 `engine.generation._validate_generation_publishable` before the pointer
 write\
 **Test:** `tests/test_publication_transaction.py::test_shutdown_signal_during_publication_is_absorbed_until_committed`
@@ -302,8 +302,8 @@ A process is identified by PID, start time, and boot id together, and a
 differing boot id settles a reboot without signalling anything.
 
 **Held by:** `mcp.runs.identity_from_earlier_boot`,
-`mcp.runs.RunStore.from_earlier_boot`, `runtime.process.is_same_live_process`,
-`runtime.process.cleanup_stale_trial_process`\
+`mcp.runs.RunStore.from_earlier_boot`, `runtime.reaper.is_same_live_process`,
+`runtime.reaper.cleanup_stale_trial_process`\
 **Tests:** `tests/test_mcp_runs.py::test_state_cleanup_uncertain_on_pid_reuse_mismatch`,
 `tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`
 

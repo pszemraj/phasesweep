@@ -349,7 +349,7 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch)
 @pytest.mark.integration
 def test_wandb_supervision_bounds_blocked_sdk_and_descendants(wandb_worker_sdk, tmp_path, stage):
     from phasesweep.evidence.wandb import WandbPollTimeout, poll_wandb_summary
-    from phasesweep.runtime.process import is_pid_alive
+    from phasesweep.runtime.reaper import is_pid_alive
     from tests.conftest import is_pid_zombie
 
     pid_file = tmp_path / "descendant"

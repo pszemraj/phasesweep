@@ -527,7 +527,7 @@ def test_private_open_closes_descriptor_on_shutdown_during_fdopen_handoff(
     filename: str,
 ) -> None:
     """A deferred shutdown aborting fd handoff must close the returned stream."""
-    from phasesweep.runtime.process import PhaseSweepShutdown, _shutdown_handler
+    from phasesweep.runtime.shutdown import PhaseSweepShutdown, _shutdown_handler
 
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
@@ -615,7 +615,7 @@ def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
     walk finishes and the completed final descriptor must be closed before
     the shutdown propagates to the caller.
     """
-    from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
+    from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 
     target = tmp_path / "nested" / "dir"
     target.mkdir(parents=True)

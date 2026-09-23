@@ -42,12 +42,11 @@ from phasesweep.runtime.files import (
     storage_recovery_locator,
 )
 from phasesweep.runtime.json import strict_json_loads
-from phasesweep.runtime.process import (
+from phasesweep.runtime.process import AttemptLifecycle, read_attempt_lifecycle
+from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
-    AttemptLifecycle,
     StaleProcessIdentity,
     cleanup_stale_trial_process,
-    read_attempt_lifecycle,
     read_stale_process_identity,
 )
 

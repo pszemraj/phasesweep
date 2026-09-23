@@ -46,7 +46,7 @@ from phasesweep.errors import GpuConfigurationError, LockBusyError, OperatorActi
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
-from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
     make_experiment,
     write_trainer,

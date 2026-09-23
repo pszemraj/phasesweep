@@ -62,7 +62,7 @@ from phasesweep.mcp.snapshots import (
     parse_result_snapshot,
 )
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
-from phasesweep.runtime.process import is_same_live_process, kill_stale_group, read_boot_id
+from phasesweep.runtime.reaper import is_same_live_process, kill_stale_group, read_boot_id
 from phasesweep.runtime.time import utc_now_iso
 
 

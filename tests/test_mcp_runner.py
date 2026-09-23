@@ -66,13 +66,8 @@ from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.runtime.files import open_private_text
-from phasesweep.runtime.process import (
-    PROCESS_IDENTITY_FILE,
-    PhaseSweepShutdown,
-    ShutdownCleanupReport,
-    _process_group_alive,
-    read_boot_id,
-)
+from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, _process_group_alive, read_boot_id
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import (
     REPO,
@@ -106,21 +101,21 @@ def test_in_process_runner_helper_restores_host_signal_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The process-entry-point runner must not retain pytest's signal ownership."""
-    import phasesweep.runtime.process as runtime_process
+    import phasesweep.runtime.shutdown as runtime_shutdown
 
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
+    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
     prior_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
 
     def host_handler(_signum: int, _frame: object) -> None:
         return None
 
     def fake_main(_argv: list[str]) -> int:
-        runtime_process.install_signal_handlers()
+        runtime_shutdown.install_signal_handlers()
         os.chdir(tmp_path)
         return 23
 
     try:
-        for sig in runtime_process._SHUTDOWN_SIGNALS:
+        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
             signal.signal(sig, host_handler)
         signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
         original_cwd = Path.cwd()
@@ -129,10 +124,10 @@ def test_in_process_runner_helper_restores_host_signal_state(
         assert runner_main([], cwd=tmp_path) == 23
 
         assert Path.cwd() == original_cwd
-        for sig in runtime_process._SHUTDOWN_SIGNALS:
+        for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
             assert signal.getsignal(sig) is host_handler
         assert signal.pthread_sigmask(signal.SIG_BLOCK, set()) == (prior_mask | {signal.SIGTERM})
-        assert not runtime_process._process_lifetime_owner
+        assert not runtime_shutdown._process_lifetime_owner
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, prior_mask)
         for sig, handler in prior_handlers.items():
@@ -1336,12 +1331,12 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     untouched, and only then does the process exit with the POSIX signalled
     code for the signal it held.
     """
-    import phasesweep.runtime.process as runtime_process
+    import phasesweep.runtime.shutdown as runtime_shutdown
 
     # Restores the module's pending-shutdown marker to ``None`` at teardown, so
     # a failure before the runner services the signal cannot leak an absorbed
     # shutdown into an unrelated later test.
-    monkeypatch.setattr(runtime_process, "_deferred_shutdown_signum", None)
+    monkeypatch.setattr(runtime_shutdown, "_deferred_shutdown_signum", None)
 
     config_path, config_sha256 = _constant_trial_config(tmp_path, "cancel_at_capture")
     real_capture = mcp_runner.capture_result_snapshot
@@ -1382,7 +1377,7 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     # it surfaces out of the terminal status write's own defer window.
     assert exc_info.value.signum == signal.SIGTERM
     assert exc_info.value.code == 128 + signal.SIGTERM
-    assert runtime_process._deferred_shutdown_signum is None
+    assert runtime_shutdown._deferred_shutdown_signum is None
 
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "complete"

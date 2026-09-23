@@ -84,7 +84,8 @@ from phasesweep.engine.trial import (
 )
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
-from phasesweep.runtime.process import PhaseSweepShutdown, write_attempt_lifecycle
+from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.runtime.shutdown import PhaseSweepShutdown
 
 log = logging.getLogger("phasesweep.engine.phase")
 

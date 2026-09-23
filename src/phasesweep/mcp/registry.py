@@ -36,7 +36,7 @@ from phasesweep.runtime.files import (
     storage_backend,
     storage_is_in_memory,
 )
-from phasesweep.runtime.process import read_proc_starttime
+from phasesweep.runtime.reaper import read_proc_starttime
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 

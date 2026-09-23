@@ -35,7 +35,7 @@ from phasesweep.runtime.files import (
     unlock_file,
     validate_private_dir,
 )
-from phasesweep.runtime.process import is_same_live_process, read_boot_id, reap_child
+from phasesweep.runtime.reaper import is_same_live_process, read_boot_id, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
