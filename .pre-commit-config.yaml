@@ -38,8 +38,13 @@ repos:
         language: system
         files: ^src/.*\.py$
         verbose: true
+      - id: module-size
+        name: src module size
+        entry: bash scripts/check_module_size.sh
+        language: system
+        files: ^src/.*\.py$
       # Runs on every commit: the contracts span all of src/ and the pytest
-      # configuration, and the run takes about a second.
+      # configuration.
       - id: contract-tests
         name: contract tests
         entry: pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py -q -p no:cacheprovider

@@ -49,14 +49,18 @@ pre-commit install
 | `ruff check --fix`, `ruff format` | commit | changed Python files |
 | `pathlint` | commit | changed `src/` and `tests/` Python files |
 | `doc-check` | commit | changed `src/` Python files, with `--strict` |
+| module size | commit | changed `src/` Python files |
 | contract tests | commit | every commit |
 | `mypy src` | push | the whole package |
 
 The contract tests are `tests/test_ledger_contract.py`,
 `tests/test_error_routing.py`, and `tests/test_tier_guard.py`. `doc-check` runs
 the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the
-hook prints that it skipped. When Ruff rewrites a file, the commit stops; stage
-the fix and commit again.
+hook prints that it skipped. The module-size hook refuses a commit that touches
+a `src/` module longer than 2000 lines, so split a module before changing it;
+[`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the
+limit. When Ruff rewrites a file, the commit stops; stage the fix and commit
+again.
 
 `pre-commit run --all-files` runs the commit hooks over the whole tree;
 add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain
