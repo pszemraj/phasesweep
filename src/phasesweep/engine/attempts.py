@@ -818,8 +818,9 @@ def _attempt_lifecycle_for_reaping(
     :raises ProcessCleanupUncertainError: The trial has no valid persisted
         attempt id, or the record is malformed or belongs to another attempt.
     """
-    # recover-run resolves RUNNING trials through here too, so these refusals
-    # never route back to it, as _read_trial_process_identity's do not.
+    # recover-run also resolves RUNNING trials through this function, so these
+    # refusals must not send the operator back to recover-run; the refusals in
+    # _read_trial_process_identity follow the same rule.
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if not isinstance(attempt_id, str) or not attempt_id:
         raise ProcessCleanupUncertainError(
