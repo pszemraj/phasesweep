@@ -86,7 +86,6 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.runtime.files import (
     atomic_text_writer,
-    sqlite_database_path,
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
@@ -98,7 +97,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import tree_snapshot
+from tests.ledger_fixtures import materialize, tree_snapshot
 
 
 def test_wandb_managed_defaults_and_rotating_credentials_do_not_change_cohort(monkeypatch):
@@ -1070,22 +1069,10 @@ def test_unbound_known_phasesweep_state_names_the_blocking_entry(
     assert not _artifact_root_binding_path(experiment).exists()
 
 
-@pytest.mark.integration
 def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     """One tree cannot mix publication files from one DB with counts from another."""
-    trainer = write_constant_trainer(tmp_path)
-    workdir = tmp_path / "runs"
-
-    def _experiment(database: str) -> Experiment:
-        return make_experiment(
-            workdir=workdir,
-            storage=f"sqlite:///{tmp_path / database}",
-            trainer=trainer,
-            n_trials=1,
-        )
-
-    owner = _experiment("owner.db")
-    run_experiment(owner)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    owner = materialized.experiment
     published = _last_successful_generation_id(owner)
     assert published is not None
     generation_dir = _experiment_dir(owner) / "generations"
@@ -1095,7 +1082,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     assert len(binding["storage_key"]) == 64
     assert all(character in "0123456789abcdef" for character in binding["storage_key"])
 
-    foreign = _experiment("foreign.db")
+    foreign = owner.model_copy(update={"storage": f"sqlite:///{tmp_path / 'foreign.db'}"})
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         run_experiment(foreign)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
@@ -1112,7 +1099,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     assert {path.name for path in generation_dir.iterdir()} == generations_before
     owner_status = read_status(owner)
     assert owner_status["publication_integrity"] == "ok"
-    assert owner_status["phases"][0]["trials"]["COMPLETE"] == 1
+    assert owner_status["phases"][0]["trials"]["COMPLETE"] == 2
 
 
 @pytest.mark.integration
@@ -1193,13 +1180,11 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
     assert study.get_trials(deepcopy=False) == []
 
 
-@pytest.mark.integration
 def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     """A populated pre-cutover study is refused without mutation."""
-    trainer = write_constant_trainer(tmp_path)
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    experiment = materialized.experiment
     storage = experiment.storage
-    run_experiment(experiment)
     root = _experiment_dir(experiment)
     assert_published_winner_evidence_local(root)
     drop_artifact_root_binding(storage, "t::p")
@@ -1313,15 +1298,13 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
         assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
 
-@pytest.mark.integration
 def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The published-phase existence read keeps strict storage-error semantics."""
-    trainer = write_constant_trainer(tmp_path)
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
-    run_experiment(experiment)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    experiment = materialized.experiment
     published = _last_successful_generation_id(experiment)
     assert published is not None
     generation_before = _generation_path(experiment).read_bytes()
@@ -1656,18 +1639,12 @@ def test_fresh_and_repeated_in_memory_roots_record_explicit_no_ledger_bindings(
 
 
 @pytest.mark.parametrize("in_memory_storage", [None, "sqlite:///:memory:"])
-@pytest.mark.integration
 def test_persistent_bound_root_rejects_an_in_memory_configuration(
     tmp_path: Path, in_memory_storage: str | None
 ) -> None:
     """A durable publication tree cannot be reused with an ephemeral ledger."""
-    trainer = write_constant_trainer(tmp_path)
-    owner = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
-    run_experiment(owner)
-    pointer_before = _generation_path(owner).read_bytes()
-    ledger_before = sqlite_database_path(owner.storage)
-    assert ledger_before is not None
-    ledger_bytes_before = ledger_before.read_bytes()
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    owner = materialized.experiment
     status_before = read_status(owner)
 
     offered = owner.model_copy(update={"storage": in_memory_storage})
@@ -1682,8 +1659,7 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(
         read_status(offered)
     assert str(excinfo.value).endswith("Nothing was written.")
 
-    assert _generation_path(owner).read_bytes() == pointer_before
-    assert ledger_before.read_bytes() == ledger_bytes_before
+    assert materialized.unchanged()
     assert read_status(owner) == status_before
 
 
