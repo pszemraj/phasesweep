@@ -140,15 +140,18 @@ its trials.
 #### 7. Recovery validates before it opens
 
 Recovery validates the binding and the format before it opens any study, never
-claims, and refuses a pre-cutover ledger or an incomplete scan with the bytes
+claims, refuses a study bound to another artifact root before it reaps
+anything, and refuses a pre-cutover ledger or an incomplete scan with the bytes
 unchanged.
 
 **Held by:** `mcp.recovery._load_recovery_studies`, through
 `engine.ledger.validate_ledger` and then `engine.ledger.open_existing_study`,
-which refuses a handle whose scan did not complete\
+which refuses a handle whose scan did not complete, with
+`engine.artifact_roots._check_study_artifact_root` on every opened study\
 **Tests:** `tests/test_ledger_read_paths.py::test_recovery_inspect_never_writes_to_a_golden_ledger`,
 `tests/test_ledger_read_paths.py::test_recovery_study_load_rewraps_the_engine_refusal`,
-`tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`
+`tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
+`tests/test_stale_reaper.py::test_recovery_refuses_a_study_bound_to_another_artifact_root`
 
 ### Attempts and trial outcomes
 

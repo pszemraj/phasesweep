@@ -229,6 +229,7 @@ flowchart TD
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if
   it preserves the current last-successful pointer and all cited winner
   provenance.
-- TODO(engine): keep docs/invariants.md in step with the ledger chokepoint; a
-  new storage constructor call site fails tests/test_ledger_contract.py and
-  needs a matching entry in that page.
+- TODO(engine): keep docs/invariants.md in step with the ledger chokepoint.
+  A storage constructor outside `engine/ledger.py` already fails
+  tests/test_ledger_contract.py; a new ordering rule or ledger entry point
+  needs its own entry there, citing the code and the test that hold it.
