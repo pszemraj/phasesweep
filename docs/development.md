@@ -101,6 +101,22 @@ that excludes `integration` ends with a list of unmarked tests at or over the
 threshold. The list is a report, not a failure, because timing thresholds
 flake on loaded hosts.
 
+The scanner cannot follow a call into another module, so a helper shared from
+a non-test module under `tests/` that spawns or waits is registered by name in
+`PROCESS_DRIVER_CALLS` or `WALLCLOCK_HELPER_CALLS` in `tests/tiers.py`, and a
+test that calls it, or requests it as a fixture, is classified as if it did
+the work itself. `test_shared_helpers_that_spawn_or_wait_are_registered` in
+`tests/test_tier_guard.py` scans those modules and fails until every such
+helper is registered. `reaped_pid` is deliberately not registered: its child
+has exited before it returns, so its caller neither manages a live process
+nor waits.
+
+An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any
+test whose code would send a real signal to pytest, its parent, or either
+one's process group; a signal-0 liveness probe passes. A test that signals its
+own PID on purpose, to drive a shutdown handler, carries
+`@pytest.mark.signals_own_pid`, which lifts only that one target.
+
 GitHub Actions intentionally has one Linux pull-request static-check job for
 Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier
 guard hook runs, and the three contract tests plus
