@@ -21,12 +21,10 @@ from pathlib import Path
 import optuna
 import pytest
 import yaml
-from click.testing import CliRunner
 
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
-from phasesweep.cli import cli as cli_main
 from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_config
 from phasesweep.engine import (
     ActiveAttemptPersistenceError,
@@ -82,6 +80,7 @@ from tests.mcp_helpers import (
     slow_mcp_config_text,
     write_mcp_catalog,
 )
+from tests.recovery_helpers import recover_run_cli
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -597,16 +596,9 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         with pytest.raises(ConcurrencyLimitError):
             app.launch("other")
 
-        recovery_args = [
-            "mcp",
-            "recover-run",
-            "--state-dir",
-            str(tmp_path / "state"),
-            "--run-id",
-            run_id,
-        ]
-        for confirmation in ([], ["--confirm"]):
-            blocked = CliRunner().invoke(cli_main, [*recovery_args, *confirmation])
+        state_dir = tmp_path / "state"
+        for confirm in (False, True):
+            blocked = recover_run_cli(state_dir, run_id, confirm=confirm)
             assert blocked.exit_code != 0
             if backend == "journal" and damage != "permission-denied":
                 # A bad last line is repaired by truncating it, never by recovery.
@@ -645,8 +637,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
                     trial = study.ask()
                     study.tell(trial, 0.5)
             replacement_before = ledger.read_bytes() if ledger.exists() else None
-            for confirmation in ([], ["--confirm"]):
-                refused = CliRunner().invoke(cli_main, [*recovery_args, *confirmation])
+            for confirm in (False, True):
+                refused = recover_run_cli(state_dir, run_id, confirm=confirm)
                 assert refused.exit_code != 0, refused.output
                 assert "Published generation " in refused.output
                 assert expected_diagnostics[replacement] in refused.output
@@ -670,15 +662,15 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         else:
             unrelated["failure"]["cause"]["stage"] = "execution"
         store.status_path(run_id).write_text(json.dumps(unrelated))
-        refused_recovery = CliRunner().invoke(cli_main, recovery_args)
+        refused_recovery = recover_run_cli(state_dir, run_id)
         assert refused_recovery.exit_code != 0
         assert "could not confirm any trial-level cleanup evidence" in refused_recovery.output
         assert not store.cleanup_recovery_path(run_id).exists()
     store.status_path(run_id).write_bytes(terminal_before)
-    preflight = CliRunner().invoke(cli_main, recovery_args)
+    preflight = recover_run_cli(state_dir, run_id)
     assert preflight.exit_code == 0, preflight.output
     assert store.recovery_required(handle)
-    confirmed = CliRunner().invoke(cli_main, [*recovery_args, "--confirm"])
+    confirmed = recover_run_cli(state_dir, run_id, confirm=True)
     assert confirmed.exit_code == 0, confirmed.output
     assert store.state(handle) == "failed"
     assert not store.recovery_required(handle)
@@ -2060,20 +2052,12 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         run_id if crash_boundary == "after_pointer" and not damage_publication else None
     )
 
-    command = [
-        "mcp",
-        "recover-run",
-        "--state-dir",
-        str(tmp_path / "state"),
-        "--run-id",
-        run_id,
-    ]
-    dry_run = CliRunner().invoke(cli_main, command)
+    dry_run = recover_run_cli(tmp_path / "state", run_id)
     if damage_publication:
         assert read_status(experiment)["publication_integrity"] == "failed"
         assert dry_run.exit_code != 0
         assert "last-success publication is invalid or unreadable" in dry_run.output
-        recovered = CliRunner().invoke(cli_main, [*command, "--confirm"])
+        recovered = recover_run_cli(tmp_path / "state", run_id, confirm=True)
         assert recovered.exit_code != 0
         assert "last-success publication is invalid or unreadable" in recovered.output
         assert store.status_path(run_id).read_bytes() == prepared_bytes
@@ -2081,7 +2065,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         return
     assert dry_run.exit_code == 0, dry_run.output
     assert "prepared" in dry_run.output
-    recovered = CliRunner().invoke(cli_main, [*command, "--confirm"])
+    recovered = recover_run_cli(tmp_path / "state", run_id, confirm=True)
     assert recovered.exit_code == 0, recovered.output
 
     terminal = json.loads(store.status_path(run_id).read_text())

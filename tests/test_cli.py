@@ -53,6 +53,7 @@ from tests.conftest import (
     write_trainer,
     write_yaml,
 )
+from tests.recovery_helpers import recover_run_cli
 
 
 @pytest.mark.parametrize(
@@ -211,10 +212,7 @@ def test_recover_run_expands_user_state_dir(
     monkeypatch.setenv("HOME", str(tmp_path))
     RunStore(tmp_path / "state")
 
-    result = CliRunner().invoke(
-        cli_main,
-        ["mcp", "recover-run", "--state-dir", "~/state", "--run-id", "missing"],
-    )
+    result = recover_run_cli("~/state", "missing")
 
     assert result.exit_code != 0
     assert "unknown run id: missing" in result.output
@@ -241,10 +239,7 @@ def test_recover_run_surfaces_host_error_suggestion(
 
     monkeypatch.setattr("phasesweep.cli.require_linux_mcp_host", refuse_host)
 
-    result = CliRunner().invoke(
-        cli_main,
-        ["mcp", "recover-run", "--state-dir", str(tmp_path / "state"), "--run-id", "missing"],
-    )
+    result = recover_run_cli(tmp_path / "state", "missing")
 
     assert result.exit_code != 0
     assert "cannot read this process's Linux /proc start time" in result.output
