@@ -12,7 +12,7 @@ import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, ClassVar
+from typing import IO, ClassVar, Literal
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 from phasesweep.errors import LockBusyError, OperatorAction, PhaseSweepError
@@ -1355,6 +1355,29 @@ def sqlite_readonly_uri(storage: str) -> str | None:
     :param str storage: SQLite storage URL.
     :return str | None: Read-only SQLite URI, or ``None`` for in-memory storage.
     """
+    return _sqlite_connect_uri(storage, "ro")
+
+
+def sqlite_existing_readwrite_uri(storage: str) -> str | None:
+    """Build a ``sqlite3.connect(..., uri=True)`` URI that writes but never creates.
+
+    Same file as :func:`sqlite_readonly_uri`, opened ``mode=rw``: SQLite may
+    write to an existing database, such as rolling back a journal a crash left
+    behind, but refuses to open a missing one rather than creating it.
+
+    :param str storage: SQLite storage URL.
+    :return str | None: Read-write SQLite URI, or ``None`` for in-memory storage.
+    """
+    return _sqlite_connect_uri(storage, "rw")
+
+
+def _sqlite_connect_uri(storage: str, mode: Literal["ro", "rw"]) -> str | None:
+    """Build a ``sqlite3`` URI for a SQLite storage URL's file in one open mode.
+
+    :param str storage: SQLite storage URL.
+    :param Literal["ro", "rw"] mode: SQLite ``mode`` URI parameter; neither creates a file.
+    :return str | None: SQLite URI, or ``None`` for in-memory storage.
+    """
     if storage_is_in_memory(storage):
         return None
 
@@ -1365,11 +1388,11 @@ def sqlite_readonly_uri(storage: str) -> str | None:
             for key, value in _url_query_pairs(storage)
             if key.lower() not in {"mode", "uri"}
         ]
-        params.append(("mode", "ro"))
+        params.append(("mode", mode))
         return f"{database}?{urlencode(params)}"
 
     path = Path(database).resolve()
-    return f"file:{quote(str(path), safe='/')}?mode=ro"
+    return f"file:{quote(str(path), safe='/')}?mode={mode}"
 
 
 def storage_recovery_locator(storage: str | None) -> str | None:

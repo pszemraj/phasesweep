@@ -31,11 +31,16 @@ from phasesweep.engine.cleanup import (
 )
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
+    LedgerTransactionInterruptedError,
     PublishedStudyMissingError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
-from phasesweep.engine.ledger import open_existing_study, validate_ledger
+from phasesweep.engine.ledger import (
+    open_existing_study,
+    roll_back_interrupted_transaction,
+    validate_ledger,
+)
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.errors import OperatorAction, PhaseSweepError
@@ -521,7 +526,9 @@ def _publication_recovery_action(
     return None, None
 
 
-def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[str, optuna.Study]:
+def _load_recovery_studies(
+    config: Experiment, needs: _RecoveryNeeds, *, confirm: bool = False
+) -> dict[str, optuna.Study]:
     """Load phase studies needed to inspect or reconcile trial cleanup evidence.
 
     When ownership storage was unavailable during the run, verifies the published phase history
@@ -529,7 +536,10 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
 
     Validation comes first and is read-only, so recovery refuses a tree bound
     to another ledger, or a pre-cutover ledger, before it opens anything and
-    without changing a byte. Each opened study then passes the read-only
+    without changing a byte. A confirmed recovery holds the experiment lock,
+    so it alone then lets SQLite roll back a transaction a crash interrupted;
+    inspection reports that ledger unavailable and leaves it untouched. Each
+    opened study then passes the read-only
     ownership half of the check a run's claim applies, because recovery reaps
     and tells trials through these live objects: a study bound to another
     artifact root belongs to that root's runs, and recovering this tree must
@@ -541,6 +551,8 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
 
     :param Experiment config: Experiment defining phase names and storage locations.
     :param _RecoveryNeeds needs: Recovery decisions that may require published-history checks.
+    :param bool confirm: The caller holds the experiment lock for a confirmed
+        recovery, so SQLite may roll back an interrupted transaction.
     :raises RunRecoveryError: The ledger is refused, a phase study belongs to
         another artifact root, or required storage or published studies cannot
         be read.
@@ -554,6 +566,8 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
     )
     try:
         ledger = validate_ledger(config)
+        if confirm:
+            ledger = roll_back_interrupted_transaction(ledger)
     except (ArtifactRootConflictError, StudySchemaMismatchError) as exc:
         raise RunRecoveryError.rewrap(exc, str(exc)) from exc
     except StudyStorageUnavailableError as exc:
@@ -564,6 +578,10 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
     for phase in config.phases:
         try:
             study = open_existing_study(ledger, phase)
+        except LedgerTransactionInterruptedError as exc:
+            # The ledger is intact: its own remedy, a confirmed recover-run,
+            # replaces the restore every other storage refusal needs.
+            raise RunRecoveryError.rewrap(exc, str(exc)) from exc
         except StudyStorageUnavailableError as exc:
             raise RunRecoveryError(
                 f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
@@ -628,7 +646,7 @@ def _recover_trial_evidence(
     inspected_attempt_locations: dict[str, tuple[str, int, str]] = {}
     inspected_studies = 0
     if needs.cleanup_needed:
-        loaded_studies = _load_recovery_studies(config, needs)
+        loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
         if confirm:
             active_report = _PreflightCleanupReport()
             registered_attempts = _preflight_active_attempts(

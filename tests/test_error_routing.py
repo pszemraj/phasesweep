@@ -29,6 +29,7 @@ import json
 import pickle
 import pkgutil
 import pwd
+import shutil
 import sqlite3
 import sys
 from collections.abc import Callable, Mapping
@@ -45,6 +46,7 @@ import phasesweep.engine.ledger as engine_ledger
 from phasesweep.config import Experiment, IntParam, Phase, WandbSummaryRequiredGate
 from phasesweep.engine import (
     ArtifactRootConflictError,
+    LedgerTransactionInterruptedError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     PublicationIntegrityError,
@@ -383,6 +385,33 @@ def _trials_deleted(path: Path) -> None:
     """Drop every trial row while the study keeps its current format stamp."""
     with contextlib.closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("DELETE FROM trials")
+
+
+def _interrupted_commit(path: Path) -> None:
+    """Leave a hot journal, as a crash in the middle of a commit does.
+
+    Mirrors ``tests/test_format_cutover.py::_leave_hot_journal``: both files
+    are copied while a writer's spilled transaction is still open.
+    """
+    writer = path.with_name(f"{path.name}.writer")
+    shutil.copyfile(path, writer)
+    with contextlib.closing(sqlite3.connect(writer, isolation_level=None)) as conn:
+        conn.execute("PRAGMA cache_size=10")
+        conn.execute("BEGIN IMMEDIATE")
+        for index in range(2000):
+            conn.execute(
+                "INSERT INTO study_user_attributes (study_id, key, value_json) VALUES (1, ?, ?)",
+                (f"uncommitted-{index}", json.dumps("x" * 500)),
+            )
+        shutil.copyfile(writer, path)
+        shutil.copyfile(f"{writer}-journal", f"{path}-journal")
+    writer.unlink()
+
+
+def _interrupted_commit_write_protected(path: Path) -> None:
+    """Leave a hot journal in a ledger file the owner may no longer write."""
+    _interrupted_commit(path)
+    path.chmod(0o444)
 
 
 def _materialize_damaged(
@@ -729,6 +758,16 @@ WRAP_CASES = (
         action=OperatorAction.RESTORE_LEDGER,
         cause=StudyStorageUnavailableError,
         message=_RECOVERY_STORAGE,
+    ),
+    WrapCase(
+        # The ledger is intact, so the storage wrap's restore remedy must not
+        # replace the confirmed recover-run that lets SQLite roll it back.
+        id="recovery_studies_interrupted_transaction",
+        trigger=_recovery_studies_damaged("tree", _interrupted_commit),
+        outbound=RunRecoveryError,
+        action=OperatorAction.RUN_RECOVER_RUN,
+        cause=LedgerTransactionInterruptedError,
+        message="`phasesweep mcp recover-run --confirm` holds the experiment lock",
     ),
     WrapCase(
         id="recovery_published_missing",
@@ -1210,6 +1249,25 @@ def _claim_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     return engine_ledger.claim_ledger(engine_ledger.validate_ledger(moved))
 
 
+def _open_after_interrupted_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Open a phase study through a ledger a crash left mid-commit."""
+    materialized = _materialize_damaged(tmp_path, "current-sqlite", "tree", _interrupted_commit)
+    experiment = materialized.experiment
+    return engine_ledger.open_existing_study(
+        engine_ledger.validate_ledger(experiment), experiment.phases[0]
+    )
+
+
+def _claim_after_interrupted_commit_write_protected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Claim a ledger whose interrupted commit SQLite cannot roll back."""
+    materialized = _materialize_damaged(
+        tmp_path, "current-sqlite", "tree", _interrupted_commit_write_protected
+    )
+    return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
+
+
 def _validate_tree_bound_to_another_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
@@ -1413,6 +1471,23 @@ ORIGIN_CASES = (
         raised=ArtifactRootConflictError,
         action=OperatorAction.FIX_CONFIG,
         message="Use the config that owns this current-format tree",
+    ),
+    OriginCase(
+        # Not RETRY: no holder is waited on, and repeating a read never rolls
+        # the journal back. The confirmed recover-run is the locked command
+        # the one surfacing read, recovery inspection, is a flag away from.
+        id="sqlite_transaction_interrupted",
+        trigger=_open_after_interrupted_commit,
+        raised=LedgerTransactionInterruptedError,
+        action=OperatorAction.RUN_RECOVER_RUN,
+        message="`phasesweep mcp recover-run --confirm` holds the experiment lock",
+    ),
+    OriginCase(
+        id="sqlite_rollback_refused",
+        trigger=_claim_after_interrupted_commit_write_protected,
+        raised=StudyStorageUnavailableError,
+        action=OperatorAction.RESTORE_LEDGER,
+        message="Restore write access to the ledger and its directory before retrying.",
     ),
     OriginCase(
         id="environment_cohort_changed",

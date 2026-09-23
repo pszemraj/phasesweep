@@ -140,7 +140,11 @@ restore the prior setting or start a fresh namespace.
 
 No command writes to the artifact root or its ledger until it has checked the
 tree's binding and then the ledger's format. When a check fails, the command
-stops and leaves both byte-for-byte as they were. Read-only commands,
+stops and leaves both byte-for-byte as they were. The one write that comes
+earlier is SQLite's own: when a crash interrupted a commit, the next
+`phasesweep run` or confirmed `phasesweep mcp recover-run` lets SQLite roll
+that transaction back before the format check, while read-only commands
+report the ledger's trial data unavailable and leave it alone. Read-only commands,
 including `status`, `show-winners`, and `run --dry-run`, never create a missing
 ledger or its directory. Contributors will find the ordering rules behind these
 guarantees, and the tests that hold them, in
