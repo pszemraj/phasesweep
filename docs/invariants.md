@@ -187,7 +187,10 @@ before its `_claim_study_artifact_root` loop\
 `read_status`, `read_winners`, CLI `status` and `show-winners`, and the MCP
 result snapshot build no file-backed storage, write no bytes, and report a
 phase whose format scan did not complete as unavailable rather than counting
-its trials.
+its trials. The one exception is a SQLite ledger someone switched to WAL mode,
+which Optuna never does: a read there leaves the database bytes unchanged,
+but SQLite itself creates the `-wal` and `-shm` files it coordinates readers
+through.
 
 **Held by:** `engine.ledger.validate_ledger` and
 `engine.ledger.read_phase_trial_stats`, under `engine.read.read_status`,
