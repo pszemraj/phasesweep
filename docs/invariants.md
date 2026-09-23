@@ -88,6 +88,17 @@ recorded on the handle, and on an unbound tree it is refused.
 `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`
 (its `release-0.3.1` cells pin the binding check before the format scan)
 
+**Known gap:** a SQLite URI filename with a non-local authority, such as
+`sqlite:///file://db-host/runs/study.db?uri=true`, passes config validation
+but maps to no local file, so the format scan and
+`engine.ledger._sqlite_study_exists` both treat the ledger as absent without
+reading it. SQLite rejects that authority, so no study can exist behind the
+URL, but a run still writes the tree binding and its generation claim before
+`open_phase_study` fails, and `status` stops on an assertion in
+`engine.ledger._sqlite_phase_trial_stats` instead of reporting the phase
+unavailable. MCP catalogs refuse such a URL as a non-absolute storage path;
+the CLI does not.
+
 #### 3. Only a claimed ledger runs trials
 
 Only a `ClaimedLedger` can open a study that runs new trials, and
