@@ -29,7 +29,6 @@ from phasesweep.config import (
     Constraint,
     ExecutionContext,
     Experiment,
-    IntParam,
     JsonExtractor,
     Metric,
     Phase,
@@ -64,7 +63,12 @@ from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_INPUT_ATTR,
 )
-from tests.conftest import assert_published_winner_evidence_local, make_experiment, write_trainer
+from tests.conftest import (
+    assert_published_winner_evidence_local,
+    make_experiment,
+    write_constant_trainer,
+    write_trainer,
+)
 
 # Every test here drives a real sweep through external trainer processes before
 # it can check what selection published, so the whole module is integration tier.
@@ -90,9 +94,8 @@ def test_json_primary_external_trainer_inherits_replays_and_verifies_source(tmp_
     """,
     )
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'json.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        persistent=tmp_path,
+        trainer=trainer,
         metric=Metric(extractor=JsonExtractor(type="json", path="r.json", key="eval.loss")),
         phases=[
             Phase(
@@ -305,22 +308,10 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         assert len(study.trials) == 1
 
 
-# Every trial prints the same objective, so selection always ties and the tie
-# break (lowest trial number) makes trial 0 the winner no matter how many
-# top-ups run. That keeps "the winner is the trial whose evidence we broke"
-# a property of the fixture rather than of the sampler's draw order.
-_CONSTANT_TRAINER = """
-import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument("--out")
-parser.add_argument("--x", type=int, default=0)
-args, _ = parser.parse_known_args()
-print("x=0.5")
-"""
-
-# Same constant objective, but trial 1 exits non-zero until a recovery marker
-# file appears. Used to produce a *genuine* generation that crashed between a
-# trial completing and anything being published (see the carve-out control).
+# The constant objective of ``write_constant_trainer``, but trial 1 exits
+# non-zero until a recovery marker file appears. Used to produce a *genuine*
+# generation that crashed between a trial completing and anything being
+# published (see the carve-out control).
 _FLAKY_TRAINER = """
 import argparse, sys
 from pathlib import Path
@@ -339,7 +330,7 @@ def _evidence_experiment(
     tmp_path: Path,
     *,
     n_trials: int = 1,
-    trainer_body: str = _CONSTANT_TRAINER,
+    trainer_body: str | None = None,
     max_consecutive_failures: int = 3,
     fixed_overrides: dict[str, object] | None = None,
     override_format: str = "argparse",
@@ -349,33 +340,30 @@ def _evidence_experiment(
     Persistent storage is what makes a top-up reselect an *existing* trial
     rather than starting over, which is the whole subject here.
     """
-    trainer = write_trainer(tmp_path / "trainer.py", trainer_body)
+    # Every trial of the default constant trainer logs the same objective, so
+    # the tie break (lowest trial number) makes trial 0 the winner however many
+    # top-ups run, whatever the sampler draws.
+    if trainer_body is None:
+        trainer = write_constant_trainer(tmp_path)
+    else:
+        trainer = write_trainer(tmp_path / "trainer.py", trainer_body)
+    trainer_config = None
     if override_format == "yaml_file":
-        trial_command = f"python {trainer} --out {{trial_dir}}/r.json --config {{config_path}}"
+        trainer_input = "--config {config_path}"
         trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
     elif override_format == "json_file":
-        trial_command = f"python {trainer} --out {{trial_dir}}/r.json --input {{overrides_path}}"
-        trainer_config = None
+        trainer_input = "--input {overrides_path}"
     else:
-        trial_command = f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-        trainer_config = None
+        trainer_input = "{overrides}"
     return make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=trial_command,
+        persistent=tmp_path,
+        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {trainer_input}",
         override_format=override_format,
         trainer_config=trainer_config,
-        phases=[
-            Phase(
-                name="p",
-                n_trials=n_trials,
-                n_jobs=1,
-                max_consecutive_failures=max_consecutive_failures,
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-                fixed_overrides=fixed_overrides or {},
-            )
-        ],
+        n_trials=n_trials,
+        n_jobs=1,
+        max_consecutive_failures=max_consecutive_failures,
+        fixed_overrides=fixed_overrides or {},
     )
 
 
@@ -431,9 +419,8 @@ def _from_phase_evidence_experiment(
     marker = tmp_path / "resumed-trainer-ran"
     trainer = write_trainer(tmp_path / "from_phase_trainer.py", _MARKED_TRAINER)
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
+        persistent=tmp_path,
+        trainer=trainer,
         phases=[
             Phase(name="p", n_trials=1, sampler=Sampler(type="random", seed=0)),
             Phase(

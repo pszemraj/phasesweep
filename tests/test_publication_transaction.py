@@ -65,6 +65,7 @@ from tests.conftest import (
     patch_path_method_failure,
     requires_nonroot,
     temporary_umask,
+    write_param_echo_trainer,
     write_trainer,
 )
 
@@ -76,16 +77,6 @@ def _fail_terminal_generation_state(original: Callable, error: BaseException):
         return original(owner, **kwargs)
 
     return flaky_state
-
-
-_TRAINER_BODY = """
-import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument("--out")
-parser.add_argument("--x", type=int, default=0)
-args, _ = parser.parse_known_args()
-print(f"x={args.x}")
-"""
 
 
 # Provenance files frozen into every generation namespace at claim time
@@ -104,23 +95,10 @@ def _tamper_winner_artifact(path: Path) -> None:
     path.write_text(yaml.safe_dump(winner, sort_keys=False))
 
 
-def _stored_experiment(tmp_path: Path, *, n_trials: int = 1, env: dict[str, str] | None = None):
-    trainer = write_trainer(tmp_path / "trainer.py", _TRAINER_BODY)
+def _stored_experiment(tmp_path: Path, *, env: dict[str, str] | None = None):
+    trainer = write_param_echo_trainer(tmp_path)
     return make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        env=env,
-        phases=[
-            Phase(
-                name="p",
-                n_trials=n_trials,
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-                fixed_overrides={"batch_size": 8},
-            )
-        ],
+        persistent=tmp_path, trainer=trainer, env=env, n_trials=1, fixed_overrides={"batch_size": 8}
     )
 
 
@@ -499,11 +477,7 @@ def test_terminal_callback_control_flow_exception_cannot_replace_failure(
     """A diagnostic callback raising KeyboardInterrupt cannot mask the primary error."""
     trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-        max_consecutive_failures=1,
+        workdir=tmp_path / "runs", trainer=trainer, n_trials=1, max_consecutive_failures=1
     )
 
     def interrupting_callback(_report: TerminalReport) -> None:
@@ -562,11 +536,7 @@ def test_execution_failure_leaves_current_pointer_terminal(tmp_path: Path) -> No
     """An ordinary execution failure drives the current pointer to a terminal state."""
     trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-        max_consecutive_failures=1,
+        workdir=tmp_path / "runs", trainer=trainer, n_trials=1, max_consecutive_failures=1
     )
 
     with pytest.raises(NoFeasibleTrialError):
@@ -1525,11 +1495,7 @@ def test_failed_generation_still_retains_its_provenance_files(tmp_path: Path) ->
     """
     trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-        max_consecutive_failures=1,
+        workdir=tmp_path / "runs", trainer=trainer, n_trials=1, max_consecutive_failures=1
     )
 
     with pytest.raises(NoFeasibleTrialError):
@@ -1635,11 +1601,7 @@ def test_experiment_state_write_failure_preserves_primary_error(
     """Even a control-flow exception during persistence cannot mask the failure."""
     trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-        max_consecutive_failures=1,
+        workdir=tmp_path / "runs", trainer=trainer, n_trials=1, max_consecutive_failures=1
     )
     original = generation_ops._write_generation_state
 
