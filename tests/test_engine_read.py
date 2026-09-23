@@ -505,12 +505,14 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
         path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
     } == generation_dirs_before
 
-    # A lost ledger and a lost study report the same refusal; an emptied one
-    # names its own reason. Both carry the same remedy, never a silent rerun.
+    # A lost ledger and a lost study report the same refusal; an emptied or
+    # stale one names its own reason. All carry the same remedy, never a
+    # silent rerun.
     reason_for_damage = {
         "missing-ledger": "persistent study is missing",
         "missing-study": "persistent study is missing",
         "empty-study": "persistent study contains no trials",
+        "stale-ledger": "persistent study does not contain the published trial identity",
     }
     if damage in reason_for_damage:
         message = str(excinfo.value)
