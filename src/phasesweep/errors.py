@@ -23,7 +23,10 @@ class OperatorAction(StrEnum):
         Restore or repair the on-disk experiment tree - artifacts, evidence, or
         its permissions - before running again.
     ``RUN_RECOVER_RUN``
-        Run the operator recovery command before anything else touches the run.
+        Run operator recovery before anything else touches the run:
+        ``phasesweep mcp recover-run`` for an MCP run, or ``phasesweep run``
+        again with the same config for a CLI run, whose preflight retries the
+        cleanup before it launches anything.
     ``FIX_CONFIG``
         Correct the experiment configuration, the request, or the environment
         it runs in (variables, installed extras), then run again.
@@ -117,6 +120,14 @@ class PhaseSweepError(RuntimeError):
         if action is None and isinstance(cause, PhaseSweepError):
             action = cause.actions
         return cls(*args, action=action)
+
+
+#: The recovery a refusal at the ``RUN_RECOVER_RUN`` default names, on both
+#: surfaces, so a CLI operator is not sent to an MCP-only command.
+RERUN_CLEANUP_RECOVERY = (
+    "run `phasesweep run` again with the same config for a CLI run, or "
+    "`phasesweep mcp recover-run` for an MCP run"
+)
 
 
 class ProcessCleanupUncertainError(PhaseSweepError):

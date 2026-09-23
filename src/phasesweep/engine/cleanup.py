@@ -30,6 +30,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _restore_prelaunch_environment_identity
 from phasesweep.engine.trial import ProcessCleanupUncertainError
+from phasesweep.errors import RERUN_CLEANUP_RECOVERY
 from phasesweep.runtime.process import (
     StaleProcessIdentity,
     cleanup_stale_trial_process,
@@ -297,7 +298,9 @@ def _recover_cleanup_uncertain_trials(
                 f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
                 f"study {study.study_name}: process cleanup could not be confirmed. "
                 f"experiment={experiment.experiment} phase={phase_name} "
-                f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}."
+                f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}. "
+                f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`), then "
+                f"{RERUN_CLEANUP_RECOVERY}."
             )
         _record_cleanup_recovery(study, trial)
         _collect_attempt_generation(

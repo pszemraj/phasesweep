@@ -293,7 +293,9 @@ def _interrupt_first_cleanup_clear() -> Callable[[RunStore, RunHandle], None]:
         nonlocal clear_calls
         clear_calls += 1
         if clear_calls == 1:
-            raise RuntimeError("interrupted before clearing cleanup marker")
+            # The marker's removal is filesystem work, so an interruption there
+            # is an OSError recovery reports; a defect would propagate instead.
+            raise OSError("interrupted before clearing cleanup marker")
         real_clear(candidate_store, candidate)
 
     return interrupt_first_clear
@@ -4955,7 +4957,9 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
         snapshot_calls += 1
         snapshot_attempt_ids.append(set(confirmed_attempt_ids))
         if snapshot_calls == 1:
-            raise RuntimeError("snapshot finalization failed")
+            # An operator-repairable failure: recovery reports it as a refusal,
+            # whereas a defect would reach the internal-error boundary instead.
+            raise OSError("snapshot finalization failed")
         return finalize_result_snapshot(
             snapshot,
             confirmed_attempt_ids=confirmed_attempt_ids,

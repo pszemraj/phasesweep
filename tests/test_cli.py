@@ -42,7 +42,7 @@ from phasesweep.engine.paths import (
     _winner_path,
 )
 from phasesweep.engine.publication import _last_successful_generation_id
-from phasesweep.errors import GpuConfigurationError, LockBusyError
+from phasesweep.errors import GpuConfigurationError, LockBusyError, OperatorAction
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
@@ -936,6 +936,32 @@ def test_cli_only_explains_marked_post_publication_shutdown(
     assert exit_code == 128 + signal.SIGTERM
     notice = "shutdown was honored after the published result was committed"
     assert (notice in captured.err) is expects_notice
+
+
+def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A trial cleanup refusal routes to recovery, which for a CLI run is running it again.
+
+    The next ``phasesweep run`` preflight retries the recorded cleanup before it
+    launches anything, so that is the step the CLI operator is told.
+    """
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    refusal = UnsafeProcessCleanupError("Trial 0 cleanup could not be confirmed.")
+    _stub_run_command(monkeypatch, refusal)
+
+    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err.strip() == (
+        "phasesweep: Trial 0 cleanup could not be confirmed. To retry its cleanup, "
+        "run `phasesweep run` again with the same config."
+    )
+    assert refusal.actions == (OperatorAction.RUN_RECOVER_RUN,)
 
 
 def test_cli_boundary_reports_config_syntax_error_without_traceback(

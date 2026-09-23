@@ -36,6 +36,7 @@ from phasesweep.engine.trial import (
     _preflight_trainer_environments,
     _trainer_environment,
 )
+from phasesweep.errors import RERUN_CLEANUP_RECOVERY
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
 from phasesweep.runtime.process import (
     PhaseSweepShutdown,
@@ -551,7 +552,8 @@ def _run_experiment_outcome(
                 # the original failure remains chained for diagnosis but is unsafe to handle alone,
                 # so its action is replaced too: recovery has to settle cleanup before its remedy.
                 raise ProcessCleanupUncertainError(
-                    "The run failed and subsequent process cleanup could not be confirmed.",
+                    "The run failed and subsequent process cleanup could not be confirmed. "
+                    f"To retry that cleanup, {RERUN_CLEANUP_RECOVERY}.",
                     action=OperatorAction.RUN_RECOVER_RUN,
                 ) from primary_error
             if control_error is not None:

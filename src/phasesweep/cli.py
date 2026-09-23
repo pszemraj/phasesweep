@@ -25,6 +25,7 @@ from phasesweep.engine import (
     PhaseSweepError,
     PublicationAccessError,
     PublicationIntegrityError,
+    UnsafeProcessCleanupError,
     config_status,
     run_config,
 )
@@ -377,6 +378,13 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
             sys.exit(2)
     try:
         run_config(config, from_phase=from_phase, dry_run=dry_run)
+    except UnsafeProcessCleanupError as exc:
+        # A trial's cleanup refusal describes the leak, and the study keeps
+        # that text as the cause a later phase-abort refusal quotes, so the
+        # recovery a CLI operator runs is added here rather than at the raise.
+        raise UnsafeProcessCleanupError.rewrap(
+            exc, f"{exc} To retry its cleanup, run `phasesweep run` again with the same config."
+        ) from exc
     except PhaseSweepShutdown as exc:
         if exc.published_result_committed:
             click.echo(

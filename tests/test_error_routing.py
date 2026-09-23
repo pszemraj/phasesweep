@@ -565,44 +565,44 @@ def _recover_from_shared_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 
 
-def _recover_pending_snapshot_unwritable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Confirm recovery of an orphaned pending snapshot whose status is unsafe to rewrite."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
-    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
-    write_run_status(
-        RunStore.open_existing(state_dir),
-        run_id,
-        returncode=1,
-        result_snapshot=capture_pre_generation_result_snapshot(materialized.experiment),
-        result_snapshot_state="pending",
-    )
-    monkeypatch.setattr(
-        "phasesweep.mcp.recovery.write_status_file",
-        _raiser(UnsafePrivatePathError("Private directory is not owner-only.")),
-    )
-    return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
+def _recover_pending_snapshot_while(failing: str, error: Exception) -> Trigger:
+    """Confirm recovery of an orphaned pending snapshot while ``failing`` raises ``error``."""
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        materialized = materialize("current-sqlite", tmp_path, mode="tree")
+        state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
+        write_run_status(
+            RunStore.open_existing(state_dir),
+            run_id,
+            returncode=1,
+            result_snapshot=capture_pre_generation_result_snapshot(materialized.experiment),
+            result_snapshot_state="pending",
+        )
+        monkeypatch.setattr(f"phasesweep.mcp.recovery.{failing}", _raiser(error))
+        return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
+
+    return trigger
 
 
-def _finalize_complete_snapshot_unwritable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Finalize a complete stored snapshot on a host that cannot rewrite its status safely."""
-    terminal_status = {
-        "run_id": "wrap-recover",
-        "result_snapshot": capture_pre_generation_result_snapshot(make_experiment()),
-        "result_snapshot_state": "complete",
-    }
-    monkeypatch.setattr(
-        "phasesweep.mcp.recovery.write_status_file",
-        _raiser(PlatformCapabilityError("O_NOFOLLOW is unavailable.")),
-    )
-    return _finalize_stored_terminal_result_snapshot(
-        RunStore(tmp_path / "mcp-state"),
-        "wrap-recover",
-        terminal_status,
-        confirmed_attempt_ids=set(),
-        confirmed_attempt_locations={},
-    )
+def _finalize_complete_snapshot_while(failing: str, error: Exception) -> Trigger:
+    """Finalize a complete stored snapshot while ``failing`` raises ``error``."""
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        terminal_status = {
+            "run_id": "wrap-recover",
+            "result_snapshot": capture_pre_generation_result_snapshot(make_experiment()),
+            "result_snapshot_state": "complete",
+        }
+        monkeypatch.setattr(f"phasesweep.mcp.recovery.{failing}", _raiser(error))
+        return _finalize_stored_terminal_result_snapshot(
+            RunStore(tmp_path / "mcp-state"),
+            "wrap-recover",
+            terminal_status,
+            confirmed_attempt_ids=set(),
+            confirmed_attempt_locations={},
+        )
+
+    return trigger
 
 
 def _registered_entry(experiment: Experiment, trial_dir: Path) -> Path:
@@ -656,11 +656,35 @@ def _moved_workdir(materialized: Materialized, tmp_path: Path) -> Experiment:
     return materialized.experiment.model_copy(update={"workdir": str(tmp_path / "moved")})
 
 
-def _recovery_studies_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Load recovery's studies through a config whose workdir moved away from them."""
+def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Inspect recovery after the symlink a run's pinned workdir names was retargeted.
+
+    recover-run reads the run's digest-pinned config snapshot, so the workdir
+    can stop resolving to the studies' root only through the filesystem, as
+    when a volume behind a symlink moves.
+    """
     materialized = materialize("current-sqlite", tmp_path, mode="tree")
-    needs = _recovery_needs(ownership_storage_unavailable=False)
-    return _load_recovery_studies(_moved_workdir(materialized, tmp_path), needs)
+    link = tmp_path / "data"
+    link.symlink_to(materialized.experiment.workdir)
+    config = yaml.safe_load(materialized.config_path.read_text())
+    config["workdir"] = str(link)
+    snapshot = yaml.safe_dump(config).encode()
+    state_dir = tmp_path / "mcp-state"
+    store = RunStore(state_dir)
+    handle = make_run_handle(
+        run_id="wrap-recover",
+        experiment_id=materialized.experiment.experiment,
+        config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        pid=999999,
+        starttime=111,
+    )
+    store.create(handle)
+    store.config_snapshot_path("wrap-recover").write_bytes(snapshot)
+    store.mark_cleanup_uncertain(handle)
+    link.unlink()
+    (tmp_path / "new-volume").mkdir()
+    link.symlink_to(tmp_path / "new-volume")
+    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 
 
 def _accepted_target_study(name: str, target: int) -> optuna.Study:
@@ -845,7 +869,9 @@ WRAP_CASES = (
     ),
     WrapCase(
         id="recover_run_pending_snapshot_unsafe_path",
-        trigger=_recover_pending_snapshot_unwritable,
+        trigger=_recover_pending_snapshot_while(
+            "write_status_file", UnsafePrivatePathError("Private directory is not owner-only.")
+        ),
         outbound=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
         cause=None,
@@ -854,7 +880,9 @@ WRAP_CASES = (
     ),
     WrapCase(
         id="finalize_snapshot_platform",
-        trigger=_finalize_complete_snapshot_unwritable,
+        trigger=_finalize_complete_snapshot_while(
+            "write_status_file", PlatformCapabilityError("O_NOFOLLOW is unavailable.")
+        ),
         outbound=RunRecoveryError,
         action=OperatorAction.FIX_CONFIG,
         cause=None,
@@ -872,10 +900,12 @@ WRAP_CASES = (
         message="delete the entry file if you are certain nothing is running.",
     ),
     WrapCase(
+        # Composed: the claim path routes this refusal to fixing the config,
+        # but recovery's config is pinned, so only the tree can be restored.
         id="recovery_studies_root_moved",
-        trigger=_recovery_studies_from_moved_workdir,
+        trigger=_recover_through_retargeted_workdir,
         outbound=RunRecoveryError,
-        action=OperatorAction.FIX_CONFIG,
+        action=OperatorAction.RESTORE_TREE,
         cause=ArtifactRootConflictError,
         message="Restore the original workdir, or use a fresh artifact root",
     ),
@@ -1292,6 +1322,43 @@ def _recover_unsettled_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         preparation.close()
 
 
+def _recover_unknown_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Inspect recovery of a run id the state directory never recorded."""
+    state_dir = tmp_path / "mcp-state"
+    RunStore(state_dir)
+    return recover_run(state_dir, "typo", confirm=False, emit=lambda _message: None)
+
+
+def _recover_with_config_snapshot(change: Callable[[Path], None]) -> Trigger:
+    """Inspect recovery of a dead uncertain run after ``change`` hits its config snapshot."""
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        materialized = materialize("current-sqlite", tmp_path, mode="tree")
+        state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
+        change(RunStore.open_existing(state_dir).config_snapshot_path(run_id))
+        return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
+
+    return trigger
+
+
+def _snapshot_altered(path: Path) -> None:
+    """Replace a config snapshot with bytes its recorded digest does not match."""
+    path.write_bytes(b"experiment: other\n")
+
+
+def _snapshot_unreadable(path: Path) -> None:
+    """Leave a config snapshot in place but unreadable."""
+    path.chmod(0o000)
+
+
+def _recover_without_boot_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Inspect recovery on a host whose boot id cannot be read."""
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
+    monkeypatch.setattr("phasesweep.mcp.recovery.read_boot_id", lambda: None)
+    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
+
+
 def _live_uncertain_run(state_dir: Path) -> tuple[RunStore, RunHandle]:
     """Record a cleanup-uncertain run whose runner is this live test process.
 
@@ -1615,6 +1682,44 @@ ORIGIN_CASES = (
         action=OperatorAction.RETRY,
         message="Wait briefly and retry",
     ),
+    # recover-run raises every RunRecoveryError itself, so none may route back
+    # to it by default; only a confirmed run's own remedy names it.
+    OriginCase(
+        id="recover_unknown_run_id",
+        trigger=_recover_unknown_run,
+        raised=RunRecoveryError,
+        action=OperatorAction.FIX_CONFIG,
+        message="pass a run id this MCP state directory records.",
+    ),
+    OriginCase(
+        id="recover_config_snapshot_missing",
+        trigger=_recover_with_config_snapshot(Path.unlink),
+        raised=RunRecoveryError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Restore it before retrying recovery.",
+    ),
+    OriginCase(
+        id="recover_config_snapshot_unreadable",
+        trigger=_recover_with_config_snapshot(_snapshot_unreadable),
+        raised=RunRecoveryError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Restore it or access to it before retrying recovery.",
+    ),
+    OriginCase(
+        id="recover_config_snapshot_altered",
+        trigger=_recover_with_config_snapshot(_snapshot_altered),
+        raised=RunRecoveryError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Restore the run's original config snapshot before retrying recovery.",
+    ),
+    OriginCase(
+        # No mechanical remedy: the host cannot rule out PID reuse.
+        id="recover_boot_id_unavailable",
+        trigger=_recover_without_boot_id,
+        raised=RunRecoveryError,
+        action=OperatorAction.INSPECT_LOGS,
+        message="runner boot id is unavailable",
+    ),
     OriginCase(
         id="recover_live_runner",
         trigger=_recover_live_runner,
@@ -1710,6 +1815,55 @@ def test_origin_raises_route_by_their_message_remedy(
     expected = case.action if isinstance(case.action, tuple) else (case.action,)
     assert error.actions == expected
     assert case.message in str(error)
+
+
+def _defect_while_inspecting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Inspect recovery while one of its own steps has a bug."""
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
+    monkeypatch.setattr(
+        "phasesweep.mcp.recovery._publication_recovery_action",
+        _raiser(NotImplementedError("unfinished branch")),
+    )
+    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
+
+
+@pytest.mark.parametrize(
+    ("trigger", "defect"),
+    [
+        (_defect_while_inspecting, NotImplementedError),
+        (
+            _recover_pending_snapshot_while(
+                "write_status_file", TypeError("Object of type set is not JSON serializable")
+            ),
+            TypeError,
+        ),
+        (
+            _finalize_complete_snapshot_while(
+                "finalize_result_snapshot",
+                RuntimeError("cleanup report identifies more attempts than the snapshot records"),
+            ),
+            RuntimeError,
+        ),
+    ],
+    ids=["inspection", "snapshot_reservation", "snapshot_finalization"],
+)
+def test_recover_run_lets_a_defect_keep_its_traceback(
+    trigger: Trigger,
+    defect: type[Exception],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bug inside recovery is not an operator refusal with a remedy to route.
+
+    Only a PhaseSweepError, or an OSError from recovery's own filesystem
+    writes, becomes a RunRecoveryError; anything else reaches the CLI's
+    internal-error boundary as itself.
+    """
+    with pytest.raises(defect) as excinfo:
+        trigger(tmp_path, monkeypatch)
+    assert type(excinfo.value) is defect
+    assert not isinstance(excinfo.value, PhaseSweepError)
 
 
 class _ActionArguments(ast.NodeVisitor):

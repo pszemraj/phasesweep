@@ -67,9 +67,14 @@ from phasesweep.runtime.time import utc_now_iso
 
 
 class RunRecoveryError(PhaseSweepError):
-    """An operator recovery request cannot be completed safely."""
+    """An operator recovery request cannot be completed safely.
 
-    default_action: ClassVar[OperatorAction] = OperatorAction.RUN_RECOVER_RUN
+    Every raise happens inside ``recover-run``, so the class default cannot be
+    that command: a raise whose remedy is a confirmed ``recover-run`` says so
+    explicitly or inherits it from its cause.
+    """
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
 
 @dataclass(frozen=True)
@@ -197,7 +202,9 @@ def recover_run(
                 terminal_status["result_snapshot_state"] = "pending"
                 try:
                     write_status_file(store.status_path(run_id), terminal_status)
-                except Exception as exc:
+                # The write is filesystem work an operator can fix; anything
+                # else is a defect and keeps its traceback.
+                except (PhaseSweepError, OSError) as exc:
                     raise RunRecoveryError.rewrap(
                         exc,
                         f"failed to finalize terminal result snapshot for {run_id}: "
@@ -235,9 +242,12 @@ def recover_run(
                 )
     except RunRecoveryError:
         raise
-    except RuntimeError as exc:
+    except (PhaseSweepError, OSError) as exc:
         # The chain is suppressed but the remedy is not: a lock held elsewhere
         # or a damaged publication keeps the action its own raise site chose.
+        # An OSError comes from recovery's own state writes, which the operator
+        # can repair; any other exception is a defect and reaches the CLI's
+        # internal-error boundary with its traceback.
         raise RunRecoveryError.rewrap(exc, str(exc)) from None
 
 
@@ -289,7 +299,10 @@ def _recover_pre_spawn_orphan(
                 f"start a trainer under this identity.{log_result}"
             )
             return
-    raise RunRecoveryError(f"unknown run id: {run_id}")
+    raise RunRecoveryError(
+        f"unknown run id: {run_id}; pass a run id this MCP state directory records.",
+        action=OperatorAction.FIX_CONFIG,
+    )
 
 
 def _resolve_launch_state(
@@ -445,17 +458,30 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
     :raises RunRecoveryError: The snapshot is missing, unreadable, invalid, or digest-mismatched.
     :return Experiment: Parsed experiment configuration from the verified stored snapshot.
     """
+    # The snapshot is the run's own record in the state directory, pinned by
+    # digest, so a missing or altered one is restored rather than rewritten.
     snapshot = store.config_snapshot_path(handle.run_id)
     if not snapshot.is_file():
-        raise RunRecoveryError(f"run config snapshot is missing: {snapshot}")
+        raise RunRecoveryError(
+            f"run config snapshot is missing: {snapshot}. Restore it before retrying recovery.",
+            action=OperatorAction.RESTORE_TREE,
+        )
     try:
         return load_experiment_snapshot(
             snapshot, handle.config_sha256, source=f"run snapshot {handle.run_id}"
         )
     except OSError as exc:
-        raise RunRecoveryError(f"cannot read run config snapshot: {snapshot}") from exc
+        raise RunRecoveryError(
+            f"cannot read run config snapshot: {snapshot}. Restore it or access to it "
+            "before retrying recovery.",
+            action=OperatorAction.RESTORE_TREE,
+        ) from exc
     except ValueError as exc:
-        raise RunRecoveryError(f"{exc}; refusing recovery") from None
+        raise RunRecoveryError(
+            f"{exc}; refusing recovery. Restore the run's original config snapshot "
+            "before retrying recovery.",
+            action=OperatorAction.RESTORE_TREE,
+        ) from None
 
 
 def _cleanup_runner(
@@ -599,7 +625,12 @@ def _load_recovery_studies(
             try:
                 _check_study_artifact_root(study, config)
             except ArtifactRootConflictError as exc:
-                raise RunRecoveryError.rewrap(exc, str(exc)) from exc
+                # The config is the run's digest-pinned snapshot and MCP
+                # workdirs are absolute, so only the filesystem can have moved
+                # the root away: restore it, not the config the claim path fixes.
+                raise RunRecoveryError.rewrap(
+                    exc, str(exc), action=OperatorAction.RESTORE_TREE
+                ) from exc
             loaded_studies[phase.name] = study
     if needs.ownership_storage_unavailable:
         try:
@@ -955,13 +986,18 @@ def _finalize_stored_terminal_result_snapshot(
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)
-    except Exception as exc:  # noqa: BLE001 - report operator repair failures
+    except Exception as exc:  # noqa: BLE001 - restore the prior view, then sort below
+        # Whatever failed, the prior frozen view is put back before it propagates.
         terminal_status["result_snapshot"] = raw_snapshot
         terminal_status["result_snapshot_state"] = prior_state
         if prior_state != "complete":
             terminal_status["result_snapshot_error"] = type(exc).__name__
             with contextlib.suppress(Exception):
                 write_status_file(store.status_path(run_id), terminal_status)
+        # Only a refusal or the status write's filesystem failure is the
+        # operator's to repair; anything else is a defect and keeps its traceback.
+        if not isinstance(exc, (PhaseSweepError, OSError)):
+            raise
         raise RunRecoveryError.rewrap(
             exc, f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
         ) from None

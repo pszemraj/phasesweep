@@ -324,7 +324,8 @@ step unless the operator must do several, every one of them: alternatives
 route the one that keeps the operator's existing work, and retrying what failed
 is never a step. A raise
 that requires several steps is allowlisted in the routing test, so adding one
-is a reviewed decision.
+is a reviewed decision. `recover-run` never routes a refusal back to itself
+except to a confirmed run, so `RunRecoveryError` defaults to reading the logs.
 
 **Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.actions`,
 `errors.PhaseSweepError.rewrap`\
