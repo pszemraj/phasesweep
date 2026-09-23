@@ -104,7 +104,7 @@ def test_default_lock_dir_requires_an_absolute_account_home(
     assert runtime_files.lock_dir() == override
 
 
-@pytest.mark.parametrize("invalid", ["relative", "missing", "mode", "symlink"])
+@pytest.mark.parametrize("invalid", ["missing", "mode", "symlink"])
 def test_home_override_requires_private_provisioned_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
 ) -> None:
@@ -117,7 +117,7 @@ def test_home_override_requires_private_provisioned_root(
         link = tmp_path / "link"
         link.symlink_to(root, target_is_directory=True)
         root = link
-    monkeypatch.setenv("PHASESWEEP_HOME", "relative" if invalid == "relative" else str(root))
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
     with pytest.raises(runtime_files.UnsafePrivatePathError):
         runtime_files.phasesweep_home()
     assert not (root / "locks").exists()

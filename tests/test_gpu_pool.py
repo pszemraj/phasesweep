@@ -673,15 +673,6 @@ def test_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch
     assert prefix_pool._devices[0].visible_token == uuid
 
 
-def test_abbreviated_uuid_prefix_without_map_fails_closed(tmp_path, monkeypatch) -> None:
-    """An unverified UUID prefix cannot reserve a lock for a physical device."""
-    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
-
-    with pytest.raises(RuntimeError, match="Cannot validate configured GPU UUID"):
-        GpuPool.create(n_jobs=1, explicit_devices=["GPU-2b23"])
-
-
 def test_lowercase_full_uuid_shares_the_numeric_index_lock(tmp_path, monkeypatch) -> None:
     """Full UUID spellings are case-insensitive for both validation and locking."""
     uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"

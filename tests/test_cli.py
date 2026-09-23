@@ -1066,7 +1066,6 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
 @pytest.mark.parametrize(
     "error",
     [
-        UnsafeLockPathError("PHASESWEEP_LOCK_DIR must be an absolute path"),
         LockBusyError("another experiment process holds the lock"),
     ],
 )
@@ -1076,7 +1075,10 @@ def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Runtime configuration and lock contention are failures, not bugs."""
+    """Lock contention is a failure, not a bug.
+
+    Runtime lock configuration goes through the real validator in the next test.
+    """
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, error)

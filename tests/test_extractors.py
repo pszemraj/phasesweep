@@ -601,30 +601,6 @@ def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:
     )
 
 
-def test_log_regex_selects_last_or_min_value(tmp_path):
-    cases = [
-        (
-            "last",
-            "step=1 eval_loss=1.0\nstep=2 eval_loss=0.5\nstep=3 eval_loss=0.25\n",
-            "last",
-            0.25,
-        ),
-        ("min", "eval_loss=1.0\neval_loss=0.5\neval_loss=0.7\n", "min", 0.5),
-    ]
-
-    for case, text, select, expected in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        (case_dir / "stdout.log").write_text(text)
-        cfg = LogRegexExtractor(
-            type="log_regex",
-            file="stdout.log",
-            pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
-            select=select,
-        )
-        assert run_extractor(make_trial_context(case_dir), cfg) == expected
-
-
 @pytest.mark.parametrize(
     ("select", "line", "expected", "match_count"),
     [

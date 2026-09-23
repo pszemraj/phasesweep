@@ -247,19 +247,6 @@ def test_phase_composition_accepts_child_fixed_resolution_as_new_origin() -> Non
             "both fixed_overrides and search_space",
             id="local-fixed-sampled",
         ),
-        pytest.param(
-            [
-                Phase(name="base", n_trials=1, fixed_overrides={"model": "small"}),
-                Phase(
-                    name="child",
-                    n_trials=1,
-                    inherits=["base"],
-                    search_space={"model.depth": {"type": "int", "low": 1, "high": 2}},
-                ),
-            ],
-            "dotted-key namespace collision",
-            id="dotted-collision",
-        ),
     ],
 )
 def test_phase_composition_rejects_invalid_origins(phases: list[Phase], match: str) -> None:

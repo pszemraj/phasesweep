@@ -263,19 +263,6 @@ def test_await_run_returns_immediately_on_terminal(
     assert isinstance(result["elapsed_seconds"], int)
 
 
-def test_await_run_times_out_with_unchanged_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app, _registry, _store = _app_with_run(tmp_path)
-    clock = _fake_clock(monkeypatch)
-
-    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
-    assert result["reason"] == "timeout"
-    assert result["changed"] is False
-    assert result["run"]["state"] == "running"
-    assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
-
-
 def test_await_run_rechecks_mid_wait_at_the_default_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -357,6 +344,8 @@ def test_await_run_clamps_timeout(
     result = asyncio.run(app.await_run("r1", timeout_seconds=requested_timeout))
 
     assert result["reason"] == "timeout"
+    assert result["changed"] is False
+    assert result["run"]["state"] == "running"
     assert clock["sleeps"] == pytest.approx(effective_timeout)
 
 
