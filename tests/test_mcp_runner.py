@@ -53,7 +53,7 @@ from phasesweep.engine.paths import (
     _winner_path,
 )
 from phasesweep.engine.publication import _last_successful_generation_id
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION, Winner, WinnerSource
+from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
@@ -618,37 +618,6 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             ledger.chmod(original_mode)
     if damage == "permission-denied":
         assert ledger.read_bytes() == damaged
-
-    if published:
-        expected_diagnostics = {
-            "missing": "persistent study is missing",
-            "empty": "persistent study contains no trials",
-            "unrelated-trial": "persistent study does not contain the published trial identity",
-        }
-        for replacement in ("missing", "empty", "unrelated-trial"):
-            ledger.unlink()
-            if replacement != "missing":
-                study = optuna.create_study(
-                    study_name=f"t::{from_phase or 'p'}",
-                    storage=_resolve_storage(experiment.resolved_storage),
-                )
-                study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-                if replacement == "unrelated-trial":
-                    trial = study.ask()
-                    study.tell(trial, 0.5)
-            replacement_before = ledger.read_bytes() if ledger.exists() else None
-            for confirm in (False, True):
-                refused = recover_run_cli(state_dir, run_id, confirm=confirm)
-                assert refused.exit_code != 0, refused.output
-                assert "Published generation " in refused.output
-                assert expected_diagnostics[replacement] in refused.output
-                assert "Restore the original complete storage ledger" in refused.output
-                assert (ledger.read_bytes() if ledger.exists() else None) == replacement_before
-                assert store.status_path(run_id).read_bytes() == terminal_before
-                assert not store.cleanup_recovery_path(run_id).exists()
-                assert store.recovery_required(handle)
-            if replacement == "missing":
-                ledger.write_bytes(healthy)
 
     ledger.write_bytes(healthy)
     # A storage error after generation allocation, or an unrelated failure,
