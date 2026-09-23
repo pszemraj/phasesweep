@@ -51,12 +51,16 @@ pre-commit install
 | `doc-check` | commit | changed `src/` Python files, with `--strict` |
 | module size | commit | changed `src/` Python files |
 | contract tests | commit | every commit |
+| tier guard | commit | every commit, collecting the whole suite |
 | `mypy src` | push | the whole package |
 
 The contract tests are `tests/test_ledger_contract.py`,
-`tests/test_error_routing.py`, and `tests/test_tier_guard.py`. `doc-check` runs
+`tests/test_error_routing.py`, and `tests/test_tier_guard.py`. The tier guard
+collects the whole suite without running it, which applies the
+[integration-marker guard](#test-tiers) to every test module. `doc-check` runs
 the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the
-hook prints that it skipped. The module-size hook refuses a commit that touches
+hook prints that it skipped. It is a maintainer-local check, and CI does not
+run it. The module-size hook refuses a commit that touches
 a `src/` module longer than 2000 lines, so split a module before changing it;
 [`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the
 limit. When Ruff rewrites a file, the commit stops; stage the fix and commit
@@ -98,10 +102,11 @@ threshold. The list is a report, not a failure, because timing thresholds
 flake on loaded hosts.
 
 GitHub Actions intentionally has one Linux pull-request static-check job for
-Ruff linting, Ruff format checking, mypy, and the same three contract tests the
-commit hook runs, imported from `src/` without building the package. The full
-suite and installed wheel check stay local to control CI cost. Hardware tests
-remain opt-in.
+Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier
+guard hook runs, and the three contract tests plus
+`tests/test_ledger_read_paths.py`, all imported from `src/` without building
+the package. The full suite and installed wheel check stay local to control CI
+cost. Hardware tests remain opt-in.
 
 The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
 read-only inspection behavior depends on that range; do not widen it without

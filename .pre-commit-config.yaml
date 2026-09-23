@@ -51,6 +51,14 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      # Collecting the whole suite runs the integration-tier guard over every
+      # test module without executing any test.
+      - id: tier-guard
+        name: tier guard (whole-suite collection)
+        entry: pytest --collect-only -q -p no:cacheprovider
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: mypy
         name: mypy
         entry: mypy src

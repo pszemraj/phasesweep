@@ -24,8 +24,13 @@ jobs:
       - run: ruff format --check .
       - run: mypy src
       # Fast in-process contracts, run from src/ without building the package.
+      # Collecting the whole suite runs the integration-tier guard over every
+      # test module without executing one; it imports each module, so a test
+      # that needs Hydra or W&B must import it inside the test.
       - name: Contract tests
         run: |
           python -m pip install 'pytest>=7'
+          PYTHONPATH=src python -m pytest --collect-only -q -p no:cacheprovider
           PYTHONPATH=src python -m pytest -p no:cacheprovider \
-            tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py
+            tests/test_ledger_contract.py tests/test_error_routing.py \
+            tests/test_tier_guard.py tests/test_ledger_read_paths.py
