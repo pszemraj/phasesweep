@@ -56,10 +56,7 @@ from phasesweep.engine.artifacts import _save_winner, _write_yaml_atomic
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
-from phasesweep.engine.fingerprints import (
-    _experiment_semantic_fingerprint,
-    _phase_fingerprint,
-)
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.generation import (
     _claim_generation,
     _publish_generation,
@@ -95,11 +92,18 @@ from phasesweep.evidence.models import objective_evidence_assurance
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
+    ConfigChangedError,
     ExperimentBusyError,
+    InvalidPhaseError,
+    McpToolError,
+    PermissionDeniedError,
+    ResumeNotReadyError,
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
     RunPersistentStateUnavailableError,
+    RunSnapshotUnavailableError,
     UnknownExperimentError,
+    UnknownRunError,
 )
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runs import RunHandle, RunState, RunStore
@@ -452,7 +456,7 @@ def test_launch_permission_denied_before_spawn(tmp_path: Path) -> None:
     config = _config(tmp_path)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
 
-    with pytest.raises(Exception, match="action 'launch' is not permitted"):
+    with pytest.raises(PermissionDeniedError, match="action 'launch' is not permitted"):
         app.launch("srv")
 
 
@@ -462,7 +466,7 @@ def test_from_phase_permission_denied_before_validation(tmp_path: Path) -> None:
         _catalog(tmp_path, config, allow={"launch": True, "cancel": True, "from_phase": False}),
     )
 
-    with pytest.raises(Exception, match="action 'from_phase' is not permitted"):
+    with pytest.raises(PermissionDeniedError, match="action 'from_phase' is not permitted"):
         app.launch("srv", from_phase="p")
 
 
@@ -470,7 +474,7 @@ def test_invalid_from_phase_rejected_before_spawn(tmp_path: Path) -> None:
     config = _config(tmp_path)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
 
-    with pytest.raises(Exception, match="phase 'missing' is not a phase"):
+    with pytest.raises(InvalidPhaseError, match="phase 'missing' is not a phase"):
         app.launch("srv", from_phase="missing")
 
 
@@ -493,7 +497,7 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
     config = _config(tmp_path, phases=RESUMABLE_PHASES)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
 
-    with pytest.raises(Exception, match="earlier phase 'p' has no winner yet") as excinfo:
+    with pytest.raises(ResumeNotReadyError, match="earlier phase 'p' has no winner yet") as excinfo:
         app.launch("srv", from_phase="q")
 
     assert "get_latest_run('srv') first" in str(excinfo.value)
@@ -582,7 +586,7 @@ def test_resume_rejects_incompatible_winner_before_spawn(
         incomplete=incomplete,
     )
 
-    with pytest.raises(Exception, match="compatible winner"):
+    with pytest.raises(ResumeNotReadyError, match="compatible winner"):
         app.launch("srv", from_phase="q")
 
     assert store.list_handles() == []
@@ -593,7 +597,7 @@ def test_launch_refuses_config_changed_after_registry_load(tmp_path: Path) -> No
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     config.write_text(config.read_text().replace("python train.py", "python changed.py"))
 
-    with pytest.raises(Exception, match="changed since server startup"):
+    with pytest.raises(ConfigChangedError, match="changed since server startup"):
         app.launch("srv")
 
     assert store.list_handles() == []
@@ -1217,7 +1221,7 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
     store.create(pending)
 
     restarted = PhaseSweepMCP(registry, RunStore(registry.state_dir))
-    with pytest.raises(Exception, match="already has a running sweep"):
+    with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         restarted.launch("srv")
 
     assert store.recovery_required(pending)
@@ -2132,7 +2136,7 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
         )
     )
 
-    with pytest.raises(Exception, match="saved config snapshot"):
+    with pytest.raises(RunSnapshotUnavailableError, match="saved config snapshot"):
         if method_name == "await_run":
             asyncio.run(app.await_run(run_id))
         else:
@@ -2145,7 +2149,7 @@ def test_read_tools_require_a_known_run_id(tmp_path: Path, method_name: str) -> 
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
     method = getattr(app, method_name)
 
-    with pytest.raises(Exception, match="unknown run id"):
+    with pytest.raises(UnknownRunError, match="unknown run id"):
         method("nope-123")
 
 
@@ -2963,9 +2967,9 @@ def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
     assert second["total_count"] == 3
     assert second["next_cursor"] is None
 
-    with pytest.raises(Exception, match="invalid cursor"):
+    with pytest.raises(McpToolError, match="invalid cursor"):
         app.list_experiments(cursor="not-a-cursor")
-    with pytest.raises(Exception, match="limit must be between"):
+    with pytest.raises(McpToolError, match="limit must be between"):
         app.list_experiments(limit=0)
 
 
@@ -2974,7 +2978,7 @@ def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
     config.write_text(config.read_text() + "\n# changed after server startup\n")
 
-    with pytest.raises(Exception, match="restart the MCP server"):
+    with pytest.raises(ConfigChangedError, match="restart the MCP server"):
         app.validate("srv")
 
 
@@ -3018,7 +3022,7 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
 
     app.validate("srv")
     launched = app.launch("srv")
-    with pytest.raises(Exception, match="already has a running sweep") as exc_info:
+    with pytest.raises(ExperimentBusyError, match="already has a running sweep") as exc_info:
         app.launch("srv")
     busy_message = str(exc_info.value)
     assert launched["run_id"] in busy_message
@@ -3485,7 +3489,7 @@ def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
     )
 
     assert store.state(handle) == "running"
-    with pytest.raises(Exception, match="already has a running sweep"):
+    with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
 
@@ -3520,7 +3524,7 @@ def test_cancel_requires_catalog_and_launch_time_permission(
         )
     )
 
-    with pytest.raises(Exception, match="action 'cancel' is not permitted"):
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted"):
         app.cancel(run_id)
 
 
@@ -3594,7 +3598,7 @@ def test_cancel_decataloged_run_is_denied_without_launch_permission(tmp_path: Pa
         )
     )
 
-    with pytest.raises(Exception, match="action 'cancel' is not permitted"):
+    with pytest.raises(PermissionDeniedError, match="action 'cancel' is not permitted"):
         app.cancel(run_id)
 
 
@@ -3656,7 +3660,7 @@ def test_cancel_cleanup_confirmation_policy(
     if status_cleanup_confirmed is None:
         assert not store.status_path(run_id).exists()
     if check_launch_gate:
-        with pytest.raises(Exception, match="already has a running sweep"):
+        with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
             app.launch("srv")
 
 
@@ -3802,7 +3806,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     store.mark_cleanup_uncertain(handle)
 
-    with pytest.raises(Exception, match="already has a running sweep"):
+    with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
     runner = CliRunner()
@@ -4362,7 +4366,7 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
     assert not store.status_path(run_id).exists()
     assert store.state(handle) == "running"
     assert store.recovery_required(handle)
-    with pytest.raises(Exception, match="already has a running sweep"):
+    with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
 
@@ -4453,7 +4457,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     assert not store.status_path(run_id).exists()
     assert not store.cleanup_recovery_path(run_id).exists()
     assert store.state(handle) == "running"
-    with pytest.raises(Exception, match="already has a running sweep"):
+    with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
     trial_cleanup_allowed = True
@@ -4640,7 +4644,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         assert "could not confirm any trial-level cleanup evidence" in result.output
         assert not recovery_path.exists()
         assert store.state(handle) == "running"
-        with pytest.raises(Exception, match="already has a running sweep"):
+        with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
             app.launch("srv")
 
 
@@ -4808,7 +4812,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     )
     monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_trial_cleanup)
 
-    with pytest.raises(Exception, match="already has a running sweep"):
+    with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
 
     runner = CliRunner()

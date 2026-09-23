@@ -15,6 +15,12 @@ import pytest
 
 from phasesweep import __version__
 from phasesweep.mcp import agent_prompt_text
+from phasesweep.mcp.errors import (
+    ConcurrencyLimitError,
+    ExperimentBusyError,
+    LaunchInProgressError,
+    UnknownRunError,
+)
 from phasesweep.mcp.server import CATALOG_RESOURCE_URI, PROMPT_RUN_AND_MONITOR
 from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
@@ -95,7 +101,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
 
     Exact payload shapes are pinned by cheaper unit tests, not here: the
     ``metric.objective_evidence`` dict shape by
-    tests/test_engine_read.py::test_objective_evidence_assurance_json_envelope_without_declared_checkpoint,
+    tests/test_engine_read.py::test_objective_evidence_assurance_json_envelope_checkpoint_binding,
     and the ``all_phases_have_winners``/``missing_phases``/``winner_generation``
     computation by
     tests/test_mcp_redaction.py::test_winners_payload_computes_phase_completeness_and_provenance.
@@ -194,7 +200,7 @@ def test_launch_then_cancel_from_restarted_server_then_relaunch(tmp_path: Path) 
         got = wait_for_mcp_running_trial(app, run_id, timeout=30)
         assert got == "running", f"expected a running trial, got {got}"
         # A second launch while one is live is refused.
-        with pytest.raises(Exception, match="already has a running sweep"):
+        with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
             app.launch("slow")
 
         # A fresh server process has only durable state to go on: it must
@@ -235,7 +241,7 @@ def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
     try:
         assert wait_for_mcp_running_trial(app, run_a, timeout=30) == "running"
         # A *different* experiment cannot start while one sweep is live (single-GPU cap).
-        with pytest.raises(Exception, match="max_concurrent_runs=1") as exc_info:
+        with pytest.raises(ConcurrencyLimitError, match="max_concurrent_runs=1") as exc_info:
             app.launch("slowb")
         assert run_a in str(exc_info.value)
         assert "await_run" in str(exc_info.value)
@@ -269,7 +275,7 @@ def test_launch_refused_while_launch_lock_held(tmp_path: Path) -> None:
     held = try_lock_file(store._launch_lock_path)
     assert held is not None
     try:
-        with pytest.raises(Exception, match="launch is in progress"):
+        with pytest.raises(LaunchInProgressError, match="launch is in progress"):
             app.launch("slow")
     finally:
         unlock_file(held)
@@ -284,7 +290,7 @@ def test_cancel_rejects_unknown_run(tmp_path: Path) -> None:
     catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
     app, _registry, _store = make_mcp_app(catalog)
 
-    with pytest.raises(Exception, match="unknown run id"):
+    with pytest.raises(UnknownRunError, match="unknown run id"):
         app.cancel("nope-123")
 
 

@@ -14,6 +14,7 @@ import pytest
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
+from phasesweep.mcp.errors import UnknownRunError
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -497,7 +498,7 @@ def test_await_run_unknown_run_id(tmp_path: Path) -> None:
     config_text = mcp_experiment_config_text(tmp_path)
     catalog = write_mcp_config_catalog(tmp_path, {"srv": config_text})
     app, _registry, _store = make_mcp_app(catalog)
-    with pytest.raises(Exception, match="unknown run id"):
+    with pytest.raises(UnknownRunError, match="unknown run id"):
         asyncio.run(app.await_run("missing"))
 
 
