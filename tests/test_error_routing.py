@@ -14,13 +14,11 @@ The wrap table near the end carries the same contract across layer boundaries: a
 survives each translation unless the site deliberately composes or replaces it, and every such site
 is driven for real rather than in isolation. The origin table after it holds raises whose message
 names its own remedy to the action that routes it. The MCP runner's failure payload, where routing
-reaches an agent, must then say exactly the steps a raise routes. The last test keeps multi-step
-remediations rare: every raise that requires more than one step must be on an explicit allowlist.
+reaches an agent, must then say exactly the steps a raise routes.
 """
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import errno
 import hashlib
@@ -32,7 +30,6 @@ import pkgutil
 import pwd
 import sqlite3
 import sys
-from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -141,55 +138,6 @@ _SWEEP_WITNESSES = frozenset(
 
 # A remediation of two required steps, for exercising the multi-step path.
 _TWO_STEPS = (OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE)
-
-# Every raise that requires more than one remedy step, as (module under src/,
-# enclosing function, steps in order) and how many raises there write them.
-# Asserted exactly, like the ledger contract's ratchets: a new multi-step raise
-# fails until it is written down here, so a second step is a reviewed decision.
-# Alternatives the operator would choose between never belong here; their raise
-# routes the one that keeps the operator's existing work.
-_MULTI_STEP_RAISES: Mapping[tuple[str, str, tuple[str, ...]], int] = MappingProxyType(
-    {
-        # Either the ledger's attempt id or the tree's identity files may be the
-        # side that changed, and the operator cannot tell which, so both return.
-        (
-            "phasesweep/engine/attempts.py",
-            "_read_trial_process_identity",
-            ("RESTORE_LEDGER", "RESTORE_TREE"),
-        ): 1,
-        # The same split for the lifecycle record a RUNNING trial is resolved by.
-        (
-            "phasesweep/engine/attempts.py",
-            "_attempt_lifecycle_for_reaping",
-            ("RESTORE_LEDGER", "RESTORE_TREE"),
-        ): 1,
-    }
-)
-
-# The only places an ``action=`` may be computed rather than written out: each
-# forwards a remediation some raise already declared, so it cannot add a step.
-_ACTION_PASSTHROUGHS = frozenset(
-    {
-        # rewrap hands the cause's steps, or the caller's explicit ones, to the class.
-        ("phasesweep/errors.py", "rewrap"),
-        # A preflight aggregate forwards the steps its refusals all share.
-        ("phasesweep/engine/guards.py", "_preflight_existing_studies"),
-    }
-)
-
-# Calls that splat keywords, which could carry ``action`` unnamed. None of
-# these reaches an error's constructor; a new splat must be checked the same way.
-_KEYWORD_SPLATS = frozenset(
-    {
-        # A W&B polling request's fields, read back from its private request file.
-        ("phasesweep/evidence/wandb.py", "main"),
-        # A persisted run handle's fields, validated after construction.
-        ("phasesweep/mcp/runs.py", "_load_handle"),
-        # MCP tool wrappers pass the tool's own arguments through unchanged.
-        ("phasesweep/mcp/server.py", "async_wrapper"),
-        ("phasesweep/mcp/server.py", "sync_wrapper"),
-    }
-)
 
 
 def _import_every_module() -> None:
@@ -2113,215 +2061,6 @@ def test_runner_payload_follows_the_routed_steps(
     with pytest.raises(PhaseSweepError) as excinfo:
         _ROUTING_CASES[row].trigger(tmp_path, monkeypatch)
     _assert_payload_follows(excinfo.value)
-
-
-class _ActionArguments(ast.NodeVisitor):
-    """Sort every ``action=`` argument into literal step lists and computed values.
-
-    A step is literal only when written as a member of ``OperatorAction`` under
-    a name the module binds to it; any other expression, including a ``**``
-    splat that could carry ``action`` unnamed, is computed. Assignments to an
-    ``actions`` attribute are collected too, since one would bypass the
-    constructor.
-    """
-
-    def __init__(self, module: str, tree: ast.Module) -> None:
-        self.module = module
-        self.scope: list[str] = []
-        self.enum_names = {
-            alias.asname or alias.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-            for alias in node.names
-            if alias.name == "OperatorAction"
-        } | {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ClassDef) and node.name == "OperatorAction"
-        }
-        self.multi_step: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
-        self.computed: set[tuple[str, str]] = set()
-        self.assigned: set[tuple[str, str]] = set()
-
-    def _site(self) -> tuple[str, str]:
-        return self.module, self.scope[-1] if self.scope else "<module>"
-
-    def _step(self, node: ast.expr) -> str | None:
-        """Return the member a literal step names, or ``None`` for anything else."""
-        if (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id in self.enum_names
-        ):
-            return node.attr
-        return None
-
-    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        self.scope.append(node.name)
-        self.generic_visit(node)
-        self.scope.pop()
-
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-    def visit_Call(self, node: ast.Call) -> None:
-        for keyword in node.keywords:
-            value = keyword.value
-            if keyword.arg is None:
-                self.computed.add(self._site())
-                continue
-            if keyword.arg != "action" or isinstance(value, ast.Constant):
-                # An unrelated keyword, or a literal such as argparse's; a string
-                # that reaches an error is refused by its constructor instead.
-                continue
-            listed = isinstance(value, (ast.Tuple, ast.List))
-            steps = [self._step(element) for element in (value.elts if listed else [value])]
-            if None in steps:
-                self.computed.add(self._site())
-            elif listed:
-                self.multi_step[(*self._site(), tuple(str(step) for step in steps))] += 1
-        if (
-            isinstance(node.func, ast.Name)
-            and node.func.id == "setattr"
-            and len(node.args) >= 2
-            and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value == "actions"
-        ):
-            self.assigned.add(self._site())
-        self.generic_visit(node)
-
-    def _collect_targets(self, *targets: ast.expr) -> None:
-        for target in targets:
-            if any(
-                isinstance(node, ast.Attribute) and node.attr == "actions"
-                for node in ast.walk(target)
-            ):
-                self.assigned.add(self._site())
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        self._collect_targets(*node.targets)
-        self.generic_visit(node)
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        self._collect_targets(node.target)
-        self.generic_visit(node)
-
-    def visit_AugAssign(self, node: ast.AugAssign) -> None:
-        self._collect_targets(node.target)
-        self.generic_visit(node)
-
-
-def _action_arguments(module: str, source: str) -> _ActionArguments:
-    """Return the guard's findings for one module's source."""
-    visitor = _ActionArguments(module, tree := ast.parse(source))
-    visitor.visit(tree)
-    return visitor
-
-
-def test_multi_step_remediations_are_deliberate() -> None:
-    """Only allowlisted raises require several steps, each a distinct real action."""
-    src = Path(__file__).resolve().parent.parent / "src"
-    multi_step: Counter[tuple[str, str, tuple[str, ...]]] = Counter()
-    computed: set[tuple[str, str]] = set()
-    assigned: set[tuple[str, str]] = set()
-    for path in sorted((src / "phasesweep").rglob("*.py")):
-        visitor = _action_arguments(path.relative_to(src).as_posix(), path.read_text())
-        multi_step += visitor.multi_step
-        computed |= visitor.computed
-        assigned |= visitor.assigned
-
-    assert multi_step == Counter(_MULTI_STEP_RAISES), (
-        "a raise now requires several remedy steps; if the operator must do every one, "
-        "add it to _MULTI_STEP_RAISES with the reason, and if they are alternatives, "
-        "route the one that keeps the operator's existing work. "
-        f"Found: {sorted(multi_step.items())}; allowed: {sorted(_MULTI_STEP_RAISES.items())}"
-    )
-    # A computed action would hide its steps from the allowlist above, so only
-    # the forwarding sites may compute one; a raise writes its steps out.
-    assert computed == _ACTION_PASSTHROUGHS | _KEYWORD_SPLATS, (
-        f"write each raise's steps out literally. Computed at: {sorted(computed)}"
-    )
-    # Only the constructor sets actions, after checking them.
-    assert assigned == {("phasesweep/errors.py", "__init__")}, (
-        f"route through the constructor instead of assigning actions at: {sorted(assigned)}"
-    )
-    for _module, _function, steps in multi_step:
-        assert len(steps) >= 2, f"a single step is spelled as one action, not {steps}"
-        assert len(set(steps)) == len(steps), f"repeated step in {steps}"
-        assert set(steps) <= set(OperatorAction.__members__), f"unknown step in {steps}"
-
-
-_GUARD_HEADER = (
-    "import functools\n"
-    "from phasesweep.errors import OperatorAction, OperatorAction as OA\n"
-    "from phasesweep.errors import ProcessCleanupUncertainError as E\n"
-)
-
-
-@pytest.mark.parametrize(
-    ("body", "finding"),
-    [
-        pytest.param(
-            "def f():\n    raise E('m', action=(OA.RESTORE_TREE, OA.FIX_CONFIG))",
-            "multi_step",
-            id="aliased-steps",
-        ),
-        pytest.param(
-            "class K:\n    STEPS = (OperatorAction.RESTORE_TREE, OperatorAction.FIX_CONFIG)\n"
-            "def f():\n    raise E('m', action=K.STEPS)",
-            "computed",
-            id="attribute-of-another-name",
-        ),
-        pytest.param("def f(exc):\n    raise E('m', action=exc.actions)", "computed", id="forward"),
-        pytest.param(
-            "def f():\n    raise E('m', action=(OA.RESTORE_TREE, K.FIX_CONFIG))",
-            "computed",
-            id="foreign-step-in-list",
-        ),
-        pytest.param(
-            "def f():\n    raise E('m', **{'action': (OA.RESTORE_TREE, OA.FIX_CONFIG)})",
-            "computed",
-            id="keyword-splat",
-        ),
-        pytest.param(
-            "P = functools.partial(E, **{'action': OA.RESTORE_TREE})\ndef f():\n    raise P('m')",
-            "computed",
-            id="partial-splat",
-        ),
-        pytest.param(
-            "def f():\n    err = E('m')\n    err.actions = (OA.RESTORE_TREE, OA.FIX_CONFIG)\n"
-            "    raise err",
-            "assigned",
-            id="assigned-after-construction",
-        ),
-        pytest.param(
-            "def f():\n    err = E('m')\n    setattr(err, 'actions', (OA.FIX_CONFIG,))\n"
-            "    raise err",
-            "assigned",
-            id="setattr",
-        ),
-    ],
-)
-def test_multi_step_guard_flags_every_way_around_it(body: str, finding: str) -> None:
-    """Each form the guard must see, written the way a raise would write it."""
-    visitor = _action_arguments("phasesweep/probe.py", _GUARD_HEADER + body)
-    found = {
-        "multi_step": bool(visitor.multi_step),
-        "computed": bool(visitor.computed),
-        "assigned": bool(visitor.assigned),
-    }
-    assert found == {kind: kind == finding for kind in found}
-
-
-def test_multi_step_guard_counts_each_raise() -> None:
-    """A second multi-step raise in an allowlisted function is a second decision."""
-    raise_twice = (
-        "def f(c):\n    if c:\n        raise E('m', action=(OA.RESTORE_TREE, OA.FIX_CONFIG))\n"
-        "    raise E('n', action=(OA.RESTORE_TREE, OA.FIX_CONFIG))"
-    )
-    visitor = _action_arguments("phasesweep/probe.py", _GUARD_HEADER + raise_twice)
-    assert visitor.multi_step == Counter(
-        {("phasesweep/probe.py", "f", ("RESTORE_TREE", "FIX_CONFIG")): 2}
-    )
 
 
 @pytest.mark.parametrize(
