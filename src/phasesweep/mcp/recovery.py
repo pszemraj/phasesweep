@@ -603,6 +603,7 @@ def _load_recovery_studies(
         ArtifactRootConflictError,
         StudySchemaMismatchError,
         IncompleteJournalRecordError,
+        LedgerTransactionInterruptedError,
     ) as exc:
         raise RunRecoveryError.rewrap(exc, str(exc)) from exc
     except StudyStorageUnavailableError as exc:
