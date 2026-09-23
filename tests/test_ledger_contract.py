@@ -8,27 +8,34 @@ that validate first. This module enforces that statically with :mod:`ast`, so a
 new call site fails in CI before it can ever run.
 
 Most storage entry points are banned by name (:data:`BANNED_LEAVES`): calling,
-referencing, or importing one all count. ``optuna.Study`` is banned only as a
-call (:data:`BANNED_CALLS`), because the same class is the package's study
-annotation.
+referencing, or importing one all count. ``optuna.Study`` and
+``sqlite3.Connection`` are banned only as calls (:data:`BANNED_CALLS`), because
+the same classes annotate study and connection objects.
 
-The chokepoint is ``phasesweep/engine/ledger.py``. Two ratchet dicts
-(:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) record what is still
-reachable from outside it. They are compared for *equality*, not containment:
-adding a call site fails, and removing one fails until the ratchet is tightened
-in the same commit. Both are empty: every storage constructor and every
-storage-private helper is reached only through the ledger's public handle API,
-so any entry added to either one is a new bypass that needs a stated reason.
+The chokepoint is ``phasesweep/engine/ledger.py``. Its private names are read
+from its own source, so a new helper is private the moment it is defined. Two
+ratchet dicts (:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) record
+what is still reachable from outside it. They are compared for *equality*, not
+containment: adding a call site fails, and removing one fails until the ratchet
+is tightened in the same commit. Both are empty: every storage constructor and
+every storage-private helper is reached only through the ledger's public handle
+API, so any entry added to either one is a new bypass that needs a stated
+reason.
+
+Each detector also runs over synthetic source that must trip it, so a detector
+that stops finding anything fails here instead of passing every real module.
 
 Out of scope on purpose, because no static reader can follow them: dynamic
 attribute access such as ``getattr(optuna, "create_study")``, and anything
 reached through :mod:`importlib`. Both are absent from ``src/phasesweep``
-today; the tier-guard and review process, not this test, keep them out.
+today, and no automated gate keeps them out: ``tests/tiers.py`` scans only test
+modules, so review is the only guard.
 """
 
 from __future__ import annotations
 
 import ast
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -41,7 +48,9 @@ CHOKEPOINT = "phasesweep/engine/ledger.py"
 
 #: Storage entry points no module outside :data:`CHOKEPOINT` may name.
 #: ``JournalStorage`` is banned outright, like ``RDBStorage``: over any backend
-#: it is live storage, and only the chokepoint names it, even as a type.
+#: it is live storage, and only the chokepoint names it, even as a type. The
+#: study listers take a storage URL and build that storage to answer, so they
+#: create a missing SQLite file like any other constructor.
 BANNED_LEAVES: dict[str, frozenset[str]] = {
     "optuna": frozenset(
         {
@@ -49,6 +58,8 @@ BANNED_LEAVES: dict[str, frozenset[str]] = {
             "load_study",
             "delete_study",
             "copy_study",
+            "get_all_study_names",
+            "get_all_study_summaries",
             "get_storage",
             "RDBStorage",
             "JournalFileBackend",
@@ -56,43 +67,19 @@ BANNED_LEAVES: dict[str, frozenset[str]] = {
             "JournalStorage",
         }
     ),
-    "sqlalchemy": frozenset({"create_engine"}),
+    "sqlalchemy": frozenset({"create_engine", "engine_from_config"}),
     "sqlite3": frozenset({"connect"}),
 }
 
 #: Storage entry points no module outside :data:`CHOKEPOINT` may *call*.
 #: ``optuna.Study(name, storage)`` resolves a storage URL through
-#: ``get_storage`` internally, but the class also annotates study objects
-#: throughout the package, so only a call to it counts.
+#: ``get_storage`` internally, and ``sqlite3.Connection(path)`` opens the
+#: database itself, but both classes also annotate objects throughout the
+#: package, so only a call to either counts.
 BANNED_CALLS: dict[str, frozenset[str]] = {
     "optuna": frozenset({"Study"}),
+    "sqlite3": frozenset({"Connection"}),
 }
-
-#: Every private helper :data:`CHOKEPOINT` defines. Each assumes its caller
-#: already ran the validate-before-open order, so none may be imported outside
-#: the ledger; the public API reaches them only after that order holds.
-STORAGE_PRIVATE_NAMES = frozenset(
-    {
-        "_journal_path",
-        "_resolve_storage",
-        "_build_phase_study",
-        "_load_existing_phase_study",
-        "_scan_ledger_format",
-        "_validate_storage_versions",
-        "_phase_trial_stats",
-        "_phase_trial_stats_params",
-        "_sqlite_phase_trial_stats",
-        "_sqlite_study_exists",
-        "_load_journal_study_snapshot",
-        "_require_replay_matches_snapshot",
-        "_journal_snapshot_storage",
-        "_JournalSnapshot",
-        "_trial_stats_from_rows",
-        "_unavailable_phase_trial_stats",
-        "_decoded_string_attr",
-        "_describe_ledger",
-    }
-)
 
 #: Banned storage entry points still reachable outside the chokepoint.
 _LEGACY_SITES: dict[str, set[str]] = {}
@@ -133,15 +120,54 @@ def _module_name(relpath: str) -> str:
     return stem.removesuffix("/__init__").replace("/", ".")
 
 
-def _alias_table(tree: ast.AST) -> dict[str, str]:
+def _package(path: Path, relpath: str | None) -> str | None:
+    """Return the package a module's relative imports resolve against.
+
+    :param Path path: Module on disk.
+    :param str | None relpath: The module's ``src``-relative path, when it is
+        not the path's own location under ``src``.
+    :return str | None: Dotted package name, or ``None`` when the module sits
+        outside ``src`` and no ``relpath`` places it in a package.
+    """
+    if relpath is None:
+        if not path.is_relative_to(SRC):
+            return None
+        relpath = _relpath(path)
+    module = _module_name(relpath)
+    return module if relpath.endswith("/__init__.py") else module.rpartition(".")[0]
+
+
+def _import_source(node: ast.ImportFrom, package: str | None) -> str | None:
+    """Return the absolute module an ``ImportFrom`` reads, resolving relative levels.
+
+    :param ast.ImportFrom node: Import statement.
+    :param str | None package: Package of the importing module.
+    :return str | None: Absolute dotted module, or ``None`` when a relative
+        import cannot be anchored.
+    """
+    if not node.level:
+        return node.module
+    if not package:
+        return None
+    parts = package.split(".")
+    if node.level - 1 >= len(parts):
+        return None
+    base = ".".join(parts[: len(parts) - (node.level - 1)])
+    return f"{base}.{node.module}" if node.module else base
+
+
+def _alias_table(tree: ast.AST, package: str | None) -> dict[str, str]:
     """Map every bound import alias in a module to its fully qualified target.
 
     The table is deliberately scope-insensitive: a function-local
     ``from optuna.storages.journal import JournalFileBackend`` binds the same
     name as a module-level one as far as this contract is concerned, and
     function-local imports are exactly how a call site would otherwise hide.
+    Relative imports resolve against ``package``, so ``from .ledger import _x``
+    names the same helper as its absolute spelling.
 
     :param ast.AST tree: Parsed module.
+    :param str | None package: Package of the module, for relative imports.
     :return dict[str, str]: Bound name -> dotted target it refers to.
     """
     aliases: dict[str, str] = {}
@@ -155,13 +181,24 @@ def _alias_table(tree: ast.AST) -> dict[str, str]:
                     root = alias.name.split(".")[0]
                     aliases[root] = root
         elif isinstance(node, ast.ImportFrom):
-            if node.level or node.module is None:
-                # Relative imports never reach ``optuna``/``sqlite3``.
+            source = _import_source(node, package)
+            if source is None:
                 continue
             for alias in node.names:
                 bound = alias.asname or alias.name
-                aliases[bound] = f"{node.module}.{alias.name}"
+                aliases[bound] = f"{source}.{alias.name}"
     return aliases
+
+
+def _parse(path: Path, relpath: str | None) -> tuple[ast.Module, dict[str, str]]:
+    """Parse a module and build its import alias table.
+
+    :param Path path: Module to parse.
+    :param str | None relpath: ``src``-relative path anchoring relative imports.
+    :return tuple[ast.Module, dict[str, str]]: Parsed tree and alias table.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return tree, _alias_table(tree, _package(path, relpath))
 
 
 def _dotted(node: ast.expr) -> str | None:
@@ -211,7 +248,7 @@ def _is_banned(qualified: str, banned: dict[str, frozenset[str]] = BANNED_LEAVES
     return parts[-1] in banned.get(parts[0], frozenset())
 
 
-def banned_references(path: Path) -> set[str]:
+def banned_references(path: Path, *, relpath: str | None = None) -> set[str]:
     """Collect every banned storage entry point a module can reach.
 
     For :data:`BANNED_LEAVES`, both call targets (``optuna.create_study(...)``)
@@ -221,15 +258,12 @@ def banned_references(path: Path) -> set[str]:
     import spelling names the class.
 
     :param Path path: Module to scan.
+    :param str | None relpath: ``src``-relative path for a module that does
+        not live under ``src``, anchoring its relative imports.
     :return set[str]: Fully qualified banned names referenced by the module.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    aliases = _alias_table(tree)
-    found: set[str] = set()
-    for bound, target in aliases.items():
-        del bound
-        if _is_banned(target):
-            found.add(target)
+    tree, aliases = _parse(path, relpath)
+    found = {target for target in aliases.values() if _is_banned(target)}
     for node in ast.walk(tree):
         is_call = isinstance(node, ast.Call)
         target_node = node.func if isinstance(node, ast.Call) else node
@@ -246,34 +280,77 @@ def banned_references(path: Path) -> set[str]:
     return found
 
 
-def private_ledger_references(path: Path, ledger_module: str) -> set[str]:
+def ledger_private_names(path: Path) -> frozenset[str]:
+    """Return every private name a ledger module defines at module level.
+
+    A private name is a ``_``-prefixed, non-dunder def, class, or assignment
+    target, including one defined under a module-level ``if``, ``try``, or
+    ``with``. Each assumes its caller already ran the validate-before-open
+    order, so none may be imported outside the ledger. Names the module only
+    imports belong to their defining module and are not listed.
+
+    :param Path path: Ledger module to read.
+    :return frozenset[str]: The module's private names.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    pending: list[ast.stmt] = list(tree.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(
+                name.id
+                for target in node.targets
+                for name in ast.walk(target)
+                if isinstance(name, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.If):
+            pending.extend([*node.body, *node.orelse])
+        elif isinstance(node, ast.Try):
+            pending.extend([*node.body, *node.orelse, *node.finalbody])
+            for handler in node.handlers:
+                pending.extend(handler.body)
+        elif isinstance(node, ast.With):
+            pending.extend(node.body)
+    return frozenset(name for name in names if name.startswith("_") and not name.startswith("__"))
+
+
+def private_ledger_references(
+    path: Path,
+    ledger_module: str,
+    private_names: frozenset[str],
+    *,
+    relpath: str | None = None,
+) -> set[str]:
     """Collect the storage-private helpers a module borrows from the ledger.
 
-    Catches both ``from <ledger> import _x`` (including function-local ones)
-    and attribute access such as ``optuna_module._x``.
+    Catches ``from <ledger> import _x`` under any absolute or relative spelling
+    (including function-local ones) and attribute access such as
+    ``ledger._x``.
 
     :param Path path: Module to scan.
     :param str ledger_module: Dotted name of the chokepoint module.
+    :param frozenset[str] private_names: Names from :func:`ledger_private_names`.
+    :param str | None relpath: ``src``-relative path for a module that does
+        not live under ``src``, anchoring its relative imports.
     :return set[str]: Storage-private names this module reaches for.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    aliases = _alias_table(tree)
-    found: set[str] = set()
-    for target in aliases.values():
-        module, _, leaf = target.rpartition(".")
-        if module == ledger_module and leaf in STORAGE_PRIVATE_NAMES:
-            found.add(leaf)
+    tree, aliases = _parse(path, relpath)
+    qualified_names = set(aliases.values())
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Attribute):
-            continue
-        dotted = _dotted(node)
-        if dotted is None:
-            continue
-        qualified = _resolve(dotted, aliases)
-        if qualified is None:
-            continue
+        if isinstance(node, ast.Attribute):
+            dotted = _dotted(node)
+            qualified = _resolve(dotted, aliases) if dotted is not None else None
+            if qualified is not None:
+                qualified_names.add(qualified)
+    found: set[str] = set()
+    for qualified in qualified_names:
         module, _, leaf = qualified.rpartition(".")
-        if module == ledger_module and leaf in STORAGE_PRIVATE_NAMES:
+        if module == ledger_module and leaf in private_names:
             found.add(leaf)
     return found
 
@@ -313,24 +390,15 @@ def test_ledger_private_names_are_not_imported_outside_the_ledger_module() -> No
     """Storage-private ledger helpers stay private outside the ledger module."""
     chokepoint = SRC / CHOKEPOINT
     ledger_module = _module_name(CHOKEPOINT)
-    tree = ast.parse(chokepoint.read_text(encoding="utf-8"), filename=str(chokepoint))
-    defined = {
-        node.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
-    }
-    missing = sorted(STORAGE_PRIVATE_NAMES - defined)
-    assert not missing, (
-        f"STORAGE_PRIVATE_NAMES lists {missing}, which {CHOKEPOINT} does not define; "
-        "the list is stale."
-    )
+    private_names = ledger_private_names(chokepoint)
+    assert private_names, f"{CHOKEPOINT} defines no private names; the derivation broke."
 
     found: dict[str, set[str]] = {}
     for path in _source_files():
         relpath = _relpath(path)
         if relpath == CHOKEPOINT:
             continue
-        references = private_ledger_references(path, ledger_module)
+        references = private_ledger_references(path, ledger_module, private_names)
         if references:
             found[relpath] = references
 
@@ -343,38 +411,51 @@ def test_ledger_private_names_are_not_imported_outside_the_ledger_module() -> No
     )
 
 
-def test_visitor_flags_study_construction_but_not_study_annotations(tmp_path: Path) -> None:
-    """``optuna.Study`` is banned as a call only; every other live-storage builder always.
+def test_visitor_flags_storage_construction_but_not_type_annotations(tmp_path: Path) -> None:
+    """Classes banned as calls stay usable as types; every other builder is banned outright.
 
-    ``optuna.Study(name, storage)`` resolves a storage URL internally, so it is
-    a constructor the ban must see, yet the same class annotates study objects
-    all over the package. A direct ``JournalStorage`` over any backend and a
-    ``sqlalchemy`` engine are storage too. The visitor has to tell a call from
-    a type, whichever import spelling reaches the class.
+    ``optuna.Study(name, storage)`` resolves a storage URL internally and
+    ``sqlite3.Connection(path)`` opens the file, so the ban must see both
+    calls, yet the same classes annotate study and connection objects all over
+    the package. The visitor has to tell a call from a type, whichever import
+    spelling reaches the class. Parsing a SQLite URL the way SQLAlchemy does
+    opens nothing, so it stays allowed.
     """
     annotated = tmp_path / "annotated.py"
     annotated.write_text(
         "import optuna\n"
+        "import sqlite3\n"
         "from optuna import Study\n"
         "from optuna.study import Study as Aliased\n"
+        "from sqlalchemy.engine import make_url\n"
         "\n"
-        "def keep(study: optuna.Study, other: Study) -> optuna.study.Study:\n"
+        "def keep(study: optuna.Study, other: Study, conn: sqlite3.Connection) -> optuna.study.Study:\n"
         "    x: Aliased = study\n"
-        "    return isinstance(other, optuna.Study) and x\n",
+        "    url = make_url('sqlite:///db')\n"
+        "    url.get_dialect()().create_connect_args(url)\n"
+        "    return isinstance(other, optuna.Study) and isinstance(conn, sqlite3.Connection) and x\n",
         encoding="utf-8",
     )
     constructing = tmp_path / "constructing.py"
     constructing.write_text(
         "import optuna\n"
         "import sqlalchemy\n"
+        "import sqlite3\n"
         "from optuna.study import Study as Aliased\n"
+        "from optuna.study import get_all_study_summaries\n"
         "from optuna.storages import JournalStorage\n"
+        "from sqlite3 import Connection\n"
         "\n"
-        "def build(url, backend):\n"
+        "def build(url, backend, config):\n"
         "    optuna.Study('s', url)\n"
         "    optuna.study.Study('s', url)\n"
         "    Aliased('s', url)\n"
+        "    optuna.get_all_study_names(storage=url)\n"
+        "    get_all_study_summaries(storage=url)\n"
+        "    sqlite3.Connection(url)\n"
+        "    Connection(url)\n"
         "    sqlalchemy.create_engine(url)\n"
+        "    sqlalchemy.engine_from_config(config)\n"
         "    return JournalStorage(backend)\n",
         encoding="utf-8",
     )
@@ -383,47 +464,212 @@ def test_visitor_flags_study_construction_but_not_study_annotations(tmp_path: Pa
     assert banned_references(constructing) == {
         "optuna.Study",
         "optuna.study.Study",
+        "optuna.get_all_study_names",
+        "optuna.study.get_all_study_summaries",
         "optuna.storages.JournalStorage",
+        "sqlite3.Connection",
         "sqlalchemy.create_engine",
+        "sqlalchemy.engine_from_config",
     }
+
+
+def test_ledger_private_names_are_derived_from_its_source(tmp_path: Path) -> None:
+    """Every module-level private definition counts, and nothing public or imported does."""
+    ledger = tmp_path / "ledger.py"
+    ledger.write_text(
+        "from phasesweep.engine.optuna import _borrowed\n"
+        "__all__ = ['public']\n"
+        "_SQL = 'SELECT 1'\n"
+        "_TYPED: int = 1\n"
+        "_A, _B = 1, 2\n"
+        "def _helper(): ...\n"
+        "async def _async_helper(): ...\n"
+        "class _Snapshot: ...\n"
+        "try:\n"
+        "    def _guarded(): ...\n"
+        "except ImportError:\n"
+        "    def _fallback(): ...\n"
+        "if True:\n"
+        "    _CONDITIONAL = 1\n"
+        "def public():\n"
+        "    _local = 1\n"
+        "    def _nested(): ...\n",
+        encoding="utf-8",
+    )
+
+    assert ledger_private_names(ledger) == {
+        "_SQL",
+        "_TYPED",
+        "_A",
+        "_B",
+        "_helper",
+        "_async_helper",
+        "_Snapshot",
+        "_guarded",
+        "_fallback",
+        "_CONDITIONAL",
+    }
+
+
+#: Case id -> (importing module's ``src``-relative path, its source, helpers it borrows).
+PRIVATE_IMPORT_PROBES: dict[str, tuple[str, str, set[str]]] = {
+    "absolute": (
+        "phasesweep/cli.py",
+        "from phasesweep.engine.ledger import _helper\n",
+        {"_helper"},
+    ),
+    "function-local-alias": (
+        "phasesweep/cli.py",
+        "def f():\n    from phasesweep.engine.ledger import _Snapshot as S\n    return S\n",
+        {"_Snapshot"},
+    ),
+    "module-attribute": (
+        "phasesweep/cli.py",
+        "import phasesweep.engine.ledger as ledger\n\nledger._SQL\n",
+        {"_SQL"},
+    ),
+    "sibling-relative": (
+        "phasesweep/engine/read.py",
+        "from .ledger import _helper\n",
+        {"_helper"},
+    ),
+    "parent-relative": (
+        "phasesweep/mcp/recovery.py",
+        "from ..engine.ledger import _Snapshot\n",
+        {"_Snapshot"},
+    ),
+    "package-relative-attribute": (
+        "phasesweep/engine/read.py",
+        "from . import ledger\n\nledger._SQL\n",
+        {"_SQL"},
+    ),
+    "from-package-init": (
+        "phasesweep/engine/__init__.py",
+        "from .ledger import _helper\n",
+        {"_helper"},
+    ),
+    "public-name": (
+        "phasesweep/engine/read.py",
+        "from .ledger import validate_ledger\n",
+        set(),
+    ),
+    "other-package-ledger": (
+        "phasesweep/mcp/recovery.py",
+        "from .ledger import _helper\n",
+        set(),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(PRIVATE_IMPORT_PROBES))
+def test_private_import_detector_resolves_every_spelling(case: str, tmp_path: Path) -> None:
+    """Each import spelling of a ledger private is caught; public and foreign names are not."""
+    relpath, source, expected = PRIVATE_IMPORT_PROBES[case]
+    module = tmp_path / "probe.py"
+    module.write_text(source, encoding="utf-8")
+    private_names = frozenset({"_helper", "_Snapshot", "_SQL"})
+
+    found = private_ledger_references(
+        module, "phasesweep.engine.ledger", private_names, relpath=relpath
+    )
+
+    assert found == expected
+
+
+def _annotation_names(annotation: ast.expr) -> Iterator[str]:
+    """Yield every name an annotation mentions, looking inside quoted forward references.
+
+    :param ast.expr annotation: Annotation expression.
+    :return Iterator[str]: Bare names and attribute leaves, in walk order.
+    """
+    for part in ast.walk(annotation):
+        if isinstance(part, ast.Name):
+            yield part.id
+        elif isinstance(part, ast.Attribute):
+            yield part.attr
+        elif isinstance(part, ast.Constant) and isinstance(part.value, str):
+            try:
+                quoted = ast.parse(part.value, mode="eval").body
+            except SyntaxError:
+                continue  # a ``Literal`` string, not a type
+            yield from _annotation_names(quoted)
+
+
+def _return_type_problem(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
+    """Explain why a public ledger function's return annotation is not concrete.
+
+    :param node: Function definition to check.
+    :return str | None: The problem, or ``None`` when the annotation names only
+        concrete types.
+    """
+    if node.returns is None:
+        return "no return annotation"
+    if any(name in ("Any", "object") for name in _annotation_names(node.returns)):
+        return f"returns {ast.unparse(node.returns)}, which admits any object"
+    return None
 
 
 def test_ledger_public_api_returns_concrete_types() -> None:
     """Every name the ledger exports is defined and annotated with a real type."""
     chokepoint = SRC / CHOKEPOINT
     tree = ast.parse(chokepoint.read_text(encoding="utf-8"), filename=str(chokepoint))
-    exported: list[str] | None = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(target, ast.Name) and target.id == "__all__" for target in node.targets
-        ):
+    exported: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets, value = [node.target], node.value
+        else:
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "__all__" for target in targets):
             exported = [
                 element.value
-                for element in getattr(node.value, "elts", [])
+                for element in getattr(value, "elts", [])
                 if isinstance(element, ast.Constant) and isinstance(element.value, str)
             ]
-    if exported is None:
-        pytest.skip(
-            f"{CHOKEPOINT} has no __all__, so its public API is undeclared and there "
-            "is nothing for this test to check."
-        )
+    assert exported, (
+        f"{CHOKEPOINT} declares no names in __all__, so its public API is undeclared; "
+        "list the handles and openers other modules may use."
+    )
 
     definitions = {
         node.name: node
-        for node in ast.walk(tree)
+        for node in tree.body
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
     }
     problems: list[str] = []
     for name in exported:
         node = definitions.get(name)
         if node is None:
-            problems.append(f"{name}: exported but not defined")
+            problems.append(f"{name}: exported but not a module-level function or class")
             continue
         if isinstance(node, ast.ClassDef):
             continue
-        returns = node.returns
-        if returns is None:
-            problems.append(f"{name}: no return annotation")
-        elif isinstance(returns, ast.Name) and returns.id == "Any":
-            problems.append(f"{name}: returns Any instead of a concrete ledger type")
+        problem = _return_type_problem(node)
+        if problem is not None:
+            problems.append(f"{name}: {problem}")
     assert not problems, "Ledger public API is not concretely typed: " + "; ".join(problems)
+
+
+@pytest.mark.parametrize(
+    ("annotation", "concrete"),
+    [
+        ("optuna.Study | None", True),
+        ("ClaimedLedger", True),
+        ("'ClaimedLedger'", True),
+        ("list['ClaimedLedger']", True),
+        ("Literal['memory', 'on disk']", True),
+        ("Any", False),
+        ("typing.Any", False),
+        ("Any | None", False),
+        ("dict[str, Any]", False),
+        ("object", False),
+        ("'Any'", False),
+        ("list['Any']", False),
+    ],
+)
+def test_concrete_return_rule_rejects_any_object(annotation: str, concrete: bool) -> None:
+    """``Any`` or ``object`` anywhere in a return annotation fails the public-API rule."""
+    node = ast.parse(f"def f() -> {annotation}: ...").body[0]
+    assert isinstance(node, ast.FunctionDef)
+    assert (_return_type_problem(node) is None) is concrete
