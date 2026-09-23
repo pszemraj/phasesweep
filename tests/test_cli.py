@@ -714,7 +714,7 @@ def _corrupt_the_publication(config_path: Path) -> str:
     return generation_id
 
 
-def test_status_reports_a_corrupt_publication_and_exits_nonzero(
+def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -723,7 +723,9 @@ def test_status_reports_a_corrupt_publication_and_exits_nonzero(
 
     ``status`` used to print a payload byte-identical to a never-run workdir
     and exit 0, so the operator's natural next move -- re-run -- advanced the
-    pointer and erased the only evidence of corruption.
+    pointer and erased the only evidence of corruption. ``show-winners`` must
+    likewise not answer "no winner yet" over it. Both commands are read-only,
+    so they share one corrupted tree.
     """
     config_path = _published_experiment_config(tmp_path)
     run_experiment(load_experiment(config_path))
@@ -743,17 +745,6 @@ def test_status_reports_a_corrupt_publication_and_exits_nonzero(
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
     assert "Do not run anything over this tree" in captured.err
-
-
-def test_show_winners_reports_a_corrupt_publication_and_exits_nonzero(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """``show-winners`` must not answer "no winner yet" over a corrupt publication."""
-    config_path = _published_experiment_config(tmp_path)
-    run_experiment(load_experiment(config_path))
-    generation_id = _corrupt_the_publication(config_path)
 
     exit_code = _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch)
 
