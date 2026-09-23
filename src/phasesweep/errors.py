@@ -86,13 +86,26 @@ class PhaseSweepError(RuntimeError):
         :param OperatorAction | tuple[OperatorAction, ...] | None action:
             Remediation for this one raise, overriding the class's
             :attr:`default_action`: one step, or every required step in order.
+        :raises TypeError: ``action`` is not one step or a non-empty tuple of
+            distinct steps.
         """
         super().__init__(*args)
         if action is None:
             action = type(self).default_action
-        self.actions: tuple[OperatorAction, ...] = (
-            (action,) if isinstance(action, OperatorAction) else action
-        )
+        steps = (action,) if isinstance(action, OperatorAction) else action
+        # Callers route by these as an ordered, hashable set of real steps: a
+        # string, list, empty, or repeated value would misroute without failing.
+        if not (
+            isinstance(steps, tuple)
+            and steps
+            and all(isinstance(step, OperatorAction) for step in steps)
+            and len(set(steps)) == len(steps)
+        ):
+            raise TypeError(
+                "action must be None, an OperatorAction, or a non-empty tuple of distinct "
+                f"OperatorActions, not {action!r}"
+            )
+        self.actions: tuple[OperatorAction, ...] = steps
 
     @classmethod
     def rewrap(

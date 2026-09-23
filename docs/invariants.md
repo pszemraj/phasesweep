@@ -324,7 +324,9 @@ step unless the operator must do several, every one of them: alternatives
 route the one that keeps the operator's existing work, and retrying what failed
 is never a step. A raise
 that requires several steps is allowlisted in the routing test, so adding one
-is a reviewed decision. `recover-run` never routes a refusal back to itself
+is a reviewed decision; the only ones left restore both the ledger and the tree
+where the two disagree about a trial's attempt, since either side may be the
+one that changed. `recover-run` never routes a refusal back to itself
 except to a confirmed run, so `RunRecoveryError` defaults to reading the logs.
 An MCP run's failure payload takes its next steps only from the actions, one
 phrase per step, so no error type gives the agent advice of its own.

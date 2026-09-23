@@ -197,21 +197,22 @@ def lock_dir() -> Path:
 
     # Shells and services for one account must contend even when HOME or XDG
     # settings differ. Only the explicit lock override may move this namespace.
-    # Without a usable home, the operator must both provision a directory and
-    # point the override at it: the override never creates what it names.
+    # Without a usable home, the operator provisions a lock directory and
+    # points the override at it, since the override never creates what it
+    # names. Both are setting up the environment PhaseSweep runs in: one step.
     try:
         home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
     except KeyError as exc:
         raise UnsafeLockPathError(
             f"No OS account home exists for uid {os.geteuid()}; provision an absolute "
             f"lock directory and set {_LOCK_DIR_ENV}.",
-            action=(OperatorAction.RESTORE_TREE, OperatorAction.FIX_CONFIG),
+            action=OperatorAction.FIX_CONFIG,
         ) from exc
     if not home.is_absolute():
         raise UnsafeLockPathError(
             f"The OS account home is not absolute; provision an absolute lock directory "
             f"and set {_LOCK_DIR_ENV}.",
-            action=(OperatorAction.RESTORE_TREE, OperatorAction.FIX_CONFIG),
+            action=OperatorAction.FIX_CONFIG,
         )
     path = home / ".cache" / "phasesweep" / "locks"
     try:
