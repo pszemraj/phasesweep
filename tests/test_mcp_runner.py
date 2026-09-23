@@ -1312,6 +1312,7 @@ phases:
 
 
 @pytest.mark.integration
+@pytest.mark.signals_own_pid
 def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1333,9 +1334,8 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     """
     import phasesweep.runtime.shutdown as runtime_shutdown
 
-    # Restores the module's pending-shutdown marker to ``None`` at teardown, so
-    # a failure before the runner services the signal cannot leak an absorbed
-    # shutdown into an unrelated later test.
+    # Resets the pending-shutdown marker at teardown, so a failure before the
+    # runner services the signal cannot leak the absorbed shutdown into a later test.
     monkeypatch.setattr(runtime_shutdown, "_deferred_shutdown_signum", None)
 
     config_path, config_sha256 = _constant_trial_config(tmp_path, "cancel_at_capture")

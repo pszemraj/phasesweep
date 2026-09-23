@@ -600,6 +600,7 @@ def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
     assert close_calls
 
 
+@pytest.mark.signals_own_pid
 def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

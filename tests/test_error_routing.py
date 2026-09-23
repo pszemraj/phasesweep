@@ -1511,8 +1511,8 @@ def _recover_without_boot_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 def _live_uncertain_run(state_dir: Path) -> tuple[RunStore, RunHandle]:
     """Record a cleanup-uncertain run whose runner is this live test process.
 
-    ``make_run_handle`` gives the runner a process group no test owns, so a
-    regressed liveness check still cannot signal pytest.
+    A regressed liveness check would signal pytest's real group; conftest's
+    ``guard_runner_signals`` fails the test instead of delivering it.
     """
     store = RunStore(state_dir)
     handle = make_run_handle(run_id="wrap-recover")

@@ -15,7 +15,7 @@ import stat
 import textwrap
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, NoReturn, ParamSpec, TypeVar
 
 import optuna
 import pytest
@@ -319,6 +319,82 @@ def isolate_signal_ownership_tokens() -> Iterator[None]:
     """
     with restored_signal_ownership():
         yield
+
+
+#: Marker for a test that signals its own process on purpose, to drive a
+#: shutdown handler. It lifts only that one target from the runner guard.
+SIGNALS_OWN_PID = "signals_own_pid"
+
+
+class RunnerSignalGuard:
+    """``os.kill``/``os.killpg`` replacements that refuse to signal the test runner.
+
+    Protected: pytest's PID and its parent's PID, and the process groups of
+    both. Signal 0 only probes liveness and always passes through.
+    """
+
+    def __init__(self, *, allow_own_pid: bool) -> None:
+        """Record the protected targets as they are when the test starts.
+
+        :param bool allow_own_pid: Let signals reach pytest's own PID, but no
+            other protected target.
+        """
+        own_pid, parent_pid = os.getpid(), os.getppid()
+        self.pids = frozenset({parent_pid} if allow_own_pid else {own_pid, parent_pid})
+        groups = {os.getpgrp()}
+        with contextlib.suppress(OSError):
+            groups.add(os.getpgid(parent_pid))
+        self.groups = frozenset(groups)
+        self.refused: list[str] = []
+        # The guard's own tests swap these for recorders, so a regressed guard
+        # still cannot deliver the signal it was meant to refuse.
+        self.send_kill: Callable[[int, int], None] = os.kill
+        self.send_killpg: Callable[[int, int], None] = os.killpg
+
+    def _refuse(self, call: str) -> NoReturn:
+        self.refused.append(call)
+        # ``pytest.fail`` raises a BaseException, so the broad ``except
+        # Exception`` around kills in the code under test cannot swallow it.
+        pytest.fail(f"{call} would signal the test runner, its parent, or their process group")
+
+    def kill(self, pid: int, sig: int) -> None:
+        """Forward ``os.kill`` unless it would signal a protected target."""
+        # 0 addresses the caller's own group, -1 every process, -N group N.
+        if sig != 0 and (pid in self.pids or pid in (0, -1) or -pid in self.groups):
+            self._refuse(f"os.kill({pid}, {sig!r})")
+        self.send_kill(pid, sig)
+
+    def killpg(self, pgid: int, sig: int) -> None:
+        """Forward ``os.killpg`` unless it would signal a protected group."""
+        if sig != 0 and (pgid == 0 or pgid in self.groups):
+            self._refuse(f"os.killpg({pgid}, {sig!r})")
+        self.send_killpg(pgid, sig)
+
+
+@pytest.fixture(autouse=True)
+def guard_runner_signals(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> Iterator[RunnerSignalGuard]:
+    """Fail any test whose code would send a real signal to the test runner.
+
+    A default ``make_run_handle`` names pytest's live PID, and
+    ``patch_popen_capture`` names pytest's parent, each with a matching start
+    time. ``kill_stale_group`` trusts such an identity and signals
+    ``os.getpgid(pid)``: pytest's real process group. Tests patch the reaper out
+    of those paths; this guard catches the one that forgets. A refusal also
+    fails the test at teardown, in case a ``BaseException`` boundary in the code
+    under test swallowed the in-call failure. A test that signals itself on
+    purpose opts out with ``@pytest.mark.signals_own_pid``.
+    """
+    guard = RunnerSignalGuard(
+        allow_own_pid=request.node.get_closest_marker(SIGNALS_OWN_PID) is not None
+    )
+    monkeypatch.setattr(os, "kill", guard.kill)
+    monkeypatch.setattr(os, "killpg", guard.killpg)
+    yield guard
+    if guard.refused:
+        pytest.fail("refused signals to the test runner: " + ", ".join(guard.refused))
 
 
 def copy_fake_train(tmp_path: Path) -> Path:

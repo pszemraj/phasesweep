@@ -2572,6 +2572,7 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
 
 
 @pytest.mark.integration
+@pytest.mark.signals_own_pid
 def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_restore() -> None:
     """A signal pending at scope-exit must reach the restored HOST handler, not
     ``_shutdown_handler`` mid-restoration (review v0.5.15 / blocker 2A).
@@ -2603,12 +2604,11 @@ def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_rest
             os.kill(os.getpid(), signal.SIGTERM)
             assert received == [], "signal fired before scope exit"
 
-        # Scope exit order: block -> restore handlers -> restore mask. The
-        # pending SIGTERM is delivered on the final unblock, by which point
-        # the HOST handler (not phasesweep's) is installed. CPython only
-        # invokes the Python-level handler at the next eval-breaker check,
-        # not necessarily synchronously with the unblocking call, so poll
-        # briefly instead of asserting immediately.
+        # Scope exit order: block -> restore handlers -> restore mask. The pending
+        # SIGTERM is delivered on the final unblock, by which point the HOST handler
+        # (not phasesweep's) is installed. CPython only invokes the Python-level handler
+        # at the next eval-breaker check, not necessarily synchronously with the
+        # unblocking call, so poll briefly instead of asserting immediately.
         deadline = time.monotonic() + 2.0
         while not received and time.monotonic() < deadline:
             time.sleep(0.001)
@@ -2821,14 +2821,14 @@ def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.signals_own_pid
 def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint() -> None:
     """A shutdown inside an absorb window is reported, not raised — then honored later.
 
-    The publication transaction uses this to win its race against a shutdown
-    signal deterministically (review v0.5.16 / blocker 1): the window exit
-    reports the absorbed signal on the yielded object instead of raising, and
-    the next ``defer_shutdown_signals()`` exit (e.g. the next trial launch)
-    still delivers the shutdown before new work starts.
+    The publication transaction uses this to win its race against a shutdown signal
+    deterministically (review v0.5.16 / blocker 1): the window exit reports the absorbed signal on
+    the yielded object instead of raising, and the next ``defer_shutdown_signals()`` exit (e.g. the
+    next trial launch) still delivers the shutdown before new work starts.
     """
     prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
     try:

@@ -203,9 +203,13 @@ def make_run_handle(
     else:
         process_id = os.getpid() if pid is None else pid
         # Default fixtures need a genuinely live PID so RunStore state checks
-        # see a running handle, but must never target pytest's own process
-        # group if a cancellation guard regresses. Explicit PID fixtures keep
-        # their matching PGID for process-lifecycle tests.
+        # see a running handle, so the default runner is pytest itself. The
+        # unused PGID keeps code that reads ``handle.pgid`` off real groups, but
+        # it is no protection from ``kill_stale_group``: a live PID with a
+        # matching start time makes it signal ``os.getpgid(pid)``, pytest's real
+        # group. The autouse ``guard_runner_signals`` fixture in conftest is
+        # what fails a test that reaches it. Explicit PID fixtures keep their
+        # matching PGID for process-lifecycle tests.
         process_group_id = 2_000_000_000 if pid is None else process_id
         process_starttime = read_proc_starttime(process_id) if starttime is None else starttime
     return RunHandle(

@@ -513,6 +513,7 @@ def test_terminal_callback_control_flow_exception_cannot_replace_failure(
 
 
 @pytest.mark.integration
+@pytest.mark.signals_own_pid
 def test_shutdown_signal_during_publication_is_absorbed_until_committed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
