@@ -97,15 +97,17 @@ path handling and are not symlink-hardened; records that need crash-safe
 replacement, including those two, are written to a temporary file and renamed
 into place atomically.
 
-Three things inside the tree are hardened. `config.snapshot.yaml` (the warning
-above explains why) and the `environment.json` a trial writes when
-`execution.record_env` is set are created owner-only (`0600`) while their
-directories keep ordinary permissions, and PhaseSweep refuses to replace either
-unless the existing file is already an owner-only regular file with no other
-hard links. The attempt registry under `attempts/` is an owner-only (`0700`)
-directory of `0600` entries, and PhaseSweep refuses to read it through a
-symlink or with shared permissions. The same validated, no-follow path handling
-protects the runtime lock namespace and the MCP `state_dir`.
+Three things inside the tree are hardened:
+
+| Path | Mode | PhaseSweep refuses to |
+| --- | --- | --- |
+| `generations/<generation-id>/config.snapshot.yaml` | `0600` | replace it unless the existing file is an owner-only regular file with no other hard links |
+| `environment.json` in a trial directory, written only when `execution.record_env` is set | `0600` | replace it under the same condition |
+| `attempts/`, the attempt registry | `0700` directory of `0600` entries | read it through a symlink or with shared permissions |
+
+The two files are owner-only while their directories keep ordinary
+permissions. The same validated, no-follow path handling protects the runtime
+lock namespace and the MCP `state_dir`.
 
 ## Storage and locks
 
