@@ -310,14 +310,8 @@ def test_runner_finalizes_pre_captured_terminal_snapshot(tmp_path: Path) -> None
 
 @pytest.mark.integration
 def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: Path) -> None:
-    trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-        sampler=Sampler(type="random", seed=0),
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=1
     )
     captured: dict[str, object] = {}
 
@@ -1066,14 +1060,8 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
     storage flakiness that the tolerant status read itself shrugs off. The
     fatal read simply no longer happens.
     """
-    trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-        sampler=SEEDED_RANDOM,
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=1
     )
     reports: list[TerminalReport] = []
 
@@ -1402,7 +1390,6 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     critically, the last-success pointer stay exactly as the prior successful
     publication left them.
     """
-    trainer = write_constant_trainer(tmp_path)
     phases = [
         Phase(
             name="a", n_trials=1, fixed_overrides={"k": 1}, sampler=SEEDED_RANDOM, search_space={}
@@ -1410,11 +1397,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
         Phase(name="b", n_trials=1, inherits=["a"], sampler=SEEDED_RANDOM, search_space={}),
     ]
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=phases,
+        persistent=tmp_path, trainer=write_constant_trainer(tmp_path), phases=phases
     )
     run_experiment(experiment)
     first_generation = _last_successful_generation_id(experiment)

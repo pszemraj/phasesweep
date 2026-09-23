@@ -78,11 +78,7 @@ def test_run_experiment_writes_summary_at_namespaced_path(
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     source = tmp_path / "experiment.yaml"
     source.write_text("# operator-authored configuration\n")
-    exp = make_experiment(
-        workdir=str(tmp_path / workdir_name),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-    )
+    exp = make_experiment(workdir=str(tmp_path / workdir_name), trainer=trainer)
     if existing_workdir:
         Path(exp.workdir).mkdir(exist_ok=True)
     run_experiment(exp)
