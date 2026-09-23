@@ -42,22 +42,14 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
         workdir=tmp_path / "wd",
         storage=storage,
         trial_command="python x.py {overrides}",
-        override_format="argparse",
         metric=Metric(
             name="loss",
-            goal="minimize",
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                # Seeded random keeps this helper usable with persistent storage,
-                # which rejects an unseeded stochastic sampler.
-                sampler=Sampler(type="random", seed=0),
-                search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
-            )
-        ],
+        n_trials=1,
+        # Explicit, because in-memory storage gets no injected default sampler.
+        sampler=Sampler(type="random", seed=0),
+        search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
     )
 
 
