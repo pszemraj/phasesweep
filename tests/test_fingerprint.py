@@ -96,6 +96,7 @@ from tests.conftest import (
     write_trainer,
     write_yaml,
 )
+from tests.ledger_fixtures import tree_snapshot
 
 
 def test_wandb_managed_defaults_and_rotating_credentials_do_not_change_cohort(monkeypatch):
@@ -983,19 +984,6 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
         )
 
 
-def _artifact_tree_bytes(root: Path) -> dict[str, bytes]:
-    """Snapshot every file under an experiment namespace for byte-identity checks.
-
-    :param Path root: Experiment artifact namespace to snapshot.
-    :return dict[str, bytes]: Relative path to file content for every regular file.
-    """
-    return {
-        str(path.relative_to(root)): path.read_bytes()
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
-
-
 @pytest.mark.integration
 def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path: Path) -> None:
     """One persistent study cannot back two publication roots (review v0.5.19 / finding F5)."""
@@ -1004,8 +992,9 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
     run_experiment(bound)
     bound_root = _experiment_dir(bound)
-    before = _artifact_tree_bytes(bound_root)
-    assert before
+    before = tree_snapshot(bound_root)
+    # More than the root itself, so the byte-identity check below is not vacuous.
+    assert set(before) > {"."}
 
     for phase in bound.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
@@ -1019,7 +1008,7 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     assert str(bound_root) in message
     assert str(_experiment_dir(moved)) in message
     assert "fresh artifact root and local storage" in message
-    assert _artifact_tree_bytes(bound_root) == before
+    assert tree_snapshot(bound_root) == before
     for phase in bound.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
