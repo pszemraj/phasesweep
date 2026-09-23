@@ -813,7 +813,7 @@ def _persist_cleanup_recovery(
 def _finish_result_recovery(
     store: RunStore,
     run_id: str,
-    terminal_status: dict[str, Any],
+    terminal_status: dict[str, object],
     needs: _RecoveryNeeds,
     evidence: _CleanupEvidence,
     publication_action: str | None,
@@ -887,7 +887,7 @@ def _finish_result_recovery(
 def _finalize_stored_terminal_result_snapshot(
     store: RunStore,
     run_id: str,
-    terminal_status: dict,
+    terminal_status: dict[str, Any],
     *,
     confirmed_attempt_ids: set[str],
     confirmed_attempt_locations: dict[str, tuple[str, int, str]],
@@ -896,7 +896,7 @@ def _finalize_stored_terminal_result_snapshot(
 
     :param RunStore store: Existing run store containing the terminal status.
     :param str run_id: Run whose stored terminal snapshot should be finalized.
-    :param dict terminal_status: Validated terminal process status to enrich.
+    :param dict[str, object] terminal_status: Validated terminal process status to enrich.
     :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to FAIL.
     :param dict confirmed_attempt_locations: Phase, trial, and generation of reconciled attempts.
     :raises RunRecoveryError: The stored snapshot is unavailable or persistence fails.

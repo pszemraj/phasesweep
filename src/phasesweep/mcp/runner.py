@@ -388,7 +388,7 @@ _STATUS_WRITE_BACKOFF_SECONDS: tuple[float, ...] = (0.05, 0.25)
 
 def _write_status_file_with_retry(
     status_path: Path,
-    payload: dict,
+    payload: dict[str, object],
     *,
     attempts: int = 3,
 ) -> None:
@@ -400,7 +400,7 @@ def _write_status_file_with_retry(
     immediately so it can downgrade the record to a serializable one.
 
     :param Path status_path: Destination ``status.json`` path for the run.
-    :param dict payload: JSON-serializable terminal status payload.
+    :param dict[str, object] payload: JSON-serializable terminal status payload.
     :param int attempts: Total attempts, including the first; must be at least one.
     :raises OSError: The final attempt's persistence failure, once the retry
         budget is exhausted.
@@ -531,9 +531,9 @@ class _RunnerPublicationHook(PublicationHook):
 
 def _write_status(
     status_path: Path,
-    payload: dict,
+    payload: dict[str, object],
     *,
-    result_snapshot: dict | None,
+    result_snapshot: dict[str, object] | None,
     result_snapshot_error: str | None,
 ) -> bool:
     """Persist terminal evidence and its already-captured result snapshot.
@@ -555,8 +555,8 @@ def _write_status(
     permanent.
 
     :param Path status_path: JSON file where terminal cause should be recorded.
-    :param dict payload: Status payload containing run id, return code, and error class.
-    :param dict | None result_snapshot: Raw snapshot captured under the experiment lock.
+    :param dict[str, object] payload: Status payload containing run id, return code, and error class.
+    :param dict[str, object] | None result_snapshot: Raw snapshot captured under the experiment lock.
     :param str | None result_snapshot_error: Capture error class when no snapshot exists.
     :return bool: Whether durable terminal evidence exists, i.e. some record
         (``pending``, ``complete``, or ``failed``) reached disk. ``False`` only
@@ -802,7 +802,7 @@ def main(argv: list[str] | None = None) -> int:
     # the run derives "running" behind its cleanup-uncertainty marker forever.
     install_signal_handlers()
 
-    status: dict = {
+    status: dict[str, object] = {
         "run_id": args.run_id,
         "from_phase": args.from_phase,
         "returncode": 0,
@@ -810,7 +810,7 @@ def main(argv: list[str] | None = None) -> int:
         "cleanup_confirmed": True,
         "failure": None,
     }
-    result_snapshot: dict | None = None
+    result_snapshot: dict[str, object] | None = None
     result_snapshot_error: str | None = None
     terminal_report: TerminalReport | None = None
     config: Experiment | None = None
@@ -919,11 +919,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     except PhaseSweepShutdown as exc:
         code = exc.code if isinstance(exc.code, int) else 1
-        status["cleanup_confirmed"] = (
+        cleanup_confirmed = (
             terminal_report.cleanup_confirmed
             if terminal_report is not None
             else exc.report.cleanup_confirmed
         )
+        status["cleanup_confirmed"] = cleanup_confirmed
         if terminal_report is None or terminal_report.primary_error is not None:
             status["returncode"] = code
             status["error_class"] = "cancelled"
@@ -931,7 +932,7 @@ def main(argv: list[str] | None = None) -> int:
             status["failure"] = _terminal_failure_payload(
                 primary,
                 stage=failure_stage,
-                cleanup_confirmed=status["cleanup_confirmed"],
+                cleanup_confirmed=cleanup_confirmed,
             )
         raise
     except ProcessCleanupUncertainError as exc:
@@ -951,13 +952,14 @@ def main(argv: list[str] | None = None) -> int:
         status["returncode"] = 1
         primary, failure_stage = _terminal_error(terminal_report, exc)
         status["error_class"] = type(primary).__name__
-        status["cleanup_confirmed"] = (
+        cleanup_confirmed = (
             terminal_report.cleanup_confirmed if terminal_report is not None else True
         )
+        status["cleanup_confirmed"] = cleanup_confirmed
         status["failure"] = _terminal_failure_payload(
             primary,
             stage=failure_stage,
-            cleanup_confirmed=status["cleanup_confirmed"],
+            cleanup_confirmed=cleanup_confirmed,
         )
         raise
     finally:

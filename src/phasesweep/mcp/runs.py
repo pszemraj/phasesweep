@@ -17,7 +17,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO, Literal, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
@@ -155,11 +155,11 @@ def _strict_unlink(path: Path) -> None:
         os.close(directory_fd)
 
 
-def _read_json_object(path: Path) -> dict | None:
+def _read_json_object(path: Path) -> dict[str, object] | None:
     """Read a JSON object, returning ``None`` for missing or malformed files.
 
     :param Path path: JSON file to read.
-    :return dict | None: Parsed object, or ``None`` when unavailable or invalid.
+    :return dict[str, object] | None: Parsed object, or ``None`` when unavailable or invalid.
     """
     directory_fd = -1
     try:
@@ -174,20 +174,20 @@ def _read_json_object(path: Path) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def write_status_file(status_path: Path, payload: dict) -> None:
+def write_status_file(status_path: Path, payload: dict[str, object]) -> None:
     """Atomically write a detached-run terminal status payload.
 
     :param Path status_path: Destination ``status.json`` path for the run.
-    :param dict payload: JSON-serializable terminal status payload.
+    :param dict[str, object] payload: JSON-serializable terminal status payload.
     """
     private_atomic_write_text(status_path, json.dumps(payload, indent=2) + "\n")
 
 
-def write_status_file_if_absent(status_path: Path, payload: dict) -> bool:
+def write_status_file_if_absent(status_path: Path, payload: dict[str, object]) -> bool:
     """Atomically create a server failure only while no runner status exists.
 
     :param Path status_path: Destination ``status.json`` path for the run.
-    :param dict payload: JSON-serializable server failure payload.
+    :param dict[str, object] payload: JSON-serializable server failure payload.
     :return bool: Whether this call created the status; ``False`` if one already exists.
     """
     temporary = status_path.with_name(f".{status_path.name}.{uuid4().hex}.tmp")
@@ -907,7 +907,8 @@ class RunStore:
         if payload is None:
             return None
         try:
-            handle = RunHandle(**payload)
+            # This on-disk JSON is checked field by field after construction.
+            handle = RunHandle(**payload)  # type: ignore[arg-type]
         except TypeError:
             return None
         if handle.run_id != expected_run_id:
@@ -1092,11 +1093,11 @@ class RunStore:
             return "cancelled"
         return "failed"
 
-    def recorded_terminal_status(self, handle: RunHandle) -> dict | None:
+    def recorded_terminal_status(self, handle: RunHandle) -> dict[str, object] | None:
         """Return the runner-written terminal status payload, if readable.
 
         :param RunHandle handle: Run handle whose terminal status should be returned.
-        :return dict | None: Decoded status payload, or ``None`` when absent or malformed.
+        :return dict[str, object] | None: Decoded status payload, or ``None`` when absent or malformed.
         """
         return self._read_status(handle)
 
@@ -1320,7 +1321,8 @@ class RunStore:
         status = self._read_status(handle)
         if status is None:
             return set()
-        return set(status.get("uncertain_attempt_ids", []))
+        uncertain_attempt_ids = cast(list[str], status.get("uncertain_attempt_ids", []))
+        return set(uncertain_attempt_ids)
 
     def snapshot_recovery_required(self, handle: RunHandle) -> bool:
         """Return whether a dead runner left snapshot finalization pending.
@@ -1357,11 +1359,11 @@ class RunStore:
             and is_same_live_process(handle.pid, handle.pid_starttime)
         )
 
-    def _read_status(self, handle: RunHandle) -> dict | None:
+    def _read_status(self, handle: RunHandle) -> dict[str, object] | None:
         """Read the runner-written terminal status payload.
 
         :param RunHandle handle: Run handle whose status file should be read.
-        :return dict | None: Decoded JSON payload, or ``None`` when absent or malformed.
+        :return dict[str, object] | None: Decoded JSON payload, or ``None`` when absent or malformed.
         """
         payload = _read_json_object(self.status_path(handle.run_id))
         if payload is None:
@@ -1571,7 +1573,7 @@ class RunStore:
         return identity
 
 
-def _valid_positive_optional_int(value: object) -> bool:
+def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:
     """Return whether ``value`` is ``None`` or a positive non-bool ``int``.
 
     :param object value: Value to validate.
@@ -1580,7 +1582,7 @@ def _valid_positive_optional_int(value: object) -> bool:
     return value is None or (type(value) is int and value > 0)
 
 
-def _valid_optional_boot_id(value: object) -> bool:
+def _valid_optional_boot_id(value: object) -> TypeGuard[str | None]:
     """Return whether ``value`` is ``None`` or a canonical Linux boot UUID.
 
     :param object value: Value to validate.

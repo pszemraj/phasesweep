@@ -90,7 +90,7 @@ _SUPERVISOR_SCRIPT_PATH = _supervisor_script_path()
 # ---------------------------------------------------------------------------
 
 _lock = threading.Lock()
-_active_children: dict[int, subprocess.Popen] = {}  # pgid -> Popen
+_active_children: dict[int, subprocess.Popen[bytes]] = {}  # pgid -> Popen
 
 # The launch lock guards the Popen() -> _register() critical section so the
 # shutdown handler cannot snapshot _active_children while a child has been
@@ -689,7 +689,7 @@ def absorb_shutdown_signals() -> Iterator[AbsorbedShutdown]:
             absorbed.signum = drained
 
 
-def _register(proc: subprocess.Popen, *, pgid: int | None = None) -> int:
+def _register(proc: subprocess.Popen[bytes], *, pgid: int | None = None) -> int:
     """Add a freshly-launched subprocess to the global child registry.
 
     Args:
@@ -724,7 +724,7 @@ def _unregister(pgid: int) -> None:
         _active_children.pop(pgid, None)
 
 
-def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
+def _kill_group(pgid: int, proc: subprocess.Popen[bytes]) -> bool:
     """Terminate the trial process group and return whether cleanup is confirmed.
 
     Returns ``True`` when the group is confirmed gone, ``False`` when cleanup
@@ -785,7 +785,7 @@ def _kill_group(pgid: int, proc: subprocess.Popen) -> bool:
     return cleanup_confirmed
 
 
-def _wait_for_guardian_exit(proc: subprocess.Popen) -> bool:
+def _wait_for_guardian_exit(proc: subprocess.Popen[bytes]) -> bool:
     """Bound the in-band wait for the post-root lease guardian.
 
     The guardian deliberately remains alive after SIGKILL when it cannot prove
@@ -794,7 +794,7 @@ def _wait_for_guardian_exit(proc: subprocess.Popen) -> bool:
     returns cleanup uncertainty so the phase aborts without scheduling more
     work, while the detached guardian continues protecting the device.
 
-    :param subprocess.Popen proc: Guardian process whose trainer root already exited.
+    :param subprocess.Popen[bytes] proc: Guardian process whose trainer root already exited.
     :return bool: Whether the guardian exited inside its cleanup allowance.
     """
     try:
@@ -810,7 +810,7 @@ def _wait_for_guardian_exit(proc: subprocess.Popen) -> bool:
     return True
 
 
-def _abort_launch(proc: subprocess.Popen, pgid: int | None) -> bool:
+def _abort_launch(proc: subprocess.Popen[bytes], pgid: int | None) -> bool:
     """Kill and unregister a subprocess after launch or supervision fails.
 
     Shared by the readiness-wait failure in
@@ -1254,7 +1254,7 @@ def _spawn_blocked_supervisor(
     stderr: IO[str],
     deadline: float | None = None,
     gpu_lease_fds: Collection[int] = (),
-) -> tuple[subprocess.Popen, int, int, int]:
+) -> tuple[subprocess.Popen[bytes], int, int, int]:
     """Spawn a supervisor that cannot exec the trainer until its parent delivers a payload.
 
     Launches the stdlib-only ``phasesweep.runtime.supervisor`` script
@@ -1310,7 +1310,7 @@ def _spawn_blocked_supervisor(
 
     ready_read, ready_write = os.pipe()
     ack_read, ack_write = os.pipe()
-    proc: subprocess.Popen | None = None
+    proc: subprocess.Popen[bytes] | None = None
     pgid: int | None = None
     try:
         proc = subprocess.Popen(
@@ -1499,7 +1499,7 @@ def run_supervised(
     # Correct ordering: block signals -> take lock -> work -> release lock
     # -> unblock signals. Any pending signal is delivered after the lock is
     # released, so the handler can safely acquire it.
-    proc: subprocess.Popen | None = None
+    proc: subprocess.Popen[bytes] | None = None
     pgid: int | None = None
     ack_write: int | None = None
     status_read: int | None = None

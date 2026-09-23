@@ -2135,7 +2135,7 @@ class PhaseSweepMCP:
         # Once Popen returns, every later operation is inside the BaseException
         # boundary: shutdown interrupts are ownership failures too, not proof
         # that no child was created.
-        proc: subprocess.Popen | None = None
+        proc: subprocess.Popen[bytes] | None = None
         handle: RunHandle | None = None
         pid_starttime: int | None = None
         boot_id: str | None = None
