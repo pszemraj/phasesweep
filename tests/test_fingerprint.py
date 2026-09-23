@@ -791,17 +791,7 @@ def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
 @pytest.mark.integration
 def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     """End-to-end: run with n_trials=2, then n_trials=4 -> 4 total trials in same study."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import json, argparse
-        ap = argparse.ArgumentParser()
-        ap.add_argument('--out', required=True)
-        args, _ = ap.parse_known_args()
-        with open(args.out, 'w') as f: json.dump({'eval_loss': 0.5}, f)
-        print('eval_loss=0.5')
-        """,
-    )
+    trainer = write_constant_trainer(tmp_path, key="eval_loss")
     db = tmp_path / "phases.db"
     yaml_text = f"""
 experiment: topup

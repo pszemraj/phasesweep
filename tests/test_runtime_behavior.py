@@ -90,7 +90,10 @@ from tests.conftest import (
     patch_rejected_trial_user_attr,
     requires_nonroot,
     write_constant_trainer,
+    write_flag_gated_trainer,
+    write_param_echo_trainer,
     write_trainer,
+    write_trial_zero_trainer,
     write_yaml,
 )
 
@@ -670,20 +673,8 @@ def test_terminal_callback_failure_cannot_fail_published_run(
 @pytest.mark.integration
 def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     """Missing constraint output -> TrialState.FAIL, not COMPLETE+infeasible."""
-    trainer = tmp_path / "trainer.py"
-    write_trainer(
-        trainer,
-        """
-        import json, sys, argparse
-        ap = argparse.ArgumentParser()
-        ap.add_argument('--out', required=True)
-        args, _ = ap.parse_known_args()
-        # Write metric only — constraint extractor will fail to find param_bytes.
-        with open(args.out, 'w') as f:
-            json.dump({'eval_loss': 1.0}, f)
-        print('eval_loss=1.0')
-        """,
-    )
+    # Write metric only — constraint extractor will fail to find param_bytes.
+    trainer = write_constant_trainer(tmp_path, key="eval_loss", value=1.0)
 
     db = tmp_path / "phases.db"
     yaml_text = f"""
@@ -1146,15 +1137,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
     selection consumes the durable abort record (review v0.5.17 / blocker 1).
     """
     flag = tmp_path / "resume_enabled"
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        f"""
-        import pathlib, sys
-        if not pathlib.Path({str(flag)!r}).exists():
-            sys.exit(1)
-        print("x=0.5")
-        """,
-    )
+    trainer = write_flag_gated_trainer(tmp_path, flag)
     db = tmp_path / "abort.db"
 
     def _exp(n_trials: int):
@@ -1652,15 +1635,7 @@ def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
     replay re-derives the same winner.
     """
     flag = tmp_path / "resume_enabled"
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        f"""
-        import pathlib, sys
-        if not pathlib.Path({str(flag)!r}).exists():
-            sys.exit(1)
-        print("x=0.5")
-        """,
-    )
+    trainer = write_flag_gated_trainer(tmp_path, flag)
     db = tmp_path / "abort.db"
 
     def _exp(n_trials: int):
@@ -1894,21 +1869,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
     allow_incomplete_on_timeout: bool,
 ) -> None:
     """A timeout guard should not reject a phase once every requested trial is terminal."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json, os, time
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
-            with open(args.out, "w") as f:
-                json.dump({"x": 1.0}, f)
-            print("x=1.0")
-        else:
-            time.sleep(30.0)
-        """,
-    )
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
     exp = Experiment(
         experiment="phase_timeout_all_terminal",
         workdir=str(tmp_path / "runs"),
@@ -1949,21 +1910,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
 
 @pytest.mark.integration
 def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Path) -> None:
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json, os, time
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
-            with open(args.out, "w") as f:
-                json.dump({"x": 1.0}, f)
-            print("x=1.0")
-        else:
-            time.sleep(30.0)
-        """,
-    )
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
     exp = Experiment(
         experiment="phase_timeout_allowed_abort_counter",
         workdir=str(tmp_path / "runs"),
@@ -2034,21 +1981,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
 
     import phasesweep.engine.phase as phase_mod
 
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json, os, sys
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
-            with open(args.out, "w") as f:
-                json.dump({"x": 1.0}, f)
-            print("x=1.0")
-        else:
-            sys.exit(1)
-        """,
-    )
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="sys.exit(1)")
     exp = Experiment(
         experiment="phase_scheduler_deadline_with_abort",
         workdir=str(tmp_path / "runs"),
@@ -2175,21 +2108,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
 
     import phasesweep.engine.phase as phase_mod
 
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json, os, sys
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
-            with open(args.out, "w") as f:
-                json.dump({"x": 1.0}, f)
-            print("x=1.0")
-        else:
-            sys.exit(1)
-        """,
-    )
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="sys.exit(1)")
     exp = Experiment(
         experiment="refused_partial_timeout_abort",
         workdir=str(tmp_path / "runs"),
@@ -2320,18 +2239,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     import phasesweep.engine.phase as phase_mod
     from phasesweep.runtime.gpu import GpuAssignment, GpuLeaseTimeoutError
 
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        ap = argparse.ArgumentParser()
-        ap.add_argument("--out", required=True)
-        args, _ = ap.parse_known_args()
-        with open(args.out, "w") as f:
-            json.dump({"x": 1.0}, f)
-        print("x=1.0")
-        """,
-    )
+    trainer = write_constant_trainer(tmp_path, value=1.0)
     exp = Experiment(
         experiment="gpu_lease_timeout_attribution",
         workdir=str(tmp_path / "runs"),
@@ -2407,17 +2315,7 @@ def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
     node must not require GPU discovery or mutate the durable accepted target
     (review v0.5.14 / blocker 4).
     """
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        p = argparse.ArgumentParser()
-        p.add_argument("--out")
-        p.add_argument("--x", type=int, default=0)
-        a, _ = p.parse_known_args()
-        print(f"x={a.x}")
-        """,
-    )
+    trainer = write_param_echo_trainer(tmp_path)
     experiment = make_experiment(
         persistent=tmp_path, trainer=trainer, n_trials=1, sampler=Sampler(type="random", seed=0)
     )
@@ -2447,17 +2345,7 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
     problem permanently strands the study above its last working config
     (review v0.5.14 / blocker 4).
     """
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        p = argparse.ArgumentParser()
-        p.add_argument("--out")
-        p.add_argument("--x", type=int, default=0)
-        a, _ = p.parse_known_args()
-        print(f"x={a.x}")
-        """,
-    )
+    trainer = write_param_echo_trainer(tmp_path)
     phase = Phase(
         name="p",
         n_trials=1,
