@@ -280,6 +280,7 @@ def test_restored_override_format_is_validated_without_artifacts(
     ],
 )
 def test_hydra_values_round_trip_real_parser_and_omegaconf(value):
+    pytest.importorskip("hydra")
     from hydra.core.override_parser.overrides_parser import OverridesParser
     from omegaconf import OmegaConf
 
@@ -391,6 +392,9 @@ def test_restored_input_real_consumer_inherits_and_replays(tmp_path, selector):
 
     trainer = tmp_path / "trainer.py"
     if selector == "hydra":
+        # The trainer below imports Hydra in a subprocess, where a missing
+        # package would surface as a failed trial rather than a skip.
+        pytest.importorskip("hydra")
         (tmp_path / "config.yaml").write_text(
             "model: {depth: 0}\nrate: 0.0\ntag: ''\n", encoding="utf-8"
         )
