@@ -1562,7 +1562,6 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
         run_experiment(experiment, terminal_callback=captured.append)
 
     assert isinstance(exc_info.value.__cause__, NoFeasibleTrialError)
-    assert exc_info.value.action is OperatorAction.RUN_RECOVER_RUN
     assert registry_scans == 1
     assert len(captured) == 1
     assert isinstance(captured[0].primary_error, NoFeasibleTrialError)

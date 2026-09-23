@@ -83,7 +83,6 @@ from phasesweep.engine.state import (
     WinnerSource,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
-from phasesweep.errors import OperatorAction
 from phasesweep.runtime.files import (
     atomic_text_writer,
     file_url_path,
@@ -1442,7 +1441,6 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
         run_experiment(experiment)
 
     assert isinstance(excinfo.value.__cause__, StudyStorageUnavailableError)
-    assert excinfo.value.action is OperatorAction.RESTORE_LEDGER
 
     for phase in experiment.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)

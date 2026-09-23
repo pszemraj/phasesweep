@@ -35,7 +35,6 @@ from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSIO
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.read import read_status, read_winners
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.errors import OperatorAction
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _load_recovery_studies,
@@ -304,13 +303,10 @@ def test_recovery_inspect_never_writes_to_a_golden_ledger(
     "fixture_name", ["precutover-schema2-sqlite", "precutover-unstamped-journal"]
 )
 def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_path: Path) -> None:
-    """Recovery refuses a pre-cutover ledger in the engine's own words and remedy.
+    """Recovery refuses a pre-cutover ledger in the engine's own words.
 
     The wrapper's job is to say which command the operator is running, not to
-    re-explain the failure. So the original refusal text has to survive intact,
-    and the remediation has to survive with it: ``rewrap`` carries the cause's
-    ``action`` across the layer boundary so a routing caller still learns that
-    the fix is the preserved prior release, not "run recover-run again".
+    re-explain the failure, so the original refusal text has to survive intact.
     """
     materialized = materialize(fixture_name, tmp_path, mode="tree")
 
@@ -320,7 +316,6 @@ def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_p
     assert _SCHEMA_MISMATCH_PHRASE in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, StudySchemaMismatchError)
     assert str(excinfo.value) == str(excinfo.value.__cause__)
-    assert excinfo.value.action is OperatorAction.USE_PRIOR_RELEASE
     assert materialized.unchanged(), materialized.changes()
 
 

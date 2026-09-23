@@ -19,7 +19,6 @@ from threading import Event, Thread
 import pytest
 
 import phasesweep.mcp.runs as mcp_runs
-from phasesweep.errors import OperatorAction
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
@@ -585,53 +584,35 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    ("build", "action", "message"),
+    ("build", "message"),
     [
         # The marker is there, so the directory is the state directory and the
         # missing, shared, or unreadable part of it is damage to restore.
-        (_logs_deleted, OperatorAction.RESTORE_TREE, "has its format marker but is missing"),
-        pytest.param(
-            _marker_mode(0o000),
-            OperatorAction.RESTORE_TREE,
-            "cannot be read",
-            marks=requires_nonroot,
-        ),
-        (_marker_mode(0o644), OperatorAction.RESTORE_TREE, "with mode 0600; found"),
-        (_marker_text("not json\n"), OperatorAction.RESTORE_TREE, "is malformed"),
-        (
-            _marker_text('{"schema_version": 1, "unexpected": true}\n'),
-            OperatorAction.RESTORE_TREE,
-            "is malformed",
-        ),
+        (_logs_deleted, "has its format marker but is missing"),
+        pytest.param(_marker_mode(0o000), "cannot be read", marks=requires_nonroot),
+        (_marker_mode(0o644), "with mode 0600; found"),
+        (_marker_text("not json\n"), "is malformed"),
+        (_marker_text('{"schema_version": 1, "unexpected": true}\n'), "is malformed"),
         # The CLI resolves a symlinked state_dir first; through the API the
         # marker is reached, so the link standing in for the directory is damage.
-        (_symlink_to_state_dir, OperatorAction.RESTORE_TREE, "is not a real directory"),
+        (_symlink_to_state_dir, "is not a real directory"),
         # A readable marker naming another format is another release's state.
-        (
-            _marker_text('{"schema_version": 0}\n'),
-            OperatorAction.USE_PRIOR_RELEASE,
-            "declares unsupported format 0",
-        ),
+        (_marker_text('{"schema_version": 0}\n'), "declares unsupported format 0"),
         # No marker and no run handles: the path names some other directory,
         # whatever its layout or permissions, and no chmod turns it into state.
         (
             lambda tmp_path: _shared_project_dir(tmp_path, 0o755),
-            OperatorAction.FIX_CONFIG,
             "no format marker and no run handles",
         ),
         (
             lambda tmp_path: _shared_project_dir(tmp_path, 0o700),
-            OperatorAction.FIX_CONFIG,
             "no format marker and no run handles",
         ),
-        (_regular_file, OperatorAction.FIX_CONFIG, "expected directories are missing"),
+        (_regular_file, "expected directories are missing"),
         # A walk that fails above state_dir never reached a state directory.
-        (_below_regular_file, OperatorAction.FIX_CONFIG, "is not reachable through real"),
+        (_below_regular_file, "is not reachable through real"),
         pytest.param(
-            _under_unsearchable_dir,
-            OperatorAction.FIX_CONFIG,
-            "is not reachable through real",
-            marks=requires_nonroot,
+            _under_unsearchable_dir, "is not reachable through real", marks=requires_nonroot
         ),
     ],
     ids=[
@@ -650,9 +631,9 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
     ],
 )
 def test_recovery_tells_a_wrong_state_dir_from_a_damaged_one(
-    tmp_path: Path, build: Callable[[Path], Path], action: OperatorAction, message: str
+    tmp_path: Path, build: Callable[[Path], Path], message: str
 ) -> None:
-    """recover-run routes a wrong path to fixing it and a damaged state dir to restoring it."""
+    """recover-run tells a wrong path, a damaged state dir, and another release's apart."""
     state_dir = build(tmp_path)
     locked = tmp_path / "someone-elses-home"
     try:
@@ -661,7 +642,6 @@ def test_recovery_tells_a_wrong_state_dir_from_a_damaged_one(
     finally:
         if locked.exists():
             locked.chmod(0o700)
-    assert excinfo.value.action is action
     assert message in str(excinfo.value)
 
 

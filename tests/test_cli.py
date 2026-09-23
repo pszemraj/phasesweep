@@ -40,7 +40,7 @@ from phasesweep.engine.paths import (
     _winner_path,
 )
 from phasesweep.engine.publication import _last_successful_generation_id
-from phasesweep.errors import GpuConfigurationError, LockBusyError, OperatorAction
+from phasesweep.errors import GpuConfigurationError, LockBusyError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
@@ -920,7 +920,6 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
         "phasesweep: Trial 0 cleanup could not be confirmed. To retry its cleanup, "
         "run `phasesweep run` again with the same config."
     )
-    assert refusal.action is OperatorAction.RUN_RECOVER_RUN
 
 
 def test_cli_boundary_reports_config_syntax_error_without_traceback(

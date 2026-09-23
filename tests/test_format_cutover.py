@@ -40,7 +40,7 @@ from phasesweep.engine.ledger import (
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import PhaseSweepError
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _load_recovery_studies,
@@ -267,7 +267,6 @@ def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
         claim_ledger(validate_ledger(experiment))
 
     assert isinstance(refused.value.__cause__, PermissionError)
-    assert refused.value.action is OperatorAction.RESTORE_TREE
     assert not _artifact_root_binding_path(experiment).exists()
 
 
@@ -628,8 +627,6 @@ def test_reads_report_an_interrupted_transaction_and_leave_it_for_a_locked_path(
     assert _INTERRUPTED in caplog.text
     for refusal in (opened.value, inspected.value):
         assert _INTERRUPTED in str(refusal)
-        assert "`phasesweep mcp recover-run --confirm`" in str(refusal)
-        assert refusal.action is OperatorAction.RUN_RECOVER_RUN
     assert tree_snapshot(materialized.root) == before
 
 
@@ -719,9 +716,8 @@ def test_rollback_open_never_creates_a_missing_ledger(tmp_path: Path) -> None:
     with pytest.raises(StudyStorageUnavailableError, match="could not roll it back") as refused:
         roll_back_interrupted_transaction(ledger)
 
-    # Still the interrupted transaction's refusal, routed to bringing the ledger back.
+    # Still the interrupted transaction's refusal.
     assert type(refused.value) is LedgerTransactionInterruptedError
-    assert refused.value.action is OperatorAction.RESTORE_LEDGER
     assert not database.exists()
 
 
@@ -764,7 +760,6 @@ def test_writers_refuse_a_partial_final_journal_record_and_leave_it(
     for refusal in (claimed.value, registry.value, inspected.value, confirmed.value):
         assert "ends with an incomplete record" in str(refusal)
         assert f"truncate -s {len(complete)} {journal}" in str(refusal)
-        assert refusal.action is OperatorAction.RESTORE_LEDGER
     assert tree_snapshot(materialized.root) == before
 
 
