@@ -190,6 +190,19 @@ class ClaimedLedger(ValidatedLedger):
     studies: Mapping[str, optuna.Study]
 
 
+def _journal_path(url: str) -> Path:
+    """Resolve a ``journal:///`` storage URL to the journal file it names.
+
+    Every journal path in this module comes from here, so the directory
+    :func:`open_phase_study` prepares, the file the snapshot reader opens, and
+    the file the live backend appends to can never drift apart.
+
+    :param str url: Journal storage URL, including escaped ``file:`` forms.
+    :return Path: The journal file, with ``~`` expanded and nothing else resolved.
+    """
+    return Path(file_url_path(url)).expanduser()
+
+
 def _resolve_storage(url: str | None) -> Any:
     """Translate a storage URL into an Optuna storage object or pass through.
 
@@ -221,7 +234,7 @@ def _resolve_storage(url: str | None) -> Any:
     if url is None or storage_is_in_memory(url):
         return None
     if storage_backend(url) == "journal":
-        path = Path(file_url_path(url)).expanduser()
+        path = _journal_path(url)
         log.info("Using JournalFileStorage at %s", path)
         from optuna.storages.journal import JournalFileBackend
 
@@ -337,7 +350,7 @@ def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | 
     :return JournalStorage | None: Snapshot storage, or ``None`` when absent.
     :raises StudyStorageUnavailableError: The snapshot is unreadable or incomplete.
     """
-    path = Path(file_url_path(storage_url)).expanduser()
+    path = _journal_path(storage_url)
     try:
         try:
             with path.open("rb") as source:
@@ -863,7 +876,7 @@ def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> Val
             ledger_path = sqlite_database_path(url)
         elif named == "journal":
             backend = "journal"
-            ledger_path = Path(file_url_path(url)).expanduser()
+            ledger_path = _journal_path(url)
         else:
             raise ValueError(f"Unsupported local storage backend: {named!r}.")
     return ValidatedLedger(
@@ -1178,7 +1191,7 @@ def _require_replay_matches_snapshot(
             )
         ):
             raise StudyStorageUnavailableError(
-                f"Journal storage {Path(file_url_path(locator)).expanduser()} changed while "
+                f"Journal storage {_journal_path(locator)} changed while "
                 f"study {snapshot.study_name!r} was being opened: trial {captured.number} "
                 "no longer matches the complete snapshot read first."
             )
@@ -1233,7 +1246,7 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
         live = optuna.load_study(study_name=study_name, storage=_resolve_storage(locator))
     except KeyError as exc:
         raise StudyStorageUnavailableError(
-            f"Journal storage {Path(file_url_path(locator)).expanduser()} lost study "
+            f"Journal storage {_journal_path(locator)} lost study "
             f"{study_name!r} between its complete snapshot and the live replay."
         ) from exc
     _require_replay_matches_snapshot(snapshot, live, locator)

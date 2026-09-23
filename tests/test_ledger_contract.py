@@ -73,6 +73,7 @@ BANNED_CALLS: dict[str, frozenset[str]] = {
 #: the ledger; the public API reaches them only after that order holds.
 STORAGE_PRIVATE_NAMES = frozenset(
     {
+        "_journal_path",
         "_resolve_storage",
         "_build_phase_study",
         "_load_existing_phase_study",
