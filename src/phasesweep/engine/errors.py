@@ -139,10 +139,11 @@ class IncompleteJournalRecordError(StudyStorageUnavailableError):
     """Raised before a write when a journal ledger ends with a partial record.
 
     Reads skip that record as Optuna does, but an append after it would be
-    glued onto it and corrupt the journal for good. The record may belong to
-    another experiment's append still in flight, so nothing repairs it
-    automatically: the message names the byte to truncate the journal at once
-    no process uses it, which is the ledger repair this routes to.
+    glued onto it and corrupt the journal for good. The experiment lock does
+    not exclude another experiment's append to a shared journal, so the record
+    may be an append still in flight, and nothing repairs it automatically:
+    the message names the byte to truncate the journal at once no process uses
+    it, which is the ledger repair this routes to.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER

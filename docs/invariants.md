@@ -107,9 +107,11 @@ skipped exactly as Optuna's reader skips it, so status, winners, and the
 result snapshot report the complete records. Every path that may write refuses
 it before any live open, naming the byte to truncate at, and so does recovery,
 inspection or confirmed, because inspection previews a mutation. Nothing
-repairs it automatically: unlike SQLite, whose own lock makes its rollback
-safe, a journal shared by two experiments under different experiment locks may
-be mid-append, and truncating that line would destroy a live record.
+repairs it automatically. The experiment lock does not exclude another
+experiment's append to a shared journal, so the line may be an append still in
+flight, and truncating it would destroy a live record. Only the file lock
+Optuna's journal backend takes for every append excludes all writers, and
+PhaseSweep does not take it.
 
 **Held by:** `engine.ledger.validate_ledger`, running
 `engine.artifact_roots._check_artifact_root_binding` before

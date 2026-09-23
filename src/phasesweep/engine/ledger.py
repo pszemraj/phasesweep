@@ -435,9 +435,11 @@ def _require_complete_journal(storage_url: str) -> None:
     Optuna appends with no separator check, so its next record would be glued
     onto the partial line: that record is lost, and once a later record follows
     it, every reader, Optuna's included, fails on the journal for good. The
-    partial line is never truncated here. Two experiments can share one
-    journal under different experiment locks, so the line may be another
-    run's append still in flight, and removing it would destroy a live record.
+    partial line is never truncated here. The experiment lock does not exclude
+    another experiment's append to a shared journal, so the line may be an
+    append still in flight, and removing it would destroy a live record. Only
+    the file lock Optuna's journal backend takes for every append excludes all
+    writers, and PhaseSweep does not take it.
 
     :param str storage_url: Journal storage URL a caller is about to write through.
     :raises IncompleteJournalRecordError: The journal ends with a line Optuna
