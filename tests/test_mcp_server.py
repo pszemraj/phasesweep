@@ -3441,6 +3441,12 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     status = json.loads(status_path.read_text())
     assert status["cleanup_confirmed"] is False
     assert status["uncertain_attempt_ids"] == [attempt_id]
+    # The refusal names the ledger as the first repair, so the agent hears the same.
+    assert status["failure"]["code"] == "cleanup_uncertain"
+    assert status["failure"]["remediation"] == (
+        "Ask the operator to restore the original complete storage ledger and access to it, "
+        "then run phasesweep mcp recover-run before another launch."
+    )
 
 
 def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:

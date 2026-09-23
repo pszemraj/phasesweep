@@ -255,6 +255,7 @@ instead of replacing it with the wrapper's own advice.
 `errors.PhaseSweepError.rewrap`\
 **Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`,
 `tests/test_error_routing.py::test_operator_action_survives_wrap`,
+`tests/test_error_routing.py::test_origin_raises_route_by_their_message_remedy`,
 `tests/test_mcp_runner.py::test_cleanup_uncertain_remediation_follows_the_operator_action`
 
 #### 16. Refusals are tested against real ledgers

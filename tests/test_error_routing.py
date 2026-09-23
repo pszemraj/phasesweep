@@ -11,9 +11,11 @@ list: it imports every module in the package and then recurses through
 ``PhaseSweepError.__subclasses__()``, so a subclass added in some far corner of
 the tree is covered the moment it exists.
 
-The wrap table at the end carries the same contract across layer boundaries: a
+The wrap table near the end carries the same contract across layer boundaries: a
 remediation survives each translation unless the site deliberately composes or
 replaces it, and every such site is driven for real rather than in isolation.
+The origin table after it holds raises whose message names its own remedy to the
+action that routes it.
 """
 
 from __future__ import annotations
@@ -34,8 +36,9 @@ import pytest
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
-from phasesweep.config import IntParam, Phase, WandbSummaryRequiredGate
+from phasesweep.config import Experiment, IntParam, Phase, WandbSummaryRequiredGate
 from phasesweep.engine import (
+    ArtifactRootConflictError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     PublicationIntegrityError,
@@ -49,20 +52,44 @@ from phasesweep.engine import (
     study_policy,
     trial,
 )
+from phasesweep.engine.artifact_roots import _write_artifact_root_binding
+from phasesweep.engine.attempts import (
+    _preflight_active_attempts,
+    _PreflightCleanupReport,
+    _register_active_attempt,
+)
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION, TRIAL_TARGET_ATTR
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _attempts_dir,
+    _generation_summary_path,
+)
+from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.state import (
+    CLEANUP_CONFIRMED_ATTR,
+    GENERATION_ID_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+    TRIAL_DIR_ATTR,
+    TRIAL_TARGET_ATTR,
+)
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
+    _finalize_stored_terminal_result_snapshot,
     _load_recovery_studies,
+    _publication_recovery_action,
     _RecoveryNeeds,
     recover_run,
 )
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunStore
+from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
+from phasesweep.runtime.files import PlatformCapabilityError, UnsafePrivatePathError
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment
 from tests.ledger_fixtures import Materialized, ledger_file, materialize
-from tests.mcp_helpers import make_run_handle
+from tests.mcp_helpers import make_run_handle, write_run_status
 
 # Importing a ``__main__`` module runs the program it guards, so the sweep skips
 # those and only those. Every other module is a plain import.
@@ -424,6 +451,54 @@ def _recover_over_invalid_publication(tmp_path: Path, monkeypatch: pytest.Monkey
     return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
+def _recover_over_pre_cutover_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover from a state directory the 0.3.1 runtime left without a format marker."""
+    state_dir = tmp_path / "mcp-state"
+    RunStore(state_dir)
+    (state_dir / _STATE_FORMAT_MARKER_NAME).unlink()
+    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
+
+
+def _recover_pending_snapshot_unwritable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Confirm recovery of an orphaned pending snapshot whose status is unsafe to rewrite."""
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
+    write_run_status(
+        RunStore.open_existing(state_dir),
+        run_id,
+        returncode=1,
+        result_snapshot=capture_pre_generation_result_snapshot(materialized.experiment),
+        result_snapshot_state="pending",
+    )
+    monkeypatch.setattr(
+        "phasesweep.mcp.recovery.write_status_file",
+        _raiser(UnsafePrivatePathError("Private directory is not owner-only.")),
+    )
+    return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
+
+
+def _finalize_complete_snapshot_unwritable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Finalize a complete stored snapshot on a host that cannot rewrite its status safely."""
+    terminal_status = {
+        "run_id": "wrap-recover",
+        "result_snapshot": capture_pre_generation_result_snapshot(make_experiment()),
+        "result_snapshot_state": "complete",
+    }
+    monkeypatch.setattr(
+        "phasesweep.mcp.recovery.write_status_file",
+        _raiser(PlatformCapabilityError("O_NOFOLLOW is unavailable.")),
+    )
+    return _finalize_stored_terminal_result_snapshot(
+        RunStore(tmp_path / "mcp-state"),
+        "wrap-recover",
+        terminal_status,
+        confirmed_attempt_ids=set(),
+        confirmed_attempt_locations={},
+    )
+
+
 def _accepted_target_study(name: str, target: int) -> optuna.Study:
     """Return an empty current-format study that already accepted ``target`` trials."""
     study = optuna.create_study(study_name=name)
@@ -567,6 +642,34 @@ WRAP_CASES = (
         message="Published result is invalid.",
     ),
     WrapCase(
+        # Composed: the inbound refusal is a ValueError carrying no action, so the
+        # site supplies the one its message names.
+        id="recover_run_pre_cutover_state",
+        trigger=_recover_over_pre_cutover_state,
+        outbound=RunRecoveryError,
+        action=OperatorAction.USE_PRIOR_RELEASE,
+        cause=None,
+        message="use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime",
+    ),
+    WrapCase(
+        id="recover_run_pending_snapshot_unsafe_path",
+        trigger=_recover_pending_snapshot_unwritable,
+        outbound=RunRecoveryError,
+        action=OperatorAction.RESTORE_TREE,
+        cause=None,
+        message="failed to finalize terminal result snapshot for wrap-recover: "
+        "UnsafePrivatePathError",
+    ),
+    WrapCase(
+        id="finalize_snapshot_platform",
+        trigger=_finalize_complete_snapshot_unwritable,
+        outbound=RunRecoveryError,
+        action=OperatorAction.FIX_CONFIG,
+        cause=None,
+        message="failed to finalize terminal result snapshot for wrap-recover: "
+        "PlatformCapabilityError",
+    ),
+    WrapCase(
         id="sqlite_unopenable",
         trigger=_validate_damaged("current-sqlite", _directory),
         outbound=StudyStorageUnavailableError,
@@ -641,4 +744,156 @@ def test_operator_action_survives_wrap(
         assert error.__cause__ is None
     else:
         assert type(error.__cause__) is case.cause
+    assert case.message in str(error)
+
+
+# An origin raise states its remedy in its own message, so its action has to
+# name that same remedy rather than whatever its class defaults to. Each row
+# drives the real code path to one such raise and pins the pair together.
+
+
+@dataclass(frozen=True)
+class OriginCase:
+    """One raise site whose action must match the remedy its message gives."""
+
+    id: str
+    #: Drives the real code path until the raise under test.
+    trigger: Trigger
+    raised: type[PhaseSweepError]
+    action: OperatorAction
+    #: Stable substring of the remedy the message gives today.
+    message: str
+
+
+def _auto_storage_experiment(workdir: Path, n_jobs: int) -> Experiment:
+    """Return an auto-storage experiment whose parallelism selects its backend."""
+    return make_experiment(
+        workdir=workdir, storage="auto", n_jobs=n_jobs, allow_no_gpu_isolation=True
+    )
+
+
+def _validate_after_auto_backend_switch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Validate a sequential config over a tree its parallel predecessor bound."""
+    parallel = _auto_storage_experiment(tmp_path / "runs", n_jobs=2)
+    _artifact_root_binding_path(parallel).parent.mkdir(parents=True)
+    _write_artifact_root_binding(parallel)
+    return engine_ledger.validate_ledger(_auto_storage_experiment(tmp_path / "runs", n_jobs=1))
+
+
+def _claim_after_unlocked_bind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Claim a ledger whose tree another process bound after it was validated."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    validated = engine_ledger.validate_ledger(experiment)
+    _artifact_root_binding_path(experiment).parent.mkdir(parents=True)
+    _write_artifact_root_binding(experiment)
+    return engine_ledger.claim_ledger(validated)
+
+
+def _preflight_over_shared_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Scan an attempt registry other users can enter."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    registry = _attempts_dir(experiment)
+    registry.mkdir(parents=True)
+    registry.chmod(0o755)
+    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+
+def _reconcile_prepared_over_damaged_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Reconcile a prepared publication after the last-success target lost its summary."""
+    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    _generation_summary_path(experiment, published).unlink()
+    needs = replace(
+        _recovery_needs(ownership_storage_unavailable=False),
+        prepared_publication_generation="prepared-generation",
+    )
+    return _publication_recovery_action(experiment, needs)
+
+
+def _preflight_registered_trial_without_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Scan a registry entry whose terminal trial lost its durable attempt id.
+
+    Mirrors the ``missing-attempt`` case of
+    ``tests/test_stale_reaper.py::test_registry_terminal_cleanup_requires_matching_attempt_identity``.
+    """
+    experiment = make_experiment(
+        workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'study.db'}"
+    )
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
+    write_attempt_lifecycle(attempt_dir, attempt_id="attempt", state="allocated")
+    _register_active_attempt(
+        experiment,
+        attempt_id="attempt",
+        phase_name="p",
+        study_name="t::p",
+        trial_number=0,
+        trial_dir=attempt_dir,
+        generation_id="generation",
+    )
+    storage = engine_ledger._resolve_storage(experiment.resolved_storage)
+    study = optuna.create_study(study_name="t::p", storage=storage)
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    running = study.ask()
+    running.set_user_attr(GENERATION_ID_ATTR, "generation")
+    running.set_user_attr(TRIAL_DIR_ATTR, str(attempt_dir))
+    running.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(running, state=optuna.trial.TrialState.FAIL)
+    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+
+ORIGIN_CASES = (
+    OriginCase(
+        id="auto_storage_backend_switch",
+        trigger=_validate_after_auto_backend_switch,
+        raised=ArtifactRootConflictError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Restore the previous n_jobs setting to continue this tree",
+    ),
+    OriginCase(
+        id="claim_ledger_tree_changed",
+        trigger=_claim_after_unlocked_bind,
+        raised=ArtifactRootConflictError,
+        action=OperatorAction.RETRY,
+        message="Stop that process before retrying.",
+    ),
+    OriginCase(
+        id="attempt_registry_not_private",
+        trigger=_preflight_over_shared_registry,
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Restore the original registry with mode 0700 before retrying.",
+    ),
+    OriginCase(
+        id="prepared_publication_unreadable",
+        trigger=_reconcile_prepared_over_damaged_publication,
+        raised=RunRecoveryError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Restore the publication evidence or access to it before retrying recovery.",
+    ),
+    OriginCase(
+        id="registry_terminal_identity_missing",
+        trigger=_preflight_registered_trial_without_attempt,
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_LEDGER,
+        message="Restore the original storage ledger with its durable attempt and generation",
+    ),
+)
+
+
+@pytest.mark.parametrize("case", ORIGIN_CASES, ids=lambda case: case.id)
+def test_origin_raises_route_by_their_message_remedy(
+    case: OriginCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(case.raised) as excinfo:
+        case.trigger(tmp_path, monkeypatch)
+
+    error = excinfo.value
+    assert type(error) is case.raised
+    assert error.action is case.action
     assert case.message in str(error)

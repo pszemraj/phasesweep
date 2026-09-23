@@ -1087,7 +1087,8 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
             f"claimed: validation found it {ledger.binding_state}, but it is now "
             f"{binding_state} at {offered!r}. Another process modified this tree without "
             "holding the experiment lock. Stop that process before retrying. Nothing was "
-            "written."
+            "written.",
+            action=OperatorAction.RETRY,
         )
     # Both directions are now known-compatible. Claim the tree first, then
     # empty studies: a crash cannot leave a study pointing at a tree that does

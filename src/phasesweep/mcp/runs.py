@@ -46,6 +46,7 @@ __all__ = [
     "RunLaunchState",
     "RunState",
     "RunStore",
+    "UnsupportedStateFormatError",
     "identity_from_earlier_boot",
     "write_status_file",
 ]
@@ -73,6 +74,16 @@ _RUN_EVIDENCE_SUFFIXES = (
 MCP_STATE_FORMAT_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
+
+
+class UnsupportedStateFormatError(ValueError):
+    """An MCP state directory holds run-store state this release does not operate.
+
+    Still a ``ValueError`` for every caller that refuses a bad state directory
+    that way. The subclass lets operator recovery tell this refusal, whose
+    remedy is the preserved release, apart from a state directory that is
+    simply missing.
+    """
 
 
 def _strict_fsync_directory(path: Path) -> None:
@@ -313,6 +324,8 @@ class RunStore:
         :param Path state_dir: Existing MCP state directory containing ``runs/``
             and ``logs/`` subdirectories.
         :return RunStore: Store bound to the recognized existing layout.
+        :raises UnsupportedStateFormatError: The layout exists but its format
+            marker is missing, malformed, or declares another format.
         :raises ValueError: If ``state_dir`` is not an MCP run-store layout.
         """
         store = cls.__new__(cls)
@@ -432,13 +445,13 @@ class RunStore:
         except FileExistsError:
             self._require_supported_format_marker()
 
-    def _format_refusal(self, detail: str) -> ValueError:
+    def _format_refusal(self, detail: str) -> UnsupportedStateFormatError:
         """Build the actionable refusal for pre-cutover MCP state.
 
         :param str detail: Specific format-boundary failure observed.
-        :return ValueError: Refusal that directs the operator to a safe path.
+        :return UnsupportedStateFormatError: Refusal that directs the operator to a safe path.
         """
-        return ValueError(
+        return UnsupportedStateFormatError(
             f"MCP state directory {self._format_marker_path.parent} {detail}; "
             "use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime "
             "for existing state."

@@ -16,6 +16,7 @@ import optuna
 from phasesweep.config import Experiment
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
+    OperatorAction,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -291,7 +292,8 @@ def _open_attempt_registry(
         raise ProcessCleanupUncertainError(
             f"Attempt registry {attempts_dir} is not a real owner-only directory. "
             "Recovery cannot trust process authority reached through a symlink or "
-            "shared path. Restore the original registry with mode 0700 before retrying."
+            "shared path. Restore the original registry with mode 0700 before retrying.",
+            action=OperatorAction.RESTORE_TREE,
         ) from exc
     try:
         try:
@@ -658,7 +660,8 @@ def _registry_attempt_fail_stale_trial(
                     "retained; cleanup recovery cannot be attributed to this trial. "
                     "Restore the original storage ledger with its durable attempt and "
                     "generation identities before retrying recovery; do not infer "
-                    "replacement identities."
+                    "replacement identities.",
+                    action=OperatorAction.RESTORE_LEDGER,
                 )
             if not recovered:
                 _record_cleanup_recovery(study, trial)

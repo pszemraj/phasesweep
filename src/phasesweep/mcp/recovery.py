@@ -45,6 +45,7 @@ from phasesweep.mcp.runs import (
     ProcessIdentity,
     RunHandle,
     RunStore,
+    UnsupportedStateFormatError,
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (
@@ -108,6 +109,8 @@ def recover_run(
     """
     try:
         store = RunStore.open_existing(state_dir)
+    except UnsupportedStateFormatError as exc:
+        raise RunRecoveryError(str(exc), action=OperatorAction.USE_PRIOR_RELEASE) from None
     except ValueError as exc:
         raise RunRecoveryError(str(exc)) from None
     handle = store.get(run_id)
@@ -185,9 +188,10 @@ def recover_run(
                 try:
                     write_status_file(store.status_path(run_id), terminal_status)
                 except Exception as exc:
-                    raise RunRecoveryError(
+                    raise RunRecoveryError.rewrap(
+                        exc,
                         f"failed to finalize terminal result snapshot for {run_id}: "
-                        f"{type(exc).__name__}"
+                        f"{type(exc).__name__}",
                     ) from None
             repairing_complete_snapshot = (
                 needs.snapshot_finalize_needed
@@ -500,7 +504,8 @@ def _publication_recovery_action(
         raise RunRecoveryError(
             "the prepared run result cannot be reconciled because the "
             "last-success publication is invalid or unreadable. Restore the "
-            "publication evidence or access to it before retrying recovery."
+            "publication evidence or access to it before retrying recovery.",
+            action=OperatorAction.RESTORE_TREE,
         )
     return None, None
 
@@ -919,6 +924,6 @@ def _finalize_stored_terminal_result_snapshot(
             terminal_status["result_snapshot_error"] = type(exc).__name__
             with contextlib.suppress(Exception):
                 write_status_file(store.status_path(run_id), terminal_status)
-        raise RunRecoveryError(
-            f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
+        raise RunRecoveryError.rewrap(
+            exc, f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
         ) from None

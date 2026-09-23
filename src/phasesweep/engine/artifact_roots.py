@@ -252,7 +252,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
     if raw != expected:
         backend_conflict = _auto_storage_backend_conflict(experiment, raw)
         if backend_conflict is not None:
-            raise ArtifactRootConflictError(backend_conflict)
+            raise ArtifactRootConflictError(backend_conflict, action=OperatorAction.FIX_CONFIG)
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
             f"ledger or experiment than {experiment.experiment!r}. Use the config that owns "
