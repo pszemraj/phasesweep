@@ -52,8 +52,14 @@ produced by the working tree's PhaseSweep. `release-0.3.1-sqlite` and
 a detached `v0.3.1` worktree, against the same Optuna range -- so the format
 boundary is tested against bytes the old release actually wrote, not a
 reconstruction of them. Every manifest carries `produced_by` with the
-phasesweep `git describe`, Optuna, SQLite, and Python versions, plus the working
-directory the run used.
+phasesweep `git describe`, Optuna, SQLite, and Python versions, plus the
+directory the generator ran from.
+
+The 0.3.1 pair predates the trainer-cwd pin described below, so their phase and
+experiment fingerprints embed the directory they were generated from and match
+no materialized config. That is harmless: every read path refuses those
+fixtures first, at `root-conflict` in `tree` mode and `schema-mismatch` in
+`ledger-only` mode, so no read ever compares their fingerprints.
 
 ## Regeneration
 
@@ -79,7 +85,7 @@ The generator refuses to write a manifest whose declared verdicts disagree with
 the ones it computes from the bytes it just produced, so a regeneration that
 silently changes meaning fails instead of landing.
 
-Two things the generator changes about a raw run, both for packaging rather
+Three things the generator changes about a raw run, all for packaging rather
 than for the format boundary:
 
 - `artifact_root/t/.gitignore` is rewritten from PhaseSweep's `*` to `!*`. A
@@ -88,6 +94,13 @@ than for the format boundary:
 - the experiment declares `execution.inherit_env: none`, because the default
   records every ambient variable *name* in the ledger, which would commit the
   generating operator's environment shape and differ on every machine.
+- the experiment declares `execution.cwd: /`. An unset trainer cwd puts the
+  invocation directory into every phase and experiment fingerprint, so a
+  fixture would match its own config only in the checkout that generated it.
+  With the pin, the stored fingerprints are the same from any clone path and
+  any generating directory;
+  `tests/test_ledger_read_paths.py::test_fixture_fingerprints_do_not_depend_on_the_working_directory`
+  holds that.
 
 ## Churn
 
@@ -97,8 +110,8 @@ every time, in the ledger and in the artifact tree:
 - generation ids, attempt ids, trial directory names, and Optuna worker ids;
 - `datetime_start` / `datetime_complete` / `recorded_at` timestamps, `run.log`,
   and trial durations;
-- `phasesweep_version` and `config_fingerprint` in `summary.yaml` and
-  `reproducibility.json`, which move with the SCM revision;
+- `phasesweep_version` in `summary.yaml` and `reproducibility.json`, which
+  moves with the SCM revision;
 - absolute paths, which name the checkout the fixture was generated in, and with
   them `artifact_root_binding.json`'s `artifact_root` and its `storage_key`
   digest (`tests/ledger_fixtures.py` rewrites both for the copy it reads);

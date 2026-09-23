@@ -12,9 +12,9 @@ Run it from the repository root, in the environment under test::
 
     python -m tests.fixtures.make_ledger_fixtures
 
-The experiment's semantic fingerprint includes the resolved invocation
-directory, so regenerating from anywhere other than the repository root makes
-``published_config_matches_current`` false for the regenerated fixtures.
+The experiment pins ``execution.cwd`` to ``/``, so the phase fingerprints it
+stores name no directory of the generating checkout: a fixture read from any
+clone path recomputes the fingerprint it was published with.
 
 The two ``release-0.3.1-*`` fixtures are produced from a detached worktree of
 the ``v0.3.1`` tag instead of the working tree::
@@ -54,6 +54,11 @@ PHASE = "p"
 N_TRIALS = 2
 #: Provenance revision recorded in every fixture config.
 PROVENANCE_REVISION = "golden-fixture-v1"
+#: Trainer working directory. An unset ``execution.cwd`` fingerprints the
+#: invocation directory, which would tie every stored phase fingerprint to the
+#: checkout path the generator ran in. ``/`` exists on every host, and the
+#: inline trainer reads no files.
+TRAINER_CWD = "/"
 #: Objective token the inline trainer prints. Deliberately not a parameter name,
 #: so an override echoed into a trial log can never be mistaken for the metric.
 OBJECTIVE_TOKEN = "PSWOBJ"
@@ -101,7 +106,8 @@ def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:
     Tests re-materialize a fixture by calling this with the copied ledger and
     artifact-root paths, so the only fields that differ between generation and
     materialization are the two paths -- neither of which the experiment's
-    semantic fingerprint covers.
+    semantic fingerprint covers. The trainer cwd is pinned rather than left to
+    the invocation directory, which the fingerprint *does* cover.
 
     :param str storage_url: Resolved ``sqlite:///`` or ``journal:///`` ledger URL.
     :param Path workdir: Artifact root parent; artifacts land in ``workdir/t``.
@@ -117,7 +123,7 @@ def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:
         # Without a narrowed contract the trial records every ambient variable
         # NAME in the ledger, which would commit the generating operator's
         # environment shape and make the fixture unreproducible elsewhere.
-        "execution": {"inherit_env": "none"},
+        "execution": {"cwd": TRAINER_CWD, "inherit_env": "none"},
         "metric": {
             "name": "objective",
             "goal": "minimize",

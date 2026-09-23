@@ -31,10 +31,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from phasesweep.cli import main as cli_boundary
 from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
+from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.read import read_status, read_winners
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.errors import OperatorAction
@@ -395,6 +397,45 @@ def test_current_fixture_carries_this_release_format(fixture_name: str, tmp_path
         f"{fixture.manifest['binding_schema_version']}, not the current "
         f"{ARTIFACT_ROOT_BINDING_SCHEMA_VERSION}; regenerate tests/fixtures/ledgers"
     )
+
+
+def _fixtures_from_this_generator() -> list[str]:
+    """Name every published fixture the working tree's generator produces.
+
+    The ``release-*`` fixtures are the old release's own output: they carry its
+    fingerprints, and every read path refuses them before comparing one.
+
+    :return list[str]: Fixture names with a ledger and a current-generator origin.
+    """
+    return [
+        fixture.name
+        for fixture in discover_ledger_fixtures()
+        if fixture.manifest["backend"] is not None and not fixture.name.startswith("release-")
+    ]
+
+
+@pytest.mark.parametrize("fixture_name", _fixtures_from_this_generator())
+def test_fixture_fingerprints_do_not_depend_on_the_working_directory(
+    fixture_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fixture's stored fingerprints match its config from any checkout path.
+
+    An unset ``execution.cwd`` fingerprints the invocation directory, so a
+    fixture generated that way matches its own config only when read from the
+    generating checkout. Every other clone -- CI's included -- then sees a
+    changed phase config wherever a read or resume compares fingerprints.
+    """
+    materialized = materialize(fixture_name, tmp_path, mode="tree")
+    monkeypatch.chdir(tmp_path)
+    experiment = materialized.experiment
+    (phase,) = experiment.phases
+    generations = materialized.root / "artifact_root" / experiment.experiment / "generations"
+    (generation,) = sorted(generations.iterdir())
+
+    winner = yaml.safe_load((generation / "phases" / phase.name / "winner.yaml").read_text())
+    summary = yaml.safe_load((generation / "summary.yaml").read_text())
+    assert winner["phase_fingerprint"] == _phase_fingerprint(experiment, phase, {})
+    assert summary["config_fingerprint"] == _experiment_semantic_fingerprint(experiment)
 
 
 @pytest.mark.parametrize("fixture_name", ["current-sqlite", "current-sqlite-optuna40-versioninfo"])

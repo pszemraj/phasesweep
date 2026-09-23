@@ -1,8 +1,8 @@
-2026-09-22 12:52:57 I phasesweep.engine.optuna Using JournalFileStorage at /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/precutover-unstamped-journal/ledger/study.journal
-2026-09-22 12:52:57 I phasesweep.engine.artifact_roots Bound study t::p to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/precutover-unstamped-journal/artifact_root/t
-2026-09-22 12:52:57 I phasesweep.engine.phase phase=p study=t::p completed=0 remaining=2 n_jobs=1
-2026-09-22 12:52:57 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
-2026-09-22 12:52:57 I phasesweep.engine.trial [p/trial_0] python -c 'print("PSWOBJ=0.5")' --a=1
-2026-09-22 12:52:58 I phasesweep.engine.trial [p/trial_1] python -c 'print("PSWOBJ=0.5")' --a=10
-2026-09-22 12:52:58 I phasesweep.engine.run phase=p WINNER trial=0 metric=0.5 params={'a': 1}
-2026-09-22 12:52:58 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/precutover-unstamped-journal/artifact_root/t/generations/ffc45ae634ab4e5e90b32325d9c4aa91/summary.yaml
+2026-09-23 01:54:17 I phasesweep.engine.ledger Using JournalFileStorage at /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/precutover-unstamped-journal/ledger/study.journal
+2026-09-23 01:54:17 I phasesweep.engine.artifact_roots Bound study t::p to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/precutover-unstamped-journal/artifact_root/t
+2026-09-23 01:54:17 I phasesweep.engine.phase phase=p study=t::p completed=0 remaining=2 n_jobs=1
+2026-09-23 01:54:17 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
+2026-09-23 01:54:18 I phasesweep.engine.trial [p/trial_0] python -c 'print("PSWOBJ=0.5")' --a=1
+2026-09-23 01:54:18 I phasesweep.engine.trial [p/trial_1] python -c 'print("PSWOBJ=0.5")' --a=10
+2026-09-23 01:54:18 I phasesweep.engine.run phase=p WINNER trial=0 metric=0.5 params={'a': 1}
+2026-09-23 01:54:19 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/precutover-unstamped-journal/artifact_root/t/generations/00b5d79cf6d345bc975b01cc8e30e84a/summary.yaml
