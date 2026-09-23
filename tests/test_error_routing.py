@@ -448,7 +448,7 @@ def _recovery_needs(*, ownership_storage_unavailable: bool) -> _RecoveryNeeds:
 def _dead_uncertain_run(materialized: Materialized, tmp_path: Path) -> tuple[Path, str]:
     """Record a dead, cleanup-uncertain MCP run over a materialized fixture.
 
-    Mirrors ``tests/test_ledger_read_paths.py::_recover_inspect_verdict``: the
+    Mirrors ``tests/test_ledger_read_paths.py::_recover_inspect``: the
     handle names a long-dead PID, which is the state recovery acts on.
     """
     state_dir = tmp_path / "mcp-state"

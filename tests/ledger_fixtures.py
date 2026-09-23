@@ -11,8 +11,10 @@ error at the moment it is violated rather than a diff noticed afterwards.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -43,18 +45,53 @@ LEDGER_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "ledgers"
 LEDGER_MODES = ("tree", "ledger-only")
 
 
-def _tree_bytes(root: Path) -> dict[str, bytes]:
-    """Return the exact regular-file contents below ``root``.
+#: One snapshot entry: ``st_mode`` file-type and permission bits, then the
+#: contents -- file bytes, a symlink's target, or ``None`` for anything else.
+TreeEntry = tuple[int, bytes | str | None]
+
+
+def _tree_bytes(root: Path) -> dict[str, TreeEntry]:
+    """Snapshot every entry below ``root``: its type, permission bits, and contents.
+
+    A read path writes when it creates a directory, even an empty one, or
+    changes a mode, not only when it changes file bytes, so all three are
+    recorded, along with ``root`` itself as ``"."``. Timestamps are left out:
+    reads legitimately move atimes, and mtimes would make the snapshot noisy.
 
     :param Path root: Directory to snapshot.
-    :return dict[str, bytes]: Relative path to file contents, for every
-        regular file in the tree.
+    :return dict[str, TreeEntry]: POSIX relative path to its entry.
     """
-    return {
-        str(path.relative_to(root)): path.read_bytes()
-        for path in sorted(root.rglob("*"))
-        if path.is_file()
-    }
+    snapshot: dict[str, TreeEntry] = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        info = path.lstat()
+        content: bytes | str | None = None
+        if stat.S_ISREG(info.st_mode):
+            content = path.read_bytes()
+        elif stat.S_ISLNK(info.st_mode):
+            content = os.readlink(path)
+        mode = stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode)
+        snapshot[path.relative_to(root).as_posix()] = (mode, content)
+    return snapshot
+
+
+def tree_changes(before: dict[str, TreeEntry], after: dict[str, TreeEntry]) -> dict[str, str]:
+    """Describe how one tree snapshot differs from another.
+
+    :param dict[str, TreeEntry] before: Earlier :func:`_tree_bytes` snapshot.
+    :param dict[str, TreeEntry] after: Later snapshot of the same root.
+    :return dict[str, str]: Relative path to ``"added"``, ``"removed"``,
+        ``"rewritten"``, or a mode change, for every entry that differs.
+    """
+    diff = {path: "added" for path in after.keys() - before.keys()}
+    diff.update({path: "removed" for path in before.keys() - after.keys()})
+    for path in before.keys() & after.keys():
+        (old_mode, old_content), (new_mode, new_content) = before[path], after[path]
+        changed = ["rewritten"] if old_content != new_content else []
+        if old_mode != new_mode:
+            changed.append(f"mode {old_mode:o} -> {new_mode:o}")
+        if changed:
+            diff[path] = ", ".join(changed)
+    return diff
 
 
 @dataclass(frozen=True)
@@ -90,33 +127,23 @@ class Materialized:
     experiment: Experiment
     config_path: Path
     ledger_dir: Path
-    before: dict[str, bytes]
+    before: dict[str, TreeEntry]
 
     def unchanged(self) -> bool:
-        """Return whether the materialized tree still holds its original bytes.
+        """Return whether the materialized tree is exactly as materialization left it.
 
-        :return bool: ``True`` when no file below ``root`` was added, removed,
-            or rewritten since materialization.
+        :return bool: ``True`` when no entry below ``root`` was added, removed,
+            rewritten, or re-moded since materialization.
         """
         return _tree_bytes(self.root) == self.before
 
     def changes(self) -> dict[str, str]:
-        """Describe how the materialized tree differs from its original bytes.
+        """Describe how the materialized tree differs from its snapshot.
 
-        :return dict[str, str]: Relative path to ``"added"`` / ``"removed"`` /
-            ``"rewritten"`` for every file that differs.
+        :return dict[str, str]: Relative path to what changed, per
+            :func:`tree_changes`.
         """
-        after = _tree_bytes(self.root)
-        diff = {path: "added" for path in after.keys() - self.before.keys()}
-        diff.update({path: "removed" for path in self.before.keys() - after.keys()})
-        diff.update(
-            {
-                path: "rewritten"
-                for path in self.before.keys() & after.keys()
-                if self.before[path] != after[path]
-            }
-        )
-        return diff
+        return tree_changes(self.before, _tree_bytes(self.root))
 
 
 def discover_ledger_fixtures() -> list[LedgerFixture]:

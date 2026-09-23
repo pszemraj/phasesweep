@@ -46,7 +46,7 @@ from phasesweep.mcp.recovery import (
     _RecoveryNeeds,
     recover_run,
 )
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import RunStore, UnsupportedStateFormatError
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from tests.ledger_fixtures import (
     Materialized,
@@ -57,6 +57,7 @@ from tests.ledger_fixtures import (
     forbid_file_backed_storage,
     ledger_file,
     materialize,
+    tree_changes,
 )
 from tests.mcp_helpers import make_run_handle
 
@@ -175,18 +176,21 @@ def _cli_verdict(
     return _classify_message(captured.err)
 
 
-def _recover_inspect_verdict(materialized: Materialized, tmp_path: Path) -> str:
+def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, dict[str, str]]:
     """Run MCP recovery preflight over a materialized fixture and classify it.
 
     The run store lives beside the fixture copy, so building it cannot show up
-    as a change to the fixture's bytes. The handle names a long-dead PID with a
-    mismatched start time and is marked cleanup-uncertain, which is the state
-    that makes preflight load the phase studies (mirrors
+    as a change to the fixture's bytes; it is snapshotted on its own once
+    built, because preflight must leave it untouched too. The handle names a
+    long-dead PID with a mismatched start time and is marked cleanup-uncertain,
+    which is the state that makes preflight load the phase studies (mirrors
     ``tests/test_mcp_server.py::test_operator_recovery_clears_no_status_cleanup_uncertainty``).
 
     :param Materialized materialized: Copied fixture and its config.
     :param Path tmp_path: Per-test temporary directory.
-    :return str: ``"ok"`` when preflight reported, otherwise its verdict.
+    :return tuple[str, dict[str, str]]: ``"ok"`` when preflight reported,
+        otherwise its verdict; and how preflight changed the MCP state
+        directory, empty when it did not.
     """
     state_dir = tmp_path / "mcp-state"
     store = RunStore(state_dir)
@@ -202,15 +206,18 @@ def _recover_inspect_verdict(materialized: Materialized, tmp_path: Path) -> str:
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config_bytes)
     store.mark_cleanup_uncertain(handle)
+    state_before = _tree_bytes(state_dir)
     messages: list[str] = []
     try:
         recover_run(state_dir, run_id, confirm=False, emit=messages.append)
     except RunRecoveryError as exc:
-        return _classify_message(str(exc))
+        verdict = _classify_message(str(exc))
     except Exception as exc:
-        return _classify_exception(exc)
-    assert messages, "recovery preflight reported nothing"
-    return "ok"
+        verdict = _classify_exception(exc)
+    else:
+        assert messages, "recovery preflight reported nothing"
+        verdict = "ok"
+    return verdict, tree_changes(state_before, _tree_bytes(state_dir))
 
 
 def _mode_cells() -> list[Any]:
@@ -256,11 +263,12 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
     fixture = fixture_by_name(fixture_name)
     expected = fixture.expected(mode)
     materialized = materialize(fixture_name, tmp_path, mode=mode)
+    state_changes: dict[str, str] = {}
 
     if read_path == RECOVERY_READ_PATH:
         if mode == "ledger-only":
             expected = _RECOVERY_LEDGER_ONLY_VERDICTS.get(expected, expected)
-        verdict = _recover_inspect_verdict(materialized, tmp_path)
+        verdict, state_changes = _recover_inspect(materialized, tmp_path)
     else:
         attempts = forbid_file_backed_storage(monkeypatch)
         if read_path == "engine-read_status":
@@ -283,22 +291,27 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
     assert materialized.unchanged(), (
         f"{read_path} over {fixture_name} ({mode}) changed bytes: {materialized.changes()}"
     )
+    assert state_changes == {}, f"{read_path} changed the MCP state directory: {state_changes}"
 
 
 @pytest.mark.parametrize(("fixture_name", "mode"), _mode_cells())
 def test_recovery_inspect_never_writes_to_a_golden_ledger(
     fixture_name: str, mode: str, tmp_path: Path
 ) -> None:
-    """Recovery preflight leaves a golden ledger byte-identical, whatever it decides.
+    """Recovery preflight leaves a golden ledger and its run store untouched, whatever it decides.
 
     The matrix above owns the verdict. This isolates the bytes half so it is
     asserted on its own, for every cell, by a test that can only fail for that
     one reason.
     """
     materialized = materialize(fixture_name, tmp_path, mode=mode)
-    _recover_inspect_verdict(materialized, tmp_path)
+    _, state_changes = _recover_inspect(materialized, tmp_path)
     assert materialized.unchanged(), (
         f"recovery preflight over {fixture_name} ({mode}) changed bytes: {materialized.changes()}"
+    )
+    assert state_changes == {}, (
+        f"recovery preflight over {fixture_name} ({mode}) changed the MCP state "
+        f"directory: {state_changes}"
     )
 
 
@@ -352,13 +365,16 @@ def test_precutover_mcp_state_is_refused_without_writing(entry_point: str, tmp_p
     state_dir = root / "mcp_state"
     before = _tree_bytes(root)
 
-    with pytest.raises(ValueError, match="MCP state directory"):
+    # The format refusal, not the missing-layout ValueError whose message also
+    # names an "MCP state directory": that one would mean the copy is broken.
+    with pytest.raises(UnsupportedStateFormatError) as excinfo:
         if entry_point == "open_existing":
             RunStore.open_existing(state_dir)
         else:
             RunStore(state_dir)
 
-    assert _tree_bytes(root) == before
+    assert type(excinfo.value) is UnsupportedStateFormatError
+    assert tree_changes(before, _tree_bytes(root)) == {}
 
 
 @pytest.mark.parametrize("fixture_name", ["current-sqlite", "current-journal"])
