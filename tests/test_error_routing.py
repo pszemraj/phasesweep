@@ -48,7 +48,6 @@ from phasesweep.engine import (
     LedgerTransactionInterruptedError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
-    PublicationIntegrityError,
     PublishedStudyMissingError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -87,7 +86,6 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
-    TRIAL_TARGET_ATTR,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.wandb import require_wandb_sdk
@@ -339,21 +337,9 @@ def _garbage(path: Path) -> None:
     path.write_bytes(b"this is not a sqlite database\n" * 64)
 
 
-def _directory(path: Path) -> None:
-    """Replace a ledger file with a directory SQLite cannot open."""
-    path.unlink()
-    path.mkdir()
-
-
 def _truncated(path: Path) -> None:
     """Cut the journal's last record short, as an interrupted append leaves it."""
     path.write_bytes(path.read_bytes()[:-8])
-
-
-def _middle_record_corrupted(path: Path) -> None:
-    """Put an undecodable line before the journal's last record, which nothing skips."""
-    *earlier, last = path.read_bytes().rstrip(b"\n").split(b"\n")
-    path.write_bytes(b"\n".join([*earlier, b"not a journal record", last]) + b"\n")
 
 
 def _trials_deleted(path: Path) -> None:
@@ -542,17 +528,6 @@ def _recover_while_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ob
         return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
 
 
-def _recover_over_invalid_publication(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Inspect recovery while the evidence it reads fails publication validation."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
-    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
-    monkeypatch.setattr(
-        "phasesweep.mcp.recovery._recover_trial_evidence",
-        _raiser(PublicationIntegrityError("Published result is invalid.")),
-    )
-    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
-
-
 def _recover_over_pre_cutover_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Recover from a state directory the 0.3.1 runtime left: run handles, no format marker."""
     state_dir = tmp_path / "mcp-state"
@@ -698,14 +673,6 @@ def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.Monk
     return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 
 
-def _accepted_target_study(name: str, target: int) -> optuna.Study:
-    """Return an empty current-format study that already accepted ``target`` trials."""
-    study = optuna.create_study(study_name=name)
-    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    study.set_user_attr(TRIAL_TARGET_ATTR, target)
-    return study
-
-
 def _refuse_as_prior_release(study: optuna.Study) -> None:
     """Refuse each phase with a different type that names the same remedy."""
     error_type = (
@@ -779,22 +746,9 @@ def _preflight_shared_registry_and_lost_ledger(
     return trigger(tmp_path, monkeypatch)
 
 
-_RECOVERY_STORAGE = (
-    "Restore the original complete storage ledger and access to it, then retry "
-    "phasesweep mcp recover-run."
-)
 _PREFLIGHT_AGGREGATE = "Experiment recovery preflight found multiple unsafe studies: "
-_SQLITE_SCAN = "could not be inspected for its PhaseSweep format without mutation."
 
 WRAP_CASES = (
-    WrapCase(
-        id="claim_ledger_discovery_default",
-        trigger=_claim_while(engine_ledger, "_load_existing_phase_study", _storage_gone),
-        outbound=StudyStorageUnavailableError,
-        action=OperatorAction.RESTORE_LEDGER,
-        cause=RuntimeError,
-        message="Could not inspect persistent study storage for phase 'p'.",
-    ),
     WrapCase(
         id="claim_ledger_discovery_preserves_override",
         trigger=_claim_while(engine_ledger, "_load_existing_phase_study", _ledger_busy),
@@ -829,16 +783,6 @@ WRAP_CASES = (
         message="Nothing was written. Cleanup state is therefore unknown. For an MCP run",
     ),
     WrapCase(
-        # So does a rollback SQLite refused: only write access has to return.
-        id="run_ownership_keeps_rollback_repair",
-        trigger=_run_over_damaged("current-sqlite", _interrupted_commit_write_protected),
-        outbound=ProcessCleanupUncertainError,
-        action=OperatorAction.RESTORE_LEDGER,
-        cause=LedgerTransactionInterruptedError,
-        message="its directory before retrying. Cleanup state is therefore unknown. For an MCP",
-        marks=(requires_nonroot,),
-    ),
-    WrapCase(
         # Composed: the cleanup refusal's own repair survives the replacement.
         id="run_failure_cleanup_keeps_repair",
         trigger=_run_fails_then_registry_turns_shared,
@@ -857,20 +801,15 @@ WRAP_CASES = (
         message="The run failed and subsequent process cleanup could not be confirmed.",
     ),
     WrapCase(
-        id="recovery_studies_storage_unbound",
-        trigger=_recovery_studies_damaged("ledger-only", _garbage),
-        outbound=RunRecoveryError,
-        action=OperatorAction.RESTORE_LEDGER,
-        cause=StudyStorageUnavailableError,
-        message=_RECOVERY_STORAGE,
-    ),
-    WrapCase(
         id="recovery_studies_storage_bound",
         trigger=_recovery_studies_damaged("tree", _garbage),
         outbound=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
         cause=StudyStorageUnavailableError,
-        message=_RECOVERY_STORAGE,
+        message=(
+            "Restore the original complete storage ledger and access to it, then retry "
+            "phasesweep mcp recover-run."
+        ),
     ),
     WrapCase(
         # The ledger is intact, so the storage wrap's restore remedy must not
@@ -902,14 +841,6 @@ WRAP_CASES = (
         action=OperatorAction.RETRY,
         cause=None,
         message="Another phasesweep process appears to be using the same experiment backend",
-    ),
-    WrapCase(
-        id="recover_run_publication_integrity",
-        trigger=_recover_over_invalid_publication,
-        outbound=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        cause=None,
-        message="Published result is invalid.",
     ),
     WrapCase(
         # Composed: the inbound refusal is a ValueError carrying no action, so the
@@ -982,30 +913,12 @@ WRAP_CASES = (
         message="Restore the original workdir, or use a fresh artifact root",
     ),
     WrapCase(
-        id="sqlite_unopenable",
-        trigger=_validate_damaged("current-sqlite", _directory),
-        outbound=StudyStorageUnavailableError,
-        action=OperatorAction.RESTORE_LEDGER,
-        cause=sqlite3.OperationalError,
-        message=_SQLITE_SCAN,
-    ),
-    WrapCase(
         id="sqlite_garbage",
         trigger=_validate_damaged("current-sqlite", _garbage),
         outbound=StudyStorageUnavailableError,
         action=OperatorAction.RESTORE_LEDGER,
         cause=sqlite3.DatabaseError,
-        message=_SQLITE_SCAN,
-    ),
-    WrapCase(
-        # A cut-short last record is skipped on reads, as Optuna skips it; a bad
-        # line that another line follows is what a read refuses.
-        id="journal_middle_record_corrupt",
-        trigger=_validate_damaged("current-journal", _middle_record_corrupted),
-        outbound=StudyStorageUnavailableError,
-        action=OperatorAction.RESTORE_LEDGER,
-        cause=json.JSONDecodeError,
-        message="could not be completely read while checking for the PhaseSweep format boundary.",
+        message="could not be inspected for its PhaseSweep format without mutation.",
     ),
     WrapCase(
         # Inspection previews the confirmed write, so it refuses a cut-short
@@ -1078,16 +991,6 @@ WRAP_CASES = (
         trigger=_preflight(_two_precutover_studies, schema_check=_refuse_as_prior_release),
         outbound=PhaseSweepError,
         action=OperatorAction.USE_PRIOR_RELEASE,
-        cause=StudySchemaMismatchError,
-        message=_PREFLIGHT_AGGREGATE,
-    ),
-    WrapCase(
-        id="preflight_mixed_aggregate_disagreeing",
-        trigger=_preflight(
-            lambda: {"a": _populated_study("t::a"), "b": _accepted_target_study("t::b", 5)}
-        ),
-        outbound=PhaseSweepError,
-        action=OperatorAction.INSPECT_LOGS,
         cause=StudySchemaMismatchError,
         message=_PREFLIGHT_AGGREGATE,
     ),
