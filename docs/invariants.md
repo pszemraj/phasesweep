@@ -1,10 +1,10 @@
 # Durability invariants
 
 PhaseSweep's local ledger, artifact-root binding, publication transaction, and
-operator recovery are the only places where a wrong ordering silently destroys
-work. Three review passes found bugs only here, because the ordering rules
-lived in comments. This page is the enforceable version: every rule names the
-code that holds it and the test that fails when it stops holding.
+operator recovery are where a wrong ordering silently destroys work. Every rule
+on this page names the code that holds it and the test that fails when it stops
+holding, so breaking one fails a test instead of waiting for a reviewer to
+notice.
 
 ## Agent handoff
 
@@ -12,10 +12,24 @@ Paste this block into the instructions of any agent that changes the engine or
 the MCP layer.
 
 ```text
-1. Mutating paths (a run, and recover-run when confirmed) take the experiment lock before they touch the artifact tree or the ledger. Read paths and recovery inspection take no lock, so they must write nothing.
-2. Validate, then claim, then open. validate_ledger checks the artifact-root binding, then scans the ledger format, and writes nothing; on a bound tree an unreadable scan is tolerated and recorded on the handle. claim_ledger rescans strictly if that scan did not complete, loads every existing phase study, checks every study's root before any write, writes the tree binding, then claims empty studies. Only the ClaimedLedger it returns reaches open_phase_study.
-3. Pure read paths (read_status, read_winners, CLI status and show-winners, the MCP result snapshot) never construct file-backed storage and never write bytes. Recovery inspection validates binding and format before any open and refuses a pre-cutover ledger with the bytes unchanged.
-4. Only src/phasesweep/engine/ledger.py may construct Optuna or sqlite3 storage, and no other module imports its private names. tests/test_ledger_contract.py enforces both, and its ratchets are empty, so a new site anywhere else fails.
+1. Mutating paths (a run, and recover-run when confirmed) take the experiment
+   lock before they touch the artifact tree or the ledger. Read paths and
+   recovery inspection take no lock, so they must write nothing.
+2. Validate, then claim, then open. validate_ledger checks the artifact-root
+   binding, then scans the ledger format, and writes nothing; on a bound tree
+   an unreadable scan is tolerated and recorded on the handle. claim_ledger
+   rescans strictly if that scan did not complete, loads every existing phase
+   study, checks every study's root before any write, writes the tree binding,
+   then claims empty studies. Only the ClaimedLedger it returns reaches
+   open_phase_study.
+3. Pure read paths (read_status, read_winners, CLI status and show-winners,
+   the MCP result snapshot) never construct file-backed storage and never
+   write bytes. Recovery inspection validates binding and format before any
+   open and refuses a pre-cutover ledger with the bytes unchanged.
+4. Only src/phasesweep/engine/ledger.py may construct Optuna or sqlite3
+   storage, and no other module imports its private names.
+   tests/test_ledger_contract.py enforces both, and its ratchets are empty,
+   so a new site anywhere else fails.
 ```
 
 > [!IMPORTANT]
