@@ -41,7 +41,7 @@ from phasesweep.engine.ledger import (
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.errors import OperatorAction
+from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _load_recovery_studies,
@@ -287,9 +287,11 @@ def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
 
     monkeypatch.setattr(Path, "mkdir", refuse_ledger_directory)
 
-    with pytest.raises(PermissionError):
+    with pytest.raises(PhaseSweepError, match="could not be created") as refused:
         claim_ledger(validate_ledger(experiment))
 
+    assert isinstance(refused.value.__cause__, PermissionError)
+    assert refused.value.actions == (OperatorAction.RESTORE_TREE,)
     assert not _artifact_root_binding_path(experiment).exists()
 
 
@@ -761,7 +763,8 @@ def test_rollback_open_never_creates_a_missing_ledger(tmp_path: Path) -> None:
     with pytest.raises(StudyStorageUnavailableError, match="could not roll it back") as refused:
         roll_back_interrupted_transaction(ledger)
 
-    assert type(refused.value) is StudyStorageUnavailableError
+    # Still the interrupted transaction's refusal, routed to bringing the ledger back.
+    assert type(refused.value) is LedgerTransactionInterruptedError
     assert refused.value.actions == (OperatorAction.RESTORE_LEDGER,)
     assert not database.exists()
 

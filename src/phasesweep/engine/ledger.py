@@ -50,6 +50,7 @@ recovery; it opens the existing file read-write and never creates one.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -81,6 +82,7 @@ from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
     LedgerTransactionInterruptedError,
     OperatorAction,
+    PhaseSweepError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
@@ -502,8 +504,9 @@ def _let_sqlite_roll_back(storage_url: str) -> None:
     instead of creating it, so this can never bring a ledger into existence.
 
     :param str storage_url: SQLite storage URL whose ledger holds a hot journal.
-    :raises StudyStorageUnavailableError: SQLite could not open the ledger for
-        writing or could not complete the rollback.
+    :raises LedgerTransactionInterruptedError: SQLite could not open the ledger
+        for writing or could not complete the rollback, so the interrupted
+        transaction remains until write access to the ledger is restored.
     """
     database = sqlite_database_path(storage_url)
     uri = sqlite_existing_readwrite_uri(storage_url)
@@ -515,10 +518,13 @@ def _let_sqlite_roll_back(storage_url: str) -> None:
         finally:
             conn.close()
     except sqlite3.Error as exc:
-        raise StudyStorageUnavailableError(
+        # Still the interrupted transaction, but a locked open already failed
+        # to roll it back, so the ledger's write access is what must return.
+        raise LedgerTransactionInterruptedError(
             f"SQLite storage {database} holds a transaction that a crash interrupted, and "
             f"SQLite could not roll it back: {exc}. Restore write access to the ledger and "
-            "its directory before retrying."
+            "its directory before retrying.",
+            action=OperatorAction.RESTORE_LEDGER,
         ) from exc
 
 
@@ -1141,8 +1147,9 @@ def roll_back_interrupted_transaction(ledger: ValidatedLedger) -> ValidatedLedge
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :return ValidatedLedger: The handle, verified when SQLite finished its
         rollback and the rescan passed; unchanged otherwise.
-    :raises StudyStorageUnavailableError: SQLite could not roll the
-        transaction back, or the rescan could not read the ledger.
+    :raises LedgerTransactionInterruptedError: SQLite could not roll the
+        transaction back, routed to restoring the ledger's write access.
+    :raises StudyStorageUnavailableError: The rescan could not read the ledger.
     :raises StudySchemaMismatchError: The rescan found pre-cutover or
         otherwise unsupported PhaseSweep study state.
     """
@@ -1207,6 +1214,39 @@ def read_phase_trial_stats(
     return _phase_trial_stats(ledger.experiment, phase, published_trial)
 
 
+# Creating a directory fails with these when the configured path itself is
+# unusable, which no permission repair fixes.
+_UNUSABLE_PATH_ERRNOS = frozenset({errno.EEXIST, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP})
+
+
+def _create_ledger_directory(directory: Path) -> None:
+    """Create the directory a file-backed ledger is written in.
+
+    Nothing exists there yet, so there is no ledger to restore: either the
+    configured path is wrong or its parent does not let this user write.
+
+    :param Path directory: The ledger file's parent directory.
+    :raises PhaseSweepError: The path names something that cannot be a
+        directory, or the directory could not be created; nothing was written.
+    """
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        if exc.errno in _UNUSABLE_PATH_ERRNOS:
+            raise PhaseSweepError(
+                f"Storage ledger directory {directory} cannot be created at that path: "
+                f"{exc}. Correct the storage path, or the workdir for auto storage, so it "
+                "names a directory PhaseSweep can create. Nothing was written.",
+                action=OperatorAction.FIX_CONFIG,
+            ) from exc
+        raise PhaseSweepError(
+            f"Storage ledger directory {directory} could not be created: {exc}. Restore "
+            "write access to the directory that holds it, then run again. Nothing was "
+            "written.",
+            action=OperatorAction.RESTORE_TREE,
+        ) from exc
+
+
 def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> ClaimedLedger:
     """Discover every existing phase study once, then bind the tree and claim them.
 
@@ -1261,8 +1301,8 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     :raises ArtifactRootConflictError: A phase study is already bound to a
         different artifact root, carries a binding that is not a string, or the
         tree's ownership record changed after validation.
-    :raises OSError: The ledger's directory could not be created; nothing was
-        bound or claimed.
+    :raises PhaseSweepError: The ledger's directory could not be created;
+        nothing was bound or claimed.
     """
     ledger = roll_back_interrupted_transaction(ledger)
     if not ledger.format_verified:
@@ -1302,7 +1342,7 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     # ledger fails before the tree is bound to it and the path can still be
     # corrected. Both backends need it: SQLite creates only the file.
     if ledger.ledger_path is not None:
-        ledger.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        _create_ledger_directory(ledger.ledger_path.parent)
     # Both directions are now known-compatible. Claim the tree first, then
     # empty studies: a crash cannot leave a study pointing at a tree that does
     # not itself name the same ledger. Crucially, neither claim occurs when a

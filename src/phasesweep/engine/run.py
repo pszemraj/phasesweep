@@ -26,7 +26,12 @@ from phasesweep.config import Config, Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import _metric_scoring_line, _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
-from phasesweep.engine.errors import OperatorAction, StudyStorageUnavailableError
+from phasesweep.engine.errors import (
+    IncompleteJournalRecordError,
+    LedgerTransactionInterruptedError,
+    OperatorAction,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
@@ -371,12 +376,20 @@ def _run_experiment_outcome(
             # failed ownership read cannot prove those processes are resolved,
             # even though this invocation has not claimed a generation or
             # launched anything of its own. Recovery cannot read the ledger
-            # either, so restoring it is the first step the message names.
-            raise ProcessCleanupUncertainError(
+            # either, so the ledger's repair is the first step the message names.
+            unknown = (
                 "Artifact ownership could not be checked because required persistent "
-                f"study state is unavailable: {exc} Cleanup state is therefore unknown. "
-                "Restore the original complete storage ledger and access to it before "
-                "retrying. For an MCP run, then run phasesweep mcp recover-run.",
+                f"study state is unavailable: {exc} Cleanup state is therefore unknown."
+            )
+            if isinstance(exc, (LedgerTransactionInterruptedError, IncompleteJournalRecordError)):
+                # These name the repair of an otherwise intact ledger; restoring
+                # the whole ledger instead would be the wrong remedy.
+                raise ProcessCleanupUncertainError.rewrap(
+                    exc, f"{unknown} For an MCP run, then run phasesweep mcp recover-run."
+                ) from exc
+            raise ProcessCleanupUncertainError(
+                f"{unknown} Restore the original complete storage ledger and access to it "
+                "before retrying. For an MCP run, then run phasesweep mcp recover-run.",
                 action=OperatorAction.RESTORE_LEDGER,
             ) from exc
         _preflight_missing_reached_phase_environments(

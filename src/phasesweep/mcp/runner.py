@@ -124,7 +124,7 @@ _OPERATOR_STEPS: dict[OperatorAction, str] = {
     OperatorAction.FRESH_NAMESPACE: (
         "use a new experiment name, or a fresh artifact root and local storage"
     ),
-    OperatorAction.RESTORE_LEDGER: "restore the original complete storage ledger and access to it",
+    OperatorAction.RESTORE_LEDGER: "restore or repair the storage ledger and access to it",
     OperatorAction.RESTORE_TREE: (
         "repair the experiment tree's files and permissions, deleting a file only if "
         "certain nothing is running"

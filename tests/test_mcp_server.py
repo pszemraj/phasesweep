@@ -3448,8 +3448,8 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     # The refusal names the ledger as the first repair, so the agent hears the same.
     assert status["failure"]["code"] == "cleanup_uncertain"
     assert status["failure"]["remediation"] == (
-        "Ask the operator to restore the original complete storage ledger and access to it, "
-        "then run phasesweep mcp recover-run before another launch. The error in the "
+        "Ask the operator to restore or repair the storage ledger and access to it, then "
+        "run phasesweep mcp recover-run before another launch. The error in the "
         "PhaseSweep run log gives the details."
     )
 

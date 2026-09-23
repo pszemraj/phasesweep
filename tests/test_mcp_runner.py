@@ -461,8 +461,8 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "Ask the operator to restore the original complete storage ledger and access to "
-            "it. The error in the PhaseSweep run log gives the details."
+            "Ask the operator to restore or repair the storage ledger and access to it. The "
+            "error in the PhaseSweep run log gives the details."
         ),
     }
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
@@ -560,7 +560,12 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             timeout=30,
         )
         assert refused_run.returncode != 0
-        assert "Restore the original complete storage ledger" in refused_run.stderr
+        if backend == "journal" and damage != "permission-denied":
+            # The bad last line's own repair, not a restore of the whole ledger.
+            assert f"truncate -s {len(healthy)} " in refused_run.stderr
+            assert "Restore the original complete storage ledger" not in refused_run.stderr
+        else:
+            assert "Restore the original complete storage ledger" in refused_run.stderr
 
         run_id = "damaged-storage"
         digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -603,7 +608,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         assert status["failure"]["cause"]["stage"] == "preflight"
         # The cause routes a ledger restore, which only the operator can do.
         assert status["failure"]["cause"]["retryable"] is False
-        assert "restore the original complete storage ledger" in status["failure"]["remediation"]
+        assert "restore or repair the storage ledger" in status["failure"]["remediation"]
         assert "then run phasesweep mcp recover-run" in status["failure"]["remediation"]
         assert app.status(run_id=run_id)["run"]["failure"] == status["failure"]
         assert str(ledger) not in json.dumps(status["failure"])
@@ -1595,7 +1600,7 @@ def test_cleanup_uncertainty_outer_failure_controls_a_cancelled_cause() -> None:
 
 _RUN_LOG_DETAILS = " The error in the PhaseSweep run log gives the details."
 _RESTORE_LEDGER_FIRST = (
-    "Ask the operator to restore the original complete storage ledger and access to it, "
+    "Ask the operator to restore or repair the storage ledger and access to it, "
     "then run phasesweep mcp recover-run before another launch." + _RUN_LOG_DETAILS
 )
 _RECOVER_RUN_ONLY = "Ask the operator to run phasesweep mcp recover-run before another launch."
@@ -1605,7 +1610,7 @@ _RESTORE_TREE_FIRST = (
     "another launch." + _RUN_LOG_DETAILS
 )
 _RESTORE_BOTH_FIRST = (
-    "Ask the operator to restore the original complete storage ledger and access to it, "
+    "Ask the operator to restore or repair the storage ledger and access to it, "
     "and repair the experiment tree's files and permissions, deleting a file only if "
     "certain nothing is running, then run phasesweep mcp recover-run before another "
     "launch." + _RUN_LOG_DETAILS

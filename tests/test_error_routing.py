@@ -515,6 +515,41 @@ def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return run_experiment(materialized.experiment)
 
 
+def _run_over_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
+    """Return a trigger that starts a run over a current golden ledger ``damage`` hit."""
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        return run_experiment(_materialize_damaged(tmp_path, fixture, "tree", damage).experiment)
+
+    return trigger
+
+
+def _claim_ledger_under(parent: Callable[[Path], Path]) -> Trigger:
+    """Return a trigger that claims a fresh SQLite ledger to be created below ``parent``."""
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        ledger = parent(tmp_path) / "ledgers" / "study.db"
+        experiment = make_experiment(workdir=tmp_path / "runs", storage=f"sqlite:///{ledger}")
+        return engine_ledger.claim_ledger(engine_ledger.validate_ledger(experiment))
+
+    return trigger
+
+
+def _regular_file(tmp_path: Path) -> Path:
+    """Return a regular file where the ledger's path needs a directory."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory\n")
+    return blocker
+
+
+def _unwritable_directory(tmp_path: Path) -> Path:
+    """Return a directory this user may read but not create entries in."""
+    parent = tmp_path / "read-only"
+    parent.mkdir()
+    parent.chmod(0o555)
+    return parent
+
+
 def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Fail a run, then lose the root before reconciliation can confirm cleanup.
 
@@ -839,6 +874,24 @@ WRAP_CASES = (
         action=OperatorAction.RESTORE_LEDGER,
         cause=StudyStorageUnavailableError,
         message="Artifact ownership could not be checked because required persistent",
+    ),
+    WrapCase(
+        # The partial record names its own repair; restoring the ledger is not it.
+        id="run_ownership_keeps_journal_repair",
+        trigger=_run_over_damaged("current-journal", _truncated),
+        outbound=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_LEDGER,
+        cause=IncompleteJournalRecordError,
+        message="Nothing was written. Cleanup state is therefore unknown. For an MCP run",
+    ),
+    WrapCase(
+        # So does a rollback SQLite refused: only write access has to return.
+        id="run_ownership_keeps_rollback_repair",
+        trigger=_run_over_damaged("current-sqlite", _interrupted_commit_write_protected),
+        outbound=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_LEDGER,
+        cause=LedgerTransactionInterruptedError,
+        message="its directory before retrying. Cleanup state is therefore unknown. For an MCP",
     ),
     WrapCase(
         # Composed: the cleanup refusal's own repair survives the replacement.
@@ -1885,9 +1938,23 @@ ORIGIN_CASES = (
     OriginCase(
         id="sqlite_rollback_refused",
         trigger=_claim_after_interrupted_commit_write_protected,
-        raised=StudyStorageUnavailableError,
+        raised=LedgerTransactionInterruptedError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Restore write access to the ledger and its directory before retrying.",
+    ),
+    OriginCase(
+        id="ledger_directory_path_unusable",
+        trigger=_claim_ledger_under(_regular_file),
+        raised=PhaseSweepError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Correct the storage path, or the workdir for auto storage",
+    ),
+    OriginCase(
+        id="ledger_directory_unwritable",
+        trigger=_claim_ledger_under(_unwritable_directory),
+        raised=PhaseSweepError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Restore write access to the directory that holds it, then run again.",
     ),
     OriginCase(
         id="environment_cohort_changed",

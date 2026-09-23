@@ -127,7 +127,9 @@ class LedgerTransactionInterruptedError(StudyStorageUnavailableError):
     committed state is intact, so restoring the ledger is the wrong remedy:
     a command that holds the lock lets SQLite finish its own recovery first.
     Routed to recovery because the one read that raises this to an operator
-    is ``recover-run`` inspection, whose confirmed form holds that lock.
+    is ``recover-run`` inspection, whose confirmed form holds that lock. A
+    locked open whose rollback SQLite refuses raises it routed to restoring
+    the ledger's write access instead.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RUN_RECOVER_RUN
