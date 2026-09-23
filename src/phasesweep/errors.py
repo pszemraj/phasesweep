@@ -25,7 +25,8 @@ class OperatorAction(StrEnum):
     ``RUN_RECOVER_RUN``
         Run the operator recovery command before anything else touches the run.
     ``FIX_CONFIG``
-        Correct the experiment configuration or the request, then run again.
+        Correct the experiment configuration, the request, or the environment
+        it runs in (variables, installed extras), then run again.
     ``RETRY``
         Wait for the current holder to finish and repeat the same request.
     ``INSPECT_LOGS``
