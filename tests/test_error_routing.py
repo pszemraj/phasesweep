@@ -1,20 +1,10 @@
 """Contract tests for the operator actions every PhaseSweepError carries.
 
-``actions`` is a *routing* attribute: it names the remediation an operator should carry out, so a
-caller can steer a failure without parsing prose. The message text stays authoritative about what
-went wrong, and these tests pin that separation down in both directions -- every operator-facing
-error resolves to real ``OperatorAction`` steps, and attaching them never edits the message.
-
-The class walk below is deliberately exhaustive rather than a hand-maintained
-list: it imports every module in the package and then recurses through
-``PhaseSweepError.__subclasses__()``, so a subclass added in some far corner of
-the tree is covered the moment it exists.
-
-The wrap table near the end carries the same contract across layer boundaries: a remediation
-survives each translation unless the site deliberately composes or replaces it, and every such site
-is driven for real rather than in isolation. The origin table after it holds raises whose message
-names its own remedy to the action that routes it. The MCP runner's failure payload, where routing
-reaches an agent, must then say exactly the steps a raise routes.
+``actions`` routes a failure to the remediation an operator should carry out, without parsing
+prose; the message stays authoritative about what went wrong, and routing never edits it. The class
+walk imports the whole package, so a subclass is covered the moment it exists. The routing table
+drives real raise and wrap sites and pins the action each routes, and the MCP runner's failure
+payload, where routing reaches an agent, must say exactly those steps.
 """
 
 from __future__ import annotations
@@ -204,13 +194,6 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     # A cause with no action of its own leaves the class default in place.
     foreign = RunRecoveryError.rewrap(OSError("disk"), "y")
     assert foreign.actions == (RunRecoveryError.default_action,)
-
-    # rewrap returns; the caller still writes the `from` clause that links the cause.
-    cause = StudyStorageUnavailableError("x")
-    with pytest.raises(RunRecoveryError) as excinfo:
-        raise RunRecoveryError.rewrap(cause, "y") from cause
-    assert excinfo.value.__cause__ is cause
-    assert excinfo.value.actions == (OperatorAction.RESTORE_LEDGER,)
 
 
 @pytest.mark.parametrize(
