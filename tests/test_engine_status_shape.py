@@ -10,18 +10,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
-from phasesweep import config_status, load_experiment, run_experiment
+from phasesweep import config_status
+from phasesweep.config import Experiment
 from phasesweep.engine import read_status
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.run import experiment_status
-from tests.conftest import write_trainer, write_yaml
-
-# Every test here pins the status payload against a real completed sweep, so
-# each one pays for trainer subprocesses; the whole module is integration tier.
-pytestmark = pytest.mark.integration
+from tests.ledger_fixtures import materialize
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",
@@ -96,44 +91,14 @@ reviewer 2, blocker 6); the CLI phase payload keeps exactly
 """
 
 
-def _write_experiment(tmp_path: Path) -> Path:
-    """Write an experiment whose trainer reports a constant objective."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        ap = argparse.ArgumentParser(); ap.add_argument('--out', required=True)
-        args, _ = ap.parse_known_args()
-        open(args.out, 'w').write(json.dumps({'x': 1.0}))
-        print('x=1.0')
-        """,
-    )
-    return write_yaml(
-        tmp_path,
-        f"""
-        experiment: shape
-        workdir: {tmp_path}/runs
-        storage: sqlite:///{tmp_path}/shape.db
-        provenance: {{revision: test-fixture-v1}}
-        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-        """,
-    )
+def _published(tmp_path: Path) -> Experiment:
+    """Return the config that reads the golden fixture's two-trial publication."""
+    return materialize("current-sqlite", tmp_path, mode="tree").experiment
 
 
 def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
     """A standalone experiment payload carries generation identity plus phases."""
-    experiment = load_experiment(_write_experiment(tmp_path))
-    run_experiment(experiment)
+    experiment = _published(tmp_path)
 
     payload = config_status(experiment)
 
@@ -150,7 +115,7 @@ def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
     assert not READ_STATUS_ONLY_PHASE_KEYS & set(phase)
     assert phase["name"] == "p"
     assert phase["winner"] is not None
-    assert phase["completed"] == 1
+    assert phase["completed"] == 2
 
 
 def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path) -> None:
@@ -161,8 +126,7 @@ def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path
     (PR #5 review / reviewer 2, blocker 6), and ``experiment_status`` is a
     pinned public contract that must not grow a key because of it.
     """
-    experiment = load_experiment(_write_experiment(tmp_path))
-    run_experiment(experiment)
+    experiment = _published(tmp_path)
 
     (read_phase,) = read_status(experiment)["phases"]
     (cli_phase,) = experiment_status(experiment)["phases"]
@@ -182,8 +146,7 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     be byte-identical to a tree that had never published, so the operator's
     natural next move was to re-run over the evidence.
     """
-    experiment = load_experiment(_write_experiment(tmp_path))
-    run_experiment(experiment)
+    experiment = _published(tmp_path)
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
 
