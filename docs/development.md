@@ -94,7 +94,7 @@ The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
 read-only inspection behavior depends on that range; do not widen it without
 targeted validation.
 
-The restored W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's
+The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's
 summary decoding and error behavior with controlled responses, plus supervised
 worker fixtures for deadlines, cleanup faults, and recovery. They do not certify
 live service access. Input tests use the real Hydra 1.3 parser and entrypoint;

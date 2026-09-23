@@ -8,9 +8,8 @@ later phases.
 
 Run `phasesweep validate <config>` before launching. The loader rejects
 duplicate YAML mapping keys and unsupported fields before it creates run
-artifacts. A top-level `suite` is not a configuration variant: it is rejected.
-Run formerly independent components as separate full experiment YAML files and
-review their defaults explicitly.
+artifacts. A top-level `suite` is rejected: write each component as its own
+complete experiment YAML file and review its defaults explicitly.
 
 Field types, defaults, and validation constraints are in
 [config_reference.yaml](config_reference.yaml).

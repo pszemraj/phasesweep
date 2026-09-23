@@ -53,9 +53,9 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 ## Fresh MCP state
 
 `state_dir` is private, owner-only state for handles, logs, audit entries, and
-frozen terminal snapshots. This release adds a format marker at its root, and
-the server refuses an unmarked, malformed, or unsupported durable state
-directory before creating or repairing it.
+frozen terminal snapshots. Its root carries a format marker, and the server
+refuses an unmarked, malformed, or unsupported durable state directory before
+creating or repairing it.
 
 > [!IMPORTANT]
 > Use a fresh state directory for the consolidated release. Do not point this
