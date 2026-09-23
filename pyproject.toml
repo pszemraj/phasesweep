@@ -130,5 +130,5 @@ testpaths = ["tests"]
 addopts = "-q -m 'not hardware' --strict-markers"
 markers = [
     "hardware: tests that query real host hardware and require explicit opt-in",
-    "integration: spawns real processes, waits on wall-clock time, or drives a multi-step durable recovery workflow; excluded from the fast review tier (docs/development.md)",
+    "integration: slow tests, excluded from the fast review tier. Collection fails when an unmarked test manages processes or waits on the clock directly; engine runs with quick trainers stay in the fast tier; any other slow test is marked by the classification rule in docs/development.md",
 ]

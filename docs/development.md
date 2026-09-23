@@ -81,12 +81,21 @@ pytest -m "integration and not hardware"       # integration tier only
 > rather than adding to it, which is why both commands above spell out
 > `not hardware`.
 
-A test is `@pytest.mark.integration` when it spawns real processes, waits on
+A test is `@pytest.mark.integration` when it manages real processes, waits on
 wall-clock time, drives a multi-step durable recovery workflow, or is otherwise
-slow; everything else stays in the fast tier. `tests/tiers.py` recognizes the
-process and wall-clock primitives statically and `tests/conftest.py` fails
-collection when a test uses one without the marker, so the fast tier cannot
-quietly absorb a slow test.
+slow: its call phase takes at least `SLOW_CALL_SECONDS` from `tests/tiers.py`.
+Everything else stays in the fast tier, including engine runs with quick
+trainers, such as `run_experiment` over an `echo` trainer, which spawn their
+subprocess inside the package.
+
+The guard enforces only what a test's source shows: `tests/conftest.py` fails
+collection when a test manages processes or waits on the clock *directly*, in
+its body or a same-module helper or fixture, without the marker
+(`tests/tiers.py` lists the primitives). A test that is slow for any other
+reason is marked by the classification rule above. To keep one visible, a run
+that excludes `integration` ends with a list of unmarked tests at or over the
+threshold. The list is a report, not a failure, because timing thresholds
+flake on loaded hosts.
 
 GitHub Actions intentionally has one Linux pull-request static-check job for
 Ruff linting, Ruff format checking, mypy, and the same three contract tests the

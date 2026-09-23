@@ -40,7 +40,7 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import _read_proc_stat
-from tests.tiers import flagged_tests
+from tests.tiers import SLOW_CALL_SECONDS, excludes_integration, flagged_tests, slow_unmarked
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
@@ -50,16 +50,18 @@ _R = TypeVar("_R")
 
 
 def pytest_collection_modifyitems(session, config, items) -> None:
-    """Refuse collection when a test spawns processes or sleeps without the integration marker.
+    """Refuse collection when a test manages processes or sleeps directly without the marker.
 
     The fast review tier is a marker expression, so it is only trustworthy if
-    every test that spawns a real process or waits on the wall clock actually
+    every test that manages a real process or waits on the wall clock itself
     carries ``@pytest.mark.integration``. ``tests/tiers.py`` recognizes those
-    primitives statically; this hook applies it to whatever was collected and
-    fails loudly rather than letting an unmarked slow test silently slip into
-    the fast tier. There is no escape hatch: a test that matches the rules is
-    an integration test, and a test that should not match should stop using the
-    primitive.
+    primitives statically in a test's own module; this hook applies it to
+    whatever was collected and fails loudly. There is no escape hatch: a test
+    that matches the rules is an integration test, and a test that should not
+    match should stop using the primitive. Engine runs that spawn a quick
+    trainer inside the package are out of its reach by design, and
+    :func:`pytest_terminal_summary` reports any unmarked test that turns out
+    slow.
     """
     scanned: dict[Path, dict[str, str]] = {}
     offenders: dict[tuple[Path, str], str] = {}
@@ -83,6 +85,33 @@ def pytest_collection_modifyitems(session, config, items) -> None:
             + "\n\nAdd @pytest.mark.integration (see docs/development.md, "
             "'Quality gates') or stop using the primitive."
         )
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    """List unmarked slow tests in a run that leaves the integration tier out.
+
+    The collection guard cannot see a test that is slow for reasons its source
+    does not show, so this makes such a test visible where it lands: in the
+    fast tier. It is a report, not a failure, because a timing threshold would
+    flake on a loaded host.
+    """
+    if not excludes_integration(config.option.markexpr):
+        return
+    reports = [
+        report
+        for group in terminalreporter.stats.values()
+        for report in group
+        if isinstance(report, pytest.TestReport)
+    ]
+    slow = slow_unmarked(reports)
+    if not slow:
+        return
+    terminalreporter.write_sep(
+        "=",
+        f"unmarked tests at or over {SLOW_CALL_SECONDS:g}s: classify them (docs/development.md)",
+    )
+    for nodeid, seconds in slow:
+        terminalreporter.write_line(f"{seconds:6.2f}s {nodeid}")
 
 
 def raise_after_first_successful_call(

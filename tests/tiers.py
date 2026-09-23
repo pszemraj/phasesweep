@@ -1,18 +1,29 @@
 """Static classifier that decides which tests belong to the integration tier.
 
 The fast review tier is ``pytest -m "not hardware and not integration"``. A test
-belongs to the integration tier when it spawns real processes, waits on
-wall-clock time, or drives a multi-step durable recovery workflow. The first two
-properties are visible in the source, so this module detects them statically and
-``tests/conftest.py`` fails collection when a test matches one of them without
-carrying the marker. Detection is deliberately syntactic: it never imports the
-module under inspection and never touches the filesystem beyond reading source.
+belongs to the integration tier when it manages real processes, waits on
+wall-clock time, drives a multi-step durable recovery workflow, or is otherwise
+slow. This module enforces the part of that rule a test's own source shows: a
+test that manages processes or waits on the clock *directly*, in its body or in
+a same-module helper or fixture. ``tests/conftest.py`` fails collection when
+such a test lacks the marker.
 
-Two rules fire here:
+What the scanner does not see is deliberate. An engine run with a quick trainer,
+such as ``run_experiment`` over an ``echo`` trainer, spawns its subprocess inside
+the package; it stays in the fast tier, which relies on those runs for engine
+coverage. Any other slow test is marked by the classification rule in
+``docs/development.md``, not by this scanner. To keep such a test visible,
+``tests/conftest.py`` lists unmarked tests whose call phase took at least
+:data:`SLOW_CALL_SECONDS` in any run that leaves the integration tier out. The
+list is a report, never a failure: timing-based failures flake on loaded hosts.
 
-* **Rule (a), real processes** -- ``subprocess`` spawn entry points, ``os.killpg``,
-  a ``start_new_session=`` keyword argument, or a call to the in-process MCP
-  runner driver ``runner_main``.
+Detection is syntactic: it never imports the module under inspection and never
+touches the filesystem beyond reading source. Two rules fire here:
+
+* **Rule (a), real processes** -- a reference to a process primitive in
+  :data:`PROCESS_PRIMITIVES` or the ``os.spawn*`` family, under any import
+  spelling; a ``start_new_session=`` keyword argument; or a call to the
+  in-process MCP runner driver ``runner_main``.
 * **Rule (b), wall-clock waits** -- a call whose leaf name is ``sleep``
   (``time.sleep``, ``asyncio.sleep``, a bare imported ``sleep``) or a string
   literal that embeds ``sleep(``, which is how the suite injects delays into
@@ -22,26 +33,38 @@ Two rules fire here:
 
 Both rules resolve transitively through same-module helper functions and
 same-module fixtures, so a test that only calls a local ``_spawn_runner()``
-helper is still classified by what that helper does.
+helper, or only requests a local fixture that spawns, is still classified by
+what that helper does.
 """
 
 from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Iterable, Mapping
 from pathlib import Path
+from typing import Protocol
 
-#: ``subprocess`` attributes that start a real child process.
-SUBPROCESS_SPAWNERS = frozenset({"Popen", "run", "check_output", "check_call", "call"})
+from _pytest.mark.expression import Expression
 
-#: ``os`` attributes that signal direct process-group control.
-OS_PROCESS_CONTROLS = frozenset({"killpg"})
-
-#: Module attribute leaves that mean "this touches a real process", per head module.
-_PROCESS_ATTRS: dict[str, frozenset[str]] = {
-    "subprocess": SUBPROCESS_SPAWNERS,
-    "os": OS_PROCESS_CONTROLS,
+#: Root package -> attribute leaves that start or signal a real process. A
+#: reference counts whatever path reaches the leaf, so ``multiprocessing.Pool``
+#: and ``multiprocessing.pool.Pool`` both match.
+PROCESS_PRIMITIVES: dict[str, frozenset[str]] = {
+    "subprocess": frozenset(
+        {"Popen", "run", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
+    ),
+    "os": frozenset(
+        {"killpg", "system", "popen", "fork", "forkpty", "posix_spawn", "posix_spawnp"}
+    ),
+    "multiprocessing": frozenset({"Process", "Pool"}),
+    "concurrent": frozenset({"ProcessPoolExecutor"}),
+    "asyncio": frozenset({"create_subprocess_exec", "create_subprocess_shell"}),
+    "pty": frozenset({"spawn", "fork"}),
 }
+
+#: ``os.spawnl`` through ``os.spawnvpe`` are one family, matched by prefix.
+OS_SPAWN_PREFIX = "spawn"
 
 #: Bare call names that drive a full detached-run lifecycle in this suite.
 PROCESS_DRIVER_CALLS = frozenset({"runner_main"})
@@ -54,6 +77,12 @@ SLEEP_CALL = "sleep"
 
 #: ``sleep(`` inside a string literal, i.e. a delay embedded in a generated script.
 SLEEP_IN_SOURCE_STRING = re.compile(r"\bsleep\(")
+
+#: Call-phase seconds at which an unmarked test is slow enough to classify.
+SLOW_CALL_SECONDS = 1.0
+
+#: Markers that already keep a test out of the fast tier.
+TIER_MARKERS = frozenset({"integration", "hardware"})
 
 _FunctionDef = ast.FunctionDef | ast.AsyncFunctionDef
 
@@ -82,17 +111,35 @@ def _call_leaf(node: ast.Call) -> str:
     return _decorator_leaf(node.func)
 
 
-def _attribute_head(node: ast.Attribute) -> str:
-    """Return the base name of an attribute chain such as ``subprocess`` in ``subprocess.run``.
+def _dotted(node: ast.expr) -> str | None:
+    """Flatten a ``Name``/``Attribute`` chain such as ``os.path.join`` into dotted text.
 
-    :param ast.Attribute node: Attribute expression to inspect.
-    :return: Name at the base of the chain, or the empty string when the base is
-        not a plain name.
+    :param ast.expr node: Expression to flatten.
+    :return: Dotted text, or ``None`` when the chain does not start at a bare name.
     """
-    value = node.value
-    while isinstance(value, ast.Attribute):
-        value = value.value
-    return value.id if isinstance(value, ast.Name) else ""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def is_process_primitive(qualified: str) -> bool:
+    """Return whether a fully qualified name is a process primitive under rule (a).
+
+    :param str qualified: Dotted name after import aliases are resolved.
+    :return: ``True`` for a leaf in :data:`PROCESS_PRIMITIVES` or the ``os.spawn*`` family.
+    """
+    root, _, rest = qualified.partition(".")
+    if not rest:
+        return False
+    leaf = rest.rpartition(".")[2]
+    if leaf in PROCESS_PRIMITIVES.get(root, frozenset()):
+        return True
+    return root == "os" and rest.startswith(OS_SPAWN_PREFIX)
 
 
 class _ModuleIndex:
@@ -103,31 +150,31 @@ class _ModuleIndex:
 
         :param ast.Module tree: Parsed module to index.
         """
-        # Alias -> canonical module name, for `import subprocess as sp`.
-        self.module_aliases: dict[str, str] = {}
-        # Bare name -> "module.attr", for `from subprocess import Popen`.
-        self.imported_names: dict[str, str] = {}
+        # Bound name -> the dotted target it names: ``sp`` -> ``subprocess``
+        # for ``import subprocess as sp``, ``P`` -> ``subprocess.Popen`` for
+        # ``from subprocess import Popen as P``.
+        self.aliases: dict[str, str] = {}
         self.functions: dict[str, _FunctionDef] = {}
         self.fixtures: set[str] = set()
         self._index_imports(tree)
         self._index_functions(tree)
 
     def _index_imports(self, tree: ast.Module) -> None:
-        """Record every ``subprocess``/``os`` import in the module, at any nesting depth."""
+        """Record every absolute import in the module, at any nesting depth."""
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name in _PROCESS_ATTRS:
-                        self.module_aliases[alias.asname or alias.name] = alias.name
-            elif isinstance(node, ast.ImportFrom):
-                interesting = _PROCESS_ATTRS.get(node.module or "")
-                if interesting is None:
-                    continue
+                    if alias.asname:
+                        self.aliases[alias.asname] = alias.name
+                    else:
+                        # ``import a.b`` binds ``a``; attribute chains walk the rest.
+                        root = alias.name.partition(".")[0]
+                        self.aliases[root] = root
+            elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                # A relative import names a sibling test module, never a
+                # process primitive, and helpers are only followed same-module.
                 for alias in node.names:
-                    if alias.name in interesting:
-                        self.imported_names[alias.asname or alias.name] = (
-                            f"{node.module}.{alias.name}"
-                        )
+                    self.aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
 
     def _index_functions(self, tree: ast.Module) -> None:
         """Record module-level functions and ``Test*`` class methods as resolvable helpers."""
@@ -144,6 +191,21 @@ class _ModuleIndex:
         self.functions.setdefault(node.name, node)
         if any(_decorator_leaf(deco) == "fixture" for deco in node.decorator_list):
             self.fixtures.add(node.name)
+
+    def resolve(self, node: ast.expr) -> str | None:
+        """Return the fully qualified name a reference resolves to through imports.
+
+        :param ast.expr node: ``Name`` or ``Attribute`` reference.
+        :return: Dotted target, or ``None`` when its root name was never imported.
+        """
+        dotted = _dotted(node)
+        if dotted is None:
+            return None
+        head, _, tail = dotted.partition(".")
+        target = self.aliases.get(head)
+        if target is None:
+            return None
+        return f"{target}.{tail}" if tail else target
 
     def parameter_helpers(self, node: _FunctionDef) -> list[str]:
         """Return parameter names of ``node`` that name a fixture defined in this module.
@@ -166,13 +228,9 @@ def _local_reason(node: ast.AST, index: _ModuleIndex) -> str | None:
     :param _ModuleIndex index: Import and function table for the enclosing module.
     :return: Human-readable reason, or ``None`` when the node is tier-neutral.
     """
-    if isinstance(node, ast.Attribute):
-        head = index.module_aliases.get(_attribute_head(node))
-        if head is not None and node.attr in _PROCESS_ATTRS[head]:
-            return f"references {head}.{node.attr}"
-    elif isinstance(node, ast.Name):
-        qualified = index.imported_names.get(node.id)
-        if qualified is not None:
+    if isinstance(node, ast.Attribute | ast.Name):
+        qualified = index.resolve(node)
+        if qualified is not None and is_process_primitive(qualified):
             return f"references {qualified}"
     elif isinstance(node, ast.keyword):
         if node.arg in SESSION_KEYWORDS:
@@ -290,3 +348,42 @@ def flagged_tests(path: Path) -> dict[str, str]:
     :raises SyntaxError: If ``path`` does not contain parseable Python.
     """
     return scan_module(path.read_text(encoding="utf-8"))
+
+
+class CallReport(Protocol):
+    """The fields of a ``pytest.TestReport`` the slow-test report reads."""
+
+    nodeid: str
+    when: str
+    duration: float
+    keywords: Mapping[str, object]
+
+
+def excludes_integration(markexpr: str) -> bool:
+    """Return whether a ``-m`` expression deselects a test marked only ``integration``.
+
+    :param str markexpr: The run's effective marker expression, possibly empty.
+    :return: ``True`` when the run leaves the integration tier out.
+    """
+    if not markexpr:
+        return False
+    return not Expression.compile(markexpr).evaluate(lambda name, **_: name == "integration")
+
+
+def slow_unmarked(
+    reports: Iterable[CallReport], threshold: float = SLOW_CALL_SECONDS
+) -> list[tuple[str, float]]:
+    """Return unmarked tests whose call phase took at least ``threshold`` seconds.
+
+    :param Iterable[CallReport] reports: Test reports from one run, any phase.
+    :param float threshold: Call-phase seconds at which a test is listed.
+    :return: ``(node id, seconds)`` pairs, slowest first.
+    """
+    slow = [
+        (report.nodeid, report.duration)
+        for report in reports
+        if report.when == "call"
+        and report.duration >= threshold
+        and TIER_MARKERS.isdisjoint(report.keywords)
+    ]
+    return sorted(slow, key=lambda pair: (-pair[1], pair[0]))
