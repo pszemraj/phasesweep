@@ -98,46 +98,19 @@ def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None
     assert status["phases"][0]["running_attempts"] is None
 
 
-def test_read_status_uses_one_sqlite_snapshot_per_phase(
+def test_read_status_aggregates_each_sqlite_phase_in_one_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = tmp_path / "phases.db"
     storage = f"sqlite:///{db}"
     study = optuna.create_study(study_name="read_t::p", storage=storage)
-    study.optimize(lambda trial: 1.0, n_trials=1)
+    # More than one trial, so a per-trial transfer cannot pass as the single
+    # aggregated row asserted below.
+    study.optimize(lambda trial: 1.0, n_trials=3)
     exp = _experiment(tmp_path, storage=storage)
     mark_current_format(exp, study)
     real_connect = engine_ledger.sqlite3.connect
     connections = 0
-
-    def counting_connect(*args: object, **kwargs: object):
-        nonlocal connections
-        connections += 1
-        return real_connect(*args, **kwargs)
-
-    monkeypatch.setattr(engine_ledger.sqlite3, "connect", counting_connect)
-
-    status = read_status(exp)
-
-    # One connection for the ledger-format scan ``validate_ledger`` runs before
-    # any phase is read, then exactly one more per phase: the counts and the
-    # RUNNING identities that explain them still come from a single snapshot.
-    assert connections == 1 + len(exp.phases)
-    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
-    assert status["phases"][0]["trial_data_available"] is True
-
-
-@pytest.mark.integration
-def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    db = tmp_path / "phases.db"
-    storage = f"sqlite:///{db}"
-    study = optuna.create_study(study_name="read_t::p", storage=storage)
-    study.optimize(lambda trial: 1.0, n_trials=50)
-    exp = _experiment(tmp_path, storage=storage)
-    mark_current_format(exp, study)
-    real_connect = engine_ledger.sqlite3.connect
     transferred: list[tuple[str, int]] = []
 
     class CursorProxy:
@@ -161,13 +134,21 @@ def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
             self._connection.close()
 
     def observed_connect(*args: object, **kwargs: object):
+        nonlocal connections
+        connections += 1
         return ConnectionProxy(real_connect(*args, **kwargs))
 
     monkeypatch.setattr(engine_ledger.sqlite3, "connect", observed_connect)
 
     status = read_status(exp)
 
-    assert status["phases"][0]["trials"] == {"COMPLETE": 50}
+    # Connection 1 is the ledger-format scan ``validate_ledger`` runs before any
+    # phase is read. Each phase then adds exactly one: the trial-stats snapshot
+    # ``read_phase_trial_stats`` opens, so the counts and the RUNNING
+    # identities that explain them come from a single snapshot.
+    assert connections == 1 + len(exp.phases)
+    assert status["phases"][0]["trials"] == {"COMPLETE": 3}
+    assert status["phases"][0]["trial_data_available"] is True
     # The format scan reads the ledger first and is not what this pins down.
     # The statement under test is the one naming the ``phase_trials`` CTE: it
     # must aggregate server-side and hand back a single row, not one per trial.
