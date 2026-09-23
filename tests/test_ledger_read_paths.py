@@ -22,9 +22,7 @@ every pure read says ``ok``.
 from __future__ import annotations
 
 import json
-import logging
 import sqlite3
-import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -32,7 +30,6 @@ from typing import Any
 import pytest
 import yaml
 
-from phasesweep.cli import main as cli_boundary
 from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
@@ -46,6 +43,7 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.mcp.runs import RunStore, UnsupportedStateFormatError
 from phasesweep.mcp.snapshots import capture_result_snapshot
+from tests.conftest import invoke_cli_boundary
 from tests.ledger_fixtures import (
     LEDGER_MODES,
     Materialized,
@@ -154,26 +152,18 @@ def _cli_verdict(
 ) -> str:
     """Run one CLI command through the real process boundary and classify it.
 
-    ``CliRunner`` invokes the Click group directly and therefore never reaches
-    the boundary that turns a refusal into an operator diagnostic and an exit
-    status, which is exactly the verdict under test here (mirrors
-    ``tests/test_cli.py::_invoke_cli_boundary``).
+    The boundary is what turns a refusal into an operator diagnostic and an
+    exit status, which is exactly the verdict under test here.
 
     :param list[str] argv: Arguments following the program name.
     :param pytest.MonkeyPatch monkeypatch: Fixture used to set ``sys.argv``.
     :param pytest.CaptureFixture[str] capsys: Fixture capturing the diagnostic.
     :return str: ``"ok"`` on exit 0, otherwise the diagnostic's verdict.
     """
-    monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
-    monkeypatch.setattr(logging.getLogger(), "level", logging.INFO)
-    with pytest.raises(SystemExit) as excinfo:
-        cli_boundary()
-    code = excinfo.value.code
+    code = invoke_cli_boundary(argv, monkeypatch)
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err, captured.err
-    if code in (None, 0):
-        return "ok"
-    return _classify_message(captured.err)
+    return "ok" if code == 0 else _classify_message(captured.err)
 
 
 def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, dict[str, str]]:
