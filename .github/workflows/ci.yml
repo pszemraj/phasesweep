@@ -26,9 +26,11 @@ jobs:
       # Fast in-process contracts, run from src/ without building the package.
       # Collecting the whole suite runs the integration-tier guard over every
       # test module without executing one; it imports each module, so a test
-      # that needs Hydra or W&B must import it inside the test.
+      # that needs Hydra or W&B must import it inside the test. The size check
+      # covers every tracked src module, not only the ones a commit touched.
       - name: Contract tests
         run: |
+          bash scripts/check_module_size.sh
           python -m pip install 'pytest>=7'
           PYTHONPATH=src python -m pytest --collect-only -q -p no:cacheprovider
           PYTHONPATH=src python -m pytest -p no:cacheprovider \
