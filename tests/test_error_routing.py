@@ -1665,7 +1665,7 @@ ORIGIN_CASES = (
         id="claim_ledger_tree_changed",
         trigger=_claim_after_unlocked_bind,
         raised=ArtifactRootConflictError,
-        action=OperatorAction.RETRY,
+        action=OperatorAction.INSPECT_LOGS,
         message="Stop that process before retrying.",
     ),
     OriginCase(

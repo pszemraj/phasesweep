@@ -1332,13 +1332,15 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     offered = _artifact_root_identity(experiment)
     binding_state = _check_artifact_root_binding(experiment)
     if binding_state != ledger.binding_state or offered != ledger.artifact_root:
+        # Only the operator can find and stop the process the message names;
+        # retrying while it still runs would fail the same way.
         raise ArtifactRootConflictError(
             f"Artifact root {ledger.artifact_root!r} changed while its ledger was being "
             f"claimed: validation found it {ledger.binding_state}, but it is now "
             f"{binding_state} at {offered!r}. Another process modified this tree without "
             "holding the experiment lock. Stop that process before retrying. Nothing was "
             "written.",
-            action=OperatorAction.RETRY,
+            action=OperatorAction.INSPECT_LOGS,
         )
     # The ledger's directory is the first write, so a path that cannot hold a
     # ledger fails before the tree is bound to it and the path can still be
