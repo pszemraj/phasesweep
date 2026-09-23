@@ -28,10 +28,10 @@ import phasesweep.mcp.recovery as mcp_recovery
 import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
-from phasesweep._metadata import __version__
 from phasesweep.config import (
     ExecutionContext,
     Experiment,
+    FloatParam,
     IntParam,
     JsonEnvelopeExtractor,
     LogRegexExtractor,
@@ -40,25 +40,21 @@ from phasesweep.config import (
     Sampler,
     load_config,
 )
-from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import (
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     TerminalReport,
+    read_winners,
     run_experiment,
 )
 from phasesweep.engine.artifact_roots import (
     _bind_study_artifact_root,
     _write_artifact_root_binding,
 )
-from phasesweep.engine.artifacts import _save_winner, _write_yaml_atomic
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
-from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.generation import (
-    _claim_generation,
-    _publish_generation,
     _write_generation_state,
 )
 from phasesweep.engine.locking import _experiment_lock
@@ -71,19 +67,14 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _trial_dir_for,
 )
-from phasesweep.engine.publication_validation import _generation_artifact_manifest
-from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
-    GENERATION_SUMMARY_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRIAL_DIR_ATTR,
-    Winner,
-    WinnerSource,
 )
 from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.evidence.models import objective_evidence_assurance
@@ -128,6 +119,7 @@ from tests.conftest import (
     reaped_pid,
     write_constant_trainer,
 )
+from tests.ledger_fixtures import republish_as_incomplete
 from tests.mcp_helpers import (
     claim_runner_handle,
     make_mcp_app,
@@ -399,87 +391,38 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
     assert "get_run_results with its run_id" in str(excinfo.value)
 
 
-def _write_winner_yaml(
-    experiment: Experiment,
-    phase_name: str,
-    *,
-    phase_fingerprint: str,
-    incomplete: bool = False,
-    generation_id: str | None = None,
-) -> None:
-    """Publish one minimal current-format winner fixture."""
-    mark_current_format(experiment)
-    published_generation_id = _claim_generation(experiment, generation_id)
-    winner = Winner(
-        trial_number=0,
-        metric=0.123,
-        params={"lr": 0.001},
-        effective_overrides={"lr": 0.001},
-        completion={"incomplete": incomplete},
-        phase_fingerprint=phase_fingerprint,
-        generation_id=published_generation_id,
-        attempt_id="fixture-attempt",
-        source=WinnerSource(
-            kind="phase_trial",
-            phase=phase_name,
-            trial_number=0,
-            generation_id=published_generation_id,
-            attempt_id="fixture-attempt",
-        ),
-    )
-    _save_winner(
-        experiment,
-        phase_name,
-        winner,
-        generation_id=published_generation_id,
-    )
-    summary_path = _generation_summary_path(experiment, published_generation_id)
-    summary = {
-        "schema_version": GENERATION_SUMMARY_SCHEMA_VERSION,
-        "experiment": experiment.experiment,
-        "generation_id": published_generation_id,
-        "phasesweep_version": __version__,
-        "config_fingerprint": _experiment_semantic_fingerprint(experiment),
-        "metric": _metric_semantics_payload(experiment.metric),
-        "phase_plan": [
-            {"name": phase.name, "comment": phase.comment} for phase in experiment.phases
-        ],
-        "phases": [_winner_summary_item(phase_name, winner)],
-        "artifacts": _generation_artifact_manifest(experiment, published_generation_id),
-    }
-    _write_yaml_atomic(summary_path, summary)
-    _publish_generation(
-        experiment,
-        published_generation_id,
-        from_phase=None,
-        winners={phase_name: winner},
-        publication_hook=None,
-    )
-
-
 @pytest.mark.parametrize(
-    ("fingerprint_override", "incomplete"),
+    ("lr_high", "incomplete"),
     [
-        pytest.param("0" * 64, False, id="stale"),
-        pytest.param(None, True, id="incomplete"),
+        pytest.param(3, False, id="stale"),
+        pytest.param(2, True, id="incomplete"),
     ],
 )
+@pytest.mark.integration
 def test_resume_rejects_incompatible_winner_before_spawn(
     tmp_path: Path,
-    fingerprint_override: str | None,
+    lr_high: int,
     incomplete: bool,
 ) -> None:
-    config = _config(tmp_path, phases=RESUMABLE_PHASES)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    exp = load_config(config)
-    assert isinstance(exp, Experiment)
-    phase_fingerprint = fingerprint_override or _phase_fingerprint(exp, exp.phases[0], {})
-    _write_winner_yaml(
-        exp,
-        "p",
-        phase_fingerprint=phase_fingerprint,
-        incomplete=incomplete,
+    trainer = write_constant_trainer(tmp_path)
+    published = _drift_experiment(tmp_path, trainer)
+    run_experiment(published)
+    if incomplete:
+        republish_as_incomplete(published)
+    # The operator appends phase q, which resumes from p's published winner; a
+    # wider p search space than the one published changes p's fingerprint.
+    (p,) = published.phases
+    p = p.model_copy(update={"search_space": {"lr": IntParam(type="int", low=1, high=lr_high)}})
+    q = Phase(
+        name="q",
+        inherits=["p"],
+        n_trials=1,
+        sampler=Sampler(type="random", seed=1),
+        search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
     )
+    config = tmp_path / "srv.yaml"
+    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phases=[p, q]))
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
 
     with pytest.raises(ResumeNotReadyError, match="compatible winner"):
         app.launch("srv", from_phase="q")
@@ -1859,16 +1802,22 @@ def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
     ]
 
 
-@pytest.mark.parametrize("method_name", ["status", "winners"])
+@pytest.mark.parametrize(
+    "method_name",
+    # Only the winners read needs a published run, and a real run is slow.
+    ["status", pytest.param("winners", marks=pytest.mark.integration)],
+)
 def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     tmp_path: Path,
     method_name: str,
 ) -> None:
-    config = _config(tmp_path)
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _drift_experiment(tmp_path, trainer)
+    config = tmp_path / "srv.yaml"
+    _write_experiment_config(config, experiment)
     catalog = _catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS)
     _app, registry, store = make_mcp_app(catalog)
     reg = registry.get("srv")
-    exp = reg.experiment
     run_id = "srv-launched"
     snapshot = config.read_bytes()
     store.config_snapshot_path(run_id).write_bytes(snapshot)
@@ -1880,13 +1829,8 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
         )
     )
     if method_name == "winners":
-        _write_winner_yaml(
-            exp,
-            "p",
-            phase_fingerprint="0" * 64,
-            generation_id=run_id,
-        )
-    config.write_text(config.read_text().replace("- name: p", "- name: edited"))
+        run_experiment(experiment, generation_id=run_id)
+    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phase_name="edited"))
 
     restarted_registry = Registry.load(catalog)
     restarted_app = PhaseSweepMCP(restarted_registry, store)
@@ -1896,22 +1840,19 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     if method_name == "status":
         assert by_run["run"]["state"] == "running"
     else:
-        assert by_run["phases"][0]["metric"] == 0.123
+        assert by_run["phases"][0]["metric"] == 0.5
 
 
+@pytest.mark.integration
 def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     tmp_path: Path,
 ) -> None:
-    old_config = _config(tmp_path, name="old")
-    old_exp = load_config(old_config)
-    assert isinstance(old_exp, Experiment)
+    trainer = write_constant_trainer(tmp_path)
+    old_exp = _drift_experiment(tmp_path, trainer, name="old")
+    old_config = tmp_path / "old.yaml"
+    _write_experiment_config(old_config, old_exp)
     run_id = "old-launched"
-    _write_winner_yaml(
-        old_exp,
-        "p",
-        phase_fingerprint=_phase_fingerprint(old_exp, old_exp.phases[0], {}),
-        generation_id=run_id,
-    )
+    run_experiment(old_exp, generation_id=run_id)
     other_config = _config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, visible_params={"other": "all"})
@@ -1932,27 +1873,16 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     assert result["phases"][0]["params"] == {"lr": "<redacted>"}
 
 
+@pytest.mark.integration
 def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> None:
-    old_config = _config(tmp_path, name="old")
-    old_exp = load_config(old_config)
-    assert isinstance(old_exp, Experiment)
+    trainer = write_constant_trainer(tmp_path)
+    old_exp = _drift_experiment(tmp_path, trainer, name="old")
+    old_config = tmp_path / "old.yaml"
+    _write_experiment_config(old_config, old_exp)
     run_id = "old-live-published"
-    _write_winner_yaml(
-        old_exp,
-        "p",
-        phase_fingerprint=_phase_fingerprint(old_exp, old_exp.phases[0], {}),
-        generation_id=run_id,
-    )
-    _generation_summary_path(old_exp, run_id).write_text(
-        yaml.safe_dump(
-            {
-                "config_fingerprint": _experiment_semantic_fingerprint(old_exp),
-                "metric": {"name": "loss", "goal": "minimize"},
-                "phase_plan": [{"name": "p"}],
-            },
-            sort_keys=False,
-        )
-    )
+    # The published summary carries the launched config's own fingerprint, so
+    # only the missing catalog entry can leave the drift unknown.
+    run_experiment(old_exp, generation_id=run_id)
 
     other_config = _config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(write_mcp_catalog(tmp_path, {"other": other_config}))
@@ -2023,14 +1953,16 @@ def _drift_experiment(
     tmp_path: Path,
     trainer: Path,
     *,
+    name: str = "srv",
     metric_name: str = "x",
     goal: str = "minimize",
     extractor: object | None = None,
     phase_name: str = "p",
+    phases: list[Phase] | None = None,
 ) -> Experiment:
-    """Build the one-phase experiment the catalog-drift tests publish and edit."""
+    """Build the runnable experiment the tests publish and then edit: one phase unless ``phases``."""
     return make_experiment(
-        experiment="srv",
+        experiment=name,
         storage=f"sqlite:///{tmp_path / 'drift.db'}",
         workdir=str(tmp_path / "runs"),
         execution=ExecutionContext(cwd=str(tmp_path)),
@@ -2041,7 +1973,8 @@ def _drift_experiment(
             extractor=extractor
             or LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         ),
-        phases=[
+        phases=phases
+        or [
             Phase(
                 name=phase_name,
                 n_trials=1,
@@ -2747,21 +2680,25 @@ def test_published_winner_survives_a_catalog_phase_rename(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
-    ("launch_policy", "current_policy", "expected"),
+    ("launch_policy", "current_policy", "visible"),
     [
-        pytest.param("none", "all", "<redacted>", id="later-loosening-cannot-reveal"),
-        pytest.param("all", "none", "<redacted>", id="later-tightening-redacts"),
-        pytest.param(["lr"], "all", 0.001, id="launch-allowlist-remains-visible"),
-        pytest.param("all", ["lr"], 0.001, id="current-allowlist-restricts"),
+        pytest.param("none", "all", False, id="later-loosening-cannot-reveal"),
+        pytest.param("all", "none", False, id="later-tightening-redacts"),
+        pytest.param(["lr"], "all", True, id="launch-allowlist-remains-visible"),
+        pytest.param("all", ["lr"], True, id="current-allowlist-restricts"),
     ],
 )
+@pytest.mark.integration
 def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
     tmp_path: Path,
     launch_policy: object,
     current_policy: object,
-    expected: object,
+    visible: bool,
 ) -> None:
-    config = _config(tmp_path)
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _drift_experiment(tmp_path, trainer)
+    config = tmp_path / "srv.yaml"
+    _write_experiment_config(config, experiment)
     catalog = _catalog(tmp_path, config, visible_params=launch_policy)
     launch_registry = Registry.load(catalog)
     store = RunStore(launch_registry.state_dir)
@@ -2777,12 +2714,9 @@ def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
             visible_params_at_launch=reg.visible_params,
         )
     )
-    _write_winner_yaml(
-        reg.experiment,
-        "p",
-        phase_fingerprint=_phase_fingerprint(reg.experiment, reg.experiment.phases[0], {}),
-        generation_id=run_id,
-    )
+    run_experiment(experiment, generation_id=run_id)
+    (published,) = read_winners(experiment)
+    expected = published.params["lr"] if visible else "<redacted>"
 
     _catalog(tmp_path, config, visible_params=current_policy)
     restarted = PhaseSweepMCP(Registry.load(catalog), store)
