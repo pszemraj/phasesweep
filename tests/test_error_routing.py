@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import hashlib
 import importlib
 import json
 import os
@@ -61,8 +60,6 @@ from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
     _generation_summary_path,
-    _generation_winner_path,
-    _last_successful_generation_path,
 )
 from phasesweep.engine.phase import _failure_policy_abort_record
 from phasesweep.engine.publication import _last_successful_generation_id
@@ -98,7 +95,13 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment, requires_nonroot
-from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
+from tests.ledger_fixtures import (
+    Materialized,
+    leave_hot_journal,
+    ledger_file,
+    materialize,
+    republish_as_incomplete,
+)
 from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
 from tests.recovery_helpers import load_only_recovery_needs
 
@@ -1202,33 +1205,10 @@ def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     return run_experiment(experiment)
 
 
-def _republish_as_incomplete(experiment: Experiment) -> None:
-    """Reseal the fixture's publication as a partial result an earlier config accepted.
-
-    The winner, the summary entry that mirrors it, the summary's hash of it,
-    and the pointer's hash of the summary change together, so the publication
-    still validates and the load reaches the partial-result policy.
-    """
-    generation = _last_successful_generation_id(experiment)
-    assert generation is not None
-    winner = _generation_winner_path(experiment, generation, "p")
-    summary = _generation_summary_path(experiment, generation)
-    complete_digest = hashlib.sha256(winner.read_bytes()).hexdigest()
-    for path in (winner, summary):
-        path.write_text(path.read_text().replace("incomplete: false", "incomplete: true"))
-    partial_digest = hashlib.sha256(winner.read_bytes()).hexdigest()
-    summary.write_text(summary.read_text().replace(complete_digest, partial_digest))
-    pointer_path = _last_successful_generation_path(experiment)
-    pointer = yaml.safe_load(pointer_path.read_text())
-    pointer["summary_size_bytes"] = len(summary.read_bytes())
-    pointer["summary_sha256"] = hashlib.sha256(summary.read_bytes()).hexdigest()
-    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
-
-
 def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Skip a phase whose published winner is a partial result this config does not accept."""
     experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
-    _republish_as_incomplete(experiment)
+    republish_as_incomplete(experiment)
     return _load_winner(experiment, experiment.phases[0], {})
 
 
