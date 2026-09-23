@@ -975,33 +975,26 @@ def _preflight_registered_trial_without_attempt(
     return _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
 
-def _inspect_uncertain_trial_without_attempt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Inspect a cleanup-uncertain terminal trial whose ledger lost its attempt id."""
-    study = optuna.create_study(study_name="t::p")
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    uncertain = study.ask()
-    uncertain.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-    uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
-    study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
-    return _inspect_cleanup_uncertain_trials(study, "p")
+def _inspect_uncertain(*kept: str) -> Trigger:
+    """Inspect a cleanup-uncertain FAIL trial whose ledger kept only the ``kept`` identity attrs.
 
+    The trial directory exists and holds no identity files, so a trial that
+    names both its attempt and its directory reaches the identity-file check.
+    """
 
-def _inspect_uncertain_trial_without_identity_files(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Inspect a cleanup-uncertain trial whose attempt id no identity files back."""
-    study = optuna.create_study(study_name="t::p")
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    uncertain = study.ask()
-    uncertain.set_user_attr(ATTEMPT_ID_ATTR, "attempt")
-    uncertain.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-    uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
-    study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
-    return _inspect_cleanup_uncertain_trials(study, "p")
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        trial_dir = tmp_path / "trial"
+        trial_dir.mkdir()
+        identity = {ATTEMPT_ID_ATTR: "attempt", TRIAL_DIR_ATTR: str(trial_dir)}
+        study = optuna.create_study(study_name="t::p")
+        uncertain = study.ask()
+        for key in kept:
+            uncertain.set_user_attr(key, identity[key])
+        uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+        study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
+        return _inspect_cleanup_uncertain_trials(study, "p")
+
+    return trigger
 
 
 def _lock_dir_without_account_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1099,18 +1092,6 @@ def _reap_trial_with_foreign_lifecycle(tmp_path: Path, monkeypatch: pytest.Monke
     return _reap_running_trial(
         tmp_path, **{TRIAL_DIR_ATTR: str(trial_dir), ATTEMPT_ID_ATTR: "attempt"}
     )
-
-
-def _inspect_uncertain_trial_without_trial_dir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Inspect a cleanup-uncertain terminal trial whose ledger lost its directory."""
-    study = optuna.create_study(study_name="t::p")
-    uncertain = study.ask()
-    uncertain.set_user_attr(ATTEMPT_ID_ATTR, "attempt")
-    uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
-    study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
-    return _inspect_cleanup_uncertain_trials(study, "p")
 
 
 def _recover_during_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1293,7 +1274,7 @@ ORIGIN_CASES = (
     ),
     RoutingCase(
         id="uncertain_trial_attempt_missing",
-        trigger=_inspect_uncertain_trial_without_attempt,
+        trigger=_inspect_uncertain(TRIAL_DIR_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Process identity is unknown. Restore the original storage ledger",
@@ -1302,7 +1283,7 @@ ORIGIN_CASES = (
         # Either the ledger or the tree may be the side that changed, so the
         # message names both and no one repair is the remedy.
         id="uncertain_trial_identity_files_mismatch",
-        trigger=_inspect_uncertain_trial_without_identity_files,
+        trigger=_inspect_uncertain(ATTEMPT_ID_ATTR, TRIAL_DIR_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.INSPECT_LOGS,
         message="Restore the original storage ledger and this attempt's process-identity files",
@@ -1375,7 +1356,7 @@ ORIGIN_CASES = (
     ),
     RoutingCase(
         id="uncertain_trial_dir_missing",
-        trigger=_inspect_uncertain_trial_without_trial_dir,
+        trigger=_inspect_uncertain(ATTEMPT_ID_ATTR),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Restore the original storage ledger before retrying recovery.",
