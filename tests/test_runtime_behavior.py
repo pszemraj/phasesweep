@@ -760,11 +760,7 @@ def test_non_finite_extracted_value_returns_failed_result(
         constraints=[
             Constraint(
                 name="param_bytes",
-                extractor=JsonExtractor(
-                    type="json",
-                    path="result.json",
-                    key="param_bytes",
-                ),
+                extractor=JsonExtractor(type="json", path="result.json", key="param_bytes"),
                 max=1000,
             )
         ]
@@ -787,12 +783,7 @@ def test_non_finite_extracted_value_returns_failed_result(
             return_code=0,
             duration_seconds=0.1,
         ),
-        process=ProcessResult(
-            return_code=0,
-            timed_out=False,
-            pid=123,
-            duration_seconds=0.1,
-        ),
+        process=ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1),
     )
 
     result = extract_trial_result(experiment=experiment, executed=executed)
@@ -880,13 +871,18 @@ def test_optuna_logging_verbosity_tracks_cli_verbose_flag() -> None:
         ("verbose", optuna.logging.WARNING, True, optuna.logging.INFO),
     ]
 
-    for case, initial, verbose, expected in cases:
-        optuna.logging.set_verbosity(initial)
-        _configure_logging(verbose=verbose)
-        assert optuna.logging.get_verbosity() == expected, case
-
-    # Reset for any later tests.
-    logging.getLogger().handlers.clear()
+    # Logging state is process-global, and pytest's capture handlers sit on the root logger.
+    root, saved_verbosity = logging.getLogger(), optuna.logging.get_verbosity()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    try:
+        for case, initial, verbose, expected in cases:
+            optuna.logging.set_verbosity(initial)
+            _configure_logging(verbose=verbose)
+            assert optuna.logging.get_verbosity() == expected, case
+    finally:
+        optuna.logging.set_verbosity(saved_verbosity)
+        root.handlers[:] = saved_handlers
+        root.setLevel(saved_level)
 
 
 @pytest.mark.integration
@@ -2651,10 +2647,14 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
                 raise OSError("simulated restore failure")
             return real_signal(signalnum, handler)
 
-        with pytest.raises(OSError, match="simulated restore failure"), signal_handler_scope():
-            # Patch only after the scope's own entry-time installation
-            # (which uses the real signal.signal) has already happened.
-            monkeypatch.setattr(signal, "signal", flaky_signal)
+        with (
+            pytest.raises(OSError, match="simulated restore failure"),
+            monkeypatch.context() as scoped,
+            signal_handler_scope(),
+        ):
+            # Patch only after the scope's entry-time installation used the real
+            # signal.signal; the patch ends with this block, before the restore below.
+            scoped.setattr(signal, "signal", flaky_signal)
 
         for sig in runtime_shutdown._SHUTDOWN_SIGNALS:
             if sig == first_signal:
@@ -2664,7 +2664,6 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
                 continue
             assert signal.getsignal(sig) is sentinel_handlers[sig]
     finally:
-        monkeypatch.undo()
         for sig, handler in prior_handlers.items():
             signal.signal(sig, handler)
 

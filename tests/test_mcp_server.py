@@ -1693,24 +1693,21 @@ def _launch_with_poison_project(
     poison(project / "sitecustomize.py", "sitecustomize")
     poison(project / "startup.py", "pythonstartup")
 
-    monkeypatch.setenv("PYTHONPATH", str(project))
-    monkeypatch.setenv("PYTHONSTARTUP", str(project / "startup.py"))
-    monkeypatch.setenv("PYTHONHOME", str(project))
-    monkeypatch.setenv("PYTHONEXECUTABLE", str(project / "python"))
-    app, _registry, _store = make_mcp_app(
-        write_mcp_catalog(
-            tmp_path,
-            {"srv": config},
-            allow=ALLOW_SIDE_EFFECTS,
-            cwd={"srv": project},
+    # Scoped, so leaving it restores only these patches and the test's own
+    # isolation fixtures stay in force.
+    with monkeypatch.context() as scoped:
+        scoped.setenv("PYTHONPATH", str(project))
+        scoped.setenv("PYTHONSTARTUP", str(project / "startup.py"))
+        scoped.setenv("PYTHONHOME", str(project))
+        scoped.setenv("PYTHONEXECUTABLE", str(project / "python"))
+        app, _registry, _store = make_mcp_app(
+            write_mcp_catalog(
+                tmp_path, {"srv": config}, allow=ALLOW_SIDE_EFFECTS, cwd={"srv": project}
+            )
         )
-    )
-    captured = patch_popen_capture(monkeypatch)
-
-    app.launch("srv")
-
-    parent_env = dict(os.environ)
-    monkeypatch.undo()
+        captured = patch_popen_capture(scoped)
+        app.launch("srv")
+        parent_env = dict(os.environ)
     return captured, project, markers, parent_env
 
 
