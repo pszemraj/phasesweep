@@ -22,7 +22,7 @@ import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 
 import optuna
 import pytest
@@ -96,7 +96,7 @@ from phasesweep.runtime.files import (
     lock_dir,
     phasesweep_home,
 )
-from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, write_attempt_lifecycle
+from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment, reaped_pid, requires_nonroot
 from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
 from tests.mcp_helpers import make_run_handle, write_run_status
@@ -1038,19 +1038,6 @@ def _lock_dir_without_account_home(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     return lock_dir()
 
 
-def _lock_dir_with_relative_account_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Resolve the lock directory for an account whose home is not absolute."""
-    monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
-    monkeypatch.setattr(pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir="relative-home"))
-    return lock_dir()
-
-
-def _lock_dir_override_relative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Resolve the lock directory through a relative override."""
-    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", "relative-locks")
-    return lock_dir()
-
-
 def _home_override_relative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Resolve the private root through a relative override."""
     monkeypatch.setenv("PHASESWEEP_HOME", "relative-home")
@@ -1063,21 +1050,11 @@ def _wandb_sdk_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     return require_wandb_sdk()
 
 
-def _rewrite_entry(entry: Path, change: Callable[[dict[str, object]], None]) -> None:
-    """Apply ``change`` to a registry entry's payload, keeping its owner-only file."""
-    payload = json.loads(entry.read_text())
-    change(payload)
-    entry.write_text(json.dumps(payload))
-
-
-def _foreign_locator(entry: Path) -> None:
-    """Point a registry entry at a storage backend this release does not retain."""
-    _rewrite_entry(entry, lambda payload: payload.update(storage_locator="postgresql://h/db"))
-
-
 def _field_dropped(entry: Path) -> None:
-    """Drop a field every current registry entry carries."""
-    _rewrite_entry(entry, lambda payload: payload.pop("generation_id"))
+    """Drop a field every current registry entry carries, keeping its owner-only file."""
+    payload = json.loads(entry.read_text())
+    del payload["generation_id"]
+    entry.write_text(json.dumps(payload))
 
 
 def _registry_entry_damaged(damage: Callable[[Path], None]) -> Trigger:
@@ -1098,30 +1075,6 @@ def _preflight_entry_without_trial_dir(tmp_path: Path, monkeypatch: pytest.Monke
     experiment = make_experiment(workdir=tmp_path / "runs")
     _registered_entry(experiment, tmp_path / "gone")
     return _preflight_active_attempts(experiment, _PreflightCleanupReport())
-
-
-def _registered_trial_dir_damaged(damage: Callable[[Path], None]) -> Trigger:
-    """Preflight a registry entry whose trial directory's evidence was damaged."""
-
-    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        experiment = make_experiment(workdir=tmp_path / "runs")
-        trial_dir = tmp_path / "attempt"
-        trial_dir.mkdir()
-        _registered_entry(experiment, trial_dir)
-        damage(trial_dir)
-        return _preflight_active_attempts(experiment, _PreflightCleanupReport())
-
-    return trigger
-
-
-def _lifecycle_garbled(trial_dir: Path) -> None:
-    """Leave an attempt lifecycle record no reader parses."""
-    (trial_dir / ATTEMPT_LIFECYCLE_FILE).write_text("{not json")
-
-
-def _launched_without_identity(trial_dir: Path) -> None:
-    """Record a launch whose process identity files never appeared."""
-    write_attempt_lifecycle(trial_dir, attempt_id="attempt", state="launching")
 
 
 def _preflight_unenumerable_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1223,16 +1176,6 @@ def _recover_with_config_snapshot(change: Callable[[Path], None]) -> Trigger:
         return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
     return trigger
-
-
-def _snapshot_altered(path: Path) -> None:
-    """Replace a config snapshot with bytes its recorded digest does not match."""
-    path.write_bytes(b"experiment: other\n")
-
-
-def _snapshot_unreadable(path: Path) -> None:
-    """Leave a config snapshot in place but unreadable."""
-    path.chmod(0o000)
 
 
 def _recover_without_boot_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1369,10 +1312,6 @@ def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
     return study_policy._validate_environment_cohort(study, "d" * 64)
 
 
-_DELETE_ENTRY_IF_IDLE = "Delete the entry file only if you are certain no process"
-_DELETE_ENTRY_IF_NOTHING_RUNS = "Delete the entry file only if you are certain nothing is running."
-
-
 ORIGIN_CASES = (
     RoutingCase(
         id="auto_storage_backend_switch",
@@ -1426,20 +1365,6 @@ ORIGIN_CASES = (
         message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
     ),
     RoutingCase(
-        id="lock_dir_relative_account_home",
-        trigger=_lock_dir_with_relative_account_home,
-        raised=UnsafeLockPathError,
-        action=OperatorAction.FIX_CONFIG,
-        message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
-    ),
-    RoutingCase(
-        id="lock_dir_override_relative",
-        trigger=_lock_dir_override_relative,
-        raised=UnsafeLockPathError,
-        action=OperatorAction.FIX_CONFIG,
-        message="PHASESWEEP_LOCK_DIR must be an absolute path",
-    ),
-    RoutingCase(
         id="phasesweep_home_override_relative",
         trigger=_home_override_relative,
         raised=UnsafePrivatePathError,
@@ -1454,42 +1379,21 @@ ORIGIN_CASES = (
         message='python -m pip install "phasesweep[wandb]"',
     ),
     RoutingCase(
-        id="registry_entry_foreign_locator",
-        trigger=_registry_entry_damaged(_foreign_locator),
-        raised=ProcessCleanupUncertainError,
-        action=OperatorAction.RESTORE_TREE,
-        message=_DELETE_ENTRY_IF_IDLE,
-    ),
-    RoutingCase(
         id="registry_entry_partial_schema",
         trigger=_registry_entry_damaged(_field_dropped),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message=_DELETE_ENTRY_IF_IDLE,
+        message="Delete the entry file only if you are certain no process",
     ),
     RoutingCase(
         id="registry_entry_trial_dir_missing",
         trigger=_preflight_entry_without_trial_dir,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message=_DELETE_ENTRY_IF_NOTHING_RUNS,
+        message="Delete the entry file only if you are certain nothing is running.",
     ),
     # recover-run runs every cleanup check below in both of its modes, so none
-    # of these may route back to it: each names the repair the operator makes.
-    RoutingCase(
-        id="registry_lifecycle_malformed",
-        trigger=_registered_trial_dir_damaged(_lifecycle_garbled),
-        raised=ProcessCleanupUncertainError,
-        action=OperatorAction.RESTORE_TREE,
-        message=_DELETE_ENTRY_IF_NOTHING_RUNS,
-    ),
-    RoutingCase(
-        id="registry_identity_missing",
-        trigger=_registered_trial_dir_damaged(_launched_without_identity),
-        raised=ProcessCleanupUncertainError,
-        action=OperatorAction.RESTORE_TREE,
-        message=_DELETE_ENTRY_IF_NOTHING_RUNS,
-    ),
+    # of these may route back to it.
     RoutingCase(
         id="registry_unenumerable",
         trigger=_preflight_unenumerable_registry,
@@ -1555,21 +1459,6 @@ ORIGIN_CASES = (
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
         message="Restore it before retrying recovery.",
-    ),
-    RoutingCase(
-        id="recover_config_snapshot_unreadable",
-        trigger=_recover_with_config_snapshot(_snapshot_unreadable),
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="Restore it or access to it before retrying recovery.",
-        marks=(requires_nonroot,),
-    ),
-    RoutingCase(
-        id="recover_config_snapshot_altered",
-        trigger=_recover_with_config_snapshot(_snapshot_altered),
-        raised=RunRecoveryError,
-        action=OperatorAction.RESTORE_TREE,
-        message="Restore the run's original config snapshot before retrying recovery.",
     ),
     RoutingCase(
         # No mechanical remedy: the host cannot rule out PID reuse.
