@@ -17,7 +17,6 @@ from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
-from phasesweep.cli import main as cli_boundary
 from phasesweep.config import Experiment
 from phasesweep.engine import (
     ArtifactRootConflictError,
@@ -47,6 +46,7 @@ from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
     requires_nonroot,
     write_trainer,
@@ -731,7 +731,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     run_experiment(load_experiment(config_path))
     generation_id = _corrupt_the_publication(config_path)
 
-    exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["status", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -746,7 +746,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     assert "does not match its recorded hash" in captured.err
     assert "Do not run anything over this tree" in captured.err
 
-    exit_code = _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -771,12 +771,12 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     record = _generation_dir(experiment, generation_id) / "reproducibility.json"
     record.write_bytes(record.read_bytes() + b"\n")
 
-    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 1
+    assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 1
     status_captured = capsys.readouterr()
     assert yaml.safe_load(status_captured.out)["publication_integrity"] == "failed"
     assert "Do not run anything over this tree" in status_captured.err
 
-    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 1
+    assert invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 1
     winners_captured = capsys.readouterr()
     assert "Do not run anything over this tree" in winners_captured.err
     assert "Traceback" not in winners_captured.err
@@ -805,7 +805,7 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     original_mode = stat.S_IMODE(snapshot.stat().st_mode)
     snapshot.chmod(0o000)
     try:
-        exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
+        exit_code = invoke_cli_boundary(["status", str(config_path)], monkeypatch)
         captured = capsys.readouterr()
     finally:
         snapshot.chmod(original_mode)
@@ -829,48 +829,19 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     """A healthy publication and a never-published tree both stay exit 0."""
     config_path = _published_experiment_config(tmp_path)
 
-    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     fresh = capsys.readouterr()
     assert yaml.safe_load(fresh.out)["publication_integrity"] == "absent"
-    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
     capsys.readouterr()
 
     run_experiment(load_experiment(config_path))
 
-    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     published = capsys.readouterr()
     assert yaml.safe_load(published.out)["publication_integrity"] == "ok"
-    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
     assert "trial_number" in capsys.readouterr().out
-
-
-def _invoke_cli_boundary(
-    argv: list[str],
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    debug: bool = False,
-) -> int:
-    """Run the console-script entry point exactly as the installed command does.
-
-    ``CliRunner`` invokes the Click group directly and therefore bypasses the
-    process-level error boundary; these tests must exercise the boundary, so
-    they call it with a patched ``sys.argv`` instead.
-
-    :param list[str] argv: Arguments following the program name.
-    :param pytest.MonkeyPatch monkeypatch: Fixture used to set ``sys.argv`` and
-        the root log level.
-    :param bool debug: Root log level the boundary observes. ``True`` mirrors
-        what ``-v`` produces in a real process; ``_configure_logging`` cannot be
-        used here because ``logging.basicConfig`` is a no-op once pytest's own
-        root handler is installed.
-    :return int: Status the boundary passed to ``sys.exit``.
-    """
-    monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
-    monkeypatch.setattr(logging.getLogger(), "level", logging.DEBUG if debug else logging.INFO)
-    with pytest.raises(SystemExit) as excinfo:
-        cli_boundary()
-    code = excinfo.value.code
-    return 0 if code is None else int(code)
 
 
 def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
@@ -918,7 +889,7 @@ def test_cli_only_explains_marked_post_publication_shutdown(
         shutdown.published_result_committed = True
     _stub_run_command(monkeypatch, shutdown)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 128 + signal.SIGTERM
@@ -941,7 +912,7 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
     refusal = UnsafeProcessCleanupError("Trial 0 cleanup could not be confirmed.")
     _stub_run_command(monkeypatch, refusal)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -966,7 +937,7 @@ def test_cli_boundary_reports_config_syntax_error_without_traceback(
     config_path = tmp_path / "broken.yaml"
     config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
 
-    exit_code = _invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 2
@@ -983,7 +954,7 @@ def test_cli_boundary_names_config_for_schema_validation_error(
     config_path = tmp_path / "invalid-schema.yaml"
     config_path.write_text("experiment: t\nphases: []\n")
 
-    exit_code = _invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 2
@@ -1013,7 +984,7 @@ def test_cli_boundary_reports_expected_run_failure(
     argv = ["run", str(config_path)]
     if verbose:
         argv.append("-v")
-    exit_code = _invoke_cli_boundary(argv, monkeypatch, debug=verbose)
+    exit_code = invoke_cli_boundary(argv, monkeypatch, debug=verbose)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1050,7 +1021,7 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
     config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
     monkeypatch.setenv(env_name, env_value)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1074,7 +1045,7 @@ def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, error)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1099,7 +1070,7 @@ def test_cli_boundary_classifies_relative_lock_directory_as_operational(
         lambda *_args, **_kwargs: lock_dir(),
     )
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1118,7 +1089,7 @@ def test_cli_boundary_reports_unexpected_failure_as_internal_error(
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, RuntimeError("injected-internal"))
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 70
@@ -1139,7 +1110,7 @@ def test_cli_boundary_does_not_misclassify_unexpected_validation_error(
         Experiment.model_validate({})
     _stub_run_command(monkeypatch, exc_info.value)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 70
@@ -1156,7 +1127,7 @@ def test_cli_boundary_reports_environmental_io_failure_as_operational(
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, PermissionError("workdir is not writable"))
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1170,7 +1141,7 @@ def test_cli_boundary_leaves_help_exit_status_unchanged(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``--help`` still succeeds through the boundary rather than being trapped."""
-    exit_code = _invoke_cli_boundary(["--help"], monkeypatch)
+    exit_code = invoke_cli_boundary(["--help"], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 0

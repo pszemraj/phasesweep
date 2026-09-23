@@ -7,11 +7,13 @@ _exp / _make_exp helpers scattered across test files. Tests that need specialize
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import shutil
 import signal
 import sqlite3
 import stat
+import sys
 import textwrap
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -23,6 +25,7 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment
+from phasesweep.cli import main as cli_boundary
 from phasesweep.config import (
     Constraint,
     ExecutionContext,
@@ -551,6 +554,23 @@ def assert_invalid_experiment_yaml(tmp_path: Path, body: str, match: str) -> Non
     """Assert that one YAML experiment fails model validation."""
     with pytest.raises(ValidationError, match=match):
         load_experiment(write_yaml(tmp_path, body))
+
+
+def invoke_cli_boundary(
+    argv: list[str], monkeypatch: pytest.MonkeyPatch, *, debug: bool = False
+) -> int:
+    """Run the console-script entry point exactly as the installed command does; return its exit status."""
+    # ``CliRunner`` invokes the Click group directly and so bypasses the
+    # process-level error boundary under test; a patched ``sys.argv`` reaches it.
+    monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
+    # ``debug`` mirrors what ``-v`` sets in a real process. ``_configure_logging``
+    # cannot, because ``logging.basicConfig`` is a no-op once pytest's own root
+    # handler is installed.
+    monkeypatch.setattr(logging.getLogger(), "level", logging.DEBUG if debug else logging.INFO)
+    with pytest.raises(SystemExit) as excinfo:
+        cli_boundary()
+    code = excinfo.value.code
+    return 0 if code is None else int(code)
 
 
 def write_trainer(path: Path, body: str) -> Path:
