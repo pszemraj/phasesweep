@@ -887,7 +887,7 @@ def _finish_result_recovery(
 def _finalize_stored_terminal_result_snapshot(
     store: RunStore,
     run_id: str,
-    terminal_status: dict[str, Any],
+    terminal_status: dict[str, object],
     *,
     confirmed_attempt_ids: set[str],
     confirmed_attempt_locations: dict[str, tuple[str, int, str]],

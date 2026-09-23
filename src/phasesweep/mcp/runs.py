@@ -1321,6 +1321,7 @@ class RunStore:
         status = self._read_status(handle)
         if status is None:
             return set()
+        # _read_status refused any status whose ids are not nonempty strings.
         uncertain_attempt_ids = cast(list[str], status.get("uncertain_attempt_ids", []))
         return set(uncertain_attempt_ids)
 
