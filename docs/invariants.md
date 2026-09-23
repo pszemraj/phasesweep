@@ -171,12 +171,16 @@ for every loaded study and a re-check of the binding in `claim_ledger`\
 
 `claim_ledger` writes the tree binding before it claims any study, so a crash
 between the two cannot leave a study naming a tree that does not name its
-ledger.
+ledger. Its first write, before the binding, creates the ledger's directory
+for either backend, so a ledger path that cannot hold a file fails while the
+tree is still unbound and the path can be corrected.
 
-**Held by:** `engine.ledger.claim_ledger`, calling
-`engine.artifact_roots._write_artifact_root_binding` before its
-`_claim_study_artifact_root` loop\
-**Test:** `tests/test_format_cutover.py::test_claim_ledger_writes_tree_binding_before_claiming_studies`
+**Held by:** `engine.ledger.claim_ledger`, creating the ledger's parent
+directory, then calling `engine.artifact_roots._write_artifact_root_binding`
+before its `_claim_study_artifact_root` loop\
+**Tests:** `tests/test_format_cutover.py::test_claim_ledger_writes_tree_binding_before_claiming_studies`,
+`tests/test_format_cutover.py::test_claim_ledger_creates_ledger_parent_but_validate_does_not`,
+`tests/test_format_cutover.py::test_unwritable_ledger_directory_fails_before_the_tree_is_bound`
 
 #### 6. Read paths construct and write nothing
 

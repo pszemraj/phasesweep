@@ -234,32 +234,74 @@ def test_validate_ledger_on_a_fresh_root_creates_nothing(tmp_path: Path, backend
     assert not _experiment_dir(experiment).exists()
 
 
-def test_open_phase_study_creates_journal_parent_but_validate_does_not(tmp_path: Path) -> None:
-    """Only the live opener brings a journal's directory into existence.
+@pytest.mark.parametrize("backend", ["sqlite", "journal"])
+def test_claim_ledger_creates_ledger_parent_but_validate_does_not(
+    tmp_path: Path, backend: str
+) -> None:
+    """Claiming brings the ledger's directory into existence before it binds the tree.
 
     Every read path validates, so validating must never materialize a ledger
-    directory. Claiming writes the tree's ownership record, which lives in the
-    artifact root, and still leaves the ledger's directory alone. The first
-    live open is the one step that needs the directory, so it is the one step
-    that creates it.
+    directory. The claim is the first step that writes, and the directory is
+    its first write: a path that cannot hold a ledger then fails before the
+    tree names that ledger, while the path can still be corrected. Neither
+    step creates the ledger file itself; the first live open does.
     """
     missing = tmp_path / "not-created-by-a-read"
-    experiment = _experiment(tmp_path, storage=f"journal:///{missing / 'study.journal'}")
+    ledger_file = missing / f"study.{backend}"
+    experiment = _experiment(tmp_path, storage=f"{backend}:///{ledger_file}")
 
     ledger = validate_ledger(experiment)
 
-    assert ledger.backend == "journal"
-    assert ledger.ledger_path == missing / "study.journal"
+    assert ledger.backend == backend
+    assert ledger.ledger_path == ledger_file
     assert not missing.exists()
 
     claimed = claim_ledger(ledger)
 
+    assert missing.is_dir()
     assert _artifact_root_binding_path(experiment).is_file()
-    assert not missing.exists()
+    assert not ledger_file.exists()
 
     open_phase_study(claimed, experiment.phases[0])
 
-    assert (missing / "study.journal").is_file()
+    assert ledger_file.is_file()
+
+
+def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ledger directory that cannot be created leaves the tree unbound and correctable."""
+    experiment = _experiment(tmp_path, storage=f"sqlite:///{tmp_path / 'missing' / 'study.db'}")
+    real_mkdir = Path.mkdir
+
+    def refuse_ledger_directory(path: Path, *args: object, **kwargs: object) -> None:
+        if path == tmp_path / "missing":
+            raise PermissionError(13, "Permission denied", str(path))
+        real_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "mkdir", refuse_ledger_directory)
+
+    with pytest.raises(PermissionError):
+        claim_ledger(validate_ledger(experiment))
+
+    assert not _artifact_root_binding_path(experiment).exists()
+
+
+@pytest.mark.integration
+def test_run_creates_a_missing_sqlite_ledger_directory(tmp_path: Path) -> None:
+    """An explicit SQLite ledger in a directory that does not exist yet runs.
+
+    SQLite creates the file but not its directory, so the run used to bind
+    the tree and then die opening the ledger, after which correcting the path
+    was refused as a second ledger for the same tree.
+    """
+    database = tmp_path / "missing" / "study.db"
+    experiment = _experiment(tmp_path, storage=f"sqlite:///{database}")
+
+    run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{database}")
+    assert [trial.state.name for trial in study.trials] == ["COMPLETE"]
 
 
 @pytest.mark.parametrize("offered", ["storage-url", "validated-ledger"])
