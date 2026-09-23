@@ -2034,8 +2034,7 @@ def _drift_experiment(
         storage=f"sqlite:///{tmp_path / 'drift.db'}",
         workdir=str(tmp_path / "runs"),
         execution=ExecutionContext(cwd=str(tmp_path)),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         metric=Metric(
             name=metric_name,
             goal=goal,
@@ -2990,10 +2989,8 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     config = tmp_path / "srv.yaml"
     experiment = make_experiment(
         experiment="srv",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
+        persistent=tmp_path,
+        trainer=trainer,
         phases=[
             Phase(
                 name="p",
