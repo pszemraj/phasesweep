@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -24,15 +25,18 @@ from phasesweep.config import (
     Sampler,
     WandbExtractor,
 )
-from phasesweep.engine import read_status, read_winners
+from phasesweep.engine import PublishedStudyMissingError, read_status, read_winners
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
     _generation_summary_path,
 )
-from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _resolve_publication_pointer,
+)
 from phasesweep.engine.run import experiment_status
-from tests.conftest import make_experiment, mark_current_format
+from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
 from tests.ledger_fixtures import ledger_file, materialize, tree_snapshot
 
 
@@ -435,10 +439,7 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     tmp_path: Path, n_jobs: int, damage: str
 ) -> None:
     """The same status flags select the same remedy for both file backends."""
-    from phasesweep.engine import (
-        ProcessCleanupUncertainError,
-        PublishedStudyMissingError,
-    )
+    from phasesweep.engine import ProcessCleanupUncertainError
     from phasesweep.mcp.redaction import status_payload
     from phasesweep.mcp.snapshots import capture_result_snapshot
 
@@ -470,6 +471,9 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
             mark_current_format(experiment, optuna.create_study(study_name="t::p", storage=storage))
     ledger_before = ledger.read_bytes() if ledger.exists() else None
     generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
 
     status = read_status(experiment)
     cli_status = experiment_status(experiment)
@@ -494,9 +498,78 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     expected_error = (
         ProcessCleanupUncertainError if damage == "corrupt" else PublishedStudyMissingError
     )
-    with pytest.raises(expected_error):
+    with pytest.raises(expected_error) as excinfo:
         run_experiment(experiment)
     assert _generation_path(experiment).read_bytes() == generation_before
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+
+    # A lost ledger and a lost study report the same refusal; an emptied one
+    # names its own reason. Both carry the same remedy, never a silent rerun.
+    reason_for_damage = {
+        "missing-ledger": "persistent study is missing",
+        "missing-study": "persistent study is missing",
+        "empty-study": "persistent study contains no trials",
+    }
+    if damage in reason_for_damage:
+        message = str(excinfo.value)
+        assert reason_for_damage[damage] in message
+        assert "continuing could reuse incomplete or unrelated trials" in message
+        assert "Restore the original complete storage ledger and study" in message
+
+
+@pytest.mark.integration
+def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> None:
+    """A retained winner row alone cannot authorize replacement trials.
+
+    The matrix above damages a whole SQLite or journal ledger; this restores
+    one that is internally consistent but short -- every trial after the
+    published one is gone, so the study is neither missing nor empty, just
+    below the boundary the publication recorded. Only SQLite exposes trial
+    rows to delete directly; a journal has no equivalent partial-restore shape.
+    """
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        n_trials=3,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    with sqlite3.connect(tmp_path / "studies.db") as connection:
+        trial_ids = connection.execute("SELECT trial_id FROM trials WHERE number > 0").fetchall()
+        assert len(trial_ids) == 2
+        for statement in (
+            "DELETE FROM trial_heartbeats WHERE trial_id = ?",
+            "DELETE FROM trial_intermediate_values WHERE trial_id = ?",
+            "DELETE FROM trial_params WHERE trial_id = ?",
+            "DELETE FROM trial_system_attributes WHERE trial_id = ?",
+            "DELETE FROM trial_user_attributes WHERE trial_id = ?",
+            "DELETE FROM trial_values WHERE trial_id = ?",
+            "DELETE FROM trials WHERE trial_id = ?",
+        ):
+            connection.executemany(statement, trial_ids)
+
+    status = read_status(experiment)
+    assert status["phases"][0]["published_study_unavailable"] is True
+    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+
+    with pytest.raises(PublishedStudyMissingError, match="published completion boundary"):
+        run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.resolved_storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_id(experiment) == published
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
