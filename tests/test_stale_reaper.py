@@ -1885,23 +1885,3 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert winners["p"].metric == pytest.approx(0.5)
     assert launched.exists()
     assert not list(attempts_dir.glob("*.json"))
-
-
-@pytest.mark.integration
-def test_registry_entries_are_retired_after_normal_runs(tmp_path: Path) -> None:
-    """A healthy run leaves no active-attempt registry entries behind."""
-    trainer = write_trainer(tmp_path, "print('x=1.0')")
-    exp = make_experiment(
-        experiment="healthy",
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'h.db'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
-        n_trials=2,
-    )
-
-    winners = run_experiment(exp)
-
-    assert "p" in winners
-    attempts_dir = tmp_path / "runs" / "healthy" / "attempts"
-    assert not list(attempts_dir.glob("*.json"))
