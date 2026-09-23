@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import errno
 import hashlib
 import importlib
 import json
+import os
 import pickle
 import pkgutil
 import pwd
@@ -110,7 +112,7 @@ from phasesweep.runtime.files import (
     lock_dir,
     phasesweep_home,
 )
-from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, write_attempt_lifecycle
 from tests.conftest import make_experiment
 from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
 from tests.mcp_helpers import make_run_handle, write_run_status
@@ -152,6 +154,12 @@ _MULTI_STEP_RAISES = frozenset(
         (
             "phasesweep/engine/attempts.py",
             "_read_trial_process_identity",
+            ("RESTORE_LEDGER", "RESTORE_TREE"),
+        ),
+        # The same split for the lifecycle record a RUNNING trial is resolved by.
+        (
+            "phasesweep/engine/attempts.py",
+            "_attempt_lifecycle_for_reaping",
             ("RESTORE_LEDGER", "RESTORE_TREE"),
         ),
         # With no usable account home, only the override can name a lock
@@ -623,6 +631,26 @@ def _recover_over_malformed_registry_entry(
     return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
+_NO_NOFOLLOW = "O_NOFOLLOW is unavailable."
+
+
+def _registry_scan_without_capability(helper: str) -> Trigger:
+    """Preflight a registry of one entry while ``helper`` lacks a platform capability."""
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        experiment = make_experiment(workdir=tmp_path / "runs")
+        trial_dir = tmp_path / "attempt"
+        trial_dir.mkdir()
+        _registered_entry(experiment, trial_dir)
+        monkeypatch.setattr(
+            f"phasesweep.engine.attempts.{helper}",
+            _raiser(PlatformCapabilityError(_NO_NOFOLLOW)),
+        )
+        return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    return trigger
+
+
 def _moved_workdir(materialized: Materialized, tmp_path: Path) -> Experiment:
     """Return the fixture's config pointed at a workdir its studies never published into."""
     return materialized.experiment.model_copy(update={"workdir": str(tmp_path / "moved")})
@@ -888,12 +916,30 @@ WRAP_CASES = (
         message="truncate it after its last complete line",
     ),
     WrapCase(
+        # recover-run reaps through the same read, so the ledger comes back first.
         id="cleanup_reap_inspect",
         trigger=_reap_unreadable_study,
         outbound=ProcessCleanupUncertainError,
-        action=OperatorAction.RUN_RECOVER_RUN,
+        action=OperatorAction.RESTORE_LEDGER,
         cause=RuntimeError,
         message="Could not inspect study 't::p' for stale RUNNING trials.",
+    ),
+    WrapCase(
+        # Not a damaged registry: the missing capability keeps its own routing.
+        id="registry_open_platform_capability",
+        trigger=_registry_scan_without_capability("open_directory_fd"),
+        outbound=PlatformCapabilityError,
+        action=OperatorAction.FIX_CONFIG,
+        cause=None,
+        message=_NO_NOFOLLOW,
+    ),
+    WrapCase(
+        id="registry_entry_platform_capability",
+        trigger=_registry_scan_without_capability("read_private_text_at"),
+        outbound=PlatformCapabilityError,
+        action=OperatorAction.FIX_CONFIG,
+        cause=None,
+        message=_NO_NOFOLLOW,
     ),
     WrapCase(
         id="preflight_same_type_aggregate",
@@ -1140,6 +1186,93 @@ def _preflight_entry_without_trial_dir(tmp_path: Path, monkeypatch: pytest.Monke
     return _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
 
+def _registered_trial_dir_damaged(damage: Callable[[Path], None]) -> Trigger:
+    """Preflight a registry entry whose trial directory's evidence was damaged."""
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        experiment = make_experiment(workdir=tmp_path / "runs")
+        trial_dir = tmp_path / "attempt"
+        trial_dir.mkdir()
+        _registered_entry(experiment, trial_dir)
+        damage(trial_dir)
+        return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    return trigger
+
+
+def _lifecycle_garbled(trial_dir: Path) -> None:
+    """Leave an attempt lifecycle record no reader parses."""
+    (trial_dir / ATTEMPT_LIFECYCLE_FILE).write_text("{not json")
+
+
+def _launched_without_identity(trial_dir: Path) -> None:
+    """Record a launch whose process identity files never appeared."""
+    write_attempt_lifecycle(trial_dir, attempt_id="attempt", state="launching")
+
+
+def _preflight_unenumerable_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Preflight a private registry whose directory listing fails."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    trial_dir = tmp_path / "attempt"
+    trial_dir.mkdir()
+    _registered_entry(experiment, trial_dir)
+    real_listdir = os.listdir
+
+    def listdir(path: object = ".") -> list[str]:
+        if isinstance(path, int):
+            raise OSError(errno.EIO, "Input/output error")
+        return real_listdir(path)  # type: ignore[call-overload]
+
+    monkeypatch.setattr(os, "listdir", listdir)
+    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+
+def _reap_running_trial(tmp_path: Path, **attrs: object) -> object:
+    """Reap one RUNNING in-memory trial that carries ``attrs``."""
+    study = optuna.create_study(study_name="t::p")
+    running = study.ask()
+    for key, value in attrs.items():
+        running.set_user_attr(key, value)
+    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p")
+
+
+def _reap_trial_with_invalid_trial_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Reap a RUNNING trial whose persisted trial directory is not a path."""
+    return _reap_running_trial(tmp_path, **{TRIAL_DIR_ATTR: 7})
+
+
+def _reap_trial_without_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Reap a RUNNING trial whose ledger kept its directory but lost its attempt id.
+
+    A launch writes the attempt id before the directory, so only damage leaves this.
+    """
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    return _reap_running_trial(tmp_path, **{TRIAL_DIR_ATTR: str(trial_dir)})
+
+
+def _reap_trial_with_foreign_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Reap a RUNNING trial whose lifecycle record names another attempt."""
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    write_attempt_lifecycle(trial_dir, attempt_id="another", state="launching")
+    return _reap_running_trial(
+        tmp_path, **{TRIAL_DIR_ATTR: str(trial_dir), ATTEMPT_ID_ATTR: "attempt"}
+    )
+
+
+def _inspect_uncertain_trial_without_trial_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Inspect a cleanup-uncertain terminal trial whose ledger lost its directory."""
+    study = optuna.create_study(study_name="t::p")
+    uncertain = study.ask()
+    uncertain.set_user_attr(ATTEMPT_ID_ATTR, "attempt")
+    uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
+    return _inspect_cleanup_uncertain_trials(study, "p")
+
+
 def _recover_during_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Recover a run id while another MCP launch holds the launch lock."""
     state_dir = tmp_path / "mcp-state"
@@ -1301,6 +1434,7 @@ def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 _DELETE_ENTRY_IF_IDLE = "Delete the entry file only if you are certain no process"
+_DELETE_ENTRY_IF_NOTHING_RUNS = "Delete the entry file only if you are certain nothing is running."
 
 
 ORIGIN_CASES = (
@@ -1414,7 +1548,58 @@ ORIGIN_CASES = (
         trigger=_preflight_entry_without_trial_dir,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        message="Delete the entry file only if you are certain nothing is running.",
+        message=_DELETE_ENTRY_IF_NOTHING_RUNS,
+    ),
+    # recover-run runs every cleanup check below in both of its modes, so none
+    # of these may route back to it: each names the repair the operator makes.
+    OriginCase(
+        id="registry_lifecycle_malformed",
+        trigger=_registered_trial_dir_damaged(_lifecycle_garbled),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message=_DELETE_ENTRY_IF_NOTHING_RUNS,
+    ),
+    OriginCase(
+        id="registry_identity_missing",
+        trigger=_registered_trial_dir_damaged(_launched_without_identity),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message=_DELETE_ENTRY_IF_NOTHING_RUNS,
+    ),
+    OriginCase(
+        id="registry_unenumerable",
+        trigger=_preflight_unenumerable_registry,
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Restore the original registry and access to it before retrying.",
+    ),
+    OriginCase(
+        id="running_trial_dir_invalid",
+        trigger=_reap_trial_with_invalid_trial_dir,
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_LEDGER,
+        message="Restore the original storage ledger before retrying recovery.",
+    ),
+    OriginCase(
+        id="running_trial_attempt_missing",
+        trigger=_reap_trial_without_attempt,
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_LEDGER,
+        message="Process identity is unknown. Restore the original storage ledger",
+    ),
+    OriginCase(
+        id="running_trial_lifecycle_mismatch",
+        trigger=_reap_trial_with_foreign_lifecycle,
+        raised=ProcessCleanupUncertainError,
+        action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
+        message="Restore the original storage ledger and this attempt's lifecycle record",
+    ),
+    OriginCase(
+        id="uncertain_trial_dir_missing",
+        trigger=_inspect_uncertain_trial_without_trial_dir,
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_LEDGER,
+        message="Restore the original storage ledger before retrying recovery.",
     ),
     OriginCase(
         id="recover_during_launch",

@@ -118,11 +118,15 @@ def _trial_dir_for_reaping(
         return trial_dir
 
     stored = trial.user_attrs[TRIAL_DIR_ATTR]
+    # recover-run reaps through here too, so it cannot repair the attribute;
+    # only the ledger that recorded it can.
     if not isinstance(stored, str) or not stored:
         raise ProcessCleanupUncertainError(
             f"Refusing to reap RUNNING trial {trial.number}: invalid persisted "
             f"{TRIAL_DIR_ATTR!r} user attribute {stored!r}. The trial cannot be "
-            "tied to its identity files safely."
+            "tied to its identity files safely. Restore the original storage ledger "
+            "before retrying recovery.",
+            action=OperatorAction.RESTORE_LEDGER,
         )
     return Path(stored)
 
@@ -263,7 +267,7 @@ def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
     :param str attempt_id: Attempt whose trial reached a terminal state.
     """
     with (
-        contextlib.suppress(OSError, ProcessCleanupUncertainError),
+        contextlib.suppress(OSError, PlatformCapabilityError, ProcessCleanupUncertainError),
         _open_attempt_registry(experiment) as (directory_fd, _entry_paths),
     ):
         if directory_fd is not None:
@@ -291,7 +295,9 @@ def _open_attempt_registry(
     except FileNotFoundError:
         yield None, []
         return
-    except (OSError, PlatformCapabilityError, UnsafePrivatePathError) as exc:
+    # A missing platform capability is not a damaged registry, so it
+    # propagates with its own routing instead of this repair.
+    except (OSError, UnsafePrivatePathError) as exc:
         raise ProcessCleanupUncertainError(
             f"Attempt registry {attempts_dir} is not a real owner-only directory. "
             "Recovery cannot trust process authority reached through a symlink or "
@@ -302,8 +308,11 @@ def _open_attempt_registry(
         try:
             names = sorted(name for name in os.listdir(directory_fd) if name.endswith(".json"))
         except OSError as exc:
+            # recover-run enumerates the same registry, so it cannot clear this.
             raise ProcessCleanupUncertainError(
-                f"Attempt registry {attempts_dir} cannot be enumerated safely."
+                f"Attempt registry {attempts_dir} cannot be enumerated safely. "
+                "Restore the original registry and access to it before retrying.",
+                action=OperatorAction.RESTORE_TREE,
             ) from exc
         yield directory_fd, [attempts_dir / name for name in names]
     finally:
@@ -323,7 +332,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     # one: the entry file is what the operator repairs or removes.
     try:
         payload = strict_json_loads(read_private_text_at(directory_fd, entry_path.name, entry_path))
-    except (OSError, PlatformCapabilityError, UnsafePrivatePathError, ValueError) as exc:
+    except (OSError, UnsafePrivatePathError, ValueError) as exc:
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} is unreadable or malformed. "
             "Recovery cannot prove whether a process from this attempt is still "
@@ -415,8 +424,8 @@ def _registry_attempt_process_is_resolved(
     """
     attempt_id = entry["attempt_id"]
     trial_dir = Path(entry["trial_dir"])
-    # Inspection and confirmed recovery both stop here, so recover-run cannot
-    # clear this entry; the operator repairs or removes it.
+    # Inspection and confirmed recovery both stop at each evidence check below,
+    # so recover-run cannot clear this entry; the operator repairs or removes it.
     if not trial_dir.is_dir():
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} points at a missing trial "
@@ -428,7 +437,9 @@ def _registry_attempt_process_is_resolved(
         lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
     except ValueError as exc:
         raise ProcessCleanupUncertainError(
-            f"Attempt registry entry {entry_path} has a malformed lifecycle record in {trial_dir}."
+            f"Attempt registry entry {entry_path} has a malformed lifecycle record in {trial_dir}. "
+            "Delete the entry file only if you are certain nothing is running.",
+            action=OperatorAction.RESTORE_TREE,
         ) from exc
     resolution = _attempt_process_resolution(
         lifecycle,
@@ -443,7 +454,9 @@ def _registry_attempt_process_is_resolved(
     except (OSError, ValueError) as exc:
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} has a missing or malformed "
-            f"process identity in {trial_dir}."
+            f"process identity in {trial_dir}. "
+            "Delete the entry file only if you are certain nothing is running.",
+            action=OperatorAction.RESTORE_TREE,
         ) from exc
     if inspect_only:
         return
@@ -804,11 +817,16 @@ def _attempt_lifecycle_for_reaping(
     :raises ProcessCleanupUncertainError: The trial has no valid persisted
         attempt id, or the record is malformed or belongs to another attempt.
     """
+    # recover-run resolves RUNNING trials through here too, so these refusals
+    # route to the repair, as _read_trial_process_identity's do.
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if not isinstance(attempt_id, str) or not attempt_id:
         raise ProcessCleanupUncertainError(
             f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
-            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown."
+            f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown. "
+            "Restore the original storage ledger with its durable attempt and generation "
+            "identities before retrying recovery; do not infer replacement identities.",
+            action=OperatorAction.RESTORE_LEDGER,
         )
     try:
         return read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
@@ -816,7 +834,10 @@ def _attempt_lifecycle_for_reaping(
         raise ProcessCleanupUncertainError(
             f"Refusing to recover trial {trial.number} in study {study_name}: its attempt "
             f"lifecycle record is malformed or belongs to another attempt. "
-            f"trial_dir={trial_dir}."
+            f"trial_dir={trial_dir}. Restore the original storage ledger and this "
+            "attempt's lifecycle record before retrying recovery.",
+            # Both, in order: either side may be the one that no longer matches.
+            action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
         ) from exc
 
 

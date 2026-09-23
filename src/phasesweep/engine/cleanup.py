@@ -20,6 +20,7 @@ from phasesweep.engine.attempts import (
     _trial_requires_cleanup_recovery,
 )
 from phasesweep.engine.errors import (
+    OperatorAction,
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.state import (
@@ -72,8 +73,12 @@ def _reap_stale_trials(
     try:
         trials = study.get_trials(deepcopy=False)
     except Exception as exc:
+        # recover-run reaps through here too and cannot read the ledger either,
+        # so restoring it comes first.
         raise ProcessCleanupUncertainError(
-            f"Could not inspect study {study.study_name!r} for stale RUNNING trials."
+            f"Could not inspect study {study.study_name!r} for stale RUNNING trials. "
+            "Restore the original complete storage ledger and access to it before retrying.",
+            action=OperatorAction.RESTORE_LEDGER,
         ) from exc
     for trial in trials:
         if trial.state != optuna.trial.TrialState.RUNNING:
@@ -223,11 +228,15 @@ def _trial_dir_for_cleanup_recovery(
     :raises ProcessCleanupUncertainError: The trial has no safe persisted trial directory.
     """
     stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    # A launch records the directory before its process can leak, so only a
+    # damaged ledger lacks it here, and recover-run reads the same attribute.
     if not isinstance(stored, str) or not stored:
         raise ProcessCleanupUncertainError(
             f"Refusing to recover cleanup-uncertain trial {trial.number} in study "
             f"{study_name}: missing or invalid {TRIAL_DIR_ATTR!r} user attribute "
-            f"{stored!r}. The leaked process group cannot be tied to identity files safely."
+            f"{stored!r}. The leaked process group cannot be tied to identity files safely. "
+            "Restore the original storage ledger before retrying recovery.",
+            action=OperatorAction.RESTORE_LEDGER,
         )
     return Path(stored)
 
