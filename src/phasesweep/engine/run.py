@@ -551,6 +551,13 @@ def _run_experiment_outcome(
                 # Cleanup uncertainty intentionally becomes the actionable error;
                 # the original failure remains chained for diagnosis but is unsafe to handle alone,
                 # so its action is replaced too: recovery has to settle cleanup before its remedy.
+                # A cleanup refusal that names its own repair keeps it, and its text says it.
+                if isinstance(cleanup.error, ProcessCleanupUncertainError):
+                    raise ProcessCleanupUncertainError.rewrap(
+                        cleanup.error,
+                        "The run failed and subsequent process cleanup could not be confirmed. "
+                        f"{cleanup.error}",
+                    ) from primary_error
                 raise ProcessCleanupUncertainError(
                     "The run failed and subsequent process cleanup could not be confirmed. "
                     f"To retry that cleanup, {RERUN_CLEANUP_RECOVERY}.",

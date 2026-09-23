@@ -345,7 +345,8 @@ class WrapCase:
     #: Drives the real entry point until the wrap under test raises.
     trigger: Trigger
     outbound: type[PhaseSweepError]
-    action: OperatorAction
+    #: The one step, or every step in order where the site composes several.
+    action: OperatorAction | tuple[OperatorAction, ...]
     #: Exact ``__cause__`` type, or ``None`` where the site raises ``from None``.
     cause: type[BaseException] | None
     #: Stable substring of the operator text the site raises today.
@@ -509,6 +510,22 @@ def _run_fails_then_cleanup_unconfirmed(tmp_path: Path, monkeypatch: pytest.Monk
 
     def fail_run(*_args: object, **_kwargs: object) -> None:
         monkeypatch.setattr(guards, "validate_ledger", _raiser(OSError("root is gone")))
+        raise NoFeasibleTrialError("trainer failed")
+
+    monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
+    return run_experiment(experiment)
+
+
+def _run_fails_then_registry_turns_shared(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Fail a run whose reconciliation then finds the attempt registry shared."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+
+    def fail_run(*_args: object, **_kwargs: object) -> None:
+        registry = _attempts_dir(experiment)
+        registry.mkdir(parents=True, exist_ok=True)
+        registry.chmod(0o755)
         raise NoFeasibleTrialError("trainer failed")
 
     monkeypatch.setattr("phasesweep.engine.run._run_experiment_inner", fail_run)
@@ -709,6 +726,7 @@ def _preflight(
     studies: Callable[[], Mapping[str, optuna.Study]],
     *,
     schema_check: Callable[[optuna.Study], None] | None = None,
+    after_claim: Callable[[Experiment], None] | None = None,
 ) -> Trigger:
     """Run preflight over two phases whose claimed studies are ``studies()``."""
 
@@ -721,6 +739,8 @@ def _preflight(
             ],
         )
         claimed = engine_ledger.claim_ledger(engine_ledger.validate_ledger(experiment))
+        if after_claim is not None:
+            after_claim(experiment)
         if schema_check is not None:
             monkeypatch.setattr(guards, "_validate_study_schema", schema_check)
         return guards._preflight_existing_studies(
@@ -733,6 +753,36 @@ def _preflight(
 def _two_precutover_studies() -> dict[str, optuna.Study]:
     """Return two populated studies that predate the schema stamp."""
     return {"a": _populated_study("t::a"), "b": _populated_study("t::b")}
+
+
+def _refuse_schema_differently(study: optuna.Study) -> None:
+    """Refuse each phase with the same type but a different remedy."""
+    action = (
+        OperatorAction.USE_PRIOR_RELEASE
+        if study.study_name == "t::a"
+        else OperatorAction.FRESH_NAMESPACE
+    )
+    raise StudySchemaMismatchError(f"{study.study_name} is unsupported.", action=action)
+
+
+def _share_registry(experiment: Experiment) -> None:
+    """Create the attempt registry with a mode other users can enter."""
+    registry = _attempts_dir(experiment)
+    registry.mkdir(parents=True)
+    registry.chmod(0o755)
+
+
+def _preflight_shared_registry_and_lost_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Preflight a shared registry and a phase whose stale-trial reap loses its ledger."""
+    monkeypatch.setattr(
+        guards,
+        "_reap_stale_trials",
+        _raiser(StudyStorageUnavailableError("t::a could not be marked FAIL.")),
+    )
+    trigger = _preflight(lambda: {"a": _populated_study("t::a")}, after_claim=_share_registry)
+    return trigger(tmp_path, monkeypatch)
 
 
 _RECOVERY_STORAGE = (
@@ -774,6 +824,15 @@ WRAP_CASES = (
         action=OperatorAction.RESTORE_LEDGER,
         cause=StudyStorageUnavailableError,
         message="Artifact ownership could not be checked because required persistent",
+    ),
+    WrapCase(
+        # Composed: the cleanup refusal's own repair survives the replacement.
+        id="run_failure_cleanup_keeps_repair",
+        trigger=_run_fails_then_registry_turns_shared,
+        outbound=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        cause=NoFeasibleTrialError,
+        message="Restore the original registry with mode 0700 before retrying.",
     ),
     WrapCase(
         # Negative: unconfirmed cleanup deliberately replaces the run's own remedy.
@@ -980,6 +1039,28 @@ WRAP_CASES = (
         message=_PREFLIGHT_AGGREGATE,
     ),
     WrapCase(
+        # One type does not make one remedy: disagreeing refusals route to reading them.
+        id="preflight_same_type_aggregate_disagreeing",
+        trigger=_preflight(_two_precutover_studies, schema_check=_refuse_schema_differently),
+        outbound=StudySchemaMismatchError,
+        action=OperatorAction.INSPECT_LOGS,
+        cause=StudySchemaMismatchError,
+        message=_PREFLIGHT_AGGREGATE,
+    ),
+    WrapCase(
+        # Composed: every repair any cleanup or storage refusal needs, then recovery.
+        id="preflight_cleanup_aggregate_repairs",
+        trigger=_preflight_shared_registry_and_lost_ledger,
+        outbound=ProcessCleanupUncertainError,
+        action=(
+            OperatorAction.RESTORE_TREE,
+            OperatorAction.RESTORE_LEDGER,
+            OperatorAction.RUN_RECOVER_RUN,
+        ),
+        cause=ProcessCleanupUncertainError,
+        message=_PREFLIGHT_AGGREGATE,
+    ),
+    WrapCase(
         id="preflight_mixed_aggregate_agreeing",
         trigger=_preflight(_two_precutover_studies, schema_check=_refuse_as_prior_release),
         outbound=PhaseSweepError,
@@ -1009,7 +1090,7 @@ def test_operator_action_survives_wrap(
 
     error = excinfo.value
     assert type(error) is case.outbound
-    assert error.actions == (case.action,)
+    assert error.actions == (case.action if isinstance(case.action, tuple) else (case.action,))
     if case.cause is None:
         assert error.__cause__ is None
     else:

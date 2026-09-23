@@ -1652,6 +1652,47 @@ def test_cleanup_uncertain_remediation_follows_the_operator_action(
     assert "action" not in failure
 
 
+@pytest.mark.parametrize(
+    ("primary", "cleanup_error", "remediation"),
+    [
+        pytest.param(
+            NoFeasibleTrialError("trainer failed"),
+            ProcessCleanupUncertainError("registry shared", action=OperatorAction.RESTORE_TREE),
+            _RESTORE_TREE_FIRST,
+            id="cleanup-repair",
+        ),
+        pytest.param(
+            NoFeasibleTrialError("trainer failed"),
+            OSError("root is gone"),
+            _RECOVER_RUN_ONLY,
+            id="no-specific-repair",
+        ),
+        pytest.param(
+            StudyStorageUnavailableError("ledger write failed"),
+            None,
+            _RESTORE_LEDGER_FIRST,
+            id="storage-primary",
+        ),
+        pytest.param(
+            StudyStorageUnavailableError("ledger write failed"),
+            ProcessCleanupUncertainError("registry shared", action=OperatorAction.RESTORE_TREE),
+            _RESTORE_BOTH_FIRST,
+            id="storage-primary-and-cleanup-repair",
+        ),
+    ],
+)
+def test_unconfirmed_cleanup_keeps_the_recorded_cleanup_repairs(
+    primary: BaseException, cleanup_error: BaseException | None, remediation: str
+) -> None:
+    """The engine's recorded cleanup error, not a fresh default, names the repairs."""
+    failure = mcp_runner._terminal_failure_payload(
+        primary, stage="execution", cleanup_confirmed=False, cleanup_error=cleanup_error
+    )
+
+    assert failure["code"] == "cleanup_uncertain"
+    assert failure["remediation"] == remediation
+
+
 def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

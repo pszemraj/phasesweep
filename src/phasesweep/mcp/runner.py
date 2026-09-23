@@ -117,6 +117,25 @@ _CLEANUP_REPAIRS: dict[OperatorAction, str] = {
 }
 
 
+def _cleanup_uncertain_payload(actions: tuple[OperatorAction, ...]) -> dict[str, object]:
+    """Return the cleanup-uncertain failure whose repairs come before recover-run.
+
+    :param tuple[OperatorAction, ...] actions: Steps the cleanup refusal routes, in order.
+    :return dict[str, object]: The ``"cleanup_uncertain"`` payload.
+    """
+    repairs = [_CLEANUP_REPAIRS[action] for action in actions if action in _CLEANUP_REPAIRS]
+    first = f"{', and '.join(repairs)}, then " if repairs else ""
+    return {
+        "code": "cleanup_uncertain",
+        "stage": "cleanup",
+        "retryable": False,
+        "actor": "operator",
+        "remediation": (
+            f"Ask the operator to {first}run phasesweep mcp recover-run before another launch."
+        ),
+    }
+
+
 def _base_failure_payload(
     error: BaseException,
     *,
@@ -249,19 +268,7 @@ def _base_failure_payload(
     if isinstance(error, ProcessCleanupUncertainError):
         # What must come back before recover-run is the raise site's decision,
         # carried as its actions; the chained cause is history.
-        repairs = [
-            _CLEANUP_REPAIRS[action] for action in error.actions if action in _CLEANUP_REPAIRS
-        ]
-        first = f"{', and '.join(repairs)}, then " if repairs else ""
-        return {
-            "code": "cleanup_uncertain",
-            "stage": "cleanup",
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                f"Ask the operator to {first}run phasesweep mcp recover-run before another launch."
-            ),
-        }
+        return _cleanup_uncertain_payload(error.actions)
     if isinstance(error, NoFeasibleTrialError):
         return {
             "code": "trainer_failed",
@@ -315,10 +322,37 @@ def _safe_failure_payload(
     return FailurePayload.model_validate(payload).model_dump(mode="json", exclude_none=True)
 
 
+def _cleanup_steps(
+    primary: BaseException, cleanup_error: BaseException | None
+) -> tuple[OperatorAction, ...]:
+    """Return the steps an unconfirmed cleanup routes, ahead of recover-run.
+
+    A cleanup refusal routes its own repairs. Otherwise the cleanup error the
+    engine recorded supplies them, and a storage primary adds the ledger that
+    recover-run must read first.
+
+    :param BaseException primary: Terminal error observed before cleanup was
+        found to be uncertain.
+    :param BaseException | None cleanup_error: The engine's recorded cleanup failure.
+    :return tuple[OperatorAction, ...]: De-duplicated steps in order.
+    """
+    if isinstance(primary, ProcessCleanupUncertainError):
+        return primary.actions
+    steps: list[OperatorAction] = []
+    if isinstance(primary, StudyStorageUnavailableError):
+        steps.append(OperatorAction.RESTORE_LEDGER)
+    if isinstance(cleanup_error, ProcessCleanupUncertainError):
+        steps.extend(action for action in cleanup_error.actions if action not in steps)
+    else:
+        steps.append(ProcessCleanupUncertainError.default_action)
+    return tuple(steps)
+
+
 def _cleanup_failure_payload(
     primary: BaseException,
     *,
     cause_stage: str | None,
+    cleanup_error: BaseException | None = None,
 ) -> dict[str, object]:
     """Make cleanup uncertainty actionable while retaining its safe primary cause.
 
@@ -326,16 +360,13 @@ def _cleanup_failure_payload(
         found to be uncertain.
     :param str | None cause_stage: Stage at which ``primary`` occurred, used
         when classifying it as the nested cause.
+    :param BaseException | None cleanup_error: The engine's recorded cleanup
+        failure, whose repairs the payload keeps.
     :return dict[str, object]: A ``"cleanup_uncertain"`` failure payload, with
         ``primary`` nested under ``"cause"``. For an existing cleanup error,
         retain its explicit storage failure when that prevents inspection.
     """
-    cleanup = (
-        primary
-        if isinstance(primary, ProcessCleanupUncertainError)
-        else ProcessCleanupUncertainError("trainer process cleanup could not be confirmed")
-    )
-    payload = _base_failure_payload(cleanup, stage="cleanup")
+    payload = _cleanup_uncertain_payload(_cleanup_steps(primary, cleanup_error))
     # ``cause`` is diagnostic history, not a second action contract. It
     # intentionally retains the primary failure's own actor/retryability
     # (for example, a storage error or user cancellation) while the authoritative
@@ -370,21 +401,33 @@ def _terminal_error(
     return report.primary_error or fallback, report.failure_stage
 
 
+def _recorded_cleanup_error(report: TerminalReport | None) -> BaseException | None:
+    """Return the cleanup failure an engine report recorded, if one was delivered.
+
+    :param TerminalReport | None report: Engine terminal report, when one was delivered.
+    :return BaseException | None: The report's cleanup error.
+    """
+    return report.cleanup_error if report is not None else None
+
+
 def _terminal_failure_payload(
     error: BaseException,
     *,
     stage: str | None,
     cleanup_confirmed: bool,
+    cleanup_error: BaseException | None = None,
 ) -> dict[str, object]:
     """Classify one terminal error, making cleanup uncertainty authoritative.
 
     :param BaseException error: Primary terminal error.
     :param str | None stage: Stage at which the primary error occurred.
     :param bool cleanup_confirmed: Whether child-process cleanup was confirmed.
+    :param BaseException | None cleanup_error: The engine's recorded cleanup
+        failure, when cleanup is unconfirmed.
     :return dict[str, object]: Validated, path-free terminal failure payload.
     """
     if not cleanup_confirmed:
-        return _cleanup_failure_payload(error, cause_stage=stage)
+        return _cleanup_failure_payload(error, cause_stage=stage, cleanup_error=cleanup_error)
     return _safe_failure_payload(error, stage=stage)
 
 
@@ -895,6 +938,7 @@ def main(argv: list[str] | None = None) -> int:
                         report.primary_error,
                         stage=report.failure_stage,
                         cleanup_confirmed=report.cleanup_confirmed,
+                        cleanup_error=report.cleanup_error,
                     )
                 if publication_hook.snapshot is not None:
                     result_snapshot = dict(publication_hook.snapshot)
@@ -942,6 +986,7 @@ def main(argv: list[str] | None = None) -> int:
                 primary,
                 stage=failure_stage,
                 cleanup_confirmed=cleanup_confirmed,
+                cleanup_error=_recorded_cleanup_error(terminal_report),
             )
         raise
     except ProcessCleanupUncertainError as exc:
@@ -955,6 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
             primary,
             stage=failure_stage,
             cleanup_confirmed=False,
+            cleanup_error=_recorded_cleanup_error(terminal_report),
         )
         raise
     except BaseException as exc:  # noqa: BLE001 - record every terminal cause, then re-raise
@@ -969,6 +1015,7 @@ def main(argv: list[str] | None = None) -> int:
             primary,
             stage=failure_stage,
             cleanup_confirmed=cleanup_confirmed,
+            cleanup_error=_recorded_cleanup_error(terminal_report),
         )
         raise
     finally:

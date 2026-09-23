@@ -15,6 +15,7 @@ from phasesweep.engine.cleanup import (
     _recover_cleanup_uncertain_trials,
 )
 from phasesweep.engine.errors import (
+    OperatorAction,
     PhaseSweepError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -71,6 +72,28 @@ def _reconcile_existing_studies(
     return _preflight_existing_studies(
         claimed, cleanup_report=cleanup_report, from_phase=from_phase
     )
+
+
+def _cleanup_aggregate_steps(errors: list[Exception]) -> tuple[OperatorAction, ...]:
+    """Return every repair an aggregate's cleanup and storage refusals need, then recovery.
+
+    Each refusal's repair must happen before recovery can succeed, so none is
+    dropped for the first; a retry is implied and recovery itself comes last.
+
+    :param list[Exception] errors: Refusals the preflight collected, in order.
+    :return tuple[OperatorAction, ...]: Ordered, de-duplicated repairs, then
+        ``RUN_RECOVER_RUN``.
+    """
+    last = OperatorAction.RUN_RECOVER_RUN
+    steps: list[OperatorAction] = []
+    for error in errors:
+        if isinstance(error, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
+            steps.extend(
+                action
+                for action in error.actions
+                if action not in (OperatorAction.RETRY, last) and action not in steps
+            )
+    return (*steps, last)
 
 
 def _preflight_existing_studies(
@@ -182,32 +205,32 @@ def _preflight_existing_studies(
         message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
             str(error) for error in errors
         )
-        # A typed aggregate carries the action of the error it is chained from,
-        # so several refusals of one kind route exactly as a single one would.
+        # No single error speaks for an aggregate, whatever its types: it
+        # routes to a remediation only when every collected error names the
+        # same steps, and otherwise to reading the refusals it lists.
+        remediations = {error.actions for error in errors if isinstance(error, PhaseSweepError)}
+        shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
         if all(isinstance(error, StudySchemaMismatchError) for error in errors):
-            raise StudySchemaMismatchError.rewrap(first, message) from first
+            raise StudySchemaMismatchError(message, action=shared) from first
         if all(isinstance(error, StudyFingerprintMismatchError) for error in errors):
-            raise StudyFingerprintMismatchError.rewrap(first, message) from first
+            raise StudyFingerprintMismatchError(message, action=shared) from first
         if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
-            raise StudyStorageUnavailableError.rewrap(first, message) from first
+            raise StudyStorageUnavailableError(message, action=shared) from first
         if all(isinstance(error, TrialTargetRegressionError) for error in errors):
-            raise TrialTargetRegressionError.rewrap(first, message) from first
+            raise TrialTargetRegressionError(message, action=shared) from first
         cleanup_error = next(
             (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
             None,
         )
         if cleanup_error is not None:
-            raise ProcessCleanupUncertainError.rewrap(cleanup_error, message) from cleanup_error
+            raise ProcessCleanupUncertainError(
+                message, action=_cleanup_aggregate_steps(errors)
+            ) from cleanup_error
         unexpected = next(
             (error for error in errors if not isinstance(error, PhaseSweepError)),
             None,
         )
         if unexpected is not None:
             raise RuntimeError(message) from unexpected
-        # No single error speaks for a mixed aggregate: it routes to a
-        # remediation only when every collected error names the same steps, and
-        # otherwise falls back to the base default of reading the refusals it lists.
-        remediations = {error.actions for error in errors if isinstance(error, PhaseSweepError)}
-        shared = remediations.pop() if len(remediations) == 1 else None
         raise PhaseSweepError(message, action=shared) from first
     return studies
