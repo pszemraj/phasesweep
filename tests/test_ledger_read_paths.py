@@ -49,6 +49,7 @@ from phasesweep.mcp.recovery import (
 from phasesweep.mcp.runs import RunStore, UnsupportedStateFormatError
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from tests.ledger_fixtures import (
+    LEDGER_MODES,
     Materialized,
     _tree_bytes,
     copy_fixture,
@@ -519,7 +520,14 @@ def test_required_ledger_fixtures_are_present() -> None:
 
 
 def test_every_ledger_fixture_is_documented() -> None:
-    """Each fixture records its provenance and appears in the inventory README."""
+    """Each fixture records its provenance and read modes and appears in the inventory README.
+
+    A ``release-<version>-*`` fixture claims to be the old release's own
+    output, so it must name exactly that tag: ``unknown``, a ``-dirty``
+    checkout, or commits past the tag all mean the claim is unproven. A
+    fixture with a ledger must declare a read mode, or the matrix silently
+    drops it; one without a ledger has nothing to read.
+    """
     readme = (Path(__file__).resolve().parent / "fixtures" / "ledgers" / "README.md").read_text(
         encoding="utf-8"
     )
@@ -528,4 +536,23 @@ def test_every_ledger_fixture_is_documented() -> None:
         assert isinstance(produced_by, dict) and produced_by.get("phasesweep_git"), (
             f"{fixture.name} has no produced_by provenance"
         )
+        if fixture.name.startswith("release-"):
+            version = fixture.name.removeprefix("release-").rpartition("-")[0]
+            assert produced_by["phasesweep_git"] == f"v{version}", (
+                f"{fixture.name} was produced by {produced_by['phasesweep_git']!r}, "
+                f"not a clean checkout of v{version}"
+            )
         assert fixture.name in readme, f"{fixture.name} is missing from the fixture README"
+
+        modes = fixture.modes
+        assert len(set(modes)) == len(modes) and set(modes) <= set(LEDGER_MODES), (
+            f"{fixture.name} declares modes {modes}; each must be one of {LEDGER_MODES}, once"
+        )
+        assert set(fixture.manifest["expect"]) == set(modes), (
+            f"{fixture.name} expects verdicts for {sorted(fixture.manifest['expect'])}, "
+            f"but declares modes {modes}"
+        )
+        if fixture.manifest["backend"] is None:
+            assert modes == (), f"{fixture.name} has no ledger, yet declares modes {modes}"
+        else:
+            assert modes, f"{fixture.name} has a ledger but declares no read mode"

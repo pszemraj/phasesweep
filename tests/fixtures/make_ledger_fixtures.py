@@ -474,12 +474,15 @@ def _isolate_environment(sandbox: Path) -> None:
 def _git_describe(path: Path) -> str:
     """Describe the git checkout a path belongs to.
 
+    ``--dirty`` marks a checkout with uncommitted changes, whose bytes no
+    commit reproduces.
+
     :param Path path: Any path inside the checkout.
-    :return str: ``git describe --tags --always`` output, or ``"unknown"``.
+    :return str: ``git describe --tags --always --dirty`` output, or ``"unknown"``.
     """
     try:
         result = subprocess.run(
-            ["git", "-C", str(path), "describe", "--tags", "--always"],
+            ["git", "-C", str(path), "describe", "--tags", "--always", "--dirty"],
             capture_output=True,
             text=True,
             check=True,

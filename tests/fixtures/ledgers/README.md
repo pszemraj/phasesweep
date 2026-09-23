@@ -52,8 +52,11 @@ produced by the working tree's PhaseSweep. `release-0.3.1-sqlite` and
 a detached `v0.3.1` worktree, against the same Optuna range -- so the format
 boundary is tested against bytes the old release actually wrote, not a
 reconstruction of them. Every manifest carries `produced_by` with the
-phasesweep `git describe`, Optuna, SQLite, and Python versions, plus the
-directory the generator ran from.
+phasesweep `git describe --tags --always --dirty`, Optuna, SQLite, and Python
+versions, plus the directory the generator ran from. A `release-<version>-*`
+manifest must record exactly `v<version>`, and every fixture with a ledger
+must declare at least one read mode; the fixture-documentation test refuses
+anything else.
 
 The 0.3.1 pair predates the trainer-cwd pin described below, so their phase and
 experiment fingerprints embed the directory they were generated from and match
