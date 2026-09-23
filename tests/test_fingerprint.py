@@ -21,7 +21,6 @@ from phasesweep.config import (
     FloatParam,
     IntParam,
     JsonEqualsGate,
-    LogRegexExtractor,
     Metric,
     Phase,
     Sampler,
@@ -310,13 +309,7 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
 
 def test_fingerprint_changes_when_parent_winner_changes():
     """A child's fingerprint must change if a parent winner changes, even if child config is identical."""
-    exp = Experiment(
-        experiment="t",
-        trial_command="echo {overrides}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
+    exp = make_experiment(
         phases=[
             Phase(
                 name="arch",
@@ -392,38 +385,6 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
 
 def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
     """Top-up and throughput knobs are ignored; trainer semantics still hash in."""
-
-    def env_pair() -> tuple[Experiment, Experiment]:
-        base_phase = Phase(
-            name="p", n_trials=4, search_space={"x": IntParam(type="int", low=0, high=10)}
-        )
-        return (
-            Experiment(
-                experiment="t",
-                trial_command="echo {overrides}",
-                override_format="argparse",
-                metric=Metric(
-                    extractor=LogRegexExtractor(
-                        type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
-                    )
-                ),
-                phases=[base_phase],
-                env={"CUBLAS_WORKSPACE_CONFIG": ":4096:8"},
-            ),
-            Experiment(
-                experiment="t",
-                trial_command="echo {overrides}",
-                override_format="argparse",
-                metric=Metric(
-                    extractor=LogRegexExtractor(
-                        type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
-                    )
-                ),
-                phases=[base_phase],
-                env={"CUBLAS_WORKSPACE_CONFIG": ":16:8"},
-            ),
-        )
-
     cases = [
         (
             "n_trials_top_up",
@@ -443,7 +404,14 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
             ),
             True,
         ),
-        ("env", env_pair, False),
+        (
+            "env",
+            lambda: (
+                make_experiment(n_trials=4, env={"CUBLAS_WORKSPACE_CONFIG": ":4096:8"}),
+                make_experiment(n_trials=4, env={"CUBLAS_WORKSPACE_CONFIG": ":16:8"}),
+            ),
+            False,
+        ),
         (
             "provenance",
             lambda: (
@@ -2072,27 +2040,8 @@ def test_save_winner_replace_failure_preserves_existing_file(
 def test_phase_comment_schema_and_fingerprint(tmp_path: Path) -> None:
     """Editing an optional phase comment must not invalidate its fingerprint."""
 
-    def build(comment: str | None) -> Experiment:
-        return Experiment(
-            experiment="t",
-            workdir=str(tmp_path / "wd"),
-            trial_command="echo {overrides}",
-            override_format="argparse",
-            metric=Metric(
-                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-            ),
-            phases=[
-                Phase(  # type: ignore[arg-type]
-                    name="p",
-                    n_trials=4,
-                    comment=comment,
-                    search_space={"x": IntParam(type="int", low=0, high=10)},
-                )
-            ],
-        )
-
     def fingerprint(comment: str | None) -> str:
-        experiment = build(comment)
+        experiment = make_experiment(workdir=tmp_path / "wd", n_trials=4, comment=comment)
         return _phase_fingerprint(experiment, experiment.phases[0], {})
 
     assert fingerprint("First version") == fingerprint("Reworded later") == fingerprint(None)

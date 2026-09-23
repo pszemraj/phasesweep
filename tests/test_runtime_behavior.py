@@ -1870,23 +1870,14 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
 ) -> None:
     """A timeout guard should not reject a phase once every requested trial is terminal."""
     trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
-    exp = Experiment(
+    exp = make_experiment(
         experiment="phase_timeout_all_terminal",
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=2,
-                timeout_seconds_per_phase=8.0,
-                allow_incomplete_on_timeout=allow_incomplete_on_timeout,
-                search_space={},
-            )
-        ],
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        n_trials=2,
+        timeout_seconds_per_phase=8.0,
+        allow_incomplete_on_timeout=allow_incomplete_on_timeout,
+        search_space={},
     )
 
     winners = run_experiment(exp)
@@ -1911,27 +1902,17 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
 @pytest.mark.integration
 def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Path) -> None:
     trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
-    exp = Experiment(
+    exp = make_experiment(
         experiment="phase_timeout_allowed_abort_counter",
-        workdir=str(tmp_path / "runs"),
+        workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'timeout-counter.db'}",
-        provenance={"revision": "test-fixture-v1"},
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=3,
-                max_consecutive_failures=1,
-                timeout_seconds_per_phase=8.0,
-                allow_incomplete_on_timeout=True,
-                sampler=Sampler(type="random", seed=7),
-                search_space={},
-            )
-        ],
+        trainer=trainer,
+        n_trials=3,
+        max_consecutive_failures=1,
+        timeout_seconds_per_phase=8.0,
+        allow_incomplete_on_timeout=True,
+        sampler=Sampler(type="random", seed=7),
+        search_space={},
     )
 
     winners = run_experiment(exp)
@@ -1982,16 +1963,11 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     import phasesweep.engine.phase as phase_mod
 
     trainer = write_trial_zero_trainer(tmp_path, otherwise="sys.exit(1)")
-    exp = Experiment(
+    exp = make_experiment(
         experiment="phase_scheduler_deadline_with_abort",
-        workdir=str(tmp_path / "runs"),
+        workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'decision.db'}",
-        provenance={"revision": "test-fixture-v1"},
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
+        trainer=trainer,
         phases=[
             Phase(
                 name="p",
@@ -2109,28 +2085,18 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     import phasesweep.engine.phase as phase_mod
 
     trainer = write_trial_zero_trainer(tmp_path, otherwise="sys.exit(1)")
-    exp = Experiment(
+    exp = make_experiment(
         experiment="refused_partial_timeout_abort",
-        workdir=str(tmp_path / "runs"),
+        workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'refused.db'}",
-        provenance={"revision": "test-fixture-v1"},
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=3,
-                max_consecutive_failures=1,
-                timeout_seconds_per_phase=600.0,
-                gpu_policy="none",
-                allow_no_gpu_isolation=True,
-                sampler=Sampler(type="random", seed=7),
-                search_space={},
-            )
-        ],
+        trainer=trainer,
+        n_trials=3,
+        max_consecutive_failures=1,
+        timeout_seconds_per_phase=600.0,
+        gpu_policy="none",
+        allow_no_gpu_isolation=True,
+        sampler=Sampler(type="random", seed=7),
+        search_space={},
     )
 
     offset = {"seconds": 0.0}
@@ -2240,24 +2206,15 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     from phasesweep.runtime.gpu import GpuAssignment, GpuLeaseTimeoutError
 
     trainer = write_constant_trainer(tmp_path, value=1.0)
-    exp = Experiment(
+    exp = make_experiment(
         experiment="gpu_lease_timeout_attribution",
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=3,
-                max_consecutive_failures=1,
-                timeout_seconds_per_phase=600.0,
-                allow_incomplete_on_timeout=True,
-                search_space={},
-            )
-        ],
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        n_trials=3,
+        max_consecutive_failures=1,
+        timeout_seconds_per_phase=600.0,
+        allow_incomplete_on_timeout=True,
+        search_space={},
     )
 
     exc_type = GpuLeaseTimeoutError if lease_timeout else TimeoutError
