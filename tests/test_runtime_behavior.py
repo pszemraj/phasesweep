@@ -17,12 +17,14 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from phasesweep import load_experiment, run_experiment
+from phasesweep import run_experiment
 from phasesweep.config import (
     CategoricalParam,
     Constraint,
     Experiment,
+    FloatParam,
     IntParam,
+    JsonEnvelopeExtractor,
     JsonExtractor,
     LogRegexExtractor,
     Metric,
@@ -94,7 +96,6 @@ from tests.conftest import (
     write_param_echo_trainer,
     write_trainer,
     write_trial_zero_trainer,
-    write_yaml,
 )
 
 
@@ -407,30 +408,27 @@ def test_parallel_trials_e2e(tmp_path):
     trainer = copy_fake_train(tmp_path)
 
     journal_path = tmp_path / "phases.journal"
-    yaml_text = f"""
-experiment: parallel_test
-storage: journal:///{journal_path}
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
-phases:
-  - name: lr_sweep
-    n_trials: 8
-    n_jobs: 4
-    allow_no_gpu_isolation: true
-    sampler: {{ type: tpe, seed: 42, acknowledge_nonresumable: true }}
-    search_space:
-      lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }}
-"""
-    yaml_path = tmp_path / "exp.yaml"
-    yaml_path.write_text(yaml_text)
-
-    exp = load_experiment(yaml_path)
+    exp = make_experiment(
+        experiment="parallel_test",
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{journal_path}",
+        trial_command=f"python {trainer} {{overrides}}",
+        metric=Metric(
+            name="eval_loss",
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope",
+                objective_name="eval_loss",
+                split="validation",
+                policy="synthetic",
+            ),
+        ),
+        name="lr_sweep",
+        n_trials=8,
+        n_jobs=4,
+        allow_no_gpu_isolation=True,
+        sampler=Sampler(type="tpe", seed=42, acknowledge_nonresumable=True),
+        search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-2, log=True)},
+    )
     winners = run_experiment(exp)
 
     assert "lr_sweep" in winners
@@ -449,27 +447,16 @@ phases:
 def test_failed_trials_marked_fail_not_complete(tmp_path):
     """Process crashes should produce FAIL trials, not COMPLETE with inf."""
     db_path = tmp_path / "phases.db"
-    yaml_text = f"""
-experiment: fail_state_test
-storage: sqlite:///{db_path}
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path / "runs"}
-trial_command: "false {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
-phases:
-  - name: a
-    n_trials: 3
-    max_consecutive_failures: 10
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
-"""
-    yaml_path = tmp_path / "exp.yaml"
-    yaml_path.write_text(yaml_text)
-    exp = load_experiment(yaml_path)
+    exp = make_experiment(
+        experiment="fail_state_test",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{db_path}",
+        trial_command="false {overrides}",
+        name="a",
+        n_trials=3,
+        max_consecutive_failures=10,
+        search_space={"x": FloatParam(type="float", low=0, high=1)},
+    )
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
@@ -677,32 +664,29 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     trainer = write_constant_trainer(tmp_path, key="eval_loss", value=1.0)
 
     db = tmp_path / "phases.db"
-    yaml_text = f"""
-experiment: c2
-storage: sqlite:///{db}
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)' }}
-constraints:
-  - name: param_bytes
-    extractor: {{ type: json, path: result.json, key: param_bytes }}
-    max: 1000
-phases:
-  - name: a
-    n_trials: 2
-    max_consecutive_failures: 10
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
-"""
-    p = tmp_path / "exp.yaml"
-    p.write_text(yaml_text)
-    exp = load_experiment(p)
-    from phasesweep.engine.selection import NoFeasibleTrialError
+    exp = make_experiment(
+        experiment="c2",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{db}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
+        metric=Metric(
+            name="eval_loss",
+            extractor=LogRegexExtractor(
+                type="log_regex", pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)"
+            ),
+        ),
+        constraints=[
+            Constraint(
+                name="param_bytes",
+                extractor=JsonExtractor(type="json", path="result.json", key="param_bytes"),
+                max=1000,
+            )
+        ],
+        name="a",
+        n_trials=2,
+        max_consecutive_failures=10,
+        search_space={"x": FloatParam(type="float", low=0, high=1)},
+    )
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
@@ -799,29 +783,17 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
         "phasesweep.runtime.gpu._detect_gpu_uuid_map",
         lambda: {"0": "GPU-test-0"},
     )
-    yaml_text = f"""
-experiment: abort_recheck
-workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json_envelope, objective_name: eval_loss, split: test, policy: test }}
-phases:
-  - name: p
-    n_trials: 16
-    n_jobs: 4
-    gpu_ids: [0]   # only one slot — n_jobs=4 will queue
-    max_consecutive_failures: 1
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
-"""
-    p = tmp_path / "exp.yaml"
-    p.write_text(yaml_text)
-    exp = load_experiment(p)
-
-    from phasesweep.engine.selection import NoFeasibleTrialError
+    exp = make_experiment(
+        experiment="abort_recheck",
+        workdir=tmp_path / "runs",
+        trial_command=f"python {trainer} {{overrides}}",
+        n_trials=16,
+        n_jobs=4,
+        gpu_ids=[0],  # only one slot — n_jobs=4 will queue
+        max_consecutive_failures=1,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": FloatParam(type="float", low=0, high=1)},
+    )
 
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
@@ -910,24 +882,13 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
         has_fcntl=False,
     )
 
-    body = f"""
-experiment: platform_check
-storage: sqlite:///{tmp_path}/platform.db
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path}/runs
-trial_command: "echo {{overrides}}"
-override_format: argparse
-metric:
-  name: x
-  goal: minimize
-  extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-phases:
-  - name: p
-    n_trials: 1
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-"""
-    exp = load_experiment(write_yaml(tmp_path, body))
+    exp = make_experiment(
+        experiment="platform_check",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path}/platform.db",
+        n_trials=1,
+        search_space={"x": IntParam(type="int", low=0, high=1)},
+    )
 
     monkeypatch.setattr(runtime_files, "_supports_posix_runtime_features", lambda: False)
 
@@ -942,25 +903,16 @@ phases:
 @pytest.mark.integration
 def test_max_consecutive_failures_aborts_phase(tmp_path):
     """Trial command always fails -> phase aborts before running n_trials."""
-    body = f"""
-experiment: failtest
-storage: sqlite:///{tmp_path}/fail.db
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path}/runs
-trial_command: "false {{overrides}}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: {{ type: json_envelope, objective_name: loss, split: test, policy: test }}
-phases:
-  - name: a
-    n_trials: 100
-    max_consecutive_failures: 3
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ x: {{ type: float, low: 0, high: 1 }} }}
-"""
-    exp = load_experiment(write_yaml(tmp_path, body))
+    exp = make_experiment(
+        experiment="failtest",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{tmp_path}/fail.db",
+        trial_command="false {overrides}",
+        name="a",
+        n_trials=100,
+        max_consecutive_failures=3,
+        search_space={"x": FloatParam(type="float", low=0, high=1)},
+    )
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(exp)
     # Verify only a small number of trials actually executed before the abort.
@@ -2977,31 +2929,28 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         """,
     )
     storage_url = f"sqlite:///{tmp_path / 'fidelity.db'}"
-    yaml_path = write_yaml(
-        tmp_path,
-        f"""
-        experiment: categorical_fidelity
-        storage: {storage_url}
-        provenance: {{revision: test-fixture-v1}}
-        workdir: {tmp_path / "runs"}
-        trial_command: "python {trainer} {{overrides}}"
-        override_format: argparse
-        metric:
-          name: eval_loss
-          goal: minimize
-          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: pick
-            n_trials: {len(_FIDELITY_CHOICES)}
-            sampler: {{ type: grid, seed: 0 }}
-            search_space:
-              x: {{ type: categorical, choices: [0, 1.5, "one", true] }}
-          - name: child
-            inherits: [pick]
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{}}
-        """,
+    exp = make_experiment(
+        experiment="categorical_fidelity",
+        workdir=tmp_path / "runs",
+        storage=storage_url,
+        trial_command=f"python {trainer} {{overrides}}",
+        phases=[
+            Phase(
+                name="pick",
+                n_trials=len(_FIDELITY_CHOICES),
+                sampler=Sampler(type="grid", seed=0),
+                search_space={
+                    "x": CategoricalParam(type="categorical", choices=list(_FIDELITY_CHOICES))
+                },
+            ),
+            Phase(
+                name="child",
+                inherits=["pick"],
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={},
+            ),
+        ],
     )
 
     # (a) The live value handed to _composed_overrides, i.e. the trainer input.
@@ -3015,7 +2964,6 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
 
     monkeypatch.setattr("phasesweep.engine.phase._suggest", recording_suggest)
 
-    exp = load_experiment(yaml_path)
     winners = run_experiment(exp)
 
     # The grid covered every choice exactly once, each with its declared type.

@@ -13,14 +13,16 @@ import optuna
 import pytest
 import yaml
 
-from phasesweep import __version__, load_experiment, run_experiment
+from phasesweep import __version__, run_experiment
 from phasesweep.config import (
     CategoricalParam,
     ExecutionContext,
     Experiment,
     FloatParam,
     IntParam,
+    JsonEnvelopeExtractor,
     JsonEqualsGate,
+    LogRegexExtractor,
     Metric,
     Phase,
     Sampler,
@@ -89,12 +91,12 @@ from phasesweep.runtime.files import (
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
     assert_published_winner_evidence_local,
+    copy_fake_train,
     drop_artifact_root_binding,
     make_experiment,
     mark_current_format,
     write_constant_trainer,
     write_trainer,
-    write_yaml,
 )
 from tests.ledger_fixtures import tree_snapshot
 
@@ -176,41 +178,35 @@ def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) ->
 @pytest.mark.integration
 def test_fingerprint_mismatch_raises(tmp_path):
     """Changing phase config and re-running should fail, not silently mix results."""
-    from tests.conftest import copy_fake_train
-
     trainer = copy_fake_train(tmp_path)
 
-    db_path = tmp_path / "phases.db"
-    base_yaml = f"""
-experiment: fp_test
-storage: sqlite:///{db_path}
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
-phases:
-  - name: a
-    n_trials: 2
-    allow_partial_grid: true
-    sampler: {{ type: grid }}
-    search_space:
-      n_layers: {{ type: categorical, choices: [4, 8] }}
-"""
-    yaml_path = tmp_path / "exp.yaml"
-    yaml_path.write_text(base_yaml)
-    exp = load_experiment(yaml_path)
-    run_experiment(exp)
+    def experiment(choices: list[int]) -> Experiment:
+        return make_experiment(
+            experiment="fp_test",
+            workdir=tmp_path / "runs",
+            storage=f"sqlite:///{tmp_path / 'phases.db'}",
+            trial_command=f"python {trainer} {{overrides}}",
+            metric=Metric(
+                name="eval_loss",
+                extractor=JsonEnvelopeExtractor(
+                    type="json_envelope",
+                    objective_name="eval_loss",
+                    split="validation",
+                    policy="synthetic",
+                ),
+            ),
+            name="a",
+            n_trials=2,
+            allow_partial_grid=True,
+            sampler=Sampler(type="grid"),
+            search_space={"n_layers": CategoricalParam(type="categorical", choices=choices)},
+        )
+
+    run_experiment(experiment([4, 8]))
 
     # Now change the search space and re-run — should fail.
-    changed_yaml = base_yaml.replace("choices: [4, 8]", "choices: [4, 8, 12]")
-    yaml_path.write_text(changed_yaml)
-    exp2 = load_experiment(yaml_path)
     with pytest.raises(RuntimeError, match="different phase config"):
-        run_experiment(exp2)
+        run_experiment(experiment([4, 8, 12]))
 
 
 def test_persistent_storage_requires_declared_provenance(tmp_path: Path) -> None:
@@ -347,32 +343,23 @@ def test_from_phase_dry_run_placeholder_includes_inherited(tmp_path):
 
     The placeholder must still compose inherited overrides for its descendants.
     """
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, path: r.json, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: arch
-            fixed_overrides:
-              model_family: llama
-            n_trials: 1
-            search_space:
-              n_layers: {{ type: categorical, choices: [4, 8] }}
-          - name: lr
-            inherits: [arch]
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-        """,
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        phases=[
+            Phase(
+                name="arch",
+                fixed_overrides={"model_family": "llama"},
+                n_trials=1,
+                search_space={"n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
+            ),
+            Phase(
+                name="lr",
+                inherits=["arch"],
+                n_trials=1,
+                search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+            ),
+        ],
     )
-    exp = load_experiment(p)
     # No winner files on disk; dry-run from phase 'lr' must synthesize a placeholder
     # for arch that still carries its fixed_overrides.
     winners = run_experiment(exp, from_phase="lr", dry_run=True)
@@ -762,30 +749,24 @@ def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     """End-to-end: run with n_trials=2, then n_trials=4 -> 4 total trials in same study."""
     trainer = write_constant_trainer(tmp_path, key="eval_loss")
     db = tmp_path / "phases.db"
-    yaml_text = f"""
-experiment: topup
-storage: sqlite:///{db}
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} --out {{trial_dir}}/result.json {{overrides}}"
-override_format: argparse
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: log_regex, pattern: 'eval_loss=(?P<value>[0-9.eE+-]+)' }}
-phases:
-  - name: a
-    n_trials: 2
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-"""
-    p = tmp_path / "exp.yaml"
-    p.write_text(yaml_text)
-    run_experiment(load_experiment(p))
+    experiment = make_experiment(
+        experiment="topup",
+        workdir=tmp_path / "runs",
+        storage=f"sqlite:///{db}",
+        trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
+        metric=Metric(
+            name="eval_loss",
+            extractor=LogRegexExtractor(
+                type="log_regex", pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)"
+            ),
+        ),
+        name="a",
+        n_trials=2,
+    )
+    run_experiment(experiment)
 
     # Bump n_trials and re-run; this must not error on fingerprint.
-    p.write_text(yaml_text.replace("n_trials: 2", "n_trials: 4"))
-    run_experiment(load_experiment(p))
+    run_experiment(_with_trial_target(experiment, 4))
 
     study = optuna.load_study(study_name="topup::a", storage=f"sqlite:///{db}")
     finished = [t for t in study.get_trials() if t.state.is_finished()]
