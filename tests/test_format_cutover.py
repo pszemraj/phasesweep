@@ -62,13 +62,7 @@ from tests.recovery_helpers import load_only_recovery_needs
 def _experiment(tmp_path: Path, *, storage: str | None) -> Experiment:
     """Build one real-trial experiment for format-boundary tests."""
     trainer = write_constant_trainer(tmp_path)
-    return make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    return make_experiment(workdir=tmp_path / "runs", storage=storage, trainer=trainer, n_trials=1)
 
 
 @pytest.mark.parametrize("durable_entry", ["generations", "attempts"])
