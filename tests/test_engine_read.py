@@ -26,13 +26,14 @@ from phasesweep.config import (
 )
 from phasesweep.engine import read_status, read_winners
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_path,
     _generation_summary_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
 from tests.conftest import make_experiment, mark_current_format
-from tests.ledger_fixtures import materialize, tree_snapshot
+from tests.ledger_fixtures import ledger_file, materialize, tree_snapshot
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -238,29 +239,28 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     assert cause in warnings[0]
 
 
-def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment, Path]:
-    """Return an experiment whose journal holds a current study, run or only created.
+def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment, Path, Path]:
+    """Return an experiment whose journal holds a current study, published or only created.
 
     :param Path tmp_path: Test-owned directory for the tree and the journal.
-    :param bool published: Run the experiment once, so the journal holds a
-        published trial, instead of only creating and stamping its study.
-    :return tuple[Experiment, Path]: The experiment and its journal file.
+    :param bool published: Read the current-journal golden fixture, whose
+        journal holds published trials, instead of only creating and stamping
+        a study.
+    :return tuple[Experiment, Path, Path]: The experiment, its journal file,
+        and its artifact root, which exists.
     """
-    ledger = tmp_path / "study.journal"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"journal:///{ledger}",
-        n_trials=1,
-        trial_command="echo x=0.5 {overrides}",
-    )
     if published:
-        run_experiment(experiment)
+        materialized = materialize("current-journal", tmp_path, mode="tree")
+        experiment, ledger = materialized.experiment, ledger_file(materialized, "journal")
     else:
+        ledger = tmp_path / "study.journal"
+        experiment = make_experiment(workdir=tmp_path / "runs", storage=f"journal:///{ledger}")
         study = optuna.create_study(
             study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
         )
         mark_current_format(experiment, study)
-    return experiment, ledger
+        _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
+    return experiment, ledger, _experiment_dir(experiment)
 
 
 def _status_phases(experiment: Experiment, status: dict[str, Any]) -> list[dict[str, Any]]:
@@ -286,7 +286,7 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
     """A record Optuna cannot replay, or a bad line another line follows, is refused everywhere."""
     from phasesweep.engine import ProcessCleanupUncertainError, StudyStorageUnavailableError
 
-    experiment, ledger = _journal_experiment(tmp_path, published=published)
+    experiment, ledger, root = _journal_experiment(tmp_path, published=published)
     original = ledger.read_bytes()
     last_record = original.rstrip(b"\n").split(b"\n")[-1] + b"\n"
     tail = {
@@ -295,8 +295,6 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
     }[damage]
     damaged = (original if keep_prefix else b"") + tail
     ledger.write_bytes(damaged)
-    root = tmp_path / "runs" / "t"
-    root.mkdir(parents=True, exist_ok=True)
     before = tree_snapshot(root)
 
     status = read_status(experiment)
@@ -330,7 +328,7 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
     """
     from phasesweep.engine import IncompleteJournalRecordError, ProcessCleanupUncertainError
 
-    experiment, ledger = _journal_experiment(tmp_path, published=published)
+    experiment, ledger, root = _journal_experiment(tmp_path, published=published)
     original = ledger.read_bytes()
     complete = _status_phases(experiment, read_status(experiment))
     tail = {
@@ -340,8 +338,6 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
     }[damage]
     prefix = original if keep_prefix else b""
     ledger.write_bytes(prefix + tail)
-    root = tmp_path / "runs" / "t"
-    root.mkdir(parents=True, exist_ok=True)
     before = tree_snapshot(root)
 
     for phase, undamaged in zip(
