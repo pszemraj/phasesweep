@@ -271,7 +271,8 @@ decides; liveness alone never concludes a run.
 Every operator-facing error declares its remediation, and a wrap preserves it
 instead of replacing it with the wrapper's own advice. A remediation is one
 step unless the operator must do several, every one of them: alternatives
-route the first option alone, and retrying what failed is never a step. A raise
+route the one that keeps the operator's existing work, and retrying what failed
+is never a step. A raise
 that requires several steps is allowlisted in the routing test, so adding one
 is a reviewed decision.
 

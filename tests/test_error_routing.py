@@ -27,11 +27,12 @@ import hashlib
 import importlib
 import pickle
 import pkgutil
+import pwd
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import optuna
 import pytest
@@ -88,7 +89,12 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunStore
 from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
-from phasesweep.runtime.files import PlatformCapabilityError, UnsafePrivatePathError
+from phasesweep.runtime.files import (
+    PlatformCapabilityError,
+    UnsafeLockPathError,
+    UnsafePrivatePathError,
+    lock_dir,
+)
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment
 from tests.ledger_fixtures import Materialized, ledger_file, materialize
@@ -122,7 +128,8 @@ _TWO_STEPS = (OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE)
 # enclosing function, steps in order). Asserted exactly, like the ledger
 # contract's ratchets: a new multi-step raise fails until it is written down
 # here, so a second step is a reviewed decision. Alternatives the operator would
-# choose between never belong here; their raise routes the first option alone.
+# choose between never belong here; their raise routes the one that keeps the
+# operator's existing work.
 _MULTI_STEP_RAISES = frozenset(
     {
         # Either the ledger's attempt id or the tree's identity files may be the
@@ -132,6 +139,20 @@ _MULTI_STEP_RAISES = frozenset(
             "_read_trial_process_identity",
             ("RESTORE_LEDGER", "RESTORE_TREE"),
         ),
+        # With no usable account home, only the override can name a lock
+        # directory, and it never creates one: provision it, then point at it.
+        ("phasesweep/runtime/files.py", "lock_dir", ("RESTORE_TREE", "FIX_CONFIG")),
+    }
+)
+
+# The only places an ``action=`` may be computed rather than written out: each
+# forwards a remediation some raise already declared, so it cannot add a step.
+_ACTION_PASSTHROUGHS = frozenset(
+    {
+        # rewrap hands the cause's steps, or the caller's explicit ones, to the class.
+        ("phasesweep/errors.py", "rewrap"),
+        # A preflight aggregate forwards the steps its refusals all share.
+        ("phasesweep/engine/guards.py", "_preflight_existing_studies"),
     }
 )
 
@@ -941,6 +962,20 @@ def _inspect_uncertain_trial_without_identity_files(
     return _inspect_cleanup_uncertain_trials(study, "p")
 
 
+def _lock_dir_without_account_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve the lock directory for a uid the account database does not know."""
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", _raiser(KeyError("uid")))
+    return lock_dir()
+
+
+def _lock_dir_with_relative_account_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve the lock directory for an account whose home is not absolute."""
+    monkeypatch.delenv("PHASESWEEP_LOCK_DIR", raising=False)
+    monkeypatch.setattr(pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir="relative-home"))
+    return lock_dir()
+
+
 ORIGIN_CASES = (
     OriginCase(
         id="auto_storage_backend_switch",
@@ -991,6 +1026,20 @@ ORIGIN_CASES = (
         action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
         message="Restore the original storage ledger and this attempt's process-identity files",
     ),
+    OriginCase(
+        id="lock_dir_no_account_home",
+        trigger=_lock_dir_without_account_home,
+        raised=UnsafeLockPathError,
+        action=(OperatorAction.RESTORE_TREE, OperatorAction.FIX_CONFIG),
+        message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
+    ),
+    OriginCase(
+        id="lock_dir_relative_account_home",
+        trigger=_lock_dir_with_relative_account_home,
+        raised=UnsafeLockPathError,
+        action=(OperatorAction.RESTORE_TREE, OperatorAction.FIX_CONFIG),
+        message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
+    ),
 )
 
 
@@ -1008,13 +1057,14 @@ def test_origin_raises_route_by_their_message_remedy(
     assert case.message in str(error)
 
 
-class _MultiStepActions(ast.NodeVisitor):
-    """Collect every ``action=`` given as a literal sequence, by enclosing function."""
+class _ActionArguments(ast.NodeVisitor):
+    """Sort every ``action=`` argument into literal step lists and computed values."""
 
     def __init__(self, module: str) -> None:
         self.module = module
         self.scope: list[str] = []
-        self.found: set[tuple[str, str, tuple[str, ...]]] = set()
+        self.multi_step: set[tuple[str, str, tuple[str, ...]]] = set()
+        self.computed: set[tuple[str, str]] = set()
 
     def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         self.scope.append(node.name)
@@ -1024,33 +1074,47 @@ class _MultiStepActions(ast.NodeVisitor):
     visit_AsyncFunctionDef = visit_FunctionDef
 
     def visit_Call(self, node: ast.Call) -> None:
+        scope = self.scope[-1] if self.scope else "<module>"
         for keyword in node.keywords:
-            if keyword.arg == "action" and isinstance(keyword.value, (ast.Tuple, ast.List)):
+            value = keyword.value
+            if keyword.arg != "action" or isinstance(value, (ast.Attribute, ast.Constant)):
+                # One named step, or an unrelated literal such as argparse's.
+                continue
+            if isinstance(value, (ast.Tuple, ast.List)):
                 steps = tuple(
                     element.attr if isinstance(element, ast.Attribute) else ast.unparse(element)
-                    for element in keyword.value.elts
+                    for element in value.elts
                 )
-                scope = self.scope[-1] if self.scope else "<module>"
-                self.found.add((self.module, scope, steps))
+                self.multi_step.add((self.module, scope, steps))
+            else:
+                self.computed.add((self.module, scope))
         self.generic_visit(node)
 
 
 def test_multi_step_remediations_are_deliberate() -> None:
     """Only allowlisted raises require several steps, each a distinct real action."""
     src = Path(__file__).resolve().parent.parent / "src"
-    found: set[tuple[str, str, tuple[str, ...]]] = set()
+    multi_step: set[tuple[str, str, tuple[str, ...]]] = set()
+    computed: set[tuple[str, str]] = set()
     for path in sorted((src / "phasesweep").rglob("*.py")):
-        visitor = _MultiStepActions(path.relative_to(src).as_posix())
+        visitor = _ActionArguments(path.relative_to(src).as_posix())
         visitor.visit(ast.parse(path.read_text(), filename=str(path)))
-        found |= visitor.found
+        multi_step |= visitor.multi_step
+        computed |= visitor.computed
 
-    assert found == _MULTI_STEP_RAISES, (
+    assert multi_step == _MULTI_STEP_RAISES, (
         "a raise now requires several remedy steps; if the operator must do every one, "
         "add it to _MULTI_STEP_RAISES with the reason, and if they are alternatives, "
-        f"route the first alone. Unlisted: {sorted(found - _MULTI_STEP_RAISES)}; "
-        f"stale: {sorted(_MULTI_STEP_RAISES - found)}"
+        "route the one that keeps the operator's existing work. "
+        f"Unlisted: {sorted(multi_step - _MULTI_STEP_RAISES)}; "
+        f"stale: {sorted(_MULTI_STEP_RAISES - multi_step)}"
     )
-    for _module, _function, steps in found:
+    # A computed action would hide its steps from the allowlist above, so only
+    # the forwarding sites may compute one; a raise writes its steps out.
+    assert computed == _ACTION_PASSTHROUGHS, (
+        f"write each raise's steps out literally. Computed at: {sorted(computed)}"
+    )
+    for _module, _function, steps in multi_step:
         assert len(steps) >= 2, f"a single step is spelled as one action, not {steps}"
         assert len(set(steps)) == len(steps), f"repeated step in {steps}"
         assert set(steps) <= set(OperatorAction.__members__), f"unknown step in {steps}"

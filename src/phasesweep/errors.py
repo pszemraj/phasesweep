@@ -57,8 +57,9 @@ class PhaseSweepError(RuntimeError):
     attribute only: it never changes the message text an operator reads. It
     holds one :class:`OperatorAction` unless the operator must do several
     things, every one of them, in the order listed. A message that offers
-    alternatives ("restore the setting, or start fresh") routes its first
-    option alone, and retrying what failed is implied, never listed. A raise
+    alternatives ("restore the setting, or start fresh") routes the one that
+    keeps the operator's existing work, and retrying what failed is implied,
+    never listed. A raise
     that lists several steps must appear in ``tests/test_error_routing.py``'s
     allowlist, so a second step is always a reviewed decision.
     """
