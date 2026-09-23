@@ -250,7 +250,9 @@ def _register_active_attempt(
             "consumed. This entry is the only durable record that would let a later "
             "run discover this attempt after a phase rename/removal or a storage-URL "
             "change, so PhaseSweep refuses to launch a trainer it could not account "
-            "for. Restore write access to the experiment workdir, then run again."
+            "for. Restore write access to the experiment workdir, then run again. With "
+            "persistent storage this refusal durably aborts the phase, so that run also "
+            "needs n_trials raised above its accepted target, or a new experiment name."
         ) from exc
 
 

@@ -326,12 +326,15 @@ is never a step. A raise
 that requires several steps is allowlisted in the routing test, so adding one
 is a reviewed decision. `recover-run` never routes a refusal back to itself
 except to a confirmed run, so `RunRecoveryError` defaults to reading the logs.
+An MCP run's failure payload takes its next steps only from the actions, one
+phrase per step, so no error type gives the agent advice of its own.
 
 **Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.actions`,
-`errors.PhaseSweepError.rewrap`\
+`errors.PhaseSweepError.rewrap`, `mcp.runner._OPERATOR_STEPS`\
 **Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`,
 `tests/test_error_routing.py::test_operator_action_survives_wrap`,
 `tests/test_error_routing.py::test_origin_raises_route_by_their_message_remedy`,
+`tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`,
 `tests/test_error_routing.py::test_multi_step_remediations_are_deliberate`,
 `tests/test_mcp_runner.py::test_cleanup_uncertain_remediation_follows_the_operator_action`
 

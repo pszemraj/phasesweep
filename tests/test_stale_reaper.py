@@ -1992,6 +1992,9 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     else:
         assert "allocated lifecycle marker" in message
     assert "No trainer was started" in message
+    # The refusal routes only the workdir repair; its message says when the
+    # durable abort also needs a higher target, as the rerun below shows.
+    assert "n_trials raised above its accepted target" in message
     # Nothing was launched: no marker, and no durable process identity.
     assert not launched.exists()
     phase_dir = tmp_path / "runs" / "unregistrable" / "p"

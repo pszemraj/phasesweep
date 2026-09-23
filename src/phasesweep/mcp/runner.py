@@ -21,7 +21,7 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, TypeAlias
 
@@ -40,6 +40,7 @@ from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
     OperatorAction,
+    PhaseSweepError,
     PublishedStudyMissingError,
     SamplerContinuationUnsupportedError,
     StudyContextConflictError,
@@ -109,30 +110,149 @@ class FailurePayload(FailureCausePayload):
     cause: FailureCausePayload | None = None
 
 
-# What a cleanup-uncertain failure asks the operator to repair before
-# recover-run, one phrase per repairing action the raise site requires.
-_CLEANUP_REPAIRS: dict[OperatorAction, str] = {
+# What each routed step asks of the operator, completing "Ask the operator
+# to ...". This is the only source of an operational failure's next steps:
+# the specifics (which setting, file, or release) stay in the error's
+# message. A failure payload carries no message, so the tree repair states
+# the safety condition a registry-entry refusal gives in its message. A retry
+# has no phrase: it is implied after any operator step, and is the agent's to
+# make when it is the only step.
+_OPERATOR_STEPS: dict[OperatorAction, str] = {
+    OperatorAction.USE_PRIOR_RELEASE: (
+        "operate the existing state with the preserved PhaseSweep release that wrote it"
+    ),
+    OperatorAction.FRESH_NAMESPACE: (
+        "use a new experiment name, or a fresh artifact root and local storage"
+    ),
     OperatorAction.RESTORE_LEDGER: "restore the original complete storage ledger and access to it",
-    OperatorAction.RESTORE_TREE: "repair the experiment tree's files and permissions",
+    OperatorAction.RESTORE_TREE: (
+        "repair the experiment tree's files and permissions, deleting a file only if "
+        "certain nothing is running"
+    ),
+    OperatorAction.RUN_RECOVER_RUN: "run phasesweep mcp recover-run",
+    OperatorAction.FIX_CONFIG: "correct the experiment configuration or the environment it runs in",
+    OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log and the logs its error points to",
 }
+# The other steps' specifics are in the error's message, which the run log holds.
+_SELF_CONTAINED_STEPS = frozenset({OperatorAction.RUN_RECOVER_RUN, OperatorAction.INSPECT_LOGS})
+_RUN_LOG_DETAILS = "The error in the PhaseSweep run log gives the details."
+_RETRY_REMEDIATION = (
+    "Wait briefly, then start a new run; another process currently holds this experiment."
+)
+
+
+def _operator_remediation(steps: Sequence[OperatorAction], *, before: str = "") -> str:
+    """Compose operator steps into one remediation, in the order they must happen.
+
+    :param Sequence[OperatorAction] steps: Non-empty operator steps, none of them ``RETRY``.
+    :param str before: Clause naming what every step must precede, if any.
+    :return str: The remediation, pointing at the run log when a step needs
+        the error's details.
+    """
+    phrases = [_OPERATOR_STEPS[step] for step in steps]
+    joined = phrases[0]
+    if len(phrases) > 1:
+        joined = f"{', and '.join(phrases[:-1])}, then {phrases[-1]}"
+    remediation = f"Ask the operator to {joined}{before}."
+    if not _SELF_CONTAINED_STEPS.issuperset(steps):
+        remediation = f"{remediation} {_RUN_LOG_DETAILS}"
+    return remediation
+
+
+def _routed_next_steps(actions: tuple[OperatorAction, ...]) -> dict[str, object]:
+    """Return the retryability, actor, and remediation a raise's routed steps call for.
+
+    :param tuple[OperatorAction, ...] actions: Steps the raise routes, in order.
+    :return dict[str, object]: ``retryable``, ``actor``, and ``remediation``
+        payload fields: the agent's retry when retrying is the only step, and
+        otherwise the operator's steps.
+    """
+    steps = [action for action in actions if action is not OperatorAction.RETRY]
+    if not steps:
+        return {"retryable": True, "actor": "agent", "remediation": _RETRY_REMEDIATION}
+    return {"retryable": False, "actor": "operator", "remediation": _operator_remediation(steps)}
 
 
 def _cleanup_uncertain_payload(actions: tuple[OperatorAction, ...]) -> dict[str, object]:
     """Return the cleanup-uncertain failure whose repairs come before recover-run.
 
+    The server launches nothing more for a run with unconfirmed cleanup until
+    recover-run confirms it, so recover-run is how such a run is retried: the
+    implied last step after whatever repairs the refusal routes.
+
     :param tuple[OperatorAction, ...] actions: Steps the cleanup refusal routes, in order.
     :return dict[str, object]: The ``"cleanup_uncertain"`` payload.
     """
-    repairs = [_CLEANUP_REPAIRS[action] for action in actions if action in _CLEANUP_REPAIRS]
-    first = f"{', and '.join(repairs)}, then " if repairs else ""
+    last = OperatorAction.RUN_RECOVER_RUN
+    repairs = [action for action in actions if action not in (OperatorAction.RETRY, last)]
     return {
         "code": "cleanup_uncertain",
         "stage": "cleanup",
         "retryable": False,
         "actor": "operator",
-        "remediation": (
-            f"Ask the operator to {first}run phasesweep mcp recover-run before another launch."
-        ),
+        "remediation": _operator_remediation([*repairs, last], before=" before another launch"),
+    }
+
+
+# The durable failure code for each operational error type, checked in order:
+# the first type the error is an instance of names it. A code is the status
+# schema's category, not advice; the next steps come from the error's actions.
+_FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
+    (ProcessCleanupUncertainError, "cleanup_uncertain"),
+    (ExperimentLockBusyError, "experiment_busy"),
+    # Not a fingerprint problem: the study is healthy but is not provably
+    # this workdir's, so it keeps a category of its own.
+    (ArtifactRootConflictError, "artifact_root_conflict"),
+    (StudyFingerprintMismatchError, "fingerprint_mismatch"),
+    (StudyContextConflictError, "fingerprint_mismatch"),
+    (StudySchemaMismatchError, "study_schema_mismatch"),
+    (PublishedStudyMissingError, "published_study_missing"),
+    (StudyStorageUnavailableError, "storage_unavailable"),
+    # An unwritable workdir still fits the storage category.
+    (ActiveAttemptPersistenceError, "storage_unavailable"),
+    (SamplerContinuationUnsupportedError, "sampler_continuation_unsupported"),
+    (TrialTargetRegressionError, "trial_target_regression"),
+    (NoFeasibleTrialError, "trainer_failed"),
+)
+# Categories that only occur at one stage, whatever stage the caller reports.
+_FIXED_STAGES: dict[FailureCode, FailureStage] = {
+    "experiment_busy": "preflight",
+    "published_study_missing": "preflight",
+}
+
+
+def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, object]:
+    """Map an exception that carries no operator actions to its fixed failure.
+
+    :param BaseException error: Exception that is not a :class:`PhaseSweepError`.
+    :param str stage: Stage the failure occurred at.
+    :return dict[str, object]: A ``"timeout"`` or ``"cancelled"`` payload, or
+        ``"internal_error"`` for any other exception.
+    """
+    if isinstance(error, TimeoutError):
+        return {
+            "code": "timeout",
+            "stage": stage,
+            "retryable": False,
+            "actor": "operator",
+            "remediation": (
+                "Ask the operator to review the configured wallclock budget before retrying."
+            ),
+        }
+    if isinstance(error, PhaseSweepShutdown):
+        return {
+            "code": "cancelled",
+            "stage": stage,
+            "retryable": True,
+            "actor": "agent",
+            "remediation": "Start a new run only if the user still wants the sweep to continue.",
+        }
+    return {
+        "code": "internal_error",
+        "stage": stage,
+        "retryable": False,
+        "actor": "operator",
+        "remediation": "Ask the operator to inspect the PhaseSweep run log before retrying.",
     }
 
 
@@ -142,6 +262,11 @@ def _base_failure_payload(
     stage: str | None,
 ) -> dict[str, object]:
     """Map an operator-facing exception to one stable, path-free agent failure.
+
+    The error's type selects ``code`` and ``stage``. For a
+    :class:`PhaseSweepError`, ``retryable``, ``actor``, and ``remediation``
+    come only from the steps its raise routes; an exception without routed
+    steps keeps its type's fixed text.
 
     :param BaseException error: Exception whose type selects the failure code.
     :param str | None stage: Failure stage to report for most error types;
@@ -155,154 +280,23 @@ def _base_failure_payload(
         ``actor``, and ``remediation`` keys; falls back to ``"internal_error"``
         for any exception type not otherwise recognized.
     """
-    failure_stage = stage if stage in {"preflight", "execution", "cleanup"} else "execution"
-    if isinstance(error, ExperimentLockBusyError):
-        return {
-            "code": "experiment_busy",
-            "stage": "preflight",
-            "retryable": True,
-            "actor": "agent",
-            "remediation": (
-                "Wait briefly, then start a new run; another orchestrator currently owns "
-                "this experiment's consistency lock."
-            ),
-        }
-    if isinstance(error, ArtifactRootConflictError):
-        # Not a fingerprint problem: the study is healthy but is not provably
-        # this workdir's, and the fingerprint remediation (new experiment name
-        # / archive the study) would destroy the binding's value.
-        return {
-            "code": "artifact_root_conflict",
-            "stage": failure_stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Ask the operator to run this experiment from the workdir that owns its "
-                "artifact tree, or use a fresh artifact root and local storage."
-            ),
-        }
-    if isinstance(error, (StudyFingerprintMismatchError, StudyContextConflictError)):
-        return {
-            "code": "fingerprint_mismatch",
-            "stage": failure_stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Use a new experiment name, or ask the operator to archive the "
-                "incompatible persistent study before retrying."
-            ),
-        }
-    if isinstance(error, StudySchemaMismatchError):
-        return {
-            "code": "study_schema_mismatch",
-            "stage": failure_stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Use a new experiment name, or ask the operator to archive the "
-                "unsupported persistent study before retrying."
-            ),
-        }
-    if isinstance(error, PublishedStudyMissingError):
-        return {
-            "code": "published_study_missing",
-            "stage": "preflight",
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Restore the original complete storage ledger and study, or use a new "
-                "experiment identity for a fresh run."
-            ),
-        }
-    if isinstance(error, StudyStorageUnavailableError):
-        return {
-            "code": "storage_unavailable",
-            "stage": failure_stage,
-            "retryable": True,
-            "actor": "operator",
-            "remediation": (
-                "Ask the operator to restore the configured study storage, then start a new run."
-            ),
-        }
-    if isinstance(error, ActiveAttemptPersistenceError):
-        # The unavailable workdir still fits the storage category, but this
-        # pre-launch refusal is recorded as a terminal fatal trial and durable
-        # phase abort at the accepted target. MCP experiments use persistent
-        # storage, so restoring write access does not make the unchanged config
-        # retryable: recovery must explicitly schedule a higher supported
-        # target or start a new experiment. Nothing was launched, so there is
-        # no process cleanup step (PR #5 re-review, P1).
-        return {
-            "code": "storage_unavailable",
-            "stage": failure_stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Ask the operator to restore write access to the experiment workdir, then "
-                "increase the affected phase's n_trials above the failed run's accepted "
-                "target when sampler continuation is supported, or use a new experiment "
-                "name, before starting another run."
-            ),
-        }
-    if isinstance(error, SamplerContinuationUnsupportedError):
-        return {
-            "code": "sampler_continuation_unsupported",
-            "stage": failure_stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Use a new experiment name for this TPE/CMA-ES extension, or run the "
-                "full target in one invocation."
-            ),
-        }
-    if isinstance(error, TrialTargetRegressionError):
-        return {
-            "code": "trial_target_regression",
-            "stage": failure_stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Restore the study's prior trial target, or use a new experiment name."
-            ),
-        }
-    if isinstance(error, ProcessCleanupUncertainError):
+    failure_stage = (
+        stage if stage is not None and stage in {"preflight", "cleanup"} else "execution"
+    )
+    if not isinstance(error, PhaseSweepError):
+        return _unrouted_failure_payload(error, stage=failure_stage)
+    code: FailureCode = next(
+        (code for error_type, code in _FAILURE_CODES if isinstance(error, error_type)),
+        "internal_error",
+    )
+    if code == "cleanup_uncertain":
         # What must come back before recover-run is the raise site's decision,
         # carried as its actions; the chained cause is history.
         return _cleanup_uncertain_payload(error.actions)
-    if isinstance(error, NoFeasibleTrialError):
-        return {
-            "code": "trainer_failed",
-            "stage": failure_stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Ask the operator to inspect trainer and evidence logs before starting a new run."
-            ),
-        }
-    if isinstance(error, TimeoutError):
-        return {
-            "code": "timeout",
-            "stage": failure_stage,
-            "retryable": False,
-            "actor": "operator",
-            "remediation": (
-                "Ask the operator to review the configured wallclock budget before retrying."
-            ),
-        }
-    if isinstance(error, PhaseSweepShutdown):
-        return {
-            "code": "cancelled",
-            "stage": failure_stage,
-            "retryable": True,
-            "actor": "agent",
-            "remediation": "Start a new run only if the user still wants the sweep to continue.",
-        }
     return {
-        "code": "internal_error",
-        "stage": failure_stage,
-        "retryable": False,
-        "actor": "operator",
-        "remediation": "Ask the operator to inspect the PhaseSweep run log before retrying.",
+        "code": code,
+        "stage": _FIXED_STAGES.get(code, failure_stage),
+        **_routed_next_steps(error.actions),
     }
 
 

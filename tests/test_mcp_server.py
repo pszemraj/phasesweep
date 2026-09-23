@@ -3256,7 +3256,9 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     assert terminal["result_snapshot_state"] == "complete"
     assert terminal["failure"]["code"] == "study_schema_mismatch"
     assert terminal["failure"]["retryable"] is False
-    assert "unsupported persistent study" in terminal["failure"]["remediation"]
+    # Pre-cutover state routes to the release that wrote it, which keeps the
+    # study, rather than to archiving it for a fresh one.
+    assert "preserved PhaseSweep release" in terminal["failure"]["remediation"]
 
 
 @pytest.mark.integration
@@ -3447,7 +3449,8 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     assert status["failure"]["code"] == "cleanup_uncertain"
     assert status["failure"]["remediation"] == (
         "Ask the operator to restore the original complete storage ledger and access to it, "
-        "then run phasesweep mcp recover-run before another launch."
+        "then run phasesweep mcp recover-run before another launch. The error in the "
+        "PhaseSweep run log gives the details."
     )
 
 

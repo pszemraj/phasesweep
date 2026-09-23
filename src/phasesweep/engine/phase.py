@@ -827,7 +827,9 @@ def _run_phase(
                 f"Could not persist the allocated lifecycle marker for trial "
                 f"{trial.number} (attempt {attempt_id}) at {trial_dir}: {exc}. "
                 "No trainer was started and no GPU lease was consumed. Restore "
-                "write access to the experiment workdir, then run again."
+                "write access to the experiment workdir, then run again. With persistent "
+                "storage this refusal durably aborts the phase, so that run also needs "
+                "n_trials raised above its accepted target, or a new experiment name."
             ) from exc
         # Experiment-level registration is what keeps this attempt visible to
         # recovery even if the phase is later renamed/removed or the storage

@@ -15,8 +15,10 @@ The wrap table near the end carries the same contract across layer boundaries: a
 remediation survives each translation unless the site deliberately composes or
 replaces it, and every such site is driven for real rather than in isolation.
 The origin table after it holds raises whose message names its own remedy to the
-action that routes it. The last test keeps multi-step remediations rare: every
-raise that requires more than one step must be on an explicit allowlist.
+action that routes it. The MCP runner's failure payload, where routing reaches
+an agent, must then say exactly the steps a raise routes. The last test keeps
+multi-step remediations rare: every raise that requires more than one step must
+be on an explicit allowlist.
 """
 
 from __future__ import annotations
@@ -94,6 +96,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.wandb import require_wandb_sdk
+from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _cleanup_runner,
@@ -1945,6 +1948,92 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
         trigger(tmp_path, monkeypatch)
     assert type(excinfo.value) is defect
     assert not isinstance(excinfo.value, PhaseSweepError)
+
+
+# The MCP runner is where routing reaches an agent: a run's failure payload
+# says what to do next, and may say only what the raise routes. Each marker
+# belongs to one step's text alone, so a payload that names a step the raise
+# did not route fails as surely as one that omits a step.
+_STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
+    {
+        OperatorAction.USE_PRIOR_RELEASE: "preserved PhaseSweep release",
+        OperatorAction.FRESH_NAMESPACE: "new experiment name",
+        OperatorAction.RESTORE_LEDGER: "storage ledger",
+        OperatorAction.RESTORE_TREE: "repair the experiment tree",
+        OperatorAction.RUN_RECOVER_RUN: "recover-run",
+        OperatorAction.FIX_CONFIG: "correct the experiment configuration",
+        OperatorAction.INSPECT_LOGS: "inspect the PhaseSweep run log",
+    }
+)
+
+
+def _assert_payload_follows(error: PhaseSweepError) -> None:
+    """Assert the runner's failure payload for ``error`` says exactly what it routes."""
+    failure = mcp_runner._safe_failure_payload(error, stage="preflight")
+    remediation = failure["remediation"]
+    steps = [action for action in error.actions if action is not OperatorAction.RETRY]
+    if failure["code"] == "cleanup_uncertain":
+        # The server launches nothing more for such a run until recover-run
+        # confirms it, so recover-run is how it is retried.
+        last = OperatorAction.RUN_RECOVER_RUN
+        steps = [*(step for step in steps if step is not last), last]
+    if steps:
+        assert (failure["retryable"], failure["actor"]) == (False, "operator")
+    else:
+        assert (failure["retryable"], failure["actor"]) == (True, "agent")
+    positions = [remediation.find(_STEP_MARKERS[step]) for step in steps]
+    assert -1 not in positions, remediation
+    assert positions == sorted(positions), remediation
+    unrouted = [marker for action, marker in _STEP_MARKERS.items() if action not in steps]
+    assert not [marker for marker in unrouted if marker in remediation], remediation
+    if OperatorAction.RESTORE_TREE in steps:
+        # The payload carries no message, so it keeps the safety condition.
+        assert "only if certain nothing is running" in remediation
+
+
+def test_runner_payload_follows_every_class_default() -> None:
+    for cls in _operator_error_classes():
+        _assert_payload_follows(cls("boom", *_CONSTRUCTOR_ARGS.get(cls.__name__, ())))
+
+
+_ROUTING_CASES: Mapping[str, WrapCase | OriginCase] = MappingProxyType(
+    {case.id: case for case in (*ORIGIN_CASES, *WRAP_CASES)}
+)
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        # Every action, alone and in order, across the failure codes; the
+        # subclass rows route other than the type their code is keyed by.
+        "preflight_same_type_aggregate",
+        "recover_run_pre_cutover_state",
+        "sqlite_garbage",
+        "journal_final_record_incomplete",
+        "recovery_studies_storage_bound",
+        "recover_config_snapshot_missing",
+        "registry_entry_unparseable",
+        "sqlite_transaction_interrupted",
+        "run_failure_cleanup_replaces",
+        "environment_cohort_changed",
+        "auto_storage_backend_switch",
+        "lock_dir_override_relative",
+        "prior_phase_abort",
+        "wandb_sdk_missing",
+        "claim_ledger_tree_changed",
+        "claim_ledger_discovery_preserves_override",
+        "preflight_same_type_aggregate_disagreeing",
+        "recover_boot_id_unavailable",
+        "running_trial_lifecycle_mismatch",
+        "preflight_cleanup_aggregate_repairs",
+    ],
+)
+def test_runner_payload_follows_the_routed_steps(
+    row: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with pytest.raises(PhaseSweepError) as excinfo:
+        _ROUTING_CASES[row].trigger(tmp_path, monkeypatch)
+    _assert_payload_follows(excinfo.value)
 
 
 class _ActionArguments(ast.NodeVisitor):

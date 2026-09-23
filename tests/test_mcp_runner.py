@@ -387,8 +387,12 @@ def test_continuation_preflight_failures_have_actionable_mcp_categories(
     assert failure["actor"] == "operator"
 
 
-def test_attempt_registry_failure_requires_an_explicit_recovery_target() -> None:
-    """Restoring the workdir alone cannot clear the persisted phase abort."""
+def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
+    """The payload names the tree repair and leaves the phase-abort detail to the message.
+
+    Only persistent storage keeps the abort this refusal records, so raising
+    n_trials is not a step every such raise requires; the message says when.
+    """
     failure = mcp_runner._safe_failure_payload(
         ActiveAttemptPersistenceError("attempt registry is unwritable"),
         stage="execution",
@@ -397,9 +401,11 @@ def test_attempt_registry_failure_requires_an_explicit_recovery_target() -> None
     assert failure["code"] == "storage_unavailable"
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
-    assert "restore write access" in failure["remediation"]
-    assert "increase the affected phase's n_trials" in failure["remediation"]
-    assert "new experiment name" in failure["remediation"]
+    assert failure["remediation"] == (
+        "Ask the operator to repair the experiment tree's files and permissions, deleting a "
+        "file only if certain nothing is running. The error in the PhaseSweep run log gives "
+        "the details."
+    )
 
 
 @pytest.mark.integration
@@ -455,8 +461,8 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         "retryable": False,
         "actor": "operator",
         "remediation": (
-            "Restore the original complete storage ledger and study, or use a new "
-            "experiment identity for a fresh run."
+            "Ask the operator to restore the original complete storage ledger and access to "
+            "it. The error in the PhaseSweep run log gives the details."
         ),
     }
     assert status["generation_unavailable_reason"] == "engine_generation_not_claimed"
@@ -595,7 +601,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         assert status["failure"]["retryable"] is False
         assert status["failure"]["cause"]["code"] == "storage_unavailable"
         assert status["failure"]["cause"]["stage"] == "preflight"
-        assert status["failure"]["cause"]["retryable"] is True
+        # The cause routes a ledger restore, which only the operator can do.
+        assert status["failure"]["cause"]["retryable"] is False
         assert "restore the original complete storage ledger" in status["failure"]["remediation"]
         assert "then run phasesweep mcp recover-run" in status["failure"]["remediation"]
         assert app.status(run_id=run_id)["run"]["failure"] == status["failure"]
@@ -1586,19 +1593,22 @@ def test_cleanup_uncertainty_outer_failure_controls_a_cancelled_cause() -> None:
     assert failure["cause"]["retryable"] is True
 
 
+_RUN_LOG_DETAILS = " The error in the PhaseSweep run log gives the details."
 _RESTORE_LEDGER_FIRST = (
     "Ask the operator to restore the original complete storage ledger and access to it, "
-    "then run phasesweep mcp recover-run before another launch."
+    "then run phasesweep mcp recover-run before another launch." + _RUN_LOG_DETAILS
 )
 _RECOVER_RUN_ONLY = "Ask the operator to run phasesweep mcp recover-run before another launch."
 _RESTORE_TREE_FIRST = (
-    "Ask the operator to repair the experiment tree's files and permissions, "
-    "then run phasesweep mcp recover-run before another launch."
+    "Ask the operator to repair the experiment tree's files and permissions, deleting a "
+    "file only if certain nothing is running, then run phasesweep mcp recover-run before "
+    "another launch." + _RUN_LOG_DETAILS
 )
 _RESTORE_BOTH_FIRST = (
     "Ask the operator to restore the original complete storage ledger and access to it, "
-    "and repair the experiment tree's files and permissions, then run phasesweep mcp "
-    "recover-run before another launch."
+    "and repair the experiment tree's files and permissions, deleting a file only if "
+    "certain nothing is running, then run phasesweep mcp recover-run before another "
+    "launch." + _RUN_LOG_DETAILS
 )
 
 
