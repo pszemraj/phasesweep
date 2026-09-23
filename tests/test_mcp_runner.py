@@ -1587,12 +1587,12 @@ _RESTORE_LEDGER_FIRST = (
 )
 _RECOVER_RUN_ONLY = "Ask the operator to run phasesweep mcp recover-run before another launch."
 _RESTORE_TREE_FIRST = (
-    "Ask the operator to restore the experiment tree's original files and permissions, "
+    "Ask the operator to repair the experiment tree's files and permissions, "
     "then run phasesweep mcp recover-run before another launch."
 )
 _RESTORE_BOTH_FIRST = (
     "Ask the operator to restore the original complete storage ledger and access to it, "
-    "plus the experiment tree's original files and permissions, then run phasesweep mcp "
+    "and repair the experiment tree's files and permissions, then run phasesweep mcp "
     "recover-run before another launch."
 )
 

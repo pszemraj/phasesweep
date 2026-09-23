@@ -109,11 +109,11 @@ class FailurePayload(FailureCausePayload):
     cause: FailureCausePayload | None = None
 
 
-# What a cleanup-uncertain failure asks the operator to restore before
-# recover-run, one phrase per restoring action the raise site requires.
-_CLEANUP_RESTORES: dict[OperatorAction, str] = {
-    OperatorAction.RESTORE_LEDGER: "the original complete storage ledger and access to it",
-    OperatorAction.RESTORE_TREE: "the experiment tree's original files and permissions",
+# What a cleanup-uncertain failure asks the operator to repair before
+# recover-run, one phrase per repairing action the raise site requires.
+_CLEANUP_REPAIRS: dict[OperatorAction, str] = {
+    OperatorAction.RESTORE_LEDGER: "restore the original complete storage ledger and access to it",
+    OperatorAction.RESTORE_TREE: "repair the experiment tree's files and permissions",
 }
 
 
@@ -249,18 +249,17 @@ def _base_failure_payload(
     if isinstance(error, ProcessCleanupUncertainError):
         # What must come back before recover-run is the raise site's decision,
         # carried as its actions; the chained cause is history.
-        restores = [
-            _CLEANUP_RESTORES[action] for action in error.actions if action in _CLEANUP_RESTORES
+        repairs = [
+            _CLEANUP_REPAIRS[action] for action in error.actions if action in _CLEANUP_REPAIRS
         ]
-        restore = f"restore {', plus '.join(restores)}, then " if restores else ""
+        first = f"{', and '.join(repairs)}, then " if repairs else ""
         return {
             "code": "cleanup_uncertain",
             "stage": "cleanup",
             "retryable": False,
             "actor": "operator",
             "remediation": (
-                f"Ask the operator to {restore}run phasesweep mcp recover-run before another "
-                "launch."
+                f"Ask the operator to {first}run phasesweep mcp recover-run before another launch."
             ),
         }
     if isinstance(error, NoFeasibleTrialError):
