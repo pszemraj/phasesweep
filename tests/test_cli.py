@@ -53,6 +53,7 @@ from tests.conftest import (
     write_trainer,
     write_yaml,
 )
+from tests.ledger_fixtures import materialize
 from tests.recovery_helpers import recover_run_cli
 
 
@@ -402,27 +403,9 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
 
 def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
     """Mutable compatibility files must not outrank immutable generation results."""
-    config_path = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo x=0.5 {{overrides}}"
-        override_format: argparse
-        metric:
-          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{}}
-        """,
-    )
-    experiment = load_experiment(config_path)
-    run_experiment(experiment)
-    compatibility = _winner_path(experiment, "p")
-    compatibility.parent.mkdir(parents=True, exist_ok=True)
-    compatibility.write_text("trial_number: 99\n")
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    experiment, config_path = materialized.experiment, materialized.config_path
+    _winner_path(experiment, "p").write_text("trial_number: 99\n")
     _generation_path(experiment).write_text("generation_id: interrupted\n")
 
     published = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
@@ -439,35 +422,11 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
     assert "trial_number: 99" not in unpublished.output
 
 
-@pytest.mark.integration
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
     """Winner-only CLI reads enforce the artifact tree's reverse ownership."""
-    trainer = write_trainer(tmp_path / "trainer.py", 'print("x=1.0")')
-    owner_config = write_yaml(
-        tmp_path,
-        f"""
-        experiment: winner_owner
-        workdir: {tmp_path}/runs
-        storage: sqlite:///{tmp_path}/owner.db
-        provenance: {{revision: test-fixture-v1}}
-        trial_command: "python {trainer} {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)'}}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{type: random, seed: 0}}
-            search_space: {{}}
-        """,
-    )
-    owner = load_experiment(owner_config)
-    run_experiment(owner)
-
+    owner_config = materialize("current-sqlite", tmp_path, mode="tree").config_path
     foreign_config = tmp_path / "foreign.yaml"
-    foreign_config.write_text(owner_config.read_text().replace("owner.db", "foreign.db"))
+    foreign_config.write_text(owner_config.read_text().replace("study.db", "foreign.db"))
     result = CliRunner().invoke(cli_main, ["show-winners", str(foreign_config)])
 
     assert result.exit_code == 1
@@ -641,48 +600,12 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
     assert "new hypothesis" not in result.output
 
 
-def _published_experiment_config(tmp_path: Path) -> Path:
-    """Write and run a one-phase experiment so its workdir holds a real publication.
-
-    :param Path tmp_path: Per-test temporary directory.
-    :return Path: Config path whose experiment has published exactly one generation.
-    """
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        "import argparse\n"
-        "parser = argparse.ArgumentParser()\n"
-        'parser.add_argument("--out")\n'
-        'parser.add_argument("--x", type=int, default=0)\n'
-        "args, _ = parser.parse_known_args()\n"
-        'print(f"x={args.x}")\n',
-    )
-    return write_yaml(
-        tmp_path,
-        f"""
-        experiment: integrity_cli
-        workdir: {tmp_path}/runs
-        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-        """,
-    )
-
-
-def _corrupt_the_publication(config_path: Path) -> str:
+def _corrupt_the_publication(experiment: Experiment) -> str:
     """Edit a published winner artifact so its generation manifest stops validating.
 
-    :param Path config_path: Config whose published generation should be corrupted.
+    :param Experiment experiment: Experiment whose published generation should be corrupted.
     :return str: The corrupted generation id.
     """
-    experiment = load_experiment(config_path)
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
     winner_path = _generation_winner_path(experiment, generation_id, "p")
@@ -703,9 +626,9 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     likewise not answer "no winner yet" over it. Both commands are read-only,
     so they share one corrupted tree.
     """
-    config_path = _published_experiment_config(tmp_path)
-    run_experiment(load_experiment(config_path))
-    generation_id = _corrupt_the_publication(config_path)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    config_path = materialized.config_path
+    generation_id = _corrupt_the_publication(materialized.experiment)
 
     exit_code = invoke_cli_boundary(["status", str(config_path)], monkeypatch)
 
@@ -739,9 +662,8 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The claim-time provenance files feed the same reporting as any winner."""
-    config_path = _published_experiment_config(tmp_path)
-    run_experiment(load_experiment(config_path))
-    experiment = load_experiment(config_path)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
     record = _generation_dir(experiment, generation_id) / "reproducibility.json"
@@ -772,9 +694,8 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     fails closed -- nothing unvalidatable may read as published -- but the
     reason names the permission denial and the user who can validate it.
     """
-    config_path = _published_experiment_config(tmp_path)
-    run_experiment(load_experiment(config_path))
-    experiment = load_experiment(config_path)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
     snapshot = _generation_dir(experiment, generation_id) / "config.snapshot.yaml"
@@ -803,15 +724,17 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A healthy publication and a never-published tree both stay exit 0."""
-    config_path = _published_experiment_config(tmp_path)
+    fresh_config = tmp_path / "fresh.yaml"
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    fresh_config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
 
-    assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 0
     fresh = capsys.readouterr()
     assert yaml.safe_load(fresh.out)["publication_integrity"] == "absent"
-    assert invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 0
     capsys.readouterr()
 
-    run_experiment(load_experiment(config_path))
+    config_path = materialize("current-sqlite", tmp_path, mode="tree").config_path
 
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     published = capsys.readouterr()
