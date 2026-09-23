@@ -39,10 +39,10 @@ repos:
         files: ^src/.*\.py$
         verbose: true
       - id: module-size
-        name: src module size
+        name: module size
         entry: bash scripts/check_module_size.sh
         language: system
-        files: ^src/.*\.py$
+        files: ^(src|tests)/.*\.py$
       # Runs on every commit: the contracts span all of src/ and the pytest
       # configuration.
       - id: contract-tests
