@@ -19,7 +19,7 @@ import pytest
 
 import phasesweep.mcp.runs as mcp_runs
 from phasesweep.mcp.runs import RunStore, write_status_file
-from phasesweep.runtime.files import private_atomic_write_text
+from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.process import read_boot_id, read_proc_starttime
 from tests.conftest import file_mode, is_pid_zombie
 from tests.mcp_helpers import make_run_handle, write_run_status
@@ -411,6 +411,26 @@ def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: 
     assert {
         path: file_mode(path) for path in (state_dir, state_dir / "runs", state_dir / "logs")
     } == before_modes
+
+
+def test_open_existing_blames_privacy_only_on_a_complete_layout(tmp_path: Path) -> None:
+    """A shared directory without the layout is a wrong path, not damaged state."""
+    project = tmp_path / "project"
+    project.mkdir()
+    project.chmod(0o755)
+
+    with pytest.raises(ValueError, match="expected directories are missing") as missing:
+        RunStore.open_existing(project)
+    assert not isinstance(missing.value, UnsafePrivatePathError)
+    assert file_mode(project) == 0o755
+
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    (state_dir / "runs").chmod(0o755)
+
+    with pytest.raises(UnsafePrivatePathError, match="must be owned by uid"):
+        RunStore.open_existing(state_dir)
+    assert file_mode(state_dir / "runs") == 0o755
 
 
 def test_run_store_marks_fresh_scaffolded_state(tmp_path: Path) -> None:

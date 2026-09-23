@@ -489,6 +489,22 @@ def _recover_over_pre_cutover_state(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 
 
+def _recover_from_mistyped_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover from an ordinary shared directory that holds no run-store layout."""
+    not_state = tmp_path / "project"
+    not_state.mkdir(mode=0o755)
+    not_state.chmod(0o755)
+    return recover_run(not_state, "wrap-recover", confirm=False, emit=lambda _message: None)
+
+
+def _recover_from_shared_state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover from a complete run-store layout whose runs directory lost its privacy."""
+    state_dir = tmp_path / "mcp-state"
+    RunStore(state_dir)
+    (state_dir / "runs").chmod(0o755)
+    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
+
+
 def _recover_pending_snapshot_unwritable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Confirm recovery of an orphaned pending snapshot whose status is unsafe to rewrite."""
     materialized = materialize("current-sqlite", tmp_path, mode="tree")
@@ -680,6 +696,24 @@ WRAP_CASES = (
         action=OperatorAction.USE_PRIOR_RELEASE,
         cause=None,
         message="use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime",
+    ),
+    WrapCase(
+        # Composed: a path with no run-store layout is a wrong argument, even
+        # when it names some other existing, shared directory.
+        id="recover_run_mistyped_state_dir",
+        trigger=_recover_from_mistyped_state_dir,
+        outbound=RunRecoveryError,
+        action=OperatorAction.FIX_CONFIG,
+        cause=None,
+        message="Pass the state_dir from the catalog the MCP server runs with.",
+    ),
+    WrapCase(
+        id="recover_run_shared_state_dir",
+        trigger=_recover_from_shared_state_dir,
+        outbound=RunRecoveryError,
+        action=OperatorAction.RESTORE_TREE,
+        cause=None,
+        message="must be owned by uid",
     ),
     WrapCase(
         id="recover_run_pending_snapshot_unsafe_path",

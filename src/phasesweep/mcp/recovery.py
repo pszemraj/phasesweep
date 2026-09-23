@@ -54,7 +54,7 @@ from phasesweep.mcp.snapshots import (
     mark_result_snapshot_published,
     parse_result_snapshot,
 )
-from phasesweep.runtime.files import private_atomic_write_text
+from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.process import is_same_live_process, kill_stale_group, read_boot_id
 from phasesweep.runtime.time import utc_now_iso
 
@@ -112,7 +112,10 @@ def recover_run(
     except UnsupportedStateFormatError as exc:
         raise RunRecoveryError(str(exc), action=OperatorAction.USE_PRIOR_RELEASE) from None
     except ValueError as exc:
-        raise RunRecoveryError(str(exc)) from None
+        # Not a state directory at all: the path given is what needs fixing.
+        raise RunRecoveryError(str(exc), action=OperatorAction.FIX_CONFIG) from None
+    except UnsafePrivatePathError as exc:
+        raise RunRecoveryError.rewrap(exc, str(exc)) from None
     handle = store.get(run_id)
     if handle is None:
         _recover_pre_spawn_orphan(store, run_id, confirm=confirm, emit=emit)

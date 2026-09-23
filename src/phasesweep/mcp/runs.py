@@ -326,21 +326,32 @@ class RunStore:
         :return RunStore: Store bound to the recognized existing layout.
         :raises UnsupportedStateFormatError: The layout exists but its format
             marker is missing, malformed, or declares another format.
+        :raises UnsafePrivatePathError: The layout exists but one of its
+            directories is shared, symlinked, or not a real directory.
         :raises ValueError: If ``state_dir`` is not an MCP run-store layout.
         """
         store = cls.__new__(cls)
         store._set_paths(state_dir)
         missing = []
+        unsafe: UnsafePrivatePathError | None = None
         for path in (state_dir, store._runs_dir, store._logs_dir):
             try:
                 validate_private_dir(path)
-            except (OSError, UnsafePrivatePathError):
+            except UnsafePrivatePathError as exc:
+                unsafe = unsafe or exc
+            except OSError:
                 missing.append(str(path))
+        # A missing layout means this is not the state directory at all, even if
+        # the path is some other shared directory; only a complete layout makes
+        # a privacy failure the directory's own damage rather than a wrong path.
         if missing:
             raise ValueError(
                 "not an existing MCP state directory; expected directories are missing: "
                 + ", ".join(missing)
+                + ". Pass the state_dir from the catalog the MCP server runs with."
             )
+        if unsafe is not None:
+            raise unsafe
         store._require_supported_format_marker()
         return store
 
