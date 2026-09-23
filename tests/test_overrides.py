@@ -580,7 +580,7 @@ def test_validate_rejects_argparse_categorical_wire_collision(tmp_path: Path) ->
         load_experiment(config)
 
 
-def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_path):
+def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints():
     """With the value contract enforced, distinct Python values always produce
     distinct JSON-mode dumps — so no two configs that render different commands
     can share a study identity."""
@@ -588,17 +588,8 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints(tmp_pat
     from phasesweep.engine.fingerprints import _phase_fingerprint
 
     fingerprints: dict[str, str] = {}
-    for label, literal in {"int": "1", "str": '"1"', "bool": "true", "float": "1.0"}.items():
-        p = _override_yaml(
-            tmp_path,
-            "argparse",
-            "        phases:\n"
-            "          - name: t\n"
-            "            n_trials: 1\n"
-            "            fixed_overrides:\n"
-            f"              knob: {literal}\n",
-        )
-        exp = load_experiment(p)
+    for label, value in {"int": 1, "str": "1", "bool": True, "float": 1.0}.items():
+        exp = make_experiment(n_trials=1, search_space={}, fixed_overrides={"knob": value})
         fingerprints[label] = _phase_fingerprint(exp, exp.phases[0], {})
 
     assert len(set(fingerprints.values())) == len(fingerprints)

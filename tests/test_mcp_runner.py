@@ -151,24 +151,15 @@ def _constant_trial_config(tmp_path: Path, name: str) -> tuple[Path, str]:
     :param str name: Experiment name, also the catalog id used by the runner.
     :return tuple[Path, str]: Config path and its SHA-256, as the server pins it.
     """
-    trainer = write_constant_trainer(tmp_path)
-    config_path = tmp_path / f"{name}.yaml"
-    config_path.write_text(
-        f"""
-experiment: {name}
-workdir: {tmp_path}/runs
-trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-override_format: argparse
-metric:
-  name: x
-  goal: minimize
-  extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-phases:
-  - name: p
-    n_trials: 1
-    search_space: {{}}
-"""
+    experiment = make_experiment(
+        experiment=name,
+        workdir=tmp_path / "runs",
+        trainer=write_constant_trainer(tmp_path),
+        n_trials=1,
+        search_space={},
     )
+    config_path = tmp_path / f"{name}.yaml"
+    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
     return config_path, hashlib.sha256(config_path.read_bytes()).hexdigest()
 
 
@@ -1230,25 +1221,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
     """
     import phasesweep.engine.generation as generation_ops
 
-    trainer = write_constant_trainer(tmp_path)
-    config_path = tmp_path / "exp.yaml"
-    config_path.write_text(
-        f"""
-experiment: record_fail
-workdir: {tmp_path}/runs
-trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-override_format: argparse
-metric:
-  name: x
-  goal: minimize
-  extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-phases:
-  - name: p
-    n_trials: 1
-    search_space: {{}}
-"""
-    )
-    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    config_path, config_sha256 = _constant_trial_config(tmp_path, "record_fail")
 
     def fail_record_write(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated record write failure")

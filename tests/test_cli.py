@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
-from phasesweep.config import Experiment
+from phasesweep.config import Experiment, LogRegexExtractor, Metric, Sampler
 from phasesweep.engine import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
@@ -49,6 +49,7 @@ from tests.conftest import (
     invoke_cli_boundary,
     make_experiment,
     requires_nonroot,
+    write_param_echo_trainer,
     write_trainer,
     write_yaml,
 )
@@ -370,32 +371,24 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     """``show-winners`` prints comment before the winner block so the reader
     frames numerical results against intent. Also covers the no-winner-yet
     branch — the comment is still surfaced even before a phase has run."""
-    workdir = tmp_path / "wd"
 
-    def make_cfg(workdir_str: str) -> Path:
+    def make_cfg(workdir: Path) -> Path:
         cfg = tmp_path / "exp.yaml"
-        cfg.write_text(
-            textwrap.dedent(f"""
-            experiment: t
-            workdir: {workdir_str}
-            trial_command: "echo x=0.5 {{overrides}}"
-            override_format: argparse
-            metric:
-              extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            phases:
-              - name: depth
-                comment: settle the depth before anything else.
-                n_trials: 1
-                sampler: {{ type: random, seed: 0 }}
-                search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-            """)
+        experiment = make_experiment(
+            workdir=workdir,
+            trial_command="echo x=0.5 {overrides}",
+            name="depth",
+            comment="settle the depth before anything else.",
+            n_trials=1,
+            sampler=Sampler(type="random", seed=0),
         )
+        cfg.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
         return cfg
 
     runner = CliRunner()
 
     # With a winner: comment must come BEFORE the winner block.
-    config_with = make_cfg(str(workdir))
+    config_with = make_cfg(tmp_path / "wd")
     run_experiment(load_experiment(config_with))
     result_with = runner.invoke(cli_main, ["show-winners", str(config_with)])
     assert result_with.exit_code == 0
@@ -406,9 +399,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     assert result_with.output.index(comment_line) < result_with.output.index(metric_line)
 
     # Without a winner (different workdir → no winner.yaml): comment is still surfaced.
-    result_without = runner.invoke(
-        cli_main, ["show-winners", str(make_cfg(str(tmp_path / "empty_wd")))]
-    )
+    result_without = runner.invoke(cli_main, ["show-winners", str(make_cfg(tmp_path / "empty_wd"))])
     assert result_without.exit_code == 0
     assert "(no winner yet)" in result_without.output
     assert comment_line in result_without.output
@@ -624,39 +615,29 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
     annotations and an explicit marker when the current config no longer
     matches the published one.
     """
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        "import argparse\n"
-        "parser = argparse.ArgumentParser()\n"
-        'parser.add_argument("--out")\n'
-        'parser.add_argument("--x", type=int, default=0)\n'
-        "args, _ = parser.parse_known_args()\n"
-        'print(f"x={args.x}")\n',
-    )
+    trainer = write_param_echo_trainer(tmp_path)
+    config_path = tmp_path / "exp.yaml"
 
-    def config_text(comment: str, metric_name: str) -> str:
-        return f"""
-        experiment: drift_cli
-        workdir: {tmp_path}/runs
-        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-        override_format: argparse
-        metric:
-          name: {metric_name}
-          goal: minimize
-          extractor: {{ type: log_regex, pattern: '{metric_name}=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            comment: {comment}
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-        """
+    def write_config(comment: str, metric_name: str) -> None:
+        pattern = f"{metric_name}=(?P<value>[0-9.eE+-]+)"
+        experiment = make_experiment(
+            experiment="drift_cli",
+            workdir=tmp_path / "runs",
+            trainer=trainer,
+            metric=Metric(
+                name=metric_name, extractor=LogRegexExtractor(type="log_regex", pattern=pattern)
+            ),
+            comment=comment,
+            n_trials=1,
+            sampler=Sampler(type="random", seed=0),
+        )
+        config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
 
-    config_path = write_yaml(tmp_path, config_text("original hypothesis", "x"))
+    write_config("original hypothesis", "x")
     run_experiment(load_experiment(config_path))
 
     # Semantic drift (metric rename) plus a new comment on the same phase.
-    config_path.write_text(textwrap.dedent(config_text("new hypothesis", "y")).lstrip())
+    write_config("new hypothesis", "y")
 
     result = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
     assert result.exit_code == 0
