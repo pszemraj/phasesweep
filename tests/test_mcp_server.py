@@ -3954,16 +3954,13 @@ def test_launch_failure_cannot_replace_status_published_during_write(
     original_write = mcp_runs.write_status_file
     original_link = mcp_runs.os.link
 
-    def racing_write(path: Path, payload: dict) -> None:
-        original_write(path, runner_status)
-        original_write(path, payload)
-
+    # The launch-failure record links its status into place, so the runner's
+    # status lands in the window just before that link.
     def racing_link(src: str, dst: str, **kwargs: object) -> None:
         if dst == store.status_path(pending.run_id).name:
             original_write(store.status_path(pending.run_id), runner_status)
         original_link(src, dst, **kwargs)
 
-    monkeypatch.setattr(mcp_run_control, "write_status_file", racing_write, raising=False)
     monkeypatch.setattr(mcp_runs.os, "link", racing_link)
     app._record_launch_failure(pending, cleanup_confirmed=True, error_class="Injected")
 
