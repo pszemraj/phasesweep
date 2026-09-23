@@ -29,8 +29,10 @@ blocked child becomes the recorded process-group leader before executing
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import logging
+import math
 import os
 import select
 import subprocess
@@ -534,6 +536,28 @@ def _encode_launch_payload(cmd: str, env: dict[str, str], cwd: str | None = None
     return f"{len(body):0{_supervisor._HEADER_LEN}d}".encode("ascii") + body
 
 
+def fd_ready(fd: int, *, timeout: float, write: bool = False) -> bool:
+    """Wait until a descriptor can be read, or written, for at most ``timeout`` seconds.
+
+    ``select.select`` refuses descriptors at or above ``FD_SETSIZE`` (1024 on
+    Linux), which a process holding many open files reaches; ``poll`` has no
+    such limit. A hang-up or error counts as ready, as it does for ``select``,
+    so the caller's read or write then reports the EOF or the error itself.
+
+    :param int fd: Open file descriptor to wait on.
+    :param float timeout: Longest wait in seconds; zero or less checks once.
+    :param bool write: Wait for writability instead of readability.
+    :return bool: Whether ``fd`` became ready within ``timeout``.
+    :raises OSError: If ``fd`` is not an open descriptor.
+    """
+    poller = select.poll()
+    poller.register(fd, select.POLLOUT if write else select.POLLIN)
+    events = poller.poll(max(0, math.ceil(timeout * 1000)))
+    if any(mask & select.POLLNVAL for _, mask in events):
+        raise OSError(errno.EBADF, os.strerror(errno.EBADF))
+    return bool(events)
+
+
 def _write_all(
     fd: int,
     data: bytes,
@@ -564,8 +588,7 @@ def _write_all(
                     "trial launch deadline expired while delivering the trainer payload",
                     pid=pid,
                 )
-            _, writable, _ = select.select([], [fd], [], remaining)
-            if not writable or time.monotonic() >= deadline:
+            if not fd_ready(fd, timeout=remaining, write=True) or time.monotonic() >= deadline:
                 raise _LaunchDeadlineExpired(
                     "trial launch deadline expired while delivering the trainer payload",
                     pid=pid,
@@ -590,8 +613,7 @@ def _read_pipe_frame(fd: int, size: int, *, deadline: float) -> bytes | None:
     chunks: list[bytes] = []
     remaining = size
     while remaining:
-        readable, _, _ = select.select([fd], [], [], max(0.0, deadline - time.monotonic()))
-        if not readable or time.monotonic() >= deadline:
+        if not fd_ready(fd, timeout=deadline - time.monotonic()) or time.monotonic() >= deadline:
             return None
         chunk = os.read(fd, remaining)
         if not chunk:

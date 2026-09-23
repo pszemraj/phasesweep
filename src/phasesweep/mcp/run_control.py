@@ -13,7 +13,6 @@ import contextlib
 import hashlib
 import logging
 import os
-import select
 import subprocess
 import sys
 from dataclasses import replace
@@ -49,6 +48,7 @@ from phasesweep.mcp.runs import (
 )
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
+from phasesweep.runtime.process import fd_ready
 from phasesweep.runtime.reaper import kill_stale_group, read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 
@@ -846,12 +846,7 @@ class RunControl:
                         "spawned runner has no Linux boot id; refused launch because later "
                         "cancellation could not distinguish PID reuse after reboot"
                     )
-                readable, _, _ = select.select(
-                    [ready_read],
-                    [],
-                    [],
-                    _RUNNER_READY_TIMEOUT_SECONDS,
-                )
+                readable = fd_ready(ready_read, timeout=_RUNNER_READY_TIMEOUT_SECONDS)
                 ready = os.read(ready_read, 1) if readable else b""
                 if ready != _RUNNER_READY_BYTE:
                     raise RuntimeError(

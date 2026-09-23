@@ -1245,18 +1245,18 @@ def test_terminal_status_read_cannot_turn_expired_trial_into_success(
     """A status byte observed after the deadline still means the trial timed out."""
     import phasesweep.runtime.process as process
 
-    real_select = process.select.select
-    read_select_calls = 0
+    real_fd_ready = process.fd_ready
+    read_waits = 0
 
-    def delay_terminal_status_read(readers, writers, errors, timeout):  # noqa: ANN001, ANN202
-        nonlocal read_select_calls
-        if readers:
-            read_select_calls += 1
-            if read_select_calls == 2:
+    def delay_terminal_status_read(fd: int, *, timeout: float, write: bool = False) -> bool:
+        nonlocal read_waits
+        if not write:
+            read_waits += 1
+            if read_waits == 2:
                 time.sleep(0.8)
-        return real_select(readers, writers, errors, timeout)
+        return real_fd_ready(fd, timeout=timeout, write=write)
 
-    monkeypatch.setattr(process.select, "select", delay_terminal_status_read)
+    monkeypatch.setattr(process, "fd_ready", delay_terminal_status_read)
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
 
@@ -1267,7 +1267,7 @@ def test_terminal_status_read_cannot_turn_expired_trial_into_success(
         attempt_id="late-status-read",
     )
 
-    assert read_select_calls >= 2
+    assert read_waits >= 2
     assert result.timed_out
     assert result.cleanup_confirmed
     assert result.failure_reason == "timeout after 0.5s"
