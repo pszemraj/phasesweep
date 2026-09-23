@@ -460,23 +460,24 @@ def test_run_store_rejects_invalid_format_marker_without_mutation(
     assert tree_snapshot(state_dir) == before
 
 
-@pytest.mark.parametrize("evidence_kind", ["status", "log", "lease", "audit"])
+@pytest.mark.parametrize(
+    ("evidence", "text"),
+    [
+        (lambda store, _: store.status_path("exp-1"), '{"run_id": "exp-1", "returncode": 0}\n'),
+        (lambda store, _: store.log_path("exp-1"), "runner output\n"),
+        (lambda store, _: store.launch_lease_path("exp-1"), ""),
+        (lambda _, state_dir: state_dir / "audit.jsonl", '{"tool":"launch_run"}\n'),
+    ],
+    ids=["status", "log", "lease", "audit"],
+)
 def test_run_store_refuses_unmarked_durable_state_before_initialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    evidence_kind: str,
+    evidence: Callable[[RunStore, Path], Path],
+    text: str,
 ) -> None:
     state_dir = tmp_path / "state"
-    store = RunStore(state_dir)
-    run_id = "exp-1"
-    if evidence_kind == "status":
-        write_status_file(store.status_path(run_id), {"run_id": run_id, "returncode": 0})
-    elif evidence_kind == "log":
-        private_atomic_write_text(store.log_path(run_id), "runner output\n")
-    elif evidence_kind == "lease":
-        private_atomic_write_text(store.launch_lease_path(run_id), "")
-    else:
-        private_atomic_write_text(state_dir / "audit.jsonl", '{"tool":"launch_run"}\n')
+    private_atomic_write_text(evidence(RunStore(state_dir), state_dir), text)
     marker = state_dir / ".phasesweep-format.json"
     marker.unlink()
     before = tree_snapshot(state_dir)
