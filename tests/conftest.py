@@ -271,22 +271,19 @@ def isolate_host_gpu_detection(
     monkeypatch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: False)
 
 
-@pytest.fixture(autouse=True)
-def isolate_signal_ownership_tokens() -> Iterator[None]:
-    """Snapshot and restore PhaseSweep's process-level signal state per test.
+@contextlib.contextmanager
+def restored_signal_ownership() -> Iterator[None]:
+    """Give the process back its shutdown-signal state when the block exits.
 
-    ``phasesweep.runtime.shutdown._process_lifetime_owner`` and ``_scope_depth``
-    are plain module globals (review v0.5.15 / blocker 2B), deliberately not
-    re-derived from OS ground truth the way the actual signal handlers are.
-    A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
-    in-process) would otherwise permanently replace pytest's SIGTERM/SIGINT/
-    SIGHUP handlers and unblock those signals, as well as flipping the private
-    ownership tokens. Later Ctrl-C and CI timeout signals would then enter
-    PhaseSweep's shutdown handler instead of pytest's. Restore the kernel mask,
-    OS handlers, and ownership bookkeeping as one fixture-level transaction.
+    Restores, in order: the shutdown signals blocked, so none is delivered to
+    a half-restored handler set; the prior OS handlers; the prior kernel mask;
+    and ``phasesweep.runtime.shutdown``'s ownership tokens.
+
+    :return Iterator[None]: Context in which PhaseSweep may take signal ownership.
     """
     import phasesweep.runtime.shutdown as shutdown
 
+    # Bound at entry so a replacement a test installs cannot do the restoring.
     restore_signal = signal.signal
     restore_mask = getattr(signal, "pthread_sigmask", None)
     prior_owner = shutdown._process_lifetime_owner
@@ -304,6 +301,24 @@ def isolate_signal_ownership_tokens() -> Iterator[None]:
             restore_mask(signal.SIG_SETMASK, prior_mask)
         shutdown._process_lifetime_owner = prior_owner
         shutdown._scope_depth = prior_depth
+
+
+@pytest.fixture(autouse=True)
+def isolate_signal_ownership_tokens() -> Iterator[None]:
+    """Snapshot and restore PhaseSweep's process-level signal state per test.
+
+    ``phasesweep.runtime.shutdown._process_lifetime_owner`` and ``_scope_depth``
+    are plain module globals (review v0.5.15 / blocker 2B), deliberately not
+    re-derived from OS ground truth the way the actual signal handlers are.
+    A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
+    in-process) would otherwise permanently replace pytest's SIGTERM/SIGINT/
+    SIGHUP handlers and unblock those signals, as well as flipping the private
+    ownership tokens. Later Ctrl-C and CI timeout signals would then enter
+    PhaseSweep's shutdown handler instead of pytest's. Restore the kernel mask,
+    OS handlers, and ownership bookkeeping as one fixture-level transaction.
+    """
+    with restored_signal_ownership():
+        yield
 
 
 def copy_fake_train(tmp_path: Path) -> Path:
