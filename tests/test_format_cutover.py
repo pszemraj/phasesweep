@@ -226,7 +226,9 @@ def test_claim_ledger_creates_ledger_parent_but_validate_does_not(
     directory. The claim is the first step that writes, and the directory is
     its first write: a path that cannot hold a ledger then fails before the
     tree names that ledger, while the path can still be corrected. Neither
-    step creates the ledger file itself; the first live open does.
+    step creates the ledger file itself; the first live open does. SQLite
+    creates only that file, so a claim that skipped the directory would bind
+    the tree to a ledger its first open cannot create.
     """
     missing = tmp_path / "not-created-by-a-read"
     ledger_file = missing / f"study.{backend}"
@@ -268,23 +270,6 @@ def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
 
     assert isinstance(refused.value.__cause__, PermissionError)
     assert not _artifact_root_binding_path(experiment).exists()
-
-
-@pytest.mark.integration
-def test_run_creates_a_missing_sqlite_ledger_directory(tmp_path: Path) -> None:
-    """An explicit SQLite ledger in a directory that does not exist yet runs.
-
-    SQLite creates the file but not its directory, so the run used to bind
-    the tree and then die opening the ledger, after which correcting the path
-    was refused as a second ledger for the same tree.
-    """
-    database = tmp_path / "missing" / "study.db"
-    experiment = _experiment(tmp_path, storage=f"sqlite:///{database}")
-
-    run_experiment(experiment)
-
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{database}")
-    assert [trial.state.name for trial in study.trials] == ["COMPLETE"]
 
 
 @pytest.mark.parametrize("offered", ["storage-url", "validated-ledger"])
