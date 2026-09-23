@@ -168,8 +168,9 @@ which refuses a handle whose scan did not complete, with
 
 #### 8. Attempts are registered before launch
 
-The attempt registry is scanned before anything else in preflight, and each
-attempt is durably registered before its trainer is launched.
+The attempt registry is scanned before anything else in the continuation
+preflight, and each attempt is durably registered before its trainer is
+launched.
 
 **Held by:** `engine.attempts._preflight_active_attempts`, run first by
 `engine.guards._preflight_existing_studies`; then
@@ -289,7 +290,7 @@ rather than rediscovered by the next reviewer.
 
 | Machinery | Failure it prevents | Cost |
 | --- | --- | --- |
-| `recover-run` | A leaked capacity slot after a hard exit | About 950 lines |
+| `recover-run` | A leaked capacity slot after a hard exit | About 980 lines |
 | Runner boot identity | Signalling an unrelated process after a reboot | About 160 lines |
 | Persisted spawned handle | A duplicate sweep after a server restart | About 270 lines |
 
@@ -309,7 +310,7 @@ the only path that reads the durable evidence and decides. It opens studies
 only through `validate_ledger` and `open_existing_study`, so it validates the
 binding and the format before it opens anything (invariant 7).
 
-The cost is all of `src/phasesweep/mcp/recovery.py` (901 lines) plus the
+The cost is all of `src/phasesweep/mcp/recovery.py` (929 lines) plus the
 50-line `mcp_recover_run` command in `src/phasesweep/cli.py`.
 
 ### Runner boot identity
