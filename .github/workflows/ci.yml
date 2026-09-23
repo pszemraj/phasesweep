@@ -24,6 +24,8 @@ jobs:
       - run: ruff format --check .
       - run: mypy src
       # Fast in-process contracts, run from src/ without building the package.
+      # The maintainer approved this step for one Python version within about
+      # 20 seconds of CI time; anything slower stays local with the full suite.
       # Collecting the whole suite runs the integration-tier guard over every
       # test module without executing one; it imports each module, so a test
       # that needs Hydra or W&B must import it inside the test. The size check

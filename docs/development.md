@@ -123,7 +123,8 @@ GitHub Actions intentionally has one Linux pull-request static-check job for
 Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier
 guard hook runs, and the three contract tests plus
 `tests/test_ledger_read_paths.py`, all imported from `src/` without building
-the package. The full suite and installed wheel check stay local to control CI
+the package. That test step runs on one Python version and stays within about
+20 seconds; the full suite and installed wheel check stay local to control CI
 cost. Hardware tests remain opt-in.
 
 The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
