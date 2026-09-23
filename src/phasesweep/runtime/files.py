@@ -154,7 +154,9 @@ def phasesweep_home() -> Path | None:
         return None
     path = Path(override)
     if not path.is_absolute():
-        raise UnsafePrivatePathError(f"PHASESWEEP_HOME must be an absolute path: {path}")
+        raise UnsafePrivatePathError(
+            f"PHASESWEEP_HOME must be an absolute path: {path}", action=OperatorAction.FIX_CONFIG
+        )
     try:
         validate_private_dir(path)
     except FileNotFoundError as exc:
@@ -183,7 +185,10 @@ def lock_dir() -> Path:
     if override:
         path = Path(override)
         if not path.is_absolute():
-            raise UnsafeLockPathError(f"{_LOCK_DIR_ENV} must be an absolute path: {path}")
+            raise UnsafeLockPathError(
+                f"{_LOCK_DIR_ENV} must be an absolute path: {path}",
+                action=OperatorAction.FIX_CONFIG,
+            )
         _lock_policy(path)
         return path
 

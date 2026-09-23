@@ -53,11 +53,12 @@ def require_wandb_sdk() -> None:
     try:
         importlib.import_module("wandb.apis.public")
     except ImportError as exc:
-        from phasesweep.errors import PhaseSweepError
+        from phasesweep.errors import OperatorAction, PhaseSweepError
 
         raise PhaseSweepError(
             "W&B evidence requires the optional SDK in the PhaseSweep environment. "
-            'Install this distribution with its wandb extra: python -m pip install "phasesweep[wandb]".'
+            'Install this distribution with its wandb extra: python -m pip install "phasesweep[wandb]".',
+            action=OperatorAction.FIX_CONFIG,
         ) from exc
 
 

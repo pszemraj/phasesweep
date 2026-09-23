@@ -29,6 +29,7 @@ import pickle
 import pkgutil
 import pwd
 import sqlite3
+import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -79,6 +80,7 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _cleanup_runner,
@@ -95,6 +97,7 @@ from phasesweep.runtime.files import (
     UnsafeLockPathError,
     UnsafePrivatePathError,
     lock_dir,
+    phasesweep_home,
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment
@@ -977,6 +980,24 @@ def _lock_dir_with_relative_account_home(tmp_path: Path, monkeypatch: pytest.Mon
     return lock_dir()
 
 
+def _lock_dir_override_relative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve the lock directory through a relative override."""
+    monkeypatch.setenv("PHASESWEEP_LOCK_DIR", "relative-locks")
+    return lock_dir()
+
+
+def _home_override_relative(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resolve the private root through a relative override."""
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative-home")
+    return phasesweep_home()
+
+
+def _wandb_sdk_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Check for the W&B SDK in an environment that cannot import it."""
+    monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
+    return require_wandb_sdk()
+
+
 def _recover_during_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Recover a run id while another MCP launch holds the launch lock."""
     state_dir = tmp_path / "mcp-state"
@@ -1091,6 +1112,27 @@ ORIGIN_CASES = (
         raised=UnsafeLockPathError,
         action=(OperatorAction.RESTORE_TREE, OperatorAction.FIX_CONFIG),
         message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
+    ),
+    OriginCase(
+        id="lock_dir_override_relative",
+        trigger=_lock_dir_override_relative,
+        raised=UnsafeLockPathError,
+        action=OperatorAction.FIX_CONFIG,
+        message="PHASESWEEP_LOCK_DIR must be an absolute path",
+    ),
+    OriginCase(
+        id="phasesweep_home_override_relative",
+        trigger=_home_override_relative,
+        raised=UnsafePrivatePathError,
+        action=OperatorAction.FIX_CONFIG,
+        message="PHASESWEEP_HOME must be an absolute path",
+    ),
+    OriginCase(
+        id="wandb_sdk_missing",
+        trigger=_wandb_sdk_not_installed,
+        raised=PhaseSweepError,
+        action=OperatorAction.FIX_CONFIG,
+        message='python -m pip install "phasesweep[wandb]"',
     ),
     OriginCase(
         id="recover_during_launch",
