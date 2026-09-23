@@ -173,7 +173,7 @@ def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, d
     built, because preflight must leave it untouched too. The handle names a
     long-dead PID with a mismatched start time and is marked cleanup-uncertain,
     which is the state that makes preflight load the phase studies (mirrors
-    ``tests/test_mcp_server.py::test_operator_recovery_clears_no_status_cleanup_uncertainty``).
+    ``tests/test_mcp_recovery.py::test_operator_recovery_clears_no_status_cleanup_uncertainty``).
 
     :param Materialized materialized: Copied fixture and its config.
     :param Path tmp_path: Per-test temporary directory.

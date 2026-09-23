@@ -13,6 +13,17 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import yaml
+
+from phasesweep.config import (
+    ExecutionContext,
+    Experiment,
+    IntParam,
+    LogRegexExtractor,
+    Metric,
+    Phase,
+    Sampler,
+)
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.run_control import _runner_protocol_argv
@@ -20,7 +31,7 @@ from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_statu
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import reaped_pid, restored_signal_ownership
+from tests.conftest import make_experiment, reaped_pid, restored_signal_ownership
 
 
 def write_mcp_catalog(
@@ -405,3 +416,69 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
 
     monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", fake_popen)
     return captured
+
+
+ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
+
+
+def _config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
+    path = tmp_path / f"{name}.yaml"
+    path.write_text(mcp_experiment_config_text(tmp_path, name=name, phases=phases))
+    return path
+
+
+def _catalog(
+    tmp_path: Path,
+    config: Path,
+    allow: dict[str, bool] | None = None,
+    *,
+    visible_params: object | None = None,
+) -> Path:
+    return write_mcp_catalog(
+        tmp_path,
+        {"srv": config},
+        allow=allow,
+        visible_params=None if visible_params is None else {"srv": visible_params},
+        filename="srv.catalog.yaml",
+    )
+
+
+def _drift_experiment(
+    tmp_path: Path,
+    trainer: Path,
+    *,
+    name: str = "srv",
+    metric_name: str = "x",
+    goal: str = "minimize",
+    extractor: object | None = None,
+    phase_name: str = "p",
+    phases: list[Phase] | None = None,
+) -> Experiment:
+    """Build the runnable experiment the tests publish and then edit: one phase unless ``phases``."""
+    return make_experiment(
+        experiment=name,
+        storage=f"sqlite:///{tmp_path / 'drift.db'}",
+        workdir=str(tmp_path / "runs"),
+        execution=ExecutionContext(cwd=str(tmp_path)),
+        trainer=trainer,
+        metric=Metric(
+            name=metric_name,
+            goal=goal,
+            extractor=extractor
+            or LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        ),
+        phases=phases
+        or [
+            Phase(
+                name=phase_name,
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"lr": IntParam(type="int", low=1, high=2)},
+            )
+        ],
+    )
+
+
+def _write_experiment_config(config: Path, experiment: Experiment) -> None:
+    """Rewrite a cataloged config file in place, as an operator edit would."""
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
