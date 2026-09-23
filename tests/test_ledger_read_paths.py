@@ -21,7 +21,6 @@ every pure read says ``ok``.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import sqlite3
@@ -48,7 +47,6 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.mcp.runs import RunStore, UnsupportedStateFormatError
 from phasesweep.mcp.snapshots import capture_result_snapshot
-from tests.conftest import reaped_pid
 from tests.ledger_fixtures import (
     LEDGER_MODES,
     Materialized,
@@ -61,7 +59,7 @@ from tests.ledger_fixtures import (
     tree_changes,
     tree_snapshot,
 )
-from tests.mcp_helpers import make_run_handle
+from tests.mcp_helpers import stage_dead_run
 
 #: Every fixture this matrix requires. A missing entry means an incomplete
 #: regeneration, not a smaller matrix, so it is asserted by name.
@@ -195,19 +193,14 @@ def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, d
         directory, empty when it did not.
     """
     state_dir = tmp_path / "mcp-state"
-    store = RunStore(state_dir)
     run_id = "golden-ledger-recover"
-    config_bytes = materialized.config_path.read_bytes()
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=materialized.experiment.experiment,
-        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
-        pid=reaped_pid(),
-        starttime=111,
+    stage_dead_run(
+        RunStore(state_dir),
+        run_id,
+        materialized.config_path,
+        materialized.experiment.experiment,
+        cleanup_uncertain=True,
     )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config_bytes)
-    store.mark_cleanup_uncertain(handle)
     state_before = tree_snapshot(state_dir)
     messages: list[str] = []
     try:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import hashlib
 import json
 import os
 import signal
@@ -84,11 +83,10 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     patch_rejected_trial_user_attr,
-    reaped_pid,
     write_trainer,
 )
 from tests.ledger_fixtures import _write_config
-from tests.mcp_helpers import make_run_handle
+from tests.mcp_helpers import stage_dead_run
 from tests.recovery_helpers import (
     fabricate_registered_attempt,
     fabricate_stale_trial,
@@ -1209,19 +1207,10 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     before = ledger_file.read_bytes()
 
     state_dir = tmp_path / "mcp-state"
-    store = RunStore(state_dir)
     run_id = "a-refused-run"
-    config_bytes = config_a.read_bytes()
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=recovering.experiment,
-        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
-        pid=reaped_pid(),
-        starttime=111,
+    stage_dead_run(
+        RunStore(state_dir), run_id, config_a, recovering.experiment, cleanup_uncertain=True
     )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config_bytes)
-    store.mark_cleanup_uncertain(handle)
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *_a, **_k: True)
 
     with pytest.raises(RunRecoveryError) as excinfo:
