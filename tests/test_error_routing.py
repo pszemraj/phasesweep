@@ -58,7 +58,7 @@ from phasesweep.engine.attempts import (
     _PreflightCleanupReport,
     _register_active_attempt,
 )
-from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.cleanup import _inspect_cleanup_uncertain_trials, _reap_stale_trials
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -847,6 +847,20 @@ def _preflight_registered_trial_without_attempt(
     return _preflight_active_attempts(experiment, _PreflightCleanupReport())
 
 
+def _inspect_uncertain_trial_without_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Inspect a cleanup-uncertain terminal trial whose ledger lost its attempt id."""
+    study = optuna.create_study(study_name="t::p")
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    uncertain = study.ask()
+    uncertain.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
+    return _inspect_cleanup_uncertain_trials(study, "p")
+
+
 ORIGIN_CASES = (
     OriginCase(
         id="auto_storage_backend_switch",
@@ -882,6 +896,13 @@ ORIGIN_CASES = (
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Restore the original storage ledger with its durable attempt and generation",
+    ),
+    OriginCase(
+        id="uncertain_trial_attempt_missing",
+        trigger=_inspect_uncertain_trial_without_attempt,
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_LEDGER,
+        message="Process identity is unknown. Restore the original storage ledger",
     ),
 )
 

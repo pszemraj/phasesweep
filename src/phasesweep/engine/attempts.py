@@ -151,7 +151,8 @@ def _read_trial_process_identity(
             f"Refusing to recover trial {trial.number} in study {study_name}: missing or "
             f"invalid {ATTEMPT_ID_ATTR!r} user attribute. Process identity is unknown. "
             "Restore the original storage ledger with its durable attempt and generation "
-            "identities before retrying recovery; do not infer replacement identities."
+            "identities before retrying recovery; do not infer replacement identities.",
+            action=OperatorAction.RESTORE_LEDGER,
         )
     try:
         return read_stale_process_identity(
