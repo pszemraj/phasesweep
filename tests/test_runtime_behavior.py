@@ -1869,7 +1869,8 @@ def test_phase_timeout_preempts_active_trial(tmp_path: Path) -> None:
 
 
 @pytest.mark.integration
-def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
+def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_path: Path) -> None:
+    """An opted-in timeout publishes an incomplete winner; resume without the opt-in refuses it."""
     # Two-sided timing margin: one 1s trial must finish well within the 6s
     # budget even on a loaded host, while all ten (>= 10s of sleeping alone)
     # can never finish inside it.
@@ -1892,6 +1893,16 @@ def test_incomplete_timeout_can_be_explicitly_accepted(tmp_path: Path) -> None:
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
     assert completion["timeout_scope"] == "phase"
+
+    current = _sleeping_score_experiment(
+        tmp_path,
+        experiment="phase_timeout_allowed",
+        n_trials=10,
+        timeout_seconds_per_phase=6.0,
+        sleep_seconds=1.0,
+    )
+    with pytest.raises(RuntimeError, match="incomplete phase result"):
+        _load_winner(current, current.phases[0], {})
 
 
 @pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
@@ -2391,29 +2402,6 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
     completion = winners["p"].completion
     assert completion["incomplete"] is True
     assert completion["reason"] == "timeout"
-
-
-@pytest.mark.integration
-def test_incomplete_timeout_winner_requires_current_opt_in_on_resume(tmp_path: Path) -> None:
-    accepted = _sleeping_score_experiment(
-        tmp_path,
-        experiment="phase_timeout_resume_guard",
-        n_trials=10,
-        timeout_seconds_per_phase=6.0,
-        allow_incomplete_on_timeout=True,
-        sleep_seconds=1.0,
-    )
-    run_experiment(accepted)
-
-    current = _sleeping_score_experiment(
-        tmp_path,
-        experiment="phase_timeout_resume_guard",
-        n_trials=10,
-        timeout_seconds_per_phase=6.0,
-        sleep_seconds=1.0,
-    )
-    with pytest.raises(RuntimeError, match="incomplete phase result"):
-        _load_winner(current, current.phases[0], {})
 
 
 @pytest.mark.integration
