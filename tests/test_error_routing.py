@@ -85,7 +85,6 @@ from phasesweep.mcp.recovery import (
     _finalize_stored_terminal_result_snapshot,
     _load_recovery_studies,
     _publication_recovery_action,
-    _RecoveryNeeds,
     recover_run,
 )
 from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunStore
@@ -101,6 +100,7 @@ from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment, requires_nonroot
 from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
 from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
+from tests.recovery_helpers import load_only_recovery_needs
 
 # Classes proving the module sweep reached past the error modules themselves.
 # If an import ever stops happening, these vanish from the walk and say so.
@@ -315,21 +315,6 @@ def _materialize_damaged(
     return materialized
 
 
-def _recovery_needs(*, ownership_storage_unavailable: bool) -> _RecoveryNeeds:
-    """Return recovery decisions that load studies and nothing else."""
-    return _RecoveryNeeds(
-        terminal_status=None,
-        stored_snapshot=None,
-        prepared_publication_generation=None,
-        cleanup_needed=False,
-        terminal_cleanup_uncertain=False,
-        ownership_storage_unavailable=ownership_storage_unavailable,
-        snapshot_recovery_required=False,
-        snapshot_unavailable=False,
-        snapshot_finalize_needed=False,
-    )
-
-
 def _dead_uncertain_run(
     materialized: Materialized, tmp_path: Path, config: Path | None = None
 ) -> tuple[Path, str]:
@@ -377,7 +362,9 @@ def _recovery_studies_damaged(
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
         materialized = _materialize_damaged(tmp_path, fixture, mode, damage)
-        needs = _recovery_needs(ownership_storage_unavailable=ownership_storage_unavailable)
+        needs = load_only_recovery_needs(
+            ownership_storage_unavailable=ownership_storage_unavailable
+        )
         return _load_recovery_studies(materialized.experiment, needs)
 
     return trigger
@@ -945,7 +932,7 @@ def _reconcile_prepared_over_damaged_publication(
     assert published is not None
     _generation_summary_path(experiment, published).unlink()
     needs = replace(
-        _recovery_needs(ownership_storage_unavailable=False),
+        load_only_recovery_needs(),
         prepared_publication_generation="prepared-generation",
     )
     return _publication_recovery_action(experiment, needs)
@@ -1194,7 +1181,7 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     store, handle = _live_uncertain_run(tmp_path / "mcp-state")
     return _cleanup_runner(
         store.cleanup_identity(handle),
-        _recovery_needs(ownership_storage_unavailable=False),
+        load_only_recovery_needs(),
         confirm=True,
         earlier_boot=False,
         cleanup_recorded=False,
