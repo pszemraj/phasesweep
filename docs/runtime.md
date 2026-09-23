@@ -197,8 +197,12 @@ detection.
 Trial, phase, and experiment timeouts are cooperative run controls. On a
 trial timeout PhaseSweep terminates the supervised process group and records a
 terminal failed attempt after cleanup. The `max_consecutive_failures` threshold
-also stops a broken phase. `n_trials` counts terminal attempts, so failed and
-pruned attempts consume the configured target.
+also stops a broken phase. When both stop the same phase short of its target,
+the timeout decides the outcome: with `allow_incomplete_on_timeout` the phase
+publishes the winner its completed trials earned, and without it the run stops
+as a timeout, so a retry with a larger budget does not replay the failure
+abort. `n_trials` counts terminal attempts, so failed and pruned attempts
+consume the configured target.
 
 Before a supported continuation, PhaseSweep first checks the artifact-root and
 ledger binding, then reconciles stale active attempts, and only then verifies

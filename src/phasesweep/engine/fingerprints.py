@@ -48,7 +48,7 @@ _RUN_CONTROL_KEYS = frozenset(
 # invocation directories. whole_node phases additionally fingerprint their
 # configured device-set size — the trainer's world size.
 # Existing populated studies from earlier schemas fail the fingerprint check
-# on resume; see docs/config.md's upgrade section.
+# on resume, and the refusal names the operator's options.
 FINGERPRINT_SCHEMA_VERSION = 6
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 5
 
