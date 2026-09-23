@@ -11,6 +11,7 @@ error at the moment it is violated rather than a diff noticed afterwards.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import shutil
@@ -29,7 +30,13 @@ from phasesweep.engine.artifact_roots import (
     _artifact_root_binding_payload,
     _artifact_root_identity,
 )
-from phasesweep.engine.paths import _artifact_root_binding_path
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+)
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
 from tests.fixtures.make_ledger_fixtures import (
     LEDGER_FILENAME,
@@ -387,6 +394,38 @@ def leave_hot_journal(database: Path) -> None:
     ):
         probe.execute("SELECT 1 FROM sqlite_master").fetchone()
     assert refused.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
+
+
+def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
+    """Point a publication pointer at ``summary_path``'s exact bytes."""
+    pointer = yaml.safe_load(pointer_path.read_text())
+    content = summary_path.read_bytes()
+    pointer["summary_size_bytes"] = len(content)
+    pointer["summary_sha256"] = hashlib.sha256(content).hexdigest()
+    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
+
+
+def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
+    """Reseal the last-success publication so ``phase``'s winner is a partial result that still validates."""
+    generation = _last_successful_generation_id(experiment)
+    assert generation is not None
+    winner_path = _generation_winner_path(experiment, generation, phase)
+    summary_path = _generation_summary_path(experiment, generation)
+    winner = yaml.safe_load(winner_path.read_text())
+    summary = yaml.safe_load(summary_path.read_text())
+    # Only the named phase: the summary mirrors every phase's completion.
+    (mirrored,) = [entry for entry in summary["phases"] if entry["name"] == phase]
+    for payload in (winner, mirrored):
+        payload["completion"]["incomplete"] = True
+    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+    (listed,) = [
+        artifact
+        for artifact in summary["artifacts"]
+        if artifact["kind"] == "winner" and artifact["phase"] == phase
+    ]
+    listed["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
 
 def forbid_file_backed_storage(monkeypatch: pytest.MonkeyPatch) -> list[str]:
