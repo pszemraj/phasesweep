@@ -179,7 +179,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         cancel_mcp_run_quietly(app, run_id)
 
 
-def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
+def test_launch_then_cancel_from_restarted_server_then_relaunch(tmp_path: Path) -> None:
     trainer = copy_fake_train(tmp_path)
     catalog = write_mcp_config_catalog(
         tmp_path,
@@ -197,7 +197,13 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
         with pytest.raises(Exception, match="already has a running sweep"):
             app.launch("slow")
 
-        result = app.cancel(run_id)
+        # A fresh server process has only durable state to go on: it must
+        # still find the detached run live and be able to cancel it.
+        restarted_app, _restarted_registry, _restarted_store = make_mcp_app(catalog)
+        status = restarted_app.status(run_id=run_id)
+        assert status["run"]["state"] == "running"
+
+        result = restarted_app.cancel(run_id)
         assert result["state"] == "cancelled"
         assert result["cleanup_confirmed"] is True
 
@@ -209,30 +215,6 @@ def test_launch_then_cancel_then_relaunch(tmp_path: Path) -> None:
         cancel_mcp_run_quietly(app, run_id)
         if second_run_id is not None:
             cancel_mcp_run_quietly(app, second_run_id)
-
-
-def test_restarted_server_rediscovers_and_cancels_running_run(tmp_path: Path) -> None:
-    trainer = copy_fake_train(tmp_path)
-    catalog = write_mcp_config_catalog(
-        tmp_path,
-        {"slow": slow_mcp_config_text(tmp_path, trainer=trainer)},
-        allow=ALLOW_SIDE_EFFECTS,
-    )
-    app, _registry, _store = make_mcp_app(catalog)
-
-    run_id = app.launch("slow")["run_id"]
-    try:
-        assert wait_for_mcp_running_trial(app, run_id, timeout=30) == "running"
-
-        restarted_app, _restarted_registry, _restarted_store = make_mcp_app(catalog)
-        status = restarted_app.status(run_id=run_id)
-        assert status["run"]["state"] == "running"
-
-        result = restarted_app.cancel(run_id)
-        assert result["state"] == "cancelled"
-        assert result["cleanup_confirmed"] is True
-    finally:
-        cancel_mcp_run_quietly(app, run_id)
 
 
 def test_global_concurrency_cap_serializes_sweeps(tmp_path: Path) -> None:
