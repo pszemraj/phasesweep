@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
 import subprocess
 import sys
@@ -19,7 +20,7 @@ from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_statu
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import restored_signal_ownership
+from tests.conftest import reaped_pid, restored_signal_ownership
 
 
 def write_mcp_catalog(
@@ -304,6 +305,48 @@ def runner_argv(
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     full_payload = {"run_id": run_id, "cleanup_confirmed": True, **payload}
     write_status_file(store.status_path(run_id), full_payload)
+
+
+#: Start time recorded for a runner that is gone; no live process has it.
+DEAD_RUNNER_STARTTIME = 111
+
+
+def stage_dead_run(
+    store: RunStore,
+    run_id: str,
+    config: Path,
+    experiment_id: str,
+    *,
+    cleanup_uncertain: bool,
+    allow_cancel: bool = False,
+) -> RunHandle:
+    """Persist a spawned run of ``config`` whose runner has exited, as recover-run finds it."""
+    snapshot = config.read_bytes()
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=experiment_id,
+        config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        pid=reaped_pid(),
+        starttime=DEAD_RUNNER_STARTTIME,
+        allow_cancel=allow_cancel,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(snapshot)
+    if cleanup_uncertain:
+        store.mark_cleanup_uncertain(handle)
+    return handle
+
+
+def write_unsafe_cleanup_status(store: RunStore, run_id: str, **extra: object) -> None:
+    """Record the terminal status of a run whose process-group cleanup was never confirmed."""
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        **extra,
+    )
 
 
 def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
