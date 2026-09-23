@@ -25,6 +25,7 @@ import ast
 import contextlib
 import hashlib
 import importlib
+import json
 import pickle
 import pkgutil
 import pwd
@@ -570,6 +571,32 @@ def _finalize_complete_snapshot_unwritable(
     )
 
 
+def _registered_entry(experiment: Experiment, trial_dir: Path) -> Path:
+    """Register one attempt of phase ``p`` and return its registry entry file."""
+    _register_active_attempt(
+        experiment,
+        attempt_id="attempt",
+        phase_name="p",
+        study_name="t::p",
+        trial_number=0,
+        trial_dir=trial_dir,
+        generation_id="generation",
+    )
+    return _attempts_dir(experiment) / "attempt.json"
+
+
+def _recover_over_malformed_registry_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Inspect recovery while an attempt registry entry no longer parses."""
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
+    trial_dir = tmp_path / "attempt"
+    trial_dir.mkdir()
+    _garbage(_registered_entry(materialized.experiment, trial_dir))
+    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
+
+
 def _accepted_target_study(name: str, target: int) -> optuna.Study:
     """Return an empty current-format study that already accepted ``target`` trials."""
     study = optuna.create_study(study_name=name)
@@ -757,6 +784,16 @@ WRAP_CASES = (
         cause=None,
         message="failed to finalize terminal result snapshot for wrap-recover: "
         "PlatformCapabilityError",
+    ),
+    WrapCase(
+        # recover-run reads the same entry, so routing it back to recover-run
+        # would loop; the entry itself is what the operator repairs.
+        id="recover_run_malformed_registry_entry",
+        trigger=_recover_over_malformed_registry_entry,
+        outbound=RunRecoveryError,
+        action=OperatorAction.RESTORE_TREE,
+        cause=None,
+        message="delete the entry file if you are certain nothing is running.",
     ),
     WrapCase(
         id="sqlite_unopenable",
@@ -998,6 +1035,43 @@ def _wandb_sdk_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     return require_wandb_sdk()
 
 
+def _rewrite_entry(entry: Path, change: Callable[[dict[str, object]], None]) -> None:
+    """Apply ``change`` to a registry entry's payload, keeping its owner-only file."""
+    payload = json.loads(entry.read_text())
+    change(payload)
+    entry.write_text(json.dumps(payload))
+
+
+def _foreign_locator(entry: Path) -> None:
+    """Point a registry entry at a storage backend this release does not retain."""
+    _rewrite_entry(entry, lambda payload: payload.update(storage_locator="postgresql://h/db"))
+
+
+def _field_dropped(entry: Path) -> None:
+    """Drop a field every current registry entry carries."""
+    _rewrite_entry(entry, lambda payload: payload.pop("generation_id"))
+
+
+def _registry_entry_damaged(damage: Callable[[Path], None]) -> Trigger:
+    """Preflight a registry whose one entry, for a real trial directory, was damaged."""
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        experiment = make_experiment(workdir=tmp_path / "runs")
+        trial_dir = tmp_path / "attempt"
+        trial_dir.mkdir()
+        damage(_registered_entry(experiment, trial_dir))
+        return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    return trigger
+
+
+def _preflight_entry_without_trial_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Preflight a registry entry whose trial directory is gone."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    _registered_entry(experiment, tmp_path / "gone")
+    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+
 def _recover_during_launch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Recover a run id while another MCP launch holds the launch lock."""
     state_dir = tmp_path / "mcp-state"
@@ -1047,6 +1121,9 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
         earlier_boot=False,
         cleanup_recorded=False,
     )
+
+
+_DELETE_ENTRY_IF_IDLE = "Delete the entry file only if you are certain no process"
 
 
 ORIGIN_CASES = (
@@ -1133,6 +1210,34 @@ ORIGIN_CASES = (
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message='python -m pip install "phasesweep[wandb]"',
+    ),
+    OriginCase(
+        id="registry_entry_unparseable",
+        trigger=_registry_entry_damaged(_garbage),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message="delete the entry file if you are certain nothing is running.",
+    ),
+    OriginCase(
+        id="registry_entry_foreign_locator",
+        trigger=_registry_entry_damaged(_foreign_locator),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message=_DELETE_ENTRY_IF_IDLE,
+    ),
+    OriginCase(
+        id="registry_entry_partial_schema",
+        trigger=_registry_entry_damaged(_field_dropped),
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message=_DELETE_ENTRY_IF_IDLE,
+    ),
+    OriginCase(
+        id="registry_entry_trial_dir_missing",
+        trigger=_preflight_entry_without_trial_dir,
+        raised=ProcessCleanupUncertainError,
+        action=OperatorAction.RESTORE_TREE,
+        message="Delete the entry file only if you are certain nothing is running.",
     ),
     OriginCase(
         id="recover_during_launch",

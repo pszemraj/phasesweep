@@ -319,6 +319,8 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     :raises ProcessCleanupUncertainError: The entry is unreadable or malformed
         — recovery cannot know whether a process from it is still alive.
     """
+    # recover-run loads every entry through here too, so it cannot clear a bad
+    # one: the entry file is what the operator repairs or removes.
     try:
         payload = strict_json_loads(read_private_text_at(directory_fd, entry_path.name, entry_path))
     except (OSError, PlatformCapabilityError, UnsafePrivatePathError, ValueError) as exc:
@@ -326,7 +328,8 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             f"Attempt registry entry {entry_path} is unreadable or malformed. "
             "Recovery cannot prove whether a process from this attempt is still "
             "alive. Investigate the attempt's trial directory, then delete the "
-            "entry file if you are certain nothing is running."
+            "entry file if you are certain nothing is running.",
+            action=OperatorAction.RESTORE_TREE,
         ) from exc
     locator_identity: str | None = None
     if isinstance(payload, dict) and isinstance(payload.get("storage_locator"), str):
@@ -336,7 +339,8 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             raise ProcessCleanupUncertainError(
                 f"Attempt registry entry {entry_path} has an unsupported or partial "
                 "schema. Delete the entry file only if you are certain no process "
-                "from this attempt is running."
+                "from this attempt is running.",
+                action=OperatorAction.RESTORE_TREE,
             ) from exc
     if (
         not isinstance(payload, dict)
@@ -364,7 +368,8 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} has an unsupported or partial "
             "schema. Delete the entry file only if you are certain no process "
-            "from this attempt is running."
+            "from this attempt is running.",
+            action=OperatorAction.RESTORE_TREE,
         )
     return payload
 
@@ -410,11 +415,14 @@ def _registry_attempt_process_is_resolved(
     """
     attempt_id = entry["attempt_id"]
     trial_dir = Path(entry["trial_dir"])
+    # Inspection and confirmed recovery both stop here, so recover-run cannot
+    # clear this entry; the operator repairs or removes it.
     if not trial_dir.is_dir():
         raise ProcessCleanupUncertainError(
             f"Attempt registry entry {entry_path} points at a missing trial "
             f"directory {trial_dir}; its process state cannot be verified. "
-            "Delete the entry file only if you are certain nothing is running."
+            "Delete the entry file only if you are certain nothing is running.",
+            action=OperatorAction.RESTORE_TREE,
         )
     try:
         lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=attempt_id)
