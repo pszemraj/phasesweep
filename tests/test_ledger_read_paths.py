@@ -52,7 +52,6 @@ from tests.conftest import reaped_pid
 from tests.ledger_fixtures import (
     LEDGER_MODES,
     Materialized,
-    _tree_bytes,
     copy_fixture,
     discover_ledger_fixtures,
     fixture_by_name,
@@ -60,6 +59,7 @@ from tests.ledger_fixtures import (
     ledger_file,
     materialize,
     tree_changes,
+    tree_snapshot,
 )
 from tests.mcp_helpers import make_run_handle
 
@@ -208,7 +208,7 @@ def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, d
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config_bytes)
     store.mark_cleanup_uncertain(handle)
-    state_before = _tree_bytes(state_dir)
+    state_before = tree_snapshot(state_dir)
     messages: list[str] = []
     try:
         recover_run(state_dir, run_id, confirm=False, emit=messages.append)
@@ -219,7 +219,7 @@ def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, d
     else:
         assert messages, "recovery preflight reported nothing"
         verdict = "ok"
-    return verdict, tree_changes(state_before, _tree_bytes(state_dir))
+    return verdict, tree_changes(state_before, tree_snapshot(state_dir))
 
 
 def _mode_cells() -> list[Any]:
@@ -365,7 +365,7 @@ def test_precutover_mcp_state_is_refused_without_writing(entry_point: str, tmp_p
     assert fixture.modes == (), "the MCP state fixture carries no ledger read modes"
     root = copy_fixture("precutover-mcp-state", tmp_path / "fixture")
     state_dir = root / "mcp_state"
-    before = _tree_bytes(root)
+    before = tree_snapshot(root)
 
     # The format refusal, not the missing-layout ValueError whose message also
     # names an "MCP state directory": that one would mean the copy is broken.
@@ -376,7 +376,7 @@ def test_precutover_mcp_state_is_refused_without_writing(entry_point: str, tmp_p
             RunStore(state_dir)
 
     assert type(excinfo.value) is UnsupportedStateFormatError
-    assert tree_changes(before, _tree_bytes(root)) == {}
+    assert tree_changes(before, tree_snapshot(root)) == {}
 
 
 @pytest.mark.parametrize("fixture_name", ["current-sqlite", "current-journal"])

@@ -51,7 +51,7 @@ LEDGER_MODES = ("tree", "ledger-only")
 TreeEntry = tuple[int, bytes | str | None]
 
 
-def _tree_bytes(root: Path) -> dict[str, TreeEntry]:
+def tree_snapshot(root: Path) -> dict[str, TreeEntry]:
     """Snapshot every entry below ``root``: its type, permission bits, and contents.
 
     A read path writes when it creates a directory, even an empty one, or
@@ -78,7 +78,7 @@ def _tree_bytes(root: Path) -> dict[str, TreeEntry]:
 def tree_changes(before: dict[str, TreeEntry], after: dict[str, TreeEntry]) -> dict[str, str]:
     """Describe how one tree snapshot differs from another.
 
-    :param dict[str, TreeEntry] before: Earlier :func:`_tree_bytes` snapshot.
+    :param dict[str, TreeEntry] before: Earlier :func:`tree_snapshot` snapshot.
     :param dict[str, TreeEntry] after: Later snapshot of the same root.
     :return dict[str, str]: Relative path to ``"added"``, ``"removed"``,
         ``"rewritten"``, or a mode change, for every entry that differs.
@@ -136,7 +136,7 @@ class Materialized:
         :return bool: ``True`` when no entry below ``root`` was added, removed,
             rewritten, or re-moded since materialization.
         """
-        return _tree_bytes(self.root) == self.before
+        return tree_snapshot(self.root) == self.before
 
     def changes(self) -> dict[str, str]:
         """Describe how the materialized tree differs from its snapshot.
@@ -144,7 +144,7 @@ class Materialized:
         :return dict[str, str]: Relative path to what changed, per
             :func:`tree_changes`.
         """
-        return tree_changes(self.before, _tree_bytes(self.root))
+        return tree_changes(self.before, tree_snapshot(self.root))
 
 
 def discover_ledger_fixtures() -> list[LedgerFixture]:
@@ -334,7 +334,7 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
         experiment=experiment,
         config_path=tmp_path / "experiment.yaml",
         ledger_dir=root / "ledger",
-        before=_tree_bytes(root),
+        before=tree_snapshot(root),
     )
 
 

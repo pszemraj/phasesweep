@@ -51,11 +51,11 @@ from phasesweep.mcp.recovery import (
 from phasesweep.mcp.runs import RunStore
 from tests.conftest import make_experiment, mark_current_format, reaped_pid, write_constant_trainer
 from tests.ledger_fixtures import (
-    _tree_bytes,
     leave_hot_journal,
     ledger_file,
     materialize,
     rollback_journal,
+    tree_snapshot,
 )
 from tests.mcp_helpers import make_run_handle
 
@@ -82,7 +82,7 @@ def test_pre_cutover_memory_output_is_refused_before_mutation(
     state = root / durable_entry
     state.mkdir(parents=True)
     (state / "old-state").write_text("0.3.1\n", encoding="utf-8")
-    before = _tree_bytes(root)
+    before = tree_snapshot(root)
 
     with pytest.raises(
         ArtifactRootConflictError,
@@ -90,7 +90,7 @@ def test_pre_cutover_memory_output_is_refused_before_mutation(
     ):
         run_experiment(experiment)
 
-    assert _tree_bytes(root) == before
+    assert tree_snapshot(root) == before
     assert not _artifact_root_binding_path(experiment).exists()
 
 
@@ -115,7 +115,7 @@ def test_pre_cutover_artifact_binding_version_is_refused_before_mutation(
         + "\n",
         encoding="utf-8",
     )
-    before = _tree_bytes(root)
+    before = tree_snapshot(root)
 
     with pytest.raises(
         ArtifactRootConflictError,
@@ -123,7 +123,7 @@ def test_pre_cutover_artifact_binding_version_is_refused_before_mutation(
     ):
         run_experiment(experiment)
 
-    assert _tree_bytes(root) == before
+    assert tree_snapshot(root) == before
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
@@ -634,7 +634,7 @@ def test_reads_report_an_interrupted_transaction_and_leave_it_for_a_locked_path(
     materialized = materialize("current-sqlite", tmp_path, mode=mode)
     experiment = materialized.experiment
     leave_hot_journal(ledger_file(materialized, "sqlite"))
-    before = _tree_bytes(materialized.root)
+    before = tree_snapshot(materialized.root)
 
     ledger = validate_ledger(experiment)
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.ledger"):
@@ -652,7 +652,7 @@ def test_reads_report_an_interrupted_transaction_and_leave_it_for_a_locked_path(
         assert _INTERRUPTED in str(refusal)
         assert "`phasesweep mcp recover-run --confirm`" in str(refusal)
         assert refusal.actions == (OperatorAction.RUN_RECOVER_RUN,)
-    assert _tree_bytes(materialized.root) == before
+    assert tree_snapshot(materialized.root) == before
 
 
 def test_confirmed_recovery_rolls_back_an_interrupted_transaction(
@@ -774,7 +774,7 @@ def test_writers_refuse_a_partial_final_journal_record_and_leave_it(
     journal = ledger_file(materialized, "journal")
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS[damage])
-    before = _tree_bytes(materialized.root)
+    before = tree_snapshot(materialized.root)
     assert experiment.resolved_storage is not None
 
     assert validate_ledger(experiment).format_verified is True
@@ -792,7 +792,7 @@ def test_writers_refuse_a_partial_final_journal_record_and_leave_it(
         assert "ends with an incomplete record" in str(refusal)
         assert f"truncate -s {len(complete)} {journal}" in str(refusal)
         assert refusal.actions == (OperatorAction.RESTORE_LEDGER,)
-    assert _tree_bytes(materialized.root) == before
+    assert tree_snapshot(materialized.root) == before
 
 
 @pytest.mark.integration
