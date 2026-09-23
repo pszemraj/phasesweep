@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import NamedTuple
 
 import optuna
 
 from phasesweep.config import Experiment, load_config
-from phasesweep.engine.paths import _trial_dir_for
+from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
 from phasesweep.engine.state import (
+    ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
+    TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
+    TRIAL_TARGET_ATTR,
 )
+from phasesweep.engine.trial import _environment_identity
 from phasesweep.runtime.process import _write_process_identity
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
@@ -56,6 +63,84 @@ def _new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
     )
     mark_current_format(experiment, study)
     return study
+
+
+class StaleTrial(NamedTuple):
+    """A RUNNING trial an orchestrator abandoned: its study, directory and number."""
+
+    study: optuna.Study
+    trial_dir: Path
+    number: int
+
+
+def stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
+    """Bind a hand-built study to the artifact root a prior run would have claimed."""
+    # A study an earlier invocation left behind always carries this binding.
+    # Without it, preflight refuses the run as pre-cutover state, which
+    # preempts the current-format recovery behavior under test.
+    study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
+
+
+def fabricate_stale_trial(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    attempt_id: str,
+    generation_id: str = "old-generation",
+    persist_attempt_id: bool = True,
+    persist_generation_id: bool = True,
+) -> StaleTrial:
+    """Create the phase study, as a crashed engine run leaves it, holding one attribute-complete RUNNING trial."""
+    study = _new_phase_study(experiment, phase_name)
+    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
+    study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
+    stamp_artifact_root(study, experiment)
+    trial = study.ask()
+    identity = _environment_identity(experiment, phase_name)
+    trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
+    trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
+    trial_dir = _trial_dir_for(
+        experiment,
+        phase_name,
+        trial.number,
+        generation_id=generation_id,
+        attempt_id=attempt_id,
+    )
+    trial_dir.mkdir(parents=True)
+    if persist_generation_id:
+        trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
+    if persist_attempt_id:
+        trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
+    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    return StaleTrial(study, trial_dir, trial.number)
+
+
+def fabricate_registered_attempt(
+    experiment: Experiment,
+    phase_name: str,
+    *,
+    attempt_id: str,
+    persist_trial_attempt_id: bool = True,
+    persist_trial_generation_id: bool = True,
+) -> StaleTrial:
+    """Leave the stale trial :func:`fabricate_stale_trial` does, plus its attempt-registry entry."""
+    stale = fabricate_stale_trial(
+        experiment,
+        phase_name,
+        attempt_id=attempt_id,
+        persist_attempt_id=persist_trial_attempt_id,
+        persist_generation_id=persist_trial_generation_id,
+    )
+    _register_active_attempt(
+        experiment,
+        attempt_id=attempt_id,
+        phase_name=phase_name,
+        study_name=stale.study.study_name,
+        trial_number=stale.number,
+        trial_dir=stale.trial_dir,
+        generation_id="old-generation",
+    )
+    return stale
 
 
 def write_launched_stale_trial(

@@ -50,7 +50,6 @@ from phasesweep.engine.guards import _preflight_existing_studies, _reconcile_exi
 from phasesweep.engine.paths import _attempts_dir, _experiment_dir, _trial_dir_for
 from phasesweep.engine.phase import _run_phase
 from phasesweep.engine.state import (
-    ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
@@ -90,7 +89,12 @@ from tests.conftest import (
 )
 from tests.ledger_fixtures import _write_config
 from tests.mcp_helpers import make_run_handle
-from tests.recovery_helpers import write_trial_identity
+from tests.recovery_helpers import (
+    fabricate_registered_attempt,
+    fabricate_stale_trial,
+    stamp_artifact_root,
+    write_trial_identity,
+)
 
 
 def test_read_proc_starttime_self():
@@ -147,20 +151,6 @@ def test_is_same_live_process_fails_closed_when_proc_entry_is_unreadable(
     monkeypatch.setattr(Path, "read_bytes", deny_proc_reads)
 
     assert is_same_live_process(pid, saved_starttime) is False
-
-
-def _stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
-    """Bind a hand-built study to the artifact root a prior run would have claimed.
-
-    A fabricated populated study stands in for one an earlier invocation left
-    behind, and such a study always carries its artifact-root binding. Without
-    it, preflight refuses the run as pre-cutover state, which preempts the
-    current-format recovery behavior these fixtures are about.
-
-    :param optuna.Study study: Fabricated study to bind.
-    :param Experiment experiment: Experiment whose resolved root it publishes into.
-    """
-    study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
 
 
 def _claimed_over(
@@ -274,7 +264,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         ],
     )
 
-    _stamp_artifact_root(study, exp)
+    stamp_artifact_root(study, exp)
     identity = _environment_identity(exp)
     t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     t.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
@@ -342,7 +332,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
             study_name="cross_phase_orphan::b", storage=storage, direction="minimize"
         )
         mark_current_format(experiment, study)
-        _stamp_artifact_root(study, experiment)
+        stamp_artifact_root(study, experiment)
         study.set_user_attr(TRIAL_TARGET_ATTR, experiment.phases[1].n_trials)
         trial = study.ask()
         trial_dir = _trial_dir_for(
@@ -404,7 +394,7 @@ def test_current_schema_rejects_terminal_trial_without_policy_outcome(
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     study.set_user_attr(TRIAL_TARGET_ATTR, experiment.phases[0].n_trials)
-    _stamp_artifact_root(study, experiment)
+    stamp_artifact_root(study, experiment)
     study.add_trial(optuna.trial.create_trial(value=0.25, state=optuna.trial.TrialState.COMPLETE))
 
     with pytest.raises(
@@ -1114,45 +1104,6 @@ def test_reaper_reports_storage_failures_after_cleanup(
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
 
-def _fabricate_stale_running_trial(
-    experiment: Experiment,
-    phase_name: str,
-    *,
-    attempt_id: str,
-    generation_id: str = "old-generation",
-    persist_attempt_id: bool = True,
-    persist_generation_id: bool = True,
-) -> tuple[optuna.Study, Path, int]:
-    """Create the phase study with one attribute-complete RUNNING trial."""
-    study = optuna.create_study(
-        study_name=f"{experiment.experiment}::{phase_name}",
-        storage=experiment.storage,
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
-    phase = next(phase for phase in experiment.phases if phase.name == phase_name)
-    study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
-    _stamp_artifact_root(study, experiment)
-    trial = study.ask()
-    identity = _environment_identity(experiment, phase_name)
-    trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
-    trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase_name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
-    trial_dir.mkdir(parents=True)
-    if persist_generation_id:
-        trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
-    if persist_attempt_id:
-        trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
-    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-    return study, trial_dir, trial.number
-
-
 @pytest.mark.integration
 def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -> None:
     """A worker killed while queued for a GPU leaves 'allocated' and no identity.
@@ -1172,9 +1123,7 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
-    study, trial_dir, stale_number = _fabricate_stale_running_trial(
-        exp, "p", attempt_id="queued-attempt"
-    )
+    study, trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="queued-attempt")
     study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
     write_attempt_lifecycle(trial_dir, attempt_id="queued-attempt", state="allocated")
 
@@ -1201,9 +1150,7 @@ def test_exited_attempt_recovers_without_signalling(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'e.db'}",
     )
-    study, trial_dir, stale_number = _fabricate_stale_running_trial(
-        exp, "p", attempt_id="exited-attempt"
-    )
+    study, trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="exited-attempt")
     child = subprocess.Popen(["sleep", "30"], start_new_session=True)
     try:
         starttime = read_proc_starttime(child.pid)
@@ -1256,9 +1203,7 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     recovering = _write_config(
         config_a, backend="sqlite", ledger_dir=ledger_dir, workdir=tmp_path / "a"
     )
-    study, trial_dir, owned_number = _fabricate_stale_running_trial(
-        owner, "p", attempt_id="b-attempt"
-    )
+    study, trial_dir, owned_number = fabricate_stale_trial(owner, "p", attempt_id="b-attempt")
     write_attempt_lifecycle(trial_dir, attempt_id="b-attempt", state="allocated")
     ledger_file = ledger_dir / "study.db"
     before = ledger_file.read_bytes()
@@ -1288,34 +1233,6 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     assert isinstance(excinfo.value.__cause__, ArtifactRootConflictError)
     assert str(excinfo.value) == str(excinfo.value.__cause__)
     assert f"publishes into artifact root {str(_experiment_dir(owner))!r}" in str(excinfo.value)
-
-
-def _fabricate_registered_attempt(
-    experiment: Experiment,
-    phase_name: str,
-    *,
-    attempt_id: str,
-    persist_trial_attempt_id: bool = True,
-    persist_trial_generation_id: bool = True,
-) -> tuple[optuna.Study, Path, int]:
-    """Fabricate a stale RUNNING trial plus its attempt registry entry."""
-    study, trial_dir, number = _fabricate_stale_running_trial(
-        experiment,
-        phase_name,
-        attempt_id=attempt_id,
-        persist_attempt_id=persist_trial_attempt_id,
-        persist_generation_id=persist_trial_generation_id,
-    )
-    _register_active_attempt(
-        experiment,
-        attempt_id=attempt_id,
-        phase_name=phase_name,
-        study_name=study.study_name,
-        trial_number=number,
-        trial_dir=trial_dir,
-        generation_id="old-generation",
-    )
-    return study, trial_dir, number
 
 
 def _fabricate_registered_journal_attempt(
@@ -1432,7 +1349,7 @@ def test_registry_discards_attempt_whose_sqlite_ledger_is_gone_without_recreatin
         )
 
     gone = tmp_path / "gone.db"
-    _study, trial_dir, _number = _fabricate_registered_attempt(
+    _study, trial_dir, _number = fabricate_registered_attempt(
         _exp("gone.db"), "p", attempt_id="gone-attempt"
     )
     write_attempt_lifecycle(trial_dir, attempt_id="gone-attempt", state="allocated")
@@ -1644,7 +1561,7 @@ def test_relative_registry_storage_recovers_from_the_registration_cwd(
         storage="sqlite:///studies.db",
         n_trials=1,
     )
-    study, trial_dir, stale_number = _fabricate_registered_attempt(
+    study, trial_dir, stale_number = fabricate_registered_attempt(
         experiment,
         "p",
         attempt_id="relative-attempt",
@@ -1674,7 +1591,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
-    study, trial_dir, stale_number = _fabricate_registered_attempt(
+    study, trial_dir, stale_number = fabricate_registered_attempt(
         experiment,
         "p",
         attempt_id="partial-attempt",
@@ -1735,7 +1652,7 @@ def test_registry_generation_conflict_is_study_schema_mismatch(tmp_path: Path) -
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'conflict.db'}",
     )
-    _study, trial_dir, _number = _fabricate_registered_attempt(
+    _study, trial_dir, _number = fabricate_registered_attempt(
         experiment,
         "p",
         attempt_id="conflicting-attempt",
@@ -1780,7 +1697,7 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
         )
 
     old_exp = _exp("old_phase")
-    old_study, trial_dir, stale_number = _fabricate_registered_attempt(
+    old_study, trial_dir, stale_number = fabricate_registered_attempt(
         old_exp, "old_phase", attempt_id="renamed-attempt"
     )
     stale = subprocess.Popen(["sleep", "60"], start_new_session=True)
@@ -1819,7 +1736,7 @@ def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
     old = make_experiment(
         workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'study.db'}", n_trials=1
     )
-    study, trial_dir, number = _fabricate_registered_attempt(old, "p", attempt_id="remote-attempt")
+    study, trial_dir, number = fabricate_registered_attempt(old, "p", attempt_id="remote-attempt")
     started = tmp_path / "worker-started"
     wandb_worker_sdk(f"""
         import time
@@ -1889,7 +1806,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
         )
 
     old_exp = _exp("old.db")
-    old_study, trial_dir, stale_number = _fabricate_registered_attempt(
+    old_study, trial_dir, stale_number = fabricate_registered_attempt(
         old_exp, "p", attempt_id="moved-attempt"
     )
     write_attempt_lifecycle(trial_dir, attempt_id="moved-attempt", state="allocated")
