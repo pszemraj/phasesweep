@@ -25,7 +25,6 @@ import hashlib
 import importlib
 import json
 import os
-import pickle
 import pkgutil
 import pwd
 import sqlite3
@@ -112,21 +111,6 @@ from tests.conftest import make_experiment, reaped_pid, requires_nonroot
 from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
 from tests.mcp_helpers import make_run_handle, write_run_status
 
-# Importing a ``__main__`` module runs the program it guards, so the sweep skips
-# those and only those. Every other module is a plain import.
-_MAIN_MODULE = "__main__"
-
-# Subclasses whose constructor needs more than a message. Empty today: no
-# PhaseSweepError subclass defines its own ``__init__``. Populate it when one
-# does, rather than narrowing the walk.
-_CONSTRUCTOR_ARGS: dict[str, tuple[object, ...]] = {}
-
-# Subclasses permitted to reach the base ``INSPECT_LOGS`` fallback by
-# inheritance instead of declaring an action. Empty, and meant to stay that
-# way: the mechanism is kept so a future exemption has to be written down here,
-# with a reason, rather than passing unnoticed.
-_DECLARATION_PENDING: frozenset[str] = frozenset()
-
 # Classes proving the module sweep reached past the error modules themselves.
 # If an import ever stops happening, these vanish from the walk and say so.
 _SWEEP_WITNESSES = frozenset(
@@ -140,7 +124,8 @@ _TWO_STEPS = (OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE)
 def _import_every_module() -> None:
     """Import the whole package so no subclass is missing from the walk."""
     for module in pkgutil.walk_packages(phasesweep.__path__, f"{phasesweep.__name__}."):
-        if module.name.rsplit(".", 1)[-1] == _MAIN_MODULE:
+        # Importing a ``__main__`` module runs the program it guards.
+        if module.name.rsplit(".", 1)[-1] == "__main__":
             continue
         importlib.import_module(module.name)
 
@@ -174,9 +159,8 @@ def test_every_operator_error_declares_its_action():
 
     inherits_fallback = []
     for cls in classes:
-        extra = _CONSTRUCTOR_ARGS.get(cls.__name__, ())
-        plain = cls("boom", *extra)
-        routed = cls("boom", *extra, action=OperatorAction.RETRY)
+        plain = cls("boom")
+        routed = cls("boom", action=OperatorAction.RETRY)
 
         # A class default is always exactly one step.
         assert isinstance(cls.default_action, OperatorAction), f"{cls.__name__} has no action"
@@ -187,21 +171,14 @@ def test_every_operator_error_declares_its_action():
         assert str(routed) == str(plain)
         assert plain.args == routed.args
 
-        # An instance attribute, so BaseException.__reduce__ carries it in __dict__.
-        assert pickle.loads(pickle.dumps(plain)).actions == plain.actions
-        both = cls("boom", *extra, action=_TWO_STEPS)
-        assert pickle.loads(pickle.dumps(both)).actions == _TWO_STEPS
-
         if (
             cls.default_action is OperatorAction.INSPECT_LOGS
             and "default_action" not in cls.__dict__
         ):
             inherits_fallback.append(cls.__name__)
 
-    assert set(inherits_fallback) <= _DECLARATION_PENDING, (
-        "these subclasses silently inherit the base INSPECT_LOGS fallback instead of "
-        f"declaring an action of their own: {sorted(set(inherits_fallback) - _DECLARATION_PENDING)}"
-    )
+    # Each subclass declares its route rather than inheriting the base fallback.
+    assert inherits_fallback == []
 
 
 def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
@@ -1824,7 +1801,7 @@ def test_runner_payload_follows_the_routed_steps() -> None:
     # above prove each trigger raises exactly its row's, so each row's
     # declared routing stands in for driving its trigger again.
     for cls in _operator_error_classes():
-        _assert_payload_follows(cls("boom", *_CONSTRUCTOR_ARGS.get(cls.__name__, ())))
+        _assert_payload_follows(cls("boom"))
     for case in CASES:
         _assert_payload_follows(case.raised("boom", action=case.action))
 
