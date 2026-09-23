@@ -48,7 +48,7 @@ pre-commit install
 | --- | --- | --- |
 | `ruff check --fix`, `ruff format` | commit | changed Python files |
 | `pathlint` | commit | changed `src/` and `tests/` Python files |
-| `doc-check` | commit | changed `src/` files, with `--strict` |
+| `doc-check` | commit | changed `src/` Python files, with `--strict` |
 | contract tests | commit | every commit |
 | `mypy src` | push | the whole package |
 
@@ -229,7 +229,8 @@ flowchart TD
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if
   it preserves the current last-successful pointer and all cited winner
   provenance.
-- TODO(engine): keep docs/invariants.md in step with the ledger chokepoint.
-  A storage constructor outside `engine/ledger.py` already fails
-  tests/test_ledger_contract.py; a new ordering rule or ledger entry point
-  needs its own entry there, citing the code and the test that hold it.
+- TODO(engine): Keep [durability invariants](invariants.md) in step with the
+  ledger chokepoint. A storage constructor outside `engine/ledger.py` already
+  fails `tests/test_ledger_contract.py`, but a new ordering rule or ledger
+  entry point needs its own invariant entry, citing the code and the test
+  that hold it.
