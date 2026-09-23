@@ -109,6 +109,14 @@ class FailurePayload(FailureCausePayload):
     cause: FailureCausePayload | None = None
 
 
+# What a cleanup-uncertain failure asks the operator to restore before
+# recover-run, one phrase per restoring action the raise site requires.
+_CLEANUP_RESTORES: dict[OperatorAction, str] = {
+    OperatorAction.RESTORE_LEDGER: "the original complete storage ledger and access to it",
+    OperatorAction.RESTORE_TREE: "the experiment tree's original files and permissions",
+}
+
+
 def _base_failure_payload(
     error: BaseException,
     *,
@@ -239,18 +247,20 @@ def _base_failure_payload(
             ),
         }
     if isinstance(error, ProcessCleanupUncertainError):
-        # Whether the ledger must come back before recover-run is the raise
-        # site's decision, carried as its action; the chained cause is history.
+        # What must come back before recover-run is the raise site's decision,
+        # carried as its actions; the chained cause is history.
+        restores = [
+            _CLEANUP_RESTORES[action] for action in error.actions if action in _CLEANUP_RESTORES
+        ]
+        restore = f"restore {', plus '.join(restores)}, then " if restores else ""
         return {
             "code": "cleanup_uncertain",
             "stage": "cleanup",
             "retryable": False,
             "actor": "operator",
             "remediation": (
-                "Ask the operator to restore the original complete storage ledger and "
-                "access to it, then run phasesweep mcp recover-run before another launch."
-                if error.action is OperatorAction.RESTORE_LEDGER
-                else "Ask the operator to run phasesweep mcp recover-run before another launch."
+                f"Ask the operator to {restore}run phasesweep mcp recover-run before another "
+                "launch."
             ),
         }
     if isinstance(error, NoFeasibleTrialError):

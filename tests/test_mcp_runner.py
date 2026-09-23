@@ -1553,7 +1553,7 @@ def test_terminal_report_marks_failed_root_discovery_uncertain(
         run_experiment(experiment, terminal_callback=captured.append)
 
     assert isinstance(exc_info.value.__cause__, NoFeasibleTrialError)
-    assert exc_info.value.action is OperatorAction.RUN_RECOVER_RUN
+    assert exc_info.value.actions == (OperatorAction.RUN_RECOVER_RUN,)
     assert registry_scans == 1
     assert len(captured) == 1
     assert isinstance(captured[0].primary_error, NoFeasibleTrialError)
@@ -1586,11 +1586,27 @@ _RESTORE_LEDGER_FIRST = (
     "then run phasesweep mcp recover-run before another launch."
 )
 _RECOVER_RUN_ONLY = "Ask the operator to run phasesweep mcp recover-run before another launch."
+_RESTORE_TREE_FIRST = (
+    "Ask the operator to restore the experiment tree's original files and permissions, "
+    "then run phasesweep mcp recover-run before another launch."
+)
+_RESTORE_BOTH_FIRST = (
+    "Ask the operator to restore the original complete storage ledger and access to it, "
+    "plus the experiment tree's original files and permissions, then run phasesweep mcp "
+    "recover-run before another launch."
+)
 
 
 @pytest.mark.parametrize(
     ("action", "cause", "remediation"),
     [
+        pytest.param(
+            (OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
+            None,
+            _RESTORE_BOTH_FIRST,
+            id="restore-ledger-and-tree",
+        ),
+        pytest.param(OperatorAction.RESTORE_TREE, None, _RESTORE_TREE_FIRST, id="restore-tree"),
         pytest.param(
             OperatorAction.RESTORE_LEDGER,
             StudyStorageUnavailableError("ledger unreadable"),
@@ -1613,7 +1629,7 @@ _RECOVER_RUN_ONLY = "Ask the operator to run phasesweep mcp recover-run before a
     ],
 )
 def test_cleanup_uncertain_remediation_follows_the_operator_action(
-    action: OperatorAction | None,
+    action: OperatorAction | tuple[OperatorAction, ...] | None,
     cause: BaseException | None,
     remediation: str,
 ) -> None:

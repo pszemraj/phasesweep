@@ -1,10 +1,10 @@
-"""Contract tests for the operator action every PhaseSweepError carries.
+"""Contract tests for the operator actions every PhaseSweepError carries.
 
-``action`` is a *routing* attribute: it names the one remediation an operator
-should attempt, so a caller can steer a failure without parsing prose. The
+``actions`` is a *routing* attribute: it names the remediation an operator
+should carry out, so a caller can steer a failure without parsing prose. The
 message text stays authoritative about what went wrong, and these tests pin
 that separation down in both directions -- every operator-facing error resolves
-to a real ``OperatorAction``, and attaching one never edits the message.
+to real ``OperatorAction`` steps, and attaching them never edits the message.
 
 The class walk below is deliberately exhaustive rather than a hand-maintained
 list: it imports every module in the package and then recurses through
@@ -15,11 +15,13 @@ The wrap table near the end carries the same contract across layer boundaries: a
 remediation survives each translation unless the site deliberately composes or
 replaces it, and every such site is driven for real rather than in isolation.
 The origin table after it holds raises whose message names its own remedy to the
-action that routes it.
+action that routes it. The last test keeps multi-step remediations rare: every
+raise that requires more than one step must be on an explicit allowlist.
 """
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import hashlib
 import importlib
@@ -67,6 +69,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
@@ -112,6 +115,26 @@ _SWEEP_WITNESSES = frozenset(
     {"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError", "_PolicyStateWriteError"}
 )
 
+# A remediation of two required steps, for exercising the multi-step path.
+_TWO_STEPS = (OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE)
+
+# Every raise that requires more than one remedy step, as (module under src/,
+# enclosing function, steps in order). Asserted exactly, like the ledger
+# contract's ratchets: a new multi-step raise fails until it is written down
+# here, so a second step is a reviewed decision. Alternatives the operator would
+# choose between never belong here; their raise routes the first option alone.
+_MULTI_STEP_RAISES = frozenset(
+    {
+        # Either the ledger's attempt id or the tree's identity files may be the
+        # side that changed, and the operator cannot tell which, so both return.
+        (
+            "phasesweep/engine/attempts.py",
+            "_read_trial_process_identity",
+            ("RESTORE_LEDGER", "RESTORE_TREE"),
+        ),
+    }
+)
+
 
 def _import_every_module() -> None:
     """Import the whole package so no subclass is missing from the walk."""
@@ -154,16 +177,19 @@ def test_every_operator_error_declares_its_action():
         plain = cls("boom", *extra)
         routed = cls("boom", *extra, action=OperatorAction.RETRY)
 
-        assert isinstance(plain.action, OperatorAction), f"{cls.__name__} has no routed action"
-        assert plain.action == cls.default_action
-        assert routed.action is OperatorAction.RETRY
+        # A class default is always exactly one step.
+        assert isinstance(cls.default_action, OperatorAction), f"{cls.__name__} has no action"
+        assert plain.actions == (cls.default_action,)
+        assert routed.actions == (OperatorAction.RETRY,)
 
         # The action is a routing attribute, never part of what the operator reads.
         assert str(routed) == str(plain)
         assert plain.args == routed.args
 
         # An instance attribute, so BaseException.__reduce__ carries it in __dict__.
-        assert pickle.loads(pickle.dumps(plain)).action == plain.action
+        assert pickle.loads(pickle.dumps(plain)).actions == plain.actions
+        both = cls("boom", *extra, action=_TWO_STEPS)
+        assert pickle.loads(pickle.dumps(both)).actions == _TWO_STEPS
 
         if (
             cls.default_action is OperatorAction.INSPECT_LOGS
@@ -182,27 +208,31 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     from phasesweep.mcp.recovery import RunRecoveryError
 
     inbound = StudyStorageUnavailableError("x")
-    assert inbound.action is OperatorAction.RESTORE_LEDGER
+    assert inbound.actions == (OperatorAction.RESTORE_LEDGER,)
 
     inherited = RunRecoveryError.rewrap(inbound, "y")
     assert isinstance(inherited, RunRecoveryError)
-    assert inherited.action is OperatorAction.RESTORE_LEDGER
+    assert inherited.actions == (OperatorAction.RESTORE_LEDGER,)
     assert str(inherited) == "y"
 
     overridden = RunRecoveryError.rewrap(inbound, "y", action=OperatorAction.FRESH_NAMESPACE)
-    assert overridden.action is OperatorAction.FRESH_NAMESPACE
+    assert overridden.actions == (OperatorAction.FRESH_NAMESPACE,)
     assert str(overridden) == "y"
+
+    # Every step a cause requires survives, in order; none is dropped for the first.
+    two_steps = RunRecoveryError.rewrap(ProcessCleanupUncertainError("x", action=_TWO_STEPS), "y")
+    assert two_steps.actions == _TWO_STEPS
 
     # A cause with no action of its own leaves the class default in place.
     foreign = RunRecoveryError.rewrap(OSError("disk"), "y")
-    assert foreign.action == RunRecoveryError.default_action
+    assert foreign.actions == (RunRecoveryError.default_action,)
 
     # rewrap returns; the caller still writes the `from` clause that links the cause.
     cause = StudyStorageUnavailableError("x")
     with pytest.raises(RunRecoveryError) as excinfo:
         raise RunRecoveryError.rewrap(cause, "y") from cause
     assert excinfo.value.__cause__ is cause
-    assert excinfo.value.action is OperatorAction.RESTORE_LEDGER
+    assert excinfo.value.actions == (OperatorAction.RESTORE_LEDGER,)
 
 
 @pytest.mark.parametrize(
@@ -230,7 +260,7 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
 def test_pre_cutover_refusals_route_to_the_prior_release(label, call):
     with pytest.raises(PhaseSweepError) as excinfo:
         call()
-    assert excinfo.value.action is OperatorAction.USE_PRIOR_RELEASE, label
+    assert excinfo.value.actions == (OperatorAction.USE_PRIOR_RELEASE,), label
     # The routed action is additional to, not a replacement for, the remedy prose.
     assert "0.3.1" in str(excinfo.value), label
 
@@ -247,7 +277,7 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
 
     with pytest.raises(PhaseSweepError) as excinfo:
         trial._trainer_environment(experiment, "p")
-    assert excinfo.value.action is OperatorAction.FIX_CONFIG
+    assert excinfo.value.actions == (OperatorAction.FIX_CONFIG,)
     assert str(excinfo.value) == (
         "W&B evidence requires online logging; remove offline/disabled W&B settings."
     )
@@ -739,7 +769,7 @@ def test_operator_action_survives_wrap(
 
     error = excinfo.value
     assert type(error) is case.outbound
-    assert error.action is case.action
+    assert error.actions == (case.action,)
     if case.cause is None:
         assert error.__cause__ is None
     else:
@@ -760,7 +790,8 @@ class OriginCase:
     #: Drives the real code path until the raise under test.
     trigger: Trigger
     raised: type[PhaseSweepError]
-    action: OperatorAction
+    #: The one remedy, or every required step in the order the message gives.
+    action: OperatorAction | tuple[OperatorAction, ...]
     #: Stable substring of the remedy the message gives today.
     message: str
 
@@ -861,6 +892,21 @@ def _inspect_uncertain_trial_without_attempt(
     return _inspect_cleanup_uncertain_trials(study, "p")
 
 
+def _inspect_uncertain_trial_without_identity_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Inspect a cleanup-uncertain trial whose attempt id no identity files back."""
+    study = optuna.create_study(study_name="t::p")
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    uncertain = study.ask()
+    uncertain.set_user_attr(ATTEMPT_ID_ATTR, "attempt")
+    uncertain.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
+    uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
+    study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
+    return _inspect_cleanup_uncertain_trials(study, "p")
+
+
 ORIGIN_CASES = (
     OriginCase(
         id="auto_storage_backend_switch",
@@ -904,6 +950,13 @@ ORIGIN_CASES = (
         action=OperatorAction.RESTORE_LEDGER,
         message="Process identity is unknown. Restore the original storage ledger",
     ),
+    OriginCase(
+        id="uncertain_trial_identity_files_mismatch",
+        trigger=_inspect_uncertain_trial_without_identity_files,
+        raised=ProcessCleanupUncertainError,
+        action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
+        message="Restore the original storage ledger and this attempt's process-identity files",
+    ),
 )
 
 
@@ -916,5 +969,54 @@ def test_origin_raises_route_by_their_message_remedy(
 
     error = excinfo.value
     assert type(error) is case.raised
-    assert error.action is case.action
+    expected = case.action if isinstance(case.action, tuple) else (case.action,)
+    assert error.actions == expected
     assert case.message in str(error)
+
+
+class _MultiStepActions(ast.NodeVisitor):
+    """Collect every ``action=`` given as a literal sequence, by enclosing function."""
+
+    def __init__(self, module: str) -> None:
+        self.module = module
+        self.scope: list[str] = []
+        self.found: set[tuple[str, str, tuple[str, ...]]] = set()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_Call(self, node: ast.Call) -> None:
+        for keyword in node.keywords:
+            if keyword.arg == "action" and isinstance(keyword.value, (ast.Tuple, ast.List)):
+                steps = tuple(
+                    element.attr if isinstance(element, ast.Attribute) else ast.unparse(element)
+                    for element in keyword.value.elts
+                )
+                scope = self.scope[-1] if self.scope else "<module>"
+                self.found.add((self.module, scope, steps))
+        self.generic_visit(node)
+
+
+def test_multi_step_remediations_are_deliberate() -> None:
+    """Only allowlisted raises require several steps, each a distinct real action."""
+    src = Path(__file__).resolve().parent.parent / "src"
+    found: set[tuple[str, str, tuple[str, ...]]] = set()
+    for path in sorted((src / "phasesweep").rglob("*.py")):
+        visitor = _MultiStepActions(path.relative_to(src).as_posix())
+        visitor.visit(ast.parse(path.read_text(), filename=str(path)))
+        found |= visitor.found
+
+    assert found == _MULTI_STEP_RAISES, (
+        "a raise now requires several remedy steps; if the operator must do every one, "
+        "add it to _MULTI_STEP_RAISES with the reason, and if they are alternatives, "
+        f"route the first alone. Unlisted: {sorted(found - _MULTI_STEP_RAISES)}; "
+        f"stale: {sorted(_MULTI_STEP_RAISES - found)}"
+    )
+    for _module, _function, steps in found:
+        assert len(steps) >= 2, f"a single step is spelled as one action, not {steps}"
+        assert len(set(steps)) == len(steps), f"repeated step in {steps}"
+        assert set(steps) <= set(OperatorAction.__members__), f"unknown step in {steps}"

@@ -1608,7 +1608,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         ProcessCleanupUncertainError, match="cleanup could not be confirmed"
     ) as excinfo:
         run_experiment(_exp(2))
-    assert excinfo.value.action is OperatorAction.RUN_RECOVER_RUN
+    assert excinfo.value.actions == (OperatorAction.RUN_RECOVER_RUN,)
 
     study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
     record = study.user_attrs[PHASE_ABORT_ATTR]

@@ -164,7 +164,9 @@ def _read_trial_process_identity(
             f"Refusing to recover trial {trial.number} in study {study_name}: its durable "
             f"process identity is missing, malformed, partial, or belongs to another attempt. "
             f"trial_dir={trial_dir}. Restore the original storage ledger and this attempt's "
-            "process-identity files before retrying recovery."
+            "process-identity files before retrying recovery.",
+            # Both, in order: either side may be the one that no longer matches.
+            action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
         ) from exc
 
 

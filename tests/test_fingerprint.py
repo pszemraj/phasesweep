@@ -1452,7 +1452,7 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
         run_experiment(experiment)
 
     assert isinstance(excinfo.value.__cause__, StudyStorageUnavailableError)
-    assert excinfo.value.action is OperatorAction.RESTORE_LEDGER
+    assert excinfo.value.actions == (OperatorAction.RESTORE_LEDGER,)
 
     for phase in experiment.phases:
         study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)

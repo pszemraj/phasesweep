@@ -331,7 +331,7 @@ def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_p
     assert _SCHEMA_MISMATCH_PHRASE in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, StudySchemaMismatchError)
     assert str(excinfo.value) == str(excinfo.value.__cause__)
-    assert excinfo.value.action is OperatorAction.USE_PRIOR_RELEASE
+    assert excinfo.value.actions == (OperatorAction.USE_PRIOR_RELEASE,)
     assert materialized.unchanged(), materialized.changes()
 
 

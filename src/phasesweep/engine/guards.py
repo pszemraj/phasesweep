@@ -204,10 +204,10 @@ def _preflight_existing_studies(
         )
         if unexpected is not None:
             raise RuntimeError(message) from unexpected
-        # No single error speaks for a mixed aggregate: it routes to an action
-        # only when every collected error names the same one, and otherwise
-        # falls back to the base default of reading the refusals it lists.
-        actions = {error.action for error in errors if isinstance(error, PhaseSweepError)}
-        shared = actions.pop() if len(actions) == 1 else None
+        # No single error speaks for a mixed aggregate: it routes to a
+        # remediation only when every collected error names the same steps, and
+        # otherwise falls back to the base default of reading the refusals it lists.
+        remediations = {error.actions for error in errors if isinstance(error, PhaseSweepError)}
+        shared = remediations.pop() if len(remediations) == 1 else None
         raise PhaseSweepError(message, action=shared) from first
     return studies

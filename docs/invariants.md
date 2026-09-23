@@ -269,13 +269,18 @@ decides; liveness alone never concludes a run.
 #### 15. Wraps keep the operator's remediation
 
 Every operator-facing error declares its remediation, and a wrap preserves it
-instead of replacing it with the wrapper's own advice.
+instead of replacing it with the wrapper's own advice. A remediation is one
+step unless the operator must do several, every one of them: alternatives
+route the first option alone, and retrying what failed is never a step. A raise
+that requires several steps is allowlisted in the routing test, so adding one
+is a reviewed decision.
 
-**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.action`,
+**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.actions`,
 `errors.PhaseSweepError.rewrap`\
 **Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`,
 `tests/test_error_routing.py::test_operator_action_survives_wrap`,
 `tests/test_error_routing.py::test_origin_raises_route_by_their_message_remedy`,
+`tests/test_error_routing.py::test_multi_step_remediations_are_deliberate`,
 `tests/test_mcp_runner.py::test_cleanup_uncertain_remediation_follows_the_operator_action`
 
 #### 16. Refusals are tested against real ledgers
