@@ -5285,7 +5285,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
         run_id=second_run,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999998,
+        pid=reaped_pid(),
         starttime=112,
     )
     store.create(second_handle)
