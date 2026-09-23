@@ -2018,49 +2018,16 @@ def _assert_payload_follows(error: PhaseSweepError) -> None:
         assert "only if certain nothing is running" in remediation
 
 
-def test_runner_payload_follows_every_class_default() -> None:
+def test_runner_payload_follows_the_routed_steps() -> None:
+    # The payload depends only on an error's type and actions, and the tables
+    # above prove each trigger raises exactly its row's, so each row's
+    # declared routing stands in for driving its trigger again.
     for cls in _operator_error_classes():
         _assert_payload_follows(cls("boom", *_CONSTRUCTOR_ARGS.get(cls.__name__, ())))
-
-
-_ROUTING_CASES: Mapping[str, WrapCase | OriginCase] = MappingProxyType(
-    {case.id: case for case in (*ORIGIN_CASES, *WRAP_CASES)}
-)
-
-
-@pytest.mark.parametrize(
-    "row",
-    [
-        # Every action, alone and in order, across the failure codes; the
-        # subclass rows route other than the type their code is keyed by.
-        "preflight_same_type_aggregate",
-        "recover_run_pre_cutover_state",
-        "sqlite_garbage",
-        "journal_final_record_incomplete",
-        "recovery_studies_storage_bound",
-        "recover_config_snapshot_missing",
-        "registry_entry_unparseable",
-        "sqlite_transaction_interrupted",
-        "run_failure_cleanup_replaces",
-        "environment_cohort_changed",
-        "auto_storage_backend_switch",
-        "lock_dir_override_relative",
-        "prior_phase_abort",
-        "wandb_sdk_missing",
-        "claim_ledger_tree_changed",
-        "claim_ledger_discovery_preserves_override",
-        "preflight_same_type_aggregate_disagreeing",
-        "recover_boot_id_unavailable",
-        "running_trial_lifecycle_mismatch",
-        "preflight_cleanup_aggregate_repairs",
-    ],
-)
-def test_runner_payload_follows_the_routed_steps(
-    row: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    with pytest.raises(PhaseSweepError) as excinfo:
-        _ROUTING_CASES[row].trigger(tmp_path, monkeypatch)
-    _assert_payload_follows(excinfo.value)
+    for wrap in WRAP_CASES:
+        _assert_payload_follows(wrap.outbound("boom", action=wrap.action))
+    for origin in ORIGIN_CASES:
+        _assert_payload_follows(origin.raised("boom", action=origin.action))
 
 
 @pytest.mark.parametrize(
