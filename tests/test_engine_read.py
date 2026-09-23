@@ -33,6 +33,7 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
 from tests.conftest import make_experiment, mark_current_format, write_trainer
+from tests.ledger_fixtures import tree_snapshot
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -271,11 +272,6 @@ def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment,
     return experiment, ledger
 
 
-def _tree_files(root: Path) -> dict[Path, bytes]:
-    """Return every file under ``root`` with its bytes."""
-    return {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
-
-
 def _status_phases(experiment: Experiment, status: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the first phase of every status surface a journal read feeds."""
     from phasesweep.mcp.redaction import status_payload
@@ -310,7 +306,7 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
     ledger.write_bytes(damaged)
     root = tmp_path / "runs" / "t"
     root.mkdir(parents=True, exist_ok=True)
-    before = _tree_files(root)
+    before = tree_snapshot(root)
 
     status = read_status(experiment)
     for phase in _status_phases(experiment, status):
@@ -324,7 +320,7 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
         run_experiment(experiment)
 
     assert ledger.read_bytes() == damaged
-    assert _tree_files(root) == before
+    assert tree_snapshot(root) == before
 
 
 @pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
@@ -355,7 +351,7 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
     ledger.write_bytes(prefix + tail)
     root = tmp_path / "runs" / "t"
     root.mkdir(parents=True, exist_ok=True)
-    before = _tree_files(root)
+    before = tree_snapshot(root)
 
     for phase, undamaged in zip(
         _status_phases(experiment, read_status(experiment)), complete, strict=True
@@ -377,7 +373,7 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
     assert isinstance(cause, IncompleteJournalRecordError)
     assert f"truncate -s {len(prefix)} {ledger}" in str(cause)
     assert ledger.read_bytes() == prefix + tail
-    assert _tree_files(root) == before
+    assert tree_snapshot(root) == before
 
 
 @pytest.mark.parametrize("change", ["append", "finish-partial", "truncate"])
