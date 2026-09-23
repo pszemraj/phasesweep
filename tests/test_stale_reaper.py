@@ -86,6 +86,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     patch_rejected_trial_user_attr,
+    reaped_pid,
     write_trainer,
 )
 from tests.ledger_fixtures import _write_config
@@ -1262,12 +1263,11 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
 ) -> None:
     """Recovering one workdir never reaps trials another workdir's run owns.
 
-    Workdir B's run bound ``t::p`` to root B and left a reapable RUNNING trial.
-    A run from workdir A on the same ledger was refused at claim, so tree A is
-    still unbound and its format checks pass. Recovering that run opens
-    ``t::p`` live; without the per-study ownership check ``claim_ledger``
-    applies, it would reap B's trial. It must refuse in the engine's own words
-    instead, leaving the shared ledger untouched.
+    Workdir B's run bound ``t::p`` to root B and left a reapable RUNNING trial. A run
+    from workdir A on the same ledger was refused at claim, so tree A is still unbound
+    and its format checks pass. Recovering that run opens ``t::p`` live; without the
+    per-study ownership check ``claim_ledger`` applies, it would reap B's trial. It must
+    refuse in the engine's own words instead, leaving the shared ledger untouched.
     """
     ledger_dir = tmp_path / "shared-ledger"
     ledger_dir.mkdir()
@@ -1293,7 +1293,7 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
         run_id=run_id,
         experiment_id=recovering.experiment,
         config_sha256=hashlib.sha256(config_bytes).hexdigest(),
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)

@@ -196,6 +196,25 @@ def is_pid_zombie(pid: int) -> bool:
     return stat is not None and stat.state == "Z"
 
 
+# Bound at import, so a test that patches ``subprocess.Popen`` or ``os.waitpid``
+# for the code under test still gets a real, reaped child from ``reaped_pid``.
+_spawn_child = os.posix_spawnp
+_reap_child = os.waitpid
+
+
+def reaped_pid() -> int:
+    """Return the PID of a child this process spawned and has already reaped.
+
+    It stands in for a runner or trainer that has exited. Linux assigns PIDs in
+    increasing order, so this one stays unused until the PID space wraps, while
+    a fixed "dead" number such as 999999 is below the default 64-bit
+    ``pid_max`` and can belong to a live process on a busy host.
+    """
+    pid = _spawn_child("true", ["true"], os.environ)
+    _reap_child(pid, 0)
+    return pid
+
+
 def file_mode(path: Path) -> int:
     """Return the permission bits for a test path."""
     return stat.S_IMODE(path.stat().st_mode)

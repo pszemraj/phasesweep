@@ -73,6 +73,7 @@ from tests.conftest import (
     REPO,
     make_experiment,
     mark_current_format,
+    reaped_pid,
     write_constant_trainer,
     write_trainer,
 )
@@ -1953,14 +1954,13 @@ def test_unpersistable_complete_transition_keeps_the_recoverable_pending_record(
 ) -> None:
     """A durable ``pending`` record with its snapshot outranks a degraded ``failed`` one.
 
-    ``pending`` plus a dead runner is exactly what ``recover-run`` finalizes,
-    so the runner must not trade it for the permanent ``failed`` state when the
-    complete transition cannot be persisted (PR #5 review / reviewer 2 pass 2,
-    blocker 6).
+    ``pending`` plus a dead runner is exactly what ``recover-run`` finalizes, so the runner
+    must not trade it for the permanent ``failed`` state when the complete transition
+    cannot be persisted (PR #5 review / reviewer 2 pass 2, blocker 6).
     """
     store = RunStore(tmp_path / "state")
     run_id = "pending-run"
-    handle = make_run_handle(run_id=run_id, experiment_id="exp", pid=999999, starttime=111)
+    handle = make_run_handle(run_id=run_id, experiment_id="exp", pid=reaped_pid(), starttime=111)
     store.create(handle)
     status_path = store.status_path(run_id)
     monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", lambda snapshot: snapshot)

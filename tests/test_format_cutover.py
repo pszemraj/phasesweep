@@ -49,7 +49,7 @@ from phasesweep.mcp.recovery import (
     recover_run,
 )
 from phasesweep.mcp.runs import RunStore
-from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
+from tests.conftest import make_experiment, mark_current_format, reaped_pid, write_constant_trainer
 from tests.ledger_fixtures import (
     _tree_bytes,
     leave_hot_journal,
@@ -674,7 +674,7 @@ def test_confirmed_recovery_rolls_back_an_interrupted_transaction(
         run_id="interrupted",
         experiment_id=materialized.experiment.experiment,
         config_sha256=hashlib.sha256(config_bytes).hexdigest(),
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)

@@ -48,6 +48,7 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.mcp.runs import RunStore, UnsupportedStateFormatError
 from phasesweep.mcp.snapshots import capture_result_snapshot
+from tests.conftest import reaped_pid
 from tests.ledger_fixtures import (
     LEDGER_MODES,
     Materialized,
@@ -201,7 +202,7 @@ def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, d
         run_id=run_id,
         experiment_id=materialized.experiment.experiment,
         config_sha256=hashlib.sha256(config_bytes).hexdigest(),
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)

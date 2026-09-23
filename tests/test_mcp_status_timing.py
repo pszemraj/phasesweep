@@ -25,7 +25,7 @@ from phasesweep.mcp.tools import (
     _run_elapsed_seconds,
 )
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import mark_current_format
+from tests.conftest import mark_current_format, reaped_pid
 from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
@@ -48,12 +48,13 @@ def _complete_trials(experiment, *, n: int) -> None:
 
 
 def _handle(run_id: str, *, started_at: str) -> RunHandle:
+    pid = reaped_pid()
     return RunHandle(
         run_id=run_id,
         experiment_id="srv",
         config_sha256="0" * 64,
-        pid=1,
-        pgid=1,
+        pid=pid,
+        pgid=pid,
         pid_starttime=None,
         started_at=started_at,
     )

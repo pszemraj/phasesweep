@@ -15,6 +15,7 @@ import sys
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -120,7 +121,13 @@ from phasesweep.runtime.reaper import (
     read_boot_id,
     read_proc_starttime,
 )
-from tests.conftest import file_mode, make_experiment, mark_current_format, write_constant_trainer
+from tests.conftest import (
+    file_mode,
+    make_experiment,
+    mark_current_format,
+    reaped_pid,
+    write_constant_trainer,
+)
 from tests.mcp_helpers import (
     claim_runner_handle,
     make_mcp_app,
@@ -190,7 +197,7 @@ def _write_trial_process_identity(
 
 
 def _write_cleanup_uncertain_failed_trial(
-    config: Path, *, generation_id: str = "stale-generation"
+    config: Path, *, generation_id: str = "stale-generation", pid: int | None = None
 ) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
@@ -214,7 +221,7 @@ def _write_cleanup_uncertain_failed_trial(
     _write_trial_process_identity(
         trial_dir,
         attempt_id=attempt_id,
-        pid=4242,
+        pid=pid or reaped_pid(),
         starttime=111,
     )
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
@@ -232,6 +239,7 @@ def _write_stale_running_trial(
     generation_id: str = "stale-generation",
     persist_trial_attrs: bool = True,
     boot_id: str | None = None,
+    pid: int | None = None,
 ) -> int:
     exp = load_config(config)
     assert isinstance(exp, Experiment)
@@ -255,7 +263,7 @@ def _write_stale_running_trial(
     _write_trial_process_identity(
         trial_dir,
         attempt_id=attempt_id,
-        pid=4343,
+        pid=pid or reaped_pid(),
         starttime=222,
         boot_id=boot_id,
     )
@@ -347,7 +355,7 @@ def _stage_stale_running_recovery_scaffold(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
         allow_cancel=allow_cancel,
     )
@@ -824,7 +832,7 @@ def test_launch_retries_run_id_collision_without_touching_existing_run(
         run_id=collision_id,
         experiment_id="srv",
         config_sha256=registry.get("srv").config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(existing)
@@ -1420,11 +1428,12 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
     assert not store.cleanup_uncertain_path(pending.run_id).exists()
     assert store.recovery_required(pending)
 
+    runner_pid = reaped_pid()
     spawned = replace(
         pending,
         launch_state="spawned",
-        pid=999999,
-        pgid=999999,
+        pid=runner_pid,
+        pgid=runner_pid,
         pid_starttime=111,
         boot_id=read_boot_id(),
     )
@@ -1455,7 +1464,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
     cancelled = app.cancel(pending.run_id)
 
     assert store.get(pending.run_id) == spawned
-    assert signalled == [(999999, 111, 999999)]
+    assert signalled == [(runner_pid, 111, runner_pid)]
     assert cancelled["state"] == "running"
     assert cancelled["recovery_required"] is True
 
@@ -1884,7 +1893,7 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
         make_run_handle(
             run_id="srv-boot",
             experiment_id="srv",
-            pid=999999,
+            pid=reaped_pid(),
             starttime=111,
             allow_cancel=True,
         ),
@@ -1929,7 +1938,7 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
         make_run_handle(
             run_id="srv-unknown-boot",
             experiment_id="srv",
-            pid=999999,
+            pid=reaped_pid(),
             starttime=111,
             allow_cancel=True,
         ),
@@ -2218,7 +2227,7 @@ def _record_published_run_snapshot(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -3466,7 +3475,7 @@ def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -3719,7 +3728,7 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
         allow_cancel=True,
     )
@@ -3789,7 +3798,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -3858,7 +3867,7 @@ def test_recovery_preserves_status_written_after_initial_read(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -3988,7 +3997,7 @@ def test_operator_recovery_refuses_unknown_boot_process_cleanup(
             run_id=run_id,
             experiment_id=reg.id,
             config_sha256=reg.config_sha256,
-            pid=999999,
+            pid=reaped_pid(),
             starttime=111,
         ),
         boot_id=None if unknown_side == "saved" else current_boot,
@@ -4163,7 +4172,7 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -4208,7 +4217,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -4381,7 +4390,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -4398,7 +4407,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     _write_trial_process_identity(
         trial_dir,
         attempt_id=attempt_id,
-        pid=4242,
+        pid=reaped_pid(),
         starttime=222,
     )
     _register_active_attempt(
@@ -4425,14 +4434,8 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
         "phasesweep.mcp.recovery.kill_stale_group",
         _counting_success_callback(runner_cleanup_calls),
     )
-    monkeypatch.setattr(
-        "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        trial_cleanup,
-    )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
-        trial_cleanup,
-    )
+    monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", trial_cleanup)
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", trial_cleanup)
     runner = CliRunner()
     command = ["mcp", "recover-run", "--state-dir", str(registry.state_dir), "--run-id", run_id]
 
@@ -4542,7 +4545,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         run_id=earlier_run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -4653,7 +4656,7 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -4704,7 +4707,7 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
 @pytest.mark.parametrize(
     (
         "trial_setup_fn",
-        "expected_identity",
+        "trial_starttime",
         "dry_run_substring",
         "confirm_output_substring",
         "expected_reaped_running",
@@ -4714,7 +4717,7 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
     [
         pytest.param(
             _write_cleanup_uncertain_failed_trial,
-            (4242, 111, 4242),
+            111,
             "recover 1 cleanup-uncertain terminal trial",
             "Cleared cleanup uncertainty",
             0,
@@ -4723,12 +4726,8 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
             id="terminal-cleanup-uncertain-trial",
         ),
         pytest.param(
-            lambda config, *, generation_id: _write_stale_running_trial(
-                config,
-                cleanup_confirmed=False,
-                generation_id=generation_id,
-            ),
-            (4343, 222, 4343),
+            partial(_write_stale_running_trial, cleanup_confirmed=False),
+            222,
             "reap 1 stale trial",
             "reaped 1 stale trial",
             1,
@@ -4743,7 +4742,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     trial_setup_fn,
-    expected_identity: tuple[int, int, int],
+    trial_starttime: int,
     dry_run_substring: str,
     confirm_output_substring: str,
     expected_reaped_running: int,
@@ -4760,14 +4759,15 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     """
     config = _config(tmp_path)
     run_id = "srv-cleanup-uncertainty-recover"
-    trial_number = trial_setup_fn(config, generation_id=run_id)
+    trial_pid = reaped_pid()
+    trial_number = trial_setup_fn(config, generation_id=run_id, pid=trial_pid)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     handle = make_run_handle(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -4807,13 +4807,9 @@ def test_operator_recovery_clears_cleanup_uncertainty(
 
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_runner_cleanup)
     monkeypatch.setattr(
-        "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        fake_trial_cleanup,
+        "phasesweep.engine.attempts.cleanup_stale_trial_process", fake_trial_cleanup
     )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
-        fake_trial_cleanup,
-    )
+    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_trial_cleanup)
 
     with pytest.raises(Exception, match="already has a running sweep"):
         app.launch("srv")
@@ -4865,8 +4861,8 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     assert recovery["reaped_running_trials"] == expected_reaped_running
     assert recovery["cleanup_uncertain_terminal_trials"] == expected_cleanup_uncertain_terminal
     assert store.state(handle) == "failed"
-    assert runner_cleanup_calls == [(999999, 111, 999999)]
-    assert trial_cleanup_calls == [expected_identity]
+    assert runner_cleanup_calls == [(handle.pid, 111, handle.pid)]
+    assert trial_cleanup_calls == [(trial_pid, trial_starttime, trial_pid)]
     trial = _load_phase_trial(config, trial_number)
     assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
     assert trial.state == optuna.trial.TrialState.FAIL
@@ -4907,8 +4903,8 @@ def test_operator_recovery_clears_cleanup_uncertainty(
         assert "no immutable terminal result snapshot" in repeat.output
     assert store.status_path(run_id).read_bytes() == final_status
     assert store.cleanup_recovery_path(run_id).read_bytes() == final_recovery
-    assert runner_cleanup_calls == [(999999, 111, 999999)]
-    assert trial_cleanup_calls == [expected_identity]
+    assert runner_cleanup_calls == [(handle.pid, 111, handle.pid)]
+    assert trial_cleanup_calls == [(trial_pid, trial_starttime, trial_pid)]
 
     captured = patch_popen_capture(monkeypatch)
     launched = app.launch("srv")
@@ -5130,7 +5126,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -5252,7 +5248,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
         run_id=first_run,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(first_handle)
@@ -5339,7 +5335,7 @@ def _stage_terminal_uncertain_run(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -5501,7 +5497,7 @@ def test_operator_recovery_refuses_unverifiable_run(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)

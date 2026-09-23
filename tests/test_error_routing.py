@@ -117,7 +117,7 @@ from phasesweep.runtime.files import (
     phasesweep_home,
 )
 from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, write_attempt_lifecycle
-from tests.conftest import make_experiment
+from tests.conftest import make_experiment, reaped_pid
 from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
 from tests.mcp_helpers import make_run_handle, write_run_status
 
@@ -461,7 +461,7 @@ def _dead_uncertain_run(materialized: Materialized, tmp_path: Path) -> tuple[Pat
         run_id=run_id,
         experiment_id=materialized.experiment.experiment,
         config_sha256=hashlib.sha256(config_bytes).hexdigest(),
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -742,7 +742,7 @@ def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.Monk
         run_id="wrap-recover",
         experiment_id=materialized.experiment.experiment,
         config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
