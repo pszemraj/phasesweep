@@ -98,9 +98,9 @@ from phasesweep.runtime.files import (
     phasesweep_home,
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
-from tests.conftest import make_experiment, reaped_pid, requires_nonroot
+from tests.conftest import make_experiment, requires_nonroot
 from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
-from tests.mcp_helpers import make_run_handle, write_run_status
+from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
 
 # Classes proving the module sweep reached past the error modules themselves.
 # If an import ever stops happening, these vanish from the walk and say so.
@@ -330,27 +330,19 @@ def _recovery_needs(*, ownership_storage_unavailable: bool) -> _RecoveryNeeds:
     )
 
 
-def _dead_uncertain_run(materialized: Materialized, tmp_path: Path) -> tuple[Path, str]:
-    """Record a dead, cleanup-uncertain MCP run over a materialized fixture.
-
-    Mirrors ``tests/test_ledger_read_paths.py::_recover_inspect``: the
-    handle names a long-dead PID, which is the state recovery acts on.
-    """
+def _dead_uncertain_run(
+    materialized: Materialized, tmp_path: Path, config: Path | None = None
+) -> tuple[Path, str]:
+    """Record a dead, cleanup-uncertain MCP run of ``config``, by default the fixture's own."""
     state_dir = tmp_path / "mcp-state"
-    store = RunStore(state_dir)
-    run_id = "wrap-recover"
-    config_bytes = materialized.config_path.read_bytes()
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=materialized.experiment.experiment,
-        config_sha256=hashlib.sha256(config_bytes).hexdigest(),
-        pid=reaped_pid(),
-        starttime=111,
+    stage_dead_run(
+        RunStore(state_dir),
+        "wrap-recover",
+        config or materialized.config_path,
+        materialized.experiment.experiment,
+        cleanup_uncertain=True,
     )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config_bytes)
-    store.mark_cleanup_uncertain(handle)
-    return state_dir, run_id
+    return state_dir, "wrap-recover"
 
 
 def _claim_while(owner: object, name: str, inbound: Callable[[], Exception]) -> Trigger:
@@ -606,23 +598,13 @@ def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.Monk
     link.symlink_to(materialized.experiment.workdir)
     config = yaml.safe_load(materialized.config_path.read_text())
     config["workdir"] = str(link)
-    snapshot = yaml.safe_dump(config).encode()
-    state_dir = tmp_path / "mcp-state"
-    store = RunStore(state_dir)
-    handle = make_run_handle(
-        run_id="wrap-recover",
-        experiment_id=materialized.experiment.experiment,
-        config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path("wrap-recover").write_bytes(snapshot)
-    store.mark_cleanup_uncertain(handle)
+    pinned = tmp_path / "pinned.yaml"
+    pinned.write_text(yaml.safe_dump(config))
+    state_dir, run_id = _dead_uncertain_run(materialized, tmp_path, pinned)
     link.unlink()
     (tmp_path / "new-volume").mkdir()
     link.symlink_to(tmp_path / "new-volume")
-    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
+    return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
 def _refuse_as_prior_release(study: optuna.Study) -> None:
