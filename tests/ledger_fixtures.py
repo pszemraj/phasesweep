@@ -10,6 +10,7 @@ error at the moment it is violated rather than a diff noticed afterwards.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -345,6 +346,47 @@ def ledger_file(materialized: Materialized, backend: str) -> Path:
     :return Path: Absolute path to ``study.db`` or ``study.journal``.
     """
     return materialized.ledger_dir / LEDGER_FILENAME[backend]
+
+
+def rollback_journal(database: Path) -> Path:
+    """Return the rollback journal SQLite keeps beside ``database``.
+
+    :param Path database: SQLite database file.
+    :return Path: Its ``-journal`` sibling.
+    """
+    return database.with_name(f"{database.name}-journal")
+
+
+def leave_hot_journal(database: Path) -> None:
+    """Leave ``database`` exactly as a crash in the middle of a commit leaves it.
+
+    A writer with a ten-page cache spills uncommitted pages into its database
+    file after journaling their originals. Copying both files while that
+    transaction is still open captures what a SIGKILL at that instant would
+    leave on disk: rewritten pages and a hot journal that restores them, with
+    no second process involved.
+
+    :param Path database: Existing SQLite ledger holding at least one study.
+    """
+    writer = database.with_name(f"{database.name}.writer")
+    shutil.copyfile(database, writer)
+    with contextlib.closing(sqlite3.connect(writer, isolation_level=None)) as conn:
+        conn.execute("PRAGMA cache_size=10")
+        conn.execute("BEGIN IMMEDIATE")
+        for index in range(2000):
+            conn.execute(
+                "INSERT INTO study_user_attributes (study_id, key, value_json) VALUES (1, ?, ?)",
+                (f"uncommitted-{index}", json.dumps("x" * 500)),
+            )
+        shutil.copyfile(writer, database)
+        shutil.copyfile(rollback_journal(writer), rollback_journal(database))
+    writer.unlink()
+    with (
+        pytest.raises(sqlite3.OperationalError) as refused,
+        contextlib.closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as probe,
+    ):
+        probe.execute("SELECT 1 FROM sqlite_master").fetchone()
+    assert refused.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
 
 
 def forbid_file_backed_storage(monkeypatch: pytest.MonkeyPatch) -> list[str]:

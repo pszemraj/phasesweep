@@ -50,7 +50,13 @@ from phasesweep.mcp.recovery import (
 )
 from phasesweep.mcp.runs import RunStore
 from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
-from tests.ledger_fixtures import _tree_bytes, ledger_file, materialize
+from tests.ledger_fixtures import (
+    _tree_bytes,
+    leave_hot_journal,
+    ledger_file,
+    materialize,
+    rollback_journal,
+)
 from tests.mcp_helpers import make_run_handle
 
 
@@ -595,11 +601,6 @@ def test_empty_unstamped_phase_study_can_resume_in_current_ledger(
     assert len(study.trials) == 1
 
 
-def _journal_of(database: Path) -> Path:
-    """Return the rollback journal SQLite keeps beside ``database``."""
-    return database.with_name(f"{database.name}-journal")
-
-
 def _committed_trials(database: Path) -> list[tuple[int, str]]:
     """Return every committed trial's number and state, reading a snapshot copy.
 
@@ -613,38 +614,6 @@ def _committed_trials(database: Path) -> list[tuple[int, str]]:
             return conn.execute("SELECT number, state FROM trials ORDER BY trial_id").fetchall()
     finally:
         snapshot.unlink()
-
-
-def _leave_hot_journal(database: Path) -> None:
-    """Leave ``database`` exactly as a crash in the middle of a commit leaves it.
-
-    A writer with a ten-page cache spills uncommitted pages into its database
-    file after journaling their originals. Copying both files while that
-    transaction is still open captures what a SIGKILL at that instant would
-    leave on disk: rewritten pages and a hot journal that restores them, with
-    no second process involved.
-
-    :param Path database: Existing SQLite ledger holding at least one study.
-    """
-    writer = database.with_name(f"{database.name}.writer")
-    shutil.copyfile(database, writer)
-    with contextlib.closing(sqlite3.connect(writer, isolation_level=None)) as conn:
-        conn.execute("PRAGMA cache_size=10")
-        conn.execute("BEGIN IMMEDIATE")
-        for index in range(2000):
-            conn.execute(
-                "INSERT INTO study_user_attributes (study_id, key, value_json) VALUES (1, ?, ?)",
-                (f"uncommitted-{index}", json.dumps("x" * 500)),
-            )
-        shutil.copyfile(writer, database)
-        shutil.copyfile(_journal_of(writer), _journal_of(database))
-    writer.unlink()
-    with (
-        pytest.raises(sqlite3.OperationalError) as refused,
-        contextlib.closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as probe,
-    ):
-        probe.execute("SELECT 1 FROM sqlite_master").fetchone()
-    assert refused.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
 
 
 def _recovery_needs() -> _RecoveryNeeds:
@@ -679,7 +648,7 @@ def test_reads_report_an_interrupted_transaction_and_leave_it_for_a_locked_path(
     """
     materialized = materialize("current-sqlite", tmp_path, mode=mode)
     experiment = materialized.experiment
-    _leave_hot_journal(ledger_file(materialized, "sqlite"))
+    leave_hot_journal(ledger_file(materialized, "sqlite"))
     before = _tree_bytes(materialized.root)
 
     ledger = validate_ledger(experiment)
@@ -712,7 +681,7 @@ def test_confirmed_recovery_rolls_back_an_interrupted_transaction(
     materialized = materialize("current-sqlite", tmp_path, mode="tree")
     database = ledger_file(materialized, "sqlite")
     committed = _committed_trials(database)
-    _leave_hot_journal(database)
+    leave_hot_journal(database)
     state_dir = tmp_path / "mcp-state"
     store = RunStore(state_dir)
     config_bytes = materialized.config_path.read_bytes()
@@ -731,7 +700,7 @@ def test_confirmed_recovery_rolls_back_an_interrupted_transaction(
 
     recover_run(state_dir, "interrupted", confirm=True, emit=messages.append)
 
-    assert not _journal_of(database).exists()
+    assert not rollback_journal(database).exists()
     assert _committed_trials(database) == committed
     assert any("Cleared cleanup uncertainty for interrupted" in message for message in messages)
     with contextlib.closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
@@ -751,14 +720,14 @@ def test_claim_on_an_unbound_tree_rolls_back_a_shared_ledger(tmp_path: Path) -> 
     owner = _bound_tree_with_legacy_study(tmp_path, legacy=False)
     database = tmp_path / "current.db"
     committed = _committed_trials(database)
-    _leave_hot_journal(database)
+    leave_hot_journal(database)
     newcomer = owner.model_copy(update={"experiment": "u", "workdir": str(tmp_path / "other")})
 
     with _experiment_lock(newcomer):
         claimed = claim_ledger(validate_ledger(newcomer))
 
     assert claimed.format_verified is True
-    assert not _journal_of(database).exists()
+    assert not rollback_journal(database).exists()
     assert _committed_trials(database) == committed
     assert _artifact_root_binding_path(newcomer).is_file()
 
@@ -772,12 +741,12 @@ def test_registry_opener_rolls_back_an_interrupted_transaction(tmp_path: Path) -
     _bound_tree_with_legacy_study(tmp_path, legacy=False)
     database = tmp_path / "current.db"
     committed = _committed_trials(database)
-    _leave_hot_journal(database)
+    leave_hot_journal(database)
 
     study = open_registry_study(f"sqlite:///{database}", "t::p")
 
     assert study is not None
-    assert not _journal_of(database).exists()
+    assert not rollback_journal(database).exists()
     assert [(trial.number, trial.state.name) for trial in study.get_trials()] == committed
 
 
@@ -785,7 +754,7 @@ def test_rollback_open_never_creates_a_missing_ledger(tmp_path: Path) -> None:
     """The one read-write open refuses a ledger that vanished instead of creating it."""
     experiment = _bound_tree_with_legacy_study(tmp_path, legacy=False)
     database = tmp_path / "current.db"
-    _leave_hot_journal(database)
+    leave_hot_journal(database)
     ledger = validate_ledger(experiment)
     database.unlink()
 
@@ -852,14 +821,14 @@ def test_run_rolls_back_an_interrupted_transaction_and_continues(tmp_path: Path)
     experiment = _experiment(tmp_path, storage=f"sqlite:///{database}")
     run_experiment(experiment)
     committed = _committed_trials(database)
-    _leave_hot_journal(database)
+    leave_hot_journal(database)
     topped_up = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
     )
 
     run_experiment(topped_up)
 
-    assert not _journal_of(database).exists()
+    assert not rollback_journal(database).exists()
     trials = _committed_trials(database)
     assert trials[: len(committed)] == committed
     assert [state for _number, state in trials] == ["COMPLETE", "COMPLETE"]

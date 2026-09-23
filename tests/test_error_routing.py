@@ -29,7 +29,6 @@ import json
 import pickle
 import pkgutil
 import pwd
-import shutil
 import sqlite3
 import sys
 from collections.abc import Callable, Mapping
@@ -113,7 +112,7 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment
-from tests.ledger_fixtures import Materialized, ledger_file, materialize
+from tests.ledger_fixtures import Materialized, leave_hot_journal, ledger_file, materialize
 from tests.mcp_helpers import make_run_handle, write_run_status
 
 # Importing a ``__main__`` module runs the program it guards, so the sweep skips
@@ -394,30 +393,9 @@ def _trials_deleted(path: Path) -> None:
         conn.execute("DELETE FROM trials")
 
 
-def _interrupted_commit(path: Path) -> None:
-    """Leave a hot journal, as a crash in the middle of a commit does.
-
-    Mirrors ``tests/test_format_cutover.py::_leave_hot_journal``: both files
-    are copied while a writer's spilled transaction is still open.
-    """
-    writer = path.with_name(f"{path.name}.writer")
-    shutil.copyfile(path, writer)
-    with contextlib.closing(sqlite3.connect(writer, isolation_level=None)) as conn:
-        conn.execute("PRAGMA cache_size=10")
-        conn.execute("BEGIN IMMEDIATE")
-        for index in range(2000):
-            conn.execute(
-                "INSERT INTO study_user_attributes (study_id, key, value_json) VALUES (1, ?, ?)",
-                (f"uncommitted-{index}", json.dumps("x" * 500)),
-            )
-        shutil.copyfile(writer, path)
-        shutil.copyfile(f"{writer}-journal", f"{path}-journal")
-    writer.unlink()
-
-
 def _interrupted_commit_write_protected(path: Path) -> None:
     """Leave a hot journal in a ledger file the owner may no longer write."""
-    _interrupted_commit(path)
+    leave_hot_journal(path)
     path.chmod(0o444)
 
 
@@ -774,7 +752,7 @@ WRAP_CASES = (
         # The ledger is intact, so the storage wrap's restore remedy must not
         # replace the confirmed recover-run that lets SQLite roll it back.
         id="recovery_studies_interrupted_transaction",
-        trigger=_recovery_studies_damaged("tree", _interrupted_commit),
+        trigger=_recovery_studies_damaged("tree", leave_hot_journal),
         outbound=RunRecoveryError,
         action=OperatorAction.RUN_RECOVER_RUN,
         cause=LedgerTransactionInterruptedError,
@@ -1274,7 +1252,7 @@ def _claim_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 
 def _open_after_interrupted_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Open a phase study through a ledger a crash left mid-commit."""
-    materialized = _materialize_damaged(tmp_path, "current-sqlite", "tree", _interrupted_commit)
+    materialized = _materialize_damaged(tmp_path, "current-sqlite", "tree", leave_hot_journal)
     experiment = materialized.experiment
     return engine_ledger.open_existing_study(
         engine_ledger.validate_ledger(experiment), experiment.phases[0]
