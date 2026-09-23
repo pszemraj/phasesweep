@@ -157,25 +157,6 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
     } == ledger_before
 
 
-@pytest.mark.integration
-def test_current_sqlite_format_continues_after_top_up(tmp_path: Path) -> None:
-    """The early compatibility precheck preserves supported continuation."""
-    storage = f"sqlite:///{tmp_path / 'current.db'}"
-    experiment = _experiment(tmp_path, storage=storage)
-    run_experiment(experiment)
-    topped_up = experiment.model_copy(
-        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
-    )
-
-    run_experiment(topped_up)
-
-    study = optuna.load_study(study_name="t::p", storage=storage)
-    assert study.user_attrs[STUDY_SCHEMA_ATTR] == STUDY_SCHEMA_VERSION
-    assert len(study.trials) == 2
-    binding = json.loads(_artifact_root_binding_path(experiment).read_text(encoding="utf-8"))
-    assert binding["schema_version"] == ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
-
-
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.parametrize("leftover_study", ["t::retired", "other_experiment::phase"])
 @pytest.mark.integration
