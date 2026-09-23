@@ -21,6 +21,7 @@ from phasesweep.engine.state import (
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.trial import _environment_identity
+from phasesweep.mcp.recovery import _RecoveryNeeds
 from phasesweep.runtime.process import _write_process_identity
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
@@ -213,3 +214,18 @@ def write_uncertain_failed_trial(
     trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
     return trial.number
+
+
+def load_only_recovery_needs(*, ownership_storage_unavailable: bool = False) -> _RecoveryNeeds:
+    """Return recovery decisions that load the phase studies and nothing else."""
+    return _RecoveryNeeds(
+        terminal_status=None,
+        stored_snapshot=None,
+        prepared_publication_generation=None,
+        cleanup_needed=False,
+        terminal_cleanup_uncertain=False,
+        ownership_storage_unavailable=ownership_storage_unavailable,
+        snapshot_recovery_required=False,
+        snapshot_unavailable=False,
+        snapshot_finalize_needed=False,
+    )
