@@ -68,6 +68,7 @@ from tests.conftest import (
     write_param_echo_trainer,
     write_trainer,
 )
+from tests.ledger_fixtures import reanchor_summary_pointer
 
 
 def _fail_terminal_generation_state(original: Callable, error: BaseException):
@@ -121,15 +122,6 @@ def _record_state(experiment, generation_id: str) -> str | None:
     """Read one generation's immutable record ``state`` label."""
     payload = yaml.safe_load(_generation_record_path(experiment, generation_id).read_text())
     return payload.get("state") if isinstance(payload, dict) else None
-
-
-def _reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
-    """Update a test publication pointer to authenticate ``summary_path``'s exact bytes."""
-    pointer = yaml.safe_load(pointer_path.read_text())
-    content = summary_path.read_bytes()
-    pointer["summary_size_bytes"] = len(content)
-    pointer["summary_sha256"] = hashlib.sha256(content).hexdigest()
-    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
 
 
 # --------------------------------------------------------------------------
@@ -714,7 +706,7 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
     )
     artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
     assert _resolve_publication_pointer(experiment).state == "failed"
     assert read_status(experiment)["publication_integrity"] == "failed"
@@ -738,7 +730,7 @@ def test_manifest_rejects_removed_promotion_artifacts(
         summary = yaml.safe_load(summary_path.read_text())
         summary[removed_artifact] = []
         summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-        _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+        reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
     else:
         promotion_path = (
             _generation_dir(experiment, generation_id) / "phases" / "p" / removed_artifact
@@ -956,7 +948,7 @@ def test_summary_semantics_are_pointer_anchored_and_cross_checked(
     assert pointer.error is not None
     assert "summary" in pointer.error.lower()
 
-    _reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
     assert pointer.error is not None
