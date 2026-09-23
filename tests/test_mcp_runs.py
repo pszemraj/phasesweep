@@ -661,7 +661,7 @@ def test_recovery_tells_a_wrong_state_dir_from_a_damaged_one(
     finally:
         if locked.exists():
             locked.chmod(0o700)
-    assert excinfo.value.actions == (action,)
+    assert excinfo.value.action is action
     assert message in str(excinfo.value)
 
 

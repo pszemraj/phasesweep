@@ -1,6 +1,6 @@
-"""Contract tests for the operator actions every PhaseSweepError carries.
+"""Contract tests for the operator action every PhaseSweepError carries.
 
-``actions`` routes a failure to the remediation an operator should carry out, without parsing
+``action`` routes a failure to the remediation an operator should carry out, without parsing
 prose; the message stays authoritative about what went wrong, and routing never edits it. The class
 walk imports the whole package, so a subclass is covered the moment it exists. The routing table
 drives real raise and wrap sites and pins the action each routes, and the MCP runner's failure
@@ -107,9 +107,6 @@ _SWEEP_WITNESSES = frozenset(
     {"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError", "_PolicyStateWriteError"}
 )
 
-# A remediation of two required steps, for exercising the multi-step path.
-_TWO_STEPS = (OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE)
-
 
 def _import_every_module() -> None:
     """Import the whole package so no subclass is missing from the walk."""
@@ -152,10 +149,9 @@ def test_every_operator_error_declares_its_action():
         plain = cls("boom")
         routed = cls("boom", action=OperatorAction.RETRY)
 
-        # A class default is always exactly one step.
         assert isinstance(cls.default_action, OperatorAction), f"{cls.__name__} has no action"
-        assert plain.actions == (cls.default_action,)
-        assert routed.actions == (OperatorAction.RETRY,)
+        assert plain.action is cls.default_action
+        assert routed.action is OperatorAction.RETRY
 
         # The action is a routing attribute, never part of what the operator reads.
         assert str(routed) == str(plain)
@@ -176,24 +172,20 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     from phasesweep.mcp.recovery import RunRecoveryError
 
     inbound = StudyStorageUnavailableError("x")
-    assert inbound.actions == (OperatorAction.RESTORE_LEDGER,)
+    assert inbound.action is OperatorAction.RESTORE_LEDGER
 
     inherited = RunRecoveryError.rewrap(inbound, "y")
     assert isinstance(inherited, RunRecoveryError)
-    assert inherited.actions == (OperatorAction.RESTORE_LEDGER,)
+    assert inherited.action is OperatorAction.RESTORE_LEDGER
     assert str(inherited) == "y"
 
     overridden = RunRecoveryError.rewrap(inbound, "y", action=OperatorAction.FRESH_NAMESPACE)
-    assert overridden.actions == (OperatorAction.FRESH_NAMESPACE,)
+    assert overridden.action is OperatorAction.FRESH_NAMESPACE
     assert str(overridden) == "y"
-
-    # Every step a cause requires survives, in order; none is dropped for the first.
-    two_steps = RunRecoveryError.rewrap(ProcessCleanupUncertainError("x", action=_TWO_STEPS), "y")
-    assert two_steps.actions == _TWO_STEPS
 
     # A cause with no action of its own leaves the class default in place.
     foreign = RunRecoveryError.rewrap(OSError("disk"), "y")
-    assert foreign.actions == (RunRecoveryError.default_action,)
+    assert foreign.action is RunRecoveryError.default_action
 
 
 @pytest.mark.parametrize(
@@ -221,7 +213,7 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
 def test_pre_cutover_refusals_route_to_the_prior_release(label, call):
     with pytest.raises(PhaseSweepError) as excinfo:
         call()
-    assert excinfo.value.actions == (OperatorAction.USE_PRIOR_RELEASE,), label
+    assert excinfo.value.action is OperatorAction.USE_PRIOR_RELEASE, label
     # The routed action is additional to, not a replacement for, the remedy prose.
     assert "0.3.1" in str(excinfo.value), label
 
@@ -238,7 +230,7 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
 
     with pytest.raises(PhaseSweepError) as excinfo:
         trial._trainer_environment(experiment, "p")
-    assert excinfo.value.actions == (OperatorAction.FIX_CONFIG,)
+    assert excinfo.value.action is OperatorAction.FIX_CONFIG
     assert str(excinfo.value) == (
         "W&B evidence requires online logging; remove offline/disabled W&B settings."
     )
@@ -255,8 +247,7 @@ class RoutingCase:
     #: Drives the real entry point until the raise under test.
     trigger: Trigger
     raised: type[PhaseSweepError]
-    #: The one step, or every step in order where the site composes several.
-    action: OperatorAction | tuple[OperatorAction, ...]
+    action: OperatorAction
     #: Stable substring of the operator text the site raises today.
     message: str
     #: Exact ``__cause__`` type, pinned only where the runner routes by it.
@@ -916,15 +907,11 @@ WRAP_CASES = (
         message=_PREFLIGHT_AGGREGATE,
     ),
     RoutingCase(
-        # Composed: every repair any cleanup or storage refusal needs, then recovery.
-        id="preflight_cleanup_aggregate_repairs",
+        # The cleanup aggregate routes by the same shared-or-INSPECT_LOGS rule.
+        id="preflight_cleanup_aggregate_disagreeing",
         trigger=_preflight_shared_registry_and_lost_ledger,
         raised=ProcessCleanupUncertainError,
-        action=(
-            OperatorAction.RESTORE_TREE,
-            OperatorAction.RESTORE_LEDGER,
-            OperatorAction.RUN_RECOVER_RUN,
-        ),
+        action=OperatorAction.INSPECT_LOGS,
         message=_PREFLIGHT_AGGREGATE,
     ),
     RoutingCase(
@@ -1423,10 +1410,12 @@ ORIGIN_CASES = (
         message="Process identity is unknown. Restore the original storage ledger",
     ),
     RoutingCase(
+        # Either the ledger or the tree may be the side that changed, so the
+        # message names both and no one repair is the remedy.
         id="uncertain_trial_identity_files_mismatch",
         trigger=_inspect_uncertain_trial_without_identity_files,
         raised=ProcessCleanupUncertainError,
-        action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
+        action=OperatorAction.INSPECT_LOGS,
         message="Restore the original storage ledger and this attempt's process-identity files",
     ),
     RoutingCase(
@@ -1523,10 +1512,11 @@ ORIGIN_CASES = (
         message="Process identity is unknown. Restore the original storage ledger",
     ),
     RoutingCase(
+        # The same split as uncertain_trial_identity_files_mismatch.
         id="running_trial_lifecycle_mismatch",
         trigger=_reap_trial_with_foreign_lifecycle,
         raised=ProcessCleanupUncertainError,
-        action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
+        action=OperatorAction.INSPECT_LOGS,
         message="Restore the original storage ledger and this attempt's lifecycle record",
     ),
     RoutingCase(
@@ -1683,8 +1673,7 @@ def test_raise_sites_route_their_declared_action(
 
     error = excinfo.value
     assert type(error) is case.raised
-    expected = case.action if isinstance(case.action, tuple) else (case.action,)
-    assert error.actions == expected
+    assert error.action is case.action
     if case.cause is not None:
         assert type(error.__cause__) is case.cause
     assert case.message in str(error)
@@ -1759,7 +1748,7 @@ def _assert_payload_follows(error: PhaseSweepError) -> None:
     """Assert the runner's failure payload for ``error`` says exactly what it routes."""
     failure = mcp_runner._safe_failure_payload(error, stage="preflight")
     remediation = failure["remediation"]
-    steps = [action for action in error.actions if action is not OperatorAction.RETRY]
+    steps = [] if error.action is OperatorAction.RETRY else [error.action]
     if failure["code"] == "cleanup_uncertain":
         # The server launches nothing more for such a run until recover-run
         # confirms it, so recover-run is how it is retried.
@@ -1780,26 +1769,10 @@ def _assert_payload_follows(error: PhaseSweepError) -> None:
 
 
 def test_runner_payload_follows_the_routed_steps() -> None:
-    # The payload depends only on an error's type and actions, and the tables
+    # The payload depends only on an error's type and action, and the tables
     # above prove each trigger raises exactly its row's, so each row's
     # declared routing stands in for driving its trigger again.
     for cls in _operator_error_classes():
         _assert_payload_follows(cls("boom"))
     for case in CASES:
         _assert_payload_follows(case.raised("boom", action=case.action))
-
-
-@pytest.mark.parametrize(
-    "action",
-    [
-        "restore_ledger",
-        (),
-        [OperatorAction.RESTORE_LEDGER],
-        (OperatorAction.RESTORE_TREE, OperatorAction.RESTORE_TREE),
-        (OperatorAction.RESTORE_TREE, "fix_config"),
-    ],
-    ids=["string", "empty", "list", "repeated", "string-step"],
-)
-def test_an_error_refuses_actions_that_are_not_distinct_steps(action: object) -> None:
-    with pytest.raises(TypeError, match="action must be"):
-        PhaseSweepError("boom", action=action)  # type: ignore[arg-type]

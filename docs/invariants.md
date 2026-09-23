@@ -320,18 +320,18 @@ decides; liveness alone never concludes a run.
 
 #### 15. Wraps keep the operator's remediation
 
-Every operator-facing error declares its remediation, and a wrap preserves it
-instead of replacing it with the wrapper's own advice. A remediation is one
-step unless the operator must do several, every one of them: alternatives
-route the one that keeps the operator's existing work, and retrying what failed
-is never a step. The only raises that require several steps restore both the
-ledger and the tree where the two disagree about a trial's attempt, since
-either side may be the one that changed. `recover-run` never routes a refusal back to itself
-except to a confirmed run, so `RunRecoveryError` defaults to reading the logs.
-An MCP run's failure payload takes its next steps only from the actions, one
-phrase per step, so no error type gives the agent advice of its own.
+Every operator-facing error declares one remediation, and a wrap preserves it
+instead of replacing it with the wrapper's own advice. Alternatives route the
+one that keeps the operator's existing work, repairs of which none suffices
+alone route to reading the logs, and retrying what failed after a repair is
+implied. A preflight that collects several refusals routes the remediation
+they share, or reading the logs when they disagree. `recover-run` never routes
+a refusal back to itself except to a confirmed run, so `RunRecoveryError`
+defaults to reading the logs. An MCP run's failure payload takes its next
+steps only from the action, so no error type gives the agent advice of its
+own; unconfirmed cleanup adds recover-run after the repair.
 
-**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.actions`,
+**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.action`,
 `errors.PhaseSweepError.rewrap`, `mcp.runner._OPERATOR_STEPS`\
 **Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`,
 `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`,

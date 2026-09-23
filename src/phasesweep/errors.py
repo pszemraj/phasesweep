@@ -57,60 +57,37 @@ class PhaseSweepError(RuntimeError):
     line without an internal-bug traceback. Exceptions that indicate a
     PhaseSweep defect must not inherit from this class.
 
-    Each instance also carries its remediation as :attr:`actions`, a routing
-    attribute only: it never changes the message text an operator reads. It
-    holds one :class:`OperatorAction` unless the operator must do several
-    things, every one of them, in the order listed. A message that offers
-    alternatives ("restore the setting, or start fresh") routes the one that
-    keeps the operator's existing work, and retrying what failed is implied,
-    never listed.
+    Each instance also carries its remediation as :attr:`action`, a routing
+    attribute only: it never changes the message text an operator reads. A
+    message that offers alternatives ("restore the setting, or start fresh")
+    routes the one that keeps the operator's existing work, and one that needs
+    several repairs, none sufficient alone, routes ``INSPECT_LOGS``. Retrying
+    what failed after a repair is implied, so ``RETRY`` is the action only
+    when waiting is the whole remedy.
     """
 
     # The base declares a fallback solely because the base class is itself
     # raised directly at a few sites. It is not an inheritable default: every
     # concrete subclass declares its own, and tests/test_error_routing.py fails
-    # when one silently inherits this one. A class default is one step by type;
-    # only a single raise may require several.
+    # when one silently inherits this one.
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
-    def __init__(
-        self,
-        *args: object,
-        action: OperatorAction | tuple[OperatorAction, ...] | None = None,
-    ) -> None:
+    def __init__(self, *args: object, action: OperatorAction | None = None) -> None:
         """Create an operational failure carrying the remediation it calls for.
 
         :param object args: Standard exception arguments; the first is the message.
-        :param OperatorAction | tuple[OperatorAction, ...] | None action:
-            Remediation for this one raise, overriding the class's
-            :attr:`default_action`: one step, or every required step in order.
-        :raises TypeError: ``action`` is not one step or a non-empty tuple of
-            distinct steps.
+        :param OperatorAction | None action: Remediation for this one raise,
+            overriding the class's :attr:`default_action`.
         """
         super().__init__(*args)
-        if action is None:
-            action = type(self).default_action
-        steps = (action,) if isinstance(action, OperatorAction) else action
-        # Callers route by these as an ordered, hashable set of real steps: a
-        # string, list, empty, or repeated value would misroute without failing.
-        if not (
-            isinstance(steps, tuple)
-            and steps
-            and all(isinstance(step, OperatorAction) for step in steps)
-            and len(set(steps)) == len(steps)
-        ):
-            raise TypeError(
-                "action must be None, an OperatorAction, or a non-empty tuple of distinct "
-                f"OperatorActions, not {action!r}"
-            )
-        self.actions: tuple[OperatorAction, ...] = steps
+        self.action: OperatorAction = action if action is not None else type(self).default_action
 
     @classmethod
     def rewrap(
         cls,
         cause: BaseException,
         *args: object,
-        action: OperatorAction | tuple[OperatorAction, ...] | None = None,
+        action: OperatorAction | None = None,
     ) -> Self:
         """Build this error from ``cause``, inheriting the remediation ``cause`` carried.
 
@@ -119,17 +96,16 @@ class PhaseSweepError(RuntimeError):
         clause that preserves ``__cause__`` stays visible at the raise site.
 
         An explicit ``action`` wins. Otherwise a :class:`PhaseSweepError` cause
-        donates every step it carried, so a remediation survives translation
-        between layers, and any other cause falls back to :attr:`default_action`.
+        donates its action, so a remediation survives translation between
+        layers, and any other cause falls back to :attr:`default_action`.
 
         :param BaseException cause: Failure being rewrapped.
         :param object args: Arguments for the new error; the first is the message.
-        :param OperatorAction | tuple[OperatorAction, ...] | None action:
-            Remediation for this one raise.
+        :param OperatorAction | None action: Remediation for this one raise.
         :return Self: The new error, for the caller to raise ``from cause``.
         """
         if action is None and isinstance(cause, PhaseSweepError):
-            action = cause.actions
+            action = cause.action
         return cls(*args, action=action)
 
 

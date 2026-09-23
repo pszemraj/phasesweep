@@ -115,7 +115,7 @@ class FailurePayload(FailureCausePayload):
 # message. A failure payload carries no message, so the tree repair states
 # the safety condition a registry-entry refusal gives in its message. A retry
 # has no phrase: it is implied after any operator step, and is the agent's to
-# make when it is the only step.
+# make when it is the routed action.
 _OPERATOR_STEPS: dict[OperatorAction, str] = {
     OperatorAction.USE_PRIOR_RELEASE: (
         "operate the existing state with the preserved PhaseSweep release that wrote it"
@@ -158,28 +158,27 @@ def _operator_remediation(steps: Sequence[OperatorAction], *, before: str = "") 
     return remediation
 
 
-def _routed_next_steps(actions: tuple[OperatorAction, ...]) -> dict[str, object]:
-    """Return the retryability, actor, and remediation a raise's routed steps call for.
+def _routed_next_steps(action: OperatorAction) -> dict[str, object]:
+    """Return the retryability, actor, and remediation a raise's routed action calls for.
 
-    :param tuple[OperatorAction, ...] actions: Steps the raise routes, in order.
+    :param OperatorAction action: Action the raise routes.
     :return dict[str, object]: ``retryable``, ``actor``, and ``remediation``
-        payload fields: the agent's retry when retrying is the only step, and
-        otherwise the operator's steps.
+        payload fields: the agent's retry when the action is ``RETRY``, and
+        otherwise the operator's step.
     """
-    steps = [action for action in actions if action is not OperatorAction.RETRY]
-    if not steps:
+    if action is OperatorAction.RETRY:
         return {"retryable": True, "actor": "agent", "remediation": _RETRY_REMEDIATION}
-    return {"retryable": False, "actor": "operator", "remediation": _operator_remediation(steps)}
+    return {"retryable": False, "actor": "operator", "remediation": _operator_remediation([action])}
 
 
-def _cleanup_uncertain_payload(actions: tuple[OperatorAction, ...]) -> dict[str, object]:
+def _cleanup_uncertain_payload(actions: Sequence[OperatorAction]) -> dict[str, object]:
     """Return the cleanup-uncertain failure whose repairs come before recover-run.
 
     The server launches nothing more for a run with unconfirmed cleanup until
     recover-run confirms it, so recover-run is how such a run is retried: the
     implied last step after whatever repairs the refusal routes.
 
-    :param tuple[OperatorAction, ...] actions: Steps the cleanup refusal routes, in order.
+    :param Sequence[OperatorAction] actions: Steps the cleanup routes, in order.
     :return dict[str, object]: The ``"cleanup_uncertain"`` payload.
     """
     last = OperatorAction.RUN_RECOVER_RUN
@@ -195,7 +194,7 @@ def _cleanup_uncertain_payload(actions: tuple[OperatorAction, ...]) -> dict[str,
 
 # The durable failure code for each operational error type, checked in order:
 # the first type the error is an instance of names it. A code is the status
-# schema's category, not advice; the next steps come from the error's actions.
+# schema's category, not advice; the next steps come from the error's action.
 _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (ProcessCleanupUncertainError, "cleanup_uncertain"),
     (ExperimentLockBusyError, "experiment_busy"),
@@ -221,7 +220,7 @@ _FIXED_STAGES: dict[FailureCode, FailureStage] = {
 
 
 def _unrouted_failure_payload(error: BaseException, *, stage: str) -> dict[str, object]:
-    """Map an exception that carries no operator actions to its fixed failure.
+    """Map an exception that carries no operator action to its fixed failure.
 
     :param BaseException error: Exception that is not a :class:`PhaseSweepError`.
     :param str stage: Stage the failure occurred at.
@@ -264,8 +263,8 @@ def _base_failure_payload(
 
     The error's type selects ``code`` and ``stage``. For a
     :class:`PhaseSweepError`, ``retryable``, ``actor``, and ``remediation``
-    come only from the steps its raise routes; an exception without routed
-    steps keeps its type's fixed text.
+    come only from the action its raise routes; an exception without a routed
+    action keeps its type's fixed text.
 
     :param BaseException error: Exception whose type selects the failure code.
     :param str | None stage: Failure stage to report for most error types;
@@ -290,12 +289,12 @@ def _base_failure_payload(
     )
     if code == "cleanup_uncertain":
         # What must come back before recover-run is the raise site's decision,
-        # carried as its actions; the chained cause is history.
-        return _cleanup_uncertain_payload(error.actions)
+        # carried as its action; the chained cause is history.
+        return _cleanup_uncertain_payload([error.action])
     return {
         "code": code,
         "stage": _FIXED_STAGES.get(code, failure_stage),
-        **_routed_next_steps(error.actions),
+        **_routed_next_steps(error.action),
     }
 
 
@@ -317,28 +316,28 @@ def _safe_failure_payload(
 
 def _cleanup_steps(
     primary: BaseException, cleanup_error: BaseException | None
-) -> tuple[OperatorAction, ...]:
+) -> list[OperatorAction]:
     """Return the steps an unconfirmed cleanup routes, ahead of recover-run.
 
-    A cleanup refusal routes its own repairs. Otherwise the cleanup error the
-    engine recorded supplies them, and a storage primary adds the ledger that
+    A cleanup refusal routes its own repair. Otherwise the cleanup error the
+    engine recorded supplies it, and a storage primary adds the ledger that
     recover-run must read first.
 
     :param BaseException primary: Terminal error observed before cleanup was
         found to be uncertain.
     :param BaseException | None cleanup_error: The engine's recorded cleanup failure.
-    :return tuple[OperatorAction, ...]: De-duplicated steps in order.
+    :return list[OperatorAction]: De-duplicated steps in order.
     """
     if isinstance(primary, ProcessCleanupUncertainError):
-        return primary.actions
+        return [primary.action]
     steps: list[OperatorAction] = []
     if isinstance(primary, StudyStorageUnavailableError):
         steps.append(OperatorAction.RESTORE_LEDGER)
     if isinstance(cleanup_error, ProcessCleanupUncertainError):
-        steps.extend(action for action in cleanup_error.actions if action not in steps)
+        steps.append(cleanup_error.action)
     else:
         steps.append(ProcessCleanupUncertainError.default_action)
-    return tuple(steps)
+    return list(dict.fromkeys(steps))
 
 
 def _cleanup_failure_payload(

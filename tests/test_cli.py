@@ -920,7 +920,7 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
         "phasesweep: Trial 0 cleanup could not be confirmed. To retry its cleanup, "
         "run `phasesweep run` again with the same config."
     )
-    assert refusal.actions == (OperatorAction.RUN_RECOVER_RUN,)
+    assert refusal.action is OperatorAction.RUN_RECOVER_RUN
 
 
 def test_cli_boundary_reports_config_syntax_error_without_traceback(

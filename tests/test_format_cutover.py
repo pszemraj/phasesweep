@@ -267,7 +267,7 @@ def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
         claim_ledger(validate_ledger(experiment))
 
     assert isinstance(refused.value.__cause__, PermissionError)
-    assert refused.value.actions == (OperatorAction.RESTORE_TREE,)
+    assert refused.value.action is OperatorAction.RESTORE_TREE
     assert not _artifact_root_binding_path(experiment).exists()
 
 
@@ -629,7 +629,7 @@ def test_reads_report_an_interrupted_transaction_and_leave_it_for_a_locked_path(
     for refusal in (opened.value, inspected.value):
         assert _INTERRUPTED in str(refusal)
         assert "`phasesweep mcp recover-run --confirm`" in str(refusal)
-        assert refusal.actions == (OperatorAction.RUN_RECOVER_RUN,)
+        assert refusal.action is OperatorAction.RUN_RECOVER_RUN
     assert tree_snapshot(materialized.root) == before
 
 
@@ -721,7 +721,7 @@ def test_rollback_open_never_creates_a_missing_ledger(tmp_path: Path) -> None:
 
     # Still the interrupted transaction's refusal, routed to bringing the ledger back.
     assert type(refused.value) is LedgerTransactionInterruptedError
-    assert refused.value.actions == (OperatorAction.RESTORE_LEDGER,)
+    assert refused.value.action is OperatorAction.RESTORE_LEDGER
     assert not database.exists()
 
 
@@ -764,7 +764,7 @@ def test_writers_refuse_a_partial_final_journal_record_and_leave_it(
     for refusal in (claimed.value, registry.value, inspected.value, confirmed.value):
         assert "ends with an incomplete record" in str(refusal)
         assert f"truncate -s {len(complete)} {journal}" in str(refusal)
-        assert refusal.actions == (OperatorAction.RESTORE_LEDGER,)
+        assert refusal.action is OperatorAction.RESTORE_LEDGER
     assert tree_snapshot(materialized.root) == before
 
 

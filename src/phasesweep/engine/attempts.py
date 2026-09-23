@@ -168,8 +168,8 @@ def _read_trial_process_identity(
             f"process identity is missing, malformed, partial, or belongs to another attempt. "
             f"trial_dir={trial_dir}. Restore the original storage ledger and this attempt's "
             "process-identity files before retrying recovery.",
-            # Both, in order: either side may be the one that no longer matches.
-            action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
+            # Either side may be the one that changed, so no one repair is the remedy.
+            action=OperatorAction.INSPECT_LOGS,
         ) from exc
 
 
@@ -819,7 +819,7 @@ def _attempt_lifecycle_for_reaping(
         attempt id, or the record is malformed or belongs to another attempt.
     """
     # recover-run resolves RUNNING trials through here too, so these refusals
-    # route to the repair, as _read_trial_process_identity's do.
+    # never route back to it, as _read_trial_process_identity's do not.
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
     if not isinstance(attempt_id, str) or not attempt_id:
         raise ProcessCleanupUncertainError(
@@ -837,8 +837,8 @@ def _attempt_lifecycle_for_reaping(
             f"lifecycle record is malformed or belongs to another attempt. "
             f"trial_dir={trial_dir}. Restore the original storage ledger and this "
             "attempt's lifecycle record before retrying recovery.",
-            # Both, in order: either side may be the one that no longer matches.
-            action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
+            # Either side may be the one that changed, so no one repair is the remedy.
+            action=OperatorAction.INSPECT_LOGS,
         ) from exc
 
 
