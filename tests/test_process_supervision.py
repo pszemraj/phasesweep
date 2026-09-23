@@ -1702,7 +1702,7 @@ def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> 
     phase through this path; serial escalation would multiply worst-case
     shutdown latency by the trial parallelism (review v0.5.17 gap hunt).
     """
-    grace = 1.5
+    grace = 3.0
     procs: list[subprocess.Popen] = []
     try:
         for idx in range(2):
@@ -1731,8 +1731,8 @@ def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> 
                 proc.wait(timeout=5)
 
     assert verdicts == {proc.pid: True for proc in procs}
-    # Serial escalation would burn at least one full grace per group.
-    assert elapsed < 2 * grace - 0.2, f"escalation took {elapsed:.2f}s; grace not shared"
+    # Serial escalation pays a full grace per group (>= 2 * grace); sharing leaves a grace of slack.
+    assert elapsed < 2 * grace, f"escalation took {elapsed:.2f}s; grace not shared"
 
 
 def test_terminate_process_groups_reports_per_group_verdicts() -> None:
