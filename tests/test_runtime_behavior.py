@@ -543,15 +543,8 @@ def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
 ) -> None:
     """A newly reached W&B phase must validate before an existing phase can top up."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
     local = Phase(name="local", n_trials=1, sampler=Sampler(type="random", seed=0))
-    initial = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=[local],
-    )
+    initial = make_experiment(persistent=tmp_path, trainer=trainer, phases=[local])
     run_experiment(initial)
     generation_before = _generation_path(initial).read_bytes()
 
@@ -577,7 +570,7 @@ def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
         run_experiment(expanded)
 
     assert _generation_path(initial).read_bytes() == generation_before
-    study = optuna.load_study(study_name="t::local", storage=storage)
+    study = optuna.load_study(study_name="t::local", storage=initial.storage)
     assert len(study.get_trials(deepcopy=False)) == 1
 
 
@@ -2271,8 +2264,7 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"sqlite:///{tmp_path / 'shutdown.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=2,
         gpu_policy="none",
         allow_no_gpu_isolation=True,
@@ -2426,14 +2418,8 @@ def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
         print(f"x={a.x}")
         """,
     )
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-        sampler=Sampler(type="random", seed=0),
+        persistent=tmp_path, trainer=trainer, n_trials=1, sampler=Sampler(type="random", seed=0)
     )
     first = run_experiment(experiment)
 
@@ -2445,7 +2431,7 @@ def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
 
     assert rerun["p"].trial_number == first["p"].trial_number
     assert rerun["p"].metric == first["p"].metric
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 
@@ -2472,20 +2458,13 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
         print(f"x={a.x}")
         """,
     )
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
     phase = Phase(
         name="p",
         n_trials=1,
         sampler=Sampler(type="random", seed=0),
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=[phase],
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     first = run_experiment(experiment)
 
     def _no_gpu_create(**_kwargs: object) -> None:
@@ -2496,7 +2475,7 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
     with pytest.raises(RuntimeError, match="no GPUs detected"):
         run_experiment(top_up)
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 
@@ -2533,12 +2512,7 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
         signal.pthread_sigmask(signal.SIG_BLOCK, set(runtime_shutdown._SHUTDOWN_SIGNALS))
 
         trainer = write_constant_trainer(tmp_path)
-        experiment = make_experiment(
-            workdir=tmp_path / "runs",
-            trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-            override_format="argparse",
-            n_trials=1,
-        )
+        experiment = make_experiment(workdir=tmp_path / "runs", trainer=trainer, n_trials=1)
         run_experiment(experiment)
         assert_host_state_active()
 
@@ -2546,8 +2520,7 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
         failing_experiment = make_experiment(
             experiment="fails",
             workdir=tmp_path / "runs",
-            trial_command=f"python {failing_trainer} --out {{trial_dir}}/r.json {{overrides}}",
-            override_format="argparse",
+            trainer=failing_trainer,
             n_trials=1,
             max_consecutive_failures=1,
         )

@@ -154,13 +154,7 @@ def _two_phase_experiment(
             search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
         ),
     ]
-    return make_experiment(
-        workdir=str(workdir),
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=phases,
-    )
+    return make_experiment(workdir=workdir, storage=storage, trainer=trainer, phases=phases)
 
 
 def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) -> SimpleNamespace:
@@ -627,14 +621,7 @@ def _environment_cohort_experiment(
     trainer: Path,
     execution: ExecutionContext,
 ) -> Experiment:
-    return make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        execution=execution,
-        n_trials=1,
-    )
+    return make_experiment(persistent=tmp_path, trainer=trainer, execution=execution, n_trials=1)
 
 
 @pytest.mark.integration
@@ -888,13 +875,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
         sampler=sampler,
         search_space=search_space,
     )
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=[phase],
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
 
@@ -951,13 +932,7 @@ def test_stateful_sampler_completed_target_reruns_as_noop(
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
     phase = Phase(name="p", n_trials=2, sampler=sampler, search_space=search_space)
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=[phase],
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     first = run_experiment(experiment)
     rerun = run_experiment(experiment)
 
@@ -978,13 +953,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
         sampler=Sampler(type="random", seed=0),
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        phases=[phase],
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     winners = run_experiment(experiment)
     winner_before = _winner_path(experiment, "p").read_bytes()
 
@@ -1102,21 +1071,14 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
 def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> None:
     """An equal binding is a no-op: ordinary resume and top-up still work."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(experiment)
     topped_up = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
     )
     run_experiment(topped_up)
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
     assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
 
@@ -1190,8 +1152,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
         return make_experiment(
             workdir=workdir,
             storage=f"sqlite:///{tmp_path / database}",
-            trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=1,
         )
 
@@ -1238,11 +1199,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
     registration_cwd.mkdir()
     foreign_cwd.mkdir()
     experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage="sqlite:///ledger.db",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
+        workdir=tmp_path / "runs", storage="sqlite:///ledger.db", trainer=trainer, n_trials=1
     )
     monkeypatch.chdir(registration_cwd)
     run_experiment(experiment)
@@ -1275,11 +1232,7 @@ def test_retargeted_experiment_symlink_is_rejected_before_claim(
     workdir.mkdir()
     retargeted_root.mkdir()
     owner = make_experiment(
-        workdir=original_parent,
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
+        persistent=tmp_path, workdir=original_parent, trainer=trainer, n_trials=1
     )
     run_experiment(owner)
     original_binding = _artifact_root_binding_path(owner).read_bytes()
@@ -1299,18 +1252,11 @@ def test_retargeted_experiment_symlink_is_rejected_before_claim(
 def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path) -> None:
     """An empty Optuna namespace cannot silently override the configured goal."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     experiment = experiment.model_copy(
         update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
     )
-    study = optuna.create_study(study_name="t::p", storage=storage, direction="minimize")
+    study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
     with pytest.raises(StudySchemaMismatchError, match="config requires maximize"):
@@ -1323,14 +1269,8 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
 def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     """A populated pre-cutover study is refused without mutation."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
+    storage = experiment.storage
     run_experiment(experiment)
     root = _experiment_dir(experiment)
     assert_published_winner_evidence_local(root)
@@ -1452,14 +1392,7 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
 ) -> None:
     """The published-phase existence read keeps strict storage-error semantics."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(experiment)
     published = _last_successful_generation_id(experiment)
     assert published is not None
@@ -1564,13 +1497,7 @@ def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
 
     trainer = write_constant_trainer(tmp_path)
     ledger = tmp_path / "studies.db"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{ledger}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(experiment)
     published = _last_successful_generation_id(experiment)
 
@@ -1665,11 +1592,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     trainer = write_constant_trainer(tmp_path)
     storage = f"sqlite:///{tmp_path / 'studies.db'}"
     experiment_a = make_experiment(
-        workdir=tmp_path / "runs_a",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
+        workdir=tmp_path / "runs_a", storage=storage, trainer=trainer, n_trials=1
     )
     run_experiment(experiment_a)
     root_a = str(_experiment_dir(experiment_a))
@@ -1732,13 +1655,7 @@ def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) 
     """
     trainer = write_constant_trainer(tmp_path)
     db_path = tmp_path / "studies.db"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{db_path}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(experiment)
     storage = experiment.resolved_storage
     study_name = f"{experiment.experiment}::{experiment.phases[0].name}"
@@ -1760,12 +1677,11 @@ def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) 
 def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: Path) -> None:
     """Missing file and schema-less file are the only two absence verdicts."""
     trainer = write_constant_trainer(tmp_path)
-    trial_command = f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
 
     never_created = make_experiment(
         workdir=tmp_path / "runs_missing",
         storage=f"sqlite:///{tmp_path / 'never-created.db'}",
-        trial_command=trial_command,
+        trainer=trainer,
         n_trials=1,
     )
     assert not (tmp_path / "never-created.db").exists()
@@ -1777,7 +1693,7 @@ def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: P
     schemaless = make_experiment(
         workdir=tmp_path / "runs_schemaless",
         storage=f"sqlite:///{schemaless_path}",
-        trial_command=trial_command,
+        trainer=trainer,
         n_trials=1,
     )
     assert _sqlite_study_exists(schemaless.resolved_storage, "t::p") is False
@@ -1791,11 +1707,7 @@ def test_fresh_and_repeated_in_memory_roots_record_explicit_no_ledger_bindings(
     """In-memory runs record an explicit no-ledger binding for each artifact root."""
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
-        workdir=tmp_path / "runs_a",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
+        workdir=tmp_path / "runs_a", storage=storage, trainer=trainer, n_trials=1
     )
     run_experiment(experiment)
     run_experiment(experiment)
@@ -1822,17 +1734,10 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(
 ) -> None:
     """A durable publication tree cannot be reused with an ephemeral ledger."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
-    owner = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=storage,
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    owner = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(owner)
     pointer_before = _generation_path(owner).read_bytes()
-    ledger_before = sqlite_database_path(storage)
+    ledger_before = sqlite_database_path(owner.storage)
     assert ledger_before is not None
     ledger_bytes_before = ledger_before.read_bytes()
     status_before = read_status(owner)
@@ -1857,13 +1762,7 @@ def test_persistent_bound_root_rejects_an_in_memory_configuration(
 @pytest.mark.integration
 def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        n_trials=1,
-    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     generation_id = "fixed-generation"
     run_experiment(experiment, generation_id=generation_id)
     protected = [
@@ -1907,11 +1806,7 @@ def test_winner_yaml_contains_phase_fingerprint(tmp_path: Path) -> None:
     re-computed fingerprint of the current YAML.
     """
     trainer = write_constant_trainer(tmp_path)
-    exp = make_experiment(
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-    )
+    exp = make_experiment(workdir=tmp_path / "runs", trainer=trainer)
     run_experiment(exp)
 
     data = yaml.safe_load(_winner_path(exp, "p").read_text())
@@ -2104,10 +1999,8 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
     monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
     trainer = write_constant_trainer(tmp_path)
     exp = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
+        persistent=tmp_path,
+        trainer=trainer,
         env={"PHASESWEEP_TEST_SECRET": "config-secret"},
         execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
         n_trials=1,
