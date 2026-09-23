@@ -42,7 +42,6 @@ from phasesweep.errors import OperatorAction
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _load_recovery_studies,
-    _RecoveryNeeds,
     recover_run,
 )
 from phasesweep.mcp.runs import RunStore, UnsupportedStateFormatError
@@ -60,6 +59,7 @@ from tests.ledger_fixtures import (
     tree_snapshot,
 )
 from tests.mcp_helpers import stage_dead_run
+from tests.recovery_helpers import load_only_recovery_needs
 
 #: Every fixture this matrix requires. A missing entry means an incomplete
 #: regeneration, not a smaller matrix, so it is asserted by name.
@@ -323,20 +323,9 @@ def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_p
     the fix is the preserved prior release, not "run recover-run again".
     """
     materialized = materialize(fixture_name, tmp_path, mode="tree")
-    needs = _RecoveryNeeds(
-        terminal_status=None,
-        stored_snapshot=None,
-        prepared_publication_generation=None,
-        cleanup_needed=False,
-        terminal_cleanup_uncertain=False,
-        ownership_storage_unavailable=False,
-        snapshot_recovery_required=False,
-        snapshot_unavailable=False,
-        snapshot_finalize_needed=False,
-    )
 
     with pytest.raises(RunRecoveryError) as excinfo:
-        _load_recovery_studies(materialized.experiment, needs)
+        _load_recovery_studies(materialized.experiment, load_only_recovery_needs())
 
     assert _SCHEMA_MISMATCH_PHRASE in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, StudySchemaMismatchError)

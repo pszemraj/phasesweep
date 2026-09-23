@@ -44,7 +44,6 @@ from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _load_recovery_studies,
-    _RecoveryNeeds,
     recover_run,
 )
 from phasesweep.mcp.runs import RunStore
@@ -57,6 +56,7 @@ from tests.ledger_fixtures import (
     tree_snapshot,
 )
 from tests.mcp_helpers import stage_dead_run
+from tests.recovery_helpers import load_only_recovery_needs
 
 
 def _experiment(tmp_path: Path, *, storage: str | None) -> Experiment:
@@ -600,21 +600,6 @@ def _committed_trials(database: Path) -> list[tuple[int, str]]:
         snapshot.unlink()
 
 
-def _recovery_needs() -> _RecoveryNeeds:
-    """Return recovery decisions that load studies and nothing else."""
-    return _RecoveryNeeds(
-        terminal_status=None,
-        stored_snapshot=None,
-        prepared_publication_generation=None,
-        cleanup_needed=False,
-        terminal_cleanup_uncertain=False,
-        ownership_storage_unavailable=False,
-        snapshot_recovery_required=False,
-        snapshot_finalize_needed=False,
-        snapshot_unavailable=False,
-    )
-
-
 _INTERRUPTED = "holds a transaction that a crash interrupted"
 
 
@@ -641,7 +626,7 @@ def test_reads_report_an_interrupted_transaction_and_leave_it_for_a_locked_path(
     with pytest.raises(LedgerTransactionInterruptedError) as opened:
         open_existing_study(ledger, experiment.phases[0])
     with pytest.raises(RunRecoveryError) as inspected:
-        _load_recovery_studies(experiment, _recovery_needs())
+        _load_recovery_studies(experiment, load_only_recovery_needs())
 
     assert ledger.binding_state == ("bound" if mode == "tree" else "unbound")
     assert isinstance(ledger.format_scan_failure, LedgerTransactionInterruptedError)
@@ -777,9 +762,9 @@ def test_writers_refuse_a_partial_final_journal_record_and_leave_it(
     with pytest.raises(IncompleteJournalRecordError) as registry:
         open_registry_study(experiment.resolved_storage, "t::p")
     with pytest.raises(RunRecoveryError) as inspected:
-        _load_recovery_studies(experiment, _recovery_needs())
+        _load_recovery_studies(experiment, load_only_recovery_needs())
     with _experiment_lock(experiment), pytest.raises(RunRecoveryError) as confirmed:
-        _load_recovery_studies(experiment, _recovery_needs(), confirm=True)
+        _load_recovery_studies(experiment, load_only_recovery_needs(), confirm=True)
 
     assert str(inspected.value) == str(confirmed.value) == str(claimed.value)
     for refusal in (claimed.value, registry.value, inspected.value, confirmed.value):
