@@ -16,7 +16,15 @@ from pathlib import Path
 
 import pytest
 
-from tests.tiers import SLOW_CALL_SECONDS, excludes_integration, scan_module, slow_unmarked
+from tests.tiers import (
+    PROCESS_DRIVER_CALLS,
+    SLOW_CALL_SECONDS,
+    WALLCLOCK_HELPER_CALLS,
+    excludes_integration,
+    scan_helpers,
+    scan_module,
+    slow_unmarked,
+)
 
 #: Rule id -> (probe source defining ``test_probe``, fragment its reason must contain).
 RULE_PROBES: dict[str, tuple[str, str]] = {
@@ -105,6 +113,41 @@ RULE_PROBES: dict[str, tuple[str, str]] = {
         "    (tmp_path / 'trainer.py').write_text('import time; time.sleep(5)\\n')\n",
         "string literal",
     ),
+    # Nothing else holds the event, so the wait always runs its full timeout.
+    "wait-on-fresh-event": (
+        "import threading\n\ndef test_probe():\n    threading.Event().wait(0.5)\n",
+        "waits out a .wait() timeout",
+    ),
+    "wait-asserted-to-time-out": (
+        "def test_probe(ready):\n    assert not ready.wait(timeout=0.5)\n",
+        "waits out a .wait() timeout",
+    ),
+    "wait-compared-to-false": (
+        "def test_probe(ready):\n    assert ready.wait(0.5) is False\n",
+        "waits out a .wait() timeout",
+    ),
+    "threading-timer": (
+        "from threading import Timer\n\ndef test_probe():\n    Timer(0.1, print).start()\n",
+        "references threading.Timer",
+    ),
+    "select-select": (
+        "import select\n\ndef test_probe():\n    select.select([], [], [], 0.1)\n",
+        "references select.select",
+    ),
+    "signal-pause": (
+        "import signal\n\ndef test_probe():\n    signal.pause()\n",
+        "references signal.pause",
+    ),
+    "wallclock-helper": (
+        "from tests.mcp_helpers import wait_for_mcp_running_trial\n\n"
+        "def test_probe(app):\n    wait_for_mcp_running_trial(app, 'r', timeout=1.0)\n",
+        "calls wait_for_mcp_running_trial()",
+    ),
+    # A registered name also counts when a test requests it as a fixture.
+    "shared-fixture": (
+        "def test_probe(runner_main):\n    assert runner_main\n",
+        "requests fixture runner_main",
+    ),
     "helper": (
         "import subprocess\n\n"
         "def _spawn_worker():\n    return subprocess.Popen(['true'])\n\n"
@@ -162,6 +205,16 @@ FAST_TIER_PROBES: dict[str, str] = {
         "    ThreadPoolExecutor().shutdown()\n"
         "    ThreadPool(1).close()\n"
     ),
+    # A handshake returns once the peer sets the event; the timeout only bounds a hang.
+    "handshake-wait": (
+        "import threading\n\n"
+        "def test_probe():\n"
+        "    ready = threading.Event()\n"
+        "    threading.Thread(target=ready.set).start()\n"
+        "    assert ready.wait(timeout=5)\n"
+        "    if not ready.wait(5):\n"
+        "        raise AssertionError('peer never signalled')\n"
+    ),
     # A quick engine run spawns its trainer inside the package, out of the
     # scanner's sight by design: these runs are the fast tier's engine coverage.
     "quick-engine-run": (
@@ -190,6 +243,34 @@ def test_guard_module_survives_its_own_rules():
     # Otherwise every probe added here would have to be marked as an
     # integration test.
     assert scan_module(Path(__file__).read_text(encoding="utf-8")) == {}
+
+
+#: A shared helper module with one spawner, one waiter, and one plain builder.
+HELPER_MODULE_PROBE = (
+    "import subprocess\nimport time\n\n"
+    "def spawn_worker():\n    return subprocess.Popen(['true'])\n\n"
+    "def poll_until_ready():\n    time.sleep(0.1)\n\n"
+    "def build_config():\n    return {}\n"
+)
+
+
+def test_helper_scan_finds_shared_spawners_and_waiters():
+    assert set(scan_helpers(HELPER_MODULE_PROBE)) == {"spawn_worker", "poll_until_ready"}
+
+
+def test_shared_helpers_that_spawn_or_wait_are_registered():
+    # A test that imports a helper is out of the scanner's same-module reach, so
+    # only registration by name classifies it. tiers.py is skipped because its
+    # rule descriptions quote the very primitives they detect.
+    registered = PROCESS_DRIVER_CALLS | WALLCLOCK_HELPER_CALLS
+    unregistered = {
+        f"{path.name}::{name}": reason
+        for path in sorted(Path(__file__).parent.glob("*.py"))
+        if not path.name.startswith("test_") and path.name != "tiers.py"
+        for name, reason in scan_helpers(path.read_text(encoding="utf-8")).items()
+        if name not in registered
+    }
+    assert unregistered == {}, "register these in tests/tiers.py"
 
 
 def _report(nodeid, *, duration, when="call", markers=()):
