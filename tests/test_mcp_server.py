@@ -136,8 +136,10 @@ from tests.mcp_helpers import (
     patch_popen_capture,
     runner_argv,
     runner_main,
+    stage_dead_run,
     write_mcp_catalog,
     write_run_status,
+    write_unsafe_cleanup_status,
 )
 from tests.recovery_helpers import (
     recover_run_cli,
@@ -2081,15 +2083,7 @@ def _record_published_run_snapshot(
     _app, registry, store = make_mcp_app(catalog)
     reg = registry.get("srv")
     run_id = "srv-frozen-result"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     run_experiment(experiment, generation_id=run_id)
     write_run_status(
         store,
@@ -3337,13 +3331,7 @@ def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
         starttime=111,
     )
     store.create(handle)
-    write_run_status(
-        store,
-        run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, run_id)
 
     assert store.state(handle) == "running"
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
@@ -3582,24 +3570,10 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
     write_uncertain_failed_trial(config, generation_id=run_id)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-        allow_cancel=True,
+    handle = stage_dead_run(
+        store, run_id, config, reg.id, cleanup_uncertain=True, allow_cancel=True
     )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    write_run_status(
-        store,
-        run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
-    store.mark_cleanup_uncertain(handle)
+    write_unsafe_cleanup_status(store, run_id)
     monkeypatch.setattr(
         "phasesweep.engine.cleanup.cleanup_stale_trial_process", lambda _identity: True
     )
@@ -3641,16 +3615,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-operator-recover"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    store.mark_cleanup_uncertain(handle)
+    stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
 
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
@@ -3695,16 +3660,7 @@ def test_recovery_preserves_status_written_after_initial_read(
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-status-during-recovery"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    store.mark_cleanup_uncertain(handle)
+    handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
     snapshot = capture_result_snapshot(experiment, generation_id=run_id)
@@ -3964,16 +3920,7 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-recovery-lock-contention"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    store.mark_cleanup_uncertain(handle)
+    stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
     cleanup_calls = 0
 
     def unexpected_cleanup(*args: object, **kwargs: object) -> bool:
@@ -3998,15 +3945,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-pending-finalization"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     write_run_status(
         store,
         run_id,
@@ -4146,15 +4085,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-registry-only-recovery"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
 
     # A real run binds the tree in preflight, long before it registers an
     # attempt into it. Fabricating the registry entry without the binding would
@@ -4299,15 +4230,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
 
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
-    handle = make_run_handle(
-        run_id=earlier_run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(earlier_run_id).write_bytes(config.read_bytes())
+    handle = stage_dead_run(store, earlier_run_id, config, reg.id, cleanup_uncertain=False)
     status_kwargs: dict[str, object] = {}
     if anonymous_snapshot:
         snapshot = capture_result_snapshot(
@@ -4321,12 +4244,9 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
             "result_snapshot_state": "complete",
             "result_snapshot": snapshot,
         }
-    write_run_status(
+    write_unsafe_cleanup_status(
         store,
         earlier_run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
         uncertain_attempt_ids=[attempt_id] if causally_reported else [],
         **status_kwargs,
     )
@@ -4387,15 +4307,7 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-result-repair"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     write_run_status(
         store,
         run_id,
@@ -4483,28 +4395,13 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     trial_number = trial_setup_fn(config, generation_id=run_id, pid=trial_pid)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     status_kwargs: dict[str, object] = {}
     if expect_running_before_confirm:
         exp = load_config(config)
         assert isinstance(exp, Experiment)
         status_kwargs["result_snapshot"] = capture_result_snapshot(exp)
-    write_run_status(
-        store,
-        run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-        **status_kwargs,
-    )
+    write_unsafe_cleanup_status(store, run_id, **status_kwargs)
     if expect_running_before_confirm:
         assert app.status(run_id=run_id)["phases"][0]["running_trials_total"] == 1
 
@@ -4815,15 +4712,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
 
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     write_run_status(
         store,
         run_id,
@@ -4925,22 +4814,8 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
 
-    first_handle = make_run_handle(
-        run_id=first_run,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(first_handle)
-    store.config_snapshot_path(first_run).write_bytes(config.read_bytes())
-    write_run_status(
-        store,
-        first_run,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    stage_dead_run(store, first_run, config, reg.id, cleanup_uncertain=False)
+    write_unsafe_cleanup_status(store, first_run)
 
     first = recover_run_cli(registry.state_dir, first_run, confirm=True)
 
@@ -4949,22 +4824,8 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [trial_number]
 
     second_run = "srv-terminal-second"
-    second_handle = make_run_handle(
-        run_id=second_run,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=112,
-    )
-    store.create(second_handle)
-    store.config_snapshot_path(second_run).write_bytes(config.read_bytes())
-    write_run_status(
-        store,
-        second_run,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    second_handle = stage_dead_run(store, second_run, config, reg.id, cleanup_uncertain=False)
+    write_unsafe_cleanup_status(store, second_run)
 
     replay = recover_run_cli(registry.state_dir, second_run, confirm=True)
 
@@ -4989,24 +4850,8 @@ def _stage_terminal_uncertain_run(
     trial_number = write_uncertain_failed_trial(config, generation_id=run_id)
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    if mark_uncertain:
-        store.mark_cleanup_uncertain(handle)
-    write_run_status(
-        store,
-        run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=mark_uncertain)
+    write_unsafe_cleanup_status(store, run_id)
 
     def fake_cleanup(*args: object, **kwargs: object) -> bool:
         return True
@@ -5034,12 +4879,9 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     )
     experiment = load_config(config)
     assert isinstance(experiment, Experiment)
-    write_run_status(
+    write_unsafe_cleanup_status(
         store,
         run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
         result_snapshot_state="complete",
         result_snapshot=capture_result_snapshot(experiment),
     )
@@ -5151,13 +4993,7 @@ def test_operator_recovery_refuses_unverifiable_run(
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes() + snapshot_suffix)
     if terminal_without_evidence:
-        write_run_status(
-            store,
-            run_id,
-            returncode=1,
-            error_class="UnsafeProcessCleanupError",
-            cleanup_confirmed=False,
-        )
+        write_unsafe_cleanup_status(store, run_id)
     else:
         store.mark_cleanup_uncertain(handle)
 
