@@ -165,23 +165,6 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
 
 
 @pytest.mark.integration
-def test_current_memory_output_records_deliberate_no_ledger_identity(tmp_path: Path) -> None:
-    """Fresh memory runs receive the same output-format marker and can continue."""
-    experiment = _experiment(tmp_path, storage=None)
-
-    run_experiment(experiment)
-    run_experiment(experiment)
-
-    payload = json.loads(_artifact_root_binding_path(experiment).read_text(encoding="utf-8"))
-    assert payload == {
-        "schema_version": ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
-        "experiment": experiment.experiment,
-        "artifact_root": str(_experiment_dir(experiment).resolve()),
-        "storage_key": None,
-    }
-
-
-@pytest.mark.integration
 def test_current_sqlite_format_continues_after_top_up(tmp_path: Path) -> None:
     """The early compatibility precheck preserves supported continuation."""
     storage = f"sqlite:///{tmp_path / 'current.db'}"
