@@ -48,7 +48,6 @@ from phasesweep.engine import (
     LedgerTransactionInterruptedError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
-    PublishedStudyMissingError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -285,30 +284,31 @@ def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
     )
 
 
-# A wrap translates one failure into another at a layer boundary. Each row below drives a real wrap
-# site through its real entry point, faulting only the call beneath it, and pins what the operator
-# receives: the outbound type, the action it routes to, the cause it keeps, and a stable piece of
-# today's message. A row whose action differs from its outbound class default is the evidence that
-# the site preserves or composes the remediation rather than replacing it.
-
 Trigger = Callable[[Path, pytest.MonkeyPatch], object]
 
 
 @dataclass(frozen=True)
-class WrapCase:
-    """One real wrap site and the routing an operator must receive from it."""
+class RoutingCase:
+    """One real raise site and the routing an operator must receive from it."""
 
     id: str
-    #: Drives the real entry point until the wrap under test raises.
+    #: Drives the real entry point until the raise under test.
     trigger: Trigger
-    outbound: type[PhaseSweepError]
+    raised: type[PhaseSweepError]
     #: The one step, or every step in order where the site composes several.
     action: OperatorAction | tuple[OperatorAction, ...]
-    #: Exact ``__cause__`` type, or ``None`` where the site raises ``from None``.
-    cause: type[BaseException] | None
     #: Stable substring of the operator text the site raises today.
     message: str
+    #: Exact ``__cause__`` type, pinned only where the runner routes by it.
+    cause: type[BaseException] | None = None
     marks: tuple[pytest.MarkDecorator, ...] = ()
+
+
+# A wrap translates one failure into another at a layer boundary. Each row below drives a real wrap
+# site through its real entry point, faulting only the call beneath it, and pins what the operator
+# receives: the raised type, the action it routes to, and a stable piece of today's message. A row
+# whose action differs from its raised class default is the evidence that the site preserves or
+# composes the remediation rather than replacing it.
 
 
 def _raiser(error: BaseException) -> Callable[..., object]:
@@ -749,69 +749,64 @@ def _preflight_shared_registry_and_lost_ledger(
 _PREFLIGHT_AGGREGATE = "Experiment recovery preflight found multiple unsafe studies: "
 
 WRAP_CASES = (
-    WrapCase(
+    RoutingCase(
         id="claim_ledger_discovery_preserves_override",
         trigger=_claim_while(engine_ledger, "_load_existing_phase_study", _ledger_busy),
-        outbound=StudyStorageUnavailableError,
+        raised=StudyStorageUnavailableError,
         action=OperatorAction.RETRY,
-        cause=StudyStorageUnavailableError,
         message="Could not inspect persistent study storage for phase 'p'.",
     ),
-    WrapCase(
+    RoutingCase(
         id="published_check_preserves_override",
         trigger=_claim_while(optuna.Study, "get_trials", _ledger_busy),
-        outbound=StudyStorageUnavailableError,
+        raised=StudyStorageUnavailableError,
         action=OperatorAction.RETRY,
-        cause=StudyStorageUnavailableError,
         message="Could not inspect persistent study storage for published phase 'p'.",
     ),
-    WrapCase(
+    RoutingCase(
         id="run_ownership_compose",
         trigger=_run_while_discovery_fails,
-        outbound=ProcessCleanupUncertainError,
+        raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        cause=StudyStorageUnavailableError,
         message="Artifact ownership could not be checked because required persistent",
+        cause=StudyStorageUnavailableError,
     ),
-    WrapCase(
+    RoutingCase(
         # The partial record names its own repair; restoring the ledger is not it.
         id="run_ownership_keeps_journal_repair",
         trigger=_run_over_damaged("current-journal", _truncated),
-        outbound=ProcessCleanupUncertainError,
+        raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        cause=IncompleteJournalRecordError,
         message="Nothing was written. Cleanup state is therefore unknown. For an MCP run",
+        cause=IncompleteJournalRecordError,
     ),
-    WrapCase(
+    RoutingCase(
         # Composed: the cleanup refusal's own repair survives the replacement.
         id="run_failure_cleanup_keeps_repair",
         trigger=_run_fails_then_registry_turns_shared,
-        outbound=ProcessCleanupUncertainError,
+        raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
-        cause=NoFeasibleTrialError,
         message="Restore the original registry with mode 0700 before retrying.",
     ),
-    WrapCase(
+    RoutingCase(
         # Negative: unconfirmed cleanup deliberately replaces the run's own remedy.
         id="run_failure_cleanup_replaces",
         trigger=_run_fails_then_cleanup_unconfirmed,
-        outbound=ProcessCleanupUncertainError,
+        raised=ProcessCleanupUncertainError,
         action=OperatorAction.RUN_RECOVER_RUN,
-        cause=NoFeasibleTrialError,
         message="The run failed and subsequent process cleanup could not be confirmed.",
     ),
-    WrapCase(
+    RoutingCase(
         id="recovery_studies_storage_bound",
         trigger=_recovery_studies_damaged("tree", _garbage),
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        cause=StudyStorageUnavailableError,
         message=(
             "Restore the original complete storage ledger and access to it, then retry "
             "phasesweep mcp recover-run."
         ),
     ),
-    WrapCase(
+    RoutingCase(
         # The ledger is intact, so the storage wrap's restore remedy must not
         # replace the confirmed recover-run that lets SQLite roll it back. Not
         # RETRY either: no holder is waited on, and repeating a read never
@@ -820,222 +815,171 @@ WRAP_CASES = (
         # from.
         id="recovery_studies_interrupted_transaction",
         trigger=_recovery_studies_damaged("tree", leave_hot_journal),
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RUN_RECOVER_RUN,
-        cause=LedgerTransactionInterruptedError,
         message="`phasesweep mcp recover-run --confirm` holds the experiment lock",
     ),
-    WrapCase(
+    RoutingCase(
         id="recovery_published_missing",
         trigger=_recovery_studies_damaged(
             "tree", _trials_deleted, ownership_storage_unavailable=True
         ),
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        cause=PublishedStudyMissingError,
         message=(
             "Restore the original complete storage ledger and study with access to it, "
             "then retry phasesweep mcp recover-run."
         ),
     ),
-    WrapCase(
+    RoutingCase(
         id="recover_run_lock_busy",
         trigger=_recover_while_locked,
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RETRY,
-        cause=None,
         message="Another phasesweep process appears to be using the same experiment backend",
     ),
-    WrapCase(
+    RoutingCase(
         # Composed: the inbound refusal is a ValueError carrying no action, so the
         # site supplies the one its message names.
         id="recover_run_pre_cutover_state",
         trigger=_recover_over_pre_cutover_state,
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.USE_PRIOR_RELEASE,
-        cause=None,
         message="use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime",
     ),
-    WrapCase(
+    RoutingCase(
         # Composed: a path with no run-store layout is a wrong argument, even
         # when it names some other existing, shared directory.
         id="recover_run_mistyped_state_dir",
         trigger=_recover_from_mistyped_state_dir,
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.FIX_CONFIG,
-        cause=None,
         message="Pass the state_dir from the catalog the MCP server runs with.",
     ),
-    WrapCase(
+    RoutingCase(
         id="recover_run_shared_state_dir",
         trigger=_recover_from_shared_state_dir,
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        cause=None,
         message="must be owned by uid",
     ),
-    WrapCase(
+    RoutingCase(
         id="recover_run_pending_snapshot_unsafe_path",
         trigger=_recover_pending_snapshot_while(
             "write_status_file", UnsafePrivatePathError("Private directory is not owner-only.")
         ),
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        cause=None,
         message="failed to finalize terminal result snapshot for wrap-recover: "
         "UnsafePrivatePathError",
     ),
-    WrapCase(
+    RoutingCase(
         id="finalize_snapshot_platform",
         trigger=_finalize_complete_snapshot_while(
             "write_status_file", PlatformCapabilityError("O_NOFOLLOW is unavailable.")
         ),
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.FIX_CONFIG,
-        cause=None,
         message="failed to finalize terminal result snapshot for wrap-recover: "
         "PlatformCapabilityError",
     ),
-    WrapCase(
+    RoutingCase(
         # recover-run reads the same entry, so routing it back to recover-run
         # would loop; the entry itself is what the operator repairs.
         id="recover_run_malformed_registry_entry",
         trigger=_recover_over_malformed_registry_entry,
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        cause=None,
         message="delete the entry file if you are certain nothing is running.",
     ),
-    WrapCase(
+    RoutingCase(
         # Composed: the claim path routes this refusal to fixing the config,
         # but recovery's config is pinned, so only the tree can be restored.
         id="recovery_studies_root_moved",
         trigger=_recover_through_retargeted_workdir,
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
-        cause=ArtifactRootConflictError,
         message="Restore the original workdir, or use a fresh artifact root",
     ),
-    WrapCase(
+    RoutingCase(
         id="sqlite_garbage",
         trigger=_validate_damaged("current-sqlite", _garbage),
-        outbound=StudyStorageUnavailableError,
+        raised=StudyStorageUnavailableError,
         action=OperatorAction.RESTORE_LEDGER,
-        cause=sqlite3.DatabaseError,
         message="could not be inspected for its PhaseSweep format without mutation.",
     ),
-    WrapCase(
+    RoutingCase(
         # Inspection previews the confirmed write, so it refuses a cut-short
         # last record with the repair, not recover-run's usual restore remedy.
         id="recovery_studies_journal_incomplete_record",
         trigger=_recovery_studies_damaged("tree", _truncated, fixture="current-journal"),
-        outbound=RunRecoveryError,
+        raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        cause=IncompleteJournalRecordError,
         message="truncate it after its last complete line",
     ),
-    WrapCase(
+    RoutingCase(
         # recover-run reaps through the same read, so the ledger comes back first.
         id="cleanup_reap_inspect",
         trigger=_reap_unreadable_study,
-        outbound=ProcessCleanupUncertainError,
+        raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        cause=RuntimeError,
         message="Could not inspect study 't::p' for stale RUNNING trials.",
     ),
-    WrapCase(
+    RoutingCase(
         # Not a damaged registry: the missing capability keeps its own routing.
         id="registry_open_platform_capability",
         trigger=_registry_scan_without_capability("open_directory_fd"),
-        outbound=PlatformCapabilityError,
+        raised=PlatformCapabilityError,
         action=OperatorAction.FIX_CONFIG,
-        cause=None,
         message=_NO_NOFOLLOW,
     ),
-    WrapCase(
+    RoutingCase(
         id="registry_entry_platform_capability",
         trigger=_registry_scan_without_capability("read_private_text_at"),
-        outbound=PlatformCapabilityError,
+        raised=PlatformCapabilityError,
         action=OperatorAction.FIX_CONFIG,
-        cause=None,
         message=_NO_NOFOLLOW,
     ),
-    WrapCase(
+    RoutingCase(
         id="preflight_same_type_aggregate",
         trigger=_preflight(_two_precutover_studies),
-        outbound=StudySchemaMismatchError,
+        raised=StudySchemaMismatchError,
         action=OperatorAction.USE_PRIOR_RELEASE,
-        cause=StudySchemaMismatchError,
         message=_PREFLIGHT_AGGREGATE,
     ),
-    WrapCase(
+    RoutingCase(
         # One type does not make one remedy: disagreeing refusals route to reading them.
         id="preflight_same_type_aggregate_disagreeing",
         trigger=_preflight(_two_precutover_studies, schema_check=_refuse_schema_differently),
-        outbound=StudySchemaMismatchError,
+        raised=StudySchemaMismatchError,
         action=OperatorAction.INSPECT_LOGS,
-        cause=StudySchemaMismatchError,
         message=_PREFLIGHT_AGGREGATE,
     ),
-    WrapCase(
+    RoutingCase(
         # Composed: every repair any cleanup or storage refusal needs, then recovery.
         id="preflight_cleanup_aggregate_repairs",
         trigger=_preflight_shared_registry_and_lost_ledger,
-        outbound=ProcessCleanupUncertainError,
+        raised=ProcessCleanupUncertainError,
         action=(
             OperatorAction.RESTORE_TREE,
             OperatorAction.RESTORE_LEDGER,
             OperatorAction.RUN_RECOVER_RUN,
         ),
-        cause=ProcessCleanupUncertainError,
         message=_PREFLIGHT_AGGREGATE,
     ),
-    WrapCase(
+    RoutingCase(
         id="preflight_mixed_aggregate_agreeing",
         trigger=_preflight(_two_precutover_studies, schema_check=_refuse_as_prior_release),
-        outbound=PhaseSweepError,
+        raised=PhaseSweepError,
         action=OperatorAction.USE_PRIOR_RELEASE,
-        cause=StudySchemaMismatchError,
         message=_PREFLIGHT_AGGREGATE,
     ),
 )
 
 
-@pytest.mark.parametrize("case", [pytest.param(c, id=c.id, marks=c.marks) for c in WRAP_CASES])
-def test_operator_action_survives_wrap(
-    case: WrapCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    with pytest.raises(case.outbound) as excinfo:
-        case.trigger(tmp_path, monkeypatch)
-
-    error = excinfo.value
-    assert type(error) is case.outbound
-    assert error.actions == (case.action if isinstance(case.action, tuple) else (case.action,))
-    if case.cause is None:
-        assert error.__cause__ is None
-    else:
-        assert type(error.__cause__) is case.cause
-    assert case.message in str(error)
-
-
 # An origin raise states its remedy in its own message, so its action has to
 # name that same remedy rather than whatever its class defaults to. Each row
 # drives the real code path to one such raise and pins the pair together.
-
-
-@dataclass(frozen=True)
-class OriginCase:
-    """One raise site whose action must match the remedy its message gives."""
-
-    id: str
-    #: Drives the real code path until the raise under test.
-    trigger: Trigger
-    raised: type[PhaseSweepError]
-    #: The one remedy, or every required step in the order the message gives.
-    action: OperatorAction | tuple[OperatorAction, ...]
-    #: Stable substring of the remedy the message gives today.
-    message: str
-    marks: tuple[pytest.MarkDecorator, ...] = ()
 
 
 def _auto_storage_experiment(workdir: Path, n_jobs: int) -> Experiment:
@@ -1483,98 +1427,98 @@ _DELETE_ENTRY_IF_NOTHING_RUNS = "Delete the entry file only if you are certain n
 
 
 ORIGIN_CASES = (
-    OriginCase(
+    RoutingCase(
         id="auto_storage_backend_switch",
         trigger=_validate_after_auto_backend_switch,
         raised=ArtifactRootConflictError,
         action=OperatorAction.FIX_CONFIG,
         message="Restore the previous n_jobs setting to continue this tree",
     ),
-    OriginCase(
+    RoutingCase(
         id="claim_ledger_tree_changed",
         trigger=_claim_after_unlocked_bind,
         raised=ArtifactRootConflictError,
         action=OperatorAction.INSPECT_LOGS,
         message="Stop that process before retrying.",
     ),
-    OriginCase(
+    RoutingCase(
         id="prepared_publication_unreadable",
         trigger=_reconcile_prepared_over_damaged_publication,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
         message="Restore the publication evidence or access to it before retrying recovery.",
     ),
-    OriginCase(
+    RoutingCase(
         id="registry_terminal_identity_missing",
         trigger=_preflight_registered_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Restore the original storage ledger with its durable attempt and generation",
     ),
-    OriginCase(
+    RoutingCase(
         id="uncertain_trial_attempt_missing",
         trigger=_inspect_uncertain_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Process identity is unknown. Restore the original storage ledger",
     ),
-    OriginCase(
+    RoutingCase(
         id="uncertain_trial_identity_files_mismatch",
         trigger=_inspect_uncertain_trial_without_identity_files,
         raised=ProcessCleanupUncertainError,
         action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
         message="Restore the original storage ledger and this attempt's process-identity files",
     ),
-    OriginCase(
+    RoutingCase(
         id="lock_dir_no_account_home",
         trigger=_lock_dir_without_account_home,
         raised=UnsafeLockPathError,
         action=OperatorAction.FIX_CONFIG,
         message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
     ),
-    OriginCase(
+    RoutingCase(
         id="lock_dir_relative_account_home",
         trigger=_lock_dir_with_relative_account_home,
         raised=UnsafeLockPathError,
         action=OperatorAction.FIX_CONFIG,
         message="provision an absolute lock directory and set PHASESWEEP_LOCK_DIR.",
     ),
-    OriginCase(
+    RoutingCase(
         id="lock_dir_override_relative",
         trigger=_lock_dir_override_relative,
         raised=UnsafeLockPathError,
         action=OperatorAction.FIX_CONFIG,
         message="PHASESWEEP_LOCK_DIR must be an absolute path",
     ),
-    OriginCase(
+    RoutingCase(
         id="phasesweep_home_override_relative",
         trigger=_home_override_relative,
         raised=UnsafePrivatePathError,
         action=OperatorAction.FIX_CONFIG,
         message="PHASESWEEP_HOME must be an absolute path",
     ),
-    OriginCase(
+    RoutingCase(
         id="wandb_sdk_missing",
         trigger=_wandb_sdk_not_installed,
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message='python -m pip install "phasesweep[wandb]"',
     ),
-    OriginCase(
+    RoutingCase(
         id="registry_entry_foreign_locator",
         trigger=_registry_entry_damaged(_foreign_locator),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message=_DELETE_ENTRY_IF_IDLE,
     ),
-    OriginCase(
+    RoutingCase(
         id="registry_entry_partial_schema",
         trigger=_registry_entry_damaged(_field_dropped),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message=_DELETE_ENTRY_IF_IDLE,
     ),
-    OriginCase(
+    RoutingCase(
         id="registry_entry_trial_dir_missing",
         trigger=_preflight_entry_without_trial_dir,
         raised=ProcessCleanupUncertainError,
@@ -1583,63 +1527,63 @@ ORIGIN_CASES = (
     ),
     # recover-run runs every cleanup check below in both of its modes, so none
     # of these may route back to it: each names the repair the operator makes.
-    OriginCase(
+    RoutingCase(
         id="registry_lifecycle_malformed",
         trigger=_registered_trial_dir_damaged(_lifecycle_garbled),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message=_DELETE_ENTRY_IF_NOTHING_RUNS,
     ),
-    OriginCase(
+    RoutingCase(
         id="registry_identity_missing",
         trigger=_registered_trial_dir_damaged(_launched_without_identity),
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message=_DELETE_ENTRY_IF_NOTHING_RUNS,
     ),
-    OriginCase(
+    RoutingCase(
         id="registry_unenumerable",
         trigger=_preflight_unenumerable_registry,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_TREE,
         message="Restore the original registry and access to it before retrying.",
     ),
-    OriginCase(
+    RoutingCase(
         id="running_trial_dir_invalid",
         trigger=_reap_trial_with_invalid_trial_dir,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Restore the original storage ledger before retrying recovery.",
     ),
-    OriginCase(
+    RoutingCase(
         id="running_trial_attempt_missing",
         trigger=_reap_trial_without_attempt,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Process identity is unknown. Restore the original storage ledger",
     ),
-    OriginCase(
+    RoutingCase(
         id="running_trial_lifecycle_mismatch",
         trigger=_reap_trial_with_foreign_lifecycle,
         raised=ProcessCleanupUncertainError,
         action=(OperatorAction.RESTORE_LEDGER, OperatorAction.RESTORE_TREE),
         message="Restore the original storage ledger and this attempt's lifecycle record",
     ),
-    OriginCase(
+    RoutingCase(
         id="uncertain_trial_dir_missing",
         trigger=_inspect_uncertain_trial_without_trial_dir,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
         message="Restore the original storage ledger before retrying recovery.",
     ),
-    OriginCase(
+    RoutingCase(
         id="recover_during_launch",
         trigger=_recover_during_launch,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
         message="wait for it to finish and retry",
     ),
-    OriginCase(
+    RoutingCase(
         id="recover_unsettled_launch",
         trigger=_recover_unsettled_launch,
         raised=RunRecoveryError,
@@ -1648,21 +1592,21 @@ ORIGIN_CASES = (
     ),
     # recover-run raises every RunRecoveryError itself, so none may route back
     # to it by default; only a confirmed run's own remedy names it.
-    OriginCase(
+    RoutingCase(
         id="recover_unknown_run_id",
         trigger=_recover_unknown_run,
         raised=RunRecoveryError,
         action=OperatorAction.FIX_CONFIG,
         message="pass a run id this MCP state directory records.",
     ),
-    OriginCase(
+    RoutingCase(
         id="recover_config_snapshot_missing",
         trigger=_recover_with_config_snapshot(Path.unlink),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
         message="Restore it before retrying recovery.",
     ),
-    OriginCase(
+    RoutingCase(
         id="recover_config_snapshot_unreadable",
         trigger=_recover_with_config_snapshot(_snapshot_unreadable),
         raised=RunRecoveryError,
@@ -1670,14 +1614,14 @@ ORIGIN_CASES = (
         message="Restore it or access to it before retrying recovery.",
         marks=(requires_nonroot,),
     ),
-    OriginCase(
+    RoutingCase(
         id="recover_config_snapshot_altered",
         trigger=_recover_with_config_snapshot(_snapshot_altered),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_TREE,
         message="Restore the run's original config snapshot before retrying recovery.",
     ),
-    OriginCase(
+    RoutingCase(
         # No mechanical remedy: the host cannot rule out PID reuse.
         id="recover_boot_id_unavailable",
         trigger=_recover_without_boot_id,
@@ -1685,56 +1629,56 @@ ORIGIN_CASES = (
         action=OperatorAction.INSPECT_LOGS,
         message="runner boot id is unavailable",
     ),
-    OriginCase(
+    RoutingCase(
         id="recover_live_runner",
         trigger=_recover_live_runner,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
         message="runner still appears live; use cancel_run first",
     ),
-    OriginCase(
+    RoutingCase(
         id="recover_recheck_live_runner",
         trigger=_recheck_live_runner,
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
         message="runner still appears live; use cancel_run first",
     ),
-    OriginCase(
+    RoutingCase(
         id="prior_phase_abort",
         trigger=_rerun_aborted_phase,
         raised=NoFeasibleTrialError,
         action=OperatorAction.FIX_CONFIG,
         message="Increase n_trials above 2 to explicitly schedule new recovery attempts",
     ),
-    OriginCase(
+    RoutingCase(
         id="winner_incomplete_without_opt_in",
         trigger=_resume_over_incomplete_winner,
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
         message="unless the current config sets allow_incomplete_on_timeout: true.",
     ),
-    OriginCase(
+    RoutingCase(
         id="winner_phase_config_changed",
         trigger=_resume_after_phase_edit,
         raised=StudyFingerprintMismatchError,
         action=OperatorAction.FIX_CONFIG,
         message="or restore the matching config before resuming.",
     ),
-    OriginCase(
+    RoutingCase(
         id="study_root_workdir_moved",
         trigger=_claim_from_moved_workdir,
         raised=ArtifactRootConflictError,
         action=OperatorAction.FIX_CONFIG,
         message="Restore the original workdir, or use a fresh artifact root",
     ),
-    OriginCase(
+    RoutingCase(
         id="tree_bound_to_another_ledger",
         trigger=_validate_tree_bound_to_another_ledger,
         raised=ArtifactRootConflictError,
         action=OperatorAction.FIX_CONFIG,
         message="Use the config that owns this current-format tree",
     ),
-    OriginCase(
+    RoutingCase(
         id="sqlite_rollback_refused",
         trigger=_claim_after_interrupted_commit_write_protected,
         raised=LedgerTransactionInterruptedError,
@@ -1742,14 +1686,14 @@ ORIGIN_CASES = (
         message="Restore write access to the ledger and its directory before retrying.",
         marks=(requires_nonroot,),
     ),
-    OriginCase(
+    RoutingCase(
         id="ledger_directory_path_unusable",
         trigger=_claim_ledger_under(_regular_file),
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message="Correct the storage path, or the workdir for auto storage",
     ),
-    OriginCase(
+    RoutingCase(
         id="ledger_directory_unwritable",
         trigger=_claim_ledger_under(_unwritable_directory),
         raised=PhaseSweepError,
@@ -1757,7 +1701,7 @@ ORIGIN_CASES = (
         message="Restore write access to the directory that holds it, then run again.",
         marks=(requires_nonroot,),
     ),
-    OriginCase(
+    RoutingCase(
         id="environment_cohort_changed",
         trigger=_top_up_from_another_environment,
         raised=StudyFingerprintMismatchError,
@@ -1767,9 +1711,12 @@ ORIGIN_CASES = (
 )
 
 
-@pytest.mark.parametrize("case", [pytest.param(c, id=c.id, marks=c.marks) for c in ORIGIN_CASES])
-def test_origin_raises_route_by_their_message_remedy(
-    case: OriginCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+CASES = (*WRAP_CASES, *ORIGIN_CASES)
+
+
+@pytest.mark.parametrize("case", [pytest.param(c, id=c.id, marks=c.marks) for c in CASES])
+def test_raise_sites_route_their_declared_action(
+    case: RoutingCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     with pytest.raises(case.raised) as excinfo:
         case.trigger(tmp_path, monkeypatch)
@@ -1778,6 +1725,8 @@ def test_origin_raises_route_by_their_message_remedy(
     assert type(error) is case.raised
     expected = case.action if isinstance(case.action, tuple) else (case.action,)
     assert error.actions == expected
+    if case.cause is not None:
+        assert type(error.__cause__) is case.cause
     assert case.message in str(error)
 
 
@@ -1876,10 +1825,8 @@ def test_runner_payload_follows_the_routed_steps() -> None:
     # declared routing stands in for driving its trigger again.
     for cls in _operator_error_classes():
         _assert_payload_follows(cls("boom", *_CONSTRUCTOR_ARGS.get(cls.__name__, ())))
-    for wrap in WRAP_CASES:
-        _assert_payload_follows(wrap.outbound("boom", action=wrap.action))
-    for origin in ORIGIN_CASES:
-        _assert_payload_follows(origin.raised("boom", action=origin.action))
+    for case in CASES:
+        _assert_payload_follows(case.raised("boom", action=case.action))
 
 
 @pytest.mark.parametrize(
