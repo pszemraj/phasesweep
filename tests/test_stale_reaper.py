@@ -68,7 +68,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
-from phasesweep.runtime.process import _write_process_identity, write_attempt_lifecycle
+from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
@@ -77,7 +77,6 @@ from phasesweep.runtime.reaper import (
     cleanup_stale_trial_process,
     is_same_live_process,
     kill_stale_group,
-    read_boot_id,
     read_proc_starttime,
     read_stale_process_identity,
 )
@@ -91,28 +90,7 @@ from tests.conftest import (
 )
 from tests.ledger_fixtures import _write_config
 from tests.mcp_helpers import make_run_handle
-
-
-def _write_test_process_identity(
-    trial_dir: Path,
-    *,
-    attempt_id: str,
-    pid: int,
-    pgid: int,
-    starttime: int | None,
-    boot_id: str | None = None,
-) -> None:
-    _write_process_identity(
-        trial_dir / PROCESS_IDENTITY_FILE,
-        StaleProcessIdentity(
-            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
-            attempt_id=attempt_id,
-            pid=pid,
-            pgid=pgid,
-            proc_starttime=starttime,
-            boot_id=read_boot_id() if boot_id is None else boot_id,
-        ),
-    )
+from tests.recovery_helpers import write_trial_identity
 
 
 def test_read_proc_starttime_self():
@@ -378,7 +356,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         trial.set_user_attr(GENERATION_ID_ATTR, "old-generation")
         trial.set_user_attr(ATTEMPT_ID_ATTR, "old-attempt")
         trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-        _write_test_process_identity(
+        write_trial_identity(
             trial_dir,
             attempt_id="old-attempt",
             pid=stale.pid,
@@ -719,7 +697,7 @@ def test_read_stale_process_identity_rejects_malformed_or_partial_records(
 
 
 def test_read_stale_process_identity_rejects_wrong_attempt(tmp_path: Path) -> None:
-    _write_test_process_identity(
+    write_trial_identity(
         tmp_path,
         attempt_id="first-attempt",
         pid=12345,
@@ -1233,7 +1211,7 @@ def test_exited_attempt_recovers_without_signalling(
     finally:
         child.kill()
         child.wait(timeout=5)
-    _write_test_process_identity(
+    write_trial_identity(
         trial_dir,
         attempt_id="exited-attempt",
         pid=child.pid,
@@ -1809,7 +1787,7 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
     try:
         starttime = read_proc_starttime(stale.pid)
         assert starttime is not None
-        _write_test_process_identity(
+        write_trial_identity(
             trial_dir,
             attempt_id="renamed-attempt",
             pid=stale.pid,

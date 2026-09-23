@@ -76,7 +76,6 @@ from phasesweep.engine.publication_validation import _generation_artifact_manife
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
-    ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
@@ -117,10 +116,8 @@ from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_sn
 from phasesweep.mcp.tool_names import TOOL_LAUNCH_RUN
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import open_private_text
-from phasesweep.runtime.process import _write_process_identity, write_attempt_lifecycle
+from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.reaper import (
-    PROCESS_IDENTITY_FILE,
-    PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
     read_boot_id,
     read_proc_starttime,
@@ -142,6 +139,11 @@ from tests.mcp_helpers import (
     runner_main,
     write_mcp_catalog,
     write_run_status,
+)
+from tests.recovery_helpers import (
+    write_launched_stale_trial,
+    write_trial_identity,
+    write_uncertain_failed_trial,
 )
 
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
@@ -177,107 +179,6 @@ def _catalog(
         visible_params=None if visible_params is None else {"srv": visible_params},
         filename="srv.catalog.yaml",
     )
-
-
-def _write_trial_process_identity(
-    trial_dir: Path,
-    *,
-    attempt_id: str,
-    pid: int,
-    starttime: int,
-    boot_id: str | None = None,
-) -> None:
-    _write_process_identity(
-        trial_dir / PROCESS_IDENTITY_FILE,
-        StaleProcessIdentity(
-            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
-            attempt_id=attempt_id,
-            pid=pid,
-            pgid=pid,
-            proc_starttime=starttime,
-            boot_id=read_boot_id() if boot_id is None else boot_id,
-        ),
-    )
-
-
-def _write_cleanup_uncertain_failed_trial(
-    config: Path, *, generation_id: str = "stale-generation", pid: int | None = None
-) -> int:
-    exp = load_config(config)
-    assert isinstance(exp, Experiment)
-    phase = exp.phases[0]
-    study = optuna.create_study(
-        study_name=f"{exp.experiment}::{phase.name}",
-        storage=exp.storage,
-        direction="minimize",
-    )
-    mark_current_format(exp, study)
-    trial = study.ask()
-    attempt_id = f"stale-attempt-{trial.number}"
-    trial_dir = _trial_dir_for(
-        exp,
-        phase.name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
-    trial_dir.mkdir(parents=True)
-    _write_trial_process_identity(
-        trial_dir,
-        attempt_id=attempt_id,
-        pid=pid or reaped_pid(),
-        starttime=111,
-    )
-    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-    trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
-    trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
-    trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
-    study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-    return trial.number
-
-
-def _write_stale_running_trial(
-    config: Path,
-    *,
-    cleanup_confirmed: bool | None = None,
-    generation_id: str = "stale-generation",
-    persist_trial_attrs: bool = True,
-    boot_id: str | None = None,
-    pid: int | None = None,
-) -> int:
-    exp = load_config(config)
-    assert isinstance(exp, Experiment)
-    phase = exp.phases[0]
-    study = optuna.create_study(
-        study_name=f"{exp.experiment}::{phase.name}",
-        storage=exp.storage,
-        direction="minimize",
-    )
-    mark_current_format(exp, study)
-    trial = study.ask()
-    attempt_id = f"stale-attempt-{trial.number}"
-    trial_dir = _trial_dir_for(
-        exp,
-        phase.name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
-    trial_dir.mkdir(parents=True)
-    _write_trial_process_identity(
-        trial_dir,
-        attempt_id=attempt_id,
-        pid=pid or reaped_pid(),
-        starttime=222,
-        boot_id=boot_id,
-    )
-    if persist_trial_attrs:
-        trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-        trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
-        trial.set_user_attr(ATTEMPT_ID_ATTR, attempt_id)
-        if cleanup_confirmed is not None:
-            trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, cleanup_confirmed)
-    return trial.number
 
 
 def _load_first_phase_study(config: Path) -> optuna.Study:
@@ -344,7 +245,7 @@ def _stage_stale_running_recovery_scaffold(
         recorded_boot_id = "00000000-0000-0000-0000-000000000000"
         if recorded_boot_id == current_boot_id:
             recorded_boot_id = "11111111-1111-1111-1111-111111111111"
-    trial_number = _write_stale_running_trial(
+    trial_number = write_launched_stale_trial(
         config,
         cleanup_confirmed=False,
         generation_id=run_id,
@@ -3722,7 +3623,7 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
 ) -> None:
     config = _config(tmp_path)
     run_id = "srv-cancel-after-recovery"
-    _write_cleanup_uncertain_failed_trial(config, generation_id=run_id)
+    write_uncertain_failed_trial(config, generation_id=run_id)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     handle = make_run_handle(
@@ -4123,7 +4024,7 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     )
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    later_trial = _write_stale_running_trial(config, generation_id="srv-later-run")
+    later_trial = write_launched_stale_trial(config, generation_id="srv-later-run")
 
     assert _load_phase_trial(config, later_trial).state == optuna.trial.TrialState.RUNNING
     assert store.state(handle) == "failed"
@@ -4405,7 +4306,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     trial_dir = _experiment_dir(experiment) / "p" / "trial_registry_only"
     trial_dir.mkdir(parents=True)
     write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
-    _write_trial_process_identity(
+    write_trial_identity(
         trial_dir,
         attempt_id=attempt_id,
         pid=reaped_pid(),
@@ -4503,7 +4404,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         )
     earlier_run_id = "srv-earlier-uncertain"
     later_generation_id = "later-cli-generation"
-    trial_number = _write_stale_running_trial(
+    trial_number = write_launched_stale_trial(
         attempt_config,
         generation_id=later_generation_id,
         persist_trial_attrs=not anonymous_snapshot,
@@ -4717,7 +4618,7 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
     ),
     [
         pytest.param(
-            _write_cleanup_uncertain_failed_trial,
+            write_uncertain_failed_trial,
             111,
             "recover 1 cleanup-uncertain terminal trial",
             "Cleared cleanup uncertainty",
@@ -4727,7 +4628,7 @@ def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_pa
             id="terminal-cleanup-uncertain-trial",
         ),
         pytest.param(
-            partial(_write_stale_running_trial, cleanup_confirmed=False),
+            partial(write_launched_stale_trial, cleanup_confirmed=False),
             222,
             "reap 1 stale trial",
             "reaped 1 stale trial",
@@ -4753,9 +4654,9 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     """Recovery clears cleanup uncertainty from two distinct evidence branches that
     share the same launch-refusal -> dry-run -> --confirm -> relaunch scaffold: a
     terminal trial already recorded as cleanup-uncertain
-    (``_write_cleanup_uncertain_failed_trial``, pinned via
+    (``write_uncertain_failed_trial``, pinned via
     ``cleanup_uncertain_terminal_trials``) and a stale RUNNING trial reaped by the
-    recovery pass itself (``_write_stale_running_trial``, pinned via
+    recovery pass itself (``write_launched_stale_trial``, pinned via
     ``reaped_running_trials``).
     """
     config = _config(tmp_path)
@@ -5089,7 +4990,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
 ) -> None:
     config = _config(tmp_path)
     run_id = "srv-runner-reconciled"
-    trial_number = _write_stale_running_trial(
+    trial_number = write_launched_stale_trial(
         config,
         cleanup_confirmed=False,
         generation_id=run_id,
@@ -5231,7 +5132,7 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
 ) -> None:
     config = _config(tmp_path)
     first_run = "srv-terminal-first"
-    trial_number = _write_cleanup_uncertain_failed_trial(
+    trial_number = write_uncertain_failed_trial(
         config,
         generation_id=first_run,
     )
@@ -5329,7 +5230,7 @@ def _stage_terminal_uncertain_run(
     detached-runner contract). Returns ``(store, handle, trial_number,
     config, command)``."""
     config = _config(tmp_path)
-    trial_number = _write_cleanup_uncertain_failed_trial(config, generation_id=run_id)
+    trial_number = write_uncertain_failed_trial(config, generation_id=run_id)
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     handle = make_run_handle(
