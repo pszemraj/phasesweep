@@ -69,11 +69,8 @@ def _preflight_missing_reached_phase_environments(
     :param str | None from_phase: Optional first phase this invocation can execute.
     :raises PhaseSweepError: A missing reached phase has an invalid launch environment.
     """
-    reached = from_phase is None
-    for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
-        if reached and phase.name not in existing_studies:
+    for _index, phase in experiment.phases_from(from_phase):
+        if phase.name not in existing_studies:
             _trainer_environment(experiment, phase.name)
 
 

@@ -205,12 +205,8 @@ def _preflight_trainer_environments(
     :raises PhaseSweepError: A composed runtime environment disables required
         remote evidence or conflicts with its managed identity.
     """
-    reached = from_phase is None
-    for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
-        if reached:
-            _trainer_environment(experiment, phase.name)
+    for _index, phase in experiment.phases_from(from_phase):
+        _trainer_environment(experiment, phase.name)
 
 
 def _inherit_env_contract(experiment: Experiment) -> str | list[str]:

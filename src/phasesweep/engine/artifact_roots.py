@@ -363,11 +363,9 @@ def _check_published_phase_studies(
     if publication.state == "failed":
         raise PublicationIntegrityError(publication.error or "Published result is invalid.")
     published_trials = _published_phase_trial_refs(publication.summary)
-    reached = from_phase is None
-    for phase_name in (phase.name for phase in experiment.phases):
-        if phase_name == from_phase:
-            reached = True
-        if not reached or phase_name not in published_trials:
+    for _index, phase in experiment.phases_from(from_phase):
+        phase_name = phase.name
+        if phase_name not in published_trials:
             continue
         study = loaded.get(phase_name)
         expected = published_trials[phase_name]

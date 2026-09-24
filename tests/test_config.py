@@ -177,6 +177,41 @@ def test_phase_composition_accepts_a_linear_chain() -> None:
     assert [phase.name for phase in experiment.phases] == ["base", "tune", "final"]
 
 
+def test_phases_from_selects_reached_phases_by_name() -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"model.depth": 8}),
+            Phase(
+                name="tune",
+                n_trials=1,
+                inherits=["base"],
+                search_space={"learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3}},
+            ),
+            Phase(name="final", n_trials=1, inherits=["tune"], fixed_overrides={"seed": 0}),
+        ]
+    )
+
+    # None reaches every phase from the start.
+    assert [(index, phase.name) for index, phase in experiment.phases_from(None)] == [
+        (0, "base"),
+        (1, "tune"),
+        (2, "final"),
+    ]
+    # The first phase's name reaches the same full sequence as None.
+    assert [(index, phase.name) for index, phase in experiment.phases_from("base")] == [
+        (0, "base"),
+        (1, "tune"),
+        (2, "final"),
+    ]
+    # A middle phase's name skips everything declared before it.
+    assert [(index, phase.name) for index, phase in experiment.phases_from("tune")] == [
+        (1, "tune"),
+        (2, "final"),
+    ]
+    # An unknown name never becomes "reached", so nothing is yielded.
+    assert list(experiment.phases_from("unknown")) == []
+
+
 def test_phase_composition_accepts_a_same_origin_diamond() -> None:
     experiment = make_experiment(
         phases=[

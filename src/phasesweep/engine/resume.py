@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
 
 import optuna
 
@@ -11,7 +10,7 @@ import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.study_policy as study_policy_ops
-from phasesweep.config import Experiment, Phase
+from phasesweep.config import Experiment
 from phasesweep.engine.errors import StudyContextConflictError
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
 
@@ -59,30 +58,6 @@ def _preflight_skipped_winners(
     raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
 
 
-def _phases_from(experiment: Experiment, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
-    """Yield ``(index, phase)`` pairs from ``from_phase`` (or the start) onward.
-
-    Shared reached-from-phase iteration prologue for
-    :func:`_reject_bound_descendant_topups` and
-    :func:`_reject_unsupported_sampler_topups`.
-
-    :param Experiment experiment: Parsed experiment whose phase chain is scanned.
-    :param str | None from_phase: Optional resume point; phases before it are
-        skipped. ``None`` reaches every phase from the start.
-
-    Yields:
-        ``(index, phase)``: Each reached phase paired with its declaration index.
-
-    """
-    reached = from_phase is None
-    for index, phase in enumerate(experiment.phases):
-        if phase.name == from_phase:
-            reached = True
-        if not reached:
-            continue
-        yield index, phase
-
-
 def _reject_bound_descendant_topups(
     experiment: Experiment,
     *,
@@ -104,7 +79,7 @@ def _reject_bound_descendant_topups(
         top-up trials remaining while an inheriting descendant already has a
         study bound to a published winner fingerprint.
     """
-    for index, phase in _phases_from(experiment, from_phase):
+    for index, phase in experiment.phases_from(from_phase):
         study = existing_studies.get(phase.name)
         if study is None:
             continue
@@ -155,7 +130,7 @@ def _reject_unsupported_sampler_topups(
         safely continue with its configured stateful sampler; delegated to
         :func:`phasesweep.engine.study_policy._validate_sampler_continuation`.
     """
-    for _index, phase in _phases_from(experiment, from_phase):
+    for _index, phase in experiment.phases_from(from_phase):
         study = existing_studies.get(phase.name)
         if study is not None:
             study_policy_ops._validate_sampler_continuation(study, phase)

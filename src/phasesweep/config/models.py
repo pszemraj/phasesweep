@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import string
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -582,6 +582,20 @@ class Experiment(_Frozen):
             return self.storage
         root = Path(self.workdir).expanduser().resolve() / self.experiment
         return local_storage_url(root / "study.journal")
+
+    def phases_from(self, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
+        """Yield the phases a run resuming at ``from_phase`` reaches, in order.
+
+        :param str | None from_phase: Optional resume point; phases before it
+            are skipped. ``None`` reaches every phase from the start.
+        :return Iterator[tuple[int, Phase]]: Each reached phase paired with
+            its declaration index. Empty if ``from_phase`` names no phase.
+        """
+        reached = from_phase is None
+        for index, phase in enumerate(self.phases):
+            reached = reached or phase.name == from_phase
+            if reached:
+                yield index, phase
 
     @field_validator("storage")
     @classmethod
