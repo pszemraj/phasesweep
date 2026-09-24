@@ -394,9 +394,7 @@ def render_command(
         else:
             # Dry-run and config validation remain filesystem-pure while still
             # exercising the exact composition and serializer used at launch.
-            expanded_base = _substitute_trainer_config_placeholders(base, config_substitutions)
-            payload = compose_trainer_config(expanded_base, overrides)
-            dump_trainer_config_yaml(payload)
+            dump_trial_trainer_config_yaml(base, overrides, substitutions=config_substitutions)
             config_path = str(trial_dir / TRAINER_INPUT_FILENAMES["yaml_file"])
         overrides_str = ""
     elif fmt == "argparse":
