@@ -43,7 +43,16 @@ from phasesweep.runtime.time import parse_utc_iso
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
 
+# Single source of truth for the launch handshake: phasesweep.mcp.runner writes
+# LAUNCH_READY_BYTE once its process identity is durable, and
+# phasesweep.mcp.run_control writes LAUNCH_ACK_BYTE once it has recorded that
+# receipt, settling ownership of the spawned process.
+LAUNCH_READY_BYTE = b"R"
+LAUNCH_ACK_BYTE = b"A"
+
 __all__ = [
+    "LAUNCH_ACK_BYTE",
+    "LAUNCH_READY_BYTE",
     "ProcessIdentity",
     "PreparedRun",
     "RunHandle",

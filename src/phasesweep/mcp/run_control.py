@@ -40,6 +40,8 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import (
+    LAUNCH_ACK_BYTE,
+    LAUNCH_READY_BYTE,
     PreparedRun,
     RunHandle,
     RunState,
@@ -56,8 +58,6 @@ from phasesweep.runtime.time import utc_now_iso
 log = logging.getLogger("phasesweep.mcp.server")
 
 _RUNNER_READY_TIMEOUT_SECONDS = 10.0
-_RUNNER_READY_BYTE = b"R"
-_RUNNER_ACK_BYTE = b"A"
 
 
 class _SpawnBookkeepingError(Exception):
@@ -848,7 +848,7 @@ class RunControl:
                     )
                 readable = fd_ready(ready_read, timeout=_RUNNER_READY_TIMEOUT_SECONDS)
                 ready = os.read(ready_read, 1) if readable else b""
-                if ready != _RUNNER_READY_BYTE:
+                if ready != LAUNCH_READY_BYTE:
                     raise RuntimeError(
                         "detached runner did not persist its launch receipt before launch"
                     )
@@ -859,7 +859,7 @@ class RunControl:
             # runner but before os.write returns. From this point onward,
             # cleanup must assume separately-sessioned trials could start.
             runner_acknowledged = True
-            if os.write(ack_write, _RUNNER_ACK_BYTE) != len(_RUNNER_ACK_BYTE):
+            if os.write(ack_write, LAUNCH_ACK_BYTE) != len(LAUNCH_ACK_BYTE):
                 raise RuntimeError("could not acknowledge the detached runner launch")
             acknowledged_fd = ack_write
             ack_write = -1

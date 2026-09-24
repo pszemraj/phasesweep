@@ -50,7 +50,14 @@ from phasesweep.engine.errors import (
     TrialTargetRegressionError,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
-from phasesweep.mcp.runs import RunHandle, RunStore, load_experiment_snapshot, write_status_file
+from phasesweep.mcp.runs import (
+    LAUNCH_ACK_BYTE,
+    LAUNCH_READY_BYTE,
+    RunHandle,
+    RunStore,
+    load_experiment_snapshot,
+    write_status_file,
+)
 from phasesweep.mcp.snapshots import (
     capture_pre_generation_result_snapshot,
     capture_result_snapshot,
@@ -84,8 +91,6 @@ FailureCode: TypeAlias = Literal[
     "internal_error",
 ]
 
-_LAUNCH_READY_BYTE = b"R"
-_LAUNCH_ACK_BYTE = b"A"
 FailureStage: TypeAlias = Literal["preflight", "execution", "cleanup"]
 FailureActor: TypeAlias = Literal["agent", "operator"]
 
@@ -757,7 +762,7 @@ def _complete_launch_handshake(ready_fd: int, ack_fd: int, lease_fd: int) -> Non
     :raises RuntimeError: If either half of the launch handshake is unavailable.
     """
     try:
-        if os.write(ready_fd, _LAUNCH_READY_BYTE) != len(_LAUNCH_READY_BYTE):
+        if os.write(ready_fd, LAUNCH_READY_BYTE) != len(LAUNCH_READY_BYTE):
             raise RuntimeError("could not report the durable MCP launch receipt")
     except OSError as exc:
         raise RuntimeError("could not report the durable MCP launch receipt") from exc
@@ -767,13 +772,13 @@ def _complete_launch_handshake(ready_fd: int, ack_fd: int, lease_fd: int) -> Non
         with contextlib.suppress(OSError):
             os.close(lease_fd)
     try:
-        acknowledgement = os.read(ack_fd, len(_LAUNCH_ACK_BYTE))
+        acknowledgement = os.read(ack_fd, len(LAUNCH_ACK_BYTE))
     except OSError as exc:
         raise RuntimeError("could not receive the MCP launch acknowledgement") from exc
     finally:
         with contextlib.suppress(OSError):
             os.close(ack_fd)
-    if acknowledgement != _LAUNCH_ACK_BYTE:
+    if acknowledgement != LAUNCH_ACK_BYTE:
         raise RuntimeError("MCP server exited before acknowledging the runner launch")
 
 
