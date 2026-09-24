@@ -68,17 +68,18 @@ _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
 def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str, str] | None:
     """Return a trial's execution identity when it could win winner selection.
 
-    Mirrors the eligibility filter in
-    :func:`phasesweep.engine.selection.select_winner` exactly: COMPLETE state, a
-    finite value, a truthy feasibility attr, and nonempty generation/attempt
-    ids. A trial that fails any of these can never be selected, so declining to
-    verify its evidence is not result-biasing - unlike skipping an eligible
-    trial, which would change which trial wins.
+    The shared eligibility prefix used directly by both this module's
+    preflight and :func:`phasesweep.engine.selection.select_winner`: COMPLETE
+    state, a finite value, a truthy feasibility attr, and nonempty
+    generation/attempt ids. A trial that fails any of these can never be
+    selected, so declining to verify its evidence here is not result-biasing
+    - unlike skipping an eligible trial, which would change which trial wins.
 
-    The constraint-bounds half of that filter is deliberately *not* mirrored:
-    constraint bounds are config-mutable, so a trial outside today's bounds can
-    re-enter the candidate set under a later config and its evidence must still
-    be there when it does.
+    ``select_winner`` applies its own constraint-bounds filter on top of this
+    prefix; this function deliberately does not: constraint bounds are
+    config-mutable, so a trial outside today's bounds can re-enter the
+    candidate set under a later config and its evidence must still be there
+    when it does.
 
     :param optuna.trial.FrozenTrial trial: Persisted trial to classify.
     :return tuple[str, str] | None: ``(generation_id, attempt_id)`` for a

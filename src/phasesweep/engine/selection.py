@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -13,10 +12,9 @@ import optuna
 from phasesweep.config import Experiment, check_bounds
 from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.errors import OperatorAction, PhaseSweepError, TrialEvidenceMissingError
-from phasesweep.engine.evidence import _trial_objective_provenance
+from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
-    FEASIBLE_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
@@ -68,11 +66,12 @@ def select_winner(
     """Pick the best feasible completed trial from a phase study.
 
     Rules:
-      1. Trial must be COMPLETE (not pruned, not failed).
-      2. Trial's metric must be finite.
-      3. All constraint values (read from user_attrs) must satisfy bounds.
-      4. Among survivors, argmin/argmax on metric.
-      5. Ties — exact float equality only — broken by lower trial_number.
+      1. Trial must be COMPLETE, with a finite value, a truthy feasibility
+         attr, and nonempty generation/attempt ids
+         (:func:`phasesweep.engine.evidence._selection_candidate_identity`).
+      2. All constraint values (read from user_attrs) must satisfy bounds.
+      3. Among survivors, argmin/argmax on metric.
+      4. Ties — exact float equality only — broken by lower trial_number.
 
     Ordering is exact, never approximate. An earlier absolute epsilon (1e-12)
     folded everything within that distance of the optimum into one "tie" band,
@@ -109,17 +108,7 @@ def select_winner(
 
     survivors: list[optuna.trial.FrozenTrial] = []
     for t in study.get_trials(deepcopy=False):
-        if t.state != optuna.trial.TrialState.COMPLETE:
-            continue
-        if t.value is None or not math.isfinite(t.value):
-            continue
-        if not t.user_attrs.get(FEASIBLE_ATTR, False):
-            continue
-        generation_id = t.user_attrs.get(GENERATION_ID_ATTR)
-        attempt_id = t.user_attrs.get(ATTEMPT_ID_ATTR)
-        if not isinstance(generation_id, str) or not generation_id:
-            continue
-        if not isinstance(attempt_id, str) or not attempt_id:
+        if _selection_candidate_identity(t) is None:
             continue
         # Re-verify constraints from user_attrs in case rules changed or stored
         # values are non-finite (defense in depth — review v0.5.2 / item 3).
