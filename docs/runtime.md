@@ -151,6 +151,37 @@ same experiment waits or fails safely according to the operation; it never
 merges two active orchestrators. External database backends are not part of
 the runtime.
 
+### Inspect the ledger with Optuna
+
+The ledger is an ordinary Optuna journal holding one study per phase, named
+`<experiment>::<phase>`. `phasesweep status <config>` prints its absolute path
+as `ledger_path` (`null` for `storage: null`). Optuna's CLI reads the journal
+in place without writing to it, so these commands are safe while a sweep runs:
+
+```bash
+optuna studies --storage <ledger_path> --storage-class JournalFileBackend
+optuna trials --study-name '<experiment>::<phase>' --storage <ledger_path> --storage-class JournalFileBackend
+optuna best-trial --study-name '<experiment>::<phase>' --storage <ledger_path> --storage-class JournalFileBackend
+```
+
+Copy `ledger_path` exactly: Optuna creates an empty journal at a path that
+does not exist yet.
+
+For the web dashboard, install `optuna-dashboard` and serve a copy of the
+ledger:
+
+```bash
+python -m pip install optuna-dashboard
+cp <ledger_path> /tmp/<experiment>.journal
+optuna-dashboard /tmp/<experiment>.journal
+```
+
+> [!WARNING]
+> Never point `optuna-dashboard` at the ledger itself. The dashboard can
+> rename, delete, and write to studies, and a changed phase study no longer
+> matches the results PhaseSweep published from it. The copy is a snapshot;
+> copy the ledger again to see newer trials.
+
 ## Trial execution and evidence
 
 Each trial has an attempt-scoped directory and process group. The runtime
@@ -222,7 +253,9 @@ Use `validate`, `run --dry-run`, `status`, and `show-winners` to review an
 experiment without launching work; an ordinary `run` invocation launches
 trials. `--from-phase` requires valid earlier winners. These reads inspect only
 the current-format local experiment; use the original 0.3.1 environment for
-existing 0.3.1 state.
+existing 0.3.1 state. For per-trial tables and plots, point Optuna's own tools
+at the ledger as described in
+[Inspect the ledger with Optuna](#inspect-the-ledger-with-optuna).
 
 > [!TIP]
 > `status` and `show-winners` take no lock and never write to the artifact root
