@@ -18,7 +18,7 @@ from typing import Any
 import click
 import yaml
 
-from phasesweep.config import ConfigError, Experiment, load_config
+from phasesweep.config import ConfigError, Experiment, load_experiment
 from phasesweep.config.models import _metric_scoring_line
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine import (
@@ -26,8 +26,8 @@ from phasesweep.engine import (
     PublicationAccessError,
     PublicationIntegrityError,
     UnsafeProcessCleanupError,
-    config_status,
-    run_config,
+    experiment_status,
+    run_experiment,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
@@ -147,7 +147,7 @@ def _load_cli_config(path: Path) -> Experiment:
     from pydantic import ValidationError
 
     try:
-        return load_config(path)
+        return load_experiment(path)
     except ConfigError:
         raise
     except (ValidationError, ValueError) as exc:
@@ -377,7 +377,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
             click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
             sys.exit(2)
     try:
-        run_config(config, from_phase=from_phase, dry_run=dry_run)
+        run_experiment(config, from_phase=from_phase, dry_run=dry_run)
     except UnsafeProcessCleanupError as exc:
         # A trial's cleanup refusal describes the leak, and the study keeps
         # that text as the cause a later phase-abort refusal quotes, so the
@@ -497,7 +497,7 @@ def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
     the pointer, so the exit status can never disagree with what the operator
     was shown.
 
-    :param dict[str, Any] payload: ``config_status`` payload already rendered.
+    :param dict[str, Any] payload: ``experiment_status`` payload already rendered.
     :raises PublicationAccessError: Publication validation was denied by permissions.
     :raises PublicationIntegrityError: A reported publication no longer validates.
     """
@@ -614,7 +614,7 @@ def status(config_path: Path) -> None:
     :raises PublicationIntegrityError: The reported publication no longer validates.
     """
     config = _load_cli_config(config_path)
-    payload = config_status(config)
+    payload = experiment_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     _raise_on_failed_publication(payload)
 

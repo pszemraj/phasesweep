@@ -274,18 +274,18 @@ def test_run_installs_signal_handlers_before_config_load(
 
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: events.append("signals"))
 
-    def fake_load_config(_path: Path) -> object:
+    def fake_load_experiment(_path: Path) -> object:
         events.append("load")
         return config
 
-    def fake_run_config(loaded: object, *, from_phase: str | None, dry_run: bool) -> None:
+    def fake_run_experiment(loaded: object, *, from_phase: str | None, dry_run: bool) -> None:
         assert loaded is config
         assert from_phase is None
         assert dry_run is expected_dry_run
         events.append("run")
 
-    monkeypatch.setattr("phasesweep.cli.load_config", fake_load_config)
-    monkeypatch.setattr("phasesweep.cli.run_config", fake_run_config)
+    monkeypatch.setattr("phasesweep.cli.load_experiment", fake_load_experiment)
+    monkeypatch.setattr("phasesweep.cli.run_experiment", fake_run_experiment)
     args = ["run", str(config_path)]
     if expected_dry_run:
         args.append("--dry-run")
@@ -737,15 +737,15 @@ def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> 
     """Make ``phasesweep run`` reach the engine and fail with ``error``.
 
     :param pytest.MonkeyPatch monkeypatch: Fixture used to replace CLI collaborators.
-    :param BaseException error: Exception ``run_config`` raises once the CLI calls it.
+    :param BaseException error: Exception ``run_experiment`` raises once the CLI calls it.
     """
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_config", lambda _path: object())
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: object())
 
     def fail(*_args: object, **_kwargs: object) -> None:
         raise error
 
-    monkeypatch.setattr("phasesweep.cli.run_config", fail)
+    monkeypatch.setattr("phasesweep.cli.run_experiment", fail)
 
 
 @pytest.mark.parametrize(
@@ -952,9 +952,9 @@ def test_cli_boundary_classifies_relative_lock_directory_as_operational(
     config_path.write_text("placeholder: true\n")
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", "relative-locks")
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_config", lambda _path: object())
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: object())
     monkeypatch.setattr(
-        "phasesweep.cli.run_config",
+        "phasesweep.cli.run_experiment",
         lambda *_args, **_kwargs: lock_dir(),
     )
 

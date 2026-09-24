@@ -189,10 +189,10 @@ acceptance result, not evidence of service readiness.
   run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
-Common package-root calls are `load_config`, `load_experiment`, `run_config`,
-`run_experiment`, and `config_status`. Schema types are exported from
-`phasesweep.config`. Tests that need internals import direct modules under
-`engine`, `evidence`, `runtime`, or `mcp`.
+Common package-root calls are `load_experiment`, `run_experiment`, and
+`experiment_status`. Schema types are exported from `phasesweep.config`. Tests
+that need internals import direct modules under `engine`, `evidence`,
+`runtime`, or `mcp`.
 
 Within `phasesweep.engine`, module ownership is intentionally direct:
 

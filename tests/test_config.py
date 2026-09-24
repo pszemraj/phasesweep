@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from phasesweep import load_config, load_experiment
+from phasesweep import load_experiment
 from phasesweep.config import (
     ConfigError,
     Constraint,
@@ -657,7 +657,7 @@ def test_suite_config_is_rejected_before_artifacts(
     )
 
     with pytest.raises(ConfigError, match="suite configs are no longer supported"):
-        load_config(path)
+        load_experiment(path)
     assert not (tmp_path / "runs").exists()
 
 
@@ -672,7 +672,7 @@ def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
     config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
 
     with pytest.raises(ConfigError) as excinfo:
-        load_config(config_path)
+        load_experiment(config_path)
 
     assert str(config_path) in str(excinfo.value)
 

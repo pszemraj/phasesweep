@@ -1,7 +1,7 @@
-"""Public shape contract for ``config_status`` / ``experiment_status``.
+"""Public shape contract for ``experiment_status``.
 
-``config_status`` is a documented package-root API (docs/development.md) and
-``phasesweep status`` renders its payload verbatim, so its key set is a
+``experiment_status`` is a documented package-root API (docs/development.md)
+and ``phasesweep status`` renders its payload verbatim, so its key set is a
 contract for downstream consumers. These tests pin the experiment payload so
 that changes to the public CLI shape do not drift unnoticed.
 """
@@ -10,12 +10,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from phasesweep import config_status
+from phasesweep import experiment_status
 from phasesweep.config import Experiment
 from phasesweep.engine import read_status
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _last_successful_generation_id
-from phasesweep.engine.run import experiment_status
 from tests.conftest import make_experiment
 from tests.ledger_fixtures import ledger_file, materialize
 
@@ -99,12 +98,12 @@ def _published(tmp_path: Path) -> Experiment:
     return materialize("current-journal", tmp_path, mode="tree").experiment
 
 
-def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
+def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
     """A standalone experiment payload carries generation identity plus phases."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
 
-    payload = config_status(experiment)
+    payload = experiment_status(experiment)
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert not READ_STATUS_ONLY_KEYS & set(payload)
@@ -159,7 +158,7 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
 
-    payload = config_status(experiment)
+    payload = experiment_status(experiment)
 
     assert list(payload) == FAILED_PUBLICATION_STATUS_KEYS
     assert not READ_STATUS_ONLY_KEYS & set(payload)
@@ -173,7 +172,7 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
 
 def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
     """``storage: null`` has no ledger file, so ``ledger_path`` is null."""
-    payload = config_status(make_experiment(workdir=tmp_path / "runs"))
+    payload = experiment_status(make_experiment(workdir=tmp_path / "runs"))
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert payload["ledger_path"] is None

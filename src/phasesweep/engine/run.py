@@ -22,7 +22,7 @@ import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.resume as resume_ops
 from phasesweep._metadata import __version__
-from phasesweep.config import Config, Experiment
+from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import _metric_scoring_line, _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
@@ -183,31 +183,6 @@ class ExperimentRunOutcome:
     generation_id: str
     winners: Mapping[str, Winner]
     phase_fingerprints: Mapping[str, str | None]
-
-
-def run_config(
-    config: Config,
-    *,
-    from_phase: str | None = None,
-    dry_run: bool = False,
-) -> dict[str, Winner]:
-    """Run an experiment config through the sole execution implementation.
-
-    :param Config config: Parsed experiment config.
-    :param str | None from_phase: Optional phase name to resume from.
-    :param bool dry_run: If ``True``, preview commands without launching subprocesses.
-    :return dict[str, Winner]: Experiment winners keyed by phase name.
-    """
-    return run_experiment(config, from_phase=from_phase, dry_run=dry_run)
-
-
-def config_status(config: Config) -> dict[str, Any]:
-    """Collect read-only status through the sole experiment implementation.
-
-    :param Config config: Parsed experiment config to inspect.
-    :return dict[str, Any]: Read-only experiment status payload.
-    """
-    return experiment_status(config)
 
 
 def run_experiment(

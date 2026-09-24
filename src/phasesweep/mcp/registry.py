@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
-from phasesweep.config.io import _load_yaml_mapping_from_text, load_config_bytes
+from phasesweep.config.io import _load_yaml_mapping_from_text, load_experiment_bytes
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
@@ -376,7 +376,7 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     )
     try:
         config_bytes = cfg_path.read_bytes()
-        config = load_config_bytes(config_bytes, source=cfg_path)
+        config = load_experiment_bytes(config_bytes, source=cfg_path)
     except (ValueError, OSError) as exc:
         raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
     _require_mcp_stable_paths(entry.id, config, config_dir=cfg_path.parent)
@@ -572,9 +572,9 @@ class Registry:
 
         Every problem is reported as ``CatalogError`` so the server refuses to
         start with a bad catalog. Per entry: the config path exists,
-        ``load_config`` accepts it, it is an :class:`Experiment` (suites are out
-        of scope for v1), and its storage is a persistent local journal file
-        (the MCP layer is local-node only in this version).
+        ``load_experiment_bytes`` accepts it, it is an :class:`Experiment` (suites
+        are out of scope for v1), and its storage is a persistent local journal
+        file (the MCP layer is local-node only in this version).
 
         :param Path catalog_path: Path to the operator-authored catalog YAML.
         :return Registry: Immutable registry of validated catalog entries.

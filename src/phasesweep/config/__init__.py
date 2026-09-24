@@ -1,9 +1,8 @@
 """Config schema and YAML loading APIs."""
 
 from phasesweep.config.common import check_bounds
-from phasesweep.config.io import ConfigError, load_config, load_experiment
+from phasesweep.config.io import ConfigError, load_experiment
 from phasesweep.config.models import (
-    Config,
     Constraint,
     ExecutionContext,
     Experiment,
@@ -37,7 +36,6 @@ from phasesweep.evidence.models import (
 __all__ = [
     "ArtifactSizeGate",
     "CategoricalParam",
-    "Config",
     "ConfigError",
     "Constraint",
     "ExecutionContext",
@@ -62,6 +60,5 @@ __all__ = [
     "WandbSummaryRequiredGate",
     "check_bounds",
     "grid_search_space",
-    "load_config",
     "load_experiment",
 ]

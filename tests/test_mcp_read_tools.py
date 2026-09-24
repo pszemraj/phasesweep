@@ -17,7 +17,7 @@ import pytest
 from phasesweep.config import (
     Experiment,
     JsonEnvelopeExtractor,
-    load_config,
+    load_experiment,
 )
 from phasesweep.engine import (
     read_winners,
@@ -469,7 +469,7 @@ def test_run_scoped_snapshot_survives_later_artifact_corruption(tmp_path: Path) 
 @pytest.mark.integration
 def test_run_scoped_snapshot_keeps_captured_generation_pointers(tmp_path: Path) -> None:
     run_id, _trainer, config, catalog = _record_published_run_snapshot(tmp_path)
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     later_failed_id = "srv-later-failed"
     _write_generation_state(
@@ -528,7 +528,7 @@ def test_run_scoped_snapshot_survives_artifact_tree_relocation(
     """Completed run reads use frozen evidence without mutable sibling artifacts."""
     run_id, _trainer, config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, store = make_mcp_app(catalog)
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     config_snapshot = store.config_snapshot_path(run_id)
     if config_snapshot_damage == "missing":

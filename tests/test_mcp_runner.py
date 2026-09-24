@@ -24,7 +24,7 @@ import yaml
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
-from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_config
+from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_experiment
 from phasesweep.engine import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
@@ -162,7 +162,7 @@ def _constant_trial_config(tmp_path: Path, name: str) -> tuple[Path, str]:
 
 
 def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path) -> Path:
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     deadline = time.time() + 25
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -276,7 +276,7 @@ runner._write_status(
 def test_runner_finalizes_pre_captured_terminal_snapshot(tmp_path: Path) -> None:
     config = _slow_config(tmp_path)
     status_path = tmp_path / "status.json"
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     snapshot = mcp_runner.capture_result_snapshot(experiment)
 
@@ -651,7 +651,7 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     tmp_path: Path,
 ) -> None:
     config_path = _slow_config(tmp_path)
-    experiment = load_config(config_path)
+    experiment = load_experiment(config_path)
     assert isinstance(experiment, Experiment)
     store = RunStore(tmp_path / "state")
     run_id = "lock-busy"
@@ -1299,7 +1299,7 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     assert terminal["returncode"] == 0
     assert terminal["error_class"] is None
     assert terminal["failure"] is None
-    assert _last_successful_generation_id(load_config(config_path)) == run_id
+    assert _last_successful_generation_id(load_experiment(config_path)) == run_id
 
 
 @pytest.mark.parametrize("from_phase", [None, "b"])
@@ -1871,7 +1871,7 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
 
     assert not store.status_path(run_id).exists()
     assert any("no terminal MCP evidence" in record.getMessage() for record in caplog.records)
-    assert _last_successful_generation_id(load_config(config_path)) is None
+    assert _last_successful_generation_id(load_experiment(config_path)) is None
     # The consequence the exit code has to carry: this identity is exactly what
     # the runner persisted for itself (spawned, this live process), and with no
     # status.json the run stays ``running`` and holds its concurrency slot.
@@ -1914,7 +1914,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     )
     with open_private_text(store.config_snapshot_path(run_id), "x") as output:
         output.write(config_path.read_text())
-    experiment = load_config(config_path)
+    experiment = load_experiment(config_path)
     original_stats = engine_ledger._phase_trial_stats
 
     def unavailable_during_prepared_capture(

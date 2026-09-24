@@ -29,7 +29,7 @@ from phasesweep.config import (
     IntParam,
     Phase,
     Sampler,
-    load_config,
+    load_experiment,
 )
 from phasesweep.engine import (
     TerminalReport,
@@ -1542,7 +1542,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     search_space: {}
 """,
     )
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     for phase in experiment.phases:
         study = optuna.create_study(
@@ -1599,7 +1599,7 @@ def test_launch_bookkeeping_failure_preserves_runner_status(
     patch_popen_capture(monkeypatch)
 
     def interrupted_update(handle: RunHandle) -> None:
-        experiment = load_config(config)
+        experiment = load_experiment(config)
         assert isinstance(experiment, Experiment)
         write_run_status(
             store,

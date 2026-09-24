@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 
 from phasesweep.config import Experiment
-from phasesweep.config.io import load_config_bytes
+from phasesweep.config.io import load_experiment_bytes
 
 
 def load_experiment_snapshot(path: Path, expected_sha256: str, *, source: str) -> Experiment:
@@ -22,7 +22,7 @@ def load_experiment_snapshot(path: Path, expected_sha256: str, *, source: str) -
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != expected_sha256:
         raise ValueError("run snapshot hash mismatch")
-    config = load_config_bytes(data, source=source)
+    config = load_experiment_bytes(data, source=source)
     if not isinstance(config, Experiment):
         raise ValueError("config snapshot is not a single experiment")
     return config

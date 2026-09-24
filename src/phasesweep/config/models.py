@@ -1182,6 +1182,3 @@ def _wandb_query(
             if isinstance(gate, WandbSummaryRequiredGate)
         ),
     )
-
-
-Config = Experiment

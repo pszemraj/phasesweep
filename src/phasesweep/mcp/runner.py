@@ -1,10 +1,10 @@
 """Detached orchestrator entrypoint for one sweep.
 
 Spawned by the MCP server in its own session (``start_new_session=True``) with
-stdout/stderr redirected to a per-run log. Runs ``run_config`` and records the
-terminal cause in ``status.json`` so the server can report succeeded / failed /
-cancelled without scraping logs. The path it runs is supplied by the server
-from the frozen registry; it is never agent input.
+stdout/stderr redirected to a per-run log. Runs ``run_experiment`` and records
+the terminal cause in ``status.json`` so the server can report succeeded /
+failed / cancelled without scraping logs. The path it runs is supplied by the
+server from the frozen registry; it is never agent input.
 
 The server starts this process in its own state directory, not the
 experiment's, so that nothing in the project tree can execute during
@@ -839,7 +839,7 @@ def main(argv: list[str] | None = None) -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # Install shutdown handlers before any other work (run_config re-invokes
+    # Install shutdown handlers before any other work (run_experiment re-invokes
     # this; it is idempotent). A cancel can arrive while this runner is still
     # loading config or persisting its handle; without handlers the default
     # SIGTERM disposition kills the process before status.json is written and

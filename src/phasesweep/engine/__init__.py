@@ -29,8 +29,7 @@ from phasesweep.engine.read import (
 from phasesweep.engine.run import (
     PublicationHook,
     TerminalReport,
-    config_status,
-    run_config,
+    experiment_status,
     run_experiment,
 )
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -63,10 +62,9 @@ __all__ = [
     "UnsafeProcessCleanupError",
     "Winner",
     "WinnerIntegrityError",
-    "config_status",
+    "experiment_status",
     "read_status",
     "read_winner",
     "read_winners",
-    "run_config",
     "run_experiment",
 ]
