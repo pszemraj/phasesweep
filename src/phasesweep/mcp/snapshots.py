@@ -17,6 +17,7 @@ from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import (
+    TRIAL_STATE_NAMES,
     PublicationState,
     Winner,
     WinnerSource,
@@ -281,7 +282,7 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
         attempted to execute.
     :return dict[str, Any]: JSON-serializable placeholder result snapshot.
     """
-    zero_counts = {state: 0 for state in ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")}
+    zero_counts: dict[str, int] = {state: 0 for state in TRIAL_STATE_NAMES}
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
             current_generation_id=None,

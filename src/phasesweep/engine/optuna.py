@@ -29,6 +29,7 @@ from phasesweep.config import (
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
+    TERMINAL_TRIAL_STATES,
 )
 
 
@@ -127,7 +128,7 @@ def _published_trial_history_available(
     """
     if not stats.available or not stats.published_trial_available or published_trial is None:
         return False
-    finished = sum(stats.counts.get(state, 0) for state in ("COMPLETE", "PRUNED", "FAIL"))
+    finished = sum(stats.counts.get(state, 0) for state in TERMINAL_TRIAL_STATES)
     completed = stats.counts.get("COMPLETE", 0)
     return (
         published_trial.finished_trials is None or finished >= published_trial.finished_trials

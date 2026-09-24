@@ -11,6 +11,21 @@ WinnerSourceKind = Literal["phase_trial"]
 PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
 """Verdict on a last-success pointer, including inaccessible validation evidence."""
 
+TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL"]
+"""Name of an Optuna ``TrialState`` member, as status payloads report it."""
+
+TRIAL_STATE_NAMES: tuple[TrialStateName, ...] = (
+    "WAITING",
+    "RUNNING",
+    "COMPLETE",
+    "PRUNED",
+    "FAIL",
+)
+"""Every trial-state name, in the key order status payloads use."""
+
+TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "PRUNED", "FAIL")
+"""The trial states Optuna reports as finished."""
+
 
 @dataclass(frozen=True)
 class WinnerSource:
