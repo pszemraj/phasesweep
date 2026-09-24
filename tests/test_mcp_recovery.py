@@ -68,6 +68,7 @@ from tests.mcp_helpers import (
     _catalog,
     _config,
     claim_runner_handle,
+    live_runs,
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
@@ -775,7 +776,7 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     assert _load_phase_trial(config, later_trial).state == optuna.trial.TrialState.RUNNING
     assert store.state(handle) == "failed"
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
     status = app.status(run_id=run_id)
@@ -883,7 +884,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     # (review v0.5.16 / blocker 2).
     assert store.state(handle) == "succeeded"
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
     unavailable = app.status(run_id=run_id)
     assert unavailable["result_source"] == "terminal_snapshot_unavailable"
     assert unavailable["run"]["state"] == "succeeded"
@@ -1592,7 +1593,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     assert recovery["reaped_running_trials"] == 0
     assert recovery["cleanup_uncertain_terminal_trials"] == 0
     assert store.state(handle) == "cancelled"
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 @pytest.mark.integration
@@ -1649,7 +1650,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     assert phase["trials"]["RUNNING"] == 0
     assert phase["trials"]["FAIL"] == 1
     assert store.state(handle) == "cancelled"
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 def test_operator_recovery_consumes_terminal_cleanup_evidence(
@@ -1747,7 +1748,7 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     assert retry.exit_code == 0, retry.output
     recovery = json.loads(recovery_record.read_text())
     assert recovery["cleanup_confirmed"] is True
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
@@ -1782,7 +1783,7 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
 
     assert retry.exit_code == 0, retry.output
     assert not store.cleanup_uncertain_path(run_id).exists()
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 @pytest.mark.parametrize(

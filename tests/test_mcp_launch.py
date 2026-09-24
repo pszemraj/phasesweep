@@ -82,6 +82,7 @@ from tests.mcp_helpers import (
     _drift_experiment,
     _write_experiment_config,
     claim_runner_handle,
+    live_runs,
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
@@ -533,7 +534,7 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     assert handle.launch_state == "launching"
     assert store.state(handle) == "failed"
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
     terminal = store.recorded_terminal_status(handle)
     assert terminal is not None
     assert terminal["error_class"] == "OSError"
@@ -763,7 +764,7 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
         restarted.launch("srv")
 
     assert store.recovery_required(pending)
-    assert store.live_runs() == [pending]
+    assert live_runs(store) == [pending]
 
 
 def test_restarted_server_reaps_abandoned_transaction_before_retry(

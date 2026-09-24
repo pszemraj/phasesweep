@@ -72,6 +72,7 @@ from tests.conftest import (
 )
 from tests.mcp_helpers import (
     claim_runner_handle,
+    live_runs,
     make_mcp_app,
     make_run_handle,
     runner_argv,
@@ -627,7 +628,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     assert confirmed.exit_code == 0, confirmed.output
     assert store.state(handle) == "failed"
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
     recovered_status = app.status(run_id=run_id)
     assert recovered_status["run"]["state"] == "failed"
     assert recovered_status["run"]["recovery_required"] is False

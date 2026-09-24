@@ -239,6 +239,18 @@ def make_run_handle(
     )
 
 
+def live_runs(store: RunStore) -> list[RunHandle]:
+    """Every currently-running handle across all experiments.
+
+    Scanning calls ``state`` on each handle, which also reaps any runner
+    that has since exited - so this doubles as the cleanup sweep.
+
+    :param RunStore store: Store whose handles are scanned.
+    :return list[RunHandle]: All handles whose derived state is currently ``running``.
+    """
+    return [handle for handle in store.list_handles() if store.state(handle) == "running"]
+
+
 def claim_runner_handle(
     store: RunStore,
     *,

@@ -1280,16 +1280,6 @@ class RunStore:
             key=lambda handle: (datetime.fromisoformat(handle.started_at), handle.run_id),
         )
 
-    def live_runs(self) -> list[RunHandle]:
-        """Every currently-running handle across all experiments.
-
-        Scanning calls ``state`` on each handle, which also reaps any runner
-        that has since exited - so this doubles as the cleanup sweep.
-
-        :return list[RunHandle]: All handles whose derived state is currently ``running``.
-        """
-        return [handle for handle in self.list_handles() if self.state(handle) == "running"]
-
     def recovery_required(self, handle: RunHandle) -> bool:
         """Return whether operator cleanup or snapshot recovery is required.
 

@@ -25,7 +25,7 @@ from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_writ
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
 from tests.ledger_fixtures import tree_snapshot
-from tests.mcp_helpers import make_run_handle, write_run_status
+from tests.mcp_helpers import live_runs, make_run_handle, write_run_status
 
 
 def _earlier_boot_id() -> str:
@@ -74,7 +74,7 @@ def test_launching_handle_reserves_concurrency_until_outcome_is_known(tmp_path: 
     assert loaded == handle
     assert store.state(loaded) == "running"
     assert store.recovery_required(loaded)
-    assert store.live_runs() == [loaded]
+    assert live_runs(store) == [loaded]
 
 
 def test_create_refuses_existing_identity_without_replacement(tmp_path: Path) -> None:
@@ -958,7 +958,7 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     assert store.state(handle) == "running"
     assert store.snapshot_recovery_required(handle)
     assert store.recovery_required(handle)
-    assert store.live_runs() == [handle]
+    assert live_runs(store) == [handle]
 
     write_run_status(
         store,
@@ -973,7 +973,7 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     assert store.state(handle) == "succeeded"
     assert not store.snapshot_recovery_required(handle)
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) -> None:
@@ -1062,7 +1062,7 @@ def test_status_read_failures_do_not_break_state_scans(
     store.status_path("exp-1").chmod(0o600)
     assert store.recorded_terminal_status(handle) is None
     assert store.state(handle) == "running"
-    assert store.live_runs() == [handle]
+    assert live_runs(store) == [handle]
 
     private_atomic_write_text(store.status_path("exp-1"), '{"returncode": 0}')
     real_read_text = mcp_runs.read_private_text_at
@@ -1076,7 +1076,7 @@ def test_status_read_failures_do_not_break_state_scans(
 
     assert store.recorded_terminal_status(handle) is None
     assert store.state(handle) == "running"
-    assert store.live_runs() == [handle]
+    assert live_runs(store) == [handle]
 
 
 def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) -> None:
@@ -1092,7 +1092,7 @@ def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) ->
     )
 
     assert store.state(handle) == "failed"
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
@@ -1108,7 +1108,7 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
 
     assert store.state(handle) == "running"
     assert store.cleanup_uncertain(handle)
-    assert store.live_runs() == [handle]
+    assert live_runs(store) == [handle]
 
     private_atomic_write_text(
         store.cleanup_recovery_path("exp-1"),
@@ -1372,7 +1372,7 @@ def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) 
     assert not store.cleanup_uncertain(handle)
     assert not store.cleanup_recovery_required(handle)
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path: Path) -> None:
@@ -1508,7 +1508,7 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     )
 
     assert store.state(handle) == "running"
-    assert store.live_runs() == [handle]
+    assert live_runs(store) == [handle]
 
     private_atomic_write_text(
         store.cleanup_recovery_path("exp-1"),
@@ -1522,7 +1522,7 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     )
 
     assert store.state(handle) == "failed"
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> None:
