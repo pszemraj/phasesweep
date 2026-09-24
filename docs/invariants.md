@@ -296,7 +296,7 @@ write\
 A process is identified by PID, start time, and boot id together, and a
 differing boot id settles a reboot without signalling anything.
 
-**Held by:** `mcp.runs.identity_from_earlier_boot`,
+**Held by:** `runtime.reaper.identity_from_earlier_boot`,
 `mcp.runs.RunStore.from_earlier_boot`, `runtime.reaper.is_same_live_process`,
 `runtime.reaper.cleanup_stale_trial_process`\
 **Tests:** `tests/test_mcp_runs.py::test_state_cleanup_uncertain_on_pid_reuse_mismatch`,
@@ -385,13 +385,13 @@ settles the question in the safe direction. A differing boot id proves nothing
 from that boot survives, so cleanup is complete without sending a signal; an
 unknown boot id on either side refuses to signal at all.
 
-The cost is six definitions in `src/phasesweep/mcp/runs.py`
-(`identity_from_earlier_boot`, `ProcessIdentity`, `cleanup_identity`,
-`RunStore.from_earlier_boot`, `_read_cleanup_identity`,
-`_valid_optional_boot_id`), plus the lines in `_persist_spawned_handle` in
-`src/phasesweep/mcp/runner.py` that read the boot id, refuse to persist a
-handle without one, and record it. `mcp.runs` never constructs storage, so the
-ledger chokepoint does not touch it.
+The cost is five definitions in `src/phasesweep/mcp/runs.py`
+(`ProcessIdentity`, `cleanup_identity`, `RunStore.from_earlier_boot`,
+`_read_cleanup_identity`, `_valid_optional_boot_id`), plus
+`runtime.reaper.identity_from_earlier_boot`, plus the lines in
+`_persist_spawned_handle` in `src/phasesweep/mcp/runner.py` that read the boot
+id, refuse to persist a handle without one, and record it. `mcp.runs` never
+constructs storage, so the ledger chokepoint does not touch it.
 
 ### MCP restart recovery and the persisted spawned handle
 

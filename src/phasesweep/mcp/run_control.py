@@ -51,7 +51,12 @@ from phasesweep.mcp.runs import (
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
 from phasesweep.runtime.process import fd_ready
-from phasesweep.runtime.reaper import kill_stale_group, read_boot_id, read_proc_starttime
+from phasesweep.runtime.reaper import (
+    identity_from_earlier_boot,
+    kill_stale_group,
+    read_boot_id,
+    read_proc_starttime,
+)
 from phasesweep.runtime.time import utc_now_iso
 
 # The tools log on the server's channel, so one logger name covers everything served.
@@ -466,11 +471,7 @@ class RunControl:
                 identity = self._runs.cleanup_identity(handle)
                 current_boot = read_boot_id()
                 same_boot = identity.boot_id is not None and identity.boot_id == current_boot
-                earlier_boot = (
-                    identity.boot_id is not None
-                    and current_boot is not None
-                    and identity.boot_id != current_boot
-                )
+                earlier_boot = identity_from_earlier_boot(identity.boot_id, current_boot)
                 # A prior boot proves cleanup without a signal. An unknown boot
                 # cannot make saved PID/starttime safe to signal after reboot.
                 runner_group_gone = earlier_boot or (

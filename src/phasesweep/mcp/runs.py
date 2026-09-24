@@ -37,7 +37,12 @@ from phasesweep.runtime.files import (
     unlock_file,
     validate_private_dir,
 )
-from phasesweep.runtime.reaper import is_same_live_process, read_boot_id, reap_child
+from phasesweep.runtime.reaper import (
+    identity_from_earlier_boot,
+    is_same_live_process,
+    read_boot_id,
+    reap_child,
+)
 from phasesweep.runtime.time import parse_utc_iso
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
@@ -60,7 +65,6 @@ __all__ = [
     "RunState",
     "RunStore",
     "UnsupportedStateFormatError",
-    "identity_from_earlier_boot",
     "write_status_file",
 ]
 
@@ -214,29 +218,6 @@ def write_status_file_if_absent(status_path: Path, payload: dict[str, object]) -
     except FileExistsError:
         return False
     return True
-
-
-def identity_from_earlier_boot(boot_id: str | None) -> bool:
-    """Return whether a recorded boot identity proves its process cannot exist.
-
-    PID plus ``/proc`` start time is unique only within one boot: after a
-    reboot the kernel restarts both counters, so a saved pair can match an
-    unrelated process. A recorded boot id that differs from the current one
-    settles the question in the safe direction - nothing launched under the
-    earlier boot survived it, so the process and every descendant it ever had
-    are conclusively gone and cleanup needs no signal. An unknown boot id on
-    either side (a handle written before boot ids were recorded, or a host
-    without ``/proc/sys/kernel/random/boot_id``) yields ``False``. Callers
-    performing cleanup must separately refuse to signal when either boot id
-    is unknown.
-
-    :param str | None boot_id: Boot identity recorded when the process launched.
-    :return bool: Whether both boot ids are known and differ.
-    """
-    if boot_id is None:
-        return False
-    current = read_boot_id()
-    return current is not None and current != boot_id
 
 
 @dataclass(frozen=True)
@@ -1276,7 +1257,7 @@ class RunStore:
         :param RunHandle handle: Run handle whose recorded boot should be checked.
         :return bool: Whether the recorded boot id is known and differs from this boot.
         """
-        return identity_from_earlier_boot(self.cleanup_identity(handle).boot_id)
+        return identity_from_earlier_boot(self.cleanup_identity(handle).boot_id, read_boot_id())
 
     def latest_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the newest persisted handle for an experiment deterministically.
@@ -1448,7 +1429,7 @@ class RunStore:
             handle.launch_state == "spawned"
             and handle.pid is not None
             and handle.pid_starttime is not None
-            and not identity_from_earlier_boot(handle.boot_id)
+            and not identity_from_earlier_boot(handle.boot_id, read_boot_id())
             and is_same_live_process(handle.pid, handle.pid_starttime)
         )
 

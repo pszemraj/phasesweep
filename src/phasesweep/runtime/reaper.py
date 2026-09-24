@@ -46,6 +46,27 @@ def read_boot_id() -> str | None:
     return value or None
 
 
+def identity_from_earlier_boot(boot_id: str | None, current_boot_id: str | None) -> bool:
+    """Return whether a recorded boot identity proves its process cannot exist.
+
+    PID plus ``/proc`` start time is unique only within one boot: after a
+    reboot the kernel restarts both counters, so a saved pair can match an
+    unrelated process. A recorded boot id that differs from the current one
+    settles the question in the safe direction - nothing launched under the
+    earlier boot survived it, so the process and every descendant it ever had
+    are conclusively gone and cleanup needs no signal. An unknown boot id on
+    either side (a handle written before boot ids were recorded, or a host
+    without ``/proc/sys/kernel/random/boot_id``) yields ``False``. Callers
+    performing cleanup must separately refuse to signal when either boot id
+    is unknown, using the same ``current_boot_id`` read they pass here.
+
+    :param str | None boot_id: Boot identity recorded when the process launched.
+    :param str | None current_boot_id: This boot's identity, from :func:`read_boot_id`.
+    :return bool: Whether both boot ids are known and differ.
+    """
+    return boot_id is not None and current_boot_id is not None and boot_id != current_boot_id
+
+
 @dataclass(frozen=True)
 class _ProcStat:
     """Parsed fields from one Linux ``/proc/<pid>/stat`` record."""
@@ -304,7 +325,7 @@ def cleanup_stale_trial_process(
             identity.attempt_id,
         )
         return False
-    if identity.boot_id != current_boot_id:
+    if identity_from_earlier_boot(identity.boot_id, current_boot_id):
         log.warning(
             "Attempt %s belongs to an earlier host boot; no process from that boot remains.",
             identity.attempt_id,
