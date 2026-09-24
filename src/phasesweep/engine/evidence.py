@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import optuna
 
 from phasesweep.config import Experiment, Phase
+from phasesweep.config.common import is_sha256_hex
 from phasesweep.config.models import _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
@@ -134,19 +135,6 @@ def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, An
     return parsed
 
 
-def _valid_sha256(value: object) -> bool:
-    """Recognize a SHA-256 digest as written by PhaseSweep.
-
-    :param object value: Recorded digest candidate.
-    :return bool: Whether it is a lowercase 64-character hex digest.
-    """
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
-
-
 def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: str) -> None:
     """Require a present objective record to retain its source binding.
 
@@ -168,7 +156,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     if not isinstance(extractor, Mapping):
         fail("missing extractor identity")
     kind = extractor.get("kind")
-    if kind not in {"json", "json_envelope", "log_regex", "wandb"} or not _valid_sha256(
+    if kind not in {"json", "json_envelope", "log_regex", "wandb"} or not is_sha256_hex(
         extractor.get("config_sha256")
     ):
         fail("invalid extractor identity")
@@ -224,7 +212,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         or not source["path"]
         or type(source.get("size_bytes")) is not int
         or source["size_bytes"] < 0
-        or not _valid_sha256(source.get("sha256"))
+        or not is_sha256_hex(source.get("sha256"))
     ):
         fail("missing file source path, size, or digest")
     else:
@@ -344,9 +332,7 @@ def _verify_trainer_input_evidence(
         not isinstance(recorded_size, int)
         or isinstance(recorded_size, bool)
         or recorded_size < 0
-        or not isinstance(recorded_digest, str)
-        or len(recorded_digest) != 64
-        or any(character not in "0123456789abcdef" for character in recorded_digest)
+        or not is_sha256_hex(recorded_digest)
     ):
         raise TrialEvidenceMissingError(
             f"{subject} has an invalid size or content identity in its "

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import IO, Literal, TypeGuard, cast
 from uuid import UUID, uuid4
 
-from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
@@ -1002,11 +1002,7 @@ class RunStore:
             handle.experiment_id
         ):
             return None
-        if (
-            type(handle.config_sha256) is not str
-            or len(handle.config_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in handle.config_sha256)
-        ):
+        if not is_sha256_hex(handle.config_sha256):
             return None
         if type(handle.allow_cancel) is not bool:
             return None

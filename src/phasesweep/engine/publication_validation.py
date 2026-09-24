@@ -15,7 +15,7 @@ import yaml
 
 import phasesweep.engine.paths as path_ops
 from phasesweep.config import Experiment, Metric
-from phasesweep.config.common import SAFE_NAME_PATTERN
+from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.paths import GENERATION_SUMMARY_FILENAME
@@ -301,11 +301,7 @@ def _validate_generation_manifest(
                 if not isinstance(recorded, str) or not recorded:
                     raise _fail(f"winner for phase {name!r} has no valid {id_field}")
             fingerprint = payload.get("phase_fingerprint")
-            if (
-                not isinstance(fingerprint, str)
-                or len(fingerprint) != 64
-                or any(char not in "0123456789abcdef" for char in fingerprint)
-            ):
+            if not is_sha256_hex(fingerprint):
                 raise _fail(f"winner for phase {name!r} has no valid phase_fingerprint")
             source = payload.get("winner_source")
             if not isinstance(source, Mapping):
@@ -691,9 +687,7 @@ def _read_pointer_target(
     if (
         type(summary_size_bytes) is not int
         or summary_size_bytes < 0
-        or not isinstance(summary_sha256, str)
-        or len(summary_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in summary_sha256)
+        or not is_sha256_hex(summary_sha256)
     ):
         return None
     return _PointerTarget(

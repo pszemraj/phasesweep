@@ -26,7 +26,7 @@ from phasesweep.config import (
     Sampler,
     check_bounds,
 )
-from phasesweep.config.common import _find_prefix_collisions
+from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
 from phasesweep.config.search import grid_search_space
 from phasesweep.engine.optuna import _build_sampler
 from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
@@ -547,6 +547,26 @@ def test_find_prefix_collisions() -> None:
 
     for case, keys, expected in cases:
         assert _find_prefix_collisions(keys) == expected, case
+
+
+def test_is_sha256_hex() -> None:
+    """Only a ``str`` of exactly 64 lowercase hex characters is accepted."""
+    valid = "a" * 64
+    cases = [
+        ("valid_lowercase_hex", valid, True),
+        ("valid_digits_only", "0" * 64, True),
+        ("uppercase_rejected", "A" * 64, False),
+        ("too_short", valid[:-1], False),
+        ("too_long", valid + "a", False),
+        ("non_hex_character", "g" * 64, False),
+        ("empty_string", "", False),
+        ("not_a_string_int", 0, False),
+        ("not_a_string_none", None, False),
+        ("not_a_string_bytes", b"a" * 64, False),
+    ]
+
+    for case, value, expected in cases:
+        assert is_sha256_hex(value) is expected, case
 
 
 def test_rejects_dotted_prefix_collisions() -> None:
