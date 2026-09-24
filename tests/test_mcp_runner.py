@@ -452,13 +452,19 @@ def test_missing_published_study_is_an_operator_preflight_failure(
 @pytest.mark.parametrize("history", ["fresh", "published", "resume"])
 @pytest.mark.parametrize(
     "damage",
-    ["garbage", "truncated", pytest.param("permission-denied", marks=requires_nonroot)],
+    ["corrupt-interior", pytest.param("permission-denied", marks=requires_nonroot)],
 )
 @pytest.mark.integration
 def test_damaged_storage_recovery_restores_catalog_capacity(
     tmp_path: Path, damage: str, history: str
 ) -> None:
-    """Repairing a pre-launch ledger failure must let operator recovery release its slot."""
+    """Repairing a pre-launch ledger failure must let operator recovery release its slot.
+
+    A torn or garbage *final* record is now self-repaired before a write, so
+    only damage a repair may never cut remains here: a malformed record
+    another record follows (never repaired, an interior corruption cannot be
+    an in-flight append) and a permission denial (the repair itself refused).
+    """
     published = history != "fresh"
     from_phase = "q" if history == "resume" else None
     ledger = tmp_path / "study.journal"
@@ -507,11 +513,9 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     )
     healthy = ledger.read_bytes() if published else b""
     generation_before = _generation_path(experiment).read_bytes() if published else None
-    damaged = (
-        healthy
-        if damage == "permission-denied"
-        else healthy + (b"garbage\n" if damage == "garbage" else b'{"op_code":')
-    )
+    # A valid record follows the malformed one, so no repair may ever cut it.
+    trailer = healthy.rstrip(b"\n").split(b"\n")[-1] if healthy else b'{"op_code": 0}'
+    damaged = healthy if damage == "permission-denied" else healthy + b"garbage\n" + trailer + b"\n"
     ledger.write_bytes(damaged)
     original_mode = ledger.stat().st_mode
     if damage == "permission-denied":
@@ -526,12 +530,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             timeout=30,
         )
         assert refused_run.returncode != 0
-        if damage != "permission-denied":
-            # The bad last line's own repair, not a restore of the whole ledger.
-            assert f"truncate -s {len(healthy)} " in refused_run.stderr
-            assert "Restore the original complete storage ledger" not in refused_run.stderr
-        else:
-            assert "Restore the original complete storage ledger" in refused_run.stderr
+        assert "Restore the original complete storage ledger" in refused_run.stderr
 
         run_id = "damaged-storage"
         digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -590,13 +589,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         for confirm in (False, True):
             blocked = recover_run_cli(state_dir, run_id, confirm=confirm)
             assert blocked.exit_code != 0
-            if damage != "permission-denied":
-                # A bad last line is repaired by truncating it, never by recovery.
-                assert "ends with an incomplete record" in blocked.output
-                assert f"truncate -s {len(healthy)} " in blocked.output
-            else:
-                assert "could not be" in blocked.output
-                assert "Restore the original complete storage ledger" in blocked.output
+            assert "could not be" in blocked.output
+            assert "Restore the original complete storage ledger" in blocked.output
             if damage == "permission-denied":
                 assert ledger.stat().st_mode & 0o777 == 0
             else:

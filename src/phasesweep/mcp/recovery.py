@@ -38,7 +38,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.ledger import (
     open_existing_study,
-    require_complete_journal,
+    repair_incomplete_journal_record,
     validate_ledger,
 )
 from phasesweep.engine.locking import _experiment_lock
@@ -562,9 +562,10 @@ def _load_recovery_studies(
 
     Validation comes first and is read-only, so recovery refuses a tree bound
     to another ledger, or a pre-cutover ledger, before it opens anything and
-    without changing a byte. Preflight and confirmed recovery both refuse a
-    journal whose final record is partial, since inspection previews a write
-    that must not append after it. Each opened study then passes the read-only
+    without changing a byte. A confirmed recovery holds the experiment lock
+    and is about to write, so it then repairs a journal whose final record a
+    crashed writer left partial; inspection reads past that record as Optuna
+    does and leaves it for the confirmed write. Each opened study then passes the read-only
     ownership half of the check a run's claim applies, because recovery reaps
     and tells trials through these live objects: a study bound to another
     artifact root belongs to that root's runs, and recovering this tree must
@@ -576,8 +577,8 @@ def _load_recovery_studies(
 
     :param Experiment config: Experiment defining phase names and storage locations.
     :param _RecoveryNeeds needs: Recovery decisions that may require published-history checks.
-    :param bool confirm: Accepted for call-site symmetry with the confirmed
-        recovery path; this function reads storage identically in either mode.
+    :param bool confirm: The caller holds the experiment lock for a confirmed
+        recovery, so a partial final journal record may be repaired.
     :raises RunRecoveryError: The ledger is refused, a phase study belongs to
         another artifact root, or required storage or published studies cannot
         be read.
@@ -591,8 +592,8 @@ def _load_recovery_studies(
     )
     try:
         ledger = validate_ledger(config)
-        # Inspection previews the confirmed write, so it refuses what that refuses.
-        require_complete_journal(ledger)
+        if confirm:
+            repair_incomplete_journal_record(ledger)
     except (
         ArtifactRootConflictError,
         StudySchemaMismatchError,

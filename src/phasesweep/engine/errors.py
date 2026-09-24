@@ -119,15 +119,14 @@ class StudyStorageUnavailableError(PhaseSweepError):
 
 
 class IncompleteJournalRecordError(StudyStorageUnavailableError):
-    """Raised before a write when a journal ledger ends with a partial record.
+    """Raised before a write when a journal's partial final record could not be repaired.
 
-    Reads skip that record as Optuna does, but an append after it would be
-    glued onto it and corrupt the journal for good. The experiment lock does
-    not exclude another experiment's append to a shared journal, so the record
-    may be an append still in flight, and nothing repairs it automatically.
-    The message has the operator stop every writer and retry, and, for a
-    refusal that persists, names a truncation command that does nothing once
-    the journal has changed: the ledger repair this routes to.
+    A crashed writer's partial final record is normally cut under Optuna's
+    journal lock before any write. This names why that repair did not finish:
+    the lock, backup, or truncation failed, which restoring write access to
+    the ledger fixes, or the journal changed or the lock was lost while it was
+    held, which a retry settles (``action`` is then ``RETRY``). The intact
+    records remain, so the ledger needs repair, not a copy from a backup.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER

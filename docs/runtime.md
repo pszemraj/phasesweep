@@ -137,8 +137,13 @@ No command writes to the artifact root or its ledger until it has checked the
 tree's binding and then the ledger's format. When a check fails, the command
 stops and leaves both byte-for-byte as they were. Read-only commands,
 including `status`, `show-winners`, and `run --dry-run`, never create a missing
-ledger or its directory. Contributors will find the ordering rules behind these
-guarantees, and the tests that hold them, in
+ledger or its directory. A process killed while it appended to the journal
+can leave a partial final record, which every reader skips. The next
+`phasesweep run` or confirmed `phasesweep mcp recover-run` cuts it under
+Optuna's own journal lock, after saving the journal as
+`<ledger>.<UTC stamp>.bak` beside it. A record damaged anywhere before the
+last is refused as corruption. Contributors will find the ordering rules
+behind these guarantees, and the tests that hold them, in
 [durability invariants](invariants.md).
 
 Persistent phases use same-host locks. A concurrent CLI or MCP launch for the

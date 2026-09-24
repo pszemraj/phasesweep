@@ -381,8 +381,8 @@ def _run_experiment_outcome(
                 f"study state is unavailable: {exc} Cleanup state is therefore unknown."
             )
             if isinstance(exc, IncompleteJournalRecordError):
-                # This names the repair of an otherwise intact ledger; restoring
-                # the whole ledger instead would be the wrong remedy.
+                # A partial final record's repair did not finish, and it names its
+                # own remedy; restoring the whole ledger instead would be wrong.
                 raise ProcessCleanupUncertainError.rewrap(
                     exc, f"{unknown} For an MCP run, then run phasesweep mcp recover-run."
                 ) from exc

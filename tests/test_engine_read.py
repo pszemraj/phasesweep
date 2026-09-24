@@ -212,23 +212,29 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
 
     assert ledger.read_bytes() == damaged
     assert tree_snapshot(root) == before
+    # Interior corruption is never repaired automatically, so nothing about
+    # the failed attempt to write through it leaves a backup beside it.
+    assert not list(ledger.parent.glob(f"{ledger.name}.*.bak"))
 
 
 @pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
 @pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
 @pytest.mark.parametrize("damage", ["garbage", "partial-json", "missing-newline"])
-def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
+def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_before_writes(
     tmp_path: Path, published: bool, keep_prefix: bool, damage: str
 ) -> None:
-    """Reads skip a bad final line exactly as Optuna does; a run refuses to append after it.
+    """Reads skip a bad final line exactly as Optuna does; a write repairs it and proceeds.
 
     Optuna's reader skips a final line that lacks its newline or does not
-    decode, so status reports the complete records a live load would see. Its
-    writer would glue the next record onto that line, so the run refuses
-    before any live open, names the byte to truncate the journal at, and
-    writes nothing.
+    decode, so status reports the complete records a live load would see. A
+    write no longer refuses on sight: under Optuna's own journal lock it
+    backs the damaged bytes up beside the journal, cuts the journal back to
+    its last complete record, and continues. When nothing survives the cut
+    (``keep_prefix=False``) and a generation already published a winner from
+    this study, the truncation still leaves that publication's evidence gone
+    -- a real, later, unrelated refusal the repair cannot paper over.
     """
-    from phasesweep.engine import IncompleteJournalRecordError, ProcessCleanupUncertainError
+    from phasesweep.engine import PublishedStudyMissingError
 
     experiment, ledger, root = _journal_experiment(tmp_path, published=published)
     original = ledger.read_bytes()
@@ -239,7 +245,8 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
         "missing-newline": original.rstrip(b"\n").split(b"\n")[-1],
     }[damage]
     prefix = original if keep_prefix else b""
-    ledger.write_bytes(prefix + tail)
+    damaged = prefix + tail
+    ledger.write_bytes(damaged)
     before = tree_snapshot(root)
 
     for phase, undamaged in zip(
@@ -255,14 +262,22 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
             assert phase["published_study_unavailable"] is published
     loaded = engine_ledger._load_existing_phase_study(experiment, experiment.phases[0])
     assert (loaded is not None) is keep_prefix
-    with pytest.raises(ProcessCleanupUncertainError) as refused:
+
+    if published and not keep_prefix:
+        # claim_ledger reaches the same published-evidence check run_experiment
+        # would, without needing a runnable trainer or GPU isolation to get
+        # there, and it raises after the repair already ran.
+        with pytest.raises(PublishedStudyMissingError):
+            engine_ledger.claim_ledger(engine_ledger.validate_ledger(experiment))
+        assert tree_snapshot(root) == before
+    else:
         run_experiment(experiment)
 
-    cause = refused.value.__cause__
-    assert isinstance(cause, IncompleteJournalRecordError)
-    assert f"truncate -s {len(prefix)} -- {ledger}`" in str(cause)
-    assert ledger.read_bytes() == prefix + tail
-    assert tree_snapshot(root) == before
+    backups = sorted(ledger.parent.glob(f"{ledger.name}.*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == damaged
+    assert ledger.read_bytes().startswith(prefix)
+    assert engine_ledger.validate_ledger(experiment).format_verified is True
 
 
 @pytest.mark.parametrize("change", ["append", "finish-partial", "truncate"])

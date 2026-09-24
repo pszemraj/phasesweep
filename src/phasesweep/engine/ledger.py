@@ -23,7 +23,9 @@ module's handles, in one fixed order.
    :class:`ValidatedLedger` it returns.
 3. Pure read paths stop there and read trial data through
    :func:`read_phase_trial_stats`.
-4. :func:`claim_ledger` rescans strictly if the scan did not complete. It then
+4. :func:`claim_ledger` rescans strictly if the scan did not complete, and
+   cuts a partial final record a crashed writer left, under Optuna's own
+   journal lock (:func:`repair_incomplete_journal_record`). It then
    discovers every existing phase study by opening it on live storage
    (:func:`open_existing_study`), checks each study's artifact root, re-reads
    the tree binding, and only then writes: the ledger's directory, the tree
@@ -47,13 +49,14 @@ meant to observe.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
 import os
-import shlex
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -97,6 +100,7 @@ from phasesweep.engine.state import (
 )
 from phasesweep.runtime.files import (
     file_url_path,
+    fsync_directory,
     storage_backend,
     storage_is_in_memory,
 )
@@ -110,7 +114,7 @@ __all__ = [
     "open_preview_study",
     "open_registry_study",
     "read_phase_trial_stats",
-    "require_complete_journal",
+    "repair_incomplete_journal_record",
     "validate_ledger",
 ]
 
@@ -347,8 +351,8 @@ def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | 
 
     A final line Optuna would skip is skipped here too (:func:`_journal_records`),
     so a read reports the records a live load would see. Writing after that
-    line is a different matter, and every mutating path first refuses it
-    through :func:`require_complete_journal`.
+    line is a different matter, and every mutating path first removes it
+    through :func:`repair_incomplete_journal_record`.
 
     :param str storage_url: Journal storage URL to inspect.
     :param str label: Study or experiment named in an inspection failure.
@@ -369,51 +373,169 @@ def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | 
         ) from exc
 
 
-def _require_complete_journal(storage_url: str) -> None:
-    """Refuse to write through a journal whose final record is incomplete.
+def _scan_journal_before_write(path: Path) -> tuple[bytes, int] | None:
+    """Capture a journal a caller is about to write through, and find its complete prefix.
 
-    Optuna appends with no separator check, so its next record would be glued
-    onto the partial line: that record is lost, and once a later record follows
-    it, every reader, Optuna's included, fails on the journal for good. The
-    partial line is never truncated here. The experiment lock does not exclude
-    another experiment's append to a shared journal, so the line may be an
-    append still in flight, and removing it would destroy a live record. Only
-    the file lock Optuna's journal backend takes for every append excludes all
-    writers, and PhaseSweep does not take it. The operator's repair therefore
-    starts with stopping every writer and retrying, and the truncation command
-    it names checks the journal's size first, so a command copied from an
-    earlier refusal truncates nothing once that append has finished.
-
-    :param str storage_url: Journal storage URL a caller is about to write through.
-    :raises IncompleteJournalRecordError: The journal ends with a line Optuna
-        would skip.
-    :raises StudyStorageUnavailableError: The journal could not be read
-        completely.
+    :param Path path: Journal file to scan.
+    :return tuple[bytes, int] | None: The captured bytes and the offset just
+        past their last complete record, or ``None`` when no journal exists.
+    :raises StudyStorageUnavailableError: The journal could not be read, or a
+        malformed record is followed by another. An interrupted append damages
+        only the final record, so that is corruption, and nothing repairs it
+        automatically.
     """
-    path = _journal_path(storage_url)
     try:
         data = _capture_journal(path)
-        if data is None:
-            return
+    except (OSError, ValueError) as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {path} could not be read before writing to it: {exc}. "
+            "Nothing was written."
+        ) from exc
+    if data is None:
+        return None
+    try:
         _records, end = _journal_records(data)
+    except ValueError as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {path} holds a malformed record that other records follow. "
+            "An interrupted append damages only the final record, so this is corruption "
+            "and is never repaired automatically: restore the journal from a backup, "
+            f"including any `{path.name}.*.bak` copy a repair left beside it, or recover "
+            "it by hand. Nothing was written."
+        ) from exc
+    return data, end
+
+
+def _truncate_incomplete_journal_record(path: Path) -> tuple[Path, int] | None:
+    """Back up a journal, then cut its incomplete final record; the caller holds its lock.
+
+    :param Path path: Journal whose Optuna journal lock the caller holds.
+    :return tuple[Path, int] | None: The backup's path and the number of bytes
+        removed, or ``None`` when the final record had completed by the time
+        the lock was taken, so nothing needed repair.
+    :raises IncompleteJournalRecordError: The backup or the truncation failed,
+        or the journal changed size while the lock was held.
+    :raises StudyStorageUnavailableError: The journal could not be read, holds
+        a malformed record before its last, or does not replay once repaired.
+    """
+    scanned = _scan_journal_before_write(path)
+    if scanned is None or scanned[1] == len(scanned[0]):
+        return None
+    data, end = scanned
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = path.with_name(f"{path.name}.{stamp}.bak")
+    try:
+        with backup.open("xb") as copy:
+            copy.write(data)
+            copy.flush()
+            os.fsync(copy.fileno())
+        fsync_directory(path.parent)
+        with path.open("r+b") as journal:
+            if os.fstat(journal.fileno()).st_size != len(data):
+                raise IncompleteJournalRecordError(
+                    f"Journal storage {path} changed while its journal lock was held for "
+                    "repair, so it was not truncated. The journal as it was is saved at "
+                    f"{backup}. Retry to check it again. Nothing was appended.",
+                    action=OperatorAction.RETRY,
+                )
+            journal.truncate(end)
+            os.fsync(journal.fileno())
+    except OSError as exc:
+        raise IncompleteJournalRecordError(
+            f"Journal storage {path} ends with an incomplete record that could not be "
+            f"repaired: {exc}. Restore write access to the journal and its directory, "
+            "then retry. Nothing was appended."
+        ) from exc
+    try:
+        repaired = _capture_journal(path)
+        if repaired is None or len(repaired) != end:
+            raise ValueError("the repaired journal does not end at its last complete record")
+        records, repaired_end = _journal_records(repaired)
+        if repaired_end != end:
+            raise ValueError("the repaired journal still ends with an incomplete record")
+        JournalStorage(_JournalSnapshot(records))
     except Exception as exc:
         raise StudyStorageUnavailableError(
-            f"Journal storage {path} could not be completely read before writing to it."
+            f"Journal storage {path} does not replay after its incomplete final record was "
+            f"removed. The journal as it was is saved at {backup}. Restore the journal "
+            "from a backup or recover it by hand. Nothing was appended."
         ) from exc
-    if end == len(data):
+    return backup, len(data) - end
+
+
+def _repair_incomplete_journal_record(storage_url: str) -> None:
+    """Cut a journal's incomplete final record under Optuna's journal lock.
+
+    A writer that dies mid-append leaves a final line Optuna's reader skips,
+    so no reader ever saw that operation. The next append would be glued onto
+    it: that record would be lost too, and once another record followed,
+    every read would fail. A locked caller about to write therefore repairs
+    the journal first, the standard append-only-log repair: keep the longest
+    prefix of complete records and discard the uncertain suffix.
+
+    The fast path takes no lock: a journal whose final record is complete
+    needs nothing. Otherwise the repair takes Optuna's
+    ``JournalFileSymlinkLock`` on the journal, the lock every Optuna append
+    takes, whatever process or experiment it comes from. While it is held no
+    process is mid-append, so the journal is scanned again under it. A final
+    line that is still incomplete can only be a crashed writer's, and an
+    append that finished while the lock was awaited leaves nothing to repair;
+    no offset from before the lock is ever used. The captured bytes are copied
+    to ``<journal>.<UTC stamp>.bak`` beside it, the journal is truncated after
+    its last complete record and fsynced, and it must replay before the lock
+    is released. Optuna releases a crashed writer's stale lock once the
+    journal has gone unchanged for its 30-second grace period, so the section
+    under the lock is kept to one scan, one copy, and one truncation.
+
+    :param str storage_url: Journal storage URL a caller is about to write through.
+    :raises IncompleteJournalRecordError: The record could not be repaired, or
+        another process released the journal lock during the repair.
+    :raises StudyStorageUnavailableError: The journal could not be read, holds
+        a malformed record before its last, or did not replay once repaired.
+    """
+    path = _journal_path(storage_url)
+    scanned = _scan_journal_before_write(path)
+    if scanned is None or scanned[1] == len(scanned[0]):
         return
-    quoted = shlex.quote(str(path))
-    command = f'test "$(wc -c < {quoted})" -eq {len(data)} && truncate -s {end} -- {quoted}'
-    raise IncompleteJournalRecordError(
-        f"Journal storage {path} ends with an incomplete record: a writer crashed while "
-        "appending it, or is still appending it. Appending after it would corrupt the "
-        "journal permanently. Stop every process that uses this journal, then retry. If "
-        "the retry succeeds, the append had finished and nothing needs repair. If it is "
-        "refused again, back up the journal and run the command that refusal names to "
-        "truncate it after its last complete line; the command does nothing if the "
-        "journal has changed since its refusal. For the journal as this refusal saw it: "
-        f"`{command}`. Nothing was written."
+    from optuna.storages.journal import JournalFileSymlinkLock
+
+    lock = JournalFileSymlinkLock(str(path))
+    log.warning(
+        "Journal storage %s ends with an incomplete record; taking its journal lock to repair it.",
+        path,
     )
+    try:
+        lock.acquire()
+    except OSError as exc:
+        raise IncompleteJournalRecordError(
+            f"Journal storage {path} ends with an incomplete record that could not be "
+            f"repaired: its journal lock could not be taken: {exc}. Restore write access to "
+            "the journal's directory, then retry. Nothing was written."
+        ) from exc
+    try:
+        repaired = _truncate_incomplete_journal_record(path)
+    except BaseException:
+        with contextlib.suppress(RuntimeError):
+            lock.release()
+        raise
+    try:
+        lock.release()
+    except RuntimeError as exc:
+        raise IncompleteJournalRecordError(
+            f"Journal storage {path}: another process released its journal lock while its "
+            "incomplete final record was being repaired, so an append may have raced the "
+            "repair. Retry to check the journal again.",
+            action=OperatorAction.RETRY,
+        ) from exc
+    if repaired is not None:
+        backup, dropped = repaired
+        log.warning(
+            "Repaired journal storage %s: removed an incomplete final record of %d bytes "
+            "that no reader could see. The journal as it was is saved at %s.",
+            path,
+            dropped,
+            backup,
+        )
 
 
 def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.Study | None:
@@ -750,27 +872,27 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
     return _load_existing_phase_study(ledger.experiment, phase)
 
 
-def require_complete_journal(ledger: ValidatedLedger) -> None:
-    """Refuse a journal ledger whose final record a crash, or a live writer, left partial.
+def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
+    """Repair a journal ledger whose final record a crashed writer left partial.
 
-    Reads tolerate that record exactly as Optuna does, but nothing may append
-    after it, so every path that may write refuses it before any live open:
-    :func:`claim_ledger`, :func:`open_registry_study`, and MCP recovery, whose
-    inspection previews the confirmed write and so refuses it too. The check
-    only reads; the partial record is never repaired here (see
-    :func:`_require_complete_journal`). A handle whose format scan did not
-    complete is left to the openers, which refuse it in the scan's own words.
+    Reads skip that record exactly as Optuna does, and removing it changes
+    nothing any reader sees, so only paths about to write repair it, each
+    holding the experiment lock and before any live open: :func:`claim_ledger`,
+    :func:`open_registry_study`, and a confirmed MCP recovery. Recovery
+    inspection leaves it to the confirmed write. A handle whose format scan
+    did not complete is left to the openers, which refuse it in the scan's
+    own words. The repair itself is :func:`_repair_incomplete_journal_record`.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
-    :raises IncompleteJournalRecordError: The journal ends with an incomplete
-        record; the message says to stop every writer and retry, and names a
-        size-guarded command that truncates it if the refusal persists.
-    :raises StudyStorageUnavailableError: The journal could not be read.
+    :raises IncompleteJournalRecordError: The record could not be repaired, or
+        the journal lock was lost during the repair.
+    :raises StudyStorageUnavailableError: The journal could not be read, holds
+        a malformed record before its last, or did not replay once repaired.
     """
     if ledger.backend != "journal" or not ledger.format_verified:
         return
     assert ledger.storage_url is not None
-    _require_complete_journal(ledger.storage_url)
+    _repair_incomplete_journal_record(ledger.storage_url)
 
 
 def read_phase_trial_stats(
@@ -871,15 +993,17 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     unreadable ledger) is scanned again here, strictly, before discovery: a
     mutating caller must never proceed on a ledger whose foreign studies were
     not format-checked, so the returned handle is always verified. A journal
-    whose final record is partial is refused before discovery opens it live
-    (:func:`require_complete_journal`).
+    whose final record a crashed writer left partial is repaired before
+    discovery opens it live (:func:`repair_incomplete_journal_record`).
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param str | None from_phase: Resume point; earlier phases will not execute.
     :return ClaimedLedger: Bound handle carrying every existing phase study.
+    :raises IncompleteJournalRecordError: A journal's partial final record
+        could not be repaired.
     :raises StudyStorageUnavailableError: The ledger's format could still not
-        be scanned, a journal's final record is incomplete, or a phase's
-        persistent storage could not be inspected.
+        be scanned, the journal holds a malformed record before its last, or
+        a phase's persistent storage could not be inspected.
     :raises StudySchemaMismatchError: The rescan found pre-cutover or otherwise
         unsupported PhaseSweep study state.
     :raises PublishedStudyMissingError: A phase to execute has a published
@@ -893,7 +1017,7 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     if not ledger.format_verified:
         _scan_ledger_format(ledger.storage_url)
         ledger = replace(ledger, format_scan_failure=None)
-    require_complete_journal(ledger)
+    repair_incomplete_journal_record(ledger)
     experiment = ledger.experiment
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
@@ -1049,8 +1173,10 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
     it is opened. This release wrote the registry entry, so the ledger it names
     was current-format when the attempt registered; pre-cutover state there now
     means the locator no longer names that ledger, and reaping through it would
-    write into state this release refuses. A journal whose final record is
-    partial is refused instead (:func:`require_complete_journal`).
+    write into state this release refuses. Every caller holds the experiment
+    lock and is about to write through the study, so a journal whose final
+    record a crashed writer left partial is then repaired, as
+    :func:`claim_ledger` repairs its own (:func:`_repair_incomplete_journal_record`).
 
     Absence is confirmed without creating anything. A missing journal, or a
     ledger that holds no such study, returns ``None``; Optuna's own loaders
@@ -1066,6 +1192,8 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
         confirms it does not hold one called ``study_name``.
     :raises StudySchemaMismatchError: The ledger holds pre-cutover or
         unsupported PhaseSweep study state.
+    :raises IncompleteJournalRecordError: The journal's partial final record
+        could not be repaired.
     :raises StudyStorageUnavailableError: The ledger exists but could not be
         read completely, or a journal changed while the study was being opened.
     :raises ValueError: ``locator`` selects an unsupported local storage backend.
@@ -1074,7 +1202,7 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
         # An in-memory study died with the orchestrator that held it.
         return None
     _scan_ledger_format(locator)
-    _require_complete_journal(locator)
+    _repair_incomplete_journal_record(locator)
     snapshot = _load_journal_study_snapshot(locator, study_name)
     if snapshot is None:
         return None

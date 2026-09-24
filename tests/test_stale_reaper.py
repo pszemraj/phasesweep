@@ -1251,11 +1251,11 @@ def _fabricate_registered_journal_attempt(
     return experiment, ledger, _attempts_dir(experiment) / f"{attempt_id}.json"
 
 
-@pytest.mark.parametrize("tail", [b"{}\n", b"not-json\n", b"not-json", b'{"unterminated"'])
+@pytest.mark.parametrize("tail", [b"{}\n", b"not-json\n{}\n"])
 def test_registry_retains_attempt_when_journal_snapshot_is_unreadable(
     tmp_path: Path, tail: bytes
 ) -> None:
-    """Malformed journal tails cannot discard a stale-attempt recovery record."""
+    """A journal that stays unreadable cannot discard a stale-attempt recovery record."""
     experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
         tmp_path, attempt_id="journal-attempt"
     )
@@ -1267,6 +1267,40 @@ def test_registry_retains_attempt_when_journal_snapshot_is_unreadable(
 
     assert ledger.read_bytes() == ledger_before
     assert entry_path.read_bytes() == entry_before
+
+
+@pytest.mark.parametrize("tail", [b"not-json\n", b"not-json", b'{"unterminated"'])
+def test_registry_reads_its_attempt_after_repairing_a_partial_journal_record(
+    tmp_path: Path, tail: bytes
+) -> None:
+    """A partial final record is cut first, so the attempt is read as on a healthy journal."""
+    (tmp_path / "healthy").mkdir()
+    (tmp_path / "torn").mkdir()
+    healthy_experiment, healthy_ledger, healthy_entry = _fabricate_registered_journal_attempt(
+        tmp_path / "healthy", attempt_id="journal-attempt"
+    )
+    _preflight_active_attempts(healthy_experiment, _PreflightCleanupReport())
+    experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
+        tmp_path / "torn", attempt_id="journal-attempt"
+    )
+    complete = ledger.read_bytes()
+    ledger.write_bytes(complete + tail)
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    (backup,) = ledger.parent.glob(f"{ledger.name}.*.bak")
+    assert backup.read_bytes() == complete + tail
+    assert ledger.read_bytes().startswith(complete)
+    assert not list(healthy_ledger.parent.glob(f"{healthy_ledger.name}.*.bak"))
+    assert not entry_path.exists()
+    assert not healthy_entry.exists()
+
+    def trial_states(experiment: Experiment) -> list[optuna.trial.TrialState]:
+        storage = engine_ledger._resolve_storage(experiment.resolved_storage)
+        study = optuna.load_study(study_name="journal-attempt::p", storage=storage)
+        return [trial.state for trial in study.get_trials(deepcopy=False)]
+
+    assert trial_states(experiment) == trial_states(healthy_experiment)
 
 
 def test_registry_retains_attempt_when_live_journal_loses_snapshotted_trial(

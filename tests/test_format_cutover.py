@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
-import subprocess
 from pathlib import Path
 
 import optuna
@@ -20,6 +18,7 @@ from phasesweep.engine import (
     StudyStorageUnavailableError,
     read_status,
 )
+from phasesweep.engine import ledger as engine_ledger
 from phasesweep.engine.artifact_roots import (
     ARTIFACT_ROOT_BINDING_SCHEMA_VERSION,
     _artifact_root_binding_payload,
@@ -31,19 +30,22 @@ from phasesweep.engine.ledger import (
     open_existing_study,
     open_phase_study,
     open_registry_study,
-    require_complete_journal,
+    repair_incomplete_journal_record,
     validate_ledger,
 )
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.recovery import (
-    RunRecoveryError,
     _load_recovery_studies,
 )
-from phasesweep.runtime.files import local_storage_url
-from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
+from tests.conftest import (
+    make_experiment,
+    mark_current_format,
+    requires_nonroot,
+    write_constant_trainer,
+)
 from tests.ledger_fixtures import (
     ledger_file,
     materialize,
@@ -534,81 +536,181 @@ _PARTIAL_FINAL_RECORDS = {
 
 
 @pytest.mark.parametrize("damage", sorted(_PARTIAL_FINAL_RECORDS))
-def test_writers_refuse_a_partial_final_journal_record_and_leave_it(
-    tmp_path: Path, damage: str
-) -> None:
-    """Every path that may write refuses a bad last journal line, names the repair, writes nothing.
+def test_writers_repair_a_partial_final_journal_record(tmp_path: Path, damage: str) -> None:
+    """Every path that may write repairs a bad last journal line before it proceeds.
 
-    Reads skip that line as Optuna does, so the format scan passes. Optuna's
-    next append would be glued onto it, though, and the line may be another
-    experiment's append still in flight, so nothing truncates it. Recovery
-    inspection previews the confirmed write and refuses in the same words.
+    Reads skip that line as Optuna does, so the format scan passes. A write no
+    longer refuses on sight: under Optuna's own journal lock it backs the
+    damaged bytes up beside the journal and truncates back to the last
+    complete record, for ``claim_ledger``, ``open_registry_study``, and a
+    confirmed recovery alike. Unconfirmed inspection no longer checks the tail
+    at all, so it neither raises nor changes a byte.
+    """
+
+    def freshly_damaged(label: str) -> tuple[Experiment, Path, bytes, bytes]:
+        # Each writer gets its own copy of the fixture: a repair mutates the
+        # journal it runs against, so the four scenarios cannot share one.
+        materialized = materialize("current-journal", tmp_path / label, mode="tree")
+        experiment = materialized.experiment
+        journal = ledger_file(materialized, "journal")
+        complete = journal.read_bytes()
+        damaged = complete + _PARTIAL_FINAL_RECORDS[damage]
+        journal.write_bytes(damaged)
+        return experiment, journal, complete, damaged
+
+    def assert_repaired(journal: Path, complete: bytes, damaged: bytes) -> None:
+        assert journal.read_bytes() == complete
+        backups = sorted(journal.parent.glob(f"{journal.name}.*.bak"))
+        assert len(backups) == 1
+        assert backups[0].read_bytes() == damaged
+        assert not journal.with_name(f"{journal.name}.lock").exists()
+
+    experiment, journal, complete, damaged = freshly_damaged("claim")
+    claim_ledger(validate_ledger(experiment))
+    assert_repaired(journal, complete, damaged)
+
+    experiment, journal, complete, damaged = freshly_damaged("registry")
+    assert experiment.resolved_storage is not None
+    assert open_registry_study(experiment.resolved_storage, "t::p") is not None
+    assert_repaired(journal, complete, damaged)
+
+    experiment, journal, complete, damaged = freshly_damaged("confirmed")
+    with _experiment_lock(experiment):
+        _load_recovery_studies(experiment, load_only_recovery_needs(), confirm=True)
+    assert_repaired(journal, complete, damaged)
+
+    experiment, journal, complete, damaged = freshly_damaged("inspect")
+    _load_recovery_studies(experiment, load_only_recovery_needs())
+    assert journal.read_bytes() == damaged
+    assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
+
+
+def test_repair_leaves_an_append_that_finished_while_it_awaited_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repair that finds the record complete once it holds the lock writes nothing.
+
+    The scan before the lock may see a partial final line a concurrent append
+    is still writing. Optuna's own journal lock excludes every writer, so if
+    that append settles the journal back to fully complete before this
+    repair's rescan runs under the lock, no offset from before the lock is
+    ever used: nothing is truncated, and no backup is written.
+    """
+    import optuna.storages.journal as journal_module
+
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment = materialized.experiment
+    journal = ledger_file(materialized, "journal")
+    complete = journal.read_bytes()
+    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+
+    real_acquire = journal_module.JournalFileSymlinkLock.acquire
+
+    def finish_append_then_acquire(self: object) -> bool:
+        journal.write_bytes(complete)
+        return real_acquire(self)
+
+    monkeypatch.setattr(
+        journal_module.JournalFileSymlinkLock, "acquire", finish_append_then_acquire
+    )
+
+    repair_incomplete_journal_record(validate_ledger(experiment))
+
+    assert journal.read_bytes() == complete
+    assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
+
+
+def test_repair_truncates_only_while_holding_the_journal_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The truncation step only ever runs while this process holds Optuna's own journal lock."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment = materialized.experiment
+    journal = ledger_file(materialized, "journal")
+    complete = journal.read_bytes()
+    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    lock_path = journal.with_name(f"{journal.name}.lock")
+
+    real_truncate = engine_ledger._truncate_incomplete_journal_record
+
+    def truncate_while_locked(path: Path):
+        assert lock_path.is_symlink()
+        return real_truncate(path)
+
+    monkeypatch.setattr(engine_ledger, "_truncate_incomplete_journal_record", truncate_while_locked)
+
+    repair_incomplete_journal_record(validate_ledger(experiment))
+
+    assert not lock_path.exists()
+    assert journal.read_bytes() == complete
+
+
+def test_repair_refuses_a_journal_that_grew_under_its_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A journal that changed size while this repair held its lock is never truncated.
+
+    A writer that ignored the lock is exactly what the size check guards
+    against: the repair still backs the damaged bytes up, but it refuses to
+    guess which of the old or new bytes past that point are safe to keep.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     journal = ledger_file(materialized, "journal")
     complete = journal.read_bytes()
-    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS[damage])
-    before = tree_snapshot(materialized.root)
-    assert experiment.resolved_storage is not None
+    damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
+    journal.write_bytes(damaged)
+    appended = b'{"op_code": 0}\n'
 
-    assert validate_ledger(experiment).format_verified is True
-    with pytest.raises(IncompleteJournalRecordError) as claimed:
-        claim_ledger(validate_ledger(experiment))
-    with pytest.raises(IncompleteJournalRecordError) as registry:
-        open_registry_study(experiment.resolved_storage, "t::p")
-    with pytest.raises(RunRecoveryError) as inspected:
-        _load_recovery_studies(experiment, load_only_recovery_needs())
-    with _experiment_lock(experiment), pytest.raises(RunRecoveryError) as confirmed:
-        _load_recovery_studies(experiment, load_only_recovery_needs(), confirm=True)
+    real_fsync_directory = engine_ledger.fsync_directory
 
-    assert str(inspected.value) == str(confirmed.value) == str(claimed.value)
-    for refusal in (claimed.value, registry.value, inspected.value, confirmed.value):
-        assert "ends with an incomplete record" in str(refusal)
-        assert f"truncate -s {len(complete)} -- {journal}`" in str(refusal)
-    assert tree_snapshot(materialized.root) == before
+    def fsync_then_append(path: Path) -> None:
+        real_fsync_directory(path)
+        with journal.open("ab") as target:
+            target.write(appended)
+
+    monkeypatch.setattr(engine_ledger, "fsync_directory", fsync_then_append)
+
+    with pytest.raises(IncompleteJournalRecordError) as excinfo:
+        repair_incomplete_journal_record(validate_ledger(experiment))
+
+    assert excinfo.value.action == OperatorAction.RETRY
+    assert journal.read_bytes() == damaged + appended
+    backups = sorted(journal.parent.glob(f"{journal.name}.*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == damaged
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", ["ledger copy.log", "ledger's copy.log"])
-def test_journal_repair_command_truncates_only_the_journal_it_saw(
-    tmp_path: Path, name: str
+@requires_nonroot
+@pytest.mark.parametrize("step", ["lock", "backup"])
+def test_repair_that_cannot_write_beside_the_journal_leaves_it_unchanged(
+    tmp_path: Path, step: str
 ) -> None:
-    """The refusal's command cuts exactly its journal's partial record, and only that one.
+    """A repair refused its lock or its backup leaves the journal exactly as it was.
 
-    The partial record may be an append still in flight. Once the append
-    finishes, the retry the refusal asks for succeeds, and the command copied
-    from the earlier refusal truncates nothing. After a crash left the same
-    record, it cuts that record and nothing else, whatever the path's spaces
-    and quotes.
+    A read-only journal directory refuses Optuna's lock symlink before
+    anything else. The backup is reached only by a caller that holds the lock
+    already, so that step is driven directly.
     """
-    journal = tmp_path / name
-    url = local_storage_url(journal)
-    experiment = make_experiment(workdir=tmp_path / "runs", storage=url)
-    study = optuna.create_study(study_name="t::p", storage=_resolve_storage(url))
-    mark_current_format(experiment, study)
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    journal = ledger_file(materialized, "journal")
     complete = journal.read_bytes()
-    study.ask()
-    appended = journal.read_bytes()
-    bystanders = [tmp_path / "ledger", tmp_path / "copy.log", tmp_path / "ledger's"]
-    for bystander in bystanders:
-        bystander.write_text("unrelated")
+    damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
+    journal.write_bytes(damaged)
+    ledger = validate_ledger(materialized.experiment)
+    mode = journal.parent.stat().st_mode
+    journal.parent.chmod(0o555)
+    try:
+        with pytest.raises(IncompleteJournalRecordError) as excinfo:
+            if step == "lock":
+                repair_incomplete_journal_record(ledger)
+            else:
+                engine_ledger._truncate_incomplete_journal_record(journal)
+    finally:
+        journal.parent.chmod(mode)
 
-    def refused_command() -> str:
-        with pytest.raises(IncompleteJournalRecordError) as refused:
-            require_complete_journal(validate_ledger(experiment))
-        (command,) = re.findall(r"`([^`]*truncate[^`]*)`", str(refused.value))
-        return command
-
-    journal.write_bytes(appended[: len(complete) + 8])
-    stale = refused_command()
-    journal.write_bytes(appended)
-    require_complete_journal(validate_ledger(experiment))
-    assert subprocess.run(["sh", "-c", stale], cwd=tmp_path).returncode != 0
-    assert journal.read_bytes() == appended
-
-    journal.write_bytes(appended[: len(complete) + 8])
-    subprocess.run(["sh", "-c", refused_command()], cwd=tmp_path, check=True)
-    assert journal.read_bytes() == complete
-    require_complete_journal(validate_ledger(experiment))
-    assert [bystander.read_text() for bystander in bystanders] == ["unrelated"] * 3
+    assert excinfo.value.action == OperatorAction.RESTORE_LEDGER
+    assert "could not be repaired" in str(excinfo.value)
+    assert journal.read_bytes() == damaged
+    assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
+    assert not journal.with_name(f"{journal.name}.lock").exists()

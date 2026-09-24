@@ -18,7 +18,8 @@ the MCP layer.
 2. Validate, then claim, then open. validate_ledger checks the artifact-root
    binding, then scans the ledger format, and writes nothing; on a bound tree
    an unreadable scan is tolerated and recorded on the handle. claim_ledger
-   rescans strictly if the scan did not complete, loads every existing phase
+   rescans strictly if the scan did not complete, cuts a partial final
+   journal record under Optuna's journal lock, loads every existing phase
    study, checks every study's root before any write, writes the tree
    binding, then claims empty studies. Only the ClaimedLedger it returns
    reaches open_phase_study.
@@ -64,7 +65,8 @@ flowchart TD
     handle -->|"recover-run, never claims"| existing["open_existing_study<br/>refuses a scan that did not complete"]
     handle -->|"run"| rescan
     subgraph claim["claim_ledger"]
-        rescan["strict rescan if the scan did not complete"] --> discover["load every existing phase study"]
+        rescan["strict rescan if the scan did not complete"] --> repair["cut a partial final journal record<br/>under Optuna's journal lock"]
+        repair --> discover["load every existing phase study"]
         discover --> roots["check every study's root, all phases before any write"]
         roots --> recheck["re-check the tree binding is unchanged"]
         recheck --> bind["write the tree binding if unbound"]
@@ -96,33 +98,43 @@ recorded on the handle, and on an unbound tree it is refused.
 
 A journal ledger's last line that lacks its newline or does not decode is
 skipped exactly as Optuna's reader skips it, so status, winners, and the
-result snapshot report the complete records. Every path that may write refuses
-it before any live open, and so does recovery, inspection or confirmed,
-because inspection previews a mutation. Nothing repairs it automatically. The
-experiment lock does not exclude another experiment's append to a shared
-journal, so the line may be an append still in flight, and truncating it would
-destroy a live record. Only the file lock Optuna's journal backend takes for
-every append excludes all writers, and PhaseSweep does not take it. The
-refusal therefore tells the operator to stop every writer and retry, since a
-finished append makes the retry succeed. It also names a truncation command
-for a refusal that persists; the command checks the journal's size first, so
-one copied from an earlier refusal truncates nothing once the journal has
-changed.
+result snapshot report the complete records. Removing that line changes
+nothing any reader sees, and appending after it would glue the next record
+onto it, so every path about to write repairs it before any live open: a
+run's claim, the registry opener, and a confirmed recovery, each under the
+experiment lock. Recovery inspection holds no lock and leaves it alone. The
+repair takes Optuna's `JournalFileSymlinkLock`, the lock every Optuna append
+takes, whatever experiment or process it comes from, so while it is held no
+append is in flight. It scans the journal again under that lock, so an
+append that finished while the lock was awaited is never cut, and no offset
+read before the lock is ever used. It then copies the journal to
+`<journal>.<UTC stamp>.bak` beside it, checks the size is unchanged,
+truncates after the last complete record, fsyncs, and replays the result
+before releasing the lock. A repair that cannot take the lock, write the
+backup, or truncate leaves the journal as it was and refuses with
+`RESTORE_LEDGER`; a journal that grew under the lock is left untruncated and
+refused with `RETRY`. A malformed record that another record follows is
+corruption, not an interrupted append, and is refused with `RESTORE_LEDGER`
+and the bytes unchanged.
 
 **Held by:** `engine.ledger.validate_ledger`, running
 `engine.artifact_roots._check_artifact_root_binding` before
 `engine.ledger._scan_ledger_format` and returning a `ValidatedLedger` whose
 `format_verified` and `format_scan_failure` record the outcome;
 `engine.ledger._journal_records` for the tolerated line and
-`engine.ledger.require_complete_journal` for the refusal\
+`engine.ledger._repair_incomplete_journal_record` for the repair, called by
+`claim_ledger`, `open_registry_study`, and confirmed recovery\
 **Tests:** `tests/test_format_cutover.py::test_validate_ledger_on_a_fresh_root_creates_nothing`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`
 (its `release-0.3.1` cells pin the binding check before the format scan),
-`tests/test_engine_read.py::test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes`,
+`tests/test_engine_read.py::test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_before_writes`,
 `tests/test_engine_read.py::test_journal_malformed_record_before_its_end_never_means_absent`,
-`tests/test_format_cutover.py::test_writers_refuse_a_partial_final_journal_record_and_leave_it`,
-`tests/test_format_cutover.py::test_journal_repair_command_truncates_only_the_journal_it_saw`
+`tests/test_format_cutover.py::test_writers_repair_a_partial_final_journal_record`,
+`tests/test_format_cutover.py::test_repair_leaves_an_append_that_finished_while_it_awaited_the_lock`,
+`tests/test_format_cutover.py::test_repair_truncates_only_while_holding_the_journal_lock`,
+`tests/test_format_cutover.py::test_repair_refuses_a_journal_that_grew_under_its_lock`,
+`tests/test_format_cutover.py::test_repair_that_cannot_write_beside_the_journal_leaves_it_unchanged`
 
 The scan may treat a missing journal file as an absent ledger only because
 config load already refused every other storage form: `storage` other than
@@ -188,13 +200,13 @@ its trials.
 Recovery validates the binding and the format before it opens any study, never
 claims, refuses a study bound to another artifact root before it reaps
 anything, and refuses a pre-cutover ledger or an incomplete scan with the bytes
-unchanged. Both confirmed recovery and inspection refuse a journal whose last
-line is partial, with the same message, because inspection previews the
-write.
+unchanged. A confirmed recovery holds the experiment lock and is about to
+write, so it repairs a journal whose last line is partial, as a run's claim
+does; inspection reads past that line as Optuna does and writes nothing.
 
 **Held by:** `mcp.recovery._load_recovery_studies`, through
-`engine.ledger.validate_ledger`, then
-`engine.ledger.require_complete_journal`, and then
+`engine.ledger.validate_ledger`, then, when confirmed,
+`engine.ledger.repair_incomplete_journal_record`, and then
 `engine.ledger.open_existing_study`, which refuses a handle whose scan did not
 complete, with `engine.artifact_roots._check_study_artifact_root` on every
 opened study\
@@ -202,7 +214,7 @@ opened study\
 `tests/test_ledger_read_paths.py::test_recovery_study_load_rewraps_the_engine_refusal`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_stale_reaper.py::test_recovery_refuses_a_study_bound_to_another_artifact_root`,
-`tests/test_format_cutover.py::test_writers_refuse_a_partial_final_journal_record_and_leave_it`
+`tests/test_format_cutover.py::test_writers_repair_a_partial_final_journal_record`
 
 ### Attempts and trial outcomes
 
@@ -249,7 +261,9 @@ before any terminal transition and raises
 #### 11. An unreadable ledger means cleanup is uncertain
 
 A ledger that cannot be read makes cleanup uncertain, never confirmed, and the
-attempt stays registered for a later retry.
+attempt stays registered for a later retry. A journal's partial final record
+does not make it unreadable: the registry opener repairs it first (invariant 2) and
+reads the attempt as it would on a healthy journal.
 
 **Held by:** `engine.cleanup._reap_stale_trials`, which raises
 `ProcessCleanupUncertainError`; `engine.attempts._registry_attempt_fail_stale_trial`,
@@ -257,7 +271,8 @@ which opens through `engine.ledger.open_registry_study` and retains the entry
 when storage is unreachable; `engine.guards._preflight_existing_studies`,
 which marks the cleanup report uncertain\
 **Tests:** `tests/test_stale_reaper.py::test_registry_storage_failure_marks_cleanup_report_uncertain`,
-`tests/test_stale_reaper.py::test_registry_retains_attempt_when_journal_snapshot_is_unreadable`
+`tests/test_stale_reaper.py::test_registry_retains_attempt_when_journal_snapshot_is_unreadable`,
+`tests/test_stale_reaper.py::test_registry_reads_its_attempt_after_repairing_a_partial_journal_record`
 
 ### Publication
 

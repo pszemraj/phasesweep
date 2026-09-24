@@ -16,7 +16,8 @@ import os
 import pkgutil
 import pwd
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -387,6 +388,52 @@ def _run_over_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
     return trigger
 
 
+@contextmanager
+def _read_only_once_locked(journal: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Let Optuna's journal lock succeed, then deny writes to the journal's directory.
+
+    The repair's backup lives beside the lock file, so a directory that never
+    allowed writes would refuse the lock itself. Revoking write access just
+    after the real lock is taken makes the backup the repair opens next fail.
+    The directory's mode is restored on exit so the tree can be cleaned up.
+    """
+    import optuna.storages.journal as journal_module
+
+    real_acquire = journal_module.JournalFileSymlinkLock.acquire
+    mode = journal.parent.stat().st_mode
+
+    def acquire_then_deny(self: object) -> bool:
+        acquired = real_acquire(self)
+        journal.parent.chmod(0o555)
+        return acquired
+
+    monkeypatch.setattr(journal_module.JournalFileSymlinkLock, "acquire", acquire_then_deny)
+    try:
+        yield
+    finally:
+        journal.parent.chmod(mode)
+
+
+def _run_over_unbackuppable_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Start a run whose journal repair can lock its torn record but not back it up."""
+    materialized = _materialize_damaged(tmp_path, "current-journal", "tree", _truncated)
+    with _read_only_once_locked(ledger_file(materialized, "journal"), monkeypatch):
+        return run_experiment(materialized.experiment)
+
+
+def _recovery_studies_confirmed_over_unbackuppable_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Confirm recovery over a torn journal whose repair can lock but not back up."""
+    materialized = _materialize_damaged(tmp_path, "current-journal", "tree", _truncated)
+    needs = load_only_recovery_needs()
+    with (
+        _experiment_lock(materialized.experiment),
+        _read_only_once_locked(ledger_file(materialized, "journal"), monkeypatch),
+    ):
+        return _load_recovery_studies(materialized.experiment, needs, confirm=True)
+
+
 def _claim_ledger_under(parent: Callable[[Path], Path]) -> Trigger:
     """Return a trigger that claims a fresh journal ledger to be created below ``parent``."""
 
@@ -705,13 +752,14 @@ WRAP_CASES = (
         cause=StudyStorageUnavailableError,
     ),
     RoutingCase(
-        # The partial record names its own repair; restoring the ledger is not it.
+        # The repair's own refusal names its remedy; composing it keeps that.
         id="run_ownership_keeps_journal_repair",
-        trigger=_run_over_damaged("current-journal", _truncated),
+        trigger=_run_over_unbackuppable_repair,
         raised=ProcessCleanupUncertainError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Nothing was written. Cleanup state is therefore unknown. For an MCP run",
+        message="could not be repaired",
         cause=IncompleteJournalRecordError,
+        marks=(requires_nonroot,),
     ),
     RoutingCase(
         # Composed: the cleanup refusal's own repair survives the replacement.
@@ -829,13 +877,14 @@ WRAP_CASES = (
         message="could not be completely read while checking for the PhaseSweep format boundary.",
     ),
     RoutingCase(
-        # Inspection previews the confirmed write, so it refuses a cut-short
-        # last record with the repair, not recover-run's usual restore remedy.
+        # A confirmed recovery repairs a cut-short last record itself; its own
+        # refusal names the remedy, not recover-run's usual restore-ledger text.
         id="recovery_studies_journal_incomplete_record",
-        trigger=_recovery_studies_damaged("tree", _truncated, fixture="current-journal"),
+        trigger=_recovery_studies_confirmed_over_unbackuppable_repair,
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="Stop every process that uses this journal, then retry. If the retry succeeds",
+        message="could not be repaired",
+        marks=(requires_nonroot,),
     ),
     RoutingCase(
         # recover-run reaps through the same read, so the ledger comes back first.
