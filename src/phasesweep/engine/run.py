@@ -612,8 +612,6 @@ def _run_experiment_inner(
     Raises:
         TimeoutError: The whole-run wallclock deadline expired before a phase
             could start.
-        FileNotFoundError: A skipped phase has no persisted ``winner.yaml``
-            (re-raised on non-dry-run; dry runs substitute a placeholder).
 
     """
     dry_run = ledger is None
@@ -661,12 +659,11 @@ def _run_experiment_inner(
                     )
                 log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
             else:
+                # Only a dry run gets here: a real run preloads every skipped winner.
                 try:
                     winners[phase.name] = artifact_io._load_winner(experiment, phase, inherited)
                     log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
                 except FileNotFoundError:
-                    if not dry_run:
-                        raise
                     winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
                     log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
             continue

@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import optuna
 
-from phasesweep.config import Experiment, Gate, Phase
+from phasesweep.config import Experiment, Phase
 from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.artifacts import _write_trials_csv
 from phasesweep.engine.attempts import (
@@ -234,15 +234,6 @@ def _composed_overrides(
     out.update(phase.fixed_overrides)
     out.update(sampled)
     return out
-
-
-def _phase_gates(phase: Phase) -> list[Gate]:
-    """Return a phase's local gates in declaration order.
-
-    :param Phase phase: Phase whose local gates are evaluated.
-    :return list[Gate]: Phase-local gates in evaluation order.
-    """
-    return list(phase.gates)
 
 
 def _active_phase_abort(
@@ -953,7 +944,7 @@ def _run_phase(
         result = extract_trial_result(
             experiment=experiment,
             executed=executed,
-            gates=_phase_gates(phase),
+            gates=phase.gates,
             deadline=optimize_deadline,
         )
         if result.deadline_exhausted:

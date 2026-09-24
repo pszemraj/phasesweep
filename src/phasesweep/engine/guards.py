@@ -188,14 +188,14 @@ def _preflight_existing_studies(
         # same one, and otherwise to reading the refusals it lists.
         remediations = {error.action for error in errors if isinstance(error, PhaseSweepError)}
         shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
-        if all(isinstance(error, StudySchemaMismatchError) for error in errors):
-            raise StudySchemaMismatchError(message, action=shared) from first
-        if all(isinstance(error, StudyFingerprintMismatchError) for error in errors):
-            raise StudyFingerprintMismatchError(message, action=shared) from first
-        if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
-            raise StudyStorageUnavailableError(message, action=shared) from first
-        if all(isinstance(error, TrialTargetRegressionError) for error in errors):
-            raise TrialTargetRegressionError(message, action=shared) from first
+        for error_type in (
+            StudySchemaMismatchError,
+            StudyFingerprintMismatchError,
+            StudyStorageUnavailableError,
+            TrialTargetRegressionError,
+        ):
+            if all(isinstance(error, error_type) for error in errors):
+                raise error_type(message, action=shared) from first
         cleanup_error = next(
             (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
             None,
