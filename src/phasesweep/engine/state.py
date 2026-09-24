@@ -189,8 +189,7 @@ REPRODUCIBILITY_SCHEMA_VERSION = 2
 
 GenerationIdSource = Literal["caller", "engine"]
 """Who supplied a generation's identity: an external launcher, or the engine."""
-_MANIFEST_ARTIFACT_KINDS = frozenset({"winner"})
-_ARTIFACT_FILENAMES = {"winner": "winner.yaml"}
+WINNER_FILENAME = "winner.yaml"
 # Manifest kinds that name a file in the generation namespace root rather than
 # a phase. Their entries carry ``path`` instead of ``phase``; both are required
 # in every current-format generation.

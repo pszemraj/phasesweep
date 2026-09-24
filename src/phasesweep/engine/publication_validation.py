@@ -20,13 +20,12 @@ from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.paths import GENERATION_SUMMARY_FILENAME
 from phasesweep.engine.state import (
-    _ARTIFACT_FILENAMES,
     _GENERATION_FILE_FILENAMES,
-    _MANIFEST_ARTIFACT_KINDS,
     _MANIFEST_GENERATION_FILE_KINDS,
     GENERATION_CONFIG_SNAPSHOT_FILENAME,
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PUBLICATION_POINTER_SCHEMA_VERSION,
+    WINNER_FILENAME,
 )
 from phasesweep.runtime.files import file_sha256, nofollow_flag
 
@@ -102,7 +101,7 @@ def _generation_artifact_manifest(
     for phase_dir in sorted(phases_dir.iterdir()):
         if not phase_dir.is_dir():
             continue
-        artifact = phase_dir / _ARTIFACT_FILENAMES["winner"]
+        artifact = phase_dir / WINNER_FILENAME
         if artifact.is_file():
             items.append(
                 {"kind": "winner", "phase": phase_dir.name, "sha256": file_sha256(artifact)}
@@ -219,7 +218,7 @@ def _validate_generation_manifest(
                 raise _fail(f"duplicate artifact entry for {kind}")
             listed_files[str(kind)] = entry
             continue
-        if kind not in _MANIFEST_ARTIFACT_KINDS or not isinstance(entry.get("phase"), str):
+        if kind != "winner" or not isinstance(entry.get("phase"), str):
             raise _fail("summary artifact entry is malformed")
         key = (str(kind), str(entry["phase"]))
         if key in listed:
@@ -252,7 +251,7 @@ def _validate_generation_manifest(
             raise _fail(f"artifact manifest lists a winner for unknown phase {name!r}")
 
     for (kind, name), entry in listed.items():
-        artifact_path = generation_dir / "phases" / name / _ARTIFACT_FILENAMES[kind]
+        artifact_path = generation_dir / "phases" / name / WINNER_FILENAME
         try:
             content = _read_unlinked_bytes(artifact_path, root=generation_dir.parent)
         except PermissionError as exc:
@@ -350,12 +349,10 @@ def _validate_generation_manifest(
         for phase_dir in phases_dir.iterdir():
             if not phase_dir.is_dir():
                 continue
-            for kind, filename in _ARTIFACT_FILENAMES.items():
-                if (phase_dir / filename).is_file() and (kind, phase_dir.name) not in listed:
-                    raise _fail(
-                        f"namespace contains an unlisted {kind} artifact "
-                        f"for phase {phase_dir.name!r}"
-                    )
+            if (phase_dir / WINNER_FILENAME).is_file() and ("winner", phase_dir.name) not in listed:
+                raise _fail(
+                    f"namespace contains an unlisted winner artifact for phase {phase_dir.name!r}"
+                )
             if (phase_dir / "promotion.yaml").is_file():
                 raise _fail(
                     f"namespace contains removed promotion artifact for phase {phase_dir.name!r}"
@@ -430,7 +427,7 @@ def _validate_winner_source_generation(
             f"winner for phase {phase_name!r} cites source generation "
             f"{source_generation!r} which does not exist in this tree"
         )
-    source_winner_path = source_dir / "phases" / source_phase / _ARTIFACT_FILENAMES["winner"]
+    source_winner_path = source_dir / "phases" / source_phase / WINNER_FILENAME
     if not source_winner_path.is_file():
         if (source_dir / GENERATION_SUMMARY_FILENAME).is_file():
             raise fail(
