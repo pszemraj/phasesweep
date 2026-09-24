@@ -26,7 +26,7 @@ from phasesweep.engine.locking import (
     _experiment_lock,
     _run_lock_paths,
 )
-from phasesweep.errors import LockBusyError, PhaseSweepError
+from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime import files as runtime_files
 from tests.conftest import (
     make_experiment,
@@ -192,21 +192,6 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     with pytest.raises(runtime_files.UnsafeLockPathError, match="Unsafe lock directory"):
         runtime_files.lock_dir()
     assert issubclass(runtime_files.UnsafeLockPathError, PhaseSweepError)
-
-
-def test_busy_generic_lock_is_an_operational_error(tmp_path: Path) -> None:
-    """Lock contention belongs to the CLI's expected error boundary."""
-    lock_path = tmp_path / "busy.lock"
-    held = runtime_files.try_lock_file(lock_path)
-    assert held is not None
-    try:
-        with (
-            pytest.raises(LockBusyError, match="already busy"),
-            runtime_files.exclusive_lock(lock_path, busy_message="already busy"),
-        ):
-            pytest.fail("the held lock must not be reacquired")
-    finally:
-        runtime_files.unlock_file(held)
 
 
 def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(
@@ -799,11 +784,10 @@ import sys
 from phasesweep.config import Experiment
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.errors import ExperimentLockBusyError
-from phasesweep.errors import LockBusyError
 try:
     with _experiment_lock(Experiment.model_validate_json(sys.argv[1])):
         print("acquired")
-except (ExperimentLockBusyError, LockBusyError):
+except ExperimentLockBusyError:
     print("busy")
     sys.exit(2)
 """,

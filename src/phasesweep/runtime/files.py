@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import IO, ClassVar
 from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
-from phasesweep.errors import LockBusyError, OperatorAction, PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.runtime.files")
 
@@ -421,24 +421,6 @@ def unlock_file(handle: IO[str]) -> None:
         fcntl.flock(handle, fcntl.LOCK_UN)
     with contextlib.suppress(OSError):
         handle.close()
-
-
-@contextlib.contextmanager
-def exclusive_lock(path: Path, *, busy_message: str) -> Iterator[None]:
-    """Hold a non-blocking exclusive flock for the context duration.
-
-    :param Path path: Lock file path to hold during the context.
-    :param str busy_message: Error message used when the lock is already held.
-    :raises LockBusyError: If the lock cannot be acquired immediately.
-    :return Iterator[None]: Context manager iterator for the held lock.
-    """
-    handle = try_lock_file(path)
-    if handle is None:
-        raise LockBusyError(busy_message)
-    try:
-        yield
-    finally:
-        unlock_file(handle)
 
 
 def fsync_directory(path: Path) -> None:

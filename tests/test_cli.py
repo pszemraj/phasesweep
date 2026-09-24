@@ -48,7 +48,7 @@ from phasesweep.engine.paths import (
     _winner_path,
 )
 from phasesweep.engine.publication import _last_successful_generation_id
-from phasesweep.errors import GpuConfigurationError, LockBusyError
+from phasesweep.errors import GpuConfigurationError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
@@ -928,7 +928,7 @@ def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
 
     Runtime lock configuration goes through the real validator in the next test.
     """
-    error = LockBusyError("another experiment process holds the lock")
+    error = ExperimentLockBusyError("another experiment process holds the lock")
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, error)
@@ -1052,7 +1052,6 @@ def test_expected_operational_failures_share_one_base() -> None:
         UnsafeProcessCleanupError,
         ExperimentLockBusyError,
         GpuConfigurationError,
-        LockBusyError,
         SamplerContinuationUnsupportedError,
         StudyContextConflictError,
         StudyFingerprintMismatchError,
