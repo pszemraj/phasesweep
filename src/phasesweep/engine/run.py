@@ -169,23 +169,6 @@ def _terminal_report_from_cleanup(
     )
 
 
-@dataclass(frozen=True)
-class ExperimentRunOutcome:
-    """One published experiment invocation bound to its generation identity.
-
-    The winners and the generation id that produced them are materialized
-    together while the experiment lock is still held, so provenance consumers
-    can record exact lineage without re-reading mutable pointers after the lock
-    is released — an interleaving external top-up
-    would otherwise let a manifest name generation B while carrying winners
-    from generation A (review v0.5.14 / blocker 2).
-    """
-
-    generation_id: str
-    winners: Mapping[str, Winner]
-    phase_fingerprints: Mapping[str, str | None]
-
-
 def run_experiment(
     experiment: Experiment,
     *,
@@ -268,7 +251,7 @@ def run_experiment(
     # the same check until recovery proves a phase has new work remaining.
     if not path_ops._artifact_root_binding_path(experiment).exists():
         _preflight_trainer_environments(experiment, from_phase=from_phase)
-    outcome = _run_experiment_outcome(
+    winners = _run_experiment_outcome(
         experiment,
         from_phase=from_phase,
         terminal_callback=terminal_callback,
@@ -286,7 +269,7 @@ def run_experiment(
         # signalled exit without re-reading mutable publication pointers.
         exc.published_result_committed = True
         raise
-    return dict(outcome.winners)
+    return dict(winners)
 
 
 def _run_experiment_outcome(
@@ -296,13 +279,13 @@ def _run_experiment_outcome(
     terminal_callback: Callable[[TerminalReport], None] | None = None,
     publication_hook: PublicationHook | None = None,
     generation_id: str | None = None,
-) -> ExperimentRunOutcome:
-    """Run all phases and bind the winners to their published generation identity.
+) -> Mapping[str, Winner]:
+    """Run all phases and return the winners while the experiment lock is held.
 
     This is the non-dry-run engine core behind :func:`run_experiment`. The
-    returned :class:`ExperimentRunOutcome` is constructed while the experiment
-    lock is still held, so its ``generation_id`` is exactly the generation that
-    produced (and published) ``winners`` — never a later external top-up's.
+    winners are materialized while the experiment lock is still held, so they
+    are exactly those produced (and published) by this invocation's generation
+    — never a later external top-up's.
 
     :param Experiment experiment: Parsed experiment config.
     :param str | None from_phase: Optional resume point; see :func:`run_experiment`.
@@ -311,7 +294,7 @@ def _run_experiment_outcome(
     :param PublicationHook | None publication_hook: Optional required
         publication sidecar; see :func:`run_experiment`.
     :param str | None generation_id: Optional caller-owned invocation identity.
-    :return ExperimentRunOutcome: Winners bound to the publishing generation id.
+    :return Mapping[str, Winner]: Winners produced by this invocation's generation.
     :raises TrialEvidenceMissingError: Launch preflight found a trial eligible
         to win whose recorded evidence is no longer in this tree, or selection
         found the winner's objective source altered; raised before any trial
@@ -454,13 +437,7 @@ def _run_experiment_outcome(
                 winners=result,
                 cleanup_confirmed=True,
             )
-            return ExperimentRunOutcome(
-                generation_id=generation_id,
-                winners=MappingProxyType(dict(result)),
-                phase_fingerprints=MappingProxyType(
-                    {name: winner.phase_fingerprint for name, winner in result.items()}
-                ),
-            )
+            return MappingProxyType(dict(result))
         except BaseException as exc:
             terminal_error = exc
             control_error: BaseException | None = None
