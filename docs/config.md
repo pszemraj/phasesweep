@@ -155,6 +155,10 @@ at most 4,096 concrete combinations, counted before trials are materialized.
 Its trial target must equal that cardinality unless `allow_partial_grid: true`
 is set. CMA-ES accepts numeric spaces only.
 
+`sampler.n_startup_trials` applies only to `tpe`; the other sampler types
+must leave it at its default (10) or config load fails, since they never
+read it.
+
 For persistent storage, `random`, `tpe`, and `cmaes` need a seed. TPE and
 CMA-ES also require `acknowledge_nonresumable: true`: their target must finish
 in one invocation rather than being resumed or enlarged across processes.

@@ -121,7 +121,8 @@
 #   sampler: Sampler = {}
 #     type: "tpe" | "random" | "grid" | "cmaes" = "tpe"
 #     seed: int | null = null       # 0 <= seed <= 2**32 - 1
-#     n_startup_trials: int = 10    # TPE only
+#     n_startup_trials: int = 10    # tpe only; other sampler types must leave
+#                                    # it at the default 10 or config load fails
 #     acknowledge_nonresumable: bool = false
 # A grid may have at most 4,096 combinations, counted before materialization;
 # n_trials must equal the cardinality unless allow_partial_grid is true. CMA-ES

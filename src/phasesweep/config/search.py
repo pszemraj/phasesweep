@@ -236,7 +236,15 @@ class Sampler(_Frozen):
 
     type: Literal["tpe", "random", "grid", "cmaes"] = "tpe"
     seed: ConfigInt | None = Field(default=None, ge=0, le=2**32 - 1)
-    n_startup_trials: ConfigInt = Field(default=10, ge=0)  # tpe only
+    n_startup_trials: ConfigInt = Field(
+        default=10,
+        ge=0,
+        description=(
+            "Number of random trials TPE runs before it starts fitting its "
+            "surrogate model. Applies only to sampler.type 'tpe'; other "
+            "sampler types never read it and must leave it at the default."
+        ),
+    )
     acknowledge_nonresumable: bool = Field(
         default=False,
         description=(
@@ -264,6 +272,29 @@ class Sampler(_Frozen):
                 "tops the study up. Only "
                 f"{sorted(NON_RESUMABLE_SAMPLERS)} carry the run-the-target-in-one-invocation "
                 "contract this flag acknowledges. Remove acknowledge_nonresumable."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_n_startup_trials_applies(self) -> Sampler:
+        """Reject a non-default ``n_startup_trials`` for a sampler that ignores it.
+
+        Checked by value, not by whether the field was explicitly set, so a
+        config that spells out the default (e.g. a config snapshot dump)
+        keeps loading; only a value that would actually change behavior on a
+        sampler that never reads this field is refused.
+
+        :raises ValueError: ``n_startup_trials`` is not the default value for
+            a sampler type other than ``"tpe"``.
+        :return Sampler: Self, unchanged.
+        """
+        default = Sampler.model_fields["n_startup_trials"].default
+        if self.type != "tpe" and self.n_startup_trials != default:
+            raise ValueError(
+                f"sampler.n_startup_trials={self.n_startup_trials} is set for "
+                f"sampler.type={self.type!r}. Only the tpe sampler uses "
+                f"n_startup_trials (default {default}); remove it or set "
+                "sampler.type: tpe."
             )
         return self
 

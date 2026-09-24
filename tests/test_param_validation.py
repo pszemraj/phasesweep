@@ -159,6 +159,35 @@ def test_sampler_rejects_negative_n_startup_trials():
         Sampler(type="tpe", n_startup_trials=-1)
 
 
+@pytest.mark.parametrize("sampler_type", ["random", "grid", "cmaes"])
+def test_sampler_rejects_non_default_n_startup_trials_off_tpe(sampler_type: str) -> None:
+    """A non-default n_startup_trials on a sampler that ignores it is refused.
+
+    Only TPE reads n_startup_trials, yet it is part of the semantic phase
+    fingerprint, so a value that changes nothing would still split studies.
+    """
+    with pytest.raises(ValidationError, match="n_startup_trials"):
+        Sampler(type=sampler_type, n_startup_trials=999)
+
+
+def test_sampler_accepts_tpe_with_non_default_n_startup_trials() -> None:
+    """TPE is the one sampler type that actually reads n_startup_trials."""
+    sampler = Sampler(type="tpe", n_startup_trials=999)
+    assert sampler.n_startup_trials == 999
+
+
+@pytest.mark.parametrize("sampler_type", ["random", "grid", "cmaes"])
+def test_sampler_accepts_default_n_startup_trials_off_tpe(sampler_type: str) -> None:
+    """Explicitly spelling out the default n_startup_trials on a non-tpe sampler is fine.
+
+    This is checked by value, not by whether the field was explicitly set:
+    config snapshot fixtures serialize every field, including
+    n_startup_trials: 10 on sampler.type: random, and must keep loading.
+    """
+    sampler = Sampler(type=sampler_type, n_startup_trials=10)
+    assert sampler.n_startup_trials == 10
+
+
 @pytest.mark.parametrize(
     ("body", "match"),
     [
