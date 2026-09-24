@@ -285,6 +285,8 @@ def _load_winner(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
+    *,
+    published_generation_id: str | None,
 ) -> Winner:
     """Load a phase winner from disk and verify it matches the *current* config.
 
@@ -308,6 +310,10 @@ def _load_winner(
         phase: The phase whose winner is being loaded.
         inherited_winners: Winners loaded for phases earlier in the chain;
             contribute to the recomputed fingerprint.
+        published_generation_id: Last-success generation id the caller
+            resolved with ``raise_on_manifest_error=True``, so its whole
+            manifest is already validated; ``None`` when nothing is published.
+            A caller loading several phases resolves it once.
 
     Returns:
         The reconstructed :class:`Winner` for ``phase``.
@@ -320,10 +326,6 @@ def _load_winner(
             the freshly computed one.
 
     """
-    published_generation_id = publication_ops._last_successful_generation_id(
-        experiment,
-        raise_on_manifest_error=True,
-    )
     path = publication_ops._published_winner_path_for(
         experiment, published_generation_id, phase.name
     )

@@ -330,7 +330,10 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     # second one (lr, or the summary) did not. Either way, reads resolve via
     # the generation-scoped artifact once any generation has published.
     assert {view.phase for view in read_winners(experiment)} == {"arch", "lr"}
-    assert _load_winner(experiment, experiment.phases[0], {}) is not None
+    assert (
+        _load_winner(experiment, experiment.phases[0], {}, published_generation_id=generation_id)
+        is not None
+    )
 
 
 def test_fingerprint_changes_when_parent_winner_changes():

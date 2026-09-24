@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 
 from phasesweep.engine.artifacts import _load_winner
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
@@ -545,7 +546,14 @@ class RunControl:
         for phase in reg.experiment.phases[: names.index(from_phase)]:
             inherited = {parent: winners[parent] for parent in phase.inherits}
             try:
-                winners[phase.name] = _load_winner(reg.experiment, phase, inherited)
+                winners[phase.name] = _load_winner(
+                    reg.experiment,
+                    phase,
+                    inherited,
+                    published_generation_id=_last_successful_generation_id(
+                        reg.experiment, raise_on_manifest_error=True
+                    ),
+                )
             except FileNotFoundError:
                 raise ResumeNotReadyError(reg.id, from_phase, phase.name) from None
             except (

@@ -1216,7 +1216,14 @@ def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     """Skip a phase whose published winner is a partial result this config does not accept."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     republish_as_incomplete(experiment)
-    return _load_winner(experiment, experiment.phases[0], {})
+    return _load_winner(
+        experiment,
+        experiment.phases[0],
+        {},
+        published_generation_id=_last_successful_generation_id(
+            experiment, raise_on_manifest_error=True
+        ),
+    )
 
 
 def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1225,7 +1232,14 @@ def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     edited = experiment.phases[0].model_copy(
         update={"search_space": {"a": IntParam(type="int", low=0, high=20)}}
     )
-    return _load_winner(experiment.model_copy(update={"phases": [edited]}), edited, {})
+    return _load_winner(
+        experiment.model_copy(update={"phases": [edited]}),
+        edited,
+        {},
+        published_generation_id=_last_successful_generation_id(
+            experiment, raise_on_manifest_error=True
+        ),
+    )
 
 
 def _claim_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:

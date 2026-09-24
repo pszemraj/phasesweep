@@ -15,6 +15,7 @@ from phasesweep.engine import PhaseSweepError
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import PHASE_ABORT_ATTR, PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
@@ -165,7 +166,14 @@ def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_pat
         sleep_seconds=1.0,
     )
     with pytest.raises(RuntimeError, match="incomplete phase result"):
-        _load_winner(current, current.phases[0], {})
+        _load_winner(
+            current,
+            current.phases[0],
+            {},
+            published_generation_id=_last_successful_generation_id(
+                current, raise_on_manifest_error=True
+            ),
+        )
 
 
 @pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
@@ -201,7 +209,14 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
             ],
         }
     )
-    loaded = _load_winner(current, current.phases[0], {})
+    loaded = _load_winner(
+        current,
+        current.phases[0],
+        {},
+        published_generation_id=_last_successful_generation_id(
+            current, raise_on_manifest_error=True
+        ),
+    )
     assert loaded.completion["incomplete"] is False
 
 

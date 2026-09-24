@@ -9,6 +9,7 @@ import optuna
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
+import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config import Experiment
 from phasesweep.engine.errors import StudyContextConflictError
@@ -36,9 +37,21 @@ def _preflight_skipped_winners(
         or incomplete.
     :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
         disagrees with the current config.
+    :raises PublicationAccessError: The published manifest cannot be read as
+        the current user.
+    :raises PublicationIntegrityError: The published manifest fails validation.
     """
     if from_phase is None:
         return {}
+
+    # One manifest validation covers every skipped phase. Resolving once is
+    # safe here, unlike in status reads: this preflight runs under
+    # _experiment_lock, and this experiment's pointer only advances at this
+    # run's final publish.
+    published_generation_id = publication_ops._last_successful_generation_id(
+        experiment,
+        raise_on_manifest_error=True,
+    )
 
     winners: dict[str, Winner] = {}
     for phase in experiment.phases:
@@ -49,10 +62,12 @@ def _preflight_skipped_winners(
         if phase.name == from_phase:
             return winners
         inherited = {parent: winners[parent] for parent in phase.inherits}
-        # Safe to re-resolve the published pointer per phase here, unlike status
-        # reads: this preflight runs under _experiment_lock, and this
-        # experiment's pointer only advances at this run's final publish.
-        winner = artifact_io._load_winner(experiment, phase, inherited)
+        winner = artifact_io._load_winner(
+            experiment,
+            phase,
+            inherited,
+            published_generation_id=published_generation_id,
+        )
         evidence_ops._verify_skipped_winner_evidence(experiment, phase, winner)
         winners[phase.name] = winner
 

@@ -56,6 +56,7 @@ from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     _unresolvable_pointer,
 )
+from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.runtime import shutdown as runtime_shutdown
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
@@ -64,6 +65,7 @@ from tests.conftest import (
     patch_path_method_failure,
     requires_nonroot,
     temporary_umask,
+    write_constant_trainer,
     write_param_echo_trainer,
     write_trainer,
 )
@@ -745,7 +747,14 @@ def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) 
     winner_path.symlink_to(preserved_winner_path.name)
 
     with pytest.raises(PublicationIntegrityError, match="missing or unreadable"):
-        artifact_io._load_winner(experiment, experiment.phases[0], {})
+        artifact_io._load_winner(
+            experiment,
+            experiment.phases[0],
+            {},
+            published_generation_id=_last_successful_generation_id(
+                experiment, raise_on_manifest_error=True
+            ),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1033,6 +1042,63 @@ def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
 
     with pytest.raises(PublicationIntegrityError, match="does not match its recorded hash"):
         _last_successful_generation_id(experiment, raise_on_manifest_error=True)
+
+
+def test_from_phase_preflight_validates_the_published_manifest_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skipping several phases costs one manifest validation, not one per phase."""
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        phases=[
+            Phase(
+                name="a",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=4)},
+            ),
+            Phase(
+                name="b",
+                inherits=["a"],
+                n_trials=1,
+                sampler=Sampler(type="random", seed=1),
+                search_space={"y": IntParam(type="int", low=0, high=4)},
+            ),
+            Phase(
+                name="c",
+                inherits=["b"],
+                n_trials=1,
+                sampler=Sampler(type="random", seed=2),
+                search_space={"z": IntParam(type="int", low=0, high=4)},
+            ),
+            Phase(
+                name="d",
+                inherits=["c"],
+                n_trials=1,
+                sampler=Sampler(type="random", seed=3),
+                search_space={"w": IntParam(type="int", low=0, high=4)},
+            ),
+        ],
+    )
+    run_experiment(experiment)
+
+    original_validate = validation_ops._validate_generation_manifest
+    calls = 0
+
+    def counting_validate(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(validation_ops, "_validate_generation_manifest", counting_validate)
+
+    winners = _preflight_skipped_winners(experiment, from_phase="d", run_deadline=None)
+
+    assert set(winners) == {"a", "b", "c"}
+    assert calls == 1
 
 
 def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Path) -> None:

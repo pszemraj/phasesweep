@@ -32,7 +32,10 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
-from phasesweep.engine.publication import _published_winner_path_for
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _published_winner_path_for,
+)
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
@@ -642,7 +645,14 @@ def _run_experiment_inner(
             else:
                 # Only a dry run gets here: a real run preloads every skipped winner.
                 try:
-                    winners[phase.name] = artifact_io._load_winner(experiment, phase, inherited)
+                    winners[phase.name] = artifact_io._load_winner(
+                        experiment,
+                        phase,
+                        inherited,
+                        published_generation_id=_last_successful_generation_id(
+                            experiment, raise_on_manifest_error=True
+                        ),
+                    )
                     log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
                 except FileNotFoundError:
                     winners[phase.name] = _placeholder_winner(phase, inherited)
