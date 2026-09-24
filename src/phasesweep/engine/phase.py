@@ -68,8 +68,10 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
     _AcceptedPartialDecision,
+    _consecutive_failure_threshold_tripped,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
+    _next_consecutive_failures,
     _record_allocation_context,
     _record_trial_target,
     _validate_environment_cohort,
@@ -483,9 +485,8 @@ def _run_phase(
             }
             active_abort["policy"] = policy_state.fatal_policy or "fatal_trial_exception"
             study.set_user_attr(PHASE_ABORT_ATTR, active_abort)
-        if (
-            active_abort is None
-            and policy_state.consecutive_failures >= phase.max_consecutive_failures
+        if active_abort is None and _consecutive_failure_threshold_tripped(
+            policy_state.consecutive_failures, phase
         ):
             active_abort = _failure_policy_abort_record(
                 phase,
@@ -713,12 +714,9 @@ def _run_phase(
                 write_error = None
                 _completion_sequence = next_sequence
                 recorded_outcomes[trial.number] = outcome
-                if outcome in {"failure", "fatal"}:
-                    _consecutive_failures += 1
-                elif outcome == "success":
-                    _consecutive_failures = 0
-                threshold_tripped = (not abort["flag"]) and (
-                    _consecutive_failures >= phase.max_consecutive_failures
+                _consecutive_failures = _next_consecutive_failures(_consecutive_failures, outcome)
+                threshold_tripped = (not abort["flag"]) and _consecutive_failure_threshold_tripped(
+                    _consecutive_failures, phase
                 )
                 fatal_tripped = outcome == "fatal"
                 if not threshold_tripped and not fatal_tripped:

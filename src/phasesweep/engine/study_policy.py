@@ -50,6 +50,39 @@ class _PhasePolicyState:
     fatal_policy: str | None
 
 
+def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
+    """Apply one terminal outcome to a running consecutive-failure count.
+
+    Shared by live recording and replay reconstruction so both apply the
+    same consecutive-failure policy transition.
+
+    :param int consecutive_failures: Count observed before ``outcome``.
+    :param str outcome: Terminal outcome. ``"failure"`` or ``"fatal"``
+        increments the count, ``"success"`` resets it to zero, and any other
+        outcome (e.g. ``"pruned"``, ``"cancelled"``) leaves it unchanged.
+    :return int: The count after applying ``outcome``.
+    """
+    if outcome in {"failure", "fatal"}:
+        return consecutive_failures + 1
+    if outcome == "success":
+        return 0
+    return consecutive_failures
+
+
+def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Phase) -> bool:
+    """Return whether a phase's consecutive-failure abort threshold is met.
+
+    Shared by the live per-outcome check and the startup replay check so
+    both compare the same count against the same threshold.
+
+    :param int consecutive_failures: Current consecutive-failure count.
+    :param Phase phase: Phase config supplying ``max_consecutive_failures``.
+    :return bool: True when ``consecutive_failures`` meets or exceeds the
+        phase's threshold.
+    """
+    return consecutive_failures >= phase.max_consecutive_failures
+
+
 @dataclass(frozen=True)
 class _AcceptedPartialDecision:
     """Durable terminal decision to select from an incomplete timed-out phase."""
@@ -234,10 +267,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     for sequence, trial_number, outcome, cause, policy in events:
         if sequence <= recovery_boundary:
             continue
-        if outcome == "success":
-            consecutive_failures = 0
-        elif outcome in {"failure", "fatal"}:
-            consecutive_failures += 1
+        consecutive_failures = _next_consecutive_failures(consecutive_failures, outcome)
         if outcome == "fatal" and fatal_trial_number is None:
             fatal_trial_number = trial_number
             fatal_sequence = sequence
