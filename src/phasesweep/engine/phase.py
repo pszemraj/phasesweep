@@ -1463,7 +1463,6 @@ def _dry_run_phase(
         log.info("DRY RUN example command:\n  %s", cmd)
 
     return _placeholder_winner(
-        experiment,
         phase,
         inherited_winners,
         sampled_params=sampled,
@@ -1471,7 +1470,6 @@ def _dry_run_phase(
 
 
 def _placeholder_winner(
-    experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
     *,
@@ -1485,7 +1483,6 @@ def _placeholder_winner(
     Both paths include inherited effective overrides.
 
     Args:
-        experiment: Parsed experiment supplying the execution environment.
         phase: The phase whose placeholder winner is needed.
         inherited_winners: Winners from earlier phases in the chain.
         sampled_params: Values used in the displayed preview command, or
