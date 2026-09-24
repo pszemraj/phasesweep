@@ -50,6 +50,7 @@ from phasesweep.engine.state import (
     WinnerSource,
     _parse_winner_source,
 )
+from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
 
 ResultContext: TypeAlias = Literal["represented_generation", "current_config"]
 """Which config's semantics a result payload's labels were read under.
@@ -394,28 +395,19 @@ def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] 
     return names
 
 
+_OBJECTIVE_EVIDENCE_KEYS = frozenset(_ObjectiveEvidenceFields.model_fields)
+"""The ``objective_evidence`` keys, taken from the model its writers declare."""
+
+
 def _recorded_objective_evidence(candidate: object) -> dict[str, str | bool] | None:
     """Return a complete current-format assurance payload, if present.
 
     :param object candidate: Summary ``objective_evidence`` value.
     :return dict[str, str | bool] | None: Complete recorded flags, or ``None``.
     """
-    expected = {
-        "kind",
-        "attempt_location_scoped",
-        "attempt_identity_bound",
-        "source_identity_keyed",
-        "objective_name_bound",
-        "split_bound",
-        "evaluation_policy_bound",
-        "checkpoint_declared",
-        "checkpoint_value_bound",
-        "expected_step_declared",
-        "expected_step_value_bound",
-    }
-    if not isinstance(candidate, Mapping) or set(candidate) != expected:
+    if not isinstance(candidate, Mapping) or set(candidate) != _OBJECTIVE_EVIDENCE_KEYS:
         return None
-    if candidate.get("kind") not in {"json", "json_envelope", "log_regex", "wandb"}:
+    if candidate.get("kind") not in EXTRACTOR_KINDS:
         return None
     if any(type(candidate[key]) is not bool for key in candidate if key != "kind"):
         return None

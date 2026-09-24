@@ -34,6 +34,7 @@ from phasesweep.evidence.evaluation import (
     json_float,
 )
 from phasesweep.evidence.models import (
+    EXTRACTOR_KINDS,
     JsonExtractor,
     ObjectiveExtractor,
     WandbExtractor,
@@ -151,9 +152,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     if not isinstance(extractor, Mapping):
         fail("missing extractor identity")
     kind = extractor.get("kind")
-    if kind not in {"json", "json_envelope", "log_regex", "wandb"} or not is_sha256_hex(
-        extractor.get("config_sha256")
-    ):
+    if kind not in EXTRACTOR_KINDS or not is_sha256_hex(extractor.get("config_sha256")):
         fail("invalid extractor identity")
     if not isinstance(provenance.get("recorded_at"), str) or not provenance["recorded_at"]:
         fail("missing capture time")
