@@ -61,7 +61,7 @@ flowchart TD
         check["artifact-root binding check"] --> scan["ledger format scan<br/>unreadable is tolerated only on a bound tree"]
     end
     scan --> handle["ValidatedLedger<br/>records whether the scan completed"]
-    handle -->|"read paths stop here"| ro["read_phase_trial_stats<br/>phase unavailable if the scan did not complete"]
+    handle -->|"read paths stop here"| ro["read_trial_stats<br/>phase unavailable if the scan did not complete"]
     handle -->|"recover-run, never claims"| existing["open_existing_study<br/>refuses a scan that did not complete"]
     handle -->|"run"| rescan
     subgraph claim["claim_ledger"]
@@ -190,7 +190,7 @@ phase whose format scan did not complete as unavailable rather than counting
 its trials.
 
 **Held by:** `engine.ledger.validate_ledger` and
-`engine.ledger.read_phase_trial_stats`, under `engine.read.read_status`,
+`engine.ledger.read_trial_stats`, under `engine.read.read_status`,
 `engine.read.read_winners`, and `mcp.snapshots.capture_result_snapshot`\
 **Tests:** `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`,
 `tests/test_format_cutover.py::test_inconclusive_scan_on_a_bound_tree_never_reports_unchecked_counts`

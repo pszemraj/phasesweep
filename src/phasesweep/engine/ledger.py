@@ -22,7 +22,7 @@ module's handles, in one fixed order.
    On a bound tree an unreadable scan is tolerated and recorded on the
    :class:`ValidatedLedger` it returns.
 3. Pure read paths stop there and read trial data through
-   :func:`read_phase_trial_stats`.
+   :func:`read_trial_stats`, which captures the journal once for every phase.
 4. :func:`claim_ledger` rescans strictly if the scan did not complete, and
    cuts a partial final record a crashed writer left, under Optuna's own
    journal lock (:func:`repair_incomplete_journal_record`). It then
@@ -113,7 +113,7 @@ __all__ = [
     "open_phase_study",
     "open_preview_study",
     "open_registry_study",
-    "read_phase_trial_stats",
+    "read_trial_stats",
     "repair_incomplete_journal_record",
     "resolved_ledger_path",
     "validate_ledger",
@@ -144,7 +144,7 @@ class ValidatedLedger:
     nothing else. The type split does not keep this handle away from live
     storage, though: :func:`open_existing_study` takes it and returns a live,
     writable study. Pure read paths never call that opener; they read through
-    :func:`read_phase_trial_stats`, which never constructs file-backed storage.
+    :func:`read_trial_stats`, which never constructs file-backed storage.
     Outside this module, the one caller that opens existing studies live on
     this handle is MCP recovery. Because it reaps and tells trials through
     them, it applies the per-study artifact-root ownership check itself before
@@ -676,43 +676,76 @@ def _unavailable_phase_trial_stats(
     return _PhaseTrialStats({}, False, {}, None)
 
 
-def _phase_trial_stats(
-    ledger: ValidatedLedger,
-    phase: Phase,
-    published_trial: _TrialRef | None = None,
-) -> _PhaseTrialStats:
-    """Read counts and RUNNING identities without creating a missing study.
+def _trial_stats(
+    ledger: ValidatedLedger, published_trials: Mapping[str, _TrialRef | None]
+) -> dict[str, _PhaseTrialStats]:
+    """Read every phase's counts and RUNNING identities from one journal capture.
 
-    Counts, RUNNING identities, and published trial verification are read
-    from one journal snapshot, so they describe the same moment. Confirmed
-    absence reports available zero counts; read failures report unavailable
-    counts.
+    Every phase is answered from the same snapshot, so the phases describe one
+    moment and a status read replays the journal once whatever the phase
+    count. Confirmed absence reports available zero counts; read failures
+    report unavailable counts, for every phase when the capture itself fails.
 
-    :param ValidatedLedger ledger: Handle naming the ledger the study lives in.
-    :param Phase phase: Phase whose existing study is inspected.
-    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
-    :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
+    :param ValidatedLedger ledger: Handle naming the ledger the studies live in.
+    :param Mapping[str, _TrialRef | None] published_trials: Published local trial to
+        verify in the snapshot, by phase name.
+    :return dict[str, _PhaseTrialStats]: One permissive result per configured
+        phase, by phase name, with explicit availability.
+    :raises StudySchemaMismatchError: A phase's study is populated under a
+        pre-cutover or unsupported schema.
     """
+    phases = ledger.experiment.phases
     if ledger.backend == "memory":
-        return _PhaseTrialStats({}, False, {}, None)
+        return {phase.name: _PhaseTrialStats({}, False, {}, None) for phase in phases}
     assert ledger.storage_url is not None
-    study_name = _phase_study_name(ledger.experiment, phase)
     try:
-        snapshot = _journal_snapshot_storage(ledger.storage_url, f"study {study_name!r}")
-        if snapshot is None:
-            return _PhaseTrialStats({}, True, {}, [])
-        try:
-            study = optuna.load_study(study_name=study_name, storage=snapshot)
-        except KeyError:
-            return _PhaseTrialStats({}, True, {}, [])
-        trials = study.get_trials(deepcopy=False)
-        _validate_storage_versions(
-            [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
+        snapshot = _journal_snapshot_storage(
+            ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
         )
-    except StudySchemaMismatchError:
-        raise
     except Exception as exc:  # noqa: BLE001
-        return _unavailable_phase_trial_stats(ledger, phase, exc)
+        return {phase.name: _unavailable_phase_trial_stats(ledger, phase, exc) for phase in phases}
+    stats: dict[str, _PhaseTrialStats] = {}
+    for phase in phases:
+        if snapshot is None:
+            stats[phase.name] = _PhaseTrialStats({}, True, {}, [])
+            continue
+        try:
+            stats[phase.name] = _phase_trial_stats(
+                snapshot,
+                _phase_study_name(ledger.experiment, phase),
+                published_trials.get(phase.name),
+            )
+        except StudySchemaMismatchError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            stats[phase.name] = _unavailable_phase_trial_stats(ledger, phase, exc)
+    return stats
+
+
+def _phase_trial_stats(
+    snapshot: JournalStorage, study_name: str, published_trial: _TrialRef | None
+) -> _PhaseTrialStats:
+    """Read one study's counts and RUNNING identities from a captured snapshot.
+
+    Counts, RUNNING identities, and published trial verification all come
+    from ``snapshot``, so they describe the same moment. An absent study
+    reports available zero counts.
+
+    :param JournalStorage snapshot: Captured journal replay to read.
+    :param str study_name: Ledger study name of the phase inspected.
+    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
+    :return _PhaseTrialStats: The study's available counts and identities.
+    :raises StudySchemaMismatchError: The study is populated under a
+        pre-cutover or unsupported schema.
+    """
+    try:
+        study = optuna.load_study(study_name=study_name, storage=snapshot)
+    except KeyError:
+        return _PhaseTrialStats({}, True, {}, [])
+    trials = study.get_trials(deepcopy=False)
+    _validate_storage_versions(
+        [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
+    )
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
@@ -855,7 +888,7 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
 
     The study returned is live: it is built on the ledger's real backend and
     can be written through, so this is not a read path's opener (those use
-    :func:`read_phase_trial_stats`). It never creates a study or a ledger
+    :func:`read_trial_stats`). It never creates a study or a ledger
     file, because absence is settled first by a read-only probe (a complete
     journal snapshot), and the live replay must then agree with that snapshot
     (:func:`_open_existing_journal_study`). It checks nothing about which
@@ -901,34 +934,38 @@ def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
     _repair_incomplete_journal_record(ledger.storage_url)
 
 
-def read_phase_trial_stats(
-    ledger: ValidatedLedger,
-    phase: Phase,
-    published_trial: _TrialRef | None = None,
-) -> _PhaseTrialStats:
-    """Read one phase's counts and RUNNING identities from a validated ledger.
+def read_trial_stats(
+    ledger: ValidatedLedger, published_trials: Mapping[str, _TrialRef | None]
+) -> dict[str, _PhaseTrialStats]:
+    """Read every phase's counts and RUNNING identities from a validated ledger.
 
-    The snapshot is permissive by design -- an unreadable ledger reports
+    The read is permissive by design -- an unreadable ledger reports
     ``available=False`` rather than raising -- because the ledger's *format* was
     already settled by :func:`validate_ledger` before this handle existed. That
     is why no format argument appears here: the scan is not this read's job.
-    When the scan did not complete, the phase is reported unavailable without
+    When the scan did not complete, every phase is reported unavailable without
     being read, since counts read around that gap would present the ledger as
-    current-format when nothing verified it. The phase's own study still
+    current-format when nothing verified it. Each phase's own study still
     answers to the same cutover rule as a second line of defence.
 
+    The journal is captured here, once for every phase, rather than reused
+    from the format scan, so a caller that resolves the publication pointer
+    first reads a capture holding every trial that pointer published.
+
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
-    :param Phase phase: Phase whose existing study is inspected.
-    :param _TrialRef | None published_trial: Published local trial to verify in
-        this same snapshot.
-    :return _PhaseTrialStats: One permissive storage snapshot with explicit
-        availability.
-    :raises StudySchemaMismatchError: The phase's own study is populated under
-        a pre-cutover or unsupported schema.
+    :param Mapping[str, _TrialRef | None] published_trials: Published local trial to
+        verify in the same snapshot, by phase name.
+    :return dict[str, _PhaseTrialStats]: One permissive result per configured
+        phase, by phase name, with explicit availability.
+    :raises StudySchemaMismatchError: A phase's own study is populated under a
+        pre-cutover or unsupported schema.
     """
     if ledger.format_scan_failure is not None:
-        return _unavailable_phase_trial_stats(ledger, phase, ledger.format_scan_failure)
-    return _phase_trial_stats(ledger, phase, published_trial)
+        return {
+            phase.name: _unavailable_phase_trial_stats(ledger, phase, ledger.format_scan_failure)
+            for phase in ledger.experiment.phases
+        }
+    return _trial_stats(ledger, published_trials)
 
 
 # Creating a directory fails with these when the configured path itself is

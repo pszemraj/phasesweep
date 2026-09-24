@@ -23,6 +23,7 @@ from phasesweep.config import (
     JsonExtractor,
     LogRegexExtractor,
     Metric,
+    Phase,
     Sampler,
     WandbExtractor,
 )
@@ -327,8 +328,8 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
 
     with monkeypatch.context() as patched:
         patched.setattr(engine_ledger.os, "fstat", change_after_capture)
-        first = engine_ledger.read_phase_trial_stats(handle, experiment.phases[0], expected)
-    second = engine_ledger.read_phase_trial_stats(handle, experiment.phases[0], expected)
+        first = engine_ledger.read_trial_stats(handle, {"p": expected})["p"]
+    second = engine_ledger.read_trial_stats(handle, {"p": expected})["p"]
 
     # The first read sees only the bytes present when it opened the file: all
     # of them, the journal less its final newline (a partial last record,
@@ -347,6 +348,76 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     # after the complete trial is skipped the same way.
     assert second.available is True
     assert second.published_trial_available is (change != "truncate")
+
+
+@pytest.mark.parametrize("phase_count", [1, 3])
+def test_read_status_captures_trial_data_once_whatever_the_phase_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase_count: int
+) -> None:
+    """A status read captures the journal for its format scan and once for all phases."""
+    ledger = tmp_path / "study.journal"
+    phases = [
+        Phase(
+            name=f"p{index}",
+            n_trials=1,
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": IntParam(type="int", low=0, high=10)},
+        )
+        for index in range(phase_count)
+    ]
+    experiment = make_experiment(
+        experiment="capture_count",
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{ledger}",
+        phases=phases,
+    )
+    storage = engine_ledger._resolve_storage(experiment.resolved_storage)
+    studies = [
+        optuna.create_study(study_name=f"capture_count::{phase.name}", storage=storage)
+        for phase in phases
+    ]
+    mark_current_format(experiment, *studies)
+    for study in studies:
+        study.tell(study.ask(), 0.5)
+    real_capture = engine_ledger._capture_journal
+    captures: list[Path] = []
+
+    def counted_capture(path: Path) -> bytes | None:
+        captures.append(path)
+        return real_capture(path)
+
+    monkeypatch.setattr(engine_ledger, "_capture_journal", counted_capture)
+
+    status = read_status(experiment)
+
+    assert len(captures) == 2
+    assert [phase["trials"] for phase in status["phases"]] == [{"COMPLETE": 1}] * phase_count
+
+
+def test_read_status_captures_trial_data_after_resolving_the_publication_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trial finished before the pointer is read shows in the same status read."""
+    ledger = tmp_path / "study.journal"
+    experiment = _experiment(tmp_path, storage=f"journal:///{ledger}")
+    study = optuna.create_study(
+        study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
+    )
+    mark_current_format(experiment, study)
+    trial = study.ask()
+    real_resolve = engine_read._resolve_publication_pointer
+
+    def finish_then_resolve(target: Experiment):
+        # A publication tells its winning trial before it moves the pointer.
+        study.tell(trial, 0.5)
+        return real_resolve(target)
+
+    monkeypatch.setattr(engine_read, "_resolve_publication_pointer", finish_then_resolve)
+
+    status = read_status(experiment)
+
+    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+    assert status["phases"][0]["running_attempts"] == []
 
 
 @pytest.mark.parametrize(
@@ -521,9 +592,9 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
         "different" if mismatch == "attempt" else "attempt",
     )
 
-    stats = engine_ledger.read_phase_trial_stats(
-        engine_ledger.validate_ledger(experiment), experiment.phases[0], expected
-    )
+    stats = engine_ledger.read_trial_stats(
+        engine_ledger.validate_ledger(experiment), {"p": expected}
+    )["p"]
 
     assert stats.available
     assert stats.published_trial_available is (mismatch is None)

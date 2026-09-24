@@ -28,7 +28,7 @@ from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
-from phasesweep.engine.ledger import read_phase_trial_stats, validate_ledger
+from phasesweep.engine.ledger import read_trial_stats, validate_ledger
 from phasesweep.engine.optuna import (
     _published_phase_trial_refs,
     _published_trial_history_available,
@@ -261,7 +261,7 @@ def read_winner(
         winner on disk: never run, still running, selection failed, or the file
         is malformed. A malformed read is treated as "not yet written" -
             consistent with this module's permissive contract and with
-            ``read_phase_trial_stats`` swallowing transient backend errors. The
+            ``read_trial_stats`` swallowing transient backend errors. The
         strict, fingerprint-verifying read used for ``--from-phase`` resume
         lives in ``engine.artifacts._load_winner`` and is intentionally not
         relaxed here.
@@ -446,7 +446,7 @@ def read_status(
     path-bearing phase view on top of this function's path-free ``phases``
     payload instead of asking this function for paths.
 
-    Trial counts come from ``read_phase_trial_stats``, which reports empty counts
+    Trial counts come from ``read_trial_stats``, which reports empty counts
     for a study that does not exist yet, never creates one as a side effect,
     and swallows transient backend errors (e.g. a momentary journal-ledger lock
     while the runner writes) by reporting empty counts rather than raising.
@@ -593,10 +593,10 @@ def read_status(
         if _artifact_root_binding_applies(experiment)
         else {}
     )
-    phase_stats = {
-        phase.name: read_phase_trial_stats(ledger, phase, published_trials.get(phase.name))
-        for phase in experiment.phases
-    }
+    # Captured after the pointer is resolved: a publication tells its trials
+    # before it moves the pointer, so this capture holds every trial the
+    # pointer's generation published.
+    phase_stats = read_trial_stats(ledger, published_trials)
     summary_path = (
         _generation_summary_path(experiment, winner_scope_generation_id)
         if winner_scope_generation_id is not None

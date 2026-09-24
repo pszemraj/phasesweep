@@ -872,13 +872,12 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
     )
     generation_id = f"storage-unavailable-{'commit' if pointer_commits else 'abort'}"
     capture_reads = 0
-    original_stats = engine_ledger._phase_trial_stats
+    original_stats = engine_ledger._trial_stats
 
     def transient_capture_failure(
         ledger: engine_ledger.ValidatedLedger,
-        phase: Phase,
-        published_trial: engine_optuna._TrialRef | None = None,
-    ) -> engine_optuna._PhaseTrialStats:
+        published_trials: Mapping[str, engine_optuna._TrialRef | None],
+    ) -> dict[str, engine_optuna._PhaseTrialStats]:
         nonlocal capture_reads
         if _generation_summary_path(ledger.experiment, generation_id).is_file():
             capture_reads += 1
@@ -888,11 +887,11 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
-                return original_stats(ledger, phase, published_trial)
+                return original_stats(ledger, published_trials)
 
-        return original_stats(ledger, phase, published_trial)
+        return original_stats(ledger, published_trials)
 
-    monkeypatch.setattr(engine_ledger, "_phase_trial_stats", transient_capture_failure)
+    monkeypatch.setattr(engine_ledger, "_trial_stats", transient_capture_failure)
     if not pointer_commits:
         pointer_path = _last_successful_generation_path(experiment)
         original_write = generation_ops.artifact_io._write_yaml_atomic
@@ -1916,13 +1915,12 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     with open_private_text(store.config_snapshot_path(run_id), "x") as output:
         output.write(config_path.read_text())
     experiment = load_experiment(config_path)
-    original_stats = engine_ledger._phase_trial_stats
+    original_stats = engine_ledger._trial_stats
 
     def unavailable_during_prepared_capture(
         ledger: engine_ledger.ValidatedLedger,
-        phase: Phase,
-        published_trial: engine_optuna._TrialRef | None = None,
-    ) -> engine_optuna._PhaseTrialStats:
+        published_trials: Mapping[str, engine_optuna._TrialRef | None],
+    ) -> dict[str, engine_optuna._PhaseTrialStats]:
         if _generation_summary_path(ledger.experiment, run_id).is_file():
 
             def locked_read(*_args: object, **_kwargs: object) -> None:
@@ -1930,15 +1928,11 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
-                return original_stats(ledger, phase, published_trial)
+                return original_stats(ledger, published_trials)
 
-        return original_stats(ledger, phase, published_trial)
+        return original_stats(ledger, published_trials)
 
-    monkeypatch.setattr(
-        engine_ledger,
-        "_phase_trial_stats",
-        unavailable_during_prepared_capture,
-    )
+    monkeypatch.setattr(engine_ledger, "_trial_stats", unavailable_during_prepared_capture)
 
     if crash_boundary == "before_pointer":
         original_prepare = mcp_runner._RunnerPublicationHook.prepare
