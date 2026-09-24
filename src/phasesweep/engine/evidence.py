@@ -41,6 +41,7 @@ from phasesweep.evidence.models import (
     _validate_trial_file_path,
     _WandbSummarySource,
 )
+from phasesweep.runtime.commands import TRAINER_INPUT_FILENAMES
 from phasesweep.runtime.files import (
     file_sha256,
 )
@@ -61,12 +62,6 @@ _TRIAL_EVIDENCE_REMEDY = (
 # before the trainer starts, so their absence is proof the directory is no
 # longer the one that attempt produced (PR #5 review / reviewer 2, blocker 7).
 _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
-_TRAINER_INPUT_FILENAMES = {
-    "yaml_file": "trainer_config.yaml",
-    "argparse": "overrides_resolved.json",
-    "hydra": "overrides_resolved.json",
-    "json_file": "overrides.json",
-}
 
 
 def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str, str] | None:
@@ -314,7 +309,7 @@ def _verify_trainer_input_evidence(
     input_format = record.get("format")
     filename = record.get("filename")
     expected_filename = (
-        _TRAINER_INPUT_FILENAMES.get(input_format) if isinstance(input_format, str) else None
+        TRAINER_INPUT_FILENAMES.get(input_format) if isinstance(input_format, str) else None
     )
     if (
         record.get("schema_version") != TRAINER_INPUT_SCHEMA_VERSION

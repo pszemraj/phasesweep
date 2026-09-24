@@ -1446,7 +1446,6 @@ def _dry_run_phase(
             phase=phase.name,
             run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
             trainer_config=experiment.trainer_config,
-            write_files=False,
         )
         log.info("DRY RUN example command:\n  %s", cmd)
 

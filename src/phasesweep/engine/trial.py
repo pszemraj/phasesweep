@@ -39,6 +39,7 @@ from phasesweep.evidence.evaluation import (
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, compose_wandb_environment
 from phasesweep.runtime.commands import (
+    TRAINER_INPUT_FILENAMES,
     dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
     render_command,
@@ -484,8 +485,8 @@ def prepare_trainer_input(
     atomic_write_text(resolved_path, resolved_text)
 
     run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+    filename = TRAINER_INPUT_FILENAMES[experiment.override_format]
     if experiment.override_format == "yaml_file":
-        filename = "trainer_config.yaml"
         text = dump_trial_trainer_config_yaml(
             experiment.trainer_config,
             overrides,
@@ -497,10 +498,8 @@ def prepare_trainer_input(
             },
         )
     elif experiment.override_format == "json_file":
-        filename = "overrides.json"
         text = dump_json_file_overrides(overrides)
     else:
-        filename = "overrides_resolved.json"
         text = resolved_text
 
     if filename != resolved_path.name:

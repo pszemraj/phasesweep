@@ -1062,7 +1062,6 @@ def _validate_trial_command_template(
             phase=phase.name,
             run_name=f"{experiment.experiment}-{phase.name}-validate",
             trainer_config=experiment.trainer_config,
-            write_files=False,
         )
     except KeyError as exc:
         # str.format raises KeyError(name) for unknown placeholders.

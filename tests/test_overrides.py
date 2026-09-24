@@ -14,9 +14,11 @@ from pydantic import ValidationError
 from phasesweep import load_experiment, run_experiment
 from phasesweep.config import JsonEnvelopeExtractor, Metric, Phase
 from phasesweep.runtime.commands import (
+    TRAINER_INPUT_FILENAMES,
     compose_trainer_config,
     dump_json_file_overrides,
     dump_trainer_config_yaml,
+    dump_trial_trainer_config_yaml,
     format_argparse,
     format_hydra,
     render_command,
@@ -87,6 +89,11 @@ def test_argparse_rendering_rejects_values_outside_the_wire_contract(value):
 
 
 def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> None:
+    """The launch path writes one complete trainer YAML and the command names it.
+
+    ``render_command`` never writes the file itself: the trial writer does, and
+    passes its exact path back as ``materialized_input_path``, as mirrored here.
+    """
     trial_dir = tmp_path / "work-{phase}" / "trial-{trial_id}"
     trial_dir.mkdir(parents=True)
     base = {
@@ -95,24 +102,40 @@ def test_yaml_file_materializes_one_complete_trainer_config(tmp_path: Path) -> N
         "data": {"path": "data/train.jsonl"},
         "output_dir": "{trial_dir}/trainer/{phase}-{trial_id}",
     }
+    overrides = {
+        "model.depth": 8,
+        "optimizer.lr": 1e-4,
+        "trainer.seed": 17,
+        "trainer.label": "{trial_dir}",
+    }
+
+    config_path = trial_dir / TRAINER_INPUT_FILENAMES["yaml_file"]
+    config_path.write_text(
+        dump_trial_trainer_config_yaml(
+            base,
+            overrides,
+            substitutions={
+                "{trial_dir}": str(trial_dir),
+                "{trial_id}": "3",
+                "{phase}": "depth",
+                "{run_name}": "x-depth-3",
+            },
+        ),
+        encoding="utf-8",
+    )
 
     command = render_command(
         "python train.py {config_path}",
-        {
-            "model.depth": 8,
-            "optimizer.lr": 1e-4,
-            "trainer.seed": 17,
-            "trainer.label": "{trial_dir}",
-        },
+        overrides,
         "yaml_file",
         trial_dir=trial_dir,
         trial_id=3,
         phase="depth",
         run_name="x-depth-3",
         trainer_config=base,
+        materialized_input_path=config_path,
     )
 
-    config_path = trial_dir / "trainer_config.yaml"
     assert shlex.split(command) == ["python", "train.py", str(config_path)]
     assert yaml.safe_load(config_path.read_text()) == {
         "data": {"path": "data/train.jsonl"},
