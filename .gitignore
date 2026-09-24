@@ -173,3 +173,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Golden ledger fixtures are committed on purpose: real PhaseSweep output whose
+# trial logs (*.log) and artifact trees would otherwise be ignored above.
+# See tests/fixtures/ledgers/README.md.
+!tests/fixtures/ledgers/**

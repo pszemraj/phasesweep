@@ -8,9 +8,8 @@ later phases.
 
 Run `phasesweep validate <config>` before launching. The loader rejects
 duplicate YAML mapping keys and unsupported fields before it creates run
-artifacts. A top-level `suite` is not a configuration variant: it is rejected.
-Run formerly independent components as separate full experiment YAML files and
-review their defaults explicitly.
+artifacts. A top-level `suite` is rejected: write each component as its own
+complete experiment YAML file and review its defaults explicitly.
 
 Field types, defaults, and validation constraints are in
 [config_reference.yaml](config_reference.yaml).
@@ -54,13 +53,16 @@ phases:
       optimizer.lr: {type: float, low: 0.00001, high: 0.001, log: true}
 ```
 
-`storage: null` (or an omitted storage value) is an in-memory disposable run.
 Use `sqlite:///...` for a persistent sequential local ledger and
 `journal:///...` for same-host parallel trials. `storage: auto` selects
 `study.db` in `<workdir>/<experiment>/` when every phase has `n_jobs: 1`, or
 `study.journal` there otherwise. Persistent storage requires a nonempty
 `provenance` mapping. External database URLs are unsupported and rejected
 before connection or artifact creation.
+
+> [!NOTE]
+> `storage: null`, or omitting `storage` entirely, runs an in-memory disposable
+> study. It cannot be resumed or topped up by a later invocation.
 
 See [runtime behavior](runtime.md) for artifact-root binding, current-format
 state, and execution behavior.
@@ -111,9 +113,25 @@ phases:
     fixed_overrides: {optimizer.family: adamw}
 ```
 
-Here the final phase resolves the independently-originated `optimizer.family`
-value. It still receives the same-origin `model.depth` without a duplicate
-declaration.
+Each edge below lists the keys a child receives and, in parentheses, the phase
+where each key originated:
+
+```mermaid
+flowchart TD
+    arch["architecture<br/>samples model.depth"]
+    a["optimizer_a<br/>fixes optimizer.family: adamw<br/>samples optimizer.lr"]
+    b["optimizer_b<br/>fixes optimizer.family: sgd"]
+    r["resolved_comparison<br/>fixes optimizer.family: adamw"]
+    arch -->|"model.depth (architecture)"| a
+    arch -->|"model.depth (architecture)"| b
+    a -->|"model.depth (architecture)<br/>optimizer.family (optimizer_a)<br/>optimizer.lr (optimizer_a)"| r
+    b -->|"model.depth (architecture)<br/>optimizer.family (optimizer_b)"| r
+```
+
+`model.depth` reaches the final phase along both paths with the same origin,
+so the diamond is valid and needs no duplicate declaration. `optimizer.family`
+arrives from two independent origins, so validation refuses the child until it
+fixes that key; its `adamw` then becomes the origin that descendants inherit.
 
 ## Search spaces and samplers
 
@@ -124,11 +142,12 @@ representable range. Categorical choices must be distinct under Python
 equality; seed keys are rejected by default unless `allow_seed_search: true`
 makes a variance audit explicit.
 
-YAML decides scalar types before PhaseSweep reads fixed overrides or categorical
-choices. In this loader, bare `1e-3` is a string, while `1.0e-3` and `0.001`
-are floats. PhaseSweep preserves that distinction so string categories remain
-usable. Write a decimal value (or an exponent with a decimal mantissa) for a
-numeric override, and quote a value when you intend a string category.
+> [!IMPORTANT]
+> YAML decides scalar types before PhaseSweep reads fixed overrides or categorical
+> choices. In this loader, bare `1e-3` is a string, while `1.0e-3` and `0.001`
+> are floats. PhaseSweep preserves that distinction so string categories remain
+> usable. Write a decimal value (or an exponent with a decimal mantissa) for a
+> numeric override, and quote a value when you intend a string category.
 
 Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid has
 at most 4,096 concrete combinations, counted before trials are materialized.

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
+from typing import Any
 
 import optuna
 import pytest
 
+import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
 import phasesweep.engine.read as engine_read
 from phasesweep import run_experiment
@@ -19,20 +22,22 @@ from phasesweep.config import (
     JsonExtractor,
     LogRegexExtractor,
     Metric,
-    Phase,
     Sampler,
     WandbExtractor,
 )
-from phasesweep.engine import read_status, read_winners
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
+from phasesweep.engine import PublishedStudyMissingError, read_status, read_winners
 from phasesweep.engine.paths import (
+    _experiment_dir,
     _generation_path,
     _generation_summary_path,
 )
-from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _resolve_publication_pointer,
+)
 from phasesweep.engine.run import experiment_status
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from tests.conftest import make_experiment, write_trainer
+from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
+from tests.ledger_fixtures import ledger_file, materialize, tree_snapshot
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -41,30 +46,15 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
         workdir=tmp_path / "wd",
         storage=storage,
         trial_command="python x.py {overrides}",
-        override_format="argparse",
         metric=Metric(
             name="loss",
-            goal="minimize",
             extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
         ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                # Seeded random keeps this helper usable with persistent storage,
-                # which rejects an unseeded stochastic sampler.
-                sampler=Sampler(type="random", seed=0),
-                search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
-            )
-        ],
+        n_trials=1,
+        # Explicit, because in-memory storage gets no injected default sampler.
+        sampler=Sampler(type="random", seed=0),
+        search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
     )
-
-
-def _mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
-    """Stamp manually constructed studies and bind their current-format root."""
-    for study in studies:
-        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
@@ -105,72 +95,62 @@ def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None
     assert status["phases"][0]["running_attempts"] is None
 
 
-def test_read_status_uses_one_sqlite_snapshot_per_phase(
+def test_read_status_aggregates_each_sqlite_phase_in_one_snapshot(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = tmp_path / "phases.db"
     storage = f"sqlite:///{db}"
     study = optuna.create_study(study_name="read_t::p", storage=storage)
-    study.optimize(lambda trial: 1.0, n_trials=1)
+    # More than one trial, so a per-trial transfer cannot pass as the single
+    # aggregated row asserted below.
+    study.optimize(lambda trial: 1.0, n_trials=3)
     exp = _experiment(tmp_path, storage=storage)
-    _mark_current_format(exp, study)
-    real_connect = engine_optuna.sqlite3.connect
+    mark_current_format(exp, study)
+    real_connect = engine_ledger.sqlite3.connect
     connections = 0
-
-    def counting_connect(*args: object, **kwargs: object):
-        nonlocal connections
-        connections += 1
-        return real_connect(*args, **kwargs)
-
-    monkeypatch.setattr(engine_optuna.sqlite3, "connect", counting_connect)
-
-    status = read_status(exp)
-
-    assert connections == 1
-    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
-    assert status["phases"][0]["trial_data_available"] is True
-
-
-def test_sqlite_status_query_aggregates_historical_rows_before_transfer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    db = tmp_path / "phases.db"
-    storage = f"sqlite:///{db}"
-    study = optuna.create_study(study_name="read_t::p", storage=storage)
-    study.optimize(lambda trial: 1.0, n_trials=50)
-    exp = _experiment(tmp_path, storage=storage)
-    _mark_current_format(exp, study)
-    real_connect = engine_optuna.sqlite3.connect
-    transferred_rows: list[int] = []
+    transferred: list[tuple[str, int]] = []
 
     class CursorProxy:
-        def __init__(self, cursor) -> None:
+        def __init__(self, cursor, sql: str) -> None:
             self._cursor = cursor
+            self._sql = sql
 
         def fetchall(self):
             rows = self._cursor.fetchall()
-            transferred_rows.append(len(rows))
+            transferred.append((self._sql[:40], len(rows)))
             return rows
 
     class ConnectionProxy:
         def __init__(self, connection) -> None:
             self._connection = connection
 
-        def execute(self, *args: object, **kwargs: object):
-            return CursorProxy(self._connection.execute(*args, **kwargs))
+        def execute(self, sql: str, *args: object, **kwargs: object):
+            return CursorProxy(self._connection.execute(sql, *args, **kwargs), sql)
 
         def close(self) -> None:
             self._connection.close()
 
     def observed_connect(*args: object, **kwargs: object):
+        nonlocal connections
+        connections += 1
         return ConnectionProxy(real_connect(*args, **kwargs))
 
-    monkeypatch.setattr(engine_optuna.sqlite3, "connect", observed_connect)
+    monkeypatch.setattr(engine_ledger.sqlite3, "connect", observed_connect)
 
     status = read_status(exp)
 
-    assert status["phases"][0]["trials"] == {"COMPLETE": 50}
-    assert transferred_rows == [1]
+    # Connection 1 is the ledger-format scan ``validate_ledger`` runs before any
+    # phase is read. Each phase then adds exactly one: the trial-stats snapshot
+    # ``read_phase_trial_stats`` opens, so the counts and the RUNNING
+    # identities that explain them come from a single snapshot.
+    assert connections == 1 + len(exp.phases)
+    assert status["phases"][0]["trials"] == {"COMPLETE": 3}
+    assert status["phases"][0]["trial_data_available"] is True
+    # The format scan reads the ledger first and is not what this pins down.
+    # The statement under test is the one naming the ``phase_trials`` CTE: it
+    # must aggregate server-side and hand back a single row, not one per trial.
+    aggregated = [rows for sql, rows in transferred if "phase_trials" in sql]
+    assert aggregated == [1], transferred
 
 
 @pytest.mark.parametrize(
@@ -190,7 +170,7 @@ def test_read_status_counts_sqlite_trials_with_storage_url_variants(
     study = optuna.create_study(study_name="read_t::p", storage=storage)
     study.optimize(lambda trial: 1.0, n_trials=1)
     exp = _experiment(tmp_path, storage=storage)
-    _mark_current_format(exp, study)
+    mark_current_format(exp, study)
 
     status = read_status(exp)
 
@@ -211,14 +191,14 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(
     exp = _experiment(tmp_path, storage=f"{backend}:///{path}")
     study = optuna.create_study(
         study_name="read_t::p",
-        storage=engine_optuna._resolve_storage(exp.storage) or exp.storage,
+        storage=engine_ledger._resolve_storage(exp.storage) or exp.storage,
     )
     study.optimize(lambda trial: 1.0, n_trials=1)
     running = study.ask()
     running.set_user_attr("phasesweep_generation_id", "gen-1")
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
     study.ask()
-    _mark_current_format(exp, study)
+    mark_current_format(exp, study)
 
     phase = read_status(exp)["phases"][0]
 
@@ -242,13 +222,13 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     exp = _experiment(tmp_path, storage=f"{backend}:///{ledger}")
     study = optuna.create_study(
         study_name="read_t::p",
-        storage=engine_optuna._resolve_storage(exp.resolved_storage),
+        storage=engine_ledger._resolve_storage(exp.resolved_storage),
     )
-    _mark_current_format(exp, study)
+    mark_current_format(exp, study)
     # Journal tolerates a torn final record; an earlier malformed record must fail.
     ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
 
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.optuna"):
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.ledger"):
         phase = read_status(exp)["phases"][0]
 
     assert phase["trial_data_available"] is False
@@ -256,50 +236,41 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     warnings = [
         record.getMessage()
         for record in caplog.records
-        if record.name == "phasesweep.engine.optuna"
+        if record.name == "phasesweep.engine.ledger"
     ]
     assert len(warnings) == 1
     assert str(ledger) in warnings[0]
     assert cause in warnings[0]
 
 
-@pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
-@pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
-@pytest.mark.parametrize("damage", ["garbage", "partial-json", "missing-newline", "operation"])
-def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
-    tmp_path: Path, published: bool, keep_prefix: bool, damage: str
-) -> None:
-    from phasesweep.engine import ProcessCleanupUncertainError, StudyStorageUnavailableError
+def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment, Path, Path]:
+    """Return an experiment whose journal holds a current study, published or only created.
+
+    :param Path tmp_path: Test-owned directory for the tree and the journal.
+    :param bool published: Read the current-journal golden fixture, whose
+        journal holds published trials, instead of only creating and stamping
+        a study.
+    :return tuple[Experiment, Path, Path]: The experiment, its journal file,
+        and its artifact root, which exists.
+    """
+    if published:
+        materialized = materialize("current-journal", tmp_path, mode="tree")
+        experiment, ledger = materialized.experiment, ledger_file(materialized, "journal")
+    else:
+        ledger = tmp_path / "study.journal"
+        experiment = make_experiment(workdir=tmp_path / "runs", storage=f"journal:///{ledger}")
+        study = optuna.create_study(
+            study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
+        )
+        mark_current_format(experiment, study)
+        _experiment_dir(experiment).mkdir(parents=True, exist_ok=True)
+    return experiment, ledger, _experiment_dir(experiment)
+
+
+def _status_phases(experiment: Experiment, status: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the first phase of every status surface a journal read feeds."""
     from phasesweep.mcp.redaction import status_payload
 
-    ledger = tmp_path / "study.journal"
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"journal:///{ledger}",
-        n_trials=1,
-        trial_command="echo x=0.5 {overrides}",
-    )
-    if published:
-        run_experiment(experiment)
-    else:
-        study = optuna.create_study(
-            study_name="t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
-        )
-        _mark_current_format(experiment, study)
-    original = ledger.read_bytes()
-    tail = {
-        "garbage": b"not a journal record\n",
-        "partial-json": b"{",
-        "missing-newline": original.rstrip(b"\n").split(b"\n")[-1],
-        "operation": b"{}\n",
-    }[damage]
-    damaged = (original if keep_prefix else b"") + tail
-    ledger.write_bytes(damaged)
-    root = tmp_path / "runs" / "t"
-    root.mkdir(parents=True, exist_ok=True)
-    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
-
-    status = read_status(experiment)
     mcp_status = status_payload(
         "exp",
         status,
@@ -307,19 +278,93 @@ def test_journal_incomplete_or_invalid_snapshot_never_means_absent(
         result_source="current_shared_study",
         elapsed_seconds=None,
     )
-    for payload in (status, experiment_status(experiment), mcp_status):
-        phase = payload["phases"][0]
+    return [payload["phases"][0] for payload in (status, experiment_status(experiment), mcp_status)]
+
+
+@pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
+@pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
+@pytest.mark.parametrize("damage", ["operation", "middle-garbage"])
+def test_journal_malformed_record_before_its_end_never_means_absent(
+    tmp_path: Path, published: bool, keep_prefix: bool, damage: str
+) -> None:
+    """A record Optuna cannot replay, or a bad line another line follows, is refused everywhere."""
+    from phasesweep.engine import ProcessCleanupUncertainError, StudyStorageUnavailableError
+
+    experiment, ledger, root = _journal_experiment(tmp_path, published=published)
+    original = ledger.read_bytes()
+    last_record = original.rstrip(b"\n").split(b"\n")[-1] + b"\n"
+    tail = {
+        "operation": b"{}\n",
+        "middle-garbage": b"not a journal record\n" + last_record,
+    }[damage]
+    damaged = (original if keep_prefix else b"") + tail
+    ledger.write_bytes(damaged)
+    before = tree_snapshot(root)
+
+    status = read_status(experiment)
+    for phase in _status_phases(experiment, status):
         assert phase["trial_data_available"] is False
         assert phase["published_study_unavailable"] is published
         assert not any(phase["trials"].values())
     assert status["phases"][0]["running_attempts"] is None
     with pytest.raises(StudyStorageUnavailableError):
-        engine_optuna._load_existing_phase_study(experiment, experiment.phases[0])
+        engine_ledger._load_existing_phase_study(experiment, experiment.phases[0])
     with pytest.raises(ProcessCleanupUncertainError):
         run_experiment(experiment)
 
     assert ledger.read_bytes() == damaged
-    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
+    assert tree_snapshot(root) == before
+
+
+@pytest.mark.parametrize("published", [False, True], ids=["unpublished", "published"])
+@pytest.mark.parametrize("keep_prefix", [False, True], ids=["clobbered", "valid-prefix"])
+@pytest.mark.parametrize("damage", ["garbage", "partial-json", "missing-newline"])
+def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
+    tmp_path: Path, published: bool, keep_prefix: bool, damage: str
+) -> None:
+    """Reads skip a bad final line exactly as Optuna does; a run refuses to append after it.
+
+    Optuna's reader skips a final line that lacks its newline or does not
+    decode, so status reports the complete records a live load would see. Its
+    writer would glue the next record onto that line, so the run refuses
+    before any live open, names the byte to truncate the journal at, and
+    writes nothing.
+    """
+    from phasesweep.engine import IncompleteJournalRecordError, ProcessCleanupUncertainError
+
+    experiment, ledger, root = _journal_experiment(tmp_path, published=published)
+    original = ledger.read_bytes()
+    complete = _status_phases(experiment, read_status(experiment))
+    tail = {
+        "garbage": b"not a journal record\n",
+        "partial-json": b"{",
+        "missing-newline": original.rstrip(b"\n").split(b"\n")[-1],
+    }[damage]
+    prefix = original if keep_prefix else b""
+    ledger.write_bytes(prefix + tail)
+    before = tree_snapshot(root)
+
+    for phase, undamaged in zip(
+        _status_phases(experiment, read_status(experiment)), complete, strict=True
+    ):
+        assert phase["trial_data_available"] is True
+        if keep_prefix:
+            assert phase["trials"] == undamaged["trials"]
+            assert phase["published_study_unavailable"] is False
+        else:
+            # Nothing before the bad line: Optuna reads no study at all.
+            assert not any(phase["trials"].values())
+            assert phase["published_study_unavailable"] is published
+    loaded = engine_ledger._load_existing_phase_study(experiment, experiment.phases[0])
+    assert (loaded is not None) is keep_prefix
+    with pytest.raises(ProcessCleanupUncertainError) as refused:
+        run_experiment(experiment)
+
+    cause = refused.value.__cause__
+    assert isinstance(cause, IncompleteJournalRecordError)
+    assert f"truncate -s {len(prefix)} -- {ledger}`" in str(cause)
+    assert ledger.read_bytes() == prefix + tail
+    assert tree_snapshot(root) == before
 
 
 @pytest.mark.parametrize("change", ["append", "finish-partial", "truncate"])
@@ -329,18 +374,26 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     ledger = tmp_path / "study.journal"
     experiment = _experiment(tmp_path, storage=f"journal:///{ledger}")
     study = optuna.create_study(
-        study_name="read_t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+        study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
     )
+    # Stamped first, as the engine does, so the journal's last record is the
+    # trial's completion: a partial copy of it reads as a RUNNING trial.
+    mark_current_format(experiment, study)
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     study.tell(trial, 0.5)
-    _mark_current_format(experiment, study)
     complete = ledger.read_bytes()
+    expected = engine_optuna._TrialRef(0, "generation", "attempt")
+    # The handle's format scan also captures the journal. Take it on the whole
+    # journal, before the damage and the patch, so the handle is verified and
+    # the one capture the file changes under is the phase snapshot's. A handle
+    # scanned over the partial record would report every read unavailable.
+    handle = engine_ledger.validate_ledger(experiment)
+    assert handle.format_verified
     if change == "finish-partial":
         ledger.write_bytes(complete[:-1])
-    expected = engine_optuna._TrialRef(0, "generation", "attempt")
-    real_fstat = engine_optuna.os.fstat
+    real_fstat = engine_ledger.os.fstat
 
     def change_after_capture(fd):
         captured = real_fstat(fd)
@@ -354,30 +407,39 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
         return captured
 
     with monkeypatch.context() as patched:
-        patched.setattr(engine_optuna.os, "fstat", change_after_capture)
-        first = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
-    second = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
+        patched.setattr(engine_ledger.os, "fstat", change_after_capture)
+        first = engine_ledger.read_phase_trial_stats(handle, experiment.phases[0], expected)
+    second = engine_ledger.read_phase_trial_stats(handle, experiment.phases[0], expected)
 
-    assert first.available is (change == "append")
-    assert first.published_trial_available is (change == "append")
-    assert first.counts == ({"COMPLETE": 1} if change == "append" else {})
-    assert first.running_attempts == ([] if change == "append" else None)
-    assert second.available is (change != "append")
-    assert second.published_trial_available is (change == "finish-partial")
+    # The first read sees only the bytes present when it opened the file: all
+    # of them, the journal less its final newline (a partial last record,
+    # skipped as Optuna skips it), or a file that shrank under it.
+    assert (
+        first.available,
+        first.counts,
+        first.running_attempts,
+        first.published_trial_available,
+    ) == {
+        "append": (True, {"COMPLETE": 1}, [], True),
+        "finish-partial": (True, {"RUNNING": 1}, [expected], False),
+        "truncate": (False, {}, None, False),
+    }[change]
+    # The second read sees the finished change; a partial record appended
+    # after the complete trial is skipped the same way.
+    assert second.available is True
+    assert second.published_trial_available is (change != "truncate")
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
 @pytest.mark.parametrize(
     "damage", ["missing-ledger", "missing-study", "empty-study", "corrupt", "stale-ledger"]
 )
+@pytest.mark.integration
 def test_published_status_distinguishes_absent_history_from_read_failure(
     tmp_path: Path, n_jobs: int, damage: str
 ) -> None:
     """The same status flags select the same remedy for both file backends."""
-    from phasesweep.engine import (
-        ProcessCleanupUncertainError,
-        PublishedStudyMissingError,
-    )
+    from phasesweep.engine import ProcessCleanupUncertainError
     from phasesweep.mcp.redaction import status_payload
     from phasesweep.mcp.snapshots import capture_result_snapshot
 
@@ -403,14 +465,15 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     elif damage == "corrupt":
         ledger.write_text("not a database or journal\nanother record\n", encoding="utf-8")
     else:
-        storage = engine_optuna._resolve_storage(experiment.resolved_storage)
+        storage = engine_ledger._resolve_storage(experiment.resolved_storage)
         optuna.delete_study(study_name="t::p", storage=storage)
         if damage == "empty-study":
-            _mark_current_format(
-                experiment, optuna.create_study(study_name="t::p", storage=storage)
-            )
+            mark_current_format(experiment, optuna.create_study(study_name="t::p", storage=storage))
     ledger_before = ledger.read_bytes() if ledger.exists() else None
     generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
 
     status = read_status(experiment)
     cli_status = experiment_status(experiment)
@@ -435,9 +498,80 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     expected_error = (
         ProcessCleanupUncertainError if damage == "corrupt" else PublishedStudyMissingError
     )
-    with pytest.raises(expected_error):
+    with pytest.raises(expected_error) as excinfo:
         run_experiment(experiment)
     assert _generation_path(experiment).read_bytes() == generation_before
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
+
+    # A lost ledger and a lost study report the same refusal; an emptied or
+    # stale one names its own reason. All carry the same remedy, never a
+    # silent rerun.
+    reason_for_damage = {
+        "missing-ledger": "persistent study is missing",
+        "missing-study": "persistent study is missing",
+        "empty-study": "persistent study contains no trials",
+        "stale-ledger": "persistent study does not contain the published trial identity",
+    }
+    if damage in reason_for_damage:
+        message = str(excinfo.value)
+        assert reason_for_damage[damage] in message
+        assert "continuing could reuse incomplete or unrelated trials" in message
+        assert "Restore the original complete storage ledger and study" in message
+
+
+@pytest.mark.integration
+def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> None:
+    """A retained winner row alone cannot authorize replacement trials.
+
+    The matrix above damages a whole SQLite or journal ledger; this restores
+    one that is internally consistent but short -- every trial after the
+    published one is gone, so the study is neither missing nor empty, just
+    below the boundary the publication recorded. Only SQLite exposes trial
+    rows to delete directly; a journal has no equivalent partial-restore shape.
+    """
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path),
+        n_trials=3,
+    )
+    run_experiment(experiment)
+    published = _last_successful_generation_id(experiment)
+    assert published is not None
+    generation_before = _generation_path(experiment).read_bytes()
+    generation_dirs_before = {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    }
+
+    with sqlite3.connect(tmp_path / "studies.db") as connection:
+        trial_ids = connection.execute("SELECT trial_id FROM trials WHERE number > 0").fetchall()
+        assert len(trial_ids) == 2
+        for statement in (
+            "DELETE FROM trial_heartbeats WHERE trial_id = ?",
+            "DELETE FROM trial_intermediate_values WHERE trial_id = ?",
+            "DELETE FROM trial_params WHERE trial_id = ?",
+            "DELETE FROM trial_system_attributes WHERE trial_id = ?",
+            "DELETE FROM trial_user_attributes WHERE trial_id = ?",
+            "DELETE FROM trial_values WHERE trial_id = ?",
+            "DELETE FROM trials WHERE trial_id = ?",
+        ):
+            connection.executemany(statement, trial_ids)
+
+    status = read_status(experiment)
+    assert status["phases"][0]["published_study_unavailable"] is True
+    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
+
+    with pytest.raises(PublishedStudyMissingError, match="published completion boundary"):
+        run_experiment(experiment)
+
+    study = optuna.load_study(study_name="t::p", storage=experiment.resolved_storage)
+    assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+    assert _generation_path(experiment).read_bytes() == generation_before
+    assert _last_successful_generation_id(experiment) == published
+    assert {
+        path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
+    } == generation_dirs_before
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])
@@ -447,21 +581,23 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
 ) -> None:
     experiment = _experiment(tmp_path, storage=f"{backend}:///{tmp_path / 'ledger'}")
     study = optuna.create_study(
-        study_name="read_t::p", storage=engine_optuna._resolve_storage(experiment.resolved_storage)
+        study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
     )
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "generation")
     trial.set_user_attr("phasesweep_attempt_id", "attempt")
     if mismatch != "state":
         study.tell(trial, 0.5)
-    _mark_current_format(experiment, study)
+    mark_current_format(experiment, study)
     expected = engine_optuna._TrialRef(
         1 if mismatch == "number" else 0,
         "different" if mismatch == "generation" else "generation",
         "different" if mismatch == "attempt" else "attempt",
     )
 
-    stats = engine_optuna._phase_trial_stats(experiment, experiment.phases[0], expected)
+    stats = engine_ledger.read_phase_trial_stats(
+        engine_ledger.validate_ledger(experiment), experiment.phases[0], expected
+    )
 
     assert stats.available
     assert stats.published_trial_available is (mismatch is None)
@@ -582,78 +718,46 @@ def test_objective_evidence_assurance_attempt_triple_by_kind(
 # --------------------------------------------------------------------------
 # Published results are rendered under their own historical semantics, never
 # reinterpreted through whatever config is loaded today (review v0.5.16 /
-# blocker 4).
+# blocker 4). The golden fixture publishes phase ``p`` under the metric
+# ``objective`` (minimize); each test edits the config that reads it.
 # --------------------------------------------------------------------------
 
-_DRIFT_TRAINER = """
-import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument("--out")
-parser.add_argument("--x", type=int, default=0)
-args, _ = parser.parse_known_args()
-print(f"x={args.x}")
-"""
+
+def _published(tmp_path: Path) -> Experiment:
+    """Return the config that reads the golden fixture's published tree."""
+    return materialize("current-sqlite", tmp_path, mode="tree").experiment
 
 
-def _drift_experiment(tmp_path: Path, **overrides: object) -> Experiment:
-    trainer = write_trainer(tmp_path / "trainer.py", _DRIFT_TRAINER)
-    defaults: dict[str, object] = dict(
-        experiment="drift_t",
-        workdir=tmp_path / "wd",
-        storage=f"sqlite:///{tmp_path / 'drift.db'}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            name="x",
-            goal="minimize",
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
-        ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                comment="original hypothesis",
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
-    )
-    defaults.update(overrides)
-    return make_experiment(**defaults)  # type: ignore[arg-type]
+def _edited(experiment: Experiment, metric: Metric | None = None, **phase: object) -> Experiment:
+    """Return ``experiment`` with its one phase, and optionally its metric, edited."""
+    update: dict[str, object] = {"phases": [experiment.phases[0].model_copy(update=phase)]}
+    if metric is not None:
+        update["metric"] = metric
+    return experiment.model_copy(update=update)
 
 
 def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -> None:
-    """Review v0.5.16 / blocker 4 reproduction: publish x/minimize, reload as y/maximize.
+    """Review v0.5.16 / blocker 4 reproduction: publish objective/minimize, reload as y/maximize.
 
     Pre-fix, status labeled the official generation with the *current*
     metric name and inverted goal, and winner parsing silently dropped the
     actual winner because the current metric key was absent from the
     historical file.
     """
-    published = _drift_experiment(tmp_path)
-    run_experiment(published)
-
-    drifted = _drift_experiment(
-        tmp_path,
-        metric=Metric(
+    drifted = _edited(
+        _published(tmp_path),
+        Metric(
             name="y",
             goal="maximize",
             extractor=LogRegexExtractor(type="log_regex", pattern=r"y=(?P<value>[0-9.eE+-]+)"),
         ),
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                comment="new hypothesis",
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=100, high=110)},
-            )
-        ],
+        comment="new hypothesis",
+        search_space={"a": IntParam(type="int", low=100, high=110)},
     )
 
     status = read_status(drifted)
     assert status["is_published"] is True
-    assert status["metric"]["name"] == "x"
+    assert status["metric"]["name"] == "objective"
     assert status["metric"]["goal"] == "minimize"
     assert status["result_context"] == "represented_generation"
     assert status["published_config_matches_current"] is False
@@ -661,41 +765,29 @@ def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -
 
     winners = read_winners(drifted)
     assert len(winners) == 1
-    assert winners[0].metric_name == "x"
+    assert winners[0].metric_name == "objective"
     assert winners[0].metric_goal == "minimize"
 
 
 def test_run_control_edits_keep_published_config_current(tmp_path: Path) -> None:
     """A top-up or comment edit is not semantic drift for a published result."""
-    published = _drift_experiment(tmp_path)
-    run_experiment(published)
-
-    topped_up = _drift_experiment(
-        tmp_path,
-        phases=[
-            Phase(
-                name="p",
-                n_trials=2,
-                comment="reworded documentation",
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
+    published = _published(tmp_path)
+    topped_up = _edited(
+        published, n_trials=published.phases[0].n_trials + 1, comment="reworded documentation"
     )
 
     status = read_status(topped_up)
     assert status["published_config_matches_current"] is True
-    assert status["metric"]["name"] == "x"
+    assert status["metric"]["name"] == "objective"
 
 
 def test_read_status_without_any_publication_uses_current_config(tmp_path: Path) -> None:
     """With nothing published there is no historical context to render."""
-    experiment = _drift_experiment(tmp_path)
-    status = read_status(experiment)
+    status = read_status(_experiment(tmp_path))
     assert status["result_context"] == "current_config"
     assert status["published_config_matches_current"] is None
     assert status["result_phase_plan"] == ["p"]
-    assert status["metric"]["name"] == "x"
+    assert status["metric"]["name"] == "loss"
 
 
 def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path) -> None:
@@ -706,21 +798,7 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
     plan the publication actually used, so a reader can enumerate it instead
     of concluding the publication is empty (review v0.5.16 / blocker 4).
     """
-    published = _drift_experiment(tmp_path)
-    run_experiment(published)
-
-    renamed = _drift_experiment(
-        tmp_path,
-        phases=[
-            Phase(
-                name="q",
-                n_trials=1,
-                comment="renamed phase",
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
-    )
+    renamed = _edited(_published(tmp_path), name="q", comment="renamed phase")
 
     status = read_status(renamed)
     assert status["is_published"] is True
@@ -740,7 +818,7 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
         phase_names=status["result_phase_plan"],
     )
     assert winner.phase == "p"
-    assert (winner.metric_name, winner.metric_goal) == ("x", "minimize")
+    assert (winner.metric_name, winner.metric_goal) == ("objective", "minimize")
 
 
 def test_read_status_reuses_the_pointer_authenticated_summary(
@@ -748,8 +826,7 @@ def test_read_status_reuses_the_pointer_authenticated_summary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A status snapshot never reopens summary bytes after authenticating its pointer."""
-    experiment = _drift_experiment(tmp_path)
-    run_experiment(experiment)
+    experiment = _published(tmp_path)
     publication = _resolve_publication_pointer(experiment)
     assert publication.state == "ok"
     generation_id = publication.generation_id
@@ -767,7 +844,7 @@ def test_read_status_reuses_the_pointer_authenticated_summary(
     status = read_status(experiment)
     assert status["publication_integrity"] == "ok"
     assert status["result_phase_plan"] == ["p"]
-    assert status["metric"]["name"] == "x"
+    assert status["metric"]["name"] == "objective"
     assert _resolve_publication_pointer(experiment).state == "failed"
 
 

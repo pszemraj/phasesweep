@@ -1,0 +1,8 @@
+2026-09-22 12:54:35 I phasesweep.engine.optuna Using JournalFileStorage at /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/release-0.3.1-journal/ledger/study.journal
+2026-09-22 12:54:35 I phasesweep.engine.artifact_roots Bound study t::p to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/release-0.3.1-journal/artifact_root/t
+2026-09-22 12:54:35 I phasesweep.engine.phase phase=p study=t::p completed=0 remaining=2 n_jobs=1
+2026-09-22 12:54:35 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
+2026-09-22 12:54:35 I phasesweep.engine.trial [p/trial_0] python -c 'print("PSWOBJ=0.5")' --a=1
+2026-09-22 12:54:35 I phasesweep.engine.trial [p/trial_1] python -c 'print("PSWOBJ=0.5")' --a=10
+2026-09-22 12:54:36 I phasesweep.engine.run phase=p WINNER trial=0 metric=0.5 params={'a': 1}
+2026-09-22 12:54:36 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/release-0.3.1-journal/artifact_root/t/generations/71e39354ab1e49de88f0b3d8d04c5879/summary.yaml

@@ -1,11 +1,15 @@
-"""Trial launch environment behavior."""
+"""Trial launch environment and pipe behavior."""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
 import os
+import resource
+import select
 import shlex
 import stat
 from pathlib import Path
@@ -22,7 +26,7 @@ from phasesweep.config import (
 )
 from phasesweep.engine.artifacts import _warn_environment_drift
 from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
-from phasesweep.runtime.process import ProcessResult
+from phasesweep.runtime.process import ProcessResult, fd_ready
 from tests.conftest import make_experiment
 
 
@@ -615,3 +619,54 @@ def test_launch_trial_writes_no_environment_json_by_default(
     _capture_launch_env(tmp_path, monkeypatch)
 
     assert not (tmp_path / "trial_0" / "environment.json").exists()
+
+
+def test_launch_pipe_waits_accept_descriptors_past_select_limit() -> None:
+    """A launcher holding over 1024 open files can still wait on its trial pipes.
+
+    ``select.select`` raises ``ValueError`` for any descriptor at or above
+    ``FD_SETSIZE``; the payload write, the supervisor handshake, and the MCP
+    runner's ready byte all wait through ``fd_ready`` instead.
+    """
+    if resource.getrlimit(resource.RLIMIT_NOFILE)[0] <= 1502:
+        pytest.skip("the open-file limit cannot reach past select's FD_SETSIZE")
+    read_fd, write_fd = os.pipe()
+    high_read = fcntl.fcntl(read_fd, fcntl.F_DUPFD_CLOEXEC, 1500)
+    high_write = fcntl.fcntl(write_fd, fcntl.F_DUPFD_CLOEXEC, 1500)
+    os.close(read_fd)
+    os.close(write_fd)
+    try:
+        assert not fd_ready(high_read, timeout=0)
+        assert fd_ready(high_write, timeout=0, write=True)
+        os.write(high_write, b"x")
+        # A 30-day trial timeout is longer than one poll() call accepts.
+        assert fd_ready(high_read, timeout=30 * 86400)
+        assert os.read(high_read, 1) == b"x"
+        os.close(high_write)
+        # A hang-up is ready, so the caller's read sees EOF itself.
+        assert fd_ready(high_read, timeout=0)
+        assert os.read(high_read, 1) == b""
+    finally:
+        os.close(high_read)
+        with contextlib.suppress(OSError):
+            os.close(high_write)
+    with pytest.raises(OSError):
+        fd_ready(high_read, timeout=0)
+
+
+def test_launch_pipe_wait_outlasts_one_poll_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A wait past poll()'s millisecond limit keeps waiting instead of timing out."""
+    waits: list[int] = []
+
+    class _Poller:
+        def register(self, fd: int, events: int) -> None:
+            pass
+
+        def poll(self, timeout_ms: int) -> list[tuple[int, int]]:
+            waits.append(timeout_ms)
+            return [(7, select.POLLIN)] if len(waits) == 2 else []
+
+    monkeypatch.setattr(select, "poll", _Poller)
+    assert fd_ready(7, timeout=30 * 86400)
+    assert len(waits) == 2
+    assert max(waits) <= 2**31 - 1

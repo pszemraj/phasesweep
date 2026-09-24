@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -18,8 +19,8 @@ from phasesweep.config import (
     Sampler,
 )
 from phasesweep.engine import read_status, run_experiment
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _run_lock_paths
-from phasesweep.engine.optuna import _resolve_storage
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,
@@ -68,6 +69,7 @@ def test_auto_storage_requires_persistent_contract(invalid: str) -> None:
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
+@pytest.mark.integration
 def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_jobs: int
 ) -> None:
@@ -100,6 +102,7 @@ def test_auto_storage_preserves_paths_across_run_resume_and_recovery(
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
 @pytest.mark.parametrize("relocated", [False, True])
+@pytest.mark.integration
 def test_auto_backend_change_refuses_existing_tree(
     tmp_path: Path, n_jobs: int, relocated: bool
 ) -> None:
@@ -255,6 +258,109 @@ def test_external_storage_is_rejected_at_config_load(tmp_path: Path, storage: st
         load_experiment(path)
 
 
+def test_sqlite_uri_with_remote_authority_is_rejected_at_config_load(tmp_path: Path) -> None:
+    """A SQLite URI filename naming another host maps to no local ledger file.
+
+    Accepting it would let a run bind the artifact tree to a ledger SQLite then
+    refuses to open, so config load stops it before anything is written.
+    """
+    path = _storage_policy_config(
+        tmp_path, storage="sqlite:///file://db-host/runs/study.db?uri=true", n_jobs=1
+    )
+
+    with pytest.raises(ValidationError, match="SQLite storage must name a local database file"):
+        load_experiment(path)
+
+
+_SPLIT = "name one database file to PhaseSweep and to SQLAlchemy"
+_REPEATED = "set each URL option once"
+
+
+@pytest.mark.parametrize(
+    ("storage", "refusal"),
+    [
+        pytest.param(
+            "sqlite:///{tmp}/ledger.db?uri=true&cache=shared", _SPLIT, id="uri-without-file-prefix"
+        ),
+        pytest.param("sqlite:///file:{tmp}/ledger.db?URI=true", _SPLIT, id="key-case"),
+        pytest.param("sqlite:///file:{tmp}/ledger.db?uri=t", _SPLIT, id="uri-t"),
+        pytest.param("sqlite:///file:{tmp}/ledger.db?uri=y", _SPLIT, id="uri-y"),
+        pytest.param(
+            "sqlite:///file:{tmp}/ledger.db?Mode=memory&uri=true", _SPLIT, id="memory-mode-key-case"
+        ),
+        pytest.param("sqlite:///file::memory:?URI=true", _SPLIT, id="memory-uri-case"),
+        pytest.param("sqlite:///{tmp}/link/../ledger.db", _SPLIT, id="dotdot-after-symlink"),
+        pytest.param("sqlite:///file:{tmp}/ledger.db?uri=0&uri=0", _REPEATED, id="repeated"),
+        pytest.param(
+            "sqlite:///file:{tmp}/ledger.db?uri=true&URI=false",
+            _REPEATED,
+            id="repeated-across-case",
+        ),
+        pytest.param(
+            "sqlite:///file:{tmp}/ledger.db?uri=true&vfs=memdb",
+            "use SQLite's default file access",
+            id="vfs",
+        ),
+        pytest.param(
+            "sqlite:///file:{tmp}/ledger.db?uri=true#fragment",
+            "be a URL SQLAlchemy can open",
+            id="unparseable-by-sqlalchemy",
+        ),
+    ],
+)
+def test_sqlite_url_read_differently_by_sqlalchemy_is_rejected_at_config_load(
+    tmp_path: Path, storage: str, refusal: str
+) -> None:
+    """Every SQLite URL that config accepts names one file to PhaseSweep and to Optuna.
+
+    PhaseSweep scans, probes, identifies, and locks the file it parses out of
+    the URL; Optuna writes wherever SQLAlchemy's dialect opens. Each spelling
+    here splits the two, so the checks would guard one database while trials
+    land in another. Config load refuses them before anything is written.
+    """
+    (tmp_path / "real" / "sub").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "real" / "sub")
+    path = _storage_policy_config(
+        tmp_path, storage=json.dumps(storage.format(tmp=tmp_path)), n_jobs=1
+    )
+
+    with pytest.raises(ValidationError, match=f"SQLite storage must {refusal}"):
+        load_experiment(path)
+
+
+@pytest.mark.parametrize(
+    "storage",
+    [
+        pytest.param("sqlite:///{tmp}/ledger.db", id="absolute"),
+        pytest.param("sqlite:///ledger.db", id="relative"),
+        pytest.param("sqlite+pysqlite:///{tmp}/ledger.db", id="pysqlite-driver"),
+        pytest.param("sqlite:///file:{tmp}/ledger.db?uri=true", id="file-uri"),
+        pytest.param(
+            "sqlite:///file:{tmp}/ledger.db?mode=rwc&cache=shared&uri=1", id="uri-options"
+        ),
+        pytest.param("sqlite:///file:{tmp}/with%20space.db?uri=true", id="percent-encoded"),
+        pytest.param("sqlite:///~/study.db", id="literal-tilde"),
+        pytest.param("sqlite:///{tmp}/link/ledger.db", id="through-symlink"),
+        pytest.param("sqlite:///{tmp}/ledger.db?timeout=30", id="driver-option"),
+        pytest.param("sqlite:///file::memory:?uri=true", id="uri-memory"),
+    ],
+)
+def test_sqlite_url_both_parsers_agree_on_still_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: str
+) -> None:
+    """Spellings that name the same database to both parsers keep loading unchanged."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "real" / "sub").mkdir(parents=True)
+    (tmp_path / "link").symlink_to(tmp_path / "real" / "sub")
+    url = storage.format(tmp=tmp_path)
+    path = _storage_policy_config(tmp_path, storage=json.dumps(url), n_jobs=1)
+
+    experiment = load_experiment(path)
+
+    assert isinstance(experiment, Experiment)
+    assert experiment.storage == url
+
+
 def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:
     """File-based backends resolve to absolute paths so equivalent URL spellings
     (relative paths, ``..`` segments) produce one stable lock identity. None
@@ -317,6 +423,7 @@ def test_storage_recovery_locator_freezes_relative_file_paths(
 
 
 @pytest.mark.parametrize("scheme", ["sqlite", "sqlite+pysqlite"])
+@pytest.mark.integration
 def test_literal_hash_sqlite_path_survives_status_resume_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scheme: str
 ) -> None:
@@ -342,6 +449,7 @@ def test_literal_hash_sqlite_path_survives_status_resume_and_recovery(
     assert len(study.trials) == 2
 
 
+@pytest.mark.integration
 def test_literal_tilde_sqlite_path_survives_status_resume_and_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

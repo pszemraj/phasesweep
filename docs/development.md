@@ -24,22 +24,114 @@ mypy src
 scripts/check_installed_wheel.sh
 ```
 
-Run `pytest` by itself, with no concurrent lint, type check, or build job:
-process-supervision and timeout tests are timing-sensitive. The installed-wheel
-script builds and installs into a temporary location, verifies the package and
-console entry points outside the checkout, and exercises the starter's
-validation, dry run, execution, replay, and catalog scaffolding. It leaves no
-acceptance artifacts in the repository.
+> [!IMPORTANT]
+> Run `pytest` by itself, with no concurrent lint, type check, or build job:
+> process-supervision and timeout tests are timing-sensitive.
+
+The installed-wheel script builds and installs into a temporary location,
+verifies the package and console entry points outside the checkout, and
+exercises the starter's validation, dry run, execution, replay, and catalog
+scaffolding. It leaves no acceptance artifacts in the repository.
+
+### Git hooks
+
+The [hook configuration](../.pre-commit-config.yaml) calls the tools installed
+in the active environment and builds none of its own, so commit from a shell
+with that environment active. The development extra provides `pre-commit` and
+`pathlint`; after installing it, enable the hooks once per clone:
+
+```bash
+pre-commit install
+```
+
+| Hook | Stage | Runs on |
+| --- | --- | --- |
+| `ruff check --fix`, `ruff format` | commit | changed Python files |
+| `pathlint` | commit | changed `src/` and `tests/` Python files |
+| `doc-check` | commit | changed `src/` Python files, with `--strict` |
+| module size | commit | changed `src/` and `tests/` Python files |
+| contract tests | commit | every commit |
+| tier guard | commit | every commit, collecting the whole suite |
+| `mypy src` | push | the whole package |
+
+The contract tests are `tests/test_ledger_contract.py`,
+`tests/test_error_routing.py`, and `tests/test_tier_guard.py`. The tier guard
+collects the whole suite without running it, which applies the
+[integration-marker guard](#test-tiers) to every test module. `doc-check` runs
+the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the
+hook prints that it skipped. It is a maintainer-local check, and CI does not
+run it. The module-size hook refuses a commit that touches
+a `src/` or `tests/` module longer than 2000 lines, so split a module before
+changing it. A few test modules that were already longer carry a fixed ceiling
+instead: they may shrink but never grow.
+[`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the
+limit and the ceilings. When Ruff rewrites a file, the commit stops; stage the
+fix and commit again.
+
+`pre-commit run --all-files` runs the commit hooks over the whole tree;
+add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain
+`pytest` remains the full gate.
+
+### Test tiers
+
+Plain `pytest` above is the authoritative non-hardware suite and stays the
+merge and release check. While iterating, two subsets are available:
+
+```bash
+pytest -m "not hardware and not integration"   # fast review tier
+pytest -m "integration and not hardware"       # integration tier only
+```
+
+> [!NOTE]
+> A `-m` on the command line *replaces* the `-m 'not hardware'` in `addopts`
+> rather than adding to it, which is why both commands above spell out
+> `not hardware`.
+
+A test is `@pytest.mark.integration` when it manages real processes, waits on
+wall-clock time, drives a multi-step durable recovery workflow, or is otherwise
+slow: its call phase takes at least `SLOW_CALL_SECONDS` from `tests/tiers.py`.
+Everything else stays in the fast tier, including engine runs with quick
+trainers, such as `run_experiment` over an `echo` trainer, which spawn their
+subprocess inside the package.
+
+The guard enforces only what a test's source shows: `tests/conftest.py` fails
+collection when a test manages processes or waits on the clock *directly*, in
+its body or a same-module helper or fixture, without the marker
+(`tests/tiers.py` lists the primitives). A test that is slow for any other
+reason is marked by the classification rule above. To keep one visible, a run
+that excludes `integration` ends with a list of unmarked tests at or over the
+threshold. The list is a report, not a failure, because timing thresholds
+flake on loaded hosts.
+
+The scanner cannot follow a call into another module, so a helper shared from
+a non-test module under `tests/` that spawns or waits is registered by name in
+`PROCESS_DRIVER_CALLS` or `WALLCLOCK_HELPER_CALLS` in `tests/tiers.py`, and a
+test that calls it, or requests it as a fixture, is classified as if it did
+the work itself. `test_shared_helpers_that_spawn_or_wait_are_registered` in
+`tests/test_tier_guard.py` scans those modules and fails until every such
+helper is registered. `reaped_pid` is deliberately not registered: its child
+has exited before it returns, so its caller neither manages a live process
+nor waits.
+
+An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any
+test whose code would send a real signal to pytest, its parent, or either
+one's process group; a signal-0 liveness probe passes. A test that signals its
+own PID on purpose, to drive a shutdown handler, carries
+`@pytest.mark.signals_own_pid`, which lifts only that one target.
 
 GitHub Actions intentionally has one Linux pull-request static-check job for
-Ruff linting, Ruff format checking, and mypy. The full suite and installed
-wheel check stay local to control CI cost. Hardware tests remain opt-in.
+Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier
+guard hook runs, and the three contract tests plus
+`tests/test_ledger_read_paths.py`, all imported from `src/` without building
+the package. That test step runs on one Python version and stays within about
+20 seconds; the full suite and installed wheel check stay local to control CI
+cost. Hardware tests remain opt-in.
 
 The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
 read-only inspection behavior depends on that range; do not widen it without
 targeted validation.
 
-The restored W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's
+The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's
 summary decoding and error behavior with controlled responses, plus supervised
 worker fixtures for deadlines, cleanup faults, and recovery. They do not certify
 live service access. Input tests use the real Hydra 1.3 parser and entrypoint;
@@ -108,6 +200,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 | --- | --- |
 | Experiment and phase orchestration | `run`, `phase` |
 | Resume selection and continuation preflight | `resume`, `study_policy`, `guards` |
+| Ledger storage: the only module that constructs Optuna or SQLite storage | `ledger` |
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
 | Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
@@ -116,12 +209,16 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery);
 the CLI owns its arguments and rendering.
 
+The ordering rules these modules must hold, and the test that owns each one,
+are listed in [durability invariants](invariants.md).
+
 The ordinary control flow is:
 
 ```mermaid
 flowchart TD
     cli["CLI or detached MCP runner"] --> run["run.run_experiment"]
-    run --> phase["phase._run_phase"]
+    run --> preflight["take experiment lock, check and bind artifact root and ledger, claim generation, preflight attempts"]
+    preflight --> phase["phase._run_phase"]
     phase --> optimize["Optuna optimize"]
     optimize --> launch["supervise trainer"]
     launch --> evidence["read configured scalar and gates"]
@@ -148,6 +245,10 @@ flowchart TD
 - `tests/test_storage_urls.py`, `tests/test_locking.py`,
   `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local
   storage, locks, format cutover, and output layout.
+- `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`,
+  `tests/test_error_routing.py`, and `tests/test_tier_guard.py`: the storage
+  chokepoint, read paths and recovery inspection against golden ledger
+  fixtures, operator-action routing, and the integration-marker guard.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots,
   detached launch, status, cancellation, and recovery.
 - `tests/test_init.py` and `tests/test_reporting.py`: starter creation,
@@ -158,10 +259,13 @@ flowchart TD
 - TODO(mcp): Replace the private FastMCP strict-schema patch when the SDK
   exposes a tested public closed-input-schema API; keep behavior-level request
   validation as the safety net until then.
-- TODO(mcp): Split `mcp/server.py` after the MCP SDK surface stabilizes, without
-  changing its run-handle or snapshot semantics.
 - TODO(runtime): Design an explicit completion-budget mode only if its attempt
   accounting, failure cap, and timeout semantics are specified separately.
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if
   it preserves the current last-successful pointer and all cited winner
   provenance.
+- TODO(engine): Keep [durability invariants](invariants.md) in step with the
+  ledger chokepoint. A storage constructor outside `engine/ledger.py` already
+  fails `tests/test_ledger_contract.py`, but a new ordering rule or ledger
+  entry point needs its own invariant entry, citing the code and the test
+  that hold it.

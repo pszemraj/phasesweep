@@ -1,0 +1,7 @@
+2026-09-23 01:54:16 I phasesweep.engine.artifact_roots Bound study t::p to artifact root /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/precutover-unstamped-sqlite/artifact_root/t
+2026-09-23 01:54:16 I phasesweep.engine.phase phase=p study=t::p completed=0 remaining=2 n_jobs=1
+2026-09-23 01:54:16 I phasesweep.runtime.gpu CUDA_VISIBLE_DEVICES exposes no devices; phase will pin CUDA_VISIBLE_DEVICES='' in trial environments without GPU host locks.
+2026-09-23 01:54:16 I phasesweep.engine.trial [p/trial_0] python -c 'print("PSWOBJ=0.5")' --a=1
+2026-09-23 01:54:17 I phasesweep.engine.trial [p/trial_1] python -c 'print("PSWOBJ=0.5")' --a=10
+2026-09-23 01:54:17 I phasesweep.engine.run phase=p WINNER trial=0 metric=0.5 params={'a': 1}
+2026-09-23 01:54:17 I phasesweep.engine.run Wrote /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/precutover-unstamped-sqlite/artifact_root/t/generations/53518fc047594593900163cf94431852/summary.yaml

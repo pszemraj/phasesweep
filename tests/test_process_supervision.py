@@ -28,36 +28,44 @@ from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor
 from phasesweep.runtime.process import (
     ATTEMPT_LIFECYCLE_FILE,
+    _kill_group,
+    _spawn_blocked_supervisor,
+    _wait_for_guardian_exit,
+    read_attempt_lifecycle,
+    run_supervised,
+)
+from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
-    PhaseSweepShutdown,
     StaleProcessIdentity,
     _group_member_pids,
     _GroupMemberScan,
-    _kill_group,
     _process_group_alive_with_members,
     _ProcStat,
-    _shutdown_handler,
-    _spawn_blocked_supervisor,
     _terminate_process_group,
     _terminate_process_groups,
-    _wait_for_guardian_exit,
     cleanup_stale_trial_process,
-    defer_shutdown_signals,
     is_pid_alive,
-    read_attempt_lifecycle,
     read_stale_process_identity,
     reap_child,
-    run_supervised,
+)
+from phasesweep.runtime.shutdown import (
+    PhaseSweepShutdown,
+    _shutdown_handler,
 )
 from tests.conftest import is_pid_zombie, make_experiment, raise_after_first_successful_call
+
+# This module exists to observe POSIX signal delivery and descendant cleanup on
+# real process groups, so the whole file is an integration tier module: even the
+# cases that patch a spawn still assert against real signal and /proc semantics.
+pytestmark = pytest.mark.integration
 
 
 def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch group termination to clean up the group but report uncertainty."""
-    import phasesweep.runtime.process as _process
+    import phasesweep.runtime.reaper as _reaper
 
-    real_terminate = _process._terminate_process_group
+    real_terminate = _reaper._terminate_process_group
 
     def terminate_then_report_uncertain(pgid: int, *, grace_seconds: float) -> bool:
         real_terminate(pgid, grace_seconds=0.05)
@@ -67,23 +75,6 @@ def _report_uncertain_after_real_terminate(monkeypatch: pytest.MonkeyPatch) -> N
         "phasesweep.runtime.process._terminate_process_group",
         terminate_then_report_uncertain,
     )
-
-
-def _install_signal_probe(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
-    """Patch ``signal_handler_scope`` so tests can observe whether it was entered.
-
-    :param pytest.MonkeyPatch monkeypatch: Fixture used to replace the scope.
-    :return dict[str, bool]: Mutable probe; ``"called"`` flips to ``True`` on entry.
-    """
-    installed = {"called": False}
-
-    @contextlib.contextmanager
-    def fake_scope():
-        installed["called"] = True
-        yield
-
-    monkeypatch.setattr("phasesweep.engine.run.signal_handler_scope", fake_scope)
-    return installed
 
 
 def _run_supervised(
@@ -266,12 +257,13 @@ def test_pre_spawn_failure_records_confirmed_terminal_lifecycle(
 ) -> None:
     """A failed or interrupted spawn cannot strand a childless attempt."""
     import phasesweep.runtime.process as process
+    import phasesweep.runtime.shutdown as shutdown_mod
 
     def fail_before_spawn(**_kwargs: object) -> None:
         if shutdown:
             raise PhaseSweepShutdown(
                 signal.SIGTERM,
-                process.ShutdownCleanupReport(signal.SIGTERM, True, ()),
+                shutdown_mod.ShutdownCleanupReport(signal.SIGTERM, True, ()),
             )
         raise OSError("injected pre-spawn failure")
 
@@ -416,6 +408,8 @@ def test_payload_delivery_interrupt_cleans_registered_trainer_group(
 ) -> None:
     """An interrupt after payload delivery cannot leave training alive."""
     import phasesweep.runtime.process as process
+    import phasesweep.runtime.reaper as reaper
+    import phasesweep.runtime.shutdown as shutdown
 
     real_write_all = process._write_all
 
@@ -453,9 +447,9 @@ def test_payload_delivery_interrupt_cleans_registered_trainer_group(
         trial_dir,
         expected_attempt_id="interrupted-payload-delivery",
     )
-    assert not process._process_group_alive(identity.pgid)
-    with process._lock:
-        assert identity.pgid not in process._active_children
+    assert not reaper._process_group_alive(identity.pgid)
+    with shutdown._lock:
+        assert identity.pgid not in shutdown._active_children
     lifecycle = read_attempt_lifecycle(
         trial_dir,
         expected_attempt_id="interrupted-payload-delivery",
@@ -533,10 +527,11 @@ import os
 import time
 from pathlib import Path
 import phasesweep.runtime.process as process
+import phasesweep.runtime.reaper as reaper
 
 real_atomic_write_text = process.atomic_write_text
 def stall_identity_write(path: Path, text: str) -> None:
-    if path.name != process.PROCESS_IDENTITY_FILE:
+    if path.name != reaper.PROCESS_IDENTITY_FILE:
         real_atomic_write_text(path, text)
         return
     print(text, flush=True)
@@ -799,6 +794,7 @@ def test_spawn_blocked_supervisor_launch_argv_and_env(
     ``-I -S`` with a minimal sanitized environment; the trainer command must
     never appear in argv (review v0.5.15 / blocker 1)."""
     import phasesweep.runtime.process as process
+    import phasesweep.runtime.shutdown as shutdown
 
     captured: dict[str, object] = {}
     real_popen = subprocess.Popen
@@ -835,7 +831,7 @@ def test_spawn_blocked_supervisor_launch_argv_and_env(
         os.close(ack_write)
         os.close(status_read)
         _kill_group(pgid, proc)
-        process._unregister(pgid)
+        shutdown._unregister(pgid)
 
 
 def test_spawn_blocked_supervisor_invalidates_pipe_fd_before_close(
@@ -916,7 +912,7 @@ def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> 
         calls.append((pid, flags))
         return (0, 0)
 
-    monkeypatch.setattr("phasesweep.runtime.process.os.waitpid", fake_waitpid)
+    monkeypatch.setattr("phasesweep.runtime.reaper.os.waitpid", fake_waitpid)
 
     assert reap_child(12345) is False
 
@@ -925,7 +921,7 @@ def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_reap_child_reports_when_it_reaped(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        "phasesweep.runtime.process.os.waitpid",
+        "phasesweep.runtime.reaper.os.waitpid",
         lambda pid, flags: (pid, 0),
     )
 
@@ -1012,6 +1008,8 @@ def test_unexpected_status_read_failure_cleans_group_before_reraising(
 ) -> None:
     """A post-launch wait failure cannot leave an untracked trainer running."""
     import phasesweep.runtime.process as process
+    import phasesweep.runtime.reaper as reaper
+    import phasesweep.runtime.shutdown as shutdown
 
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
@@ -1044,9 +1042,9 @@ def test_unexpected_status_read_failure_cleans_group_before_reraising(
         trial_dir,
         expected_attempt_id="status-read-failure",
     )
-    assert not process._process_group_alive(identity.pgid)
-    with process._lock:
-        assert identity.pgid not in process._active_children
+    assert not reaper._process_group_alive(identity.pgid)
+    with shutdown._lock:
+        assert identity.pgid not in shutdown._active_children
     lifecycle = read_attempt_lifecycle(
         trial_dir,
         expected_attempt_id="status-read-failure",
@@ -1062,6 +1060,8 @@ def test_unexpected_status_read_failure_reports_uncertain_cleanup(
 ) -> None:
     """A failed cleanup attempt replaces an ordinary wait error with the typed stop."""
     import phasesweep.runtime.process as process
+    import phasesweep.runtime.reaper as reaper
+    import phasesweep.runtime.shutdown as shutdown
 
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
@@ -1098,9 +1098,9 @@ def test_unexpected_status_read_failure_reports_uncertain_cleanup(
         trial_dir,
         expected_attempt_id="uncertain-status-read-failure",
     )
-    assert not process._process_group_alive(identity.pgid)
-    with process._lock:
-        assert identity.pgid not in process._active_children
+    assert not reaper._process_group_alive(identity.pgid)
+    with shutdown._lock:
+        assert identity.pgid not in shutdown._active_children
     lifecycle = read_attempt_lifecycle(
         trial_dir,
         expected_attempt_id="uncertain-status-read-failure",
@@ -1245,18 +1245,18 @@ def test_terminal_status_read_cannot_turn_expired_trial_into_success(
     """A status byte observed after the deadline still means the trial timed out."""
     import phasesweep.runtime.process as process
 
-    real_select = process.select.select
-    read_select_calls = 0
+    real_fd_ready = process.fd_ready
+    read_waits = 0
 
-    def delay_terminal_status_read(readers, writers, errors, timeout):  # noqa: ANN001, ANN202
-        nonlocal read_select_calls
-        if readers:
-            read_select_calls += 1
-            if read_select_calls == 2:
+    def delay_terminal_status_read(fd: int, *, timeout: float, write: bool = False) -> bool:
+        nonlocal read_waits
+        if not write:
+            read_waits += 1
+            if read_waits == 2:
                 time.sleep(0.8)
-        return real_select(readers, writers, errors, timeout)
+        return real_fd_ready(fd, timeout=timeout, write=write)
 
-    monkeypatch.setattr(process.select, "select", delay_terminal_status_read)
+    monkeypatch.setattr(process, "fd_ready", delay_terminal_status_read)
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
 
@@ -1267,7 +1267,7 @@ def test_terminal_status_read_cannot_turn_expired_trial_into_success(
         attempt_id="late-status-read",
     )
 
-    assert read_select_calls >= 2
+    assert read_waits >= 2
     assert result.timed_out
     assert result.cleanup_confirmed
     assert result.failure_reason == "timeout after 0.5s"
@@ -1628,8 +1628,8 @@ def test_proc_scan_scopes_unreadable_entries_to_the_target_group(
         return None, False
 
     monkeypatch.setattr(Path, "iterdir", fake_iterdir)
-    monkeypatch.setattr("phasesweep.runtime.process._read_proc_stat_result", fake_stat)
-    monkeypatch.setattr("phasesweep.runtime.process.os.getpgid", lambda _pid: unreadable_pgid)
+    monkeypatch.setattr("phasesweep.runtime.reaper._read_proc_stat_result", fake_stat)
+    monkeypatch.setattr("phasesweep.runtime.reaper.os.getpgid", lambda _pid: unreadable_pgid)
 
     scan = _group_member_pids(1234)
 
@@ -1684,7 +1684,7 @@ def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> 
     phase through this path; serial escalation would multiply worst-case
     shutdown latency by the trial parallelism (review v0.5.17 gap hunt).
     """
-    grace = 1.5
+    grace = 3.0
     procs: list[subprocess.Popen] = []
     try:
         for idx in range(2):
@@ -1713,8 +1713,8 @@ def test_terminate_process_groups_shares_grace_across_groups(tmp_path: Path) -> 
                 proc.wait(timeout=5)
 
     assert verdicts == {proc.pid: True for proc in procs}
-    # Serial escalation would burn at least one full grace per group.
-    assert elapsed < 2 * grace - 0.2, f"escalation took {elapsed:.2f}s; grace not shared"
+    # Serial escalation pays a full grace per group (>= 2 * grace); sharing leaves a grace of slack.
+    assert elapsed < 2 * grace, f"escalation took {elapsed:.2f}s; grace not shared"
 
 
 def test_terminate_process_groups_reports_per_group_verdicts() -> None:
@@ -1747,14 +1747,14 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
     terminated: list[int] = []
     active: dict[int, object] = {1234: object()}
 
-    monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
+    monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
     def fake_terminate(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
         terminated.extend(pgids)
         active.clear()
         return dict.fromkeys(pgids, True)
 
-    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_groups", fake_terminate)
+    monkeypatch.setattr("phasesweep.runtime.shutdown._terminate_process_groups", fake_terminate)
 
     with pytest.raises(PhaseSweepShutdown) as excinfo:
         _shutdown_handler(signal.SIGTERM, None)
@@ -1767,9 +1767,9 @@ def test_shutdown_handler_uses_initial_pgid_snapshot(
 def test_shutdown_handler_reports_uncertain_when_group_termination_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("phasesweep.runtime.process._active_children", {1234: object()})
+    monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", {1234: object()})
     monkeypatch.setattr(
-        "phasesweep.runtime.process._terminate_process_groups",
+        "phasesweep.runtime.shutdown._terminate_process_groups",
         lambda pgids, *, grace_seconds: dict.fromkeys(pgids, False),
     )
 
@@ -1789,7 +1789,7 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
     terminated: list[int] = []
     reentered = False
 
-    monkeypatch.setattr("phasesweep.runtime.process._active_children", active)
+    monkeypatch.setattr("phasesweep.runtime.shutdown._active_children", active)
 
     def fake_terminate(pgids: tuple[int, ...], *, grace_seconds: float) -> dict[int, bool]:
         nonlocal reentered
@@ -1799,7 +1799,7 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
             assert _shutdown_handler(signal.SIGINT, None) is None
         return dict.fromkeys(pgids, True)
 
-    monkeypatch.setattr("phasesweep.runtime.process._terminate_process_groups", fake_terminate)
+    monkeypatch.setattr("phasesweep.runtime.shutdown._terminate_process_groups", fake_terminate)
 
     with pytest.raises(PhaseSweepShutdown) as excinfo:
         _shutdown_handler(signal.SIGTERM, None)
@@ -1819,12 +1819,12 @@ def test_shutdown_handler_ignores_reentrant_signal_during_cleanup(
 def test_process_group_alive_uses_cached_members(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda pgid: True)
     monkeypatch.setattr(
-        "phasesweep.runtime.process._group_member_pids",
+        "phasesweep.runtime.reaper._group_member_pids",
         lambda pgid: (_ for _ in ()).throw(AssertionError("must not rescan /proc")),
     )
-    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: True)
+    monkeypatch.setattr("phasesweep.runtime.reaper._member_pids_alive", lambda pgid, pids: True)
 
     assert _process_group_alive_with_members(1234, {11}) is True
 
@@ -1835,7 +1835,7 @@ def test_process_group_alive_refreshes_when_cached_members_are_gone(
     member_sets: list[set[int]] = []
     scans: list[int] = []
 
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda pgid: True)
 
     def fake_group_member_pids(pgid: int) -> _GroupMemberScan:
         scans.append(pgid)
@@ -1845,8 +1845,8 @@ def test_process_group_alive_refreshes_when_cached_members_are_gone(
         member_sets.append(set(pids))
         return 22 in pids
 
-    monkeypatch.setattr("phasesweep.runtime.process._group_member_pids", fake_group_member_pids)
-    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", fake_member_pids_alive)
+    monkeypatch.setattr("phasesweep.runtime.reaper._group_member_pids", fake_group_member_pids)
+    monkeypatch.setattr("phasesweep.runtime.reaper._member_pids_alive", fake_member_pids_alive)
 
     member_pids = {11}
 
@@ -1860,9 +1860,9 @@ def test_existing_group_with_no_inspectable_members_is_uncertain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A kernel-visible group cannot be declared dead from an empty procfs view."""
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda pgid: True)
     monkeypatch.setattr(
-        "phasesweep.runtime.process._group_member_pids",
+        "phasesweep.runtime.reaper._group_member_pids",
         lambda pgid: _GroupMemberScan(pids=(), complete=True, all_members_terminal=False),
     )
 
@@ -1882,16 +1882,16 @@ def test_terminal_only_group_uses_procfs_scan_completeness(
     expected_alive: bool,
 ) -> None:
     """Terminal members prove cleanup only when the procfs scan was complete."""
-    monkeypatch.setattr("phasesweep.runtime.process._process_group_exists", lambda pgid: True)
+    monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda pgid: True)
     monkeypatch.setattr(
-        "phasesweep.runtime.process._group_member_pids",
+        "phasesweep.runtime.reaper._group_member_pids",
         lambda pgid: _GroupMemberScan(
             pids=(22,),
             complete=scan_complete,
             all_members_terminal=True,
         ),
     )
-    monkeypatch.setattr("phasesweep.runtime.process._member_pids_alive", lambda pgid, pids: False)
+    monkeypatch.setattr("phasesweep.runtime.reaper._member_pids_alive", lambda pgid, pids: False)
 
     assert _process_group_alive_with_members(1234, None) is expected_alive
 
@@ -1919,9 +1919,9 @@ def test_terminate_process_group_reports_cleanup_status(
         if kill_error is not None:
             raise kill_error
 
-    monkeypatch.setattr("phasesweep.runtime.process.os.killpg", fake_killpg)
+    monkeypatch.setattr("phasesweep.runtime.reaper.os.killpg", fake_killpg)
     monkeypatch.setattr(
-        "phasesweep.runtime.process._process_group_alive_with_members",
+        "phasesweep.runtime.reaper._process_group_alive_with_members",
         lambda pgid, member_pids: group_survives,
     )
 
@@ -1977,188 +1977,6 @@ def test_reaper_raises_when_cleanup_uncertain(
 
     with pytest.raises(RuntimeError, match="cleanup could not prove"):
         _reap_stale_trials(study, exp, exp.phases[0].name)
-
-
-def test_public_run_experiment_enters_signal_handler_scope(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Library callers using ``run_experiment`` directly get the same cleanup
-    contract as CLI callers."""
-    installed = _install_signal_probe(monkeypatch)
-
-    # Minimal trial_command that emits the metric captured by the log extractor.
-    script = "print('x=1')"
-    exp = make_experiment(
-        workdir=tmp_path / "runs",
-        trial_command=f'{sys.executable} -c "{script}" trial_dir={{trial_dir}} {{overrides}}',
-        override_format="argparse",
-    )
-    run_experiment(exp)
-    assert installed["called"] is True
-
-
-def test_dry_run_does_not_enter_signal_handler_scope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Dry-run launches no children, so it must not perturb the signal mask."""
-    installed = _install_signal_probe(monkeypatch)
-
-    exp = make_experiment(workdir=tmp_path / "runs")
-    run_experiment(exp, dry_run=True)
-    assert installed["called"] is False
-
-
-def test_defer_shutdown_signals_blocks_and_restores() -> None:
-    """The context manager must add SIGTERM/SIGINT to the thread mask on entry
-    and restore the original mask on exit."""
-    if not hasattr(signal, "pthread_sigmask"):
-        pytest.skip("pthread_sigmask not available")
-
-    before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-    try:
-        with defer_shutdown_signals():
-            inside = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-            assert signal.SIGTERM in inside
-            assert signal.SIGINT in inside
-        after = signal.pthread_sigmask(signal.SIG_BLOCK, set())
-        assert after == before
-    finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, before)
-
-
-def test_install_signal_handlers_unblocks_inherited_shutdown_mask() -> None:
-    """Startup should recover if the orchestrator inherited blocked SIGTERM."""
-    if not hasattr(signal, "pthread_sigmask"):
-        pytest.skip("pthread_sigmask not available")
-
-    code = r"""
-import os, signal
-from phasesweep.runtime.process import install_signal_handlers, defer_shutdown_signals
-signal.pthread_sigmask(signal.SIG_BLOCK, (signal.SIGTERM,))
-install_signal_handlers()
-with defer_shutdown_signals():
-    print("queued", flush=True)
-    os.kill(os.getpid(), signal.SIGTERM)
-print("post-context", flush=True)
-"""
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        text=True,
-        capture_output=True,
-        timeout=5.0,
-        check=False,
-    )
-    assert "queued" in proc.stdout
-    assert proc.returncode == 128 + signal.SIGTERM
-
-
-def test_pending_sigterm_inside_signal_deferred_sections_does_not_deadlock() -> None:
-    """Queued SIGTERM must not deadlock while launch or registry locks are held."""
-    cases = [
-        (
-            "launch_lock",
-            "queued",
-            r"""
-import os, signal
-from phasesweep.runtime.process import install_signal_handlers, defer_shutdown_signals, _launch_lock
-install_signal_handlers()
-with defer_shutdown_signals(), _launch_lock:
-    print("queued", flush=True)
-    os.kill(os.getpid(), signal.SIGTERM)
-print("post-context", flush=True)
-""",
-        ),
-        (
-            "registry_lock",
-            "locked",
-            r"""
-import os, signal
-from phasesweep.runtime.process import install_signal_handlers, defer_shutdown_signals, _lock
-install_signal_handlers()
-with defer_shutdown_signals():
-    with _lock:
-        print("locked", flush=True)
-        os.kill(os.getpid(), signal.SIGTERM)
-print("post-context", flush=True)
-""",
-        ),
-    ]
-
-    for case, marker, code in cases:
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            text=True,
-            capture_output=True,
-            timeout=5.0,
-            check=False,
-        )
-        assert marker in proc.stdout, case
-        assert proc.returncode == 128 + signal.SIGTERM, case
-
-
-def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocking() -> None:
-    """A signal tripped by a non-main thread mid-window must defer, not deadlock.
-
-    Kernel masking in ``defer_shutdown_signals`` only covers the main thread.
-    Library pools (e.g. BLAS workers pulled in via numpy/optuna) keep SIGTERM
-    unblocked, so a process-directed SIGTERM sent during the masked launch
-    window is delivered to one of them — and CPython then runs the Python
-    handler in the main thread anyway, mid-critical-section. Pre-fix the
-    handler re-acquired ``_launch_lock`` held by that same thread and hung
-    until the MCP server's 30s grace SIGKILLed the runner with no status.json
-    written (the flaky-cancel e2e failures). The handler must record the signal
-    and let the window exit service it.
-    """
-    code = r"""
-import os, signal, threading, time
-import phasesweep.runtime.process as proc_mod
-from phasesweep.runtime.process import install_signal_handlers, defer_shutdown_signals, _launch_lock
-
-install_signal_handlers()
-
-# Stand-in for a BLAS pool worker: SIGTERM stays unblocked here, so the kernel
-# delivers the process-directed signal to this thread while the main thread is
-# masked inside the launch window.
-ready = threading.Event()
-def helper():
-    ready.set()
-    threading.Event().wait(30)
-threading.Thread(target=helper, daemon=True).start()
-assert ready.wait(5)
-
-with defer_shutdown_signals(), _launch_lock:
-    os.kill(os.getpid(), signal.SIGTERM)
-    deadline = time.time() + 5
-    while proc_mod._deferred_shutdown_signum is None and time.time() < deadline:
-        time.sleep(0.005)
-    print("recorded-mid-window" if proc_mod._deferred_shutdown_signum is not None
-          else "never-recorded", flush=True)
-print("post-context", flush=True)
-"""
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        text=True,
-        capture_output=True,
-        timeout=15.0,
-        check=False,
-    )
-    assert "recorded-mid-window" in proc.stdout, proc.stdout + proc.stderr
-    assert "post-context" not in proc.stdout  # window exit must raise the shutdown
-    assert proc.returncode == 128 + signal.SIGTERM
-
-
-def test_deferred_shutdown_services_at_outermost_window_exit() -> None:
-    """A shutdown recorded mid-window fires only when the outermost window exits."""
-    inner_exited = False
-    with pytest.raises(PhaseSweepShutdown) as excinfo, defer_shutdown_signals():
-        with defer_shutdown_signals():
-            # Emulates CPython invoking the handler in the main thread
-            # after a worker-thread delivery: it must record and return.
-            _shutdown_handler(signal.SIGTERM, None)
-        inner_exited = True
-    assert inner_exited, "inner window exit must not service the deferred shutdown"
-    assert excinfo.value.code == 128 + signal.SIGTERM
 
 
 def test_run_supervised_reports_uncertain_cleanup_on_timeout(

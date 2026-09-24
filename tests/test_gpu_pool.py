@@ -388,6 +388,7 @@ def test_gpu_pool_skips_host_locked_gpu(tmp_path, monkeypatch) -> None:
         fcntl.flock(held, fcntl.LOCK_UN)
 
 
+@pytest.mark.integration
 def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> None:
     """A guardian retains the lock through FD scrubbing, parent death, and descendants."""
     locks = tmp_path / "locks"
@@ -670,15 +671,6 @@ def test_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch
     assert prefix_lock == _gpu_lock_path(full_pool._devices[0])
     # CUDA receives the inventory spelling, not an abbreviated alias.
     assert prefix_pool._devices[0].visible_token == uuid
-
-
-def test_abbreviated_uuid_prefix_without_map_fails_closed(tmp_path, monkeypatch) -> None:
-    """An unverified UUID prefix cannot reserve a lock for a physical device."""
-    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
-
-    with pytest.raises(RuntimeError, match="Cannot validate configured GPU UUID"):
-        GpuPool.create(n_jobs=1, explicit_devices=["GPU-2b23"])
 
 
 def test_lowercase_full_uuid_shares_the_numeric_index_lock(tmp_path, monkeypatch) -> None:

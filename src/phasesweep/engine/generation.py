@@ -20,7 +20,7 @@ from phasesweep._metadata import __version__
 from phasesweep.config import Experiment
 from phasesweep.engine.errors import PublicationCommitError, RunRequestError
 from phasesweep.engine.state import PUBLICATION_POINTER_SCHEMA_VERSION, Winner
-from phasesweep.runtime.process import absorb_shutdown_signals
+from phasesweep.runtime.shutdown import absorb_shutdown_signals
 
 if TYPE_CHECKING:
     from phasesweep.engine.run import PublicationHook
@@ -131,7 +131,7 @@ def _log_on_failure(action: Callable[[], None], message: str) -> None:
     would propagate into the caller's terminal-failure handler and reclassify
     an already-committed publication as failed. Real shutdown *signals* are
     additionally kept out of these steps entirely by the enclosing
-    :func:`phasesweep.runtime.process.absorb_shutdown_signals` window.
+    :func:`phasesweep.runtime.shutdown.absorb_shutdown_signals` window.
 
     :param Callable[[], None] action: Zero-argument best-effort action.
     :param str message: Message logged (with exception info) on failure.
@@ -403,7 +403,7 @@ def _publish_generation(
     cannot prevent the other from running.
 
     The whole transaction runs inside an
-    :func:`phasesweep.runtime.process.absorb_shutdown_signals` window (review
+    :func:`phasesweep.runtime.shutdown.absorb_shutdown_signals` window (review
     v0.5.16 / blocker 1): a shutdown signal that arrives after the pointer
     commit must not reclassify the committed publication as failed or
     cancelled. The race has a deterministic winner — a shutdown delivered

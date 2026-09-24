@@ -1,0 +1,1 @@
+python -c 'print("PSWOBJ=0.5")' --a=1

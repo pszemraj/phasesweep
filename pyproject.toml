@@ -48,6 +48,8 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
     "mcp>=1.27,<1.28",
+    "pre-commit>=3.2",
+    "pathlint>=0.2",
 ]
 
 [project.scripts]
@@ -94,7 +96,40 @@ ignore = [
 [tool.ruff.lint.isort]
 known-third-party = ["wandb"]  # An ignored local wandb/ log directory is not a Python package.
 
+[tool.mypy]
+python_version = "3.11"  # the supported floor, not the interpreter running mypy
+files = ["src"]
+warn_return_any = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_any_generics = true
+check_untyped_defs = true
+no_implicit_reexport = true
+strict_equality = true
+extra_checks = true
+
+[[tool.mypy.overrides]]
+# numpy's bundled stubs use PEP 695 `type` statements, which mypy refuses to
+# parse for a 3.11 target. PhaseSweep never imports numpy; it arrives through
+# Optuna's stubs. Skipping it keeps the 3.11 floor checkable.
+module = ["numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+[[tool.mypy.overrides]]
+# wandb is an optional extra and requests is its transitive dependency; both
+# are imported lazily inside the W&B reader. A checkout without the extra must
+# still type-check.
+module = ["wandb.*", "requests.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -m 'not hardware'"
-markers = ["hardware: tests that query real host hardware and require explicit opt-in"]
+addopts = "-q -m 'not hardware' --strict-markers"
+markers = [
+    "hardware: tests that query real host hardware and require explicit opt-in",
+    "signals_own_pid: tests that signal pytest's own PID on purpose; lifts that one target from the runner signal guard in tests/conftest.py",
+    "integration: slow tests, excluded from the fast review tier. Collection fails when an unmarked test manages processes or waits on the clock directly; engine runs with quick trainers stay in the fast tier; any other slow test is marked by the classification rule in docs/development.md",
+]

@@ -1,0 +1,66 @@
+schema_version: 2
+experiment: t
+generation_id: 71e39354ab1e49de88f0b3d8d04c5879
+phasesweep_version: 0.3.2.dev1+gb9933cc87
+config_fingerprint: 1e3df60ad6f1a72893e968496e87bbaf8f8fa5b2e149fcd18036651e6a0143e9
+metric:
+  name: objective
+  goal: minimize
+  objective_evidence:
+    kind: log_regex
+    attempt_location_scoped: true
+    attempt_identity_bound: false
+    source_identity_keyed: false
+    objective_name_bound: false
+    split_bound: false
+    evaluation_policy_bound: false
+    checkpoint_declared: false
+    checkpoint_value_bound: false
+    expected_step_declared: false
+    expected_step_value_bound: false
+phase_plan:
+- name: p
+  comment: null
+promotion_decisions: []
+phases:
+- name: p
+  metric: 0.5
+  trial_number: 0
+  params:
+    a: 1
+  effective_overrides:
+    a: 1
+  constraints: {}
+  gates: []
+  completion:
+    requested_trials: 2
+    finished_trials: 2
+    completed_trials: 2
+    incomplete: false
+    reason: null
+    timeout_scope: null
+  generation_id: 71e39354ab1e49de88f0b3d8d04c5879
+  attempt_id: 768bb4692c6948b4ad96777b933a557e
+  winner_source:
+    kind: phase_trial
+    phase: p
+    trial_number: 0
+    generation_id: 71e39354ab1e49de88f0b3d8d04c5879
+    attempt_id: 768bb4692c6948b4ad96777b933a557e
+    study: null
+  trainer_input:
+    schema_version: 1
+    format: argparse
+    filename: overrides_resolved.json
+    size_bytes: 13
+    sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
+artifacts:
+- kind: config_snapshot
+  path: config.snapshot.yaml
+  sha256: cb23080f64d8c3cd28a7180d6d075b37e2855ba93452a4de5d4c033e4c955f97
+- kind: reproducibility
+  path: reproducibility.json
+  sha256: accddec6af30ab01c44f837f4660b441a04f8371c4fa168dfb9765031eb17929
+- kind: winner
+  phase: p
+  sha256: 40664caf282607e7c08654e30e21627ad3b8e42781bd5d7501fa3e66c4f0009d

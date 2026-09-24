@@ -50,6 +50,7 @@ def test_console_scripts_declare_importable_targets() -> None:
         assert callable(getattr(module, attribute)), f"{target} is not callable"
 
 
+@pytest.mark.integration
 def test_mcp_entrypoint_without_optional_sdk(tmp_path: Path) -> None:
     """Exercise the real entry point in a fresh process even with the dev extra installed."""
     result = subprocess.run(
@@ -119,11 +120,9 @@ def test_published_generation_metadata_never_exposes_configured_secrets(
     (review v0.5.18 / finding F6).
     """
     secret = "s3cr3t-public-metadata-sentinel"
-    trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
+        trainer=write_constant_trainer(tmp_path),
         n_trials=1,
         env={"TRAINER_TOKEN": secret},
     )

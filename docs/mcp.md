@@ -53,14 +53,15 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 ## Fresh MCP state
 
 `state_dir` is private, owner-only state for handles, logs, audit entries, and
-frozen terminal snapshots. This release adds a format marker at its root. Use
-a fresh state directory for the consolidated release. The server refuses an
-unmarked, malformed, or unsupported durable state directory before creating or
-repairing it.
+frozen terminal snapshots. Its root carries a format marker, and the server
+refuses an unmarked, malformed, or unsupported durable state directory before
+creating or repairing it.
 
-Do not point this release at old MCP state and do not try to migrate, adopt,
-or repair it. Use the preserved PhaseSweep 0.3.1 environment to inspect or
-recover existing 0.3.1 state.
+> [!IMPORTANT]
+> Use a fresh state directory for the consolidated release. Do not point this
+> release at old MCP state and do not try to migrate, adopt, or repair it. Use
+> the preserved PhaseSweep 0.3.1 environment to inspect or recover existing
+> 0.3.1 state.
 
 ## Tool workflow
 
@@ -112,15 +113,24 @@ that is absent or unreadable remains unavailable; it is not reconstructed from
 the current ledger. Availability fields may be unknown when an observation was
 not possible and must not be treated as available.
 
-`publication_integrity: failed` means the published generation needs operator
-inspection. `publication_integrity: unknown` means the run's terminal snapshot
-cannot establish an answer. `permission_denied` means the publishing tree
-cannot be read by the server process. In each case, stop automated follow-up
-and report the condition. `absent` only means no result has published yet.
+`publication_integrity` reports whether the experiment's recorded publication
+still validates:
+
+| Value | Meaning |
+| --- | --- |
+| `ok` | The recorded publication validates. |
+| `absent` | No result has published yet. |
+| `failed` | A publication was recorded but no longer validates; it needs operator inspection. |
+| `permission_denied` | The server process cannot read the publishing tree. |
+| `unknown` | The run's terminal snapshot cannot establish an answer. |
+
+For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and
+report the condition.
 
 `recovery_required: true` means cleanup, launch handoff, or snapshot
 finalization needs operator recovery. Agents should stop rather than guessing
-at process or result state.
+at process or result state; [run state and recovery](#run-state-and-recovery)
+shows where each case comes from.
 
 Winner results describe selected values, not convergence curves, robustness,
 causality, or unreturned trial history. Treat `<redacted>` values as deliberate
@@ -148,16 +158,40 @@ it cannot prove a detached process group has stopped. Cancellation uses the
 saved identity and can require confirmation of cleanup; a stale PID alone is
 never considered authority to signal another process.
 
+A run's reported `state` and `recovery_required` follow that durable evidence.
+Within one host boot, a run moves like this:
+
+```mermaid
+flowchart TD
+    launch["launch_run"] --> saved["handle saved before the runner starts"]
+    saved -->|"runner saves its process identity and the server acknowledges it"| running["state: running"]
+    running -->|"runner records its final status and result snapshot after confirmed cleanup"| terminal["state: succeeded, failed, or cancelled"]
+    running -->|"runner gone without a final status, cleanup unconfirmed, or snapshot unfinished"| reserved["state: running<br/>recovery_required: true"]
+    saved -->|"server stops before the runner saves its identity"| unsettled["state: running<br/>recovery_required: true"]
+    reserved -->|"operator runs recover-run and confirms"| terminal
+    unsettled -->|"operator runs recover-run and confirms, once no runner can still start"| removed["abandoned launch removed"]
+```
+
+In both `recovery_required` cases the run still counts as running, so it keeps
+its concurrency slot and blocks another launch of the same experiment until
+`recover-run` settles it. A host reboot is the exception for a runner that died
+without a final status: its recorded boot proves nothing from that boot
+survived, so the run reads as `failed` without any signal being sent.
+
 Operator recovery is deliberately a CLI operation, not an agent tool:
 
 ```bash
 phasesweep mcp recover-run --state-dir /absolute/path/to/phasesweep-mcp-state --run-id <run-id>
 ```
 
-Read the command's report before any confirmed recovery action. Do not delete
-run-handle files individually: a run history consists of its handle and
-matching log/status/config sidecars. Archive that complete set only between
-campaigns after the run is terminal and no recovery is required.
+Without `--confirm`, the command only inspects the run and reports the actions
+it would take. Read that report, then repeat the command with `--confirm` to
+perform them.
+
+> [!WARNING]
+> Do not delete run-handle files individually: a run history consists of its
+> handle and matching log/status/config sidecars. Archive that complete set only
+> between campaigns after the run is terminal and no recovery is required.
 
 ## Security boundary
 
@@ -169,9 +203,11 @@ config. A catalog permission is not a grant to alter its config.
 No tool returns raw trainer logs, result files, commands, storage locations,
 or unredacted fixed/inherited values. Keep secrets, private paths, and data
 identifiers out of searchable categorical choices unless exposing them is an
-intentional catalog decision. Training still runs with the authority of the
-operator-authored command; MCP restricts agent inputs and outputs, not the
-trainer process itself.
+intentional catalog decision.
+
+> [!NOTE]
+> Training still runs with the authority of the operator-authored command; MCP
+> restricts agent inputs and outputs, not the trainer process itself.
 
 Clients that support resources can read `phasesweep://catalog` for the first
 catalog page. The packaged `phasesweep_run_and_monitor` prompt supplies the

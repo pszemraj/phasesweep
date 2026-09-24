@@ -1,0 +1,13 @@
+{
+  "run_id": "golden-precutover-run",
+  "experiment_id": "t",
+  "config_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "pid": 999999,
+  "pgid": 999999,
+  "pid_starttime": 111,
+  "started_at": "2024-01-01T00:00:00Z",
+  "launch_state": "spawned",
+  "allow_cancel": false,
+  "visible_params_at_launch": null,
+  "boot_id": null
+}

@@ -1,0 +1,499 @@
+"""Discover, materialize, and police the golden ledger fixtures.
+
+The fixtures under ``tests/fixtures/ledgers`` are real on-disk PhaseSweep
+output, so a test that reads one has to answer two questions before it can
+assert anything: where does the copy live, and what did it look like before the
+read? :func:`materialize` answers both, and :func:`forbid_file_backed_storage`
+turns the "read paths never construct file-backed storage" invariant into an
+error at the moment it is violated rather than a diff noticed afterwards.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import stat
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+from phasesweep import load_experiment
+from phasesweep.config import Experiment
+from phasesweep.engine.artifact_roots import (
+    _artifact_root_binding_payload,
+    _artifact_root_identity,
+)
+from phasesweep.engine.paths import (
+    _artifact_root_binding_path,
+    _generation_summary_path,
+    _generation_winner_path,
+    _last_successful_generation_path,
+)
+from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
+from tests.fixtures.make_ledger_fixtures import (
+    LEDGER_FILENAME,
+    experiment_payload,
+    storage_url,
+)
+
+LEDGER_FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "ledgers"
+
+#: Read modes a fixture can be exercised under. ``tree`` keeps the fixture's own
+#: artifact root, so the artifact-root binding participates; ``ledger-only``
+#: points the same ledger at a workdir that has never existed, which is what a
+#: fresh checkout reading an inherited ledger actually looks like.
+LEDGER_MODES = ("tree", "ledger-only")
+
+
+#: One snapshot entry: ``st_mode`` file-type and permission bits, then the
+#: contents -- file bytes, a symlink's target, or ``None`` for anything else.
+TreeEntry = tuple[int, bytes | str | None]
+
+
+def tree_snapshot(root: Path) -> dict[str, TreeEntry]:
+    """Snapshot every entry below ``root``: its type, permission bits, and contents.
+
+    A read path writes when it creates a directory, even an empty one, or
+    changes a mode, not only when it changes file bytes, so all three are
+    recorded, along with ``root`` itself as ``"."``. Timestamps are left out:
+    reads legitimately move atimes, and mtimes would make the snapshot noisy.
+
+    :param Path root: Directory to snapshot.
+    :return dict[str, TreeEntry]: POSIX relative path to its entry.
+    """
+    snapshot: dict[str, TreeEntry] = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        info = path.lstat()
+        content: bytes | str | None = None
+        if stat.S_ISREG(info.st_mode):
+            content = path.read_bytes()
+        elif stat.S_ISLNK(info.st_mode):
+            content = os.readlink(path)
+        mode = stat.S_IFMT(info.st_mode) | stat.S_IMODE(info.st_mode)
+        snapshot[path.relative_to(root).as_posix()] = (mode, content)
+    return snapshot
+
+
+def tree_changes(before: dict[str, TreeEntry], after: dict[str, TreeEntry]) -> dict[str, str]:
+    """Describe how one tree snapshot differs from another.
+
+    :param dict[str, TreeEntry] before: Earlier :func:`tree_snapshot` snapshot.
+    :param dict[str, TreeEntry] after: Later snapshot of the same root.
+    :return dict[str, str]: Relative path to ``"added"``, ``"removed"``,
+        ``"rewritten"``, or a mode change, for every entry that differs.
+    """
+    diff = {path: "added" for path in after.keys() - before.keys()}
+    diff.update({path: "removed" for path in before.keys() - after.keys()})
+    for path in before.keys() & after.keys():
+        (old_mode, old_content), (new_mode, new_content) = before[path], after[path]
+        changed = ["rewritten"] if old_content != new_content else []
+        if old_mode != new_mode:
+            changed.append(f"mode {old_mode:o} -> {new_mode:o}")
+        if changed:
+            diff[path] = ", ".join(changed)
+    return diff
+
+
+@dataclass(frozen=True)
+class LedgerFixture:
+    """One committed golden ledger fixture and its manifest."""
+
+    name: str
+    path: Path
+    manifest: dict[str, Any]
+
+    @property
+    def modes(self) -> tuple[str, ...]:
+        """Return the read modes this fixture declares.
+
+        :return tuple[str, ...]: Declared modes, possibly empty.
+        """
+        return tuple(self.manifest["modes"])
+
+    def expected(self, mode: str) -> str:
+        """Return the verdict this fixture owes a read path in one mode.
+
+        :param str mode: ``"tree"`` or ``"ledger-only"``.
+        :return str: ``"ok"``, ``"schema-mismatch"``, or ``"root-conflict"``.
+        """
+        return str(self.manifest["expect"][mode])
+
+
+@dataclass(frozen=True)
+class Materialized:
+    """A fixture copied into a temporary tree, ready to be read."""
+
+    root: Path
+    experiment: Experiment
+    config_path: Path
+    ledger_dir: Path
+    before: dict[str, TreeEntry]
+
+    def unchanged(self) -> bool:
+        """Return whether the materialized tree is exactly as materialization left it.
+
+        :return bool: ``True`` when no entry below ``root`` was added, removed,
+            rewritten, or re-moded since materialization.
+        """
+        return tree_snapshot(self.root) == self.before
+
+    def changes(self) -> dict[str, str]:
+        """Describe how the materialized tree differs from its snapshot.
+
+        :return dict[str, str]: Relative path to what changed, per
+            :func:`tree_changes`.
+        """
+        return tree_changes(self.before, tree_snapshot(self.root))
+
+
+def discover_ledger_fixtures() -> list[LedgerFixture]:
+    """Load every committed golden ledger fixture, in name order.
+
+    :return list[LedgerFixture]: Fixtures with their parsed manifests.
+    :raises FileNotFoundError: A fixture directory carries no manifest.
+    """
+    fixtures: list[LedgerFixture] = []
+    for path in sorted(LEDGER_FIXTURE_ROOT.iterdir()):
+        if not path.is_dir():
+            continue
+        manifest_path = path / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"{path} has no manifest.json; regenerate the fixtures")
+        fixtures.append(
+            LedgerFixture(
+                name=path.name,
+                path=path,
+                manifest=json.loads(manifest_path.read_text(encoding="utf-8")),
+            )
+        )
+    return fixtures
+
+
+def fixture_by_name(name: str) -> LedgerFixture:
+    """Return one committed fixture by name.
+
+    :param str name: Fixture directory name.
+    :return LedgerFixture: The matching fixture.
+    :raises KeyError: No committed fixture carries that name.
+    """
+    for fixture in discover_ledger_fixtures():
+        if fixture.name == name:
+            return fixture
+    raise KeyError(f"no golden ledger fixture named {name!r}")
+
+
+def copy_fixture(name: str, dest: Path) -> Path:
+    """Copy one committed fixture tree to a writable location.
+
+    The MCP run store is a private namespace whose permissions git cannot
+    carry, so it is restored here rather than left at the checkout's umask.
+
+    :param str name: Fixture directory name.
+    :param Path dest: Destination directory, which must not already exist.
+    :return Path: The copied fixture root.
+    """
+    shutil.copytree(fixture_by_name(name).path, dest)
+    mcp_state = dest / "mcp_state"
+    if mcp_state.is_dir():
+        mcp_state.chmod(0o700)
+        for child in mcp_state.rglob("*"):
+            if child.is_dir():
+                child.chmod(0o700)
+    return dest
+
+
+def _write_config(
+    config_path: Path, *, backend: str, ledger_dir: Path, workdir: Path
+) -> Experiment:
+    """Write and load the fixture experiment config for a materialized copy.
+
+    The config comes from the same builder the generator used, with only the
+    two paths substituted. Neither path is part of the experiment's semantic
+    fingerprint, and the builder pins the trainer cwd, so a fixture the current
+    generator produced reports ``published_config_matches_current`` from any
+    checkout path. The ``release-*`` fixtures carry their release's own
+    fingerprints; every read refuses them before comparing one.
+
+    :param Path config_path: Where to write the YAML.
+    :param str backend: Ledger backend recorded in the manifest.
+    :param Path ledger_dir: Directory holding the copied ledger file.
+    :param Path workdir: Artifact-root parent this read should use.
+    :return Experiment: Parsed experiment config.
+    """
+    payload = experiment_payload(
+        storage_url=storage_url(backend, ledger_dir),
+        workdir=workdir,
+    )
+    config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return load_experiment(config_path)
+
+
+def _rebind(experiment: Experiment, schema_version: int | None) -> None:
+    """Rewrite a copied artifact-root binding for its new absolute location.
+
+    The binding records the absolute artifact root and a digest of the storage
+    identity, so a copied tree's binding names the generation-time paths and
+    would fail ownership validation for reasons that have nothing to do with
+    the format boundary under test. Rewriting it restores the fixture's
+    *intended* difference -- its ``schema_version`` -- and nothing else.
+
+    :param Experiment experiment: Experiment owning the copied artifact root.
+    :param int | None schema_version: Schema version the fixture records.
+    """
+    path = _artifact_root_binding_path(experiment)
+    if not path.is_file():
+        return
+    payload = _artifact_root_binding_payload(experiment)
+    payload["schema_version"] = schema_version
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _rebind_studies(experiment: Experiment, ledger: Path, backend: str) -> None:
+    """Point a copied ledger's study root bindings at the copied artifact root.
+
+    The reverse half of :func:`_rebind`. Each study records the absolute root
+    it publishes into, so a copied study still names the generation-time tree,
+    and a reader that checks per-study ownership would refuse the copy for a
+    reason unrelated to the format boundary under test. Only that recorded
+    value is rewritten. SQLite gets a single ``UPDATE``, and each journal op
+    is re-encoded exactly as Optuna writes it, so everything else stays
+    byte-identical.
+
+    :param Experiment experiment: Experiment owning the copied artifact root.
+    :param Path ledger: Copied ``study.db`` or ``study.journal``.
+    :param str backend: ``"sqlite"`` or ``"journal"``.
+    """
+    root = _artifact_root_identity(experiment)
+    if backend == "sqlite":
+        conn = sqlite3.connect(ledger)
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE study_user_attributes SET value_json = ? WHERE key = ?",
+                    (json.dumps(root), ARTIFACT_ROOT_ATTR),
+                )
+        finally:
+            conn.close()
+        return
+    lines = ledger.read_text(encoding="utf-8").splitlines(keepends=True)
+    rebound: list[str] = []
+    for line in lines:
+        if ARTIFACT_ROOT_ATTR in line:
+            op = json.loads(line)
+            attrs = op.get("user_attr")
+            if "trial_id" not in op and isinstance(attrs, dict) and ARTIFACT_ROOT_ATTR in attrs:
+                attrs[ARTIFACT_ROOT_ATTR] = root
+                ending = line[len(line.rstrip("\n")) :]
+                line = json.dumps(op, separators=(",", ":")) + ending
+        rebound.append(line)
+    ledger.write_text("".join(rebound), encoding="utf-8")
+
+
+def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
+    """Copy one fixture into ``tmp_path`` and build the config that reads it.
+
+    ``tree`` mode copies the whole fixture, so the read sees the ledger *and*
+    the artifact root that claimed it. ``ledger-only`` copies just the ledger
+    and points the experiment at a workdir that does not exist, which is the
+    case a binding cannot answer and the ledger format scan must.
+
+    The config file and any MCP state a caller needs live beside ``root``, not
+    inside it, so ``root`` holds fixture bytes and nothing else.
+
+    :param str name: Fixture directory name.
+    :param Path tmp_path: Per-test temporary directory.
+    :param str mode: ``"tree"`` or ``"ledger-only"``.
+    :return Materialized: Copied tree, its experiment, and its byte snapshot.
+    :raises ValueError: ``mode`` is not a supported read mode.
+    """
+    if mode not in LEDGER_MODES:
+        raise ValueError(f"unsupported ledger fixture mode: {mode!r}")
+    fixture = fixture_by_name(name)
+    backend = str(fixture.manifest["backend"])
+    root = tmp_path / "fixture"
+    if mode == "tree":
+        copy_fixture(name, root)
+        workdir = root / "artifact_root"
+    else:
+        root.mkdir()
+        shutil.copytree(fixture.path / "ledger", root / "ledger")
+        # Never created: a read path that materializes it has written.
+        workdir = root / "unvisited_workdir"
+    experiment = _write_config(
+        tmp_path / "experiment.yaml",
+        backend=backend,
+        ledger_dir=root / "ledger",
+        workdir=workdir,
+    )
+    if mode == "tree":
+        _rebind(experiment, fixture.manifest["binding_schema_version"])
+        _rebind_studies(experiment, root / "ledger" / LEDGER_FILENAME[backend], backend)
+    return Materialized(
+        root=root,
+        experiment=experiment,
+        config_path=tmp_path / "experiment.yaml",
+        ledger_dir=root / "ledger",
+        before=tree_snapshot(root),
+    )
+
+
+def ledger_file(materialized: Materialized, backend: str) -> Path:
+    """Return the ledger file inside a materialized fixture.
+
+    :param Materialized materialized: Copied fixture.
+    :param str backend: Ledger backend recorded in the manifest.
+    :return Path: Absolute path to ``study.db`` or ``study.journal``.
+    """
+    return materialized.ledger_dir / LEDGER_FILENAME[backend]
+
+
+def rollback_journal(database: Path) -> Path:
+    """Return the rollback journal SQLite keeps beside ``database``.
+
+    :param Path database: SQLite database file.
+    :return Path: Its ``-journal`` sibling.
+    """
+    return database.with_name(f"{database.name}-journal")
+
+
+def leave_hot_journal(database: Path) -> None:
+    """Leave ``database`` exactly as a crash in the middle of a commit leaves it.
+
+    A writer with a ten-page cache spills uncommitted pages into its database
+    file after journaling their originals. Copying both files while that
+    transaction is still open captures what a SIGKILL at that instant would
+    leave on disk: rewritten pages and a hot journal that restores them, with
+    no second process involved.
+
+    :param Path database: Existing SQLite ledger holding at least one study.
+    """
+    writer = database.with_name(f"{database.name}.writer")
+    shutil.copyfile(database, writer)
+    with contextlib.closing(sqlite3.connect(writer, isolation_level=None)) as conn:
+        conn.execute("PRAGMA cache_size=10")
+        conn.execute("BEGIN IMMEDIATE")
+        for index in range(2000):
+            conn.execute(
+                "INSERT INTO study_user_attributes (study_id, key, value_json) VALUES (1, ?, ?)",
+                (f"uncommitted-{index}", json.dumps("x" * 500)),
+            )
+        shutil.copyfile(writer, database)
+        shutil.copyfile(rollback_journal(writer), rollback_journal(database))
+    writer.unlink()
+    with (
+        pytest.raises(sqlite3.OperationalError) as refused,
+        contextlib.closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as probe,
+    ):
+        probe.execute("SELECT 1 FROM sqlite_master").fetchone()
+    assert refused.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
+
+
+def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
+    """Point a publication pointer at ``summary_path``'s exact bytes."""
+    pointer = yaml.safe_load(pointer_path.read_text())
+    content = summary_path.read_bytes()
+    pointer["summary_size_bytes"] = len(content)
+    pointer["summary_sha256"] = hashlib.sha256(content).hexdigest()
+    pointer_path.write_text(yaml.safe_dump(pointer, sort_keys=False))
+
+
+def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
+    """Reseal the last-success publication so ``phase``'s winner is a partial result that still validates."""
+    generation = _last_successful_generation_id(experiment)
+    assert generation is not None
+    winner_path = _generation_winner_path(experiment, generation, phase)
+    summary_path = _generation_summary_path(experiment, generation)
+    winner = yaml.safe_load(winner_path.read_text())
+    summary = yaml.safe_load(summary_path.read_text())
+    # Only the named phase: the summary mirrors every phase's completion.
+    (mirrored,) = [entry for entry in summary["phases"] if entry["name"] == phase]
+    for payload in (winner, mirrored):
+        payload["completion"]["incomplete"] = True
+    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+    (listed,) = [
+        artifact
+        for artifact in summary["artifacts"]
+        if artifact["kind"] == "winner" and artifact["phase"] == phase
+    ]
+    listed["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
+
+
+def forbid_file_backed_storage(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make any file-backed storage construction fail, and record every attempt.
+
+    Durability invariant 6: a read path never creates a study and never builds
+    file-backed storage, and its SQLite reads open the database ``mode=ro``.
+    Three constructors can break that -- ``RDBStorage`` (which runs
+    ``metadata.create_all`` and a version manager on open), ``JournalFileBackend``
+    (which creates the journal if absent), and ``optuna.create_study`` -- plus
+    any read-write ``sqlite3.connect``.
+
+    ``optuna.load_study`` is deliberately *not* patched: the journal read path
+    legitimately loads a study over an in-memory ``_JournalSnapshot``, which
+    touches no file. ``JournalStorage`` itself is likewise allowed, because
+    that is the wrapper the snapshot is handed to.
+
+    The attempts are both raised *and* recorded, because several read paths
+    swallow broad exceptions to stay tolerant of a live writer; the returned
+    list survives that, so an assertion on it cannot be silenced.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture used to install the patches.
+    :return list[str]: Attempted constructions, appended to as they happen.
+    """
+    from optuna.storages._rdb.storage import RDBStorage
+    from optuna.storages.journal._file import JournalFileBackend
+
+    attempts: list[str] = []
+
+    def refuse(label: str) -> Any:
+        """Build a replacement constructor that records and refuses every call.
+
+        :param str label: Name reported in the recorded attempt.
+        :return Any: Callable to install in place of the real constructor.
+        """
+
+        def constructor(*args: Any, **kwargs: Any) -> Any:
+            """Record this construction attempt and refuse it.
+
+            :raises AssertionError: Always; a read path must never get here.
+            """
+            detail = f"{label}({args[1:]!r}, {kwargs!r})" if args else f"{label}({kwargs!r})"
+            attempts.append(detail)
+            raise AssertionError(f"read path constructed file-backed storage: {detail}")
+
+        return constructor
+
+    monkeypatch.setattr(RDBStorage, "__init__", refuse("RDBStorage"))
+    monkeypatch.setattr(JournalFileBackend, "__init__", refuse("JournalFileBackend"))
+
+    import optuna
+
+    monkeypatch.setattr(optuna, "create_study", refuse("optuna.create_study"))
+
+    real_connect = sqlite3.connect
+
+    def guarded_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        """Allow only read-only URI connections, recording and refusing the rest.
+
+        :param Any database: Database string or URI the caller passed.
+        :return sqlite3.Connection: The real read-only connection.
+        :raises AssertionError: The connection was not an explicit ``mode=ro`` URI.
+        """
+        if not kwargs.get("uri") or "mode=ro" not in str(database):
+            detail = f"sqlite3.connect({database!r}, uri={kwargs.get('uri')!r})"
+            attempts.append(detail)
+            raise AssertionError(f"read path opened SQLite read-write: {detail}")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", guarded_connect)
+    return attempts

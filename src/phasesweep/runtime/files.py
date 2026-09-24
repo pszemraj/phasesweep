@@ -12,10 +12,10 @@ import stat
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, ClassVar, Literal
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
-from phasesweep.errors import LockBusyError, PhaseSweepError
+from phasesweep.errors import LockBusyError, OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.runtime.files")
 
@@ -61,13 +61,19 @@ def file_sha256(path: Path) -> str:
 class UnsafeLockPathError(PhaseSweepError):
     """Raised when a lock directory or file is not safe to trust."""
 
+    default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
+
 
 class UnsafePrivatePathError(PhaseSweepError):
     """Raised when a private directory or file is not safe to mutate."""
 
+    default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE
+
 
 class PlatformCapabilityError(PhaseSweepError):
     """Raised when the host lacks a capability required for safe operation."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
 
 
 @dataclass(frozen=True)
@@ -148,7 +154,9 @@ def phasesweep_home() -> Path | None:
         return None
     path = Path(override)
     if not path.is_absolute():
-        raise UnsafePrivatePathError(f"PHASESWEEP_HOME must be an absolute path: {path}")
+        raise UnsafePrivatePathError(
+            f"PHASESWEEP_HOME must be an absolute path: {path}", action=OperatorAction.FIX_CONFIG
+        )
     try:
         validate_private_dir(path)
     except FileNotFoundError as exc:
@@ -177,7 +185,10 @@ def lock_dir() -> Path:
     if override:
         path = Path(override)
         if not path.is_absolute():
-            raise UnsafeLockPathError(f"{_LOCK_DIR_ENV} must be an absolute path: {path}")
+            raise UnsafeLockPathError(
+                f"{_LOCK_DIR_ENV} must be an absolute path: {path}",
+                action=OperatorAction.FIX_CONFIG,
+            )
         _lock_policy(path)
         return path
 
@@ -186,17 +197,22 @@ def lock_dir() -> Path:
 
     # Shells and services for one account must contend even when HOME or XDG
     # settings differ. Only the explicit lock override may move this namespace.
+    # Without a usable home, the operator provisions a lock directory and
+    # points the override at it, since the override never creates what it
+    # names. Both are setting up the environment PhaseSweep runs in: one step.
     try:
         home = Path(pwd.getpwuid(os.geteuid()).pw_dir)
     except KeyError as exc:
         raise UnsafeLockPathError(
             f"No OS account home exists for uid {os.geteuid()}; provision an absolute "
-            f"lock directory and set {_LOCK_DIR_ENV}."
+            f"lock directory and set {_LOCK_DIR_ENV}.",
+            action=OperatorAction.FIX_CONFIG,
         ) from exc
     if not home.is_absolute():
         raise UnsafeLockPathError(
             f"The OS account home is not absolute; provision an absolute lock directory "
-            f"and set {_LOCK_DIR_ENV}."
+            f"and set {_LOCK_DIR_ENV}.",
+            action=OperatorAction.FIX_CONFIG,
         )
     path = home / ".cache" / "phasesweep" / "locks"
     try:
@@ -296,7 +312,7 @@ def open_lock_file(path: Path) -> IO[str]:
         the leaf name is unsafe, or the file fails the regular-file/ownership/
         mode checks.
     """
-    from phasesweep.runtime.process import defer_shutdown_signals
+    from phasesweep.runtime.shutdown import defer_shutdown_signals
 
     with defer_shutdown_signals():
         return _open_lock_file(path)
@@ -462,7 +478,7 @@ def nofollow_flag() -> int:
         ``O_NOFOLLOW``, so private files cannot be opened without following
         symlinks.
     """
-    nofollow = getattr(os, "O_NOFOLLOW", None)
+    nofollow: int | None = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise PlatformCapabilityError(
             "This platform cannot safely access private files without following symlinks."
@@ -587,7 +603,7 @@ def open_directory_fd(
     owner/mode policy, and only when ``private_final`` is true.
 
     The walk runs with shutdown signals deferred (see
-    :func:`phasesweep.runtime.process.defer_shutdown_signals`), so
+    :func:`phasesweep.runtime.shutdown.defer_shutdown_signals`), so
     ``PhaseSweepShutdown`` cannot land between the per-component descriptor
     handoffs and strand an intermediate descriptor. A shutdown that arrives
     mid-walk is serviced when the walk finishes: the just-opened final
@@ -613,7 +629,7 @@ def open_directory_fd(
         pre-open stat and the open, or the final component fails the
         private policy when ``private_final`` is true.
     """
-    from phasesweep.runtime.process import defer_shutdown_signals
+    from phasesweep.runtime.shutdown import defer_shutdown_signals
 
     result_fd = -1
     try:
@@ -822,7 +838,7 @@ def open_private_text(path: Path, mode: str = "w") -> IO[str]:
     :raises ValueError: If ``mode`` is unsupported.
     :raises UnsafePrivatePathError: If the file or its parent path is unsafe.
     """
-    from phasesweep.runtime.process import defer_shutdown_signals
+    from phasesweep.runtime.shutdown import defer_shutdown_signals
 
     if mode not in {"w", "a", "x"}:
         raise ValueError(f"unsupported private text mode: {mode!r}")
@@ -1225,6 +1241,15 @@ def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
     return parse_qsl(query, keep_blank_values=True)
 
 
+def storage_url_query_keys(storage: str) -> list[str]:
+    """Return a storage URL's query keys as spelled, repeats included, in order.
+
+    :param str storage: Storage URL whose query string should be inspected.
+    :return list[str]: Every query key, unchanged.
+    """
+    return [key for key, _value in _url_query_pairs(storage)]
+
+
 def storage_url_query_options(storage: str) -> dict[str, str]:
     """Return lower-cased URL query options for storage policy checks.
 
@@ -1329,6 +1354,44 @@ def sqlite_database_path(storage: str) -> Path | None:
     return Path(database)
 
 
+def sqlalchemy_sqlite_path(storage: str) -> Path | None:
+    """Return the database file Optuna's SQLAlchemy engine opens for a SQLite URL.
+
+    Optuna hands a SQLite URL to SQLAlchemy, so SQLAlchemy's reading of it,
+    not :func:`sqlite_database_path`'s, decides which file holds the ledger.
+    This runs the same URL parsing and ``create_connect_args`` the engine
+    runs, then applies SQLite's rule to the filename that produces: it is a
+    ``file:`` URI only when the connect arguments enable URIs and it starts
+    with ``file:``, and otherwise a plain filename.
+
+    :param str storage: SQLite storage URL.
+    :return Path | None: Absolute database path, or ``None`` when SQLite opens
+        an in-memory or temporary database instead of a file.
+    :raises ValueError: SQLAlchemy cannot parse the URL or build its connect
+        arguments, or the URI filename names another host.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        url = make_url(storage)
+        arguments, options = url.get_dialect()().create_connect_args(url)
+    except (SQLAlchemyError, TypeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
+    database = str(arguments[0])
+    if not options.get("uri"):
+        return None if database == ":memory:" else Path(database).absolute()
+    if not database.startswith("file:"):
+        return None if database in {"", ":memory:"} else Path(database).absolute()
+    parsed = urlsplit(database)
+    if parsed.netloc not in {"", "localhost"}:
+        raise ValueError(f"the URI filename names host {parsed.netloc!r}")
+    path = unquote(parsed.path)
+    if path in {"", ":memory:"} or ("mode", "memory") in parse_qsl(parsed.query):
+        return None
+    return Path(path).absolute()
+
+
 def sqlite_readonly_uri(storage: str) -> str | None:
     """Build a ``sqlite3.connect(..., uri=True)`` URI for read-only status reads.
 
@@ -1340,6 +1403,29 @@ def sqlite_readonly_uri(storage: str) -> str | None:
     :param str storage: SQLite storage URL.
     :return str | None: Read-only SQLite URI, or ``None`` for in-memory storage.
     """
+    return _sqlite_connect_uri(storage, "ro")
+
+
+def sqlite_existing_readwrite_uri(storage: str) -> str | None:
+    """Build a ``sqlite3.connect(..., uri=True)`` URI that writes but never creates.
+
+    Same file as :func:`sqlite_readonly_uri`, opened ``mode=rw``: SQLite may
+    write to an existing database, such as rolling back a journal a crash left
+    behind, but refuses to open a missing one rather than creating it.
+
+    :param str storage: SQLite storage URL.
+    :return str | None: Read-write SQLite URI, or ``None`` for in-memory storage.
+    """
+    return _sqlite_connect_uri(storage, "rw")
+
+
+def _sqlite_connect_uri(storage: str, mode: Literal["ro", "rw"]) -> str | None:
+    """Build a ``sqlite3`` URI for a SQLite storage URL's file in one open mode.
+
+    :param str storage: SQLite storage URL.
+    :param Literal["ro", "rw"] mode: SQLite ``mode`` URI parameter; neither creates a file.
+    :return str | None: SQLite URI, or ``None`` for in-memory storage.
+    """
     if storage_is_in_memory(storage):
         return None
 
@@ -1350,11 +1436,11 @@ def sqlite_readonly_uri(storage: str) -> str | None:
             for key, value in _url_query_pairs(storage)
             if key.lower() not in {"mode", "uri"}
         ]
-        params.append(("mode", "ro"))
+        params.append(("mode", mode))
         return f"{database}?{urlencode(params)}"
 
     path = Path(database).resolve()
-    return f"file:{quote(str(path), safe='/')}?mode=ro"
+    return f"file:{quote(str(path), safe='/')}?mode={mode}"
 
 
 def storage_recovery_locator(storage: str | None) -> str | None:

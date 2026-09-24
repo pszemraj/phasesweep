@@ -7,12 +7,15 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import optuna
 
 from phasesweep.config import Experiment
-from phasesweep.engine.artifact_roots import _check_published_phase_studies
+from phasesweep.engine.artifact_roots import (
+    _check_published_phase_studies,
+    _check_study_artifact_root,
+)
 from phasesweep.engine.attempts import (
     _inspect_active_attempts,
     _preflight_active_attempts,
@@ -26,17 +29,30 @@ from phasesweep.engine.cleanup import (
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
 )
-from phasesweep.engine.errors import PublishedStudyMissingError, StudyStorageUnavailableError
+from phasesweep.engine.errors import (
+    ArtifactRootConflictError,
+    IncompleteJournalRecordError,
+    LedgerTransactionInterruptedError,
+    PublishedStudyMissingError,
+    StudySchemaMismatchError,
+    StudyStorageUnavailableError,
+)
+from phasesweep.engine.ledger import (
+    open_existing_study,
+    require_complete_journal,
+    roll_back_interrupted_transaction,
+    validate_ledger,
+)
 from phasesweep.engine.locking import _experiment_lock
-from phasesweep.engine.optuna import _load_existing_phase_study
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.errors import PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     ProcessIdentity,
     RunHandle,
     RunStore,
+    UnsupportedStateFormatError,
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (
@@ -45,13 +61,20 @@ from phasesweep.mcp.snapshots import (
     mark_result_snapshot_published,
     parse_result_snapshot,
 )
-from phasesweep.runtime.files import private_atomic_write_text
-from phasesweep.runtime.process import is_same_live_process, kill_stale_group, read_boot_id
+from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
+from phasesweep.runtime.reaper import is_same_live_process, kill_stale_group, read_boot_id
 from phasesweep.runtime.time import utc_now_iso
 
 
 class RunRecoveryError(PhaseSweepError):
-    """An operator recovery request cannot be completed safely."""
+    """An operator recovery request cannot be completed safely.
+
+    Every raise happens inside ``recover-run``, so the class default cannot be
+    that command: a raise whose remedy is a confirmed ``recover-run`` says so
+    explicitly or inherits it from its cause.
+    """
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
 
 @dataclass(frozen=True)
@@ -98,8 +121,13 @@ def recover_run(
     """
     try:
         store = RunStore.open_existing(state_dir)
+    except UnsupportedStateFormatError as exc:
+        raise RunRecoveryError(str(exc), action=OperatorAction.USE_PRIOR_RELEASE) from None
     except ValueError as exc:
-        raise RunRecoveryError(str(exc)) from None
+        # Not a state directory at all: the path given is what needs fixing.
+        raise RunRecoveryError(str(exc), action=OperatorAction.FIX_CONFIG) from None
+    except UnsafePrivatePathError as exc:
+        raise RunRecoveryError.rewrap(exc, str(exc)) from None
     handle = store.get(run_id)
     if handle is None:
         _recover_pre_spawn_orphan(store, run_id, confirm=confirm, emit=emit)
@@ -174,10 +202,13 @@ def recover_run(
                 terminal_status["result_snapshot_state"] = "pending"
                 try:
                     write_status_file(store.status_path(run_id), terminal_status)
-                except Exception as exc:
-                    raise RunRecoveryError(
+                # The write is filesystem work an operator can fix; anything
+                # else is a defect and keeps its traceback.
+                except (PhaseSweepError, OSError) as exc:
+                    raise RunRecoveryError.rewrap(
+                        exc,
                         f"failed to finalize terminal result snapshot for {run_id}: "
-                        f"{type(exc).__name__}"
+                        f"{type(exc).__name__}",
                     ) from None
             repairing_complete_snapshot = (
                 needs.snapshot_finalize_needed
@@ -211,8 +242,13 @@ def recover_run(
                 )
     except RunRecoveryError:
         raise
-    except RuntimeError as exc:
-        raise RunRecoveryError(str(exc)) from None
+    except (PhaseSweepError, OSError) as exc:
+        # The chain is suppressed but the remedy is not: a lock held elsewhere
+        # or a damaged publication keeps the action its own raise site chose.
+        # An OSError comes from recovery's own state writes, which the operator
+        # can repair; any other exception is a defect and reaches the CLI's
+        # internal-error boundary with its traceback.
+        raise RunRecoveryError.rewrap(exc, str(exc)) from None
 
 
 def _recover_pre_spawn_orphan(
@@ -233,7 +269,8 @@ def _recover_pre_spawn_orphan(
     with store.launch_lock() as acquired:
         if not acquired:
             raise RunRecoveryError(
-                "another MCP launch is in progress; wait for it to finish and retry"
+                "another MCP launch is in progress; wait for it to finish and retry",
+                action=OperatorAction.RETRY,
             )
         if store.is_pre_spawn_orphan(run_id):
             if not confirm:
@@ -262,7 +299,10 @@ def _recover_pre_spawn_orphan(
                 f"start a trainer under this identity.{log_result}"
             )
             return
-    raise RunRecoveryError(f"unknown run id: {run_id}")
+    raise RunRecoveryError(
+        f"unknown run id: {run_id}; pass a run id this MCP state directory records.",
+        action=OperatorAction.FIX_CONFIG,
+    )
 
 
 def _resolve_launch_state(
@@ -293,7 +333,8 @@ def _resolve_launch_state(
                 "pre-spawn failure from a child that has not persisted its process identity. "
                 "The run remains reserved. Wait briefly and retry; if this persists after a "
                 "server crash, inspect the host because automated recovery cannot safely "
-                "declare that no runner was spawned."
+                "declare that no runner was spawned.",
+                action=OperatorAction.RETRY,
             )
     return handle, terminal_status
 
@@ -401,8 +442,12 @@ def _require_dead_runner(
             "runner process identity has no Linux /proc start time; refusing automated "
             "recovery because PID reuse cannot be ruled out"
         )
+    # The live runner holds the run: once cancel_run stops it, the same request
+    # can proceed, while another recover-run would stop at this same check.
     if not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise RunRecoveryError("runner still appears live; use cancel_run first")
+        raise RunRecoveryError(
+            "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
+        )
 
 
 def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
@@ -413,17 +458,30 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
     :raises RunRecoveryError: The snapshot is missing, unreadable, invalid, or digest-mismatched.
     :return Experiment: Parsed experiment configuration from the verified stored snapshot.
     """
+    # The snapshot is the run's own record in the state directory, pinned by
+    # digest, so a missing or altered one is restored rather than rewritten.
     snapshot = store.config_snapshot_path(handle.run_id)
     if not snapshot.is_file():
-        raise RunRecoveryError(f"run config snapshot is missing: {snapshot}")
+        raise RunRecoveryError(
+            f"run config snapshot is missing: {snapshot}. Restore it before retrying recovery.",
+            action=OperatorAction.RESTORE_TREE,
+        )
     try:
         return load_experiment_snapshot(
             snapshot, handle.config_sha256, source=f"run snapshot {handle.run_id}"
         )
     except OSError as exc:
-        raise RunRecoveryError(f"cannot read run config snapshot: {snapshot}") from exc
+        raise RunRecoveryError(
+            f"cannot read run config snapshot: {snapshot}. Restore it or access to it "
+            "before retrying recovery.",
+            action=OperatorAction.RESTORE_TREE,
+        ) from exc
     except ValueError as exc:
-        raise RunRecoveryError(f"{exc}; refusing recovery") from None
+        raise RunRecoveryError(
+            f"{exc}; refusing recovery. Restore the run's original config snapshot "
+            "before retrying recovery.",
+            action=OperatorAction.RESTORE_TREE,
+        ) from None
 
 
 def _cleanup_runner(
@@ -449,7 +507,9 @@ def _cleanup_runner(
     # Keep the lock from this liveness check through every signal, study
     # mutation, and recovery-state write in recover_run.
     if confirm and not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
-        raise RunRecoveryError("runner still appears live; use cancel_run first")
+        raise RunRecoveryError(
+            "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
+        )
     if (
         needs.cleanup_needed
         and confirm
@@ -488,32 +548,90 @@ def _publication_recovery_action(
         raise RunRecoveryError(
             "the prepared run result cannot be reconciled because the "
             "last-success publication is invalid or unreadable. Restore the "
-            "publication evidence or access to it before retrying recovery."
+            "publication evidence or access to it before retrying recovery.",
+            action=OperatorAction.RESTORE_TREE,
         )
     return None, None
 
 
-def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[str, optuna.Study]:
+def _load_recovery_studies(
+    config: Experiment, needs: _RecoveryNeeds, *, confirm: bool = False
+) -> dict[str, optuna.Study]:
     """Load phase studies needed to inspect or reconcile trial cleanup evidence.
 
     When ownership storage was unavailable during the run, verifies the published phase history
     before allowing recovery to treat the run as having no owned trial.
 
+    Validation comes first and is read-only, so recovery refuses a tree bound
+    to another ledger, or a pre-cutover ledger, before it opens anything and
+    without changing a byte. A confirmed recovery holds the experiment lock,
+    so it alone then lets SQLite roll back a transaction a crash interrupted;
+    inspection reports that ledger unavailable and leaves it untouched. Both
+    refuse a journal whose final record is partial, since inspection previews
+    a write that must not append after it. Each opened study then passes the read-only
+    ownership half of the check a run's claim applies, because recovery reaps
+    and tells trials through these live objects: a study bound to another
+    artifact root belongs to that root's runs, and recovering this tree must
+    not touch it. A study with no root claim yet is left unclaimed; recovery
+    never claims.
+    These refusals are rewrapped rather than rebuilt: the engine's own message
+    is already the operator's instruction, and ``rewrap`` carries its
+    remediation across the layer boundary intact.
+
     :param Experiment config: Experiment defining phase names and storage locations.
     :param _RecoveryNeeds needs: Recovery decisions that may require published-history checks.
-    :raises RunRecoveryError: Required storage or published studies cannot be read.
+    :param bool confirm: The caller holds the experiment lock for a confirmed
+        recovery, so SQLite may roll back an interrupted transaction.
+    :raises RunRecoveryError: The ledger is refused, a phase study belongs to
+        another artifact root, or required storage or published studies cannot
+        be read.
     :return dict[str, optuna.Study]: Loadable phase studies keyed by phase name.
     """
+    # A storage refusal gains a recover-run retry here, but that retry cannot
+    # succeed until the ledger is back, so these wraps route to restoring it.
+    unavailable_remedy = (
+        " Restore the original complete storage ledger and access "
+        "to it, then retry phasesweep mcp recover-run."
+    )
+    try:
+        ledger = validate_ledger(config)
+        if confirm:
+            ledger = roll_back_interrupted_transaction(ledger)
+        # Inspection previews the confirmed write, so it refuses what that refuses.
+        require_complete_journal(ledger)
+    except (
+        ArtifactRootConflictError,
+        StudySchemaMismatchError,
+        IncompleteJournalRecordError,
+        LedgerTransactionInterruptedError,
+    ) as exc:
+        raise RunRecoveryError.rewrap(exc, str(exc)) from exc
+    except StudyStorageUnavailableError as exc:
+        raise RunRecoveryError(
+            f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
+        ) from exc
     loaded_studies = {}
     for phase in config.phases:
         try:
-            study = _load_existing_phase_study(config, phase)
+            study = open_existing_study(ledger, phase)
+        except LedgerTransactionInterruptedError as exc:
+            # The ledger is intact: its own remedy, a confirmed recover-run,
+            # replaces the restore every other storage refusal needs.
+            raise RunRecoveryError.rewrap(exc, str(exc)) from exc
         except StudyStorageUnavailableError as exc:
             raise RunRecoveryError(
-                f"{exc} Restore the original complete storage ledger and access "
-                "to it, then retry phasesweep mcp recover-run."
+                f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
             ) from exc
         if study is not None:
+            try:
+                _check_study_artifact_root(study, config)
+            except ArtifactRootConflictError as exc:
+                # The config is the run's digest-pinned snapshot and MCP
+                # workdirs are absolute, so only the filesystem can have moved
+                # the root away: restore it, not the config the claim path fixes.
+                raise RunRecoveryError.rewrap(
+                    exc, str(exc), action=OperatorAction.RESTORE_TREE
+                ) from exc
             loaded_studies[phase.name] = study
     if needs.ownership_storage_unavailable:
         try:
@@ -530,7 +648,8 @@ def _load_recovery_studies(config: Experiment, needs: _RecoveryNeeds) -> dict[st
             raise RunRecoveryError(
                 f"{exc} Restore the original complete storage ledger "
                 "and study with access to it, then retry "
-                "phasesweep mcp recover-run."
+                "phasesweep mcp recover-run.",
+                action=OperatorAction.RESTORE_LEDGER,
             ) from exc
     return loaded_studies
 
@@ -568,7 +687,7 @@ def _recover_trial_evidence(
     inspected_attempt_locations: dict[str, tuple[str, int, str]] = {}
     inspected_studies = 0
     if needs.cleanup_needed:
-        loaded_studies = _load_recovery_studies(config, needs)
+        loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
         if confirm:
             active_report = _PreflightCleanupReport()
             registered_attempts = _preflight_active_attempts(
@@ -764,7 +883,7 @@ def _persist_cleanup_recovery(
 def _finish_result_recovery(
     store: RunStore,
     run_id: str,
-    terminal_status: dict[str, Any],
+    terminal_status: dict[str, object],
     needs: _RecoveryNeeds,
     evidence: _CleanupEvidence,
     publication_action: str | None,
@@ -838,7 +957,7 @@ def _finish_result_recovery(
 def _finalize_stored_terminal_result_snapshot(
     store: RunStore,
     run_id: str,
-    terminal_status: dict,
+    terminal_status: dict[str, object],
     *,
     confirmed_attempt_ids: set[str],
     confirmed_attempt_locations: dict[str, tuple[str, int, str]],
@@ -847,7 +966,7 @@ def _finalize_stored_terminal_result_snapshot(
 
     :param RunStore store: Existing run store containing the terminal status.
     :param str run_id: Run whose stored terminal snapshot should be finalized.
-    :param dict terminal_status: Validated terminal process status to enrich.
+    :param dict[str, object] terminal_status: Validated terminal process status to enrich.
     :param set[str] confirmed_attempt_ids: Exact attempts durably reconciled to FAIL.
     :param dict confirmed_attempt_locations: Phase, trial, and generation of reconciled attempts.
     :raises RunRecoveryError: The stored snapshot is unavailable or persistence fails.
@@ -868,13 +987,18 @@ def _finalize_stored_terminal_result_snapshot(
         )
         terminal_status["result_snapshot_state"] = "complete"
         write_status_file(store.status_path(run_id), terminal_status)
-    except Exception as exc:  # noqa: BLE001 - report operator repair failures
+    except Exception as exc:  # noqa: BLE001 - restore the prior view, then sort below
+        # Whatever failed, the prior frozen view is put back before it propagates.
         terminal_status["result_snapshot"] = raw_snapshot
         terminal_status["result_snapshot_state"] = prior_state
         if prior_state != "complete":
             terminal_status["result_snapshot_error"] = type(exc).__name__
             with contextlib.suppress(Exception):
                 write_status_file(store.status_path(run_id), terminal_status)
-        raise RunRecoveryError(
-            f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
+        # Only a refusal or the status write's filesystem failure is the
+        # operator's to repair; anything else is a defect and keeps its traceback.
+        if not isinstance(exc, (PhaseSweepError, OSError)):
+            raise
+        raise RunRecoveryError.rewrap(
+            exc, f"failed to finalize terminal result snapshot for {run_id}: {type(exc).__name__}"
         ) from None

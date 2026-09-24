@@ -407,7 +407,28 @@ def _extract_log_regex(
 def _capture_wandb(
     ctx: TrialContext, cfg: _WandbSummarySource, *, deadline: float | None = None
 ) -> dict[str, Any]:
-    """Obtain one accepted capture shared by all remote consumers of this attempt."""
+    """Obtain one accepted capture shared by all remote consumers of this attempt.
+
+    Args:
+        ctx: Trial context; ``wandb_capture`` caches the accepted capture and
+            ``wandb_query`` carries the phase's agreed query, if any.
+        cfg: W&B extractor or gate config used to build a one-off query when
+            the context carries none.
+        deadline: Optional absolute ``time.monotonic()`` phase/run deadline;
+            polling stops at the earlier of it and the source timeout.
+
+    Returns:
+        The shared capture: remote target, finished run state, requested
+        numeric values, present keys, and retrieval time.
+
+    Raises:
+        DeadlineExceededError: The phase/run deadline expired before an
+            accepted capture.
+        ExtractorError: The poll timed out, setup failed, the run ended
+            unsuccessfully, the SDK is missing, or the evidence is invalid.
+        UnsafeProcessCleanupError: Worker cleanup is uncertain.
+
+    """
     import time
 
     if ctx.wandb_capture:
@@ -490,7 +511,25 @@ def _extract_wandb(
     *,
     deadline: float | None = None,
 ) -> float:
-    """Read an exact numeric key from the attempt's shared finished capture."""
+    """Read an exact numeric key from the attempt's shared finished capture.
+
+    Args:
+        ctx: Trial context whose shared W&B capture supplies the value.
+        cfg: ``WandbExtractor`` config naming the remote target and the exact
+            summary key.
+        provenance: Optional sink that receives the evidence ``source`` and
+            the shared ``remote_capture`` on success.
+        deadline: Optional absolute ``time.monotonic()`` phase/run deadline
+            for obtaining the capture.
+
+    Returns:
+        The finite numeric value of ``metric_key``.
+
+    Raises:
+        ExtractorError: The capture failed or its deadline expired, or the key
+            has no valid finite numeric value.
+
+    """
     capture = _capture_wandb(ctx, cfg, deadline=deadline)
     try:
         value = json_float(capture["values"][cfg.metric_key], label=cfg.metric_key)
@@ -743,7 +782,15 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
 def _wandb_summary_required(
     ctx: TrialContext, gate: WandbSummaryRequiredGate, *, deadline: float | None = None
 ) -> GateResult:
-    """Check key presence in the same capture used by objectives and constraints."""
+    """Check key presence in the same capture used by objectives and constraints.
+
+    :param TrialContext ctx: Trial context whose shared W&B capture is inspected.
+    :param WandbSummaryRequiredGate gate: Gate config naming the required summary keys.
+    :param float | None deadline: Optional absolute ``time.monotonic()`` phase/run
+        deadline for obtaining the capture.
+    :return GateResult: Pass/fail result and human-readable detail; a failed capture
+        fails the gate, marked ``deadline_exhausted`` when the deadline expired.
+    """
     try:
         capture = _capture_wandb(ctx, gate, deadline=deadline)
     except DeadlineExceededError as exc:

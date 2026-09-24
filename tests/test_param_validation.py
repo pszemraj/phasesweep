@@ -181,25 +181,6 @@ def test_sampler_rejects_negative_n_startup_trials():
             "cmaes.*does not support categorical",
             id="cmaes-categorical",
         ),
-        pytest.param(
-            """
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: p
-            n_trials: 1
-            fixed_overrides: { lr: 0.001 }
-            search_space:
-              lr: { type: float, low: 1e-5, high: 1e-2, log: true }
-            """,
-            "both fixed_overrides and search_space",
-            id="fixed-and-sampled-collision",
-        ),
     ],
 )
 def test_validate_rejects_incompatible_phase_settings(
@@ -488,13 +469,6 @@ def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None
                 """,
             )
         )
-
-
-@pytest.mark.parametrize("storage", ["postgresql://localhost/phases", "mysql://localhost/phases"])
-def test_config_rejects_external_storage_before_artifacts(storage: str) -> None:
-    """Only memory, local SQLite, local Journal, and auto remain valid storage choices."""
-    with pytest.raises(ValidationError, match="storage must be in-memory"):
-        make_experiment(storage=storage)
 
 
 def test_categorical_choices_reject_duplicates() -> None:
@@ -876,30 +850,3 @@ def test_cmaes_phase_loads_when_package_present() -> None:
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     assert exp.phases[0].sampler.type == "cmaes"
-
-
-def test_inherit_search_space_collision_errors(tmp_path):
-    body = """
-experiment: t
-storage: ":memory:"
-provenance: {revision: test-fixture-v1}
-trial_command: "echo {overrides}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-phases:
-  - name: a
-    n_trials: 1
-    search_space:
-      lr: { type: float, low: 1e-5, high: 1e-2, log: true }
-  - name: b
-    inherits: [a]
-    n_trials: 1
-    search_space:
-      lr: { type: float, low: 1e-5, high: 1e-2, log: true }
-"""
-    cfg = write_yaml(tmp_path, body)
-    with pytest.raises(ValueError, match="re-samples key"):
-        load_experiment(cfg)

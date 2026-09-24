@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import stat
 import subprocess
@@ -18,8 +17,15 @@ from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
-from phasesweep.cli import main as cli_boundary
-from phasesweep.config import Experiment
+from phasesweep.config import (
+    Experiment,
+    FloatParam,
+    JsonEnvelopeExtractor,
+    LogRegexExtractor,
+    Metric,
+    Phase,
+    Sampler,
+)
 from phasesweep.engine import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
@@ -46,12 +52,16 @@ from phasesweep.errors import GpuConfigurationError, LockBusyError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
-from phasesweep.runtime.process import PhaseSweepShutdown, ShutdownCleanupReport
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from tests.conftest import (
+    invoke_cli_boundary,
     make_experiment,
-    write_trainer,
-    write_yaml,
+    requires_nonroot,
+    write_constant_trainer,
+    write_param_echo_trainer,
 )
+from tests.ledger_fixtures import materialize
+from tests.recovery_helpers import recover_run_cli
 
 
 @pytest.mark.parametrize(
@@ -210,10 +220,7 @@ def test_recover_run_expands_user_state_dir(
     monkeypatch.setenv("HOME", str(tmp_path))
     RunStore(tmp_path / "state")
 
-    result = CliRunner().invoke(
-        cli_main,
-        ["mcp", "recover-run", "--state-dir", "~/state", "--run-id", "missing"],
-    )
+    result = recover_run_cli("~/state", "missing")
 
     assert result.exit_code != 0
     assert "unknown run id: missing" in result.output
@@ -240,10 +247,7 @@ def test_recover_run_surfaces_host_error_suggestion(
 
     monkeypatch.setattr("phasesweep.cli.require_linux_mcp_host", refuse_host)
 
-    result = CliRunner().invoke(
-        cli_main,
-        ["mcp", "recover-run", "--state-dir", str(tmp_path / "state"), "--run-id", "missing"],
-    )
+    result = recover_run_cli(tmp_path / "state", "missing")
 
     assert result.exit_code != 0
     assert "cannot read this process's Linux /proc start time" in result.output
@@ -370,32 +374,24 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     """``show-winners`` prints comment before the winner block so the reader
     frames numerical results against intent. Also covers the no-winner-yet
     branch — the comment is still surfaced even before a phase has run."""
-    workdir = tmp_path / "wd"
 
-    def make_cfg(workdir_str: str) -> Path:
+    def make_cfg(workdir: Path) -> Path:
         cfg = tmp_path / "exp.yaml"
-        cfg.write_text(
-            textwrap.dedent(f"""
-            experiment: t
-            workdir: {workdir_str}
-            trial_command: "echo x=0.5 {{overrides}}"
-            override_format: argparse
-            metric:
-              extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-            phases:
-              - name: depth
-                comment: settle the depth before anything else.
-                n_trials: 1
-                sampler: {{ type: random, seed: 0 }}
-                search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-            """)
+        experiment = make_experiment(
+            workdir=workdir,
+            trial_command="echo x=0.5 {overrides}",
+            name="depth",
+            comment="settle the depth before anything else.",
+            n_trials=1,
+            sampler=Sampler(type="random", seed=0),
         )
+        cfg.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
         return cfg
 
     runner = CliRunner()
 
     # With a winner: comment must come BEFORE the winner block.
-    config_with = make_cfg(str(workdir))
+    config_with = make_cfg(tmp_path / "wd")
     run_experiment(load_experiment(config_with))
     result_with = runner.invoke(cli_main, ["show-winners", str(config_with)])
     assert result_with.exit_code == 0
@@ -406,9 +402,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     assert result_with.output.index(comment_line) < result_with.output.index(metric_line)
 
     # Without a winner (different workdir → no winner.yaml): comment is still surfaced.
-    result_without = runner.invoke(
-        cli_main, ["show-winners", str(make_cfg(str(tmp_path / "empty_wd")))]
-    )
+    result_without = runner.invoke(cli_main, ["show-winners", str(make_cfg(tmp_path / "empty_wd"))])
     assert result_without.exit_code == 0
     assert "(no winner yet)" in result_without.output
     assert comment_line in result_without.output
@@ -416,27 +410,9 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
 
 def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
     """Mutable compatibility files must not outrank immutable generation results."""
-    config_path = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo x=0.5 {{overrides}}"
-        override_format: argparse
-        metric:
-          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{}}
-        """,
-    )
-    experiment = load_experiment(config_path)
-    run_experiment(experiment)
-    compatibility = _winner_path(experiment, "p")
-    compatibility.parent.mkdir(parents=True, exist_ok=True)
-    compatibility.write_text("trial_number: 99\n")
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    experiment, config_path = materialized.experiment, materialized.config_path
+    _winner_path(experiment, "p").write_text("trial_number: 99\n")
     _generation_path(experiment).write_text("generation_id: interrupted\n")
 
     published = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
@@ -455,32 +431,9 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
 
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
     """Winner-only CLI reads enforce the artifact tree's reverse ownership."""
-    trainer = write_trainer(tmp_path / "trainer.py", 'print("x=1.0")')
-    owner_config = write_yaml(
-        tmp_path,
-        f"""
-        experiment: winner_owner
-        workdir: {tmp_path}/runs
-        storage: sqlite:///{tmp_path}/owner.db
-        provenance: {{revision: test-fixture-v1}}
-        trial_command: "python {trainer} {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)'}}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{type: random, seed: 0}}
-            search_space: {{}}
-        """,
-    )
-    owner = load_experiment(owner_config)
-    run_experiment(owner)
-
+    owner_config = materialize("current-sqlite", tmp_path, mode="tree").config_path
     foreign_config = tmp_path / "foreign.yaml"
-    foreign_config.write_text(owner_config.read_text().replace("owner.db", "foreign.db"))
+    foreign_config.write_text(owner_config.read_text().replace("study.db", "foreign.db"))
     result = CliRunner().invoke(cli_main, ["show-winners", str(foreign_config)])
 
     assert result.exit_code == 1
@@ -493,29 +446,32 @@ def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
     """Dry-run should preview one coherent chain without launching anything."""
 
     caplog.set_level(logging.INFO)
-    body = f"""
-experiment: dry
-storage: sqlite:///{tmp_path}/dry.db
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path}/runs
-trial_command: "false {{overrides}}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: {{ type: json_envelope, objective_name: loss, split: test, policy: test }}
-phases:
-  - name: a
-    n_trials: 5
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ lr: {{ type: float, low: 1e-5, high: 1e-2, log: true }} }}
-  - name: b
-    inherits: [a]
-    n_trials: 5
-    sampler: {{ type: random, seed: 0 }}
-    search_space: {{ wd: {{ type: float, low: 0, high: 0.3 }} }}
-"""
-    exp = load_experiment(write_yaml(tmp_path, body))
+    exp = make_experiment(
+        experiment="dry",
+        persistent=tmp_path,
+        trial_command="false {overrides}",
+        metric=Metric(
+            name="loss",
+            extractor=JsonEnvelopeExtractor(
+                type="json_envelope", objective_name="loss", split="test", policy="test"
+            ),
+        ),
+        phases=[
+            Phase(
+                name="a",
+                n_trials=5,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-2, log=True)},
+            ),
+            Phase(
+                name="b",
+                inherits=["a"],
+                n_trials=5,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"wd": FloatParam(type="float", low=0, high=0.3)},
+            ),
+        ],
+    )
     monkeypatch.setattr(
         "phasesweep.engine.phase._suggest",
         lambda _trial, _name, param: param.low,
@@ -538,39 +494,18 @@ phases:
     assert winners["b"].effective_overrides["lr"] == winners["a"].params["lr"]
 
 
+@pytest.mark.integration
 def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     """``phasesweep status`` is read-only and reports study trial state counts."""
-    trainer = write_trainer(
-        tmp_path,
-        """
-        import argparse, json
-        ap=argparse.ArgumentParser(); ap.add_argument('--out', required=True)
-        args,_=ap.parse_known_args(); open(args.out, 'w').write(json.dumps({'x': 1.0}))
-        print('x=1.0')
-        """,
+    experiment = make_experiment(
+        experiment="status_test",
+        persistent=tmp_path,
+        trainer=write_constant_trainer(tmp_path, value=1.0),
+        n_trials=1,
     )
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: status_test
-        storage: sqlite:///{tmp_path}/status.db
-        provenance: {{revision: test-fixture-v1}}
-        workdir: {tmp_path}/runs
-        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{ x: {{ type: int, low: 0, high: 1 }} }}
-        """,
-    )
-    exp = load_experiment(p)
-    run_experiment(exp)
+    p = tmp_path / "exp.yaml"
+    p.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+    run_experiment(load_experiment(p))
 
     result = CliRunner().invoke(cli_main, ["status", str(p)])
     assert result.exit_code == 0
@@ -584,10 +519,15 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     assert status_obj["published_generation_id"] == status_obj["current_generation_id"]
 
 
+@pytest.mark.integration
 def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_path: Path) -> None:
-    """An unreadable journal cannot be classified as current-format state."""
+    """An unreadable journal cannot be classified as current-format state.
+
+    Only a bad line that another line follows is unreadable: a bad last line
+    alone is skipped on reads, as Optuna's own reader skips it.
+    """
     ledger = tmp_path / "studies.journal"
-    ledger.write_text("not a journal record\n")
+    ledger.write_text("not a journal record\nanother bad record\n")
     experiment = make_experiment(
         storage=f"journal:///{ledger}",
         workdir=tmp_path / "runs",
@@ -617,39 +557,29 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
     annotations and an explicit marker when the current config no longer
     matches the published one.
     """
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        "import argparse\n"
-        "parser = argparse.ArgumentParser()\n"
-        'parser.add_argument("--out")\n'
-        'parser.add_argument("--x", type=int, default=0)\n'
-        "args, _ = parser.parse_known_args()\n"
-        'print(f"x={args.x}")\n',
-    )
+    trainer = write_param_echo_trainer(tmp_path)
+    config_path = tmp_path / "exp.yaml"
 
-    def config_text(comment: str, metric_name: str) -> str:
-        return f"""
-        experiment: drift_cli
-        workdir: {tmp_path}/runs
-        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-        override_format: argparse
-        metric:
-          name: {metric_name}
-          goal: minimize
-          extractor: {{ type: log_regex, pattern: '{metric_name}=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            comment: {comment}
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-        """
+    def write_config(comment: str, metric_name: str) -> None:
+        pattern = f"{metric_name}=(?P<value>[0-9.eE+-]+)"
+        experiment = make_experiment(
+            experiment="drift_cli",
+            workdir=tmp_path / "runs",
+            trainer=trainer,
+            metric=Metric(
+                name=metric_name, extractor=LogRegexExtractor(type="log_regex", pattern=pattern)
+            ),
+            comment=comment,
+            n_trials=1,
+            sampler=Sampler(type="random", seed=0),
+        )
+        config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
 
-    config_path = write_yaml(tmp_path, config_text("original hypothesis", "x"))
+    write_config("original hypothesis", "x")
     run_experiment(load_experiment(config_path))
 
     # Semantic drift (metric rename) plus a new comment on the same phase.
-    config_path.write_text(textwrap.dedent(config_text("new hypothesis", "y")).lstrip())
+    write_config("new hypothesis", "y")
 
     result = CliRunner().invoke(cli_main, ["show-winners", str(config_path)])
     assert result.exit_code == 0
@@ -658,48 +588,12 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
     assert "new hypothesis" not in result.output
 
 
-def _published_experiment_config(tmp_path: Path) -> Path:
-    """Write and run a one-phase experiment so its workdir holds a real publication.
-
-    :param Path tmp_path: Per-test temporary directory.
-    :return Path: Config path whose experiment has published exactly one generation.
-    """
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        "import argparse\n"
-        "parser = argparse.ArgumentParser()\n"
-        'parser.add_argument("--out")\n'
-        'parser.add_argument("--x", type=int, default=0)\n'
-        "args, _ = parser.parse_known_args()\n"
-        'print(f"x={args.x}")\n',
-    )
-    return write_yaml(
-        tmp_path,
-        f"""
-        experiment: integrity_cli
-        workdir: {tmp_path}/runs
-        trial_command: "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: log_regex, pattern: 'x=(?P<value>[0-9.eE+-]+)' }}
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: {{ type: random, seed: 0 }}
-            search_space: {{ x: {{ type: int, low: 0, high: 10 }} }}
-        """,
-    )
-
-
-def _corrupt_the_publication(config_path: Path) -> str:
+def _corrupt_the_publication(experiment: Experiment) -> str:
     """Edit a published winner artifact so its generation manifest stops validating.
 
-    :param Path config_path: Config whose published generation should be corrupted.
+    :param Experiment experiment: Experiment whose published generation should be corrupted.
     :return str: The corrupted generation id.
     """
-    experiment = load_experiment(config_path)
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
     winner_path = _generation_winner_path(experiment, generation_id, "p")
@@ -707,7 +601,7 @@ def _corrupt_the_publication(config_path: Path) -> str:
     return generation_id
 
 
-def test_status_reports_a_corrupt_publication_and_exits_nonzero(
+def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -716,13 +610,15 @@ def test_status_reports_a_corrupt_publication_and_exits_nonzero(
 
     ``status`` used to print a payload byte-identical to a never-run workdir
     and exit 0, so the operator's natural next move -- re-run -- advanced the
-    pointer and erased the only evidence of corruption.
+    pointer and erased the only evidence of corruption. ``show-winners`` must
+    likewise not answer "no winner yet" over it. Both commands are read-only,
+    so they share one corrupted tree.
     """
-    config_path = _published_experiment_config(tmp_path)
-    run_experiment(load_experiment(config_path))
-    generation_id = _corrupt_the_publication(config_path)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    config_path = materialized.config_path
+    generation_id = _corrupt_the_publication(materialized.experiment)
 
-    exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["status", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -737,18 +633,7 @@ def test_status_reports_a_corrupt_publication_and_exits_nonzero(
     assert "does not match its recorded hash" in captured.err
     assert "Do not run anything over this tree" in captured.err
 
-
-def test_show_winners_reports_a_corrupt_publication_and_exits_nonzero(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """``show-winners`` must not answer "no winner yet" over a corrupt publication."""
-    config_path = _published_experiment_config(tmp_path)
-    run_experiment(load_experiment(config_path))
-    generation_id = _corrupt_the_publication(config_path)
-
-    exit_code = _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -765,29 +650,25 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The claim-time provenance files feed the same reporting as any winner."""
-    config_path = _published_experiment_config(tmp_path)
-    run_experiment(load_experiment(config_path))
-    experiment = load_experiment(config_path)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
     record = _generation_dir(experiment, generation_id) / "reproducibility.json"
     record.write_bytes(record.read_bytes() + b"\n")
 
-    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 1
+    assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 1
     status_captured = capsys.readouterr()
     assert yaml.safe_load(status_captured.out)["publication_integrity"] == "failed"
     assert "Do not run anything over this tree" in status_captured.err
 
-    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 1
+    assert invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 1
     winners_captured = capsys.readouterr()
     assert "Do not run anything over this tree" in winners_captured.err
     assert "Traceback" not in winners_captured.err
 
 
-@pytest.mark.skipif(
-    os.geteuid() == 0,
-    reason="root reads any mode, so no PermissionError can be provoked",
-)
+@requires_nonroot
 def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -801,16 +682,15 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     fails closed -- nothing unvalidatable may read as published -- but the
     reason names the permission denial and the user who can validate it.
     """
-    config_path = _published_experiment_config(tmp_path)
-    run_experiment(load_experiment(config_path))
-    experiment = load_experiment(config_path)
+    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
     snapshot = _generation_dir(experiment, generation_id) / "config.snapshot.yaml"
     original_mode = stat.S_IMODE(snapshot.stat().st_mode)
     snapshot.chmod(0o000)
     try:
-        exit_code = _invoke_cli_boundary(["status", str(config_path)], monkeypatch)
+        exit_code = invoke_cli_boundary(["status", str(config_path)], monkeypatch)
         captured = capsys.readouterr()
     finally:
         snapshot.chmod(original_mode)
@@ -832,50 +712,23 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A healthy publication and a never-published tree both stay exit 0."""
-    config_path = _published_experiment_config(tmp_path)
+    fresh_config = tmp_path / "fresh.yaml"
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    fresh_config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
 
-    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["status", str(fresh_config)], monkeypatch) == 0
     fresh = capsys.readouterr()
     assert yaml.safe_load(fresh.out)["publication_integrity"] == "absent"
-    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 0
     capsys.readouterr()
 
-    run_experiment(load_experiment(config_path))
+    config_path = materialize("current-sqlite", tmp_path, mode="tree").config_path
 
-    assert _invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     published = capsys.readouterr()
     assert yaml.safe_load(published.out)["publication_integrity"] == "ok"
-    assert _invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
+    assert invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 0
     assert "trial_number" in capsys.readouterr().out
-
-
-def _invoke_cli_boundary(
-    argv: list[str],
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    debug: bool = False,
-) -> int:
-    """Run the console-script entry point exactly as the installed command does.
-
-    ``CliRunner`` invokes the Click group directly and therefore bypasses the
-    process-level error boundary; these tests must exercise the boundary, so
-    they call it with a patched ``sys.argv`` instead.
-
-    :param list[str] argv: Arguments following the program name.
-    :param pytest.MonkeyPatch monkeypatch: Fixture used to set ``sys.argv`` and
-        the root log level.
-    :param bool debug: Root log level the boundary observes. ``True`` mirrors
-        what ``-v`` produces in a real process; ``_configure_logging`` cannot be
-        used here because ``logging.basicConfig`` is a no-op once pytest's own
-        root handler is installed.
-    :return int: Status the boundary passed to ``sys.exit``.
-    """
-    monkeypatch.setattr(sys, "argv", ["phasesweep", *argv])
-    monkeypatch.setattr(logging.getLogger(), "level", logging.DEBUG if debug else logging.INFO)
-    with pytest.raises(SystemExit) as excinfo:
-        cli_boundary()
-    code = excinfo.value.code
-    return 0 if code is None else int(code)
 
 
 def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
@@ -923,12 +776,37 @@ def test_cli_only_explains_marked_post_publication_shutdown(
         shutdown.published_result_committed = True
     _stub_run_command(monkeypatch, shutdown)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 128 + signal.SIGTERM
     notice = "shutdown was honored after the published result was committed"
     assert (notice in captured.err) is expects_notice
+
+
+def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A trial cleanup refusal routes to recovery, which for a CLI run is running it again.
+
+    The next ``phasesweep run`` preflight retries the recorded cleanup before it
+    launches anything, so that is the step the CLI operator is told.
+    """
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text("placeholder: true\n")
+    refusal = UnsafeProcessCleanupError("Trial 0 cleanup could not be confirmed.")
+    _stub_run_command(monkeypatch, refusal)
+
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err.strip() == (
+        "phasesweep: Trial 0 cleanup could not be confirmed. To retry its cleanup, "
+        "run `phasesweep run` again with the same config."
+    )
 
 
 def test_cli_boundary_reports_config_syntax_error_without_traceback(
@@ -945,7 +823,7 @@ def test_cli_boundary_reports_config_syntax_error_without_traceback(
     config_path = tmp_path / "broken.yaml"
     config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
 
-    exit_code = _invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 2
@@ -962,7 +840,7 @@ def test_cli_boundary_names_config_for_schema_validation_error(
     config_path = tmp_path / "invalid-schema.yaml"
     config_path.write_text("experiment: t\nphases: []\n")
 
-    exit_code = _invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 2
@@ -992,7 +870,7 @@ def test_cli_boundary_reports_expected_run_failure(
     argv = ["run", str(config_path)]
     if verbose:
         argv.append("-v")
-    exit_code = _invoke_cli_boundary(argv, monkeypatch, debug=verbose)
+    exit_code = invoke_cli_boundary(argv, monkeypatch, debug=verbose)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1029,7 +907,7 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
     config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
     monkeypatch.setenv(env_name, env_value)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1039,25 +917,21 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
     assert not (tmp_path / "runs").exists()
 
 
-@pytest.mark.parametrize(
-    "error",
-    [
-        UnsafeLockPathError("PHASESWEEP_LOCK_DIR must be an absolute path"),
-        LockBusyError("another experiment process holds the lock"),
-    ],
-)
 def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
-    error: PhaseSweepError,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Runtime configuration and lock contention are failures, not bugs."""
+    """Lock contention is a failure, not a bug.
+
+    Runtime lock configuration goes through the real validator in the next test.
+    """
+    error = LockBusyError("another experiment process holds the lock")
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, error)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1082,7 +956,7 @@ def test_cli_boundary_classifies_relative_lock_directory_as_operational(
         lambda *_args, **_kwargs: lock_dir(),
     )
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1101,7 +975,7 @@ def test_cli_boundary_reports_unexpected_failure_as_internal_error(
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, RuntimeError("injected-internal"))
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 70
@@ -1122,7 +996,7 @@ def test_cli_boundary_does_not_misclassify_unexpected_validation_error(
         Experiment.model_validate({})
     _stub_run_command(monkeypatch, exc_info.value)
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 70
@@ -1139,7 +1013,7 @@ def test_cli_boundary_reports_environmental_io_failure_as_operational(
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, PermissionError("workdir is not writable"))
 
-    exit_code = _invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 1
@@ -1153,7 +1027,7 @@ def test_cli_boundary_leaves_help_exit_status_unchanged(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``--help`` still succeeds through the boundary rather than being trapped."""
-    exit_code = _invoke_cli_boundary(["--help"], monkeypatch)
+    exit_code = invoke_cli_boundary(["--help"], monkeypatch)
 
     captured = capsys.readouterr()
     assert exit_code == 0

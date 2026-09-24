@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal, TypedDict
 
 import optuna
 
@@ -11,6 +11,7 @@ from phasesweep.config import Phase
 from phasesweep.config.search import NON_RESUMABLE_SAMPLERS
 from phasesweep.engine.attempts import _parsed_trial_outcome
 from phasesweep.engine.errors import (
+    OperatorAction,
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -58,6 +59,14 @@ class _AcceptedPartialDecision:
     completed_trials: int
     timeout_scope: str
     recovered_abort_sequence: int | None
+
+
+class _AllocationRecord(TypedDict):
+    """One validated pre-Optuna allocation boundary and its trainer environment."""
+
+    generation_id: str
+    first_trial_number: int
+    trainer_environment: str
 
 
 def _load_accepted_partial_decision(
@@ -269,7 +278,8 @@ def _validate_study_schema(study: optuna.Study) -> None:
         f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
         f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
         "Use a fresh artifact root and fresh local storage with this PhaseSweep release, "
-        "or use the preserved PhaseSweep 0.3.1 environment to operate existing state."
+        "or use the preserved PhaseSweep 0.3.1 environment to operate existing state.",
+        action=OperatorAction.USE_PRIOR_RELEASE,
     )
 
 
@@ -320,7 +330,8 @@ def _accepted_trial_target(study: optuna.Study) -> int:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}. "
             "Use a fresh local ledger and artifact root, or use the preserved PhaseSweep "
-            "0.3.1 environment to operate the existing state."
+            "0.3.1 environment to operate the existing state.",
+            action=OperatorAction.USE_PRIOR_RELEASE,
         )
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(
@@ -407,11 +418,11 @@ def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
         study.set_user_attr(TRIAL_TARGET_ATTR, phase.n_trials)
 
 
-def _allocation_contexts(study: optuna.Study) -> list[dict[str, Any]]:
+def _allocation_contexts(study: optuna.Study) -> list[_AllocationRecord]:
     """Return valid pre-Optuna allocation records from a study's durable context.
 
     :param optuna.Study study: Study holding the allocation context.
-    :return list[dict[str, Any]]: Valid allocation records, ordered by creation.
+    :return list[_AllocationRecord]: Valid allocation records, ordered by creation.
     """
     raw = study.user_attrs.get(_ALLOCATION_CONTEXT_ATTR)
     if not isinstance(raw, dict) or raw.get("schema_version") != _ALLOCATION_CONTEXT_SCHEMA_VERSION:
@@ -419,7 +430,7 @@ def _allocation_contexts(study: optuna.Study) -> list[dict[str, Any]]:
     allocations = raw.get("allocations")
     if not isinstance(allocations, list):
         return []
-    records: list[dict[str, Any]] = []
+    records: list[_AllocationRecord] = []
     for record in allocations:
         if (
             not isinstance(record, dict)
@@ -431,7 +442,13 @@ def _allocation_contexts(study: optuna.Study) -> list[dict[str, Any]]:
             or not record["trainer_environment"]
         ):
             continue
-        records.append(record)
+        records.append(
+            {
+                "generation_id": record["generation_id"],
+                "first_trial_number": record["first_trial_number"],
+                "trainer_environment": record["trainer_environment"],
+            }
+        )
     return records
 
 
@@ -547,7 +564,8 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
             f"Study {study.study_name!r} contains populated trial(s) without a "
             f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
             "which environment cohort owns those results. Use a new experiment name, or "
-            "use the preserved PhaseSweep 0.3.1 environment to operate the existing state."
+            "use the preserved PhaseSweep 0.3.1 environment to operate the existing state.",
+            action=OperatorAction.USE_PRIOR_RELEASE,
         )
     if recorded != {current_digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))
@@ -556,5 +574,6 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
             f"environment cohort(s) [{rendered}], but this invocation composes "
             f"{current_digest[:12]}. No trial was allocated. Restore the original "
             "semantic environment, classify rotating credentials under "
-            "execution.passthrough_env, or use a new experiment name."
+            "execution.passthrough_env, or use a new experiment name.",
+            action=OperatorAction.FIX_CONFIG,
         )

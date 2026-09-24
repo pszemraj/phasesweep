@@ -20,6 +20,7 @@ from phasesweep.config import Experiment, Gate, check_bounds
 from phasesweep.config.models import _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
+    OperatorAction,
     PhaseSweepError,
 )
 from phasesweep.errors import (
@@ -180,7 +181,7 @@ def _trainer_environment(
                 require_online=require_wandb_online,
             )
         except ValueError as exc:
-            raise PhaseSweepError(str(exc)) from exc
+            raise PhaseSweepError(str(exc), action=OperatorAction.FIX_CONFIG) from exc
     elif "WANDB_RUN_ID" not in experiment.env:
         # Without a remote evidence consumer, an explicitly configured run ID
         # remains trainer-owned. An ambient/inherited ID is not stable trial
@@ -580,9 +581,10 @@ def launch_trial(
     # Every engine artifact under ``workdir``, including process-control
     # records written later, shares this operator-trusted boundary. These
     # files use ordinary paths rather than the validated O_NOFOLLOW helpers
-    # reserved for the lock namespace and MCP state; forcing trial dirs
-    # private would break normal operator/tool visibility into logs and
-    # resolved overrides. See docs/runtime.md's trust-boundary note.
+    # reserved for the lock namespace, the attempt registry, and MCP state;
+    # forcing trial dirs private would break normal operator/tool visibility
+    # into logs and resolved overrides. See docs/runtime.md's trust-boundary
+    # section.
     run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
     trainer_input = prepared_input or prepare_trainer_input(
         experiment=experiment,

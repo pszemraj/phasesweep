@@ -23,7 +23,7 @@ from phasesweep.config import (
 )
 from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.evaluation import extractor_config_fingerprint
-from tests.conftest import make_trial_context
+from tests.conftest import make_trial_context, requires_nonroot
 
 
 def _wandb_poll(**kwargs):
@@ -346,9 +346,10 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("stage", ["constructor", "lookup"])
+@pytest.mark.integration
 def test_wandb_supervision_bounds_blocked_sdk_and_descendants(wandb_worker_sdk, tmp_path, stage):
     from phasesweep.evidence.wandb import WandbPollTimeout, poll_wandb_summary
-    from phasesweep.runtime.process import is_pid_alive
+    from phasesweep.runtime.reaper import is_pid_alive
     from tests.conftest import is_pid_zombie
 
     pid_file = tmp_path / "descendant"
@@ -600,30 +601,6 @@ def test_extractor_config_rejects_unsafe_paths_and_keys() -> None:
     )
 
 
-def test_log_regex_selects_last_or_min_value(tmp_path):
-    cases = [
-        (
-            "last",
-            "step=1 eval_loss=1.0\nstep=2 eval_loss=0.5\nstep=3 eval_loss=0.25\n",
-            "last",
-            0.25,
-        ),
-        ("min", "eval_loss=1.0\neval_loss=0.5\neval_loss=0.7\n", "min", 0.5),
-    ]
-
-    for case, text, select, expected in cases:
-        case_dir = tmp_path / case
-        case_dir.mkdir()
-        (case_dir / "stdout.log").write_text(text)
-        cfg = LogRegexExtractor(
-            type="log_regex",
-            file="stdout.log",
-            pattern=r"eval_loss=(?P<value>[0-9.eE+-]+)",
-            select=select,
-        )
-        assert run_extractor(make_trial_context(case_dir), cfg) == expected
-
-
 @pytest.mark.parametrize(
     ("select", "line", "expected", "match_count"),
     [
@@ -664,10 +641,9 @@ def test_log_regex_reports_no_matches(tmp_path):
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
+@requires_nonroot
 def test_artifact_size_directory_gate_rejects_unreadable_subtree(tmp_path: Path) -> None:
     """An incomplete traversal cannot establish a checkpoint-size bound."""
-    if os.geteuid() == 0:
-        pytest.skip("Permission-denial reproduction requires an unprivileged user")
     private = tmp_path / "checkpoint" / "weights"
     private.mkdir(parents=True)
     (private / "model.bin").write_bytes(b"x" * 16_384)

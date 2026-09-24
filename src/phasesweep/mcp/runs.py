@@ -17,13 +17,14 @@ from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Literal
+from typing import IO, Literal, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.mcp.time import parse_utc_iso
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
+    absolute_path,
     ensure_private_dir,
     open_directory_fd,
     open_lock_file,
@@ -34,7 +35,7 @@ from phasesweep.runtime.files import (
     unlock_file,
     validate_private_dir,
 )
-from phasesweep.runtime.process import is_same_live_process, read_boot_id, reap_child
+from phasesweep.runtime.reaper import is_same_live_process, read_boot_id, reap_child
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
@@ -46,6 +47,7 @@ __all__ = [
     "RunLaunchState",
     "RunState",
     "RunStore",
+    "UnsupportedStateFormatError",
     "identity_from_earlier_boot",
     "write_status_file",
 ]
@@ -73,6 +75,16 @@ _RUN_EVIDENCE_SUFFIXES = (
 MCP_STATE_FORMAT_VERSION = 1
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
+
+
+class UnsupportedStateFormatError(ValueError):
+    """An MCP state directory holds run-store state this release does not operate.
+
+    Still a ``ValueError`` for every caller that refuses a bad state directory
+    that way. The subclass lets operator recovery tell this refusal, whose
+    remedy is the preserved release, apart from a state directory that is
+    simply missing.
+    """
 
 
 def _strict_fsync_directory(path: Path) -> None:
@@ -144,11 +156,11 @@ def _strict_unlink(path: Path) -> None:
         os.close(directory_fd)
 
 
-def _read_json_object(path: Path) -> dict | None:
+def _read_json_object(path: Path) -> dict[str, object] | None:
     """Read a JSON object, returning ``None`` for missing or malformed files.
 
     :param Path path: JSON file to read.
-    :return dict | None: Parsed object, or ``None`` when unavailable or invalid.
+    :return dict[str, object] | None: Parsed object, or ``None`` when unavailable or invalid.
     """
     directory_fd = -1
     try:
@@ -163,20 +175,20 @@ def _read_json_object(path: Path) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def write_status_file(status_path: Path, payload: dict) -> None:
+def write_status_file(status_path: Path, payload: dict[str, object]) -> None:
     """Atomically write a detached-run terminal status payload.
 
     :param Path status_path: Destination ``status.json`` path for the run.
-    :param dict payload: JSON-serializable terminal status payload.
+    :param dict[str, object] payload: JSON-serializable terminal status payload.
     """
     private_atomic_write_text(status_path, json.dumps(payload, indent=2) + "\n")
 
 
-def write_status_file_if_absent(status_path: Path, payload: dict) -> bool:
+def write_status_file_if_absent(status_path: Path, payload: dict[str, object]) -> bool:
     """Atomically create a server failure only while no runner status exists.
 
     :param Path status_path: Destination ``status.json`` path for the run.
-    :param dict payload: JSON-serializable server failure payload.
+    :param dict[str, object] payload: JSON-serializable server failure payload.
     :return bool: Whether this call created the status; ``False`` if one already exists.
     """
     temporary = status_path.with_name(f".{status_path.name}.{uuid4().hex}.tmp")
@@ -310,26 +322,112 @@ class RunStore:
         create a new state tree or change permissions on an unrelated
         directory.
 
+        The format marker decides what a failure means. With a marker, the
+        path is a state directory and anything else wrong with it is damage.
+        Without one, run handles make it state from the preserved release, and
+        their absence means the path names some other directory. A path whose
+        ancestors cannot be walked never reaches a state directory at all.
+
         :param Path state_dir: Existing MCP state directory containing ``runs/``
             and ``logs/`` subdirectories.
         :return RunStore: Store bound to the recognized existing layout.
+        :raises UnsupportedStateFormatError: The marker names another format,
+            or run handles exist without a marker.
+        :raises UnsafePrivatePathError: The marker is present but it, or a
+            directory of the layout, is missing, unreadable, malformed, shared,
+            symlinked, or not a real directory.
         :raises ValueError: If ``state_dir`` is not an MCP run-store layout.
         """
         store = cls.__new__(cls)
         store._set_paths(state_dir)
+        wrong_path = ". Pass the state_dir from the catalog the MCP server runs with."
+        parent = absolute_path(state_dir).parent
+        if parent != parent.parent:
+            try:
+                os.close(open_directory_fd(parent, create=False, private_final=False))
+            except (OSError, UnsafePrivatePathError) as exc:
+                raise ValueError(
+                    f"not an existing MCP state directory; {state_dir} is not reachable "
+                    f"through real directories: {exc}{wrong_path}"
+                ) from None
+        try:
+            os.lstat(store._format_marker_path)
+        except (FileNotFoundError, NotADirectoryError):
+            if store._has_run_handles():
+                raise store._format_refusal("durable run data has no format marker") from None
+            missing = [
+                str(path)
+                for path in (state_dir, store._runs_dir, store._logs_dir)
+                if not path.is_dir()
+            ]
+            detail = (
+                "expected directories are missing: " + ", ".join(missing)
+                if missing
+                else f"it has no format marker and no run handles under {store._runs_dir}"
+            )
+            raise ValueError(f"not an existing MCP state directory; {detail}{wrong_path}") from None
+        except OSError:
+            # The directory exists but cannot be searched, so whether it holds
+            # a marker is unknown; validating it below reports that damage.
+            pass
         missing = []
         for path in (state_dir, store._runs_dir, store._logs_dir):
             try:
                 validate_private_dir(path)
-            except (OSError, UnsafePrivatePathError):
+            except FileNotFoundError:
                 missing.append(str(path))
         if missing:
-            raise ValueError(
-                "not an existing MCP state directory; expected directories are missing: "
-                + ", ".join(missing)
+            raise UnsafePrivatePathError(
+                f"MCP state directory {state_dir} has its format marker but is missing "
+                f"{', '.join(missing)}. Restore the state directory before retrying recovery."
             )
-        store._require_supported_format_marker()
+        store._require_current_marker_for_recovery()
         return store
+
+    def _has_run_handles(self) -> bool:
+        """Return whether ``runs/`` holds any run handle, without validating it.
+
+        :return bool: Whether a ``*.json`` handle entry is present.
+        """
+        try:
+            with os.scandir(self._runs_dir) as entries:
+                return any(entry.name.endswith(".json") for entry in entries)
+        except OSError:
+            return False
+
+    def _require_current_marker_for_recovery(self) -> None:
+        """Require a readable marker naming this release's format, telling damage apart.
+
+        A marker that reads and names another format is state for another
+        release. One that cannot be read, or reads as anything but a format
+        record, is this state directory's own damage.
+
+        :raises UnsupportedStateFormatError: The marker names another format.
+        :raises UnsafePrivatePathError: The marker is unreadable, unsafe, or malformed.
+        """
+        marker = self._format_marker_path
+        directory_fd = open_directory_fd(marker.parent, create=False, private_final=True)
+        try:
+            raw = read_private_text_at(directory_fd, marker.name, marker)
+        except (OSError, UnicodeError) as exc:
+            raise UnsafePrivatePathError(
+                f"MCP state directory {marker.parent} format marker {marker} cannot be "
+                f"read: {exc}. Restore it and access to it before retrying recovery."
+            ) from exc
+        finally:
+            os.close(directory_fd)
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            payload = None
+        version = payload.get("schema_version") if isinstance(payload, dict) else None
+        if type(version) is int and version != MCP_STATE_FORMAT_VERSION:
+            raise self._format_refusal(f"format marker declares unsupported format {version}")
+        if type(version) is not int or set(cast(dict[str, object], payload)) != {"schema_version"}:
+            raise UnsafePrivatePathError(
+                f"MCP state directory {marker.parent} format marker {marker} is malformed. "
+                "Restore it before retrying recovery."
+            )
 
     def _set_paths(self, state_dir: Path) -> None:
         """Bind store paths without touching the filesystem.
@@ -432,13 +530,13 @@ class RunStore:
         except FileExistsError:
             self._require_supported_format_marker()
 
-    def _format_refusal(self, detail: str) -> ValueError:
+    def _format_refusal(self, detail: str) -> UnsupportedStateFormatError:
         """Build the actionable refusal for pre-cutover MCP state.
 
         :param str detail: Specific format-boundary failure observed.
-        :return ValueError: Refusal that directs the operator to a safe path.
+        :return UnsupportedStateFormatError: Refusal that directs the operator to a safe path.
         """
-        return ValueError(
+        return UnsupportedStateFormatError(
             f"MCP state directory {self._format_marker_path.parent} {detail}; "
             "use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime "
             "for existing state."
@@ -894,7 +992,8 @@ class RunStore:
         if payload is None:
             return None
         try:
-            handle = RunHandle(**payload)
+            # This on-disk JSON is checked field by field after construction.
+            handle = RunHandle(**payload)  # type: ignore[arg-type]
         except TypeError:
             return None
         if handle.run_id != expected_run_id:
@@ -1079,11 +1178,11 @@ class RunStore:
             return "cancelled"
         return "failed"
 
-    def recorded_terminal_status(self, handle: RunHandle) -> dict | None:
+    def recorded_terminal_status(self, handle: RunHandle) -> dict[str, object] | None:
         """Return the runner-written terminal status payload, if readable.
 
         :param RunHandle handle: Run handle whose terminal status should be returned.
-        :return dict | None: Decoded status payload, or ``None`` when absent or malformed.
+        :return dict[str, object] | None: Decoded status payload, or ``None`` when absent or malformed.
         """
         return self._read_status(handle)
 
@@ -1307,7 +1406,9 @@ class RunStore:
         status = self._read_status(handle)
         if status is None:
             return set()
-        return set(status.get("uncertain_attempt_ids", []))
+        # _read_status refused any status whose ids are not nonempty strings.
+        uncertain_attempt_ids = cast(list[str], status.get("uncertain_attempt_ids", []))
+        return set(uncertain_attempt_ids)
 
     def snapshot_recovery_required(self, handle: RunHandle) -> bool:
         """Return whether a dead runner left snapshot finalization pending.
@@ -1344,11 +1445,11 @@ class RunStore:
             and is_same_live_process(handle.pid, handle.pid_starttime)
         )
 
-    def _read_status(self, handle: RunHandle) -> dict | None:
+    def _read_status(self, handle: RunHandle) -> dict[str, object] | None:
         """Read the runner-written terminal status payload.
 
         :param RunHandle handle: Run handle whose status file should be read.
-        :return dict | None: Decoded JSON payload, or ``None`` when absent or malformed.
+        :return dict[str, object] | None: Decoded JSON payload, or ``None`` when absent or malformed.
         """
         payload = _read_json_object(self.status_path(handle.run_id))
         if payload is None:
@@ -1558,7 +1659,7 @@ class RunStore:
         return identity
 
 
-def _valid_positive_optional_int(value: object) -> bool:
+def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:
     """Return whether ``value`` is ``None`` or a positive non-bool ``int``.
 
     :param object value: Value to validate.
@@ -1567,7 +1668,7 @@ def _valid_positive_optional_int(value: object) -> bool:
     return value is None or (type(value) is int and value > 0)
 
 
-def _valid_optional_boot_id(value: object) -> bool:
+def _valid_optional_boot_id(value: object) -> TypeGuard[str | None]:
     """Return whether ``value`` is ``None`` or a canonical Linux boot UUID.
 
     :param object value: Value to validate.

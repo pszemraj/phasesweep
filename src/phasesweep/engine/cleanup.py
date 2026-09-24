@@ -20,6 +20,7 @@ from phasesweep.engine.attempts import (
     _trial_requires_cleanup_recovery,
 )
 from phasesweep.engine.errors import (
+    OperatorAction,
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.state import (
@@ -29,7 +30,8 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _restore_prelaunch_environment_identity
 from phasesweep.engine.trial import ProcessCleanupUncertainError
-from phasesweep.runtime.process import (
+from phasesweep.errors import RERUN_CLEANUP_RECOVERY
+from phasesweep.runtime.reaper import (
     StaleProcessIdentity,
     cleanup_stale_trial_process,
 )
@@ -72,8 +74,12 @@ def _reap_stale_trials(
     try:
         trials = study.get_trials(deepcopy=False)
     except Exception as exc:
+        # recover-run reaps through here too and cannot read the ledger either,
+        # so restoring it comes first.
         raise ProcessCleanupUncertainError(
-            f"Could not inspect study {study.study_name!r} for stale RUNNING trials."
+            f"Could not inspect study {study.study_name!r} for stale RUNNING trials. "
+            "Restore the original complete storage ledger and access to it before retrying.",
+            action=OperatorAction.RESTORE_LEDGER,
         ) from exc
     for trial in trials:
         if trial.state != optuna.trial.TrialState.RUNNING:
@@ -223,11 +229,15 @@ def _trial_dir_for_cleanup_recovery(
     :raises ProcessCleanupUncertainError: The trial has no safe persisted trial directory.
     """
     stored = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    # A launch records the directory before its process can leak, so only a
+    # damaged ledger lacks it here, and recover-run reads the same attribute.
     if not isinstance(stored, str) or not stored:
         raise ProcessCleanupUncertainError(
             f"Refusing to recover cleanup-uncertain trial {trial.number} in study "
             f"{study_name}: missing or invalid {TRIAL_DIR_ATTR!r} user attribute "
-            f"{stored!r}. The leaked process group cannot be tied to identity files safely."
+            f"{stored!r}. The leaked process group cannot be tied to identity files safely. "
+            "Restore the original storage ledger before retrying recovery.",
+            action=OperatorAction.RESTORE_LEDGER,
         )
     return Path(stored)
 
@@ -288,7 +298,9 @@ def _recover_cleanup_uncertain_trials(
                 f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
                 f"study {study.study_name}: process cleanup could not be confirmed. "
                 f"experiment={experiment.experiment} phase={phase_name} "
-                f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}."
+                f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}. "
+                f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`), then "
+                f"{RERUN_CLEANUP_RECOVERY}."
             )
         _record_cleanup_recovery(study, trial)
         _collect_attempt_generation(

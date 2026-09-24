@@ -26,13 +26,10 @@ import yaml
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine.artifact_roots import (
-    _artifact_root_binding_applies,
-    _validate_artifact_root_binding,
-)
+from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.ledger import read_phase_trial_stats, validate_ledger
 from phasesweep.engine.optuna import (
-    _phase_trial_stats,
     _published_phase_trial_refs,
     _published_trial_history_available,
 )
@@ -279,13 +276,13 @@ def read_winner(
         winner on disk: never run, still running, selection failed, or the file
         is malformed. A malformed read is treated as "not yet written" -
             consistent with this module's permissive contract and with
-            ``_phase_trial_stats`` swallowing transient backend errors. The
+            ``read_phase_trial_stats`` swallowing transient backend errors. The
         strict, fingerprint-verifying read used for ``--from-phase`` resume
         lives in ``engine.artifacts._load_winner`` and is intentionally not
         relaxed here.
 
     """
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    validate_ledger(experiment)
     if generation_id is not None:
         _validate_safe_name("generation", generation_id)
     path = (
@@ -328,7 +325,7 @@ def read_winners(
             here, so this only fires on a programming error.
 
     """
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    validate_ledger(experiment)
     published_generation_id: str | None = None
     if generation_id is not None:
         _validate_safe_name("generation", generation_id)
@@ -476,7 +473,7 @@ def read_status(
     :func:`phasesweep.engine.run.experiment_status` / ``config_status``, whose
     CLI consumers are trusted with local paths.
 
-    Trial counts come from ``_phase_trial_stats``, which reports empty counts
+    Trial counts come from ``read_phase_trial_stats``, which reports empty counts
     for a study that does not exist yet, never creates one as a side effect,
     and swallows transient backend errors (e.g. a momentary SQLite lock while
     the runner writes) by reporting empty counts rather than raising.
@@ -601,11 +598,7 @@ def read_status(
         config fingerprint against the current config's semantic fingerprint;
         ``None`` when the represented summary records no fingerprint.
     """
-    _validate_artifact_root_binding(
-        experiment,
-        claim_fresh=False,
-        validate_storage_format=False,
-    )
+    ledger = validate_ledger(experiment)
     current_generation_id = _current_pointer_generation_id(experiment)
     publication = _resolve_publication_pointer(experiment)
     published_generation_id = publication.generation_id if publication.state == "ok" else None
@@ -633,13 +626,8 @@ def read_status(
         else {}
     )
     phase_stats = {
-        phase.name: _phase_trial_stats(
-            experiment,
-            phase,
-            published_trials.get(phase.name),
-            validate_storage_format=index == 0,
-        )
-        for index, phase in enumerate(experiment.phases)
+        phase.name: read_phase_trial_stats(ledger, phase, published_trials.get(phase.name))
+        for phase in experiment.phases
     }
     summary_path = (
         _generation_summary_path(experiment, winner_scope_generation_id)

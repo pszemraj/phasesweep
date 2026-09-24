@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -13,13 +13,25 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import yaml
+
+from phasesweep.config import (
+    ExecutionContext,
+    Experiment,
+    IntParam,
+    LogRegexExtractor,
+    Metric,
+    Phase,
+    Sampler,
+)
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
+from phasesweep.mcp.run_control import _runner_protocol_argv
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
-from phasesweep.mcp.server import PhaseSweepMCP, _runner_protocol_argv
-from phasesweep.runtime import process as runtime_process
-from phasesweep.runtime.process import read_boot_id, read_proc_starttime
+from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
+from tests.conftest import make_experiment, reaped_pid, restored_signal_ownership
 
 
 def write_mcp_catalog(
@@ -203,9 +215,13 @@ def make_run_handle(
     else:
         process_id = os.getpid() if pid is None else pid
         # Default fixtures need a genuinely live PID so RunStore state checks
-        # see a running handle, but must never target pytest's own process
-        # group if a cancellation guard regresses. Explicit PID fixtures keep
-        # their matching PGID for process-lifecycle tests.
+        # see a running handle, so the default runner is pytest itself. The
+        # unused PGID keeps code that reads ``handle.pgid`` off real groups, but
+        # it is no protection from ``kill_stale_group``: a live PID with a
+        # matching start time makes it signal ``os.getpgid(pid)``, pytest's real
+        # group. The autouse ``guard_runner_signals`` fixture in conftest is
+        # what fails a test that reaches it. Explicit PID fixtures keep their
+        # matching PGID for process-lifecycle tests.
         process_group_id = 2_000_000_000 if pid is None else process_id
         process_starttime = read_proc_starttime(process_id) if starttime is None else starttime
     return RunHandle(
@@ -260,27 +276,11 @@ def runner_main(argv: list[str], *, cwd: Path | None = None) -> int:
     :return int: Runner process exit code.
     """
     original = Path.cwd()
-    restore_signal = signal.signal
-    restore_mask = getattr(signal, "pthread_sigmask", None)
-    prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_process._SHUTDOWN_SIGNALS}
-    prior_mask = restore_mask(signal.SIG_BLOCK, set()) if restore_mask is not None else None
-    prior_owner = runtime_process._process_lifetime_owner
-    prior_depth = runtime_process._scope_depth
-    try:
-        return mcp_runner.main([*argv, "--cwd", str(original if cwd is None else cwd)])
-    finally:
-        os.chdir(original)
-        if restore_mask is not None and prior_mask is not None:
-            restore_mask(
-                signal.SIG_BLOCK,
-                set(runtime_process._SHUTDOWN_SIGNALS),
-            )
-        for sig, handler in prior_handlers.items():
-            restore_signal(sig, handler)
-        if restore_mask is not None and prior_mask is not None:
-            restore_mask(signal.SIG_SETMASK, prior_mask)
-        runtime_process._process_lifetime_owner = prior_owner
-        runtime_process._scope_depth = prior_depth
+    with restored_signal_ownership():
+        try:
+            return mcp_runner.main([*argv, "--cwd", str(original if cwd is None else cwd)])
+        finally:
+            os.chdir(original)
 
 
 def runner_argv(
@@ -316,6 +316,48 @@ def runner_argv(
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     full_payload = {"run_id": run_id, "cleanup_confirmed": True, **payload}
     write_status_file(store.status_path(run_id), full_payload)
+
+
+#: Start time recorded for a runner that is gone; no live process has it.
+DEAD_RUNNER_STARTTIME = 111
+
+
+def stage_dead_run(
+    store: RunStore,
+    run_id: str,
+    config: Path,
+    experiment_id: str,
+    *,
+    cleanup_uncertain: bool,
+    allow_cancel: bool = False,
+) -> RunHandle:
+    """Persist a spawned run of ``config`` whose runner has exited, as recover-run finds it."""
+    snapshot = config.read_bytes()
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=experiment_id,
+        config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        pid=reaped_pid(),
+        starttime=DEAD_RUNNER_STARTTIME,
+        allow_cancel=allow_cancel,
+    )
+    store.create(handle)
+    store.config_snapshot_path(run_id).write_bytes(snapshot)
+    if cleanup_uncertain:
+        store.mark_cleanup_uncertain(handle)
+    return handle
+
+
+def write_unsafe_cleanup_status(store: RunStore, run_id: str, **extra: object) -> None:
+    """Record the terminal status of a run whose process-group cleanup was never confirmed."""
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        **extra,
+    )
 
 
 def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
@@ -372,5 +414,71 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
         captured["env"] = kwargs.get("env")
         return DummyProc()
 
-    monkeypatch.setattr("phasesweep.mcp.server.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", fake_popen)
     return captured
+
+
+ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
+
+
+def _config(tmp_path: Path, *, name: str = "srv", phases: str | None = None) -> Path:
+    path = tmp_path / f"{name}.yaml"
+    path.write_text(mcp_experiment_config_text(tmp_path, name=name, phases=phases))
+    return path
+
+
+def _catalog(
+    tmp_path: Path,
+    config: Path,
+    allow: dict[str, bool] | None = None,
+    *,
+    visible_params: object | None = None,
+) -> Path:
+    return write_mcp_catalog(
+        tmp_path,
+        {"srv": config},
+        allow=allow,
+        visible_params=None if visible_params is None else {"srv": visible_params},
+        filename="srv.catalog.yaml",
+    )
+
+
+def _drift_experiment(
+    tmp_path: Path,
+    trainer: Path,
+    *,
+    name: str = "srv",
+    metric_name: str = "x",
+    goal: str = "minimize",
+    extractor: object | None = None,
+    phase_name: str = "p",
+    phases: list[Phase] | None = None,
+) -> Experiment:
+    """Build the runnable experiment the tests publish and then edit: one phase unless ``phases``."""
+    return make_experiment(
+        experiment=name,
+        storage=f"sqlite:///{tmp_path / 'drift.db'}",
+        workdir=str(tmp_path / "runs"),
+        execution=ExecutionContext(cwd=str(tmp_path)),
+        trainer=trainer,
+        metric=Metric(
+            name=metric_name,
+            goal=goal,
+            extractor=extractor
+            or LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        ),
+        phases=phases
+        or [
+            Phase(
+                name=phase_name,
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"lr": IntParam(type="int", low=1, high=2)},
+            )
+        ],
+    )
+
+
+def _write_experiment_config(config: Path, experiment: Experiment) -> None:
+    """Rewrite a cataloged config file in place, as an operator edit would."""
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))

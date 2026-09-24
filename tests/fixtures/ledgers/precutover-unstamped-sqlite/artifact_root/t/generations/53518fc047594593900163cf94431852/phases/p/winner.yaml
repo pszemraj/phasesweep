@@ -1,0 +1,48 @@
+phase: p
+metric:
+  objective: 0.5
+  goal: minimize
+trial_number: 0
+params:
+  a: 1
+effective_overrides:
+  a: 1
+constraints: {}
+gates: []
+completion:
+  requested_trials: 2
+  finished_trials: 2
+  completed_trials: 2
+  incomplete: false
+  reason: null
+  timeout_scope: null
+generation_id: 53518fc047594593900163cf94431852
+attempt_id: fcb4d6936b4f4e21b3379ed6b9595139
+winner_source:
+  kind: phase_trial
+  phase: p
+  trial_number: 0
+  generation_id: 53518fc047594593900163cf94431852
+  attempt_id: fcb4d6936b4f4e21b3379ed6b9595139
+trainer_input:
+  schema_version: 1
+  format: argparse
+  filename: overrides_resolved.json
+  size_bytes: 13
+  sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
+phase_fingerprint: 2cc24d017571f6007de47035b37b0330b8f8dda9b95618c34c19366ab0df3f2c
+objective_provenance:
+  extractor:
+    config_sha256: b7b4aa1d877c36c43b4c3c2c1ff207148492ab08e2b0e0a4096f8b4b43e6e1a2
+    kind: log_regex
+  recorded_at: '2026-09-23T05:54:16+00:00'
+  schema_version: 1
+  source:
+    kind: file
+    match_count: 1
+    matched_line: 1
+    path: stdout.log
+    sha256: 4aefd9d9b7f57cbfc31e8739fd45762b4eef95203a53299f58a0584920ef8087
+    size_bytes: 11
+trainer_env_digest: 7b61d78f0a3261d4463f25b3f0882c40fd365473a574bed043d53f9b8661dc4d
+trainer_inherit_env: none

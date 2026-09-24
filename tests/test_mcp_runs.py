@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from threading import Event, Thread
@@ -18,10 +19,12 @@ from threading import Event, Thread
 import pytest
 
 import phasesweep.mcp.runs as mcp_runs
+from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore, write_status_file
-from phasesweep.runtime.files import private_atomic_write_text
-from phasesweep.runtime.process import read_boot_id, read_proc_starttime
-from tests.conftest import file_mode, is_pid_zombie
+from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
+from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
+from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
+from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import make_run_handle, write_run_status
 
 
@@ -35,23 +38,6 @@ def _earlier_boot_id() -> str:
         pytest.skip("boot id unavailable on this platform")
     other = "00000000-0000-0000-0000-000000000000"
     return other if other != current else "11111111-1111-1111-1111-111111111111"
-
-
-def _state_tree_snapshot(state_dir: Path) -> dict[Path, tuple[int, bytes | None]]:
-    """Capture durable state entries so refusal tests can prove no mutation.
-
-    :param Path state_dir: MCP state root to snapshot.
-    :return dict[Path, tuple[int, bytes | None]]: Relative path, mode, and file bytes.
-    """
-    snapshot: dict[Path, tuple[int, bytes | None]] = {}
-    for path in (state_dir, *sorted(state_dir.rglob("*"))):
-        info = path.lstat()
-        mode = stat.S_IMODE(info.st_mode)
-        snapshot[path.relative_to(state_dir)] = (
-            mode,
-            path.read_bytes() if stat.S_ISREG(info.st_mode) else None,
-        )
-    return snapshot
 
 
 def test_create_get_roundtrip(tmp_path: Path) -> None:
@@ -219,6 +205,7 @@ def test_failed_pre_spawn_cleanup_retains_recoverable_lease(
     assert store.launch_inventory() == ([], set())
 
 
+@pytest.mark.integration
 def test_launch_lease_distinguishes_live_child_from_abandoned_preparation(
     tmp_path: Path,
 ) -> None:
@@ -412,6 +399,26 @@ def test_open_existing_is_observational_and_requires_run_store_layout(tmp_path: 
     } == before_modes
 
 
+def test_open_existing_blames_privacy_only_on_a_complete_layout(tmp_path: Path) -> None:
+    """A shared directory without the layout is a wrong path, not damaged state."""
+    project = tmp_path / "project"
+    project.mkdir()
+    project.chmod(0o755)
+
+    with pytest.raises(ValueError, match="expected directories are missing") as missing:
+        RunStore.open_existing(project)
+    assert not isinstance(missing.value, UnsafePrivatePathError)
+    assert file_mode(project) == 0o755
+
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    (state_dir / "runs").chmod(0o755)
+
+    with pytest.raises(UnsafePrivatePathError, match="must be owned by uid"):
+        RunStore.open_existing(state_dir)
+    assert file_mode(state_dir / "runs") == 0o755
+
+
 def test_run_store_marks_fresh_scaffolded_state(tmp_path: Path) -> None:
     state_dir = tmp_path / "state"
     state_dir.mkdir(mode=0o700)
@@ -445,36 +452,35 @@ def test_run_store_rejects_invalid_format_marker_without_mutation(
     RunStore(state_dir)
     marker = state_dir / ".phasesweep-format.json"
     private_atomic_write_text(marker, marker_text)
-    before = _state_tree_snapshot(state_dir)
+    before = tree_snapshot(state_dir)
 
     with pytest.raises(ValueError, match=match):
         RunStore(state_dir)
 
-    assert _state_tree_snapshot(state_dir) == before
+    assert tree_snapshot(state_dir) == before
 
 
-@pytest.mark.parametrize("evidence_kind", ["handle", "status", "log", "lease", "audit"])
+@pytest.mark.parametrize(
+    ("evidence", "text"),
+    [
+        (lambda store, _: store.status_path("exp-1"), '{"run_id": "exp-1", "returncode": 0}\n'),
+        (lambda store, _: store.log_path("exp-1"), "runner output\n"),
+        (lambda store, _: store.launch_lease_path("exp-1"), ""),
+        (lambda _, state_dir: state_dir / "audit.jsonl", '{"tool":"launch_run"}\n'),
+    ],
+    ids=["status", "log", "lease", "audit"],
+)
 def test_run_store_refuses_unmarked_durable_state_before_initialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    evidence_kind: str,
+    evidence: Callable[[RunStore, Path], Path],
+    text: str,
 ) -> None:
     state_dir = tmp_path / "state"
-    store = RunStore(state_dir)
-    run_id = "exp-1"
-    if evidence_kind == "handle":
-        store.create(make_run_handle(run_id=run_id))
-    elif evidence_kind == "status":
-        write_status_file(store.status_path(run_id), {"run_id": run_id, "returncode": 0})
-    elif evidence_kind == "log":
-        private_atomic_write_text(store.log_path(run_id), "runner output\n")
-    elif evidence_kind == "lease":
-        private_atomic_write_text(store.launch_lease_path(run_id), "")
-    else:
-        private_atomic_write_text(state_dir / "audit.jsonl", '{"tool":"launch_run"}\n')
+    private_atomic_write_text(evidence(RunStore(state_dir), state_dir), text)
     marker = state_dir / ".phasesweep-format.json"
     marker.unlink()
-    before = _state_tree_snapshot(state_dir)
+    before = tree_snapshot(state_dir)
     initialized: list[Path] = []
 
     def fail_if_initialized(path: Path) -> None:
@@ -487,22 +493,140 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
         RunStore(state_dir)
 
     assert initialized == []
-    assert _state_tree_snapshot(state_dir) == before
+    assert tree_snapshot(state_dir) == before
 
 
 def test_open_existing_requires_supported_format_marker_without_mutation(tmp_path: Path) -> None:
+    """Without a marker or run handles, the path names some other directory, not old state."""
     state_dir = tmp_path / "state"
     RunStore(state_dir)
-    marker = state_dir / ".phasesweep-format.json"
-    marker.unlink()
-    before = _state_tree_snapshot(state_dir)
+    (state_dir / ".phasesweep-format.json").unlink()
+    before = tree_snapshot(state_dir)
 
-    with pytest.raises(
-        ValueError, match="malformed or unsupported.*fresh MCP state directory.*0.3.1"
-    ):
+    with pytest.raises(ValueError, match="no format marker and no run handles") as wrong:
         RunStore.open_existing(state_dir)
+    assert not isinstance(wrong.value, mcp_runs.UnsupportedStateFormatError)
+    assert tree_snapshot(state_dir) == before
 
-    assert _state_tree_snapshot(state_dir) == before
+
+def _logs_deleted(tmp_path: Path) -> Path:
+    state_dir = tmp_path / "state"
+    RunStore(state_dir)
+    (state_dir / "logs").rmdir()
+    return state_dir
+
+
+def _shared_project_dir(tmp_path: Path, mode: int) -> Path:
+    project = tmp_path / "project"
+    for path in (project, project / "runs", project / "logs"):
+        path.mkdir(exist_ok=True)
+        path.chmod(mode)
+    return project
+
+
+def _marker_mode(mode: int) -> Callable[[Path], Path]:
+    def build(tmp_path: Path) -> Path:
+        state_dir = tmp_path / "state"
+        RunStore(state_dir)
+        (state_dir / ".phasesweep-format.json").chmod(mode)
+        return state_dir
+
+    return build
+
+
+def _marker_text(text: str) -> Callable[[Path], Path]:
+    def build(tmp_path: Path) -> Path:
+        state_dir = tmp_path / "state"
+        RunStore(state_dir)
+        private_atomic_write_text(state_dir / ".phasesweep-format.json", text)
+        return state_dir
+
+    return build
+
+
+def _regular_file(tmp_path: Path) -> Path:
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text("x: 1\n")
+    return catalog
+
+
+def _below_regular_file(tmp_path: Path) -> Path:
+    return _regular_file(tmp_path) / "state"
+
+
+def _symlink_to_state_dir(tmp_path: Path) -> Path:
+    RunStore(tmp_path / "real")
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    return tmp_path / "link"
+
+
+def _under_unsearchable_dir(tmp_path: Path) -> Path:
+    locked = tmp_path / "someone-elses-home"
+    locked.mkdir()
+    locked.chmod(0o000)
+    return locked / "state"
+
+
+@pytest.mark.parametrize(
+    ("build", "message"),
+    [
+        # The marker is there, so the directory is the state directory and the
+        # missing, shared, or unreadable part of it is damage to restore.
+        (_logs_deleted, "has its format marker but is missing"),
+        pytest.param(_marker_mode(0o000), "cannot be read", marks=requires_nonroot),
+        (_marker_mode(0o644), "with mode 0600; found"),
+        (_marker_text("not json\n"), "is malformed"),
+        (_marker_text('{"schema_version": 1, "unexpected": true}\n'), "is malformed"),
+        # The CLI resolves a symlinked state_dir first; through the API the
+        # marker is reached, so the link standing in for the directory is damage.
+        (_symlink_to_state_dir, "is not a real directory"),
+        # A readable marker naming another format is another release's state.
+        (_marker_text('{"schema_version": 0}\n'), "declares unsupported format 0"),
+        # No marker and no run handles: the path names some other directory,
+        # whatever its layout or permissions, and no chmod turns it into state.
+        (
+            lambda tmp_path: _shared_project_dir(tmp_path, 0o755),
+            "no format marker and no run handles",
+        ),
+        (
+            lambda tmp_path: _shared_project_dir(tmp_path, 0o700),
+            "no format marker and no run handles",
+        ),
+        (_regular_file, "expected directories are missing"),
+        # A walk that fails above state_dir never reached a state directory.
+        (_below_regular_file, "is not reachable through real"),
+        pytest.param(
+            _under_unsearchable_dir, "is not reachable through real", marks=requires_nonroot
+        ),
+    ],
+    ids=[
+        "logs-deleted",
+        "marker-mode-000",
+        "marker-mode-0644",
+        "marker-not-json",
+        "marker-extra-field",
+        "symlinked-state-dir",
+        "marker-other-format",
+        "shared-project-dir",
+        "private-project-dir",
+        "regular-file",
+        "below-regular-file",
+        "under-unsearchable-dir",
+    ],
+)
+def test_recovery_tells_a_wrong_state_dir_from_a_damaged_one(
+    tmp_path: Path, build: Callable[[Path], Path], message: str
+) -> None:
+    """recover-run tells a wrong path, a damaged state dir, and another release's apart."""
+    state_dir = build(tmp_path)
+    locked = tmp_path / "someone-elses-home"
+    try:
+        with pytest.raises(RunRecoveryError) as excinfo:
+            recover_run(state_dir, "exp-1", confirm=False, emit=lambda _message: None)
+    finally:
+        if locked.exists():
+            locked.chmod(0o700)
+    assert message in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
@@ -774,7 +898,7 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     handle = make_run_handle(
         run_id="exp-1",
         experiment_id="exp",
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -913,7 +1037,7 @@ def test_status_read_failures_do_not_break_state_scans(
 
 def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
     store.create(handle)
     write_run_status(
         store,
@@ -935,7 +1059,7 @@ def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
 
 def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
     store.create(handle)
 
     assert store.state(handle) == "running"
@@ -962,7 +1086,7 @@ def test_clear_cleanup_uncertain_uses_durable_idempotent_unlink(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
     store.mark_cleanup_uncertain(handle)
     marker = store.cleanup_uncertain_path(handle.run_id)
     real_unlink = mcp_runs._strict_unlink
@@ -985,7 +1109,7 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
     store.create(handle)
     original_recovered = store._cleanup_recovered
     first_read = True
@@ -1025,7 +1149,7 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
 
 def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
     store.create(handle)
     started = Event()
     finished = Event()
@@ -1077,7 +1201,7 @@ def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: ob
     handle = make_run_handle(
         run_id="exp-1",
         config_sha256="a" * 64,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -1097,10 +1221,11 @@ def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
         config_sha256="a" * 64,
         launch_state="launching",
     )
+    runner_pid = reaped_pid()
     spawned = make_run_handle(
         run_id="exp-1",
         config_sha256="a" * 64,
-        pid=4242,
+        pid=runner_pid,
         starttime=111,
     )
     store.create(pending)
@@ -1109,11 +1234,11 @@ def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
     store.mark_cleanup_uncertain(pending)
 
     marker = json.loads(store.cleanup_uncertain_path("exp-1").read_text())
-    assert marker["pid"] == 4242
-    assert marker["pgid"] == 4242
+    assert marker["pid"] == runner_pid
+    assert marker["pgid"] == runner_pid
     assert marker["pid_starttime"] == 111
     identity = store.cleanup_identity(pending)
-    assert (identity.pid, identity.pgid, identity.pid_starttime) == (4242, 4242, 111)
+    assert (identity.pid, identity.pgid, identity.pid_starttime) == (runner_pid, runner_pid, 111)
 
 
 def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
@@ -1121,7 +1246,9 @@ def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) ->
     boot_id = read_boot_id()
     if boot_id is None:
         pytest.skip("boot id unavailable on this platform")
-    handle = replace(make_run_handle(run_id="exp-1", pid=4242, starttime=111), boot_id=boot_id)
+    handle = replace(
+        make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111), boot_id=boot_id
+    )
 
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
@@ -1163,7 +1290,9 @@ def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) ->
 @pytest.mark.parametrize("boot_id", ["", "malformed", 12345, True])
 def test_cleanup_marker_with_invalid_boot_id_is_rejected(tmp_path: Path, boot_id: object) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64, pid=999999, starttime=111)
+    handle = make_run_handle(
+        run_id="exp-1", config_sha256="a" * 64, pid=reaped_pid(), starttime=111
+    )
     store.create(handle)
     private_atomic_write_text(
         store.cleanup_uncertain_path("exp-1"),
@@ -1206,7 +1335,7 @@ def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path:
     # Same identity as the boot-mismatch case minus the boot id: an older
     # persisted handle cannot rule out PID reuse, so it must still fail closed.
     store = RunStore(tmp_path / "state")
-    handle = replace(make_run_handle(run_id="exp-1", pid=999999, starttime=111), boot_id=None)
+    handle = replace(make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111), boot_id=None)
     assert handle.boot_id is None
     store.create(handle)
 
@@ -1219,7 +1348,7 @@ def test_terminal_status_written_during_liveness_check_does_not_require_recovery
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-racing-status", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-racing-status", pid=reaped_pid(), starttime=111)
     store.create(handle)
 
     def runner_finishes(_pid: int | None, _starttime: int | None) -> bool:
@@ -1241,7 +1370,7 @@ def test_terminal_status_written_during_liveness_check_does_not_require_recovery
 def test_earlier_boot_clears_a_persisted_cleanup_uncertainty_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = replace(
-        make_run_handle(run_id="exp-1", pid=999999, starttime=111),
+        make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111),
         boot_id=_earlier_boot_id(),
     )
     store.create(handle)
@@ -1257,7 +1386,7 @@ def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
 ) -> None:
     store = RunStore(tmp_path / "state")
     handle = replace(
-        make_run_handle(run_id="exp-1", experiment_id="exp", pid=999999, starttime=111),
+        make_run_handle(run_id="exp-1", experiment_id="exp", pid=reaped_pid(), starttime=111),
         boot_id=_earlier_boot_id(),
     )
     store.create(handle)
@@ -1294,7 +1423,7 @@ def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> Non
 
 def test_confirmed_terminal_status_overrides_stale_cleanup_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=999999, starttime=111)
+    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
     write_run_status(
@@ -1322,7 +1451,7 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
         run_id="exp-1",
         experiment_id="exp",
         config_sha256="a" * 64,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -1357,7 +1486,7 @@ def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> Non
     handle = make_run_handle(
         run_id="exp-1",
         config_sha256="a" * 64,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -1392,7 +1521,7 @@ def test_cleanup_recovery_rejects_malformed_reaped_attempt_ids(
     handle = make_run_handle(
         run_id="exp-1",
         config_sha256="a" * 64,
-        pid=999999,
+        pid=reaped_pid(),
         starttime=111,
     )
     store.create(handle)
@@ -1495,6 +1624,7 @@ def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     assert store.cleanup_uncertain(handle)
 
 
+@pytest.mark.integration
 def test_state_cleanup_uncertain_for_zombie_runner_without_status(tmp_path: Path) -> None:
     if not sys.platform.startswith("linux"):
         pytest.skip("zombie detection relies on /proc")

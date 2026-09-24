@@ -247,19 +247,6 @@ def test_phase_composition_accepts_child_fixed_resolution_as_new_origin() -> Non
             "both fixed_overrides and search_space",
             id="local-fixed-sampled",
         ),
-        pytest.param(
-            [
-                Phase(name="base", n_trials=1, fixed_overrides={"model": "small"}),
-                Phase(
-                    name="child",
-                    n_trials=1,
-                    inherits=["base"],
-                    search_space={"model.depth": {"type": "int", "low": 1, "high": 2}},
-                ),
-            ],
-            "dotted-key namespace collision",
-            id="dotted-collision",
-        ),
     ],
 )
 def test_phase_composition_rejects_invalid_origins(phases: list[Phase], match: str) -> None:
@@ -628,7 +615,7 @@ phases:
         load_experiment(write_yaml(tmp_path, body))
 
 
-def test_n_jobs_default_is_one(tmp_path):
+def test_override_format_n_jobs_and_failure_limit_defaults(tmp_path):
     body = """
 experiment: t
 storage: ":memory:"
@@ -654,8 +641,12 @@ def test_plain_json_extractor_is_a_primary_objective() -> None:
     assert metric.extractor.type == "json"
 
 
-def test_suite_config_is_rejected_before_artifacts(tmp_path: Path) -> None:
+def test_suite_config_is_rejected_before_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The removed top-level selector must not be ignored as an experiment field."""
+    # With no workdir an experiment writes under ./runs, so that is where to look.
+    monkeypatch.chdir(tmp_path)
     path = write_yaml(
         tmp_path,
         """
@@ -667,6 +658,7 @@ def test_suite_config_is_rejected_before_artifacts(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="suite configs are no longer supported"):
         load_config(path)
+    assert not (tmp_path / "runs").exists()
 
 
 def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:

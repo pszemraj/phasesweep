@@ -25,11 +25,12 @@ from phasesweep.engine import (
     PhaseSweepError,
     PublicationAccessError,
     PublicationIntegrityError,
+    UnsafeProcessCleanupError,
     config_status,
     run_config,
 )
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.publication import (
     _published_winner_path_for,
@@ -46,7 +47,7 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import report_objective
 from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
-from phasesweep.runtime.process import (
+from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
 )
@@ -377,6 +378,13 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
             sys.exit(2)
     try:
         run_config(config, from_phase=from_phase, dry_run=dry_run)
+    except UnsafeProcessCleanupError as exc:
+        # A trial's cleanup refusal describes the leak, and the study keeps
+        # that text as the cause a later phase-abort refusal quotes, so the
+        # recovery a CLI operator runs is added here rather than at the raise.
+        raise UnsafeProcessCleanupError.rewrap(
+            exc, f"{exc} To retry its cleanup, run `phasesweep run` again with the same config."
+        ) from exc
     except PhaseSweepShutdown as exc:
         if exc.published_result_committed:
             click.echo(
@@ -534,7 +542,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
         printing "(no winner yet)" beside a corrupt publication reads as a
         phase that simply has not run (review v0.5.18 / finding F4).
     """
-    _validate_artifact_root_binding(experiment, claim_fresh=False)
+    validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
     if publication.state == "permission_denied":
         raise _publication_access_error(

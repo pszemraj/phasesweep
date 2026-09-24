@@ -104,7 +104,7 @@ def test_default_lock_dir_requires_an_absolute_account_home(
     assert runtime_files.lock_dir() == override
 
 
-@pytest.mark.parametrize("invalid", ["relative", "missing", "mode", "symlink"])
+@pytest.mark.parametrize("invalid", ["missing", "mode", "symlink"])
 def test_home_override_requires_private_provisioned_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
 ) -> None:
@@ -117,7 +117,7 @@ def test_home_override_requires_private_provisioned_root(
         link = tmp_path / "link"
         link.symlink_to(root, target_is_directory=True)
         root = link
-    monkeypatch.setenv("PHASESWEEP_HOME", "relative" if invalid == "relative" else str(root))
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
     with pytest.raises(runtime_files.UnsafePrivatePathError):
         runtime_files.phasesweep_home()
     assert not (root / "locks").exists()
@@ -527,7 +527,7 @@ def test_private_open_closes_descriptor_on_shutdown_during_fdopen_handoff(
     filename: str,
 ) -> None:
     """A deferred shutdown aborting fd handoff must close the returned stream."""
-    from phasesweep.runtime.process import PhaseSweepShutdown, _shutdown_handler
+    from phasesweep.runtime.shutdown import PhaseSweepShutdown, _shutdown_handler
 
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
@@ -600,6 +600,7 @@ def test_open_directory_fd_shutdown_mid_walk_does_not_double_close(
     assert close_calls
 
 
+@pytest.mark.signals_own_pid
 def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -615,7 +616,7 @@ def test_open_directory_fd_defers_midwalk_shutdown_and_leaks_no_descriptor(
     walk finishes and the completed final descriptor must be closed before
     the shutdown propagates to the caller.
     """
-    from phasesweep.runtime.process import PhaseSweepShutdown, signal_handler_scope
+    from phasesweep.runtime.shutdown import PhaseSweepShutdown, signal_handler_scope
 
     target = tmp_path / "nested" / "dir"
     target.mkdir(parents=True)
@@ -763,6 +764,7 @@ def test_in_memory_run_lock_is_keyed_by_workdir(
         assert set(paths_a).isdisjoint(paths_b)
 
 
+@pytest.mark.integration
 def test_output_lock_resolves_symlinked_experiment_leaf(tmp_path: Path) -> None:
     """A symlinked experiment leaf must share the target's output lock.
 

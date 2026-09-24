@@ -133,6 +133,12 @@ def test_check_catalog_matches_server_cross_entry_identity_rejections(
     alias_kind: str,
     expected_error: str,
 ) -> None:
+    """Two entries resolving to one engine experiment must fail catalog load.
+
+    The MCP busy guard keys on the id string while the engine locks key on
+    the output namespace and storage identity; two ids over one resource
+    would race launches and split run history (review v0.5.17 gap hunt).
+    """
     shared = mcp_experiment_config_text(tmp_path, name="shared")
     second = shared
     if alias_kind == "storage":

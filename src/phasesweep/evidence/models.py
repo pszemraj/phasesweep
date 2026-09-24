@@ -203,7 +203,13 @@ class _WandbSummarySource(_Frozen):
     @field_validator("base_url")
     @classmethod
     def _normalized_endpoint(cls, value: str) -> str:
-        """Normalize the endpoint without admitting credentials or query strings."""
+        """Normalize the endpoint without admitting credentials or query strings.
+
+        :param str value: Configured W&B API base URL.
+        :raises ValueError: The URL is not HTTP(S) or carries credentials, a
+            query, or a fragment.
+        :return str: URL with lowercase scheme and host and no trailing slash.
+        """
         parsed = urlsplit(value)
         if (
             parsed.scheme not in {"https", "http"}

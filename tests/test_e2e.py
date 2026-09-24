@@ -12,10 +12,15 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
 import yaml
 
 from phasesweep import load_experiment, run_experiment
 from tests.conftest import copy_fake_train
+
+# A full three-phase sweep against the real fake trainer: every test here spawns
+# trainer subprocesses and runs for seconds, not milliseconds.
+pytestmark = pytest.mark.integration
 
 REPO = Path(__file__).resolve().parent.parent
 EXAMPLE_YAML = REPO / "examples" / "experiment.yaml"
@@ -27,9 +32,15 @@ def _prep(tmp_path: Path) -> Path:
 
     text = EXAMPLE_YAML.read_text()
     runs_dir = tmp_path / "runs"
-    text = text.replace("./runs/phases.db", str(runs_dir / "phases.db"))
-    text = text.replace("./runs", str(runs_dir))
-    text = text.replace("python -m phasesweep.examples.fake_train", f"python {trainer.resolve()}")
+    for old, new in (
+        ("./runs/phases.db", str(runs_dir / "phases.db")),
+        ("./runs", str(runs_dir)),
+        ("python -m phasesweep.examples.fake_train", f"python {trainer.resolve()}"),
+    ):
+        # A replacement that silently matches nothing would run the sweep in the
+        # repository's own ./runs while every assertion below still passes.
+        assert old in text, f"{EXAMPLE_YAML} no longer contains {old!r}; update _prep"
+        text = text.replace(old, new)
     yaml_path = tmp_path / "experiment.yaml"
     yaml_path.write_text(text)
     return yaml_path

@@ -11,21 +11,22 @@ from pathlib import Path
 import optuna
 import pytest
 
-from phasesweep.engine.artifact_roots import _validate_artifact_root_binding
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import _generation_winner_path
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION, Winner, WinnerSource
+from phasesweep.engine.state import Winner, WinnerSource
+from phasesweep.mcp.errors import UnknownRunError
 from phasesweep.mcp.redaction import status_payload
 from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
-from phasesweep.mcp.server import (
+from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.tools import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
     AWAIT_RECHECK_SECONDS,
     _run_elapsed_seconds,
 )
-from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime.time import utc_now_iso
+from tests.conftest import mark_current_format, reaped_pid
 from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
@@ -41,25 +42,20 @@ def _complete_trials(experiment, *, n: int) -> None:
         storage=experiment.storage,
         direction="minimize",
     )
-    _mark_current_study(experiment, study)
+    mark_current_format(experiment, study)
     for i in range(n):
         trial = study.ask()
         study.tell(trial, float(i))
 
 
-def _mark_current_study(experiment, study: optuna.Study) -> None:
-    """Mark a manually constructed study/root as current-format test state."""
-    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
-    _validate_artifact_root_binding(experiment, claim_fresh=True)
-
-
 def _handle(run_id: str, *, started_at: str) -> RunHandle:
+    pid = reaped_pid()
     return RunHandle(
         run_id=run_id,
         experiment_id="srv",
         config_sha256="0" * 64,
-        pid=1,
-        pgid=1,
+        pid=pid,
+        pgid=pid,
         pid_starttime=None,
         started_at=started_at,
     )
@@ -239,8 +235,8 @@ def _fake_clock(monkeypatch: pytest.MonkeyPatch) -> dict[str, float]:
         clock["sleeps"] += seconds
         clock["pauses"] += 1
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", advance)
     return clock
 
 
@@ -267,19 +263,6 @@ def test_await_run_returns_immediately_on_terminal(
     assert result["run"]["state"] == "succeeded"
     assert clock["sleeps"] == 0.0  # no recheck pause was needed
     assert isinstance(result["elapsed_seconds"], int)
-
-
-def test_await_run_times_out_with_unchanged_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    app, _registry, _store = _app_with_run(tmp_path)
-    clock = _fake_clock(monkeypatch)
-
-    result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
-    assert result["reason"] == "timeout"
-    assert result["changed"] is False
-    assert result["run"]["state"] == "running"
-    assert clock["sleeps"] == pytest.approx(AWAIT_MIN_TIMEOUT_SECONDS)
 
 
 def test_await_run_rechecks_mid_wait_at_the_default_timeout(
@@ -313,11 +296,11 @@ def test_await_run_reports_failed_trial_progress_at_timeout(
             storage=experiment.storage,
             direction="minimize",
         )
-        _mark_current_study(experiment, study)
+        mark_current_format(experiment, study)
         study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_fail_trial)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", sleep_then_fail_trial)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
 
@@ -363,6 +346,8 @@ def test_await_run_clamps_timeout(
     result = asyncio.run(app.await_run("r1", timeout_seconds=requested_timeout))
 
     assert result["reason"] == "timeout"
+    assert result["changed"] is False
+    assert result["run"]["state"] == "running"
     assert clock["sleeps"] == pytest.approx(effective_timeout)
 
 
@@ -387,8 +372,8 @@ def _await_with_timed_reads(
     async def advance(seconds: float) -> None:
         clock["now"] += seconds
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", advance)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", advance)
     monkeypatch.setattr(app, "_read_status_target", timed_read)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MIN_TIMEOUT_SECONDS))
@@ -435,13 +420,13 @@ def test_await_run_returns_when_phase_gains_winner(
 
     async def sleep_then_write_winner(seconds: float) -> None:
         clock["now"] += seconds
-        _validate_artifact_root_binding(experiment, claim_fresh=True)
+        mark_current_format(experiment)
         winner = _generation_winner_path(experiment, "r1", experiment.phases[0].name)
         winner.parent.mkdir(parents=True, exist_ok=True)
         winner.write_text("{}\n")
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_write_winner)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", sleep_then_write_winner)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS))
     assert result["reason"] == "phase_completed"
@@ -471,8 +456,8 @@ def test_await_run_returns_when_run_fails_mid_wait(
             ),
         )
 
-    monkeypatch.setattr("phasesweep.mcp.server.time.monotonic", lambda: clock["now"])
-    monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", sleep_then_fail)
+    monkeypatch.setattr("phasesweep.mcp.tools.time.monotonic", lambda: clock["now"])
+    monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", sleep_then_fail)
 
     result = asyncio.run(app.await_run("r1", timeout_seconds=AWAIT_MAX_TIMEOUT_SECONDS))
 
@@ -513,7 +498,7 @@ def test_await_run_unknown_run_id(tmp_path: Path) -> None:
     config_text = mcp_experiment_config_text(tmp_path)
     catalog = write_mcp_config_catalog(tmp_path, {"srv": config_text})
     app, _registry, _store = make_mcp_app(catalog)
-    with pytest.raises(Exception, match="unknown run id"):
+    with pytest.raises(UnknownRunError, match="unknown run id"):
         asyncio.run(app.await_run("missing"))
 
 
@@ -562,7 +547,7 @@ def test_await_run_is_cancellable_during_recheck_pause(
             entered_sleep.set()
             await asyncio.Event().wait()
 
-        monkeypatch.setattr("phasesweep.mcp.server.asyncio.sleep", wait_forever)
+        monkeypatch.setattr("phasesweep.mcp.tools.asyncio.sleep", wait_forever)
         task = asyncio.create_task(app.await_run("r1"))
         await entered_sleep.wait()
         task.cancel()

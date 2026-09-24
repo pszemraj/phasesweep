@@ -1,0 +1,29 @@
+{
+  "backend": "journal",
+  "binding_schema_version": 3,
+  "derivation": "Drop the JSONL record with op_code == 2 (SET_STUDY_USER_ATTR) carrying user_attr['phasesweep_study_schema_version']; the trial records remain.",
+  "derived_from": "current-journal",
+  "expect": {
+    "ledger-only": "schema-mismatch",
+    "tree": "schema-mismatch"
+  },
+  "experiment": "t",
+  "ledger": "ledger/study.journal",
+  "modes": [
+    "tree",
+    "ledger-only"
+  ],
+  "n_trials": 2,
+  "name": "precutover-unstamped-journal",
+  "notes": "Populated but unmarked: the shape a 0.3.1 ledger has before stamping existed.",
+  "phases": [
+    "p"
+  ],
+  "produced_by": {
+    "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
+    "optuna": "4.9.0",
+    "phasesweep_git": "v0.3.1-57-g7ecee31",
+    "python": "3.13.15",
+    "sqlite": "3.53.4"
+  }
+}

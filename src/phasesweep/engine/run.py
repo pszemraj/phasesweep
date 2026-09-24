@@ -10,13 +10,13 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
-import phasesweep.engine.artifact_roots as artifact_root_ops
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
 import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.guards as guard_ops
+import phasesweep.engine.ledger as ledger_ops
 import phasesweep.engine.locking as locking_ops
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
@@ -26,7 +26,12 @@ from phasesweep.config import Config, Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import _metric_scoring_line, _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
-from phasesweep.engine.errors import StudyStorageUnavailableError
+from phasesweep.engine.errors import (
+    IncompleteJournalRecordError,
+    LedgerTransactionInterruptedError,
+    OperatorAction,
+    StudyStorageUnavailableError,
+)
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
@@ -36,8 +41,9 @@ from phasesweep.engine.trial import (
     _preflight_trainer_environments,
     _trainer_environment,
 )
+from phasesweep.errors import RERUN_CLEANUP_RECOVERY
 from phasesweep.runtime.files import ensure_artifact_dir, require_posix_runtime
-from phasesweep.runtime.process import (
+from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     service_pending_shutdown,
     signal_handler_scope,
@@ -279,7 +285,7 @@ def run_experiment(
         return _run_experiment_inner(
             experiment,
             from_phase=from_phase,
-            dry_run=True,
+            ledger=None,
             generation_id=None,
         )
     # A fresh artifact tree cannot be a no-op replay, so validate its launch
@@ -358,26 +364,37 @@ def _run_experiment_outcome(
         contextlib.ExitStack() as run_stack,
     ):
         # Resolve both ownership directions before the generation claim. The
-        # returned objects are passed into preflight so storage is not reread
-        # after this strict discovery-and-claim boundary.
+        # claimed handle carries the studies this strict discovery found, so
+        # preflight operates on exactly those objects instead of rereading
+        # storage, and every phase opens its live study through the handle.
         try:
-            existing_studies = artifact_root_ops._load_and_check_artifact_roots(
-                experiment, from_phase=from_phase
+            claimed = ledger_ops.claim_ledger(
+                ledger_ops.validate_ledger(experiment), from_phase=from_phase
             )
         except StudyStorageUnavailableError as exc:
             # The ledger may contain attempts from an earlier orchestrator. A
             # failed ownership read cannot prove those processes are resolved,
             # even though this invocation has not claimed a generation or
-            # launched anything of its own.
-            raise ProcessCleanupUncertainError(
+            # launched anything of its own. Recovery cannot read the ledger
+            # either, so the ledger's repair is the first step the message names.
+            unknown = (
                 "Artifact ownership could not be checked because required persistent "
-                f"study state is unavailable: {exc} Cleanup state is therefore unknown. "
-                "Restore the original complete storage ledger and access to it before "
-                "retrying. For an MCP run, then run phasesweep mcp recover-run."
+                f"study state is unavailable: {exc} Cleanup state is therefore unknown."
+            )
+            if isinstance(exc, (LedgerTransactionInterruptedError, IncompleteJournalRecordError)):
+                # These name the repair of an otherwise intact ledger; restoring
+                # the whole ledger instead would be the wrong remedy.
+                raise ProcessCleanupUncertainError.rewrap(
+                    exc, f"{unknown} For an MCP run, then run phasesweep mcp recover-run."
+                ) from exc
+            raise ProcessCleanupUncertainError(
+                f"{unknown} Restore the original complete storage ledger and access to it "
+                "before retrying. For an MCP run, then run phasesweep mcp recover-run.",
+                action=OperatorAction.RESTORE_LEDGER,
             ) from exc
         _preflight_missing_reached_phase_environments(
             experiment,
-            existing_studies,
+            claimed.studies,
             from_phase=from_phase,
         )
         ensure_artifact_dir(path_ops._experiment_dir(experiment))
@@ -401,10 +418,9 @@ def _run_experiment_outcome(
                 publish_current=True,
             )
             existing_studies = guard_ops._preflight_existing_studies(
-                experiment,
+                claimed,
                 cleanup_report=cleanup,
                 from_phase=from_phase,
-                preloaded_studies=existing_studies,
             )
             # Selection reads Optuna alone, so a tree whose candidate evidence
             # was deleted would silently reselect and republish those trials
@@ -449,7 +465,7 @@ def _run_experiment_outcome(
             result = _run_experiment_inner(
                 experiment,
                 from_phase=from_phase,
-                dry_run=False,
+                ledger=claimed,
                 generation_id=generation_id,
                 preloaded_winners=preloaded_winners,
                 run_deadline=run_deadline,
@@ -476,7 +492,7 @@ def _run_experiment_outcome(
             if generation_prepared:
                 reconciliation = attempt_ops._PreflightCleanupReport()
                 try:
-                    guard_ops._preflight_existing_studies(
+                    guard_ops._reconcile_existing_studies(
                         experiment,
                         cleanup_report=reconciliation,
                         from_phase=from_phase,
@@ -546,9 +562,19 @@ def _run_experiment_outcome(
                 and control_error is None
             ):
                 # Cleanup uncertainty intentionally becomes the actionable error;
-                # the original failure remains chained for diagnosis but is unsafe to handle alone.
+                # the original failure remains chained for diagnosis but is unsafe to handle alone,
+                # so its action is replaced too: recovery has to settle cleanup before its remedy.
+                # A cleanup refusal that names its own repair keeps it, and its text says it.
+                if isinstance(cleanup.error, ProcessCleanupUncertainError):
+                    raise ProcessCleanupUncertainError.rewrap(
+                        cleanup.error,
+                        "The run failed and subsequent process cleanup could not be confirmed. "
+                        f"{cleanup.error}",
+                    ) from primary_error
                 raise ProcessCleanupUncertainError(
-                    "The run failed and subsequent process cleanup could not be confirmed."
+                    "The run failed and subsequent process cleanup could not be confirmed. "
+                    f"To retry that cleanup, {RERUN_CLEANUP_RECOVERY}.",
+                    action=OperatorAction.RUN_RECOVER_RUN,
                 ) from primary_error
             if control_error is not None:
                 raise control_error from exc
@@ -584,7 +610,7 @@ def _run_experiment_inner(
     experiment: Experiment,
     *,
     from_phase: str | None,
-    dry_run: bool,
+    ledger: ledger_ops.ClaimedLedger | None,
     generation_id: str | None,
     preloaded_winners: dict[str, Winner] | None = None,
     run_deadline: float | None = None,
@@ -596,8 +622,11 @@ def _run_experiment_inner(
         experiment: Parsed experiment config.
         from_phase: Optional name of the phase to resume from; earlier phases
             are loaded from disk.
-        dry_run: If ``True``, no subprocesses launch and no ``summary.yaml`` is
-            written; each phase's sampler capability line is logged up front.
+        ledger: The claimed ledger every phase opens its live study through,
+            claimed for this same ``experiment``. ``None`` is a dry run: no
+            subprocesses launch, no ``summary.yaml`` is written, each phase
+            previews against an in-memory study, and each phase's sampler
+            capability line is logged up front.
         generation_id: Current invocation identity, or ``None`` for dry-run.
         preloaded_winners: Strictly validated skipped-phase winners loaded before
             the current generation was committed.
@@ -616,6 +645,7 @@ def _run_experiment_inner(
             (re-raised on non-dry-run; dry runs substitute a placeholder).
 
     """
+    dry_run = ledger is None
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
@@ -676,7 +706,7 @@ def _run_experiment_inner(
             phase,
             inherited,
             generation_id=generation_id,
-            dry_run=dry_run,
+            ledger=ledger,
             run_deadline=run_deadline,
         )
         if not dry_run:
