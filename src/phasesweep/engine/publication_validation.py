@@ -26,6 +26,7 @@ from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PUBLICATION_POINTER_SCHEMA_VERSION,
     WINNER_FILENAME,
+    _parse_winner_source,
 )
 from phasesweep.runtime.files import file_sha256, nofollow_flag
 
@@ -306,15 +307,12 @@ def _validate_generation_manifest(
             source = payload.get("winner_source")
             if not isinstance(source, Mapping):
                 raise _fail(f"winner for phase {name!r} has no valid winner_source")
-            if source.get("kind") != "phase_trial":
-                raise _fail(f"winner for phase {name!r} has no valid winner_source kind")
-            if set(source) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
-                raise _fail(f"winner for phase {name!r} has a removed winner_source field")
+            # _parse_winner_source owns kind, key set, and phase equality. The
+            # safe-name and exact-int checks stay here because it checks
+            # neither: it only requires a nonempty phase and coerces with int().
             source_phase = source.get("phase")
             if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
                 raise _fail(f"winner for phase {name!r} has no valid winner_source phase")
-            if source_phase != name:
-                raise _fail(f"winner for phase {name!r} names another winner_source phase")
             source_trial = source.get("trial_number")
             if (
                 not isinstance(source_trial, int)
@@ -322,8 +320,17 @@ def _validate_generation_manifest(
                 or source_trial != payload.get("trial_number")
             ):
                 raise _fail(f"winner for phase {name!r} has no valid winner_source trial_number")
-            for id_field in ("generation_id", "attempt_id"):
-                if source.get(id_field) != payload.get(id_field):
+            try:
+                parsed_source = _parse_winner_source(source, expected_phase=name)
+            except ValueError as exc:
+                raise _fail(
+                    f"winner for phase {name!r} has no valid winner_source ({exc})"
+                ) from exc
+            for id_field, parsed_value in (
+                ("generation_id", parsed_source.generation_id),
+                ("attempt_id", parsed_source.attempt_id),
+            ):
+                if parsed_value != payload.get(id_field):
                     raise _fail(
                         f"winner for phase {name!r} has a winner_source "
                         f"that disagrees with its {id_field}"

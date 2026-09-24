@@ -47,11 +47,13 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
     required keys, and that its ``phase`` agrees with ``expected_phase`` (the
     phase the caller is reading a winner *for* — a mismatch means the winner
     was copied or misattributed across phases). Shared by
-    :func:`phasesweep.engine.artifacts._load_winner` and
-    :func:`phasesweep.engine.read.read_winner`, which differ only in what
-    they do when this raises: the former wraps it as
-    :class:`phasesweep.engine.errors.WinnerIntegrityError`, while the latter
-    treats the winner as absent.
+    :func:`phasesweep.engine.artifacts._load_winner`,
+    :func:`phasesweep.engine.read.read_winner`, and
+    :func:`phasesweep.engine.publication_validation._validate_generation_manifest`,
+    which differ only in what they do when this raises: the first two wrap it
+    as :class:`phasesweep.engine.errors.WinnerIntegrityError` or treat the
+    winner as absent, respectively, while the manifest validator wraps it as
+    :class:`phasesweep.engine.errors.PublicationIntegrityError`.
 
     :param object data: Parsed ``winner_source`` block from a persisted
         ``winner.yaml``.
