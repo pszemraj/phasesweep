@@ -250,6 +250,6 @@ def _winner_summary_item(name: str, winner: Winner) -> dict[str, Any]:
     payload = {
         "name": name,
         "metric": winner.metric,
-        **_winner_common_payload(winner, name),
+        **_winner_common_payload(winner),
     }
     return payload

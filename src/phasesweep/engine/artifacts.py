@@ -179,7 +179,7 @@ def _save_winner(
     payload = {
         "phase": phase_name,
         "metric": {experiment.metric.name: winner.metric, "goal": experiment.metric.goal},
-        **_winner_common_payload(winner, phase_name),
+        **_winner_common_payload(winner),
         "phase_fingerprint": winner.phase_fingerprint,
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
@@ -188,11 +188,10 @@ def _save_winner(
     _write_yaml_atomic(path, payload)
 
 
-def _winner_common_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
+def _winner_common_payload(winner: Winner) -> dict[str, Any]:
     """Serialize winner fields shared by persisted and summary representations.
 
     :param Winner winner: Winner whose common fields should be serialized.
-    :param str phase_name: Phase exposed by this winner.
     :return dict[str, Any]: Shared trial, parameter, evidence, identity, and source fields.
     """
     payload = {
@@ -204,17 +203,16 @@ def _winner_common_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
         "completion": winner.completion,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
-        "winner_source": _winner_source_payload(winner, phase_name),
+        "winner_source": _winner_source_payload(winner),
         "trainer_input": winner.trainer_input,
     }
     return payload
 
 
-def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
+def _winner_source_payload(winner: Winner) -> dict[str, Any]:
     """Serialize the concrete source trial for an exposed winner.
 
     :param Winner winner: Winner whose recorded ``source`` is serialized.
-    :param str phase_name: Phase exposed by the winner source.
     :return dict[str, Any]: JSON-serializable winner-source payload with
         ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
         keys.

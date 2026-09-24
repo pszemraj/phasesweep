@@ -164,13 +164,10 @@ class WinnerSnapshot(_SnapshotModel):
 
 def _winner_source_snapshot(
     winner: PhaseWinnerView | Winner,
-    *,
-    phase: str,
 ) -> WinnerSourceSnapshot:
     """Return the concrete source model for a stored or engine-returned winner.
 
     :param PhaseWinnerView | Winner winner: Winner whose source should be captured.
-    :param str phase: Phase under which the winner is exposed.
     :return WinnerSourceSnapshot: Concrete, validated source snapshot.
     """
     source = winner.source
@@ -212,7 +209,7 @@ def _winner_snapshot(
         incomplete=incomplete,
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
-        source=_winner_source_snapshot(winner, phase=phase),
+        source=_winner_source_snapshot(winner),
     )
 
 
