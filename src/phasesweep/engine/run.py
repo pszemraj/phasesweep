@@ -32,6 +32,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
+from phasesweep.engine.publication import _published_winner_path_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
@@ -49,6 +50,9 @@ from phasesweep.runtime.shutdown import (
 )
 
 log = logging.getLogger("phasesweep.engine.run")
+
+# read_status phase keys the CLI status view replaces with ``name`` and ``winner``.
+_MCP_ONLY_PHASE_KEYS = frozenset({"phase", "winner_present", "running_attempts"})
 
 
 def _preflight_missing_reached_phase_environments(
@@ -733,14 +737,51 @@ def _run_experiment_inner(
     return winners
 
 
+def _cli_phase_payloads(
+    experiment: Experiment,
+    phases: list[dict[str, Any]],
+    published_generation_id: str | None,
+) -> list[dict[str, Any]]:
+    """Rebuild ``read_status``'s path-free phase payloads into the CLI's view.
+
+    ``experiment_status`` always calls :func:`phasesweep.engine.read.read_status`
+    unpinned, so each phase's winner is always scoped to the already-resolved
+    published generation, never a pinned one. This drops the MCP-only keys
+    (``phase``, ``winner_present``, ``running_attempts``) and adds ``name``
+    plus a resolved ``winner`` path -- the only place in this call that ever
+    puts a filesystem path in a status payload.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param list[dict[str, Any]] phases: Path-free phase payloads from ``read_status``.
+    :param str | None published_generation_id: Already-resolved last-success generation id.
+    :return list[dict[str, Any]]: Path-bearing phase payloads for the CLI status view.
+    """
+    cli_phases: list[dict[str, Any]] = []
+    for phase in phases:
+        winner_path = (
+            _published_winner_path_for(experiment, published_generation_id, phase["phase"])
+            if phase["winner_present"]
+            else None
+        )
+        cli_phases.append(
+            {
+                **{k: v for k, v in phase.items() if k not in _MCP_ONLY_PHASE_KEYS},
+                "name": phase["phase"],
+                "winner": None if winner_path is None else str(winner_path),
+            }
+        )
+    return cli_phases
+
+
 def experiment_status(experiment: Experiment) -> dict[str, Any]:
     """Collect read-only status for one experiment config.
 
     Built on a single :func:`phasesweep.engine.read.read_status` call, which
-    resolves the current pointer and the last-success pointer exactly once each
-    and reuses both for every phase's winner-path and trial-count lookup, so
-    one status object can never mix generation A's identity with generation B's
-    artifacts (review v0.5.15 / blocker 3).
+    resolves the current pointer and the last-success pointer exactly once
+    each. Every phase's winner path is then resolved by :func:`_cli_phase_payloads`
+    from that same captured published-generation id, so one status object can
+    never mix generation A's identity with generation B's artifacts (review
+    v0.5.15 / blocker 3).
 
     The returned mapping is the single experiment status snapshot shared by
     every caller, including ``phasesweep status <experiment>``. Its keys are
@@ -788,7 +829,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     :return dict[str, Any]: Status payload with generation identity plus per-phase
         winner paths and trial counts, as enumerated above.
     """
-    status = read_status(experiment, _include_winner_paths=True)
+    status = read_status(experiment)
     integrity = status["publication_integrity"]
     ledger_path = ledger_ops.resolved_ledger_path(experiment)
     return {
@@ -806,5 +847,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
             if integrity in {"failed", "permission_denied"}
             else {}
         ),
-        "phases": status["phases"],
+        "phases": _cli_phase_payloads(
+            experiment, status["phases"], status["published_generation_id"]
+        ),
     }

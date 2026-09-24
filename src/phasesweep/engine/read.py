@@ -93,7 +93,6 @@ class PhaseWinnerView:
 def _phase_status_payloads(
     experiment: Experiment,
     *,
-    include_winner_path: bool,
     trial_counts: Mapping[str, dict[str, int]],
     generation_trial_counts: Mapping[str, dict[str, int]],
     trial_data_available: Mapping[str, bool],
@@ -102,7 +101,11 @@ def _phase_status_payloads(
     winner_scope_generation_id: str | None = None,
     pinned: bool = False,
 ) -> list[dict[str, Any]]:
-    """Build per-phase status payloads for CLI and MCP readers.
+    """Build the path-free per-phase status payloads ``read_status`` returns.
+
+    :func:`phasesweep.engine.run.experiment_status` builds the CLI's separate,
+    path-bearing phase view from this function's output instead of asking it
+    for paths, so no call here can ever put a filesystem path in its result.
 
     ``winner_scope_generation_id`` must already be resolved by the caller
     exactly once (e.g. a single :func:`phasesweep.engine.publication._resolve_publication_pointer`
@@ -112,7 +115,6 @@ def _phase_status_payloads(
     from two different pointer resolutions (review v0.5.15 / blocker 3).
 
     :param Experiment experiment: Parsed experiment whose phase study counts and winner files should be inspected.
-    :param bool include_winner_path: If true, include the operator-facing winner path; otherwise return only a boolean winner flag.
     :param Mapping[str, dict[str, int]] trial_counts: Pre-read counts keyed by phase name.
     :param Mapping[str, dict[str, int]] generation_trial_counts: Counts for the represented generation, keyed by phase name.
     :param Mapping[str, bool] trial_data_available: Storage-read
@@ -158,19 +160,10 @@ def _phase_status_payloads(
             "generation_trials": generation_trial_counts[phase.name],
             "trial_data_available": trial_data_available[phase.name],
             "published_study_unavailable": phase.name in unavailable_published_phases,
+            "phase": phase.name,
+            "winner_present": winner_present,
+            "running_attempts": running_attempts[phase.name],
         }
-        if include_winner_path:
-            payload.update(
-                {"name": phase.name, "winner": str(winner_path) if winner_present else None}
-            )
-        else:
-            payload.update(
-                {
-                    "phase": phase.name,
-                    "winner_present": winner_present,
-                    "running_attempts": running_attempts[phase.name],
-                }
-            )
         phases.append(payload)
     return phases
 
@@ -443,18 +436,15 @@ def read_status(
     *,
     generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
-    _include_winner_paths: bool = False,
 ) -> dict[str, Any]:
     """Per-phase trial counts and winner presence for one experiment.
 
-    The payload is path-free **only while ``_include_winner_paths`` is
-    ``False``** (the default): setting it swaps in the operator-facing phase
-    payload, whose ``winner`` field is an absolute filesystem path. Every
-    MCP-facing caller must therefore leave it ``False`` -- the redaction layer
-    in ``phasesweep.mcp.redaction`` takes this function's default-mode output
-    as already path-free and does not strip paths itself. The flag exists for
-    :func:`phasesweep.engine.run.experiment_status`, whose CLI consumers are
-    trusted with local paths.
+    The payload is always path-free: no field ever carries a filesystem path.
+    The redaction layer in ``phasesweep.mcp.redaction`` takes this function's
+    output as already path-free and does not strip paths itself.
+    :func:`phasesweep.engine.run.experiment_status` builds the CLI's separate,
+    path-bearing phase view on top of this function's path-free ``phases``
+    payload instead of asking this function for paths.
 
     Trial counts come from ``read_phase_trial_stats``, which reports empty counts
     for a study that does not exist yet, never creates one as a side effect,
@@ -552,11 +542,6 @@ def read_status(
         Artifact and trial reads still use ``experiment``. This lets a frozen
         run config locate its own tree while a run-scoped MCP read compares the
         represented result with the catalog config a future run would execute.
-    :param bool _include_winner_paths: Internal CLI adapter flag selecting the
-        path-bearing phase payload used by
-        :func:`phasesweep.engine.run.experiment_status`. Leave ``False`` for
-        any agent-visible caller: ``True`` puts absolute winner paths in the
-        returned mapping.
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` is not a safe generation name.
@@ -564,8 +549,7 @@ def read_status(
         identity fields above, ``publication_integrity`` (plus
         ``publication_error`` only when validation failed or was denied), the metric
         descriptor, a per-phase list of trial counts plus winner presence, and
-        whether the represented summary has been written -- path-free unless
-        ``_include_winner_paths`` is set.
+        whether the represented summary has been written -- always path-free.
         The metric descriptor is the *represented generation's own* recorded
         metric whenever its summary declares one
         (``result_context: "represented_generation"``), falling back to the
@@ -689,7 +673,6 @@ def read_status(
                 if name in published_trials
                 and not _published_trial_history_available(stats, published_trials[name])
             },
-            include_winner_path=_include_winner_paths,
             trial_counts={name: stats.counts for name, stats in phase_stats.items()},
             generation_trial_counts={
                 name: (
