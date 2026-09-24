@@ -26,6 +26,7 @@ from phasesweep.engine import (
 from phasesweep.engine.generation import (
     _write_generation_state,
 )
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_summary_path,
@@ -258,7 +259,7 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     experiment = registry.get("srv").experiment
     study = optuna.load_study(
         study_name=f"{experiment.experiment}::p",
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.resolved_storage),
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
 

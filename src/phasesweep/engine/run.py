@@ -28,7 +28,6 @@ from phasesweep.config.models import _metric_scoring_line, _metric_semantics_pay
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
-    LedgerTransactionInterruptedError,
     OperatorAction,
     StudyStorageUnavailableError,
 )
@@ -381,8 +380,8 @@ def _run_experiment_outcome(
                 "Artifact ownership could not be checked because required persistent "
                 f"study state is unavailable: {exc} Cleanup state is therefore unknown."
             )
-            if isinstance(exc, (LedgerTransactionInterruptedError, IncompleteJournalRecordError)):
-                # These name the repair of an otherwise intact ledger; restoring
+            if isinstance(exc, IncompleteJournalRecordError):
+                # This names the repair of an otherwise intact ledger; restoring
                 # the whole ledger instead would be the wrong remedy.
                 raise ProcessCleanupUncertainError.rewrap(
                     exc, f"{unknown} For an MCP run, then run phasesweep mcp recover-run."

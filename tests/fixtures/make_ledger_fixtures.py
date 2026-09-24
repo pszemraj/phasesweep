@@ -4,9 +4,8 @@
 Each fixture is one real PhaseSweep run (two trials of one phase, seeded random
 sampler, no GPU) captured verbatim, plus at most one recorded raw edit that
 turns the current-format bytes into the pre-cutover shape a read path has to
-refuse. The edits are raw SQL or raw JSON/JSONL rewrites -- never PhaseSweep
-code -- so the fixture keeps testing the reader rather than the writer that
-produced it.
+refuse. The edits are raw JSON/JSONL rewrites -- never PhaseSweep code -- so
+the fixture keeps testing the reader rather than the writer that produced it.
 
 Run it from the repository root, in the environment under test::
 
@@ -16,7 +15,7 @@ The experiment pins ``execution.cwd`` to ``/``, so the phase fingerprints it
 stores name no directory of the generating checkout: a fixture read from any
 clone path recomputes the fingerprint it was published with.
 
-The two ``release-0.3.1-*`` fixtures are produced from a detached worktree of
+The ``release-0.3.1-journal`` fixture is produced from a detached worktree of
 the ``v0.3.1`` tag instead of the working tree::
 
     git worktree add --detach "$W" v0.3.1
@@ -96,8 +95,9 @@ FIXTURE_TREE_GITIGNORE = (
     "!*\n"
 )
 
-#: Ledger file name per backend, relative to a fixture's ``ledger/`` directory.
-LEDGER_FILENAME = {"sqlite": "study.db", "journal": "study.journal"}
+#: Ledger file name, relative to a fixture's ``ledger/`` directory. The
+#: journal is the only backend this fixture set produces.
+LEDGER_FILENAME = "study.journal"
 
 
 def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:
@@ -109,7 +109,7 @@ def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:
     semantic fingerprint covers. The trainer cwd is pinned rather than left to
     the invocation directory, which the fingerprint *does* cover.
 
-    :param str storage_url: Resolved ``sqlite:///`` or ``journal:///`` ledger URL.
+    :param str storage_url: Resolved ``journal:///`` ledger URL.
     :param Path workdir: Artifact root parent; artifacts land in ``workdir/t``.
     :return dict[str, Any]: Experiment config ready for YAML serialization.
     """
@@ -146,14 +146,14 @@ def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:
 def storage_url(backend: str, ledger_dir: Path) -> str:
     """Build the ledger URL for one backend under a ledger directory.
 
-    :param str backend: ``"sqlite"`` or ``"journal"``.
+    :param str backend: ``"journal"``, the only backend this fixture set produces.
     :param Path ledger_dir: Directory holding the ledger file.
     :return str: Resolved storage URL.
     :raises ValueError: The backend is not one this fixture set produces.
     """
-    if backend not in LEDGER_FILENAME:
+    if backend != "journal":
         raise ValueError(f"Unsupported fixture backend: {backend!r}")
-    return f"{backend}:///{ledger_dir / LEDGER_FILENAME[backend]}"
+    return f"{backend}:///{ledger_dir / LEDGER_FILENAME}"
 
 
 @dataclass(frozen=True)
@@ -185,9 +185,9 @@ class FixturePaths:
     def ledger(self) -> Path:
         """Return the ledger file this fixture's storage URL points at.
 
-        :return Path: Absolute path to ``study.db`` or ``study.journal``.
+        :return Path: Absolute path to ``study.journal``.
         """
-        return self.ledger_dir / LEDGER_FILENAME[self.backend]
+        return self.ledger_dir / LEDGER_FILENAME
 
     @property
     def experiment_dir(self) -> Path:
@@ -204,20 +204,6 @@ class FixturePaths:
         :return Path: Absolute path to ``artifact_root_binding.json``.
         """
         return self.experiment_dir / BINDING_FILENAME
-
-
-def _sqlite_edit(paths: FixturePaths, statement: str) -> None:
-    """Apply one raw SQL statement to a fixture's SQLite ledger.
-
-    :param FixturePaths paths: Fixture under construction.
-    :param str statement: Exact SQL recorded in the fixture manifest.
-    """
-    conn = sqlite3.connect(paths.ledger)
-    try:
-        conn.execute(statement)
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _journal_records(paths: FixturePaths) -> list[dict[str, Any]]:
@@ -294,15 +280,6 @@ def _remove_binding(paths: FixturePaths) -> None:
 #: refuses to write a manifest that disagrees.
 FIXTURE_SPECS: tuple[FixtureSpec, ...] = (
     FixtureSpec(
-        name="current-sqlite",
-        group="current",
-        backend="sqlite",
-        modes=("tree", "ledger-only"),
-        expect={"tree": "ok", "ledger-only": "ok"},
-        derivation="",
-        notes="Unedited output of this release; the reference both modes read cleanly.",
-    ),
-    FixtureSpec(
         name="current-journal",
         group="current",
         backend="journal",
@@ -310,24 +287,6 @@ FIXTURE_SPECS: tuple[FixtureSpec, ...] = (
         expect={"tree": "ok", "ledger-only": "ok"},
         derivation="",
         notes="Unedited output of this release on the journal backend.",
-    ),
-    FixtureSpec(
-        name="precutover-schema2-sqlite",
-        group="precutover",
-        backend="sqlite",
-        modes=("tree", "ledger-only"),
-        expect={"tree": "schema-mismatch", "ledger-only": "schema-mismatch"},
-        derived_from="current-sqlite",
-        derivation=(
-            "UPDATE study_user_attributes SET value_json='2' "
-            "WHERE key='phasesweep_study_schema_version'"
-        ),
-        apply=lambda paths: _sqlite_edit(
-            paths,
-            "UPDATE study_user_attributes SET value_json='2' "
-            "WHERE key='phasesweep_study_schema_version'",
-        ),
-        notes="A populated study stamped with the pre-cutover schema version.",
     ),
     FixtureSpec(
         name="precutover-schema2-journal",
@@ -344,22 +303,6 @@ FIXTURE_SPECS: tuple[FixtureSpec, ...] = (
         notes="A populated study stamped with the pre-cutover schema version.",
     ),
     FixtureSpec(
-        name="precutover-unstamped-sqlite",
-        group="precutover",
-        backend="sqlite",
-        modes=("tree", "ledger-only"),
-        expect={"tree": "schema-mismatch", "ledger-only": "schema-mismatch"},
-        derived_from="current-sqlite",
-        derivation=(
-            "DELETE FROM study_user_attributes WHERE key='phasesweep_study_schema_version'"
-        ),
-        apply=lambda paths: _sqlite_edit(
-            paths,
-            "DELETE FROM study_user_attributes WHERE key='phasesweep_study_schema_version'",
-        ),
-        notes="Populated but unmarked: the shape a 0.3.1 ledger has before stamping existed.",
-    ),
-    FixtureSpec(
         name="precutover-unstamped-journal",
         group="precutover",
         backend="journal",
@@ -374,45 +317,31 @@ FIXTURE_SPECS: tuple[FixtureSpec, ...] = (
         notes="Populated but unmarked: the shape a 0.3.1 ledger has before stamping existed.",
     ),
     FixtureSpec(
-        name="precutover-binding2-sqlite",
+        name="precutover-binding2-journal",
         group="precutover",
-        backend="sqlite",
+        backend="journal",
         modes=("tree",),
         expect={"tree": "root-conflict"},
-        derived_from="current-sqlite",
+        derived_from="current-journal",
         derivation="Set artifact_root_binding.json 'schema_version' to 2.",
         apply=_downgrade_binding,
         notes="Current ledger, pre-cutover artifact tree: the binding is checked first.",
     ),
     FixtureSpec(
-        name="precutover-unmarked-tree-sqlite",
+        name="precutover-unmarked-tree-journal",
         group="precutover",
-        backend="sqlite",
+        backend="journal",
         modes=("tree",),
         expect={"tree": "root-conflict"},
-        derived_from="current-sqlite",
+        derived_from="current-journal",
         derivation="Delete artifact_root_binding.json; generations/ is left in place.",
         apply=_remove_binding,
         notes="Durable artifact state with no format marker at all.",
     ),
     FixtureSpec(
-        name="current-sqlite-optuna40-versioninfo",
-        group="optuna40",
-        backend="sqlite",
-        modes=("tree", "ledger-only"),
-        expect={"tree": "ok", "ledger-only": "ok"},
-        derived_from="current-sqlite",
-        derivation="UPDATE version_info SET library_version='4.0.0'",
-        apply=lambda paths: _sqlite_edit(paths, "UPDATE version_info SET library_version='4.0.0'"),
-        notes=(
-            "Optuna's own recorded library version differs while its SQL schema does not. "
-            "PhaseSweep's readers must not consult it."
-        ),
-    ),
-    FixtureSpec(
         name="precutover-mcp-state",
         group="mcp-state",
-        backend="sqlite",
+        backend="journal",
         modes=(),
         expect={},
         derivation=f"Delete mcp_state/{MCP_FORMAT_MARKER} from a populated run store.",
@@ -492,38 +421,6 @@ def _git_describe(path: Path) -> str:
     return result.stdout.strip() or "unknown"
 
 
-def _sqlite_schema_versions(ledger: Path) -> list[tuple[str, object, bool]]:
-    """Read every PhaseSweep study's schema stamp from a SQLite ledger.
-
-    :param Path ledger: SQLite ledger file.
-    :return list[tuple[str, object, bool]]: Study name, decoded stamp, and
-        whether the study holds trials.
-    """
-    conn = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)
-    try:
-        studies = [
-            (int(study_id), str(name))
-            for study_id, name in conn.execute("SELECT study_id, study_name FROM studies")
-            if "::" in str(name)
-        ]
-        stamps = {
-            str(name): json.loads(value_json)
-            for name, value_json in conn.execute(
-                "SELECT studies.study_name, study_user_attributes.value_json "
-                "FROM studies JOIN study_user_attributes "
-                "ON studies.study_id = study_user_attributes.study_id "
-                "WHERE study_user_attributes.key = ?",
-                (STUDY_SCHEMA_ATTR,),
-            )
-        }
-        populated = {
-            int(study_id) for (study_id,) in conn.execute("SELECT DISTINCT study_id FROM trials")
-        }
-    finally:
-        conn.close()
-    return [(name, stamps.get(name), study_id in populated) for study_id, name in studies]
-
-
 def _journal_schema_versions(ledger: Path) -> list[tuple[str, object, bool]]:
     """Read every PhaseSweep study's schema stamp from a journal ledger.
 
@@ -558,11 +455,7 @@ def _ledger_verdict(paths: FixturePaths) -> str:
     :param FixturePaths paths: Produced fixture.
     :return str: ``"ok"`` or ``"schema-mismatch"``.
     """
-    versions = (
-        _sqlite_schema_versions(paths.ledger)
-        if paths.backend == "sqlite"
-        else _journal_schema_versions(paths.ledger)
-    )
+    versions = _journal_schema_versions(paths.ledger)
     unsupported = [
         (name, stamp)
         for name, stamp, has_trials in versions
@@ -609,20 +502,6 @@ def _computed_expectations(paths: FixturePaths, modes: tuple[str, ...]) -> dict[
     else:
         tree_verdict = ledger_verdict
     return {mode: tree_verdict if mode == "tree" else ledger_verdict for mode in modes}
-
-
-def _vacuum(paths: FixturePaths) -> None:
-    """Compact a SQLite fixture so a regenerated copy has stable page layout.
-
-    :param FixturePaths paths: Produced fixture.
-    """
-    if paths.backend != "sqlite" or not paths.ledger.is_file():
-        return
-    conn = sqlite3.connect(paths.ledger, isolation_level=None)
-    try:
-        conn.execute("VACUUM")
-    finally:
-        conn.close()
 
 
 def _run_experiment_into(paths: FixturePaths, scratch: Path) -> None:
@@ -772,7 +651,6 @@ def generate(
         _run_experiment_into(paths, scratch)
         if spec.apply is not None:
             spec.apply(paths)
-        _vacuum(paths)
     expect = _computed_expectations(paths, spec.modes)
     if verify_expectations and spec.expect is not None and expect != spec.expect:
         raise RuntimeError(

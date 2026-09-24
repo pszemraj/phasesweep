@@ -712,7 +712,7 @@ def test_distinct_phase_names_with_same_field_keys_accepted(tmp_path: Path) -> N
     """
     body = """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 override_format: argparse

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import textwrap
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 
@@ -126,12 +127,11 @@ def test_valid_catalog_loads_and_summaries_are_path_free(tmp_path: Path) -> None
 
     # The summary must carry no path, command, or storage URL.
     blob = str(summaries)
-    for needle in ("train.py", "sqlite", str(config), str(tmp_path / "runs" / "reg_ok")):
+    for needle in ("train.py", "journal", str(config), str(tmp_path / "runs" / "reg_ok")):
         assert needle not in blob
 
 
-@pytest.mark.parametrize("n_jobs", [1, 2])
-def test_auto_storage_is_absolute_for_mcp(tmp_path: Path, n_jobs: int) -> None:
+def test_auto_storage_is_absolute_for_mcp(tmp_path: Path) -> None:
     import yaml
 
     from phasesweep.config import Experiment
@@ -140,13 +140,11 @@ def test_auto_storage_is_absolute_for_mcp(tmp_path: Path, n_jobs: int) -> None:
 
     payload = yaml.safe_load(_experiment_yaml(tmp_path))
     payload["storage"] = "auto"
-    payload["phases"][0].update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
+    payload["phases"][0].update(n_jobs=2, allow_no_gpu_isolation=True)
     config = _write(tmp_path / "exp.yaml", yaml.safe_dump(payload))
     registered = Registry.load(write_mcp_catalog(tmp_path, {"auto": config})).get("auto")
     assert registered.experiment.storage == "auto"
-    assert storage_backend(registered.experiment.resolved_storage) == (
-        "sqlite" if n_jobs == 1 else "journal"
-    )
+    assert storage_backend(registered.experiment.resolved_storage) == "journal"
     assert not Path(registered.experiment.workdir).exists()
     snapshot = load_experiment_snapshot(config, file_sha256(config), source="test")
     assert isinstance(snapshot, Experiment)
@@ -315,50 +313,44 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("storage", "error_match"),
     [
-        pytest.param('"sqlite:///relative.db"', "absolute .*storage path", id="relative-sqlite"),
+        # Config load itself refuses any non-journal backend now, so the
+        # registry's own MCP-specific storage checks never run for these; an
+        # external DB, an old SQLite URL, and the bare ``:memory:`` shorthand
+        # all surface as the same config-load refusal, wrapped as a
+        # CatalogError (they don't need one case each -- the wire text is
+        # identical up to the echoed value).
         pytest.param(
-            '"sqlite+pysqlite:///relative.db"',
-            "absolute .*storage path",
-            id="relative-sqlite-driver",
+            '"postgresql://host/db"',
+            "storage must be null, auto, or a journal",
+            id="external-db-refused-at-config-load",
         ),
         pytest.param(
-            '"sqlite:///file:relative.db?mode=rwc&uri=true"',
-            "absolute .*storage path",
-            id="relative-sqlite-uri",
+            '"sqlite:///relative.db"',
+            "storage must be null, auto, or a journal",
+            id="sqlite-refused-at-config-load",
         ),
         pytest.param(
-            '"sqlite:///~/literal.db"', "absolute .*storage path", id="literal-tilde-sqlite"
+            '":memory:"',
+            "storage must be null, auto, or a journal",
+            id="memory-shorthand-refused-at-config-load",
         ),
-        pytest.param(
-            '"sqlite:///file:~/literal.db?mode=rwc&uri=true"',
-            "absolute .*storage path",
-            id="literal-tilde-sqlite-uri",
-        ),
+        # These are valid journal URLs at config load, so the registry's own
+        # path-stability checks are what refuse them.
         pytest.param(
             '"journal:///relative.journal"',
-            "absolute .*storage path",
+            "absolute .*journal storage path",
             id="relative-journal",
         ),
-        pytest.param('"journal://"', "absolute .*storage path", id="empty-journal-url"),
-        pytest.param('"journal:///"', "absolute .*storage path", id="empty-journal-path"),
-        pytest.param('"sqlite://"', "storage must be persistent", id="empty-sqlite-url"),
-        pytest.param('"sqlite:///:memory:"', "storage must be persistent", id="sqlite-memory"),
         pytest.param(
-            '"sqlite+pysqlite:///:memory:"',
-            "storage must be persistent",
-            id="sqlite-driver-memory",
+            '"journal://"',
+            "non-empty absolute .*journal storage path",
+            id="empty-journal-url",
         ),
         pytest.param(
-            '"sqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
-            "storage must be persistent",
-            id="sqlite-uri-memory",
+            '"journal:///"',
+            "non-empty absolute .*journal storage path",
+            id="empty-journal-path",
         ),
-        pytest.param(
-            '"sqlite+pysqlite:///file:memdb1?mode=memory&cache=shared&uri=true"',
-            "storage must be persistent",
-            id="sqlite-driver-uri-memory",
-        ),
-        pytest.param('":memory:"', "storage must be persistent", id="memory-shorthand"),
     ],
 )
 def test_nonpersistent_storage_rejected_for_mcp(
@@ -368,7 +360,7 @@ def test_nonpersistent_storage_rejected_for_mcp(
 ) -> None:
     config = _write(
         tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
+        _experiment_yaml(tmp_path).replace(f"journal:///{tmp_path}/reg_ok.journal", storage),
     )
 
     with pytest.raises(CatalogError, match=error_match):
@@ -385,7 +377,7 @@ def test_home_expanded_journal_storage_is_accepted_for_mcp(
     config = _write(
         tmp_path / "exp.yaml",
         _experiment_yaml(tmp_path).replace(
-            f"sqlite:///{tmp_path}/reg_ok.db", '"journal:///~/reg_ok.journal"'
+            f"journal:///{tmp_path}/reg_ok.journal", '"journal:///~/reg_ok.journal"'
         ),
     )
 
@@ -536,11 +528,11 @@ def test_missing_storage_rejected(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config))
 
 
-def test_persistent_sqlite_uri_file_storage_allowed(tmp_path: Path) -> None:
-    storage = f'"sqlite:///file:{tmp_path}/uri.db?mode=rwc&uri=true"'
+def test_persistent_journal_uri_file_storage_allowed(tmp_path: Path) -> None:
+    storage = f'"journal:///file:{quote(str(tmp_path / "uri.journal"), safe="/")}?uri=true"'
     config = _write(
         tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path).replace(f"sqlite:///{tmp_path}/reg_ok.db", storage),
+        _experiment_yaml(tmp_path).replace(f"journal:///{tmp_path}/reg_ok.journal", storage),
     )
 
     registry = Registry.load(_catalog(tmp_path, config))

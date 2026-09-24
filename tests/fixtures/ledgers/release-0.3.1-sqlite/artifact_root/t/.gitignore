@@ -1,3 +1,0 @@
-# Golden fixture: this artifact tree is committed on purpose.
-# PhaseSweep writes '*' here; see tests/fixtures/ledgers/README.md.
-!*

@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any, Literal
 
 import optuna
@@ -104,39 +103,6 @@ def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
     }
 
 
-def _auto_storage_backend_conflict(experiment: Experiment, raw: Any) -> str | None:
-    """Explain when parallelism selects the other auto-storage ledger.
-
-    :param Experiment experiment: Config whose selected backend is being checked.
-    :param Any raw: Recorded artifact-root binding.
-    :return str | None: Actionable diagnostic for a backend change, otherwise ``None``.
-    """
-    if experiment.storage != "auto" or not isinstance(raw, dict):
-        return None
-    recorded_root = raw.get("artifact_root")
-    if (
-        raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
-        or raw.get("experiment") != experiment.experiment
-        or not isinstance(recorded_root, str)
-        or not Path(recorded_root).is_absolute()
-    ):
-        return None
-    parallel = any(phase.n_jobs > 1 for phase in experiment.phases)
-    backend, previous = ("sqlite", "study.db") if parallel else ("journal", "study.journal")
-    selected = "study.journal" if parallel else "study.db"
-    # Reconstruct lexically: a moved tree's previous root may no longer exist.
-    identity = f"{backend}:///{Path(recorded_root) / previous}"
-    if raw.get("storage_key") != hashlib.sha256(identity.encode("utf-8")).hexdigest():
-        return None
-    return (
-        f"Artifact root {_artifact_root_identity(experiment)!r} is bound to {previous}, "
-        f"but storage: auto now selects {selected} because n_jobs changed between "
-        "sequential and parallel execution. Restore the previous n_jobs setting to "
-        "continue this tree, or use a new experiment name or workdir for the new backend. "
-        "No trial ran and nothing was published."
-    )
-
-
 def _root_durable_state_entry(experiment: Experiment) -> str | None:
     """Return the first known PhaseSweep state entry in an unbound root.
 
@@ -160,7 +126,6 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         "generation.yaml",
         "generations",
         "last_successful_generation.yaml",
-        "study.db",
         "study.journal",
         "summary.yaml",
         *(phase.name.casefold() for phase in experiment.phases),
@@ -250,9 +215,6 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             action=OperatorAction.USE_PRIOR_RELEASE,
         )
     if raw != expected:
-        backend_conflict = _auto_storage_backend_conflict(experiment, raw)
-        if backend_conflict is not None:
-            raise ArtifactRootConflictError(backend_conflict, action=OperatorAction.FIX_CONFIG)
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
             f"ledger or experiment than {experiment.experiment!r}. Use the config that owns "

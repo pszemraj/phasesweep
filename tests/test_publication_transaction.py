@@ -110,7 +110,7 @@ def _golden_publication(tmp_path: Path) -> tuple[Experiment, str]:
     :return tuple[Experiment, str]: The experiment reading the copy and its
         published generation id.
     """
-    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
     return experiment, generation_id

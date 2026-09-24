@@ -475,8 +475,8 @@ def read_status(
 
     Trial counts come from ``read_phase_trial_stats``, which reports empty counts
     for a study that does not exist yet, never creates one as a side effect,
-    and swallows transient backend errors (e.g. a momentary SQLite lock while
-    the runner writes) by reporting empty counts rather than raising.
+    and swallows transient backend errors (e.g. a momentary journal-ledger lock
+    while the runner writes) by reporting empty counts rather than raising.
     ``trial_data_available`` distinguishes a successful empty read from missing
     or unreadable storage so callers never treat ambiguous zeros as evidence.
     The path-free phase payload also carries ``running_attempts``: the

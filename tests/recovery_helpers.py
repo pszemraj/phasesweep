@@ -11,6 +11,7 @@ from click.testing import CliRunner, Result
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import Experiment, load_config
 from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _experiment_dir, _trial_dir_for
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
@@ -61,7 +62,7 @@ def _new_phase_study(experiment: Experiment, phase_name: str) -> optuna.Study:
     """Create one phase's minimizing study, stamped as this release's format."""
     study = optuna.create_study(
         study_name=f"{experiment.experiment}::{phase_name}",
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
     mark_current_format(experiment, study)

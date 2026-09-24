@@ -604,10 +604,10 @@ def test_effective_overrides_include_fixed(tmp_path, override_format):
     """The packaged trainer consumes dotted inherited CLI values in both supported forms."""
     trainer = copy_fake_train(tmp_path)
 
-    db_path = tmp_path / "phases.db"
+    db_path = tmp_path / "phases.journal"
     yaml_text = f"""
 experiment: eff_override_test
-storage: sqlite:///{db_path}
+storage: journal:///{db_path}
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path / "runs"}
 trial_command: "python {trainer} {{overrides}}"

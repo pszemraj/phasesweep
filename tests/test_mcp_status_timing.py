@@ -11,6 +11,7 @@ from pathlib import Path
 import optuna
 import pytest
 
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
@@ -39,7 +40,7 @@ from tests.mcp_helpers import (
 def _complete_trials(experiment, *, n: int) -> None:
     study = optuna.create_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
     mark_current_format(experiment, study)
@@ -164,7 +165,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
     _complete_trials(experiment, n=2)
     study = optuna.load_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.resolved_storage),
     )
     study.tell(study.ask(), state=optuna.trial.TrialState.FAIL)
     winner = Winner(
@@ -293,7 +294,7 @@ def test_await_run_reports_failed_trial_progress_at_timeout(
         clock["now"] += seconds
         study = optuna.create_study(
             study_name=_phase_study_name(experiment, experiment.phases[0]),
-            storage=experiment.storage,
+            storage=_resolve_storage(experiment.resolved_storage),
             direction="minimize",
         )
         mark_current_format(experiment, study)

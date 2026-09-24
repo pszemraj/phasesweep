@@ -160,7 +160,7 @@ class _TrialOutcomeUnrecordedAbort(BaseException):
 
 # Delays between the bounded retries of the per-trial outcome write. The write
 # is a single small user-attr row, so a transient backend fault (a locked
-# SQLite file, a momentary connection drop) usually clears within a few
+# journal ledger, a momentary connection drop) usually clears within a few
 # hundred milliseconds; anything longer is an outage the phase must not
 # outrun. len() + 1 total attempts.
 _OUTCOME_WRITE_RETRY_DELAYS = (0.05, 0.25)

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import json
 import logging
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -57,10 +57,9 @@ def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
     )
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
-def test_read_status_does_not_create_missing_storage(tmp_path: Path, backend: str) -> None:
-    path = tmp_path / f"missing.{backend}"
-    exp = _experiment(tmp_path, storage=f"{backend}:///{path}")
+def test_read_status_does_not_create_missing_storage(tmp_path: Path) -> None:
+    path = tmp_path / "missing.journal"
+    exp = _experiment(tmp_path, storage=f"journal:///{path}")
 
     status = read_status(exp)
 
@@ -83,112 +82,15 @@ def test_read_status_does_not_create_missing_storage(tmp_path: Path, backend: st
     }
 
 
-def test_read_status_tolerates_uninitialized_sqlite_file(tmp_path: Path) -> None:
-    db = tmp_path / "empty.db"
-    db.touch()
-    exp = _experiment(tmp_path, storage=f"sqlite:///{db}")
-
-    status = read_status(exp)
-
-    assert status["phases"][0]["trials"] == {}
-    assert status["phases"][0]["trial_data_available"] is False
-    assert status["phases"][0]["running_attempts"] is None
-
-
-def test_read_status_aggregates_each_sqlite_phase_in_one_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    db = tmp_path / "phases.db"
-    storage = f"sqlite:///{db}"
-    study = optuna.create_study(study_name="read_t::p", storage=storage)
-    # More than one trial, so a per-trial transfer cannot pass as the single
-    # aggregated row asserted below.
-    study.optimize(lambda trial: 1.0, n_trials=3)
-    exp = _experiment(tmp_path, storage=storage)
-    mark_current_format(exp, study)
-    real_connect = engine_ledger.sqlite3.connect
-    connections = 0
-    transferred: list[tuple[str, int]] = []
-
-    class CursorProxy:
-        def __init__(self, cursor, sql: str) -> None:
-            self._cursor = cursor
-            self._sql = sql
-
-        def fetchall(self):
-            rows = self._cursor.fetchall()
-            transferred.append((self._sql[:40], len(rows)))
-            return rows
-
-    class ConnectionProxy:
-        def __init__(self, connection) -> None:
-            self._connection = connection
-
-        def execute(self, sql: str, *args: object, **kwargs: object):
-            return CursorProxy(self._connection.execute(sql, *args, **kwargs), sql)
-
-        def close(self) -> None:
-            self._connection.close()
-
-    def observed_connect(*args: object, **kwargs: object):
-        nonlocal connections
-        connections += 1
-        return ConnectionProxy(real_connect(*args, **kwargs))
-
-    monkeypatch.setattr(engine_ledger.sqlite3, "connect", observed_connect)
-
-    status = read_status(exp)
-
-    # Connection 1 is the ledger-format scan ``validate_ledger`` runs before any
-    # phase is read. Each phase then adds exactly one: the trial-stats snapshot
-    # ``read_phase_trial_stats`` opens, so the counts and the RUNNING
-    # identities that explain them come from a single snapshot.
-    assert connections == 1 + len(exp.phases)
-    assert status["phases"][0]["trials"] == {"COMPLETE": 3}
-    assert status["phases"][0]["trial_data_available"] is True
-    # The format scan reads the ledger first and is not what this pins down.
-    # The statement under test is the one naming the ``phase_trials`` CTE: it
-    # must aggregate server-side and hand back a single row, not one per trial.
-    aggregated = [rows for sql, rows in transferred if "phase_trials" in sql]
-    assert aggregated == [1], transferred
-
-
-@pytest.mark.parametrize(
-    ("database_name", "storage_template"),
-    [
-        pytest.param("phases.db", "sqlite:///{db}?timeout=30", id="url-options"),
-        pytest.param("study#experiment.db", "sqlite:///{db}", id="literal-hash"),
-        pytest.param("study#experiment.db", "sqlite+pysqlite:///{db}", id="driver-literal-hash"),
-        pytest.param("uri.db", "sqlite:///file:{db}?mode=rwc&uri=true", id="uri-filename"),
-    ],
-)
-def test_read_status_counts_sqlite_trials_with_storage_url_variants(
-    tmp_path: Path, database_name: str, storage_template: str
-) -> None:
-    db = tmp_path / database_name
-    storage = storage_template.format(db=db)
-    study = optuna.create_study(study_name="read_t::p", storage=storage)
-    study.optimize(lambda trial: 1.0, n_trials=1)
-    exp = _experiment(tmp_path, storage=storage)
-    mark_current_format(exp, study)
-
-    status = read_status(exp)
-
-    assert status["phases"][0]["trials"] == {"COMPLETE": 1}
-
-
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
-def test_read_status_reports_running_attempts_from_the_counted_snapshot(
-    tmp_path: Path, backend: str
-) -> None:
-    """Every backend reports RUNNING identities beside the counts they explain.
+def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path: Path) -> None:
+    """Status reports RUNNING identities beside the counts they explain.
 
     The MCP terminal snapshot reconciles RUNNING rows against cleanup evidence
     and must not reread a study to learn which rows those are (PR #5 review /
     reviewer 2, blocker 6), so this comes from the same tolerant read.
     """
-    path = tmp_path / f"phases.{backend}"
-    exp = _experiment(tmp_path, storage=f"{backend}:///{path}")
+    path = tmp_path / "phases.journal"
+    exp = _experiment(tmp_path, storage=f"journal:///{path}")
     study = optuna.create_study(
         study_name="read_t::p",
         storage=engine_ledger._resolve_storage(exp.storage) or exp.storage,
@@ -210,16 +112,12 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(
     ]
 
 
-@pytest.mark.parametrize(
-    ("backend", "cause"),
-    [("sqlite", "DatabaseError"), ("journal", "JSONDecodeError")],
-)
 def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
-    tmp_path: Path, backend: str, cause: str, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Unread trial data reports no RUNNING identities, not an empty list."""
-    ledger = tmp_path / f"corrupt.{backend}"
-    exp = _experiment(tmp_path, storage=f"{backend}:///{ledger}")
+    ledger = tmp_path / "corrupt.journal"
+    exp = _experiment(tmp_path, storage=f"journal:///{ledger}")
     study = optuna.create_study(
         study_name="read_t::p",
         storage=engine_ledger._resolve_storage(exp.resolved_storage),
@@ -240,7 +138,7 @@ def test_read_status_reports_null_running_attempts_when_storage_is_unreadable(
     ]
     assert len(warnings) == 1
     assert str(ledger) in warnings[0]
-    assert cause in warnings[0]
+    assert "JSONDecodeError" in warnings[0]
 
 
 def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment, Path, Path]:
@@ -430,15 +328,14 @@ def test_journal_status_uses_one_bounded_snapshot_during_file_changes(
     assert second.published_trial_available is (change != "truncate")
 
 
-@pytest.mark.parametrize("n_jobs", [1, 2], ids=["sqlite", "journal"])
 @pytest.mark.parametrize(
     "damage", ["missing-ledger", "missing-study", "empty-study", "corrupt", "stale-ledger"]
 )
 @pytest.mark.integration
 def test_published_status_distinguishes_absent_history_from_read_failure(
-    tmp_path: Path, n_jobs: int, damage: str
+    tmp_path: Path, damage: str
 ) -> None:
-    """The same status flags select the same remedy for both file backends."""
+    """The same status flags select the same remedy whatever damaged the ledger."""
     from phasesweep.engine import ProcessCleanupUncertainError
     from phasesweep.mcp.redaction import status_payload
     from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -446,13 +343,12 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage="auto",
-        n_jobs=n_jobs,
         n_trials=1,
         allow_no_gpu_isolation=True,
         trial_command="echo x=-{trial_id} {overrides}",
     )
     run_experiment(experiment)
-    ledger = tmp_path / "runs" / "t" / ("study.db" if n_jobs == 1 else "study.journal")
+    ledger = tmp_path / "runs" / "t" / "study.journal"
     if damage == "stale-ledger":
         backup = ledger.read_bytes()
         experiment = experiment.model_copy(
@@ -525,11 +421,12 @@ def test_published_status_distinguishes_absent_history_from_read_failure(
 def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> None:
     """A retained winner row alone cannot authorize replacement trials.
 
-    The matrix above damages a whole SQLite or journal ledger; this restores
-    one that is internally consistent but short -- every trial after the
-    published one is gone, so the study is neither missing nor empty, just
-    below the boundary the publication recorded. Only SQLite exposes trial
-    rows to delete directly; a journal has no equivalent partial-restore shape.
+    The matrix above damages a whole journal ledger; this restores one that is
+    internally consistent but short -- as an older backup of the journal would
+    be. Trial 0 (the published winner) keeps its complete record, but every
+    record from trial 1's own creation onward is gone, so the study is neither
+    missing nor empty, just below the completion boundary the publication
+    recorded.
     """
     experiment = make_experiment(
         persistent=tmp_path,
@@ -544,19 +441,26 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
         path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
     }
 
-    with sqlite3.connect(tmp_path / "studies.db") as connection:
-        trial_ids = connection.execute("SELECT trial_id FROM trials WHERE number > 0").fetchall()
-        assert len(trial_ids) == 2
-        for statement in (
-            "DELETE FROM trial_heartbeats WHERE trial_id = ?",
-            "DELETE FROM trial_intermediate_values WHERE trial_id = ?",
-            "DELETE FROM trial_params WHERE trial_id = ?",
-            "DELETE FROM trial_system_attributes WHERE trial_id = ?",
-            "DELETE FROM trial_user_attributes WHERE trial_id = ?",
-            "DELETE FROM trial_values WHERE trial_id = ?",
-            "DELETE FROM trials WHERE trial_id = ?",
-        ):
-            connection.executemany(statement, trial_ids)
+    journal = tmp_path / "studies.journal"
+    lines = journal.read_text(encoding="utf-8").splitlines(keepends=True)
+    records = [json.loads(line) for line in lines]
+    # optuna.storages.journal._storage.JournalOperation: CREATE_STUDY == 0,
+    # CREATE_TRIAL == 4. Study ids are assigned by the order CREATE_STUDY
+    # records replay, so this finds "t::p"'s id instead of assuming 0.
+    created_studies = [record for record in records if record.get("op_code") == 0]
+    study_id = next(
+        index for index, record in enumerate(created_studies) if record.get("study_name") == "t::p"
+    )
+    create_trial_indices = [
+        index
+        for index, record in enumerate(records)
+        if record.get("op_code") == 4 and record.get("study_id") == study_id
+    ]
+    assert len(create_trial_indices) == 3
+    # Keep every record up to, but not including, trial 1's own CREATE_TRIAL:
+    # trial 0's full lifecycle survives; trials 1 and 2 never existed.
+    cutoff = create_trial_indices[1]
+    journal.write_text("".join(lines[:cutoff]), encoding="utf-8")
 
     status = read_status(experiment)
     assert status["phases"][0]["published_study_unavailable"] is True
@@ -565,7 +469,9 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     with pytest.raises(PublishedStudyMissingError, match="published completion boundary"):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=experiment.resolved_storage)
+    study = optuna.load_study(
+        study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
+    )
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
     assert _generation_path(experiment).read_bytes() == generation_before
     assert _last_successful_generation_id(experiment) == published
@@ -574,12 +480,11 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     } == generation_dirs_before
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.parametrize("mismatch", [None, "number", "generation", "attempt", "state"])
 def test_published_trial_status_requires_the_exact_completed_attempt(
-    tmp_path: Path, backend: str, mismatch: str | None
+    tmp_path: Path, mismatch: str | None
 ) -> None:
-    experiment = _experiment(tmp_path, storage=f"{backend}:///{tmp_path / 'ledger'}")
+    experiment = _experiment(tmp_path, storage=f"journal:///{tmp_path / 'ledger'}")
     study = optuna.create_study(
         study_name="read_t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
     )
@@ -725,7 +630,7 @@ def test_objective_evidence_assurance_attempt_triple_by_kind(
 
 def _published(tmp_path: Path) -> Experiment:
     """Return the config that reads the golden fixture's published tree."""
-    return materialize("current-sqlite", tmp_path, mode="tree").experiment
+    return materialize("current-journal", tmp_path, mode="tree").experiment
 
 
 def _edited(experiment: Experiment, metric: Metric | None = None, **phase: object) -> Experiment:

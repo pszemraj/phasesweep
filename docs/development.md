@@ -200,7 +200,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 | --- | --- |
 | Experiment and phase orchestration | `run`, `phase` |
 | Resume selection and continuation preflight | `resume`, `study_policy`, `guards` |
-| Ledger storage: the only module that constructs Optuna or SQLite storage | `ledger` |
+| Ledger storage: the only module that constructs Optuna storage | `ledger` |
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
 | Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |

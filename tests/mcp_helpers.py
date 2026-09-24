@@ -111,7 +111,7 @@ def mcp_experiment_config_text(
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 """
     storage = (
-        f"storage: sqlite:///{tmp_path}/{name}.db\nprovenance: {{revision: test-fixture-v1}}\n"
+        f"storage: journal:///{tmp_path}/{name}.journal\nprovenance: {{revision: test-fixture-v1}}\n"
         if with_storage
         else ""
     )
@@ -137,7 +137,7 @@ def slow_mcp_config_text(
 ) -> str:
     return f"""\
 experiment: {name}
-storage: sqlite:///{tmp_path}/{name}.db
+storage: journal:///{tmp_path}/{name}.journal
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs/{name}
 trial_command: "{sys.executable} {trainer} --sleep {sleep} {{overrides}}"
@@ -457,7 +457,7 @@ def _drift_experiment(
     """Build the runnable experiment the tests publish and then edit: one phase unless ``phases``."""
     return make_experiment(
         experiment=name,
-        storage=f"sqlite:///{tmp_path / 'drift.db'}",
+        storage=f"journal:///{tmp_path / 'drift.journal'}",
         workdir=str(tmp_path / "runs"),
         execution=ExecutionContext(cwd=str(tmp_path)),
         trainer=trainer,

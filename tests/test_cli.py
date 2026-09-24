@@ -337,7 +337,7 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     p.write_text(
         textwrap.dedent(f"""
         experiment: t
-        storage: sqlite:///{tmp_path}/phases.db
+        storage: journal:///{tmp_path}/phases.journal
         provenance: {{revision: test-fixture-v1}}
         trial_command: "echo {{overrides}}"
         override_format: argparse
@@ -410,7 +410,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
 
 def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
     """Mutable compatibility files must not outrank immutable generation results."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment, config_path = materialized.experiment, materialized.config_path
     _winner_path(experiment, "p").write_text("trial_number: 99\n")
     _generation_path(experiment).write_text("generation_id: interrupted\n")
@@ -431,9 +431,9 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
 
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
     """Winner-only CLI reads enforce the artifact tree's reverse ownership."""
-    owner_config = materialize("current-sqlite", tmp_path, mode="tree").config_path
+    owner_config = materialize("current-journal", tmp_path, mode="tree").config_path
     foreign_config = tmp_path / "foreign.yaml"
-    foreign_config.write_text(owner_config.read_text().replace("study.db", "foreign.db"))
+    foreign_config.write_text(owner_config.read_text().replace("study.journal", "foreign.journal"))
     result = CliRunner().invoke(cli_main, ["show-winners", str(foreign_config)])
 
     assert result.exit_code == 1
@@ -614,7 +614,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     likewise not answer "no winner yet" over it. Both commands are read-only,
     so they share one corrupted tree.
     """
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path = materialized.config_path
     generation_id = _corrupt_the_publication(materialized.experiment)
 
@@ -650,7 +650,7 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The claim-time provenance files feed the same reporting as any winner."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
@@ -682,7 +682,7 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     fails closed -- nothing unvalidatable may read as published -- but the
     reason names the permission denial and the user who can validate it.
     """
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
@@ -722,7 +722,7 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 0
     capsys.readouterr()
 
-    config_path = materialize("current-sqlite", tmp_path, mode="tree").config_path
+    config_path = materialize("current-journal", tmp_path, mode="tree").config_path
 
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     published = capsys.readouterr()

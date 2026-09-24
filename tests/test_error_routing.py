@@ -9,14 +9,12 @@ payload, where routing reaches an agent, must say exactly those steps.
 
 from __future__ import annotations
 
-import contextlib
 import errno
 import importlib
 import json
 import os
 import pkgutil
 import pwd
-import sqlite3
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -34,7 +32,6 @@ from phasesweep.config import Experiment, IntParam, Phase, WandbSummaryRequiredG
 from phasesweep.engine import (
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
-    LedgerTransactionInterruptedError,
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     StudyFingerprintMismatchError,
@@ -97,7 +94,6 @@ from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import make_experiment, requires_nonroot
 from tests.ledger_fixtures import (
     Materialized,
-    leave_hot_journal,
     ledger_file,
     materialize,
     republish_as_incomplete,
@@ -283,13 +279,13 @@ def _storage_gone() -> Exception:
 def _ledger_busy() -> Exception:
     """Return a storage refusal whose own raise site routed it to a retry."""
     return StudyStorageUnavailableError(
-        "SQLite storage is locked by another writer.", action=OperatorAction.RETRY
+        "Journal storage is locked by another writer.", action=OperatorAction.RETRY
     )
 
 
 def _garbage(path: Path) -> None:
-    """Overwrite a ledger file with bytes no SQLite reader accepts."""
-    path.write_bytes(b"this is not a sqlite database\n" * 64)
+    """Overwrite a ledger file with bytes that fail to parse as journal records."""
+    path.write_bytes(b"this is not a journal record\n" * 64)
 
 
 def _truncated(path: Path) -> None:
@@ -298,15 +294,17 @@ def _truncated(path: Path) -> None:
 
 
 def _trials_deleted(path: Path) -> None:
-    """Drop every trial row while the study keeps its current format stamp."""
-    with contextlib.closing(sqlite3.connect(path)) as conn, conn:
-        conn.execute("DELETE FROM trials")
+    """Drop every trial while the journal keeps its study-level records intact.
 
-
-def _interrupted_commit_write_protected(path: Path) -> None:
-    """Leave a hot journal in a ledger file the owner may no longer write."""
-    leave_hot_journal(path)
-    path.chmod(0o444)
+    Every trial-scoped journal record (``CREATE_TRIAL`` and later) carries an
+    ``op_code`` of 4 or above; study-level records (create study, study user
+    attrs) are 0-3. Keeping only the low op codes reproduces exactly what the
+    old ``DELETE FROM trials`` did for the SQLite backend: the study, its
+    schema stamp, and its other attributes survive, but every trial is gone.
+    """
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    kept = [line for line in lines if json.loads(line).get("op_code", 0) < 4]
+    path.write_text("".join(kept), encoding="utf-8")
 
 
 def _materialize_damaged(
@@ -334,10 +332,10 @@ def _dead_uncertain_run(
 
 
 def _claim_while(owner: object, name: str, inbound: Callable[[], Exception]) -> Trigger:
-    """Claim the current SQLite golden ledger while ``owner.name`` raises."""
+    """Claim the current golden ledger while ``owner.name`` raises."""
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        materialized = materialize("current-sqlite", tmp_path, mode="tree")
+        materialized = materialize("current-journal", tmp_path, mode="tree")
         monkeypatch.setattr(owner, name, _raiser(inbound()))
         return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
 
@@ -359,7 +357,7 @@ def _recovery_studies_damaged(
     damage: Callable[[Path], None],
     *,
     ownership_storage_unavailable: bool = False,
-    fixture: str = "current-sqlite",
+    fixture: str = "current-journal",
 ) -> Trigger:
     """Load recovery's studies from a current golden ledger after damage."""
 
@@ -375,7 +373,7 @@ def _recovery_studies_damaged(
 
 def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Start a run over the current golden ledger whose phase study cannot be read."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     monkeypatch.setattr(engine_ledger, "_load_existing_phase_study", _raiser(_storage_gone()))
     return run_experiment(materialized.experiment)
 
@@ -390,11 +388,11 @@ def _run_over_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
 
 
 def _claim_ledger_under(parent: Callable[[Path], Path]) -> Trigger:
-    """Return a trigger that claims a fresh SQLite ledger to be created below ``parent``."""
+    """Return a trigger that claims a fresh journal ledger to be created below ``parent``."""
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        ledger = parent(tmp_path) / "ledgers" / "study.db"
-        experiment = make_experiment(workdir=tmp_path / "runs", storage=f"sqlite:///{ledger}")
+        ledger = parent(tmp_path) / "ledgers" / "study.journal"
+        experiment = make_experiment(workdir=tmp_path / "runs", storage=f"journal:///{ledger}")
         return engine_ledger.claim_ledger(engine_ledger.validate_ledger(experiment))
 
     return trigger
@@ -456,7 +454,7 @@ def _reap_unreadable_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> o
 
 def _recover_while_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Confirm recovery while another orchestrator holds the experiment lock."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
     with _experiment_lock(materialized.experiment):
         return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
@@ -490,7 +488,7 @@ def _recover_pending_snapshot_while(failing: str, error: Exception) -> Trigger:
     """Confirm recovery of an orphaned pending snapshot while ``failing`` raises ``error``."""
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        materialized = materialize("current-sqlite", tmp_path, mode="tree")
+        materialized = materialize("current-journal", tmp_path, mode="tree")
         state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
         write_run_status(
             RunStore.open_existing(state_dir),
@@ -544,7 +542,7 @@ def _recover_over_malformed_registry_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
     """Inspect recovery while an attempt registry entry no longer parses."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
     trial_dir = tmp_path / "attempt"
     trial_dir.mkdir()
@@ -594,7 +592,7 @@ def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.Monk
     recover-run reads the run's digest-pinned config snapshot, so the workdir can stop resolving to
     the studies' root only through the filesystem, as when a volume behind a symlink moves.
     """
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     link = tmp_path / "data"
     link.symlink_to(materialized.experiment.workdir)
     config = yaml.safe_load(materialized.config_path.read_text())
@@ -742,19 +740,6 @@ WRAP_CASES = (
         ),
     ),
     RoutingCase(
-        # The ledger is intact, so the storage wrap's restore remedy must not
-        # replace the confirmed recover-run that lets SQLite roll it back. Not
-        # RETRY either: no holder is waited on, and repeating a read never
-        # rolls the journal back. The confirmed recover-run is the locked
-        # command the one surfacing read, recovery inspection, is a flag away
-        # from.
-        id="recovery_studies_interrupted_transaction",
-        trigger=_recovery_studies_damaged("tree", leave_hot_journal),
-        raised=RunRecoveryError,
-        action=OperatorAction.RUN_RECOVER_RUN,
-        message="`phasesweep mcp recover-run --confirm` holds the experiment lock",
-    ),
-    RoutingCase(
         id="recovery_published_missing",
         trigger=_recovery_studies_damaged(
             "tree", _trials_deleted, ownership_storage_unavailable=True
@@ -837,11 +822,11 @@ WRAP_CASES = (
         message="Restore the original workdir, or use a fresh artifact root",
     ),
     RoutingCase(
-        id="sqlite_garbage",
-        trigger=_validate_damaged("current-sqlite", _garbage),
+        id="journal_garbage",
+        trigger=_validate_damaged("current-journal", _garbage),
         raised=StudyStorageUnavailableError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="could not be inspected for its PhaseSweep format without mutation.",
+        message="could not be completely read while checking for the PhaseSweep format boundary.",
     ),
     RoutingCase(
         # Inspection previews the confirmed write, so it refuses a cut-short
@@ -913,21 +898,6 @@ WRAP_CASES = (
 # drives the real code path to one such raise and pins the pair together.
 
 
-def _auto_storage_experiment(workdir: Path, n_jobs: int) -> Experiment:
-    """Return an auto-storage experiment whose parallelism selects its backend."""
-    return make_experiment(
-        workdir=workdir, storage="auto", n_jobs=n_jobs, allow_no_gpu_isolation=True
-    )
-
-
-def _validate_after_auto_backend_switch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Validate a sequential config over a tree its parallel predecessor bound."""
-    parallel = _auto_storage_experiment(tmp_path / "runs", n_jobs=2)
-    _artifact_root_binding_path(parallel).parent.mkdir(parents=True)
-    _write_artifact_root_binding(parallel)
-    return engine_ledger.validate_ledger(_auto_storage_experiment(tmp_path / "runs", n_jobs=1))
-
-
 def _claim_after_unlocked_bind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Claim a ledger whose tree another process bound after it was validated."""
     experiment = make_experiment(workdir=tmp_path / "runs")
@@ -941,7 +911,7 @@ def _reconcile_prepared_over_damaged_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
     """Reconcile a prepared publication after the last-success target lost its summary."""
-    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     published = _last_successful_generation_id(experiment)
     assert published is not None
     _generation_summary_path(experiment, published).unlink()
@@ -961,7 +931,7 @@ def _preflight_registered_trial_without_attempt(
     ``tests/test_stale_reaper.py::test_registry_terminal_cleanup_requires_matching_attempt_identity``.
     """
     experiment = make_experiment(
-        workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'study.db'}"
+        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}"
     )
     attempt_dir = tmp_path / "attempt"
     attempt_dir.mkdir()
@@ -1107,7 +1077,7 @@ def _recover_with_config_snapshot(change: Callable[[Path], None]) -> Trigger:
     """Inspect recovery of a dead uncertain run after ``change`` hits its config snapshot."""
 
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        materialized = materialize("current-sqlite", tmp_path, mode="tree")
+        materialized = materialize("current-journal", tmp_path, mode="tree")
         state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
         change(RunStore.open_existing(state_dir).config_snapshot_path(run_id))
         return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
@@ -1117,7 +1087,7 @@ def _recover_with_config_snapshot(change: Callable[[Path], None]) -> Trigger:
 
 def _recover_without_boot_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Inspect recovery on a host whose boot id cannot be read."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
     monkeypatch.setattr("phasesweep.mcp.recovery.read_boot_id", lambda: None)
     return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
@@ -1157,9 +1127,11 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
 
 def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Re-run a phase whose study durably aborted at its current trial target."""
-    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     phase = experiment.phases[0]
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(
+        study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
+    )
     study.set_user_attr(
         PHASE_ABORT_ATTR,
         _failure_policy_abort_record(
@@ -1171,14 +1143,14 @@ def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
 
 def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Skip a phase whose published winner is a partial result this config does not accept."""
-    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     republish_as_incomplete(experiment)
     return _load_winner(experiment, experiment.phases[0], {})
 
 
 def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Skip a phase whose search space changed after its winner was published."""
-    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     edited = experiment.phases[0].model_copy(
         update={"search_space": {"a": IntParam(type="int", low=0, high=20)}}
     )
@@ -1187,28 +1159,22 @@ def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 
 def _claim_from_moved_workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Claim the fixture's ledger through a config whose workdir moved away from it."""
-    moved = _moved_workdir(materialize("current-sqlite", tmp_path, mode="tree"), tmp_path)
+    moved = _moved_workdir(materialize("current-journal", tmp_path, mode="tree"), tmp_path)
     return engine_ledger.claim_ledger(engine_ledger.validate_ledger(moved))
-
-
-def _claim_after_interrupted_commit_write_protected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> object:
-    """Claim a ledger whose interrupted commit SQLite cannot roll back."""
-    materialized = _materialize_damaged(
-        tmp_path, "current-sqlite", "tree", _interrupted_commit_write_protected
-    )
-    return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
 
 
 def _validate_tree_bound_to_another_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> object:
     """Validate a config over a tree that a different storage ledger bound."""
-    owner = make_experiment(workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'a.db'}")
+    owner = make_experiment(
+        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'a.journal'}"
+    )
     _artifact_root_binding_path(owner).parent.mkdir(parents=True)
     _write_artifact_root_binding(owner)
-    other = make_experiment(workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'b.db'}")
+    other = make_experiment(
+        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'b.journal'}"
+    )
     return engine_ledger.validate_ledger(other)
 
 
@@ -1227,13 +1193,6 @@ def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 
 ORIGIN_CASES = (
-    RoutingCase(
-        id="auto_storage_backend_switch",
-        trigger=_validate_after_auto_backend_switch,
-        raised=ArtifactRootConflictError,
-        action=OperatorAction.FIX_CONFIG,
-        message="Restore the previous n_jobs setting to continue this tree",
-    ),
     RoutingCase(
         id="claim_ledger_tree_changed",
         trigger=_claim_after_unlocked_bind,
@@ -1440,14 +1399,6 @@ ORIGIN_CASES = (
         message="Use the config that owns this current-format tree",
     ),
     RoutingCase(
-        id="sqlite_rollback_refused",
-        trigger=_claim_after_interrupted_commit_write_protected,
-        raised=LedgerTransactionInterruptedError,
-        action=OperatorAction.RESTORE_LEDGER,
-        message="Restore write access to the ledger and its directory before retrying.",
-        marks=(requires_nonroot,),
-    ),
-    RoutingCase(
         id="ledger_directory_path_unusable",
         trigger=_claim_ledger_under(_regular_file),
         raised=PhaseSweepError,
@@ -1492,7 +1443,7 @@ def test_raise_sites_route_their_declared_action(
 
 def _defect_while_inspecting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Inspect recovery while one of its own steps has a bug."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     state_dir, run_id = _dead_uncertain_run(materialized, tmp_path)
     monkeypatch.setattr(
         "phasesweep.mcp.recovery._publication_recovery_action",

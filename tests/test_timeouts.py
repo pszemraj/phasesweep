@@ -13,6 +13,7 @@ from phasesweep import run_experiment
 from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
 from phasesweep.engine import PhaseSweepError
 from phasesweep.engine.artifacts import _load_winner
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import PHASE_ABORT_ATTR, PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
@@ -210,7 +211,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     exp = make_experiment(
         experiment="phase_timeout_allowed_abort_counter",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'timeout-counter.db'}",
+        storage=f"journal:///{tmp_path / 'timeout-counter.journal'}",
         trainer=trainer,
         n_trials=3,
         max_consecutive_failures=1,
@@ -236,7 +237,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     assert completion["timeout_scope"] == "phase"
     study = optuna.load_study(
         study_name="phase_timeout_allowed_abort_counter::p",
-        storage=exp.storage,
+        storage=_resolve_storage(exp.storage),
     )
     deadline_trials = [
         trial
@@ -271,7 +272,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     exp = make_experiment(
         experiment="phase_scheduler_deadline_with_abort",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'decision.db'}",
+        storage=f"journal:///{tmp_path / 'decision.journal'}",
         trainer=trainer,
         phases=[
             Phase(
@@ -347,7 +348,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
 
     study = optuna.load_study(
         study_name="phase_scheduler_deadline_with_abort::p",
-        storage=exp.storage,
+        storage=_resolve_storage(exp.storage),
     )
     assert study.user_attrs[PHASE_DECISION_ATTR]["decision"] == "accepted_partial_timeout"
     trial_count = len(study.trials)
@@ -356,7 +357,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
 
     study = optuna.load_study(
         study_name="phase_scheduler_deadline_with_abort::p",
-        storage=exp.storage,
+        storage=_resolve_storage(exp.storage),
     )
     assert len(study.trials) == trial_count
 
@@ -393,7 +394,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
     exp = make_experiment(
         experiment="refused_partial_timeout_abort",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'refused.db'}",
+        storage=f"journal:///{tmp_path / 'refused.journal'}",
         trainer=trainer,
         n_trials=3,
         max_consecutive_failures=1,
@@ -428,7 +429,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
 
     study = optuna.load_study(
         study_name="refused_partial_timeout_abort::p",
-        storage=exp.storage,
+        storage=_resolve_storage(exp.storage),
     )
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
     assert _load_phase_policy_state(study).consecutive_failures == 0
@@ -453,7 +454,7 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
     trainer = write_constant_trainer(tmp_path)
     exp = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'shutdown.db'}",
+        storage=f"journal:///{tmp_path / 'shutdown.journal'}",
         trainer=trainer,
         n_trials=2,
         gpu_policy="none",
@@ -481,13 +482,13 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
 
     assert exc_info.value.published_result_committed is False
 
-    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
     assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "cancelled"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
 
 
@@ -723,7 +724,7 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only GPU-lease timeout is deadline policy; launch timeouts stay fatal."""
-    storage = f"sqlite:///{tmp_path / 'timeout-cause.db'}"
+    storage = f"journal:///{tmp_path / 'timeout-cause.journal'}"
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage=storage,
@@ -740,7 +741,7 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
     with pytest.raises(TimeoutError, match="injected non-deadline launch timeout"):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
     assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unexpected_objective_exception"
 
 

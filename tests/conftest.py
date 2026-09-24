@@ -7,11 +7,11 @@ _exp / _make_exp helpers scattered across test files. Tests that need specialize
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import shutil
 import signal
-import sqlite3
 import stat
 import sys
 import textwrap
@@ -42,6 +42,7 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.evidence import TrialContext
+from phasesweep.runtime.files import file_url_path
 from phasesweep.runtime.reaper import _read_proc_stat
 from tests.tiers import SLOW_CALL_SECONDS, excludes_integration, flagged_tests, slow_unmarked
 
@@ -229,14 +230,49 @@ def file_mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
 
+#: Optuna journal op codes this helper needs. Mirrors
+#: ``optuna.storages.journal._storage.JournalOperation`` and
+#: ``tests/fixtures/make_ledger_fixtures.py``'s own local copies.
+_JOURNAL_CREATE_STUDY = 0
+_JOURNAL_SET_STUDY_USER_ATTR = 2
+
+
 def drop_artifact_root_binding(storage: str, study_name: str) -> None:
-    """Reconstruct a pre-binding study by deleting its artifact-root user attr."""
-    with sqlite3.connect(storage.removeprefix("sqlite:///")) as connection:
-        connection.execute(
-            "DELETE FROM study_user_attributes WHERE key = ? AND study_id = "
-            "(SELECT study_id FROM studies WHERE study_name = ?)",
-            (ARTIFACT_ROOT_ATTR, study_name),
+    """Reconstruct a pre-binding study by deleting its artifact-root user attr.
+
+    A journal ledger has no row to delete in place, so this replays the study
+    id assignment the same way Optuna's journal replay does -- sequentially,
+    in ``CREATE_STUDY`` record order -- then rewrites the ledger without the
+    ``SET_STUDY_USER_ATTR`` record(s) that set ``ARTIFACT_ROOT_ATTR`` for that
+    study id. Mirrors ``tests/fixtures/make_ledger_fixtures.py``'s
+    ``_drop_journal_schema_attr``.
+
+    :param str storage: ``journal:///`` storage URL for the study's ledger.
+    :param str study_name: Study whose artifact-root user attribute is dropped.
+    :raises RuntimeError: No matching attribute record was found to drop.
+    """
+    ledger = Path(file_url_path(storage))
+    records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line]
+    study_id = None
+    next_id = 0
+    for record in records:
+        if record.get("op_code") == _JOURNAL_CREATE_STUDY:
+            if record.get("study_name") == study_name:
+                study_id = next_id
+            next_id += 1
+    kept = [
+        record
+        for record in records
+        if not (
+            record.get("op_code") == _JOURNAL_SET_STUDY_USER_ATTR
+            and record.get("study_id") == study_id
+            and ARTIFACT_ROOT_ATTR in record.get("user_attr", {})
         )
+    ]
+    if len(kept) == len(records):
+        raise RuntimeError(f"no {ARTIFACT_ROOT_ATTR!r} record found for study {study_name!r}")
+    body = "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in kept)
+    ledger.write_text(body, encoding="utf-8")
 
 
 def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
@@ -463,8 +499,8 @@ def make_experiment(
     phase uses ``Sampler(type="random", seed=0)`` so it satisfies the
     persistent-storage sampler policy.
 
-    ``persistent`` names a directory that holds the SQLite ledger
-    ``studies.db`` and the workdir ``runs/``; an explicit ``workdir`` or
+    ``persistent`` names a directory that holds the journal ledger
+    ``studies.journal`` and the workdir ``runs/``; an explicit ``workdir`` or
     ``storage`` overrides that half. ``trainer`` makes each trial run that
     script as ``python <trainer> --out {trial_dir}/r.json {overrides}``.
 
@@ -482,7 +518,7 @@ def make_experiment(
         if workdir is None:
             workdir = persistent / "runs"
         if storage is None:
-            storage = f"sqlite:///{persistent / 'studies.db'}"
+            storage = f"journal:///{persistent / 'studies.journal'}"
     if trial_command is None:
         trial_command = (
             "echo {overrides}"

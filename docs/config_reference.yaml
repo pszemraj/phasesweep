@@ -10,11 +10,13 @@
 # Safe `[A-Za-z0-9_-]+` identity used in paths, study names, and locks.
 
 # storage: str | null = null
-# null (or omitted) is in-memory and disposable. Allowed durable local forms are
-# sqlite:///absolute-or-relative/path.db and journal:///.../path.journal. `auto`
-# selects <workdir>/<experiment>/study.db when every phase has n_jobs: 1 and
-# study.journal otherwise. Persistent storage requires nonempty provenance.
-# External database URLs are rejected before connection or artifact creation.
+# null (or omitted) is in-memory and disposable. The only durable local form is
+# journal:///absolute-or-relative/path.journal, which supports parallel trials
+# (n_jobs > 1) on one host. `auto` always selects
+# <workdir>/<experiment>/study.journal, regardless of n_jobs. Persistent
+# storage requires nonempty provenance. Any other value, including a
+# sqlite:///... URL, :memory:, or an external database URL, is rejected before
+# connection or artifact creation.
 
 # workdir: str = "./runs"
 # Root containing this experiment's generations, phase directories, trial logs,

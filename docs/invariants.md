@@ -17,18 +17,18 @@ the MCP layer.
    recovery inspection take no lock, so they must write nothing.
 2. Validate, then claim, then open. validate_ledger checks the artifact-root
    binding, then scans the ledger format, and writes nothing; on a bound tree
-   an unreadable scan is tolerated and recorded on the handle, and so is an
-   interrupted SQLite transaction on any tree. claim_ledger lets SQLite roll
-   that transaction back, rescans strictly if the scan did not complete,
-   loads every existing phase study, checks every study's root before any
-   write, writes the tree binding, then claims empty studies. Only the
-   ClaimedLedger it returns reaches open_phase_study.
+   an unreadable scan is tolerated and recorded on the handle. claim_ledger
+   rescans strictly if the scan did not complete, loads every existing phase
+   study, checks every study's root before any write, writes the tree
+   binding, then claims empty studies. Only the ClaimedLedger it returns
+   reaches open_phase_study.
 3. Pure read paths (read_status, read_winners, CLI status and show-winners,
    the MCP result snapshot) never construct file-backed storage and never
    write bytes. Recovery inspection validates binding and format before any
    open and refuses a pre-cutover ledger with the bytes unchanged.
-4. Only src/phasesweep/engine/ledger.py may construct Optuna or sqlite3
-   storage, and no other module imports its private names.
+4. src/phasesweep/engine/ledger.py is the only module that constructs Optuna
+   storage, and no other module imports its private names. No module
+   constructs sqlite3, SQLAlchemy, or Optuna RDB storage at all.
    tests/test_ledger_contract.py enforces both, and its ratchets are empty,
    so a new site anywhere else fails.
 ```
@@ -57,14 +57,14 @@ flowchart TD
     reads["status, show-winners, MCP reads"] -->|"no lock"| check
     lock --> check
     subgraph validate["validate_ledger: writes nothing"]
-        check["artifact-root binding check"] --> scan["ledger format scan<br/>unreadable is tolerated only on a bound tree,<br/>an interrupted SQLite transaction on any tree"]
+        check["artifact-root binding check"] --> scan["ledger format scan<br/>unreadable is tolerated only on a bound tree"]
     end
     scan --> handle["ValidatedLedger<br/>records whether the scan completed"]
     handle -->|"read paths stop here"| ro["read_phase_trial_stats<br/>phase unavailable if the scan did not complete"]
     handle -->|"recover-run, never claims"| existing["open_existing_study<br/>refuses a scan that did not complete"]
     handle -->|"run"| rescan
     subgraph claim["claim_ledger"]
-        rescan["SQLite rolls back an interrupted transaction,<br/>then strict rescan if the scan did not complete"] --> discover["load every existing phase study"]
+        rescan["strict rescan if the scan did not complete"] --> discover["load every existing phase study"]
         discover --> roots["check every study's root, all phases before any write"]
         roots --> recheck["re-check the tree binding is unchanged"]
         recheck --> bind["write the tree binding if unbound"]
@@ -92,17 +92,7 @@ durable-state context in `engine.run._run_experiment_outcome`, and in
 
 `validate_ledger` checks the artifact-root binding, then scans the ledger
 format, and writes nothing; on a bound tree an unreadable scan is tolerated and
-recorded on the handle, and on an unbound tree it is refused. The SQLite scan
-runs its queries in one read transaction, so a study stamped and given its
-first trial while the scan runs is never judged unmarked but populated.
-
-A crash in the middle of a SQLite commit leaves a hot journal that only a
-read-write open rolls back, so the `mode=ro` scan records it on either tree as
-`LedgerTransactionInterruptedError`. A locked mutating path then lets SQLite
-finish its own crash recovery before it rescans: one read-write open of the
-existing file that cannot create it. Read paths never make that open; they
-report the ledger unavailable with that reason and leave the ledger and its
-journal byte-identical.
+recorded on the handle, and on an unbound tree it is refused.
 
 A journal ledger's last line that lacks its newline or does not decode is
 skipped exactly as Optuna's reader skips it, so status, winners, and the
@@ -123,34 +113,22 @@ changed.
 `engine.artifact_roots._check_artifact_root_binding` before
 `engine.ledger._scan_ledger_format` and returning a `ValidatedLedger` whose
 `format_verified` and `format_scan_failure` record the outcome;
-`engine.ledger.roll_back_interrupted_transaction`, called by `claim_ledger` and
-confirmed recovery, and the same open in `engine.ledger.open_registry_study`;
 `engine.ledger._journal_records` for the tolerated line and
 `engine.ledger.require_complete_journal` for the refusal\
 **Tests:** `tests/test_format_cutover.py::test_validate_ledger_on_a_fresh_root_creates_nothing`,
-`tests/test_format_cutover.py::test_format_scan_judges_one_sqlite_snapshot`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`
 (its `release-0.3.1` cells pin the binding check before the format scan),
-`tests/test_format_cutover.py::test_reads_report_an_interrupted_transaction_and_leave_it_for_a_locked_path`,
-`tests/test_format_cutover.py::test_run_rolls_back_an_interrupted_transaction_and_continues`,
-`tests/test_format_cutover.py::test_claim_on_an_unbound_tree_rolls_back_a_shared_ledger`,
-`tests/test_format_cutover.py::test_registry_opener_rolls_back_an_interrupted_transaction`,
-`tests/test_format_cutover.py::test_rollback_open_never_creates_a_missing_ledger`,
 `tests/test_engine_read.py::test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes`,
 `tests/test_engine_read.py::test_journal_malformed_record_before_its_end_never_means_absent`,
 `tests/test_format_cutover.py::test_writers_refuse_a_partial_final_journal_record_and_leave_it`,
 `tests/test_format_cutover.py::test_journal_repair_command_truncates_only_the_journal_it_saw`
 
-The scan may read a missing SQLite file as an absent ledger only because every
-accepted SQLite URL names a local file: config load refuses a URI filename
-that names another host (`config.models.Experiment._storage_is_local`, tested
-by `tests/test_storage_urls.py::test_sqlite_uri_with_remote_authority_is_rejected_at_config_load`).
-The file it names is also the one Optuna writes: config load refuses a URL
-that SQLAlchemy's SQLite dialect maps to a different database than
-`runtime.files.sqlite_database_path` does, as well as a repeated option and a
-`vfs` (`config.models._require_one_sqlite_database`, tested by
-`tests/test_storage_urls.py::test_sqlite_url_read_differently_by_sqlalchemy_is_rejected_at_config_load`).
+The scan may treat a missing journal file as an absent ledger only because
+config load already refused every other storage form: `storage` other than
+`null`, `auto`, or a `journal:///` URL is refused at config load
+(`config.models.Experiment._storage_is_local`, tested by
+`tests/test_storage_urls.py::test_non_journal_storage_is_refused_at_config_load`).
 
 #### 3. Only a claimed ledger runs trials
 
@@ -181,9 +159,9 @@ for every loaded study and a re-check of the binding in `claim_ledger`\
 
 `claim_ledger` writes the tree binding before it claims any study, so a crash
 between the two cannot leave a study naming a tree that does not name its
-ledger. Its first write, before the binding, creates the ledger's directory
-for either backend, so a ledger path that cannot hold a file fails while the
-tree is still unbound and the path can be corrected.
+ledger. Its first write, before the binding, creates the ledger's parent
+directory, so a ledger path that cannot hold a file fails while the tree is
+still unbound and the path can be corrected.
 
 **Held by:** `engine.ledger.claim_ledger`, creating the ledger's parent
 directory, then calling `engine.artifact_roots._write_artifact_root_binding`
@@ -197,10 +175,7 @@ before its `_claim_study_artifact_root` loop\
 `read_status`, `read_winners`, CLI `status` and `show-winners`, and the MCP
 result snapshot build no file-backed storage, write no bytes, and report a
 phase whose format scan did not complete as unavailable rather than counting
-its trials. The one exception is a SQLite ledger someone switched to WAL mode,
-which Optuna never does: a read there leaves the database bytes unchanged,
-but SQLite itself creates the `-wal` and `-shm` files it coordinates readers
-through.
+its trials.
 
 **Held by:** `engine.ledger.validate_ledger` and
 `engine.ledger.read_phase_trial_stats`, under `engine.read.read_status`,
@@ -213,14 +188,12 @@ through.
 Recovery validates the binding and the format before it opens any study, never
 claims, refuses a study bound to another artifact root before it reaps
 anything, and refuses a pre-cutover ledger or an incomplete scan with the bytes
-unchanged. A confirmed recovery holds the experiment lock, so it lets SQLite
-roll back an interrupted transaction before it rescans; inspection reports
-that transaction and never does. Both refuse a journal whose last line is
-partial, with the same message, because inspection previews the write.
+unchanged. Both confirmed recovery and inspection refuse a journal whose last
+line is partial, with the same message, because inspection previews the
+write.
 
 **Held by:** `mcp.recovery._load_recovery_studies`, through
-`engine.ledger.validate_ledger`, then, when confirmed,
-`engine.ledger.roll_back_interrupted_transaction`, then
+`engine.ledger.validate_ledger`, then
 `engine.ledger.require_complete_journal`, and then
 `engine.ledger.open_existing_study`, which refuses a handle whose scan did not
 complete, with `engine.artifact_roots._check_study_artifact_root` on every
@@ -229,7 +202,6 @@ opened study\
 `tests/test_ledger_read_paths.py::test_recovery_study_load_rewraps_the_engine_refusal`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_stale_reaper.py::test_recovery_refuses_a_study_bound_to_another_artifact_root`,
-`tests/test_format_cutover.py::test_confirmed_recovery_rolls_back_an_interrupted_transaction`,
 `tests/test_format_cutover.py::test_writers_refuse_a_partial_final_journal_record_and_leave_it`
 
 ### Attempts and trial outcomes

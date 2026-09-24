@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
-import logging
 import re
-import shutil
-import sqlite3
 import subprocess
 from pathlib import Path
-from typing import Any
 
 import optuna
 import pytest
@@ -20,7 +15,6 @@ from phasesweep.config import Experiment
 from phasesweep.engine import (
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
-    LedgerTransactionInterruptedError,
     ProcessCleanupUncertainError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -38,30 +32,23 @@ from phasesweep.engine.ledger import (
     open_phase_study,
     open_registry_study,
     require_complete_journal,
-    roll_back_interrupted_transaction,
     validate_ledger,
 )
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.engine.study_policy import _validate_study_schema
 from phasesweep.errors import PhaseSweepError
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
     _load_recovery_studies,
-    recover_run,
 )
-from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import local_storage_url
 from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
 from tests.ledger_fixtures import (
-    leave_hot_journal,
     ledger_file,
     materialize,
-    rollback_journal,
     tree_snapshot,
 )
-from tests.mcp_helpers import stage_dead_run
 from tests.recovery_helpers import load_only_recovery_needs
 
 
@@ -125,14 +112,13 @@ def test_pre_cutover_artifact_binding_version_is_refused_before_mutation(
     assert tree_snapshot(root) == before
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.parametrize("schema_version", [2, None], ids=["old-version", "unmarked"])
 def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
-    tmp_path: Path, backend: str, schema_version: int | None
+    tmp_path: Path, schema_version: int | None
 ) -> None:
     """Changing experiment/workdir cannot reinterpret an old populated ledger as fresh."""
-    ledger = tmp_path / f"old.{backend}"
-    storage = f"{backend}:///{ledger}"
+    ledger = tmp_path / "old.journal"
+    storage = f"journal:///{ledger}"
     old = optuna.create_study(
         study_name="old_experiment::removed_phase", storage=_resolve_storage(storage)
     )
@@ -163,14 +149,13 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
     } == ledger_before
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.parametrize("leftover_study", ["t::retired", "other_experiment::phase"])
 @pytest.mark.integration
 def test_bound_root_status_refuses_empty_stamped_legacy_studies(
-    tmp_path: Path, backend: str, leftover_study: str
+    tmp_path: Path, leftover_study: str
 ) -> None:
     """Status rejects empty retired or foreign studies with an old format stamp."""
-    storage = f"{backend}:///{tmp_path / f'current.{backend}'}"
+    storage = f"journal:///{tmp_path / 'current.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
     run_experiment(experiment)
     leftover = optuna.create_study(study_name=leftover_study, storage=_resolve_storage(storage))
@@ -180,65 +165,20 @@ def test_bound_root_status_refuses_empty_stamped_legacy_studies(
         read_status(experiment)
 
 
-@pytest.mark.parametrize("read_path", ["validate", "status"])
-def test_format_scan_judges_one_sqlite_snapshot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_path: str
-) -> None:
-    """A study stamped and given its first trial mid-scan is not read as pre-cutover.
-
-    A study is legitimately empty and unmarked until its creator stamps it, and
-    status reads take no lock. Separate autocommit queries would see it
-    unmarked, then populated, a state the ledger never held. WAL lets the
-    writer commit while the scan's read transaction stays open.
-    """
-    database = tmp_path / "shared.db"
-    writer = optuna.create_study(study_name="t::p", storage=f"sqlite:///{database}")
-    with contextlib.closing(sqlite3.connect(database)) as conn:
-        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
-    experiment = make_experiment(workdir=tmp_path / "runs", storage=f"sqlite:///{database}")
-    real_connect = sqlite3.connect
-    interleaved = False
-
-    class WriterBetweenScanQueries(sqlite3.Connection):
-        def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
-            nonlocal interleaved
-            if "SELECT DISTINCT study_id FROM trials" in sql and not interleaved:
-                interleaved = True
-                _validate_study_schema(writer)
-                writer.ask()
-            return super().execute(sql, *args)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            sqlite3,
-            "connect",
-            lambda *args, **kwargs: real_connect(*args, factory=WriterBetweenScanQueries, **kwargs),
-        )
-        if read_path == "validate":
-            assert validate_ledger(experiment).format_verified
-        else:
-            assert read_status(experiment)["phases"][0]["trial_data_available"]
-
-    assert interleaved
-    assert len(writer.trials) == 1
-    assert validate_ledger(experiment).format_verified
-
-
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
-def test_validate_ledger_on_a_fresh_root_creates_nothing(tmp_path: Path, backend: str) -> None:
+def test_validate_ledger_on_a_fresh_root_creates_nothing(tmp_path: Path) -> None:
     """Validating a never-run experiment reports an unbound tree and writes nothing.
 
     The handle is what every read path takes, so obtaining one must not be the
     thing that brings the tree or the ledger into existence: a status poll on a
     config that has never run has to stay observable and leave no trace.
     """
-    ledger_path = tmp_path / "fresh" / f"study.{backend}"
-    experiment = _experiment(tmp_path, storage=f"{backend}:///{ledger_path}")
+    ledger_path = tmp_path / "fresh" / "study.journal"
+    experiment = _experiment(tmp_path, storage=f"journal:///{ledger_path}")
 
     ledger = validate_ledger(experiment)
 
     assert ledger.binding_state == "unbound"
-    assert ledger.backend == backend
+    assert ledger.backend == "journal"
     assert ledger.experiment_name == experiment.experiment
     assert ledger.artifact_root == str(_experiment_dir(experiment).resolve())
     assert not ledger_path.exists()
@@ -247,27 +187,24 @@ def test_validate_ledger_on_a_fresh_root_creates_nothing(tmp_path: Path, backend
     assert not _experiment_dir(experiment).exists()
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
-def test_claim_ledger_creates_ledger_parent_but_validate_does_not(
-    tmp_path: Path, backend: str
-) -> None:
+def test_claim_ledger_creates_ledger_parent_but_validate_does_not(tmp_path: Path) -> None:
     """Claiming brings the ledger's directory into existence before it binds the tree.
 
     Every read path validates, so validating must never materialize a ledger
     directory. The claim is the first step that writes, and the directory is
     its first write: a path that cannot hold a ledger then fails before the
     tree names that ledger, while the path can still be corrected. Neither
-    step creates the ledger file itself; the first live open does. SQLite
-    creates only that file, so a claim that skipped the directory would bind
-    the tree to a ledger its first open cannot create.
+    step creates the ledger file itself; the first live open does. The journal
+    backend creates only that file, so a claim that skipped the directory
+    would bind the tree to a ledger its first open cannot create.
     """
     missing = tmp_path / "not-created-by-a-read"
-    ledger_file = missing / f"study.{backend}"
-    experiment = _experiment(tmp_path, storage=f"{backend}:///{ledger_file}")
+    ledger_file = missing / "study.journal"
+    experiment = _experiment(tmp_path, storage=f"journal:///{ledger_file}")
 
     ledger = validate_ledger(experiment)
 
-    assert ledger.backend == backend
+    assert ledger.backend == "journal"
     assert ledger.ledger_path == ledger_file
     assert not missing.exists()
 
@@ -286,7 +223,9 @@ def test_unwritable_ledger_directory_fails_before_the_tree_is_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A ledger directory that cannot be created leaves the tree unbound and correctable."""
-    experiment = _experiment(tmp_path, storage=f"sqlite:///{tmp_path / 'missing' / 'study.db'}")
+    experiment = _experiment(
+        tmp_path, storage=f"journal:///{tmp_path / 'missing' / 'study.journal'}"
+    )
     real_mkdir = Path.mkdir
 
     def refuse_ledger_directory(path: Path, *args: object, **kwargs: object) -> None:
@@ -325,8 +264,7 @@ def test_live_openers_reject_unvalidated_storage(tmp_path: Path, offered: str) -
     assert not _artifact_root_binding_path(experiment).exists()
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
-def test_claim_ledger_binds_tree_then_returns_bound_handle(tmp_path: Path, backend: str) -> None:
+def test_claim_ledger_binds_tree_then_returns_bound_handle(tmp_path: Path) -> None:
     """Claiming a fresh tree records its owner and returns the handle that opens studies.
 
     The validated handle keeps saying what validation saw ("unbound"); only the
@@ -334,7 +272,7 @@ def test_claim_ledger_binds_tree_then_returns_bound_handle(tmp_path: Path, backe
     opened through it carries the claimed root. Reclaiming the bound tree finds
     that study in its one discovery pass.
     """
-    experiment = _experiment(tmp_path, storage=f"{backend}:///{tmp_path / f'study.{backend}'}")
+    experiment = _experiment(tmp_path, storage=f"journal:///{tmp_path / 'study.journal'}")
     validated = validate_ledger(experiment)
 
     claimed = claim_ledger(validated)
@@ -357,9 +295,8 @@ def test_claim_ledger_binds_tree_then_returns_bound_handle(tmp_path: Path, backe
         reclaimed.studies["other"] = study  # type: ignore[index]
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
 def test_claim_ledger_writes_tree_binding_before_claiming_studies(
-    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A crash between the two claims leaves a bound tree and unclaimed studies.
 
@@ -370,7 +307,7 @@ def test_claim_ledger_writes_tree_binding_before_claiming_studies(
     """
     import phasesweep.engine.ledger as ledger_module
 
-    storage = f"{backend}:///{tmp_path / f'study.{backend}'}"
+    storage = f"journal:///{tmp_path / 'study.journal'}"
     base = _experiment(tmp_path, storage=storage)
     experiment = base.model_copy(
         update={"phases": [base.phases[0], base.phases[0].model_copy(update={"name": "q"})]}
@@ -415,14 +352,14 @@ def _bound_tree_with_legacy_study(tmp_path: Path, *, legacy: bool = True) -> Exp
         only a completed format scan can see.
     :return Experiment: Experiment whose tree is bound to that ledger.
     """
-    storage = f"sqlite:///{tmp_path / 'current.db'}"
+    storage = f"journal:///{tmp_path / 'current.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
-    study = optuna.create_study(study_name="t::p", storage=storage)
+    study = optuna.create_study(study_name="t::p", storage=_resolve_storage(storage))
     study.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment).resolve()))
     mark_current_format(experiment, study)
     if legacy:
-        old = optuna.create_study(study_name="legacy::p", storage=storage)
+        old = optuna.create_study(study_name="legacy::p", storage=_resolve_storage(storage))
         old.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
     return experiment
 
@@ -504,7 +441,7 @@ def test_claim_rescans_an_unverified_ledger_before_discovery(
     written either way.
     """
     experiment = _bound_tree_with_legacy_study(tmp_path)
-    ledger_file = tmp_path / "current.db"
+    ledger_file = tmp_path / "current.journal"
     before = ledger_file.read_bytes()
     scans = _scan_fails(monkeypatch, times=1 if second_scan == "completes" else 2)
 
@@ -538,15 +475,14 @@ def test_verified_handle_reads_and_claims_after_one_scan(
     assert len(scans) == 2  # one for this handle, one for read_status's own; none in claim
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.integration
 def test_startup_scans_the_ledger_format_once(
-    tmp_path: Path, backend: str, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Root preflight scans once before Optuna loads any declared study."""
     import phasesweep.engine.ledger as ledger
 
-    storage = f"{backend}:///{tmp_path / f'current.{backend}'}"
+    storage = f"journal:///{tmp_path / 'current.journal'}"
     experiment = _experiment(tmp_path, storage=storage)
     real_validate = ledger._scan_ledger_format
     real_load = ledger._load_existing_phase_study
@@ -569,14 +505,11 @@ def test_startup_scans_the_ledger_format_once(
     assert calls == 1
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.integration
-def test_empty_unstamped_phase_study_can_resume_in_current_ledger(
-    tmp_path: Path, backend: str
-) -> None:
+def test_empty_unstamped_phase_study_can_resume_in_current_ledger(tmp_path: Path) -> None:
     """An interrupted new phase is stamped and resumed rather than classified as old state."""
-    ledger = tmp_path / f"current.{backend}"
-    storage = f"{backend}:///{ledger}"
+    ledger = tmp_path / "current.journal"
+    storage = f"journal:///{ledger}"
     experiment = _experiment(tmp_path, storage=storage)
     run_experiment(experiment)
 
@@ -592,149 +525,6 @@ def test_empty_unstamped_phase_study_can_resume_in_current_ledger(
     study = optuna.load_study(study_name="t::q", storage=_resolve_storage(resumed.resolved_storage))
     assert study.user_attrs[STUDY_SCHEMA_ATTR] == STUDY_SCHEMA_VERSION
     assert len(study.trials) == 1
-
-
-def _committed_trials(database: Path) -> list[tuple[int, str]]:
-    """Return every committed trial's number and state, reading a snapshot copy.
-
-    The copy is taken without its journal, so the read never touches, or
-    recovers, the ledger under test.
-    """
-    snapshot = database.with_name(f"{database.name}.snapshot")
-    shutil.copyfile(database, snapshot)
-    try:
-        with contextlib.closing(sqlite3.connect(snapshot)) as conn:
-            return conn.execute("SELECT number, state FROM trials ORDER BY trial_id").fetchall()
-    finally:
-        snapshot.unlink()
-
-
-_INTERRUPTED = "holds a transaction that a crash interrupted"
-
-
-@pytest.mark.parametrize("mode", ["tree", "ledger-only"])
-def test_reads_report_an_interrupted_transaction_and_leave_it_for_a_locked_path(
-    tmp_path: Path, mode: str, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Status and recovery inspection name the interrupted transaction and roll nothing back.
-
-    A ``mode=ro`` reader cannot finish SQLite's crash recovery, and no read may
-    write, so every read reports the ledger unavailable for that reason and
-    points at the commands that hold the experiment lock. The ledger and its
-    journal stay byte-identical. An unbound tree records the gap too, since
-    refusing there would also stop the run that rolls it back.
-    """
-    materialized = materialize("current-sqlite", tmp_path, mode=mode)
-    experiment = materialized.experiment
-    leave_hot_journal(ledger_file(materialized, "sqlite"))
-    before = tree_snapshot(materialized.root)
-
-    ledger = validate_ledger(experiment)
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.ledger"):
-        status = read_status(experiment)
-    with pytest.raises(LedgerTransactionInterruptedError) as opened:
-        open_existing_study(ledger, experiment.phases[0])
-    with pytest.raises(RunRecoveryError) as inspected:
-        _load_recovery_studies(experiment, load_only_recovery_needs())
-
-    assert ledger.binding_state == ("bound" if mode == "tree" else "unbound")
-    assert isinstance(ledger.format_scan_failure, LedgerTransactionInterruptedError)
-    assert status["phases"][0]["trial_data_available"] is False
-    assert _INTERRUPTED in caplog.text
-    for refusal in (opened.value, inspected.value):
-        assert _INTERRUPTED in str(refusal)
-    assert tree_snapshot(materialized.root) == before
-
-
-def test_confirmed_recovery_rolls_back_an_interrupted_transaction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A confirmed ``recover-run`` holds the lock, so SQLite finishes its own rollback.
-
-    Recovery then reads the committed trials exactly as they were before the
-    crash, and the uncommitted rows never appear.
-    """
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
-    database = ledger_file(materialized, "sqlite")
-    committed = _committed_trials(database)
-    leave_hot_journal(database)
-    state_dir = tmp_path / "mcp-state"
-    stage_dead_run(
-        RunStore(state_dir),
-        "interrupted",
-        materialized.config_path,
-        materialized.experiment.experiment,
-        cleanup_uncertain=True,
-    )
-    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *_a, **_k: True)
-    messages: list[str] = []
-
-    recover_run(state_dir, "interrupted", confirm=True, emit=messages.append)
-
-    assert not rollback_journal(database).exists()
-    assert _committed_trials(database) == committed
-    assert any("Cleared cleanup uncertainty for interrupted" in message for message in messages)
-    with contextlib.closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as conn:
-        uncommitted = conn.execute(
-            "SELECT COUNT(*) FROM study_user_attributes WHERE key LIKE 'uncommitted-%'"
-        ).fetchone()
-    assert uncommitted == (0,)
-
-
-def test_claim_on_an_unbound_tree_rolls_back_a_shared_ledger(tmp_path: Path) -> None:
-    """A new experiment sharing a ledger clears another run's interrupted commit.
-
-    The tree is unbound, so the read that found the journal could not rely on
-    a recorded owner; the claim still reaches the rollback, then rescans the
-    whole ledger strictly and binds the new tree.
-    """
-    owner = _bound_tree_with_legacy_study(tmp_path, legacy=False)
-    database = tmp_path / "current.db"
-    committed = _committed_trials(database)
-    leave_hot_journal(database)
-    newcomer = owner.model_copy(update={"experiment": "u", "workdir": str(tmp_path / "other")})
-
-    with _experiment_lock(newcomer):
-        claimed = claim_ledger(validate_ledger(newcomer))
-
-    assert claimed.format_verified is True
-    assert not rollback_journal(database).exists()
-    assert _committed_trials(database) == committed
-    assert _artifact_root_binding_path(newcomer).is_file()
-
-
-def test_registry_opener_rolls_back_an_interrupted_transaction(tmp_path: Path) -> None:
-    """Attempt-registry recovery, reached only under a lock, clears the journal too.
-
-    Its locator can name a ledger no claim in this run touched, so the opener
-    cannot rely on ``claim_ledger`` having rolled that ledger back first.
-    """
-    _bound_tree_with_legacy_study(tmp_path, legacy=False)
-    database = tmp_path / "current.db"
-    committed = _committed_trials(database)
-    leave_hot_journal(database)
-
-    study = open_registry_study(f"sqlite:///{database}", "t::p")
-
-    assert study is not None
-    assert not rollback_journal(database).exists()
-    assert [(trial.number, trial.state.name) for trial in study.get_trials()] == committed
-
-
-def test_rollback_open_never_creates_a_missing_ledger(tmp_path: Path) -> None:
-    """The one read-write open refuses a ledger that vanished instead of creating it."""
-    experiment = _bound_tree_with_legacy_study(tmp_path, legacy=False)
-    database = tmp_path / "current.db"
-    leave_hot_journal(database)
-    ledger = validate_ledger(experiment)
-    database.unlink()
-
-    with pytest.raises(StudyStorageUnavailableError, match="could not roll it back") as refused:
-        roll_back_interrupted_transaction(ledger)
-
-    # Still the interrupted transaction's refusal.
-    assert type(refused.value) is LedgerTransactionInterruptedError
-    assert not database.exists()
 
 
 _PARTIAL_FINAL_RECORDS = {
@@ -793,7 +583,7 @@ def test_journal_repair_command_truncates_only_the_journal_it_saw(
     and quotes.
     """
     journal = tmp_path / name
-    url = local_storage_url(journal, "journal")
+    url = local_storage_url(journal)
     experiment = make_experiment(workdir=tmp_path / "runs", storage=url)
     study = optuna.create_study(study_name="t::p", storage=_resolve_storage(url))
     mark_current_format(experiment, study)
@@ -822,28 +612,3 @@ def test_journal_repair_command_truncates_only_the_journal_it_saw(
     assert journal.read_bytes() == complete
     require_complete_journal(validate_ledger(experiment))
     assert [bystander.read_text() for bystander in bystanders] == ["unrelated"] * 3
-
-
-@pytest.mark.integration
-def test_run_rolls_back_an_interrupted_transaction_and_continues(tmp_path: Path) -> None:
-    """The next run lets SQLite restore the committed ledger, then tops it up.
-
-    Before the fix every path scanned ``mode=ro`` first, so the run refused
-    with a remedy to restore a ledger that was intact, and nothing ever
-    cleared the journal.
-    """
-    database = tmp_path / "current.db"
-    experiment = _experiment(tmp_path, storage=f"sqlite:///{database}")
-    run_experiment(experiment)
-    committed = _committed_trials(database)
-    leave_hot_journal(database)
-    topped_up = experiment.model_copy(
-        update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 2})]}
-    )
-
-    run_experiment(topped_up)
-
-    assert not rollback_journal(database).exists()
-    trials = _committed_trials(database)
-    assert trials[: len(committed)] == committed
-    assert [state for _number, state in trials] == ["COMPLETE", "COMPLETE"]

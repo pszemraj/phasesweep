@@ -68,7 +68,7 @@ def _chained_config(tmp_path: Path) -> str:
     trainer = copy_fake_train(tmp_path)
     return f"""\
 experiment: e2e_lm
-storage: sqlite:///{tmp_path}/phases.db
+storage: journal:///{tmp_path}/phases.journal
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs
 trial_command: "{sys.executable} {trainer} {{overrides}}"

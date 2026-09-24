@@ -32,8 +32,6 @@ from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     canonical_storage_identity,
     file_url_path,
-    sqlite_uri_filename_path,
-    storage_backend,
     storage_is_in_memory,
 )
 from phasesweep.runtime.reaper import read_proc_starttime
@@ -276,8 +274,8 @@ def _require_mcp_stable_paths(
     :param Path config_dir: Directory of the experiment config, used to compute
         concrete fix suggestions for ``phasesweep mcp check``.
     :raises CatalogError: If storage is absent or in-memory, ``workdir`` or
-        ``execution.cwd`` is relative, the storage backend is not local SQLite
-        or JournalStorage, or its file path is empty or relative.
+        ``execution.cwd`` is relative, or the journal storage path is empty
+        or relative.
     """
     storage = experiment.resolved_storage
     if storage is None or storage_is_in_memory(storage):
@@ -312,28 +310,18 @@ def _require_mcp_stable_paths(
             ),
         )
 
-    backend = storage_backend(storage)
-    if backend not in {"sqlite", "journal"}:
-        raise CatalogError(
-            f"{experiment_id!r}: MCP experiments support only local-node SQLite or "
-            "JournalStorage file-backed Optuna storage; external RDB storage is unsupported",
-            suggestion=_suggest_storage(config_dir),
-        )
-    raw_path = sqlite_uri_filename_path(storage) if backend == "sqlite" else None
-    raw_path = file_url_path(storage) if raw_path is None else raw_path
+    raw_path = file_url_path(storage)
     if raw_path == "":
         raise CatalogError(
             f"{experiment_id!r}: MCP experiments must use a non-empty absolute "
-            f"{backend} storage path; empty file-backed storage URLs cannot be "
+            "journal storage path; empty file-backed storage URLs cannot be "
             "monitored across detached processes",
             suggestion=_suggest_storage(config_dir),
         )
-    storage_path = Path(raw_path)
-    if backend == "journal":
-        storage_path = storage_path.expanduser()
+    storage_path = Path(raw_path).expanduser()
     if not storage_path.is_absolute():
         raise CatalogError(
-            f"{experiment_id!r}: MCP experiments must use an absolute {backend} "
+            f"{experiment_id!r}: MCP experiments must use an absolute journal "
             "storage path; relative storage URLs depend on the server launch "
             "directory and can point at a different Optuna study after restart",
             suggestion=f"use an absolute path, e.g. {(config_dir / raw_path).resolve()}",
@@ -346,7 +334,7 @@ def _suggest_storage(config_dir: Path) -> str:
     :param Path config_dir: Directory of the experiment config.
     :return str: Operator-facing suggestion for ``phasesweep mcp check``.
     """
-    return f"use a persistent local URL, e.g. storage: sqlite:///{config_dir / 'optuna.db'}"
+    return f"use a persistent local URL, e.g. storage: journal:///{config_dir / 'optuna.journal'}"
 
 
 def _parse_catalog(catalog_path: Path) -> tuple[_Catalog, Path]:
@@ -585,8 +573,8 @@ class Registry:
         Every problem is reported as ``CatalogError`` so the server refuses to
         start with a bad catalog. Per entry: the config path exists,
         ``load_config`` accepts it, it is an :class:`Experiment` (suites are out
-        of scope for v1), and its storage is a persistent local SQLite/Journal
-        file (the MCP layer is local-node only in this version).
+        of scope for v1), and its storage is a persistent local journal file
+        (the MCP layer is local-node only in this version).
 
         :param Path catalog_path: Path to the operator-authored catalog YAML.
         :return Registry: Immutable registry of validated catalog entries.

@@ -32,6 +32,7 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.attempts import _register_active_attempt
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _attempts_dir,
@@ -117,7 +118,7 @@ def _load_first_phase_study(config: Path) -> optuna.Study:
     phase = exp.phases[0]
     return optuna.load_study(
         study_name=f"{exp.experiment}::{phase.name}",
-        storage=exp.storage,
+        storage=_resolve_storage(exp.resolved_storage),
     )
 
 
@@ -498,7 +499,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     phase = experiment.phases[0]
     study = optuna.create_study(
         study_name=f"{experiment.experiment}::{phase.name}",
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
     mark_current_format(experiment, study)

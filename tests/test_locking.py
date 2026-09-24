@@ -700,10 +700,10 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
     this (review v0.5.6 / blocker 1).
     """
     exp_a = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'a.db'}"
+        workdir=str(tmp_path / "runs"), storage=f"journal:///{tmp_path / 'a.journal'}"
     )
     exp_b = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'b.db'}"
+        workdir=str(tmp_path / "runs"), storage=f"journal:///{tmp_path / 'b.journal'}"
     )
 
     with (  # noqa: SIM117 — testing that the inner enter raises
@@ -717,16 +717,16 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
 @pytest.mark.parametrize(
     ("storage_a_name", "storage_b_name"),
     [
-        pytest.param("a.db", "b.db", id="different-storage-and-name"),
-        pytest.param("shared.db", "shared.db", id="shared-storage-different-name"),
+        pytest.param("a.journal", "b.journal", id="different-storage-and-name"),
+        pytest.param("shared.journal", "shared.journal", id="shared-storage-different-name"),
     ],
 )
 def test_run_lock_does_not_collide_for_distinct_experiment_names(
     tmp_path: Path, storage_a_name: str, storage_b_name: str
 ) -> None:
     """Distinct experiment namespaces do not share output or storage locks."""
-    storage_a = f"sqlite:///{tmp_path / storage_a_name}"
-    storage_b = f"sqlite:///{tmp_path / storage_b_name}"
+    storage_a = f"journal:///{tmp_path / storage_a_name}"
+    storage_b = f"journal:///{tmp_path / storage_b_name}"
     exp_a = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_a)
     exp_b = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_b)
     # make_experiment hardcodes experiment="t"; clone exp_b with another name.
@@ -825,25 +825,11 @@ except (ExperimentLockBusyError, LockBusyError):
     assert all(path.stat().st_ino == inode for path, inode in lock_inodes.items())
 
 
-def test_in_memory_url_spellings_take_no_storage_lock(tmp_path: Path) -> None:
-    """Every in-memory storage spelling yields only the output lock.
-
-    ``sqlite:///:memory:``-style URLs previously produced a storage lock
-    naming a backend that does not exist, so two unrelated in-memory runs
-    sharing an experiment name (but nothing else) contended spuriously
-    (review v0.5.17 gap hunt).
-    """
-    for storage in ("sqlite://", "sqlite:///:memory:", "sqlite+pysqlite:///:memory:"):
-        exp = make_experiment(workdir=str(tmp_path / "runs"), storage="sqlite:///u.db")
-        exp = exp.model_copy(update={"storage": storage})
-        assert len(_run_lock_paths(exp)) == 1, storage
-
-
 def test_run_experiment_holds_experiment_lock_for_duration(tmp_path: Path) -> None:
     """A second concurrent ``run_experiment`` against the same experiment
     fails fast with the expected error while the run lock is held.
     """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
+    storage = f"journal:///{tmp_path / 'shared.journal'}"
     exp_a = make_experiment(
         workdir=str(tmp_path / "runs_a"),
         storage=storage,
@@ -884,7 +870,7 @@ def test_run_experiment_dry_run_does_not_take_experiment_lock(tmp_path: Path) ->
     A user inspecting an experiment's plan while a real run is in progress is
     a legitimate workflow.
     """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
+    storage = f"journal:///{tmp_path / 'shared.journal'}"
     exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage)
     exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage)
 

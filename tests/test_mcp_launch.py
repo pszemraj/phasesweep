@@ -19,6 +19,7 @@ import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.ledger as engine_ledger
 import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
@@ -1374,7 +1375,7 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
     assert "already has a running sweep" in busy_record["error"]
 
     blob = audit_path.read_text()
-    for needle in ("train.py", "sqlite", str(config), str(tmp_path / "runs")):
+    for needle in ("train.py", "journal", str(config), str(tmp_path / "runs")):
         assert needle not in blob
     assert captured["cmd"]  # sanity: the launch path really reached Popen
 
@@ -1546,7 +1547,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     for phase in experiment.phases:
         study = optuna.create_study(
             study_name=f"{experiment.experiment}::{phase.name}",
-            storage=experiment.storage,
+            storage=engine_ledger._resolve_storage(experiment.resolved_storage),
             direction="minimize",
         )
         # Two populated, unmarked studies model a pre-cutover local ledger.

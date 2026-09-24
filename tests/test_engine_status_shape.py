@@ -93,7 +93,7 @@ reviewer 2, blocker 6); the CLI phase payload keeps exactly
 
 def _published(tmp_path: Path) -> Experiment:
     """Return the config that reads the golden fixture's two-trial publication."""
-    return materialize("current-sqlite", tmp_path, mode="tree").experiment
+    return materialize("current-journal", tmp_path, mode="tree").experiment
 
 
 def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
