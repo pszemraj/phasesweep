@@ -184,7 +184,7 @@ def test_init_write_failure_does_not_claim_destination(
     def fail_fsync(_fd: int) -> None:
         raise OSError("fsync failed")
 
-    monkeypatch.setattr("phasesweep.cli.os.fsync", fail_fsync)
+    monkeypatch.setattr("phasesweep.runtime.files.os.fsync", fail_fsync)
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
@@ -209,7 +209,7 @@ def test_init_reports_publish_errors_without_a_traceback(
     def deny_hard_link(_source: Path, _destination: Path) -> None:
         raise PermissionError("hard links are not supported")
 
-    monkeypatch.setattr("phasesweep.cli.os.link", deny_hard_link)
+    monkeypatch.setattr("phasesweep.runtime.files.os.link", deny_hard_link)
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
@@ -231,7 +231,7 @@ def test_init_losing_publish_race_preserves_other_writer(
         destination.write_text("other process\n")
         raise FileExistsError(destination)
 
-    monkeypatch.setattr("phasesweep.cli.os.link", lose_publish_race)
+    monkeypatch.setattr("phasesweep.runtime.files.os.link", lose_publish_race)
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
