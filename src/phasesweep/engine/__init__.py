@@ -20,7 +20,6 @@ from phasesweep.engine.errors import (
     TrialTargetRegressionError,
     WinnerIntegrityError,
 )
-from phasesweep.engine.provenance import generation_id_source
 from phasesweep.engine.read import (
     PhaseWinnerView,
     read_status,
@@ -65,7 +64,6 @@ __all__ = [
     "Winner",
     "WinnerIntegrityError",
     "config_status",
-    "generation_id_source",
     "read_status",
     "read_winner",
     "read_winners",

@@ -2,25 +2,18 @@
 
 from __future__ import annotations
 
-import json
-from collections.abc import Mapping
-from typing import cast
-
 import yaml
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
-import phasesweep.engine.publication_validation as publication_validation_ops
 from phasesweep._metadata import __version__
 from phasesweep.config import Experiment, Phase
-from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.state import (
     GENERATION_CONFIG_SNAPSHOT_FILENAME,
     GENERATION_SUMMARY_SCHEMA_VERSION,
     REPRODUCIBILITY_SCHEMA_VERSION,
     STUDY_SCHEMA_VERSION,
-    GenerationIdSource,
 )
 from phasesweep.runtime.files import file_sha256, private_atomic_write_text
 
@@ -132,41 +125,3 @@ def _write_generation_provenance(
             },
         },
     )
-
-
-def generation_id_source(experiment: Experiment, generation_id: str) -> GenerationIdSource | None:
-    """Return who supplied one generation's identity, or ``None`` when unrecorded.
-
-    Reads the ``generation_id_source`` field frozen into the generation's
-    ``reproducibility.json`` at claim time. ``"caller"`` means an external
-    launcher granted the identity and holds that run's frozen authority record;
-    a reader that cannot load that record must not substitute mutable current
-    policy for it (PR #5 review / P2 missing-handle authority). ``None`` covers
-    every record that does not positively answer the question: no
-    reproducibility file (generations claimed before the file existed), a
-    pre-version-2 record without the field, or an unreadable/malformed file.
-    ``None`` deliberately does not fail closed -- absence is the normal state
-    of every legacy tree. Versioned publication validation separately detects
-    regular-file edits through the manifest; this lookup also refuses a path
-    that traverses a symlink before recognizing either recorded source.
-
-    :param Experiment experiment: Experiment whose artifact tree holds the generation.
-    :param str generation_id: Generation namespace identifier to look up.
-    :return GenerationIdSource | None: ``"caller"``, ``"engine"``, or ``None``
-        when no valid record answers.
-    """
-    if not SAFE_NAME_PATTERN.fullmatch(generation_id):
-        return None
-    try:
-        payload = json.loads(
-            publication_validation_ops._read_unlinked_bytes(
-                path_ops._generation_reproducibility_path(experiment, generation_id),
-                root=path_ops._experiment_dir(experiment),
-            ).decode("utf-8")
-        )
-    except (OSError, UnicodeError, ValueError):
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    source = payload.get("generation_id_source")
-    return cast("GenerationIdSource", source) if source in ("caller", "engine") else None

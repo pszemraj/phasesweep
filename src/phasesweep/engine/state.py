@@ -187,8 +187,6 @@ GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
 # survive the loss of that launcher's own state directory.
 REPRODUCIBILITY_SCHEMA_VERSION = 2
 
-GenerationIdSource = Literal["caller", "engine"]
-"""Who supplied a generation's identity: an external launcher, or the engine."""
 WINNER_FILENAME = "winner.yaml"
 # Manifest kinds that name a file in the generation namespace root rather than
 # a phase. Their entries carry ``path`` instead of ``phase``; both are required
