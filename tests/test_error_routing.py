@@ -343,6 +343,28 @@ def _claim_while(owner: object, name: str, inbound: Callable[[], Exception]) -> 
     return trigger
 
 
+def _claim_while_published_trials_fail(inbound: Callable[[], Exception]) -> Trigger:
+    """Claim the current golden ledger while the published check's trial reads raise.
+
+    Opening a study reads its trials too, so the failure is confined to the
+    published check rather than raised from every ``get_trials`` call.
+    """
+
+    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+        materialized = materialize("current-journal", tmp_path, mode="tree")
+        real_check = engine_ledger._check_published_phase_studies
+
+        def check_while_reads_fail(*args: Any, **kwargs: Any) -> None:
+            with monkeypatch.context() as reads:
+                reads.setattr(optuna.Study, "get_trials", _raiser(inbound()))
+                real_check(*args, **kwargs)
+
+        monkeypatch.setattr(engine_ledger, "_check_published_phase_studies", check_while_reads_fail)
+        return engine_ledger.claim_ledger(engine_ledger.validate_ledger(materialized.experiment))
+
+    return trigger
+
+
 def _validate_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
     """Validate an unbound current golden ledger after damaging its file."""
 
@@ -738,7 +760,7 @@ WRAP_CASES = (
     ),
     RoutingCase(
         id="published_check_preserves_override",
-        trigger=_claim_while(optuna.Study, "get_trials", _ledger_busy),
+        trigger=_claim_while_published_trials_fail(_ledger_busy),
         raised=StudyStorageUnavailableError,
         action=OperatorAction.RETRY,
         message="Could not inspect persistent study storage for published phase 'p'.",

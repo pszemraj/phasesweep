@@ -25,6 +25,7 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.ledger import (
     ClaimedLedger,
+    ValidatedLedger,
     _resolve_storage,
     claim_ledger,
     open_existing_study,
@@ -495,7 +496,7 @@ def test_startup_scans_the_ledger_format_once(
         calls += 1
         real_validate(candidate)
 
-    def checked_load(candidate: Experiment, phase):
+    def checked_load(candidate: ValidatedLedger, phase):
         assert calls == 1
         return real_load(candidate, phase)
 

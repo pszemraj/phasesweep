@@ -874,12 +874,12 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
     original_stats = engine_ledger._phase_trial_stats
 
     def transient_capture_failure(
-        experiment: Experiment,
+        ledger: engine_ledger.ValidatedLedger,
         phase: Phase,
         published_trial: engine_optuna._TrialRef | None = None,
     ) -> engine_optuna._PhaseTrialStats:
         nonlocal capture_reads
-        if _generation_summary_path(experiment, generation_id).is_file():
+        if _generation_summary_path(ledger.experiment, generation_id).is_file():
             capture_reads += 1
 
             def locked_read(*_args: object, **_kwargs: object) -> None:
@@ -887,9 +887,9 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
-                return original_stats(experiment, phase, published_trial)
+                return original_stats(ledger, phase, published_trial)
 
-        return original_stats(experiment, phase, published_trial)
+        return original_stats(ledger, phase, published_trial)
 
     monkeypatch.setattr(engine_ledger, "_phase_trial_stats", transient_capture_failure)
     if not pointer_commits:
@@ -1918,20 +1918,20 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     original_stats = engine_ledger._phase_trial_stats
 
     def unavailable_during_prepared_capture(
-        captured_experiment: Experiment,
+        ledger: engine_ledger.ValidatedLedger,
         phase: Phase,
         published_trial: engine_optuna._TrialRef | None = None,
     ) -> engine_optuna._PhaseTrialStats:
-        if _generation_summary_path(captured_experiment, run_id).is_file():
+        if _generation_summary_path(ledger.experiment, run_id).is_file():
 
             def locked_read(*_args: object, **_kwargs: object) -> None:
                 raise OSError("journal storage is locked")
 
             with monkeypatch.context() as capture_patch:
                 capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
-                return original_stats(captured_experiment, phase, published_trial)
+                return original_stats(ledger, phase, published_trial)
 
-        return original_stats(captured_experiment, phase, published_trial)
+        return original_stats(ledger, phase, published_trial)
 
     monkeypatch.setattr(
         engine_ledger,

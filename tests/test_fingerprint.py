@@ -1314,10 +1314,10 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     real_loader = ledger._load_existing_phase_study
 
-    def _fail_for_lr(exp: Experiment, phase: Phase) -> optuna.Study | None:
+    def _fail_for_lr(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
         if phase.name == "lr":
             raise RuntimeError("storage went away")
-        return real_loader(exp, phase)
+        return real_loader(handle, phase)
 
     monkeypatch.setattr(ledger, "_load_existing_phase_study", _fail_for_lr)
 
@@ -1335,7 +1335,13 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The published-phase existence read keeps strict storage-error semantics."""
+    """The published-phase existence read keeps strict storage-error semantics.
+
+    Opening a study reads its trials too, so the failure is confined to the
+    published check rather than raised from every ``get_trials`` call.
+    """
+    import phasesweep.engine.ledger as ledger
+
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     published = _last_successful_generation_id(experiment)
@@ -1348,7 +1354,14 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     def fail_trial_read(*_args: object, **_kwargs: object) -> list[optuna.trial.FrozenTrial]:
         raise RuntimeError("storage went away during trial read")
 
-    monkeypatch.setattr(optuna.Study, "get_trials", fail_trial_read)
+    real_check = ledger._check_published_phase_studies
+
+    def check_while_reads_fail(*args: object, **kwargs: object) -> None:
+        with monkeypatch.context() as reads:
+            reads.setattr(optuna.Study, "get_trials", fail_trial_read)
+            real_check(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "_check_published_phase_studies", check_while_reads_fail)
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)
@@ -1550,11 +1563,11 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     real_loader = ledger._load_existing_phase_study
     calls = {"count": 0}
 
-    def _fail_first_read(exp: Experiment, phase: Phase) -> optuna.Study | None:
+    def _fail_first_read(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("transient storage failure")
-        return real_loader(exp, phase)
+        return real_loader(handle, phase)
 
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr(ledger, "_load_existing_phase_study", _fail_first_read)

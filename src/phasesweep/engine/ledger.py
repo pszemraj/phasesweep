@@ -631,42 +631,35 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         )
 
 
-def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study | None:
+def _load_existing_phase_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.Study | None:
     """Load a phase study only if it already exists.
 
     Recovery and read-like paths must not call ``create_study(load_if_exists=True)`` because
-    that can create an empty study and make missing evidence look safe. This helper checks
-    persistent storage before delegating to Optuna's loader, then treats an absent study as
-    ``None``.
+    that can create an empty study and make missing evidence look safe. The study is opened
+    the way every existing journal study is (:func:`_open_existing_journal_study`), so an
+    absent study is ``None`` and nothing is created.
 
-    :param Experiment experiment: Parsed experiment config containing storage settings.
+    :param ValidatedLedger ledger: Handle naming the ledger the study lives in.
     :param Phase | str phase: Phase or historical phase name whose study is loaded.
     :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
     :raises StudyStorageUnavailableError: Persistent storage exists but
         could not be read, so whether the study exists cannot be determined;
         callers on mutating paths must abort rather than treat this as absence.
     """
-    storage = experiment.resolved_storage
-    if storage_is_in_memory(storage):
+    if ledger.backend == "memory":
         return None
-    assert storage is not None
-    backend = storage_backend(storage)
-    if backend != "journal":
-        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
-    study_name = _phase_study_name(experiment, phase)
-    if _load_journal_study_snapshot(storage, study_name) is None:
-        return None
-    # Preflight verified a complete snapshot. Mutating callers still use
-    # Optuna's normal backend, including its concurrent-append semantics.
-    return optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
+    assert ledger.storage_url is not None
+    return _open_existing_journal_study(
+        ledger.storage_url, _phase_study_name(ledger.experiment, phase)
+    )
 
 
 def _unavailable_phase_trial_stats(
-    experiment: Experiment, phase: Phase, exc: BaseException
+    ledger: ValidatedLedger, phase: Phase, exc: BaseException
 ) -> _PhaseTrialStats:
     """Log a storage-read failure and return an unavailable phase-trial snapshot.
 
-    :param Experiment experiment: Config whose storage backend or local path is reported.
+    :param ValidatedLedger ledger: Handle whose storage is reported.
     :param Phase phase: Phase whose status read failed.
     :param BaseException exc: Read exception whose direct cause is reported when present.
     :return _PhaseTrialStats: Empty count maps and ``running_attempts=None`` with
@@ -675,7 +668,7 @@ def _unavailable_phase_trial_stats(
     cause = exc.__cause__ or exc
     log.warning(
         "could not read status trial data from storage %s for phase %s: %s: %s",
-        experiment.resolved_storage,
+        ledger.storage_url,
         phase.name,
         type(cause).__name__,
         cause,
@@ -684,7 +677,7 @@ def _unavailable_phase_trial_stats(
 
 
 def _phase_trial_stats(
-    experiment: Experiment,
+    ledger: ValidatedLedger,
     phase: Phase,
     published_trial: _TrialRef | None = None,
 ) -> _PhaseTrialStats:
@@ -695,28 +688,21 @@ def _phase_trial_stats(
     absence reports available zero counts; read failures report unavailable
     counts.
 
-    :param Experiment experiment: Parsed experiment config containing storage settings.
+    :param ValidatedLedger ledger: Handle naming the ledger the study lives in.
     :param Phase phase: Phase whose existing study is inspected.
     :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
     :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
     """
-    if experiment.resolved_storage is None:
+    if ledger.backend == "memory":
         return _PhaseTrialStats({}, False, {}, None)
-    backend = storage_backend(experiment.resolved_storage)
-    if backend != "journal":
-        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
+    assert ledger.storage_url is not None
+    study_name = _phase_study_name(ledger.experiment, phase)
     try:
-        snapshot = _journal_snapshot_storage(
-            experiment.resolved_storage,
-            f"study {_phase_study_name(experiment, phase)!r}",
-        )
+        snapshot = _journal_snapshot_storage(ledger.storage_url, f"study {study_name!r}")
         if snapshot is None:
             return _PhaseTrialStats({}, True, {}, [])
         try:
-            study = optuna.load_study(
-                study_name=_phase_study_name(experiment, phase),
-                storage=snapshot,
-            )
+            study = optuna.load_study(study_name=study_name, storage=snapshot)
         except KeyError:
             return _PhaseTrialStats({}, True, {}, [])
         trials = study.get_trials(deepcopy=False)
@@ -726,7 +712,7 @@ def _phase_trial_stats(
     except StudySchemaMismatchError:
         raise
     except Exception as exc:  # noqa: BLE001
-        return _unavailable_phase_trial_stats(experiment, phase, exc)
+        return _unavailable_phase_trial_stats(ledger, phase, exc)
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
@@ -871,10 +857,11 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
     can be written through, so this is not a read path's opener (those use
     :func:`read_phase_trial_stats`). It never creates a study or a ledger
     file, because absence is settled first by a read-only probe (a complete
-    journal snapshot). It checks nothing about which artifact root owns the
-    study. Its two callers do that before they use the study:
-    :func:`claim_ledger` before its first write, and MCP recovery before it
-    reaps anything.
+    journal snapshot), and the live replay must then agree with that snapshot
+    (:func:`_open_existing_journal_study`). It checks nothing about which
+    artifact root owns the study. Its two callers do that before they use
+    the study: :func:`claim_ledger` before its first write, and MCP recovery
+    before it reaps anything.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param Phase | str phase: Phase or historical phase name whose study is opened.
@@ -888,7 +875,7 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
         # Same type and remedy as the scan's refusal: an interrupted
         # transaction must not read as a ledger to restore.
         raise type(failure).rewrap(failure, str(failure)) from failure
-    return _load_existing_phase_study(ledger.experiment, phase)
+    return _load_existing_phase_study(ledger, phase)
 
 
 def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
@@ -940,8 +927,8 @@ def read_phase_trial_stats(
         a pre-cutover or unsupported schema.
     """
     if ledger.format_scan_failure is not None:
-        return _unavailable_phase_trial_stats(ledger.experiment, phase, ledger.format_scan_failure)
-    return _phase_trial_stats(ledger.experiment, phase, published_trial)
+        return _unavailable_phase_trial_stats(ledger, phase, ledger.format_scan_failure)
+    return _phase_trial_stats(ledger, phase, published_trial)
 
 
 # Creating a directory fails with these when the configured path itself is
@@ -1181,6 +1168,37 @@ def _require_replay_matches_snapshot(
             )
 
 
+def _open_existing_journal_study(storage_url: str, study_name: str) -> optuna.Study | None:
+    """Open a journal study live only after a complete snapshot proves it exists.
+
+    Optuna's own loader would create a missing journal file before reporting
+    the study absent from it, so absence is settled first by a read-only
+    snapshot. The live study is what the caller writes through, with Optuna's
+    concurrent-append semantics, and its replay must agree with that snapshot:
+    a journal that loses the study or any of its trials between the two reads
+    is uncertain, not absent.
+
+    :param str storage_url: Journal storage URL holding the study.
+    :param str study_name: Study to open.
+    :return optuna.Study | None: The live study, or ``None`` when the complete
+        snapshot holds no such study.
+    :raises StudyStorageUnavailableError: The snapshot is unreadable or
+        incomplete, or the live replay disagrees with it.
+    """
+    snapshot = _load_journal_study_snapshot(storage_url, study_name)
+    if snapshot is None:
+        return None
+    try:
+        live = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage_url))
+    except KeyError as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {_journal_path(storage_url)} lost study "
+            f"{study_name!r} between its complete snapshot and the live replay."
+        ) from exc
+    _require_replay_matches_snapshot(snapshot, live, storage_url)
+    return live
+
+
 def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
     """Open a study named by an attempt-registry entry, on any ledger it names.
 
@@ -1222,15 +1240,4 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
         return None
     _scan_ledger_format(locator)
     _repair_incomplete_journal_record(locator)
-    snapshot = _load_journal_study_snapshot(locator, study_name)
-    if snapshot is None:
-        return None
-    try:
-        live = optuna.load_study(study_name=study_name, storage=_resolve_storage(locator))
-    except KeyError as exc:
-        raise StudyStorageUnavailableError(
-            f"Journal storage {_journal_path(locator)} lost study "
-            f"{study_name!r} between its complete snapshot and the live replay."
-        ) from exc
-    _require_replay_matches_snapshot(snapshot, live, locator)
-    return live
+    return _open_existing_journal_study(locator, study_name)

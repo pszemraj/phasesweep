@@ -206,7 +206,9 @@ def test_journal_malformed_record_before_its_end_never_means_absent(
         assert not any(phase["trials"].values())
     assert status["phases"][0]["running_attempts"] is None
     with pytest.raises(StudyStorageUnavailableError):
-        engine_ledger._load_existing_phase_study(experiment, experiment.phases[0])
+        engine_ledger.open_existing_study(
+            engine_ledger.validate_ledger(experiment), experiment.phases[0]
+        )
     with pytest.raises(ProcessCleanupUncertainError):
         run_experiment(experiment)
 
@@ -260,7 +262,9 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_befor
             # Nothing before the bad line: Optuna reads no study at all.
             assert not any(phase["trials"].values())
             assert phase["published_study_unavailable"] is published
-    loaded = engine_ledger._load_existing_phase_study(experiment, experiment.phases[0])
+    loaded = engine_ledger.open_existing_study(
+        engine_ledger.validate_ledger(experiment), experiment.phases[0]
+    )
     assert (loaded is not None) is keep_prefix
 
     if published and not keep_prefix:
