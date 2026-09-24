@@ -20,6 +20,9 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.optuna import (
+    _completed_trial_count,
+    _finished_trial_count,
+    _meets_published_trial_history_boundary,
     _published_phase_trial_refs,
     _published_trial_matches,
 )
@@ -377,15 +380,9 @@ def _check_published_phase_studies(
                     _published_trial_matches(trial, expected) for trial in trials
                 )
                 if matched and expected is not None:
-                    finished = sum(trial.state.is_finished() for trial in trials)
-                    completed = sum(
-                        trial.state == optuna.trial.TrialState.COMPLETE for trial in trials
-                    )
-                    if (
-                        expected.finished_trials is None or finished >= expected.finished_trials
-                    ) and (
-                        expected.completed_trials is None or completed >= expected.completed_trials
-                    ):
+                    finished = _finished_trial_count(trials)
+                    completed = _completed_trial_count(trials)
+                    if _meets_published_trial_history_boundary(finished, completed, expected):
                         continue
                     missing = (
                         f"has only {finished} terminal and {completed} complete trials, below "

@@ -12,6 +12,7 @@ import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep.config import Experiment
 from phasesweep.engine.errors import StudyContextConflictError
+from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
 
 
@@ -83,7 +84,7 @@ def _reject_bound_descendant_topups(
         study = existing_studies.get(phase.name)
         if study is None:
             continue
-        terminal = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+        terminal = _finished_trial_count(study.get_trials(deepcopy=False))
         if terminal >= phase.n_trials:
             continue
         partial_decision = study_policy_ops._load_accepted_partial_decision(study)

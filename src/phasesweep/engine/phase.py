@@ -7,7 +7,6 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -32,7 +31,12 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.evidence import _verify_winner_objective_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study, open_preview_study
-from phasesweep.engine.optuna import _phase_study_name, _suggest
+from phasesweep.engine.optuna import (
+    _completed_trial_count,
+    _finished_trial_count,
+    _phase_study_name,
+    _suggest,
+)
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
@@ -90,6 +94,36 @@ from phasesweep.runtime.shutdown import PhaseSweepShutdown
 log = logging.getLogger("phasesweep.engine.phase")
 
 
+def _winner_completion(
+    *,
+    requested_trials: int,
+    finished_trials: int,
+    completed_trials: int,
+    incomplete: bool,
+    reason: str | None,
+    timeout_scope: str | None,
+) -> dict[str, Any]:
+    """Build the completion metadata a phase's :class:`Winner` persists.
+
+    :param int requested_trials: Trial target the phase was configured to reach.
+    :param int finished_trials: Terminal trial count backing this completion.
+    :param int completed_trials: COMPLETE trial count backing this completion.
+    :param bool incomplete: Whether the phase stopped short of its trial target.
+    :param str | None reason: Why the phase is incomplete, or ``None`` when complete.
+    :param str | None timeout_scope: Timeout guard that stopped the phase, or ``None``
+        when the phase did not stop on a timeout.
+    :return dict[str, Any]: Completion metadata in the shape ``Winner.completion`` expects.
+    """
+    return {
+        "requested_trials": requested_trials,
+        "finished_trials": finished_trials,
+        "completed_trials": completed_trials,
+        "incomplete": incomplete,
+        "reason": reason,
+        "timeout_scope": timeout_scope,
+    }
+
+
 def _partial_completion_for_replay(
     study: optuna.Study,
     decision: _AcceptedPartialDecision,
@@ -107,7 +141,7 @@ def _partial_completion_for_replay(
     """
     trials = study.get_trials(deepcopy=False)
     finished_trials = _finished_trial_count(trials)
-    completed_trials = sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
+    completed_trials = _completed_trial_count(trials)
     if (
         outcome_sequence != decision.outcome_sequence
         or finished_trials != decision.finished_trials
@@ -118,14 +152,14 @@ def _partial_completion_for_replay(
             "decision was committed. Use a new experiment name, or archive/delete "
             "the inconsistent study."
         )
-    return {
-        "requested_trials": decision.trial_target,
-        "finished_trials": decision.finished_trials,
-        "completed_trials": decision.completed_trials,
-        "incomplete": True,
-        "reason": "timeout",
-        "timeout_scope": decision.timeout_scope,
-    }
+    return _winner_completion(
+        requested_trials=decision.trial_target,
+        finished_trials=decision.finished_trials,
+        completed_trials=decision.completed_trials,
+        incomplete=True,
+        reason="timeout",
+        timeout_scope=decision.timeout_scope,
+    )
 
 
 class _PolicyStateWriteError(StudyStorageUnavailableError):
@@ -196,15 +230,6 @@ class CsvSnapshotThrottle:
         """
         self.last_finished = finished
         self.last_write_at = now
-
-
-def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of terminal trials in ``trials``.
-
-    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
-    :return int: Number of trials with a finished state.
-    """
-    return sum(1 for trial in trials if trial.state.is_finished())
 
 
 def _composed_overrides(
@@ -505,16 +530,14 @@ def _run_phase(
             inherited_winners,
             study,
             phase_fingerprint=phase_fingerprint,
-            completion={
-                "requested_trials": phase.n_trials,
-                "finished_trials": _finished_trial_count(trials_after),
-                "completed_trials": sum(
-                    1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE
-                ),
-                "incomplete": False,
-                "reason": None,
-                "timeout_scope": None,
-            },
+            completion=_winner_completion(
+                requested_trials=phase.n_trials,
+                finished_trials=_finished_trial_count(trials_after),
+                completed_trials=_completed_trial_count(trials_after),
+                incomplete=False,
+                reason=None,
+                timeout_scope=None,
+            ),
         )
 
     # Compose and validate the launch environment only after recovery proves
@@ -1219,7 +1242,7 @@ def _run_phase(
 
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
-    completed_after = sum(1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE)
+    completed_after = _completed_trial_count(trials_after)
     # Scheduler-level deadline causality: the phase is short of its trial
     # target and the clock is spent, so the budget — not the observation order
     # — is what left work undone. Being short of the target is the whole test:
@@ -1316,14 +1339,14 @@ def _run_phase(
             inherited_winners,
             study,
             phase_fingerprint=phase_fingerprint,
-            completion={
-                "requested_trials": phase.n_trials,
-                "finished_trials": finished_after,
-                "completed_trials": completed_after,
-                "incomplete": accepted_partial_timeout,
-                "reason": "timeout" if accepted_partial_timeout else None,
-                "timeout_scope": timeout_source if accepted_partial_timeout else None,
-            },
+            completion=_winner_completion(
+                requested_trials=phase.n_trials,
+                finished_trials=finished_after,
+                completed_trials=completed_after,
+                incomplete=accepted_partial_timeout,
+                reason="timeout" if accepted_partial_timeout else None,
+                timeout_scope=timeout_source if accepted_partial_timeout else None,
+            ),
         )
     except NoFeasibleTrialError as exc:
         if deadline_exhausted["flag"]:
@@ -1487,14 +1510,14 @@ def _placeholder_winner(
         metric=float("nan"),
         constraints={},
         gates=[],
-        completion={
-            "requested_trials": phase.n_trials,
-            "finished_trials": 0,
-            "completed_trials": 0,
-            "incomplete": True,
-            "reason": "dry_run",
-            "timeout_scope": None,
-        },
+        completion=_winner_completion(
+            requested_trials=phase.n_trials,
+            finished_trials=0,
+            completed_trials=0,
+            incomplete=True,
+            reason="dry_run",
+            timeout_scope=None,
+        ),
         source=WinnerSource(
             kind="phase_trial",
             phase=phase.name,

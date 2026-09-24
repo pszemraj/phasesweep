@@ -23,6 +23,7 @@ from phasesweep.engine.errors import (
     TrialTargetRegressionError,
 )
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
+from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.study_policy import (
     _load_accepted_partial_decision,
     _validate_environment_cohort,
@@ -164,9 +165,7 @@ def _preflight_existing_studies(
             if reached:
                 _validate_trial_target(study, phase)
                 partial_decision = _load_accepted_partial_decision(study)
-                finished_trials = sum(
-                    trial.state.is_finished() for trial in study.get_trials(deepcopy=False)
-                )
+                finished_trials = _finished_trial_count(study.get_trials(deepcopy=False))
                 needs_new_trials = phase.n_trials > finished_trials and not (
                     partial_decision is not None and phase.n_trials == partial_decision.trial_target
                 )
