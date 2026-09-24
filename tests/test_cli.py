@@ -517,6 +517,8 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     status_obj = yaml.safe_load(result.output)
     assert status_obj["current_generation_id"] is not None
     assert status_obj["published_generation_id"] == status_obj["current_generation_id"]
+    # The ledger file Optuna's own CLI and dashboard are pointed at.
+    assert status_obj["ledger_path"] == str(tmp_path / "studies.journal")
 
 
 @pytest.mark.integration

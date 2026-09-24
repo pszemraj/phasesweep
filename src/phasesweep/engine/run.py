@@ -780,6 +780,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     * ``kind``: always ``"experiment"``.
     * ``experiment``: configured experiment name.
     * ``workdir``: experiment artifact root.
+    * ``ledger_path``: absolute path of the journal ledger, for Optuna's own
+      CLI or a dashboard copy; ``None`` for in-memory storage. The MCP read
+      view never carries it.
     * ``current_generation_id``, ``published_generation_id``,
       ``represented_generation_id``, ``is_published``: the identity split
       defined by :func:`phasesweep.engine.read.read_status` (unpinned mode, so
@@ -818,10 +821,12 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     """
     status = read_status(experiment, _include_winner_paths=True)
     integrity = status["publication_integrity"]
+    ledger_path = ledger_ops.resolved_ledger_path(experiment)
     return {
         "kind": "experiment",
         "experiment": status["experiment"],
         "workdir": str(path_ops._experiment_dir(experiment)),
+        "ledger_path": None if ledger_path is None else str(ledger_path),
         "current_generation_id": status["current_generation_id"],
         "published_generation_id": status["published_generation_id"],
         "represented_generation_id": status["represented_generation_id"],

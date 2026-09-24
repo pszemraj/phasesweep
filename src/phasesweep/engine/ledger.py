@@ -115,6 +115,7 @@ __all__ = [
     "open_registry_study",
     "read_phase_trial_stats",
     "repair_incomplete_journal_record",
+    "resolved_ledger_path",
     "validate_ledger",
 ]
 
@@ -751,6 +752,24 @@ def _phase_trial_stats(
     return _PhaseTrialStats(
         counts, True, generation_counts, running_attempts, published_trial_available
     )
+
+
+def resolved_ledger_path(experiment: Experiment) -> Path | None:
+    """Return the absolute path of the journal file an experiment's ledger lives in.
+
+    ``phasesweep status`` reports it so an operator can point Optuna's own
+    CLI, or a dashboard serving a copy, at the ledger. The path comes from
+    :func:`_journal_path` like every other journal path here, and is made
+    absolute without resolving symlinks, so it names the file Optuna opens.
+
+    :param Experiment experiment: Experiment whose resolved storage is named.
+    :return Path | None: The journal file, or ``None`` for in-memory storage.
+    """
+    url = experiment.resolved_storage
+    if storage_is_in_memory(url):
+        return None
+    assert url is not None
+    return _journal_path(url).absolute()
 
 
 def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> ValidatedLedger:

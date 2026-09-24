@@ -16,12 +16,14 @@ from phasesweep.engine import read_status
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.run import experiment_status
-from tests.ledger_fixtures import materialize
+from tests.conftest import make_experiment
+from tests.ledger_fixtures import ledger_file, materialize
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",
     "experiment",
     "workdir",
+    "ledger_path",
     "current_generation_id",
     "published_generation_id",
     "represented_generation_id",
@@ -35,6 +37,7 @@ FAILED_PUBLICATION_STATUS_KEYS = [
     "kind",
     "experiment",
     "workdir",
+    "ledger_path",
     "current_generation_id",
     "published_generation_id",
     "represented_generation_id",
@@ -98,12 +101,15 @@ def _published(tmp_path: Path) -> Experiment:
 
 def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
     """A standalone experiment payload carries generation identity plus phases."""
-    experiment = _published(tmp_path)
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment = materialized.experiment
 
     payload = config_status(experiment)
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert not READ_STATUS_ONLY_KEYS & set(payload)
+    assert payload["ledger_path"] == str(ledger_file(materialized, "journal").absolute())
+    assert "ledger_path" not in read_status(experiment)
     assert payload["kind"] == "experiment"
     assert payload["is_published"] is True
     assert payload["publication_integrity"] == "ok"
@@ -163,3 +169,11 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     assert payload["represented_generation_id"] is None
     assert payload["is_published"] is False
     assert payload["phases"][0]["winner"] is None
+
+
+def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
+    """``storage: null`` has no ledger file, so ``ledger_path`` is null."""
+    payload = config_status(make_experiment(workdir=tmp_path / "runs"))
+
+    assert list(payload) == EXPERIMENT_STATUS_KEYS
+    assert payload["ledger_path"] is None
