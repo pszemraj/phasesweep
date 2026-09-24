@@ -135,7 +135,7 @@ def test_auto_storage_is_absolute_for_mcp(tmp_path: Path) -> None:
     import yaml
 
     from phasesweep.config import Experiment
-    from phasesweep.mcp.config_snapshot import load_experiment_snapshot
+    from phasesweep.mcp.runs import load_experiment_snapshot
     from phasesweep.runtime.files import canonical_storage_identity, file_sha256, storage_backend
 
     payload = yaml.safe_load(_experiment_yaml(tmp_path))

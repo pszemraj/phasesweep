@@ -44,13 +44,13 @@ from phasesweep.engine.ledger import (
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.errors import OperatorAction, PhaseSweepError
-from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     ProcessIdentity,
     RunHandle,
     RunStore,
     UnsupportedStateFormatError,
+    load_experiment_snapshot,
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (

@@ -10,6 +10,7 @@ loses nothing and there is no stale-state write race.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -20,8 +21,9 @@ from pathlib import Path
 from typing import IO, Literal, TypeGuard, cast
 from uuid import UUID, uuid4
 
+from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
-from phasesweep.mcp.time import parse_utc_iso
+from phasesweep.config.io import load_experiment_bytes
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,
@@ -36,6 +38,7 @@ from phasesweep.runtime.files import (
     validate_private_dir,
 )
 from phasesweep.runtime.reaper import is_same_live_process, read_boot_id, reap_child
+from phasesweep.runtime.time import parse_utc_iso
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
@@ -295,6 +298,22 @@ class PreparedRun:
     def close(self) -> None:
         """Release this server process's copy of the launch lease."""
         self.lease.close()
+
+
+def load_experiment_snapshot(path: Path, expected_sha256: str, *, source: str) -> Experiment:
+    """Read, verify, and parse one immutable experiment snapshot.
+
+    :param Path path: Snapshot file to read.
+    :param str expected_sha256: Digest recorded with the run handle.
+    :param str source: Human-readable parser source label.
+    :raises OSError: If the snapshot cannot be read.
+    :raises ValueError: If its digest or syntax is invalid.
+    :return Experiment: Verified experiment configuration.
+    """
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError("run snapshot hash mismatch")
+    return load_experiment_bytes(data, source=source)
 
 
 class RunStore:
