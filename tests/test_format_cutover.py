@@ -8,6 +8,7 @@ import logging
 import shutil
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import optuna
 import pytest
@@ -40,6 +41,7 @@ from phasesweep.engine.ledger import (
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import _artifact_root_binding_path, _experiment_dir
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR, STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
+from phasesweep.engine.study_policy import _validate_study_schema
 from phasesweep.errors import PhaseSweepError
 from phasesweep.mcp.recovery import (
     RunRecoveryError,
@@ -172,6 +174,50 @@ def test_bound_root_status_refuses_empty_stamped_legacy_studies(
 
     with pytest.raises(StudySchemaMismatchError, match="pre-cutover or unsupported"):
         read_status(experiment)
+
+
+@pytest.mark.parametrize("read_path", ["validate", "status"])
+def test_format_scan_judges_one_sqlite_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_path: str
+) -> None:
+    """A study stamped and given its first trial mid-scan is not read as pre-cutover.
+
+    A study is legitimately empty and unmarked until its creator stamps it, and
+    status reads take no lock. Separate autocommit queries would see it
+    unmarked, then populated, a state the ledger never held. WAL lets the
+    writer commit while the scan's read transaction stays open.
+    """
+    database = tmp_path / "shared.db"
+    writer = optuna.create_study(study_name="t::p", storage=f"sqlite:///{database}")
+    with contextlib.closing(sqlite3.connect(database)) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    experiment = make_experiment(workdir=tmp_path / "runs", storage=f"sqlite:///{database}")
+    real_connect = sqlite3.connect
+    interleaved = False
+
+    class WriterBetweenScanQueries(sqlite3.Connection):
+        def execute(self, sql: str, *args: Any) -> sqlite3.Cursor:
+            nonlocal interleaved
+            if "SELECT DISTINCT study_id FROM trials" in sql and not interleaved:
+                interleaved = True
+                _validate_study_schema(writer)
+                writer.ask()
+            return super().execute(sql, *args)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            sqlite3,
+            "connect",
+            lambda *args, **kwargs: real_connect(*args, factory=WriterBetweenScanQueries, **kwargs),
+        )
+        if read_path == "validate":
+            assert validate_ledger(experiment).format_verified
+        else:
+            assert read_status(experiment)["phases"][0]["trial_data_available"]
+
+    assert interleaved
+    assert len(writer.trials) == 1
+    assert validate_ledger(experiment).format_verified
 
 
 @pytest.mark.parametrize("backend", ["sqlite", "journal"])

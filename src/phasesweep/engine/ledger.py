@@ -560,6 +560,11 @@ def _scan_ledger_format(storage: str | None) -> None:
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=0.1)
             try:
+                # One read transaction, so every query below sees one snapshot.
+                # Autocommit SELECTs each see their own: a study stamped and given
+                # its first trial between two of them would read as unmarked yet
+                # populated, a pre-cutover state the ledger never held.
+                conn.execute("BEGIN")
                 tables = {
                     str(row[0])
                     for row in conn.execute(

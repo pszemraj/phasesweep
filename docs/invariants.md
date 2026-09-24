@@ -92,7 +92,9 @@ durable-state context in `engine.run._run_experiment_outcome`, and in
 
 `validate_ledger` checks the artifact-root binding, then scans the ledger
 format, and writes nothing; on a bound tree an unreadable scan is tolerated and
-recorded on the handle, and on an unbound tree it is refused.
+recorded on the handle, and on an unbound tree it is refused. The SQLite scan
+runs its queries in one read transaction, so a study stamped and given its
+first trial while the scan runs is never judged unmarked but populated.
 
 A crash in the middle of a SQLite commit leaves a hot journal that only a
 read-write open rolls back, so the `mode=ro` scan records it on either tree as
@@ -122,6 +124,7 @@ confirmed recovery, and the same open in `engine.ledger.open_registry_study`;
 `engine.ledger._journal_records` for the tolerated line and
 `engine.ledger.require_complete_journal` for the refusal\
 **Tests:** `tests/test_format_cutover.py::test_validate_ledger_on_a_fresh_root_creates_nothing`,
+`tests/test_format_cutover.py::test_format_scan_judges_one_sqlite_snapshot`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`
 (its `release-0.3.1` cells pin the binding check before the format scan),
