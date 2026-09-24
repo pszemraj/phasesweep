@@ -9,6 +9,7 @@ from typing import Any
 
 import optuna
 import pytest
+import yaml
 
 import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
@@ -25,11 +26,12 @@ from phasesweep.config import (
     Sampler,
     WandbExtractor,
 )
-from phasesweep.engine import PublishedStudyMissingError, read_status, read_winners
+from phasesweep.engine import PublishedStudyMissingError, read_status, read_winner, read_winners
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
     _generation_summary_path,
+    _generation_winner_path,
 )
 from phasesweep.engine.publication import (
     _last_successful_generation_id,
@@ -743,6 +745,28 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
     )
     assert winner.phase == "p"
     assert (winner.metric_name, winner.metric_goal) == ("objective", "minimize")
+
+
+def test_read_winner_rejects_a_winner_source_naming_another_phase(tmp_path: Path) -> None:
+    """A winner_source citing another phase reads as absent, not as that phase's winner.
+
+    Reads by explicit ``generation_id`` go straight to
+    ``engine.read._read_winner_path`` without passing through
+    ``publication_validation``, so this proves the phase-agreement check now
+    lives in the permissive reader itself (``_parse_winner_source``), not
+    only in the stricter manifest validator.
+    """
+    experiment = _published(tmp_path)
+    generation_id = _last_successful_generation_id(experiment)
+    assert generation_id is not None
+
+    winner_path = _generation_winner_path(experiment, generation_id, "p")
+    winner = yaml.safe_load(winner_path.read_text())
+    assert winner["winner_source"]["phase"] == "p"
+    winner["winner_source"]["phase"] = "other"
+    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+
+    assert read_winner(experiment, "p", generation_id=generation_id) is None
 
 
 def test_read_status_reuses_the_pointer_authenticated_summary(

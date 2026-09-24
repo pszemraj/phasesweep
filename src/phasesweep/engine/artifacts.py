@@ -9,7 +9,7 @@ import logging
 import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import optuna
 import yaml
@@ -26,7 +26,6 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.state import (
     Winner,
-    WinnerSourceKind,
     _parse_winner_source,
 )
 from phasesweep.runtime.files import atomic_text_writer, fsync_directory
@@ -427,17 +426,6 @@ def _load_winner(
             f"Winner file {path} has no valid attempt_id; refusing unscoped evidence."
         )
     source_data = data.get("winner_source")
-    if not isinstance(source_data, dict):
-        raise WinnerIntegrityError(
-            f"Winner file {path} has no valid winner_source; refusing ambiguous provenance."
-        )
-    source_kind = source_data.get("kind")
-    if source_kind != "phase_trial":
-        raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source kind.")
-    if set(source_data) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
-        raise WinnerIntegrityError(f"Winner file {path} has a removed winner_source field.")
-    if source_data.get("phase") != phase.name:
-        raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source phase.")
     if "promotion" in data:
         raise WinnerIntegrityError(f"Winner file {path} contains removed promotion data.")
 
@@ -450,7 +438,7 @@ def _load_winner(
     _warn_environment_drift(experiment, phase.name, stored_env_digest)
 
     try:
-        source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
+        source = _parse_winner_source(source_data, expected_phase=phase.name)
         return Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),

@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypeAlias, cast
+from typing import Any, Literal, TypeAlias
 
 import yaml
 
@@ -48,7 +48,6 @@ from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PublicationState,
     WinnerSource,
-    WinnerSourceKind,
     _parse_winner_source,
 )
 
@@ -215,17 +214,9 @@ def _read_winner_path(path: Path | None, phase_name: str) -> PhaseWinnerView | N
         effective_overrides = data.get("effective_overrides") or {}
         if not isinstance(effective_overrides, Mapping):
             return None
-        source_data = data.get("winner_source")
-        if not isinstance(source_data, Mapping):
-            return None
-        source_kind = source_data.get("kind")
-        if source_kind != "phase_trial":
-            return None
-        if set(source_data) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
-            return None
         if "promotion" in data:
             return None
-        source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
+        source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=int(data["trial_number"]),
