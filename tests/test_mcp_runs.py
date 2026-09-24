@@ -358,6 +358,50 @@ def test_write_status_file_replaces_existing_status_without_temp_files(tmp_path:
     assert list(status_path.parent.glob(".*.tmp")) == []
 
 
+def test_write_status_file_if_absent_creates_once_then_refuses(tmp_path: Path) -> None:
+    """The first call creates the status; a second call reports it already exists."""
+    status_path = tmp_path / "state" / "logs" / "exp-1.status.json"
+
+    assert mcp_runs.write_status_file_if_absent(status_path, {"run_id": "exp-1"}) is True
+    assert json.loads(status_path.read_text()) == {"run_id": "exp-1"}
+    assert (
+        mcp_runs.write_status_file_if_absent(status_path, {"run_id": "exp-1", "other": True})
+        is False
+    )
+    assert json.loads(status_path.read_text()) == {"run_id": "exp-1"}
+    assert list(status_path.parent.glob("*.tmp")) == []
+    assert list(status_path.parent.glob(".*.tmp")) == []
+
+
+def test_write_status_file_if_absent_rolls_back_on_post_link_fsync_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A directory-fsync failure after the link unlinks the just-created status file.
+
+    ``write_status_file_if_absent`` now delegates to ``_strict_atomic_create_text``,
+    so it shares that helper's rollback: a durability failure discovered after the
+    file is already linked into place removes it again rather than leaving an
+    unsynced status file behind (accepted consolidation behavior change).
+    """
+    status_path = tmp_path / "state" / "logs" / "exp-1.status.json"
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("injected directory fsync failure")
+        real_fsync(fd)
+
+    monkeypatch.setattr(mcp_runs.os, "fsync", fail_directory_fsync)
+
+    with pytest.raises(OSError, match="directory fsync"):
+        mcp_runs.write_status_file_if_absent(status_path, {"run_id": "exp-1"})
+
+    assert not status_path.exists()
+    assert list(status_path.parent.glob("*.tmp")) == []
+    assert list(status_path.parent.glob(".*.tmp")) == []
+
+
 def test_mcp_state_files_are_private_under_permissive_umask(tmp_path: Path) -> None:
     old_umask = os.umask(0)
     try:

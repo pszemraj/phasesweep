@@ -190,38 +190,21 @@ def write_status_file(status_path: Path, payload: dict[str, object]) -> None:
 def write_status_file_if_absent(status_path: Path, payload: dict[str, object]) -> bool:
     """Atomically create a server failure only while no runner status exists.
 
+    Thin wrapper over :func:`_strict_atomic_create_text`, so it shares every
+    durability step of a runner-written status file (temp file, fsync,
+    link, directory fsync) -- including that a post-link directory-fsync
+    failure unlinks the just-created status file rather than leaving an
+    unsynced one behind.
+
     :param Path status_path: Destination ``status.json`` path for the run.
     :param dict[str, object] payload: JSON-serializable server failure payload.
     :return bool: Whether this call created the status; ``False`` if one already exists.
     """
-    temporary = status_path.with_name(f".{status_path.name}.{uuid4().hex}.tmp")
-    parent_fd = -1
     try:
-        with open_private_text(temporary, "x") as output:
-            output.write(json.dumps(payload, indent=2) + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-        parent_fd = open_directory_fd(status_path.parent, create=False, private_final=True)
-        try:
-            os.link(
-                temporary.name,
-                status_path.name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            return False
-        os.fsync(parent_fd)
-        return True
-    finally:
-        if parent_fd >= 0:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary.name, dir_fd=parent_fd)
-            os.close(parent_fd)
-        else:
-            with contextlib.suppress(OSError):
-                temporary.unlink()
+        _strict_atomic_create_text(status_path, json.dumps(payload, indent=2) + "\n")
+    except FileExistsError:
+        return False
+    return True
 
 
 def identity_from_earlier_boot(boot_id: str | None) -> bool:

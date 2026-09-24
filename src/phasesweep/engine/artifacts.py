@@ -6,7 +6,6 @@ import contextlib
 import csv
 import json
 import logging
-import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -28,7 +27,7 @@ from phasesweep.engine.state import (
     Winner,
     _parse_winner_source,
 )
-from phasesweep.runtime.files import atomic_text_writer, fsync_directory
+from phasesweep.runtime.files import atomic_create_text, atomic_text_writer
 
 log = logging.getLogger(__name__)
 
@@ -61,13 +60,11 @@ def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
 
     Unlike :func:`_write_yaml_atomic` (always-overwrite, used for mutable
     pointers), this is the create-exclusive primitive backing truly immutable
-    per-generation lifecycle records (review v0.5.15 / blocker 3): the file is
-    opened with ``O_CREAT | O_EXCL`` so a second call for an already-written
-    path can never clobber the first write, even a same-content rewrite. This
-    is a plain create-once-and-fsync, not a full atomic-rename dance like
-    :func:`atomic_text_writer` -- there is nothing to make atomic against a
-    concurrent *reader* here, only against a second *writer*, and ``O_EXCL``
-    already rules that out.
+    per-generation lifecycle records (review v0.5.15 / blocker 3): a second
+    call for an already-written path can never clobber the first write, even
+    a same-content rewrite. Delegates to :func:`atomic_create_text`, so
+    ``path`` is staged and fsynced beside itself and only hard-linked into
+    place once complete -- no reader can ever observe a partial write.
 
     :param Path path: Destination path to create; the parent directory is
         created if missing.
@@ -76,23 +73,8 @@ def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
         ``False`` when the destination already existed and nothing was
         written.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(payload, sort_keys=False)
-    try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-    except FileExistsError:
-        return False
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
-        raise
-    fsync_directory(path.parent)
-    return True
+    return atomic_create_text(path, text)
 
 
 @contextlib.contextmanager

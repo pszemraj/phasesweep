@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
-import os
-import secrets
 import shlex
 import sys
 import traceback
-from collections.abc import Callable, Iterator
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -46,7 +42,7 @@ from phasesweep.mcp.registry import (
 )
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import report_objective
-from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
+from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
@@ -172,64 +168,6 @@ def _starter_experiment_text(target: Path) -> str:
     return template.replace("__PHASESWEEP_WORKDIR__", json.dumps(str(runs_dir), ensure_ascii=False))
 
 
-@contextlib.contextmanager
-def _staged_text(destination: Path, text: str) -> Iterator[Path]:
-    """Write and fsync text beside a destination without publishing it.
-
-    :param Path destination: Eventual destination used to locate and name the staging file.
-    :param str text: Complete UTF-8 text to stage.
-    :raises FileExistsError: If ten randomized staging names collide.
-    :return Iterator[Path]: Staging path, removed when the context exits.
-    """
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    staged: Path | None = None
-    try:
-        handle = None
-        for _ in range(10):
-            candidate = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
-            try:
-                handle = candidate.open("x", encoding="utf-8")
-            except FileExistsError:
-                continue
-            staged = candidate
-            break
-        if handle is None or staged is None:
-            raise FileExistsError(f"cannot create a staging file beside {destination}")
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        yield staged
-    finally:
-        if staged is not None:
-            with contextlib.suppress(OSError):
-                staged.unlink()
-
-
-def _publish_staged_text(
-    destination: Path,
-    text: str,
-    *,
-    validate: Callable[[Path], object] | None = None,
-) -> bool:
-    """Stage, optionally validate, and exclusively publish a text file.
-
-    :param Path destination: Destination that must not already exist.
-    :param str text: Complete UTF-8 text to publish.
-    :param Callable[[Path], object] | None validate: Optional staged-file validator.
-    :return bool: True when published, or False if another writer won the destination race.
-    """
-    with _staged_text(destination, text) as staged:
-        if validate is not None:
-            validate(staged)
-        try:
-            os.link(staged, destination)
-        except FileExistsError:
-            return False
-        fsync_directory(destination.parent)
-    return True
-
-
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Write a runnable two-phase starter experiment without overwriting files.",
@@ -259,7 +197,7 @@ def init(output: Path) -> None:
         raise click.exceptions.Exit(2)
     text = _starter_experiment_text(target)
     try:
-        if not _publish_staged_text(target, text):
+        if not atomic_create_text(target, text):
             click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
             raise click.exceptions.Exit(2)
     except OSError as exc:
@@ -856,7 +794,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
             registry = Registry.load(staged)
             private_atomic_write_text(registry.state_dir / "origin", str(output.resolve()) + "\n")
 
-        if not _publish_staged_text(output, text, validate=validate_scaffold):
+        if not atomic_create_text(output, text, validate=validate_scaffold):
             click.echo(
                 f"phasesweep mcp init-catalog: {output} already exists; refusing to "
                 "overwrite. Pass -o to choose another name.",

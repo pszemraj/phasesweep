@@ -9,7 +9,7 @@ import logging
 import os
 import secrets
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, ClassVar
@@ -1113,6 +1113,63 @@ def atomic_write_text(path: Path, text: str) -> None:
     """
     with atomic_text_writer(path) as handle:
         handle.write(text)
+
+
+def atomic_create_text(
+    path: Path,
+    text: str,
+    *,
+    validate: Callable[[Path], object] | None = None,
+) -> bool:
+    """Stage, optionally validate, and exclusively publish a UTF-8 text file.
+
+    The text is written and fsynced to a hidden file beside ``path``, then
+    hard-linked into place, so ``path`` is either absent or complete. The
+    staged file is always removed. This is for workdir files with ordinary
+    permissions (``0o666`` masked by the umask), not the owner-only MCP state
+    store, and the directory fsync after the link is best-effort.
+
+    :param Path path: Destination that must not already exist.
+    :param str text: Complete UTF-8 text to publish.
+    :param Callable[[Path], object] | None validate: Optional callable run on
+        the staged file before publication; may raise to refuse the write.
+    :return bool: True when published, or False if another writer already
+        holds ``path``.
+    :raises FileExistsError: If ten randomized staging names beside ``path``
+        all collide.
+    :raises OSError: If the staged file cannot be written, or ``validate``
+        or the hard link otherwise fails.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged: Path | None = None
+    try:
+        handle: IO[str] | None = None
+        for _ in range(10):
+            candidate = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                handle = candidate.open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+            staged = candidate
+            break
+        if handle is None or staged is None:
+            raise FileExistsError(f"cannot create a staging file beside {path}")
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if validate is not None:
+            validate(staged)
+        try:
+            os.link(staged, path)
+        except FileExistsError:
+            return False
+        fsync_directory(path.parent)
+    finally:
+        if staged is not None:
+            with contextlib.suppress(OSError):
+                staged.unlink()
+    return True
 
 
 def local_storage_url(path: Path) -> str:
