@@ -472,14 +472,14 @@ def _placeholder_value_for(param: SearchParam) -> Any:
         param: A concrete search parameter from a phase's ``search_space``.
 
     Returns:
-        For ``FloatParam`` the interval midpoint; for ``IntParam`` the
-        integer midpoint; for ``CategoricalParam`` the first listed choice.
+        For ``FloatParam`` and ``IntParam`` the configured ``low`` bound,
+        which the param validators keep finite, on the step lattice, and
+        positive under ``log=True``; for ``CategoricalParam`` the first
+        listed choice.
 
     """
-    if isinstance(param, FloatParam):
-        return (param.low + param.high) / 2
-    if isinstance(param, IntParam):
-        return (param.low + param.high) // 2
+    if isinstance(param, (FloatParam, IntParam)):
+        return param.low
     return param.choices[0]
 
 

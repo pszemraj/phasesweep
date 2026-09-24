@@ -229,7 +229,7 @@ def run_experiment(
 
     Returns:
         Mapping from phase name (in declaration order) to that phase's
-        :class:`Winner`. For dry runs the winners are midpoint placeholders.
+        :class:`Winner`. For dry runs the winners are placeholders.
 
     Raises:
         NoFeasibleTrialError: A phase exhausted ``max_consecutive_failures``

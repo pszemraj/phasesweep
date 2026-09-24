@@ -388,7 +388,7 @@ def _run_phase(
         ledger: The claimed ledger, for ``experiment``, that this phase opens
             its live study through. ``None`` is a dry run: render an example
             trial command against an in-memory preview study and return a
-            placeholder midpoint winner instead of launching any subprocesses.
+            placeholder winner instead of launching any subprocesses.
         run_deadline: Optional ``time.monotonic()`` deadline inherited from
             the experiment-level wallclock guard.
 
@@ -1439,8 +1439,9 @@ def _dry_run_phase(
         remaining: Number of trials that *would* run; logged for the user.
 
     Returns:
-        A :class:`Winner` placeholder built from midpoint params so downstream
-        dry-run previews see consistent inherited context.
+        A :class:`Winner` placeholder built from the previewed sample, or from
+        each parameter's low bound or first choice, so downstream dry-run
+        previews see consistent inherited context.
 
     """
     log.info("DRY RUN phase=%s would launch %d trials", phase.name, remaining)
@@ -1482,7 +1483,7 @@ def _placeholder_winner(
 
     A phase whose command was previewed reuses that command's sampled values so
     downstream previews inherit one coherent hypothetical chain. A skipped
-    phase without a preview uses deterministic midpoint/first-choice values.
+    phase without a preview uses each parameter's low bound or first choice.
     Both paths include inherited effective overrides.
 
     Args:

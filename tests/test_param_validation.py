@@ -27,7 +27,7 @@ from phasesweep.config import (
     check_bounds,
 )
 from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
-from phasesweep.config.search import grid_search_space
+from phasesweep.config.search import _placeholder_value_for, grid_search_space
 from phasesweep.engine.optuna import _build_sampler
 from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
 
@@ -870,3 +870,44 @@ def test_cmaes_phase_loads_when_package_present() -> None:
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     assert exp.phases[0].sampler.type == "cmaes"
+
+
+@pytest.mark.parametrize(
+    ("override_format", "template"),
+    [
+        ("yaml_file", "python train.py --config {config_path}"),
+        ("argparse", "python train.py {overrides}"),
+        ("hydra", "python train.py {overrides}"),
+        ("json_file", "python train.py {overrides_path}"),
+    ],
+)
+def test_extreme_float_bounds_load_under_every_override_format(
+    override_format: str, template: str
+) -> None:
+    """A legal near-float64-max FloatParam loads under every override format.
+
+    Config load renders the trial command with a placeholder value for each
+    parameter, and every format refuses a non-finite value, so the
+    placeholder for ``low=1e308, high=1.1e308`` must stay finite.
+    """
+    exp = make_experiment(
+        trial_command=template,
+        override_format=override_format,
+        search_space={"lr": FloatParam(type="float", low=1e308, high=1.1e308)},
+        n_trials=1,
+    )
+    assert exp.override_format == override_format
+
+
+def test_placeholder_value_for_stepped_int_is_on_the_lattice() -> None:
+    """The placeholder for a stepped IntParam is a point on its step lattice."""
+    param = IntParam(type="int", low=0, high=6, step=2)
+    value = _placeholder_value_for(param)
+    assert value == param.low
+    assert (value - param.low) % param.step == 0
+
+
+def test_placeholder_value_for_categorical_is_first_choice() -> None:
+    """The placeholder for a categorical param is its first listed choice."""
+    param = CategoricalParam(type="categorical", choices=["b", "a", "c"])
+    assert _placeholder_value_for(param) == "b"
