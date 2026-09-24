@@ -265,11 +265,8 @@ def _copy_yaml_projection(source: Path, destination: Path) -> None:
 def _validate_publishable_summary(
     *,
     summary_path: Path,
-    owner_key: str,
-    owner_value: str,
-    id_key: str,
-    id_value: str,
-    label: str,
+    experiment_name: str,
+    generation_id: str,
 ) -> tuple[dict[str, Any], bytes]:
     """Parse back one generation's own immutable summary before its publication commit.
 
@@ -278,15 +275,13 @@ def _validate_publishable_summary(
     last-success pointer commits and before the per-generation lifecycle
     record is ever written for this generation, so it cannot check that
     record (it does not exist yet); it instead confirms the immutable summary
-    itself parses as a mapping naming the expected owner and id, and returns
-    it so the caller can validate the complete manifest without re-reading.
+    itself parses as a mapping naming the expected experiment and generation
+    id, and returns it so the caller can validate the complete manifest
+    without re-reading.
 
     :param Path summary_path: Immutable summary YAML path to read back.
-    :param str owner_key: Summary key naming the owning experiment.
-    :param str owner_value: Expected owner name the summary must carry.
-    :param str id_key: Summary key holding the generation id.
-    :param str id_value: Expected id the summary must name.
-    :param str label: Human label for error text.
+    :param str experiment_name: Expected owning experiment name the summary must carry.
+    :param str generation_id: Expected generation id the summary must name.
     :raises PublicationCommitError: The summary cannot be read back as a correctly
         named mapping; the last-success pointer must not advance to it.
     :return tuple[dict[str, Any], bytes]: Parsed summary and the exact bytes validated.
@@ -296,16 +291,16 @@ def _validate_publishable_summary(
         summary = yaml.safe_load(summary_bytes)
     except (OSError, yaml.YAMLError) as exc:
         raise PublicationCommitError(
-            f"{label} {id_value!r} summary could not be read back; "
+            f"Generation {generation_id!r} summary could not be read back; "
             "refusing to advance the last-success pointer."
         ) from exc
     if (
         not isinstance(summary, dict)
-        or summary.get(owner_key) != owner_value
-        or summary.get(id_key) != id_value
+        or summary.get("experiment") != experiment_name
+        or summary.get("generation_id") != generation_id
     ):
         raise PublicationCommitError(
-            f"{label} {id_value!r} summary failed publication validation; "
+            f"Generation {generation_id!r} summary failed publication validation; "
             "refusing to advance the last-success pointer."
         )
     return summary, summary_bytes
@@ -340,11 +335,8 @@ def _validate_generation_publishable(
     """
     summary, summary_bytes = _validate_publishable_summary(
         summary_path=path_ops._generation_summary_path(experiment, generation_id),
-        owner_key="experiment",
-        owner_value=experiment.experiment,
-        id_key="generation_id",
-        id_value=generation_id,
-        label="Generation",
+        experiment_name=experiment.experiment,
+        generation_id=generation_id,
     )
     validation_ops._validate_generation_manifest(
         path_ops._generation_dir(experiment, generation_id),

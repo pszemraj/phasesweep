@@ -165,11 +165,8 @@ def test_summary_readback_refusals_are_publication_commit_errors(
     with pytest.raises(PublicationCommitError, match=match):
         generation_ops._validate_publishable_summary(
             summary_path=summary_path,
-            owner_key="experiment",
-            owner_value="expected",
-            id_key="generation_id",
-            id_value="generation-test",
-            label="Generation",
+            experiment_name="expected",
+            generation_id="generation-test",
         )
 
 
