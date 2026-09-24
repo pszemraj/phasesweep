@@ -107,13 +107,17 @@ journal byte-identical.
 A journal ledger's last line that lacks its newline or does not decode is
 skipped exactly as Optuna's reader skips it, so status, winners, and the
 result snapshot report the complete records. Every path that may write refuses
-it before any live open, naming the byte to truncate at, and so does recovery,
-inspection or confirmed, because inspection previews a mutation. Nothing
-repairs it automatically. The experiment lock does not exclude another
-experiment's append to a shared journal, so the line may be an append still in
-flight, and truncating it would destroy a live record. Only the file lock
-Optuna's journal backend takes for every append excludes all writers, and
-PhaseSweep does not take it.
+it before any live open, and so does recovery, inspection or confirmed,
+because inspection previews a mutation. Nothing repairs it automatically. The
+experiment lock does not exclude another experiment's append to a shared
+journal, so the line may be an append still in flight, and truncating it would
+destroy a live record. Only the file lock Optuna's journal backend takes for
+every append excludes all writers, and PhaseSweep does not take it. The
+refusal therefore tells the operator to stop every writer and retry, since a
+finished append makes the retry succeed. It also names a truncation command
+for a refusal that persists; the command checks the journal's size first, so
+one copied from an earlier refusal truncates nothing once the journal has
+changed.
 
 **Held by:** `engine.ledger.validate_ledger`, running
 `engine.artifact_roots._check_artifact_root_binding` before
@@ -135,7 +139,8 @@ confirmed recovery, and the same open in `engine.ledger.open_registry_study`;
 `tests/test_format_cutover.py::test_rollback_open_never_creates_a_missing_ledger`,
 `tests/test_engine_read.py::test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes`,
 `tests/test_engine_read.py::test_journal_malformed_record_before_its_end_never_means_absent`,
-`tests/test_format_cutover.py::test_writers_refuse_a_partial_final_journal_record_and_leave_it`
+`tests/test_format_cutover.py::test_writers_refuse_a_partial_final_journal_record_and_leave_it`,
+`tests/test_format_cutover.py::test_journal_repair_command_truncates_only_the_journal_it_saw`
 
 The scan may read a missing SQLite file as an absent ledger only because every
 accepted SQLite URL names a local file: config load refuses a URI filename

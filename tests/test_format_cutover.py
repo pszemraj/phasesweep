@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +37,7 @@ from phasesweep.engine.ledger import (
     open_existing_study,
     open_phase_study,
     open_registry_study,
+    require_complete_journal,
     roll_back_interrupted_transaction,
     validate_ledger,
 )
@@ -49,6 +52,7 @@ from phasesweep.mcp.recovery import (
     recover_run,
 )
 from phasesweep.mcp.runs import RunStore
+from phasesweep.runtime.files import local_storage_url
 from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
 from tests.ledger_fixtures import (
     leave_hot_journal,
@@ -771,8 +775,53 @@ def test_writers_refuse_a_partial_final_journal_record_and_leave_it(
     assert str(inspected.value) == str(confirmed.value) == str(claimed.value)
     for refusal in (claimed.value, registry.value, inspected.value, confirmed.value):
         assert "ends with an incomplete record" in str(refusal)
-        assert f"truncate -s {len(complete)} {journal}" in str(refusal)
+        assert f"truncate -s {len(complete)} -- {journal}`" in str(refusal)
     assert tree_snapshot(materialized.root) == before
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", ["ledger copy.log", "ledger's copy.log"])
+def test_journal_repair_command_truncates_only_the_journal_it_saw(
+    tmp_path: Path, name: str
+) -> None:
+    """The refusal's command cuts exactly its journal's partial record, and only that one.
+
+    The partial record may be an append still in flight. Once the append
+    finishes, the retry the refusal asks for succeeds, and the command copied
+    from the earlier refusal truncates nothing. After a crash left the same
+    record, it cuts that record and nothing else, whatever the path's spaces
+    and quotes.
+    """
+    journal = tmp_path / name
+    url = local_storage_url(journal, "journal")
+    experiment = make_experiment(workdir=tmp_path / "runs", storage=url)
+    study = optuna.create_study(study_name="t::p", storage=_resolve_storage(url))
+    mark_current_format(experiment, study)
+    complete = journal.read_bytes()
+    study.ask()
+    appended = journal.read_bytes()
+    bystanders = [tmp_path / "ledger", tmp_path / "copy.log", tmp_path / "ledger's"]
+    for bystander in bystanders:
+        bystander.write_text("unrelated")
+
+    def refused_command() -> str:
+        with pytest.raises(IncompleteJournalRecordError) as refused:
+            require_complete_journal(validate_ledger(experiment))
+        (command,) = re.findall(r"`([^`]*truncate[^`]*)`", str(refused.value))
+        return command
+
+    journal.write_bytes(appended[: len(complete) + 8])
+    stale = refused_command()
+    journal.write_bytes(appended)
+    require_complete_journal(validate_ledger(experiment))
+    assert subprocess.run(["sh", "-c", stale], cwd=tmp_path).returncode != 0
+    assert journal.read_bytes() == appended
+
+    journal.write_bytes(appended[: len(complete) + 8])
+    subprocess.run(["sh", "-c", refused_command()], cwd=tmp_path, check=True)
+    assert journal.read_bytes() == complete
+    require_complete_journal(validate_ledger(experiment))
+    assert [bystander.read_text() for bystander in bystanders] == ["unrelated"] * 3
 
 
 @pytest.mark.integration

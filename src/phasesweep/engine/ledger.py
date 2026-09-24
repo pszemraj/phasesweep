@@ -54,6 +54,7 @@ import errno
 import json
 import logging
 import os
+import shlex
 import sqlite3
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -439,7 +440,10 @@ def _require_complete_journal(storage_url: str) -> None:
     another experiment's append to a shared journal, so the line may be an
     append still in flight, and removing it would destroy a live record. Only
     the file lock Optuna's journal backend takes for every append excludes all
-    writers, and PhaseSweep does not take it.
+    writers, and PhaseSweep does not take it. The operator's repair therefore
+    starts with stopping every writer and retrying, and the truncation command
+    it names checks the journal's size first, so a command copied from an
+    earlier refusal truncates nothing once that append has finished.
 
     :param str storage_url: Journal storage URL a caller is about to write through.
     :raises IncompleteJournalRecordError: The journal ends with a line Optuna
@@ -459,12 +463,17 @@ def _require_complete_journal(storage_url: str) -> None:
         ) from exc
     if end == len(data):
         return
+    quoted = shlex.quote(str(path))
+    command = f'test "$(wc -c < {quoted})" -eq {len(data)} && truncate -s {end} -- {quoted}'
     raise IncompleteJournalRecordError(
         f"Journal storage {path} ends with an incomplete record: a writer crashed while "
-        "appending it or, rarely, is appending it right now. Appending after it would "
-        "corrupt the journal permanently. Once no process uses this journal, truncate it "
-        f"after its last complete line, at byte {end} (for example `truncate -s {end} "
-        f"{path}`), then run again. Nothing was written."
+        "appending it, or is still appending it. Appending after it would corrupt the "
+        "journal permanently. Stop every process that uses this journal, then retry. If "
+        "the retry succeeds, the append had finished and nothing needs repair. If it is "
+        "refused again, back up the journal and run the command that refusal names to "
+        "truncate it after its last complete line; the command does nothing if the "
+        "journal has changed since its refusal. For the journal as this refusal saw it: "
+        f"`{command}`. Nothing was written."
     )
 
 
@@ -1182,7 +1191,8 @@ def require_complete_journal(ledger: ValidatedLedger) -> None:
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :raises IncompleteJournalRecordError: The journal ends with an incomplete
-        record; the message names the byte to truncate it at.
+        record; the message says to stop every writer and retry, and names a
+        size-guarded command that truncates it if the refusal persists.
     :raises StudyStorageUnavailableError: The journal could not be read.
     """
     if ledger.backend != "journal" or not ledger.format_verified:

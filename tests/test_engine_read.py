@@ -362,7 +362,7 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_blocks_writes(
 
     cause = refused.value.__cause__
     assert isinstance(cause, IncompleteJournalRecordError)
-    assert f"truncate -s {len(prefix)} {ledger}" in str(cause)
+    assert f"truncate -s {len(prefix)} -- {ledger}`" in str(cause)
     assert ledger.read_bytes() == prefix + tail
     assert tree_snapshot(root) == before
 

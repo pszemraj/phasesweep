@@ -850,7 +850,7 @@ WRAP_CASES = (
         trigger=_recovery_studies_damaged("tree", _truncated, fixture="current-journal"),
         raised=RunRecoveryError,
         action=OperatorAction.RESTORE_LEDGER,
-        message="truncate it after its last complete line",
+        message="Stop every process that uses this journal, then retry. If the retry succeeds",
     ),
     RoutingCase(
         # recover-run reaps through the same read, so the ledger comes back first.
