@@ -30,7 +30,7 @@ from phasesweep.engine.artifact_roots import (
     _bind_study_artifact_root,
     _write_artifact_root_binding,
 )
-from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.attempts import _AttemptRecord, _register_active_attempt
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
@@ -1546,8 +1546,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     study = _load_first_phase_study(config)
-    reconciled_attempt_ids: set[str] = set()
-    reconciled_attempt_generations: dict[str, str] = {}
+    reconciled_attempts: dict[str, _AttemptRecord] = {}
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         lambda _identity: True,
@@ -1561,11 +1560,14 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
             study,
             experiment,
             experiment.phases[0].name,
-            recovered_attempt_ids=reconciled_attempt_ids,
-            recovered_attempt_generations=reconciled_attempt_generations,
+            recovered_attempts=reconciled_attempts,
         )
         == 1
     )
+    reconciled_attempt_ids = set(reconciled_attempts)
+    reconciled_attempt_generations = {
+        aid: record.generation_id for aid, record in reconciled_attempts.items()
+    }
     assert reconciled_attempt_ids == {attempt_id}
     assert reconciled_attempt_generations == {attempt_id: run_id}
 

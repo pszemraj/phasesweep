@@ -37,6 +37,7 @@ from phasesweep.engine import (
     run_experiment,
 )
 from phasesweep.engine.attempts import (
+    _AttemptRecord,
     _inspect_active_attempts,
     _preflight_active_attempts,
     _PreflightCleanupReport,
@@ -478,6 +479,38 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
 
     with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies"):
         _preflight_existing_studies(_claimed_over(experiment, studies))
+
+
+def test_preflight_keeps_attempts_reaped_before_a_later_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attempts already failed before a later trial refuses stay in the cleanup report."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    phase_name = experiment.phases[0].name
+    studies = {phase_name: optuna.create_study(study_name=phase_name, direction="minimize")}
+
+    def reap_one_then_refuse(
+        _study: optuna.Study,
+        _experiment: Experiment,
+        name: str,
+        *,
+        recovered_attempts: dict[str, _AttemptRecord],
+        **_kwargs: object,
+    ) -> int:
+        recovered_attempts["reaped"] = _AttemptRecord("gen-reaped", name, 0)
+        recovered_attempts["no-generation"] = _AttemptRecord(None, name, 1)
+        raise ProcessCleanupUncertainError("a later trial's cleanup is uncertain")
+
+    monkeypatch.setattr("phasesweep.engine.guards._reap_stale_trials", reap_one_then_refuse)
+    report = _PreflightCleanupReport()
+
+    with pytest.raises(ProcessCleanupUncertainError, match="cleanup is uncertain"):
+        _preflight_existing_studies(_claimed_over(experiment, studies), cleanup_report=report)
+
+    assert report.recovered_attempt_ids == {"reaped", "no-generation"}
+    assert report.recovered_attempt_generations == {"reaped": "gen-reaped"}
+    assert report.cleanup_confirmed is False
 
 
 def test_registry_storage_failure_marks_cleanup_report_uncertain(

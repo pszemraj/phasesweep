@@ -17,6 +17,7 @@ from phasesweep.engine.artifact_roots import (
     _check_study_artifact_root,
 )
 from phasesweep.engine.attempts import (
+    _AttemptRecord,
     _inspect_active_attempts,
     _preflight_active_attempts,
     _PreflightCleanupReport,
@@ -673,9 +674,7 @@ def _recover_trial_evidence(
     reaped_ids, reaped_locations = store.cleanup_recovered_attempt_evidence(handle)
     evidence = _CleanupEvidence(reaped_ids, reaped_locations)
     causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
-    inspected_attempt_ids: set[str] = set()
-    inspected_attempt_generations: dict[str, str] = {}
-    inspected_attempt_locations: dict[str, tuple[str, int, str]] = {}
+    inspected_attempts: dict[str, _AttemptRecord] = {}
     inspected_studies = 0
     if needs.cleanup_needed:
         loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
@@ -712,43 +711,35 @@ def _recover_trial_evidence(
                     study,
                     config,
                     phase.name,
-                    recovered_attempt_ids=inspected_attempt_ids,
-                    recovered_attempt_generations=inspected_attempt_generations,
-                    recovered_attempt_locations=inspected_attempt_locations,
+                    recovered_attempts=inspected_attempts,
                 )
                 evidence.reaped += _reap_stale_trials(
                     study,
                     config,
                     phase.name,
-                    recovered_attempt_ids=inspected_attempt_ids,
-                    recovered_attempt_generations=inspected_attempt_generations,
-                    recovered_attempt_locations=inspected_attempt_locations,
+                    recovered_attempts=inspected_attempts,
                 )
             else:
                 evidence.cleanup_recovered += _inspect_cleanup_uncertain_trials(
                     study,
                     phase.name,
-                    recovered_attempt_ids=inspected_attempt_ids,
-                    recovered_attempt_generations=inspected_attempt_generations,
-                    recovered_attempt_locations=inspected_attempt_locations,
+                    recovered_attempts=inspected_attempts,
                 )
                 evidence.reaped += _inspect_stale_running_trials(
                     study,
                     config,
                     phase.name,
-                    recovered_attempt_ids=inspected_attempt_ids,
-                    recovered_attempt_generations=inspected_attempt_generations,
-                    recovered_attempt_locations=inspected_attempt_locations,
+                    recovered_attempts=inspected_attempts,
                 )
-        for attempt_id in inspected_attempt_ids:
-            if (
-                inspected_attempt_generations.get(attempt_id) == run_id
-                or attempt_id in causal_attempt_ids
-            ):
+        for attempt_id, record in inspected_attempts.items():
+            if record.generation_id == run_id or attempt_id in causal_attempt_ids:
                 evidence.reaped_attempt_ids.add(attempt_id)
-                location = inspected_attempt_locations.get(attempt_id)
-                if location is not None:
-                    evidence.reaped_attempt_locations[attempt_id] = location
+                if record.generation_id is not None:
+                    evidence.reaped_attempt_locations[attempt_id] = (
+                        record.phase_name,
+                        record.trial_number,
+                        record.generation_id,
+                    )
     _require_cleanup_evidence(needs, evidence, inspected_studies)
     return evidence
 

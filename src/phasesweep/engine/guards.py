@@ -6,6 +6,7 @@ import optuna
 
 from phasesweep.config import Experiment
 from phasesweep.engine.attempts import (
+    _AttemptRecord,
     _preflight_active_attempts,
     _PreflightCleanupReport,
     _retire_active_attempt,
@@ -135,25 +136,34 @@ def _preflight_existing_studies(
             continue
         studies[phase.name] = study
         try:
-            recovered_terminal_attempts: set[str] = set()
-            _recover_cleanup_uncertain_trials(
-                study,
-                experiment,
-                phase.name,
-                recovered_attempt_ids=recovered_terminal_attempts,
-                recovered_attempt_generations=report.recovered_attempt_generations,
-            )
+            # Each attempt is collected as soon as its trial's durable state
+            # changes, so a later trial's refusal must not drop the evidence
+            # already gathered; hence the ``finally`` blocks.
+            recovered_terminal_attempts: dict[str, _AttemptRecord] = {}
+            try:
+                _recover_cleanup_uncertain_trials(
+                    study,
+                    experiment,
+                    phase.name,
+                    recovered_attempts=recovered_terminal_attempts,
+                )
+            finally:
+                report.record_generations(recovered_terminal_attempts)
             report.recovered_attempt_ids.update(recovered_terminal_attempts)
             for attempt_id in recovered_terminal_attempts:
                 _retire_active_attempt(experiment, attempt_id)
-            _reap_stale_trials(
-                study,
-                experiment,
-                phase.name,
-                recovered_attempt_ids=report.recovered_attempt_ids,
-                recovered_attempt_generations=report.recovered_attempt_generations,
-                uncertain_attempt_ids=report.uncertain_attempt_ids,
-            )
+            reaped_attempts: dict[str, _AttemptRecord] = {}
+            try:
+                _reap_stale_trials(
+                    study,
+                    experiment,
+                    phase.name,
+                    recovered_attempts=reaped_attempts,
+                    uncertain_attempt_ids=report.uncertain_attempt_ids,
+                )
+            finally:
+                report.recovered_attempt_ids.update(reaped_attempts)
+                report.record_generations(reaped_attempts)
         except Exception as exc:
             if isinstance(exc, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
                 report.mark_uncertain(exc)

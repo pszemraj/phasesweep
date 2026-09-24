@@ -10,6 +10,7 @@ import optuna
 
 from phasesweep.config import Experiment
 from phasesweep.engine.attempts import (
+    _AttemptRecord,
     _cleanup_recovered_trial_numbers,
     _collect_attempt_generation,
     _read_trial_process_identity,
@@ -44,9 +45,7 @@ def _reap_stale_trials(
     experiment: Experiment,
     phase_name: str,
     *,
-    recovered_attempt_ids: set[str] | None = None,
-    recovered_attempt_generations: dict[str, str] | None = None,
-    recovered_attempt_locations: dict[str, tuple[str, int, str]] | None = None,
+    recovered_attempts: dict[str, _AttemptRecord] | None = None,
     uncertain_attempt_ids: set[str] | None = None,
 ) -> int:
     """Mark RUNNING trials as FAIL after killing orphaned process groups.
@@ -54,12 +53,9 @@ def _reap_stale_trials(
     :param optuna.Study study: Study whose stale RUNNING trials should be reaped.
     :param Experiment experiment: Experiment used to locate trial directories.
     :param str phase_name: Name of the phase containing the stale trials.
-    :param set[str] | None recovered_attempt_ids: Optional collector for exact
-        attempt identities whose durable state was changed to FAIL.
-    :param dict[str, str] | None recovered_attempt_generations: Optional mapping
-        from each recovered attempt id to its producing generation id.
-    :param dict[str, tuple[str, int, str]] | None recovered_attempt_locations:
-        Optional mapping from attempt id to phase, trial number, and generation.
+    :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
+        mapping from each attempt id whose durable state was changed to FAIL
+        to its generation, phase, and trial number.
     :param set[str] | None uncertain_attempt_ids: Optional collector for exact
         attempt identities whose cleanup could not be proven.
     :return int: Number of stale RUNNING trials marked as failed.
@@ -108,13 +104,7 @@ def _reap_stale_trials(
                 f"with an inconsistent study. trial_dir={trial_dir}"
             ) from exc
 
-        _collect_attempt_generation(
-            trial,
-            phase_name,
-            recovered_attempt_ids,
-            recovered_attempt_generations,
-            recovered_attempt_locations,
-        )
+        _collect_attempt_generation(trial, phase_name, recovered_attempts)
 
         log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
         count += 1
@@ -126,9 +116,7 @@ def _inspect_stale_running_trials(
     experiment: Experiment,
     phase_name: str,
     *,
-    recovered_attempt_ids: set[str] | None = None,
-    recovered_attempt_generations: dict[str, str] | None = None,
-    recovered_attempt_locations: dict[str, tuple[str, int, str]] | None = None,
+    recovered_attempts: dict[str, _AttemptRecord] | None = None,
 ) -> int:
     """Count stale RUNNING trials without signaling processes or writing state.
 
@@ -139,12 +127,9 @@ def _inspect_stale_running_trials(
     :param optuna.Study study: Study whose stale RUNNING trials should be inspected.
     :param Experiment experiment: Experiment used to locate trial directories.
     :param str phase_name: Name of the phase containing the stale trials.
-    :param set[str] | None recovered_attempt_ids: Optional collector for
-        attempts a confirmed pass would reap.
-    :param dict[str, str] | None recovered_attempt_generations: Optional mapping
-        from each collected attempt id to its producing generation id.
-    :param dict[str, tuple[str, int, str]] | None recovered_attempt_locations:
-        Optional mapping from attempt id to phase, trial number, and generation.
+    :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
+        mapping from each attempt id a confirmed pass would reap to its
+        generation, phase, and trial number.
     :return int: Number of stale RUNNING trials found.
     """
     count = 0
@@ -154,13 +139,7 @@ def _inspect_stale_running_trials(
         trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
         if TRIAL_DIR_ATTR in trial.user_attrs:
             _resolve_attempt_for_reaping(trial, trial_dir, study.study_name, inspect_only=True)
-        _collect_attempt_generation(
-            trial,
-            phase_name,
-            recovered_attempt_ids,
-            recovered_attempt_generations,
-            recovered_attempt_locations,
-        )
+        _collect_attempt_generation(trial, phase_name, recovered_attempts)
         count += 1
     return count
 
@@ -267,9 +246,7 @@ def _recover_cleanup_uncertain_trials(
     experiment: Experiment,
     phase_name: str,
     *,
-    recovered_attempt_ids: set[str] | None = None,
-    recovered_attempt_generations: dict[str, str] | None = None,
-    recovered_attempt_locations: dict[str, tuple[str, int, str]] | None = None,
+    recovered_attempts: dict[str, _AttemptRecord] | None = None,
 ) -> int:
     """Confirm cleanup for terminal trials that explicitly recorded uncertainty.
 
@@ -281,12 +258,9 @@ def _recover_cleanup_uncertain_trials(
     :param optuna.Study study: Existing Optuna study for the phase being recovered.
     :param Experiment experiment: Parsed experiment, used for diagnostics.
     :param str phase_name: Name of the phase being recovered.
-    :param set[str] | None recovered_attempt_ids: Optional collector for exact
-        attempts whose cleanup was confirmed.
-    :param dict[str, str] | None recovered_attempt_generations: Optional mapping
-        from each collected attempt id to its producing generation id.
-    :param dict[str, tuple[str, int, str]] | None recovered_attempt_locations:
-        Optional mapping from attempt id to phase, trial number, and generation.
+    :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
+        mapping from each attempt id whose cleanup was confirmed to its
+        generation, phase, and trial number.
     :return int: Number of cleanup-uncertain terminal trials confirmed clean.
     :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
     """
@@ -303,13 +277,7 @@ def _recover_cleanup_uncertain_trials(
                 f"{RERUN_CLEANUP_RECOVERY}."
             )
         _record_cleanup_recovery(study, trial)
-        _collect_attempt_generation(
-            trial,
-            phase_name,
-            recovered_attempt_ids,
-            recovered_attempt_generations,
-            recovered_attempt_locations,
-        )
+        _collect_attempt_generation(trial, phase_name, recovered_attempts)
         recovered += 1
         log.warning(
             "Confirmed cleanup for terminal cleanup-uncertain trial %d in study %s "
@@ -326,32 +294,21 @@ def _inspect_cleanup_uncertain_trials(
     study: optuna.Study,
     phase_name: str,
     *,
-    recovered_attempt_ids: set[str] | None = None,
-    recovered_attempt_generations: dict[str, str] | None = None,
-    recovered_attempt_locations: dict[str, tuple[str, int, str]] | None = None,
+    recovered_attempts: dict[str, _AttemptRecord] | None = None,
 ) -> int:
     """Count recoverable terminal cleanup evidence without signals or writes.
 
     :param optuna.Study study: Existing study inspected by recovery preflight.
     :param str phase_name: Name of the phase containing the recovered trials.
-    :param set[str] | None recovered_attempt_ids: Optional collector for
-        attempts a confirmed pass would recover.
-    :param dict[str, str] | None recovered_attempt_generations: Optional mapping
-        from each collected attempt id to its producing generation id.
-    :param dict[str, tuple[str, int, str]] | None recovered_attempt_locations:
-        Optional mapping from attempt id to phase, trial number, and generation.
+    :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
+        mapping from each attempt id a confirmed pass would recover to its
+        generation, phase, and trial number.
     :return int: Number of unconsumed terminal trials that record cleanup uncertainty.
     :raises ProcessCleanupUncertainError: A trial lacks the persisted identity
         required for a safe confirmed recovery.
     """
     count = 0
     for trial, _trial_dir, _identity in _iter_cleanup_uncertain_trials(study):
-        _collect_attempt_generation(
-            trial,
-            phase_name,
-            recovered_attempt_ids,
-            recovered_attempt_generations,
-            recovered_attempt_locations,
-        )
+        _collect_attempt_generation(trial, phase_name, recovered_attempts)
         count += 1
     return count
