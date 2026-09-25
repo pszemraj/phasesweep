@@ -126,10 +126,10 @@ class IncompleteJournalRecordError(StudyStorageUnavailableError):
     the lock, backup, or truncation failed, which restoring write access to
     the ledger fixes; the lock stayed held past the repair's wait, which
     removing a lock a killed writer left fixes; the journal has a second
-    hard-linked name, whose appends take another lock; or the journal changed or the
-    lock was lost while it was held, which a retry settles (``action`` is then
-    ``RETRY``). The intact records remain, so the ledger needs repair, not a
-    copy from a backup.
+    hard-linked name, whose appends take another lock; or, while the lock
+    was held, the journal changed or another process took the lock over,
+    which a retry settles (``action`` is then ``RETRY``). The intact records
+    remain, so the ledger needs repair, not a copy from a backup.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER
