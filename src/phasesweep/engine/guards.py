@@ -6,6 +6,7 @@ import optuna
 
 from phasesweep.config import Experiment
 from phasesweep.engine.attempts import (
+    _AttemptRecord,
     _preflight_active_attempts,
     _PreflightCleanupReport,
     _retire_active_attempt,
@@ -23,6 +24,7 @@ from phasesweep.engine.errors import (
     TrialTargetRegressionError,
 )
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
+from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.study_policy import (
     _load_accepted_partial_decision,
     _validate_environment_cohort,
@@ -134,25 +136,34 @@ def _preflight_existing_studies(
             continue
         studies[phase.name] = study
         try:
-            recovered_terminal_attempts: set[str] = set()
-            _recover_cleanup_uncertain_trials(
-                study,
-                experiment,
-                phase.name,
-                recovered_attempt_ids=recovered_terminal_attempts,
-                recovered_attempt_generations=report.recovered_attempt_generations,
-            )
+            # Each attempt is collected as soon as its trial's durable state
+            # changes, so a later trial's refusal must not drop the evidence
+            # already gathered; hence the ``finally`` blocks.
+            recovered_terminal_attempts: dict[str, _AttemptRecord] = {}
+            try:
+                _recover_cleanup_uncertain_trials(
+                    study,
+                    experiment,
+                    phase.name,
+                    recovered_attempts=recovered_terminal_attempts,
+                )
+            finally:
+                report.record_generations(recovered_terminal_attempts)
             report.recovered_attempt_ids.update(recovered_terminal_attempts)
             for attempt_id in recovered_terminal_attempts:
                 _retire_active_attempt(experiment, attempt_id)
-            _reap_stale_trials(
-                study,
-                experiment,
-                phase.name,
-                recovered_attempt_ids=report.recovered_attempt_ids,
-                recovered_attempt_generations=report.recovered_attempt_generations,
-                uncertain_attempt_ids=report.uncertain_attempt_ids,
-            )
+            reaped_attempts: dict[str, _AttemptRecord] = {}
+            try:
+                _reap_stale_trials(
+                    study,
+                    experiment,
+                    phase.name,
+                    recovered_attempts=reaped_attempts,
+                    uncertain_attempt_ids=report.uncertain_attempt_ids,
+                )
+            finally:
+                report.recovered_attempt_ids.update(reaped_attempts)
+                report.record_generations(reaped_attempts)
         except Exception as exc:
             if isinstance(exc, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
                 report.mark_uncertain(exc)
@@ -164,9 +175,7 @@ def _preflight_existing_studies(
             if reached:
                 _validate_trial_target(study, phase)
                 partial_decision = _load_accepted_partial_decision(study)
-                finished_trials = sum(
-                    trial.state.is_finished() for trial in study.get_trials(deepcopy=False)
-                )
+                finished_trials = _finished_trial_count(study.get_trials(deepcopy=False))
                 needs_new_trials = phase.n_trials > finished_trials and not (
                     partial_decision is not None and phase.n_trials == partial_decision.trial_target
                 )
@@ -188,14 +197,14 @@ def _preflight_existing_studies(
         # same one, and otherwise to reading the refusals it lists.
         remediations = {error.action for error in errors if isinstance(error, PhaseSweepError)}
         shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
-        if all(isinstance(error, StudySchemaMismatchError) for error in errors):
-            raise StudySchemaMismatchError(message, action=shared) from first
-        if all(isinstance(error, StudyFingerprintMismatchError) for error in errors):
-            raise StudyFingerprintMismatchError(message, action=shared) from first
-        if all(isinstance(error, StudyStorageUnavailableError) for error in errors):
-            raise StudyStorageUnavailableError(message, action=shared) from first
-        if all(isinstance(error, TrialTargetRegressionError) for error in errors):
-            raise TrialTargetRegressionError(message, action=shared) from first
+        for error_type in (
+            StudySchemaMismatchError,
+            StudyFingerprintMismatchError,
+            StudyStorageUnavailableError,
+            TrialTargetRegressionError,
+        ):
+            if all(isinstance(error, error_type) for error in errors):
+                raise error_type(message, action=shared) from first
         cleanup_error = next(
             (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
             None,

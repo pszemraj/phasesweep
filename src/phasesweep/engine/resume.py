@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
 
 import optuna
 
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
+import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
-from phasesweep.config import Experiment, Phase
+from phasesweep.config import Experiment
 from phasesweep.engine.errors import StudyContextConflictError
+from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
 
 
@@ -36,9 +37,21 @@ def _preflight_skipped_winners(
         or incomplete.
     :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
         disagrees with the current config.
+    :raises PublicationAccessError: The published manifest cannot be read as
+        the current user.
+    :raises PublicationIntegrityError: The published manifest fails validation.
     """
     if from_phase is None:
         return {}
+
+    # One manifest validation covers every skipped phase. Resolving once is
+    # safe here, unlike in status reads: this preflight runs under
+    # _experiment_lock, and this experiment's pointer only advances at this
+    # run's final publish.
+    published_generation_id = publication_ops._last_successful_generation_id(
+        experiment,
+        raise_on_manifest_error=True,
+    )
 
     winners: dict[str, Winner] = {}
     for phase in experiment.phases:
@@ -49,38 +62,16 @@ def _preflight_skipped_winners(
         if phase.name == from_phase:
             return winners
         inherited = {parent: winners[parent] for parent in phase.inherits}
-        # Safe to re-resolve the published pointer per phase here, unlike status
-        # reads: this preflight runs under _experiment_lock, and this
-        # experiment's pointer only advances at this run's final publish.
-        winner = artifact_io._load_winner(experiment, phase, inherited)
+        winner = artifact_io._load_winner(
+            experiment,
+            phase,
+            inherited,
+            published_generation_id=published_generation_id,
+        )
         evidence_ops._verify_skipped_winner_evidence(experiment, phase, winner)
         winners[phase.name] = winner
 
     raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
-
-
-def _phases_from(experiment: Experiment, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
-    """Yield ``(index, phase)`` pairs from ``from_phase`` (or the start) onward.
-
-    Shared reached-from-phase iteration prologue for
-    :func:`_reject_bound_descendant_topups` and
-    :func:`_reject_unsupported_sampler_topups`.
-
-    :param Experiment experiment: Parsed experiment whose phase chain is scanned.
-    :param str | None from_phase: Optional resume point; phases before it are
-        skipped. ``None`` reaches every phase from the start.
-
-    Yields:
-        ``(index, phase)``: Each reached phase paired with its declaration index.
-
-    """
-    reached = from_phase is None
-    for index, phase in enumerate(experiment.phases):
-        if phase.name == from_phase:
-            reached = True
-        if not reached:
-            continue
-        yield index, phase
 
 
 def _reject_bound_descendant_topups(
@@ -104,11 +95,11 @@ def _reject_bound_descendant_topups(
         top-up trials remaining while an inheriting descendant already has a
         study bound to a published winner fingerprint.
     """
-    for index, phase in _phases_from(experiment, from_phase):
+    for index, phase in experiment.phases_from(from_phase):
         study = existing_studies.get(phase.name)
         if study is None:
             continue
-        terminal = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+        terminal = _finished_trial_count(study.get_trials(deepcopy=False))
         if terminal >= phase.n_trials:
             continue
         partial_decision = study_policy_ops._load_accepted_partial_decision(study)
@@ -155,7 +146,7 @@ def _reject_unsupported_sampler_topups(
         safely continue with its configured stateful sampler; delegated to
         :func:`phasesweep.engine.study_policy._validate_sampler_continuation`.
     """
-    for _index, phase in _phases_from(experiment, from_phase):
+    for _index, phase in experiment.phases_from(from_phase):
         study = existing_studies.get(phase.name)
         if study is not None:
             study_policy_ops._validate_sampler_continuation(study, phase)

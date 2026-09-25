@@ -53,7 +53,7 @@ def _write_catalog(
     experiment = make_experiment(
         experiment="redact_me",
         workdir=tmp_path / "SECRET_WORKDIR",
-        storage=f"sqlite:///{tmp_path}/SECRET_DB.db",
+        storage=f"journal:///{tmp_path}/SECRET_DB.journal",
         trial_command=(
             "python /opt/secret/train.py --token DANGER_TOKEN --out {trial_dir}/r.json {overrides}"
         ),

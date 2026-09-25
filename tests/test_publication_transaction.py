@@ -38,7 +38,6 @@ from phasesweep.engine import (
     PublicationIntegrityError,
     TerminalReport,
     Winner,
-    generation_id_source,
     read_status,
     read_winner,
 )
@@ -57,6 +56,7 @@ from phasesweep.engine.publication import (
     _resolve_publication_pointer,
     _unresolvable_pointer,
 )
+from phasesweep.engine.resume import _preflight_skipped_winners
 from phasesweep.runtime import shutdown as runtime_shutdown
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
@@ -65,6 +65,7 @@ from tests.conftest import (
     patch_path_method_failure,
     requires_nonroot,
     temporary_umask,
+    write_constant_trainer,
     write_param_echo_trainer,
     write_trainer,
 )
@@ -110,7 +111,7 @@ def _golden_publication(tmp_path: Path) -> tuple[Experiment, str]:
     :return tuple[Experiment, str]: The experiment reading the copy and its
         published generation id.
     """
-    experiment = materialize("current-sqlite", tmp_path, mode="tree").experiment
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
     return experiment, generation_id
@@ -166,11 +167,8 @@ def test_summary_readback_refusals_are_publication_commit_errors(
     with pytest.raises(PublicationCommitError, match=match):
         generation_ops._validate_publishable_summary(
             summary_path=summary_path,
-            owner_key="experiment",
-            owner_value="expected",
-            id_key="generation_id",
-            id_value="generation-test",
-            label="Generation",
+            experiment_name="expected",
+            generation_id="generation-test",
         )
 
 
@@ -749,7 +747,14 @@ def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) 
     winner_path.symlink_to(preserved_winner_path.name)
 
     with pytest.raises(PublicationIntegrityError, match="missing or unreadable"):
-        artifact_io._load_winner(experiment, experiment.phases[0], {})
+        artifact_io._load_winner(
+            experiment,
+            experiment.phases[0],
+            {},
+            published_generation_id=_last_successful_generation_id(
+                experiment, raise_on_manifest_error=True
+            ),
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1039,6 +1044,63 @@ def test_resume_path_still_raises_the_manifest_error(tmp_path: Path) -> None:
         _last_successful_generation_id(experiment, raise_on_manifest_error=True)
 
 
+def test_from_phase_preflight_validates_the_published_manifest_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skipping several phases costs one manifest validation, not one per phase."""
+    trainer = write_constant_trainer(tmp_path)
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        phases=[
+            Phase(
+                name="a",
+                n_trials=1,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"x": IntParam(type="int", low=0, high=4)},
+            ),
+            Phase(
+                name="b",
+                inherits=["a"],
+                n_trials=1,
+                sampler=Sampler(type="random", seed=1),
+                search_space={"y": IntParam(type="int", low=0, high=4)},
+            ),
+            Phase(
+                name="c",
+                inherits=["b"],
+                n_trials=1,
+                sampler=Sampler(type="random", seed=2),
+                search_space={"z": IntParam(type="int", low=0, high=4)},
+            ),
+            Phase(
+                name="d",
+                inherits=["c"],
+                n_trials=1,
+                sampler=Sampler(type="random", seed=3),
+                search_space={"w": IntParam(type="int", low=0, high=4)},
+            ),
+        ],
+    )
+    run_experiment(experiment)
+
+    original_validate = validation_ops._validate_generation_manifest
+    calls = 0
+
+    def counting_validate(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(validation_ops, "_validate_generation_manifest", counting_validate)
+
+    winners = _preflight_skipped_winners(experiment, from_phase="d", run_deadline=None)
+
+    assert set(winners) == {"a", "b", "c"}
+    assert calls == 1
+
+
 def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Path) -> None:
     owner, _ = _golden_publication(tmp_path)
     pointer_path = _last_successful_generation_path(owner)
@@ -1246,7 +1308,6 @@ def test_generation_reproducibility_record_is_shareable_digests_only(tmp_path: P
     # A direct-caller run mints its own id; only a launcher-granted identity
     # records "caller" (PR #5 review / P2 missing-handle authority).
     assert record["generation_id_source"] == "engine"
-    assert generation_id_source(experiment, generation_id) == "engine"
     assert record["phasesweep_version"] == summary["phasesweep_version"]
     assert record["config_fingerprint"] == summary["config_fingerprint"]
     assert record["provenance"] == experiment.provenance
@@ -1276,9 +1337,7 @@ def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> Non
     The launcher (the MCP server) freezes the run's authority in its own state
     dir; this record is what lets readers detect that such frozen authority
     exists even after that state dir is deleted or replaced (PR #5 review /
-    P2 missing-handle authority). The reader answers ``None`` -- never a
-    guess -- for ids without a valid record, so legacy trees keep their
-    current-policy behavior.
+    P2 missing-handle authority).
     """
     experiment = _stored_experiment(tmp_path)
     run_experiment(experiment, generation_id="launcher-granted-1")
@@ -1287,27 +1346,6 @@ def test_caller_granted_generation_id_is_recorded_durably(tmp_path: Path) -> Non
         (_generation_dir(experiment, "launcher-granted-1") / _REPRODUCIBILITY_NAME).read_text()
     )
     assert record["generation_id_source"] == "caller"
-    assert generation_id_source(experiment, "launcher-granted-1") == "caller"
-
-    # Unanswerable cases collapse to None: no such generation, and a record
-    # predating the field (schema version 1).
-    assert generation_id_source(experiment, "never-claimed") is None
-    del record["generation_id_source"]
-    record_path = _generation_dir(experiment, "launcher-granted-1") / _REPRODUCIBILITY_NAME
-    record_path.write_text(json.dumps(record))
-    assert generation_id_source(experiment, "launcher-granted-1") is None
-
-
-def test_generation_id_source_rejects_linked_provenance_record(tmp_path: Path) -> None:
-    """A source claim is not trusted through a linked reproducibility record."""
-    experiment, generation_id = _golden_publication(tmp_path)
-
-    record_path = _generation_dir(experiment, generation_id) / _REPRODUCIBILITY_NAME
-    preserved_record_path = record_path.with_name("reproducibility.original.json")
-    record_path.rename(preserved_record_path)
-    record_path.symlink_to(preserved_record_path.name)
-
-    assert generation_id_source(experiment, generation_id) is None
 
 
 def test_generation_manifest_covers_the_provenance_files(tmp_path: Path) -> None:

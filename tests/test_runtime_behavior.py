@@ -144,7 +144,7 @@ def test_invalid_remote_constraint_fails_but_measured_violation_is_complete(
     """)
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'study.db'}",
+        storage=f"journal:///{tmp_path / 'study.journal'}",
         trial_command="echo {overrides} x=0.25",
         n_trials=1,
         constraints=[
@@ -159,7 +159,9 @@ def test_invalid_remote_constraint_fails_but_measured_violation_is_complete(
     )
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(experiment)
-    trial = optuna.load_study(study_name="t::p", storage=experiment.resolved_storage).trials[0]
+    trial = optuna.load_study(
+        study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+    ).trials[0]
     assert trial.state.name == state
     if state == "COMPLETE":
         assert trial.value == 0.25
@@ -202,10 +204,11 @@ def test_seeded_random_sequence_is_stable_across_top_up_batches(tmp_path: Path) 
     )
 
     def sampled(storage: Path, batches: list[int]) -> list[int]:
+        resolved = _resolve_storage(f"journal:///{storage}")
         for n_trials in batches:
             study = optuna.create_study(
                 study_name="stable-random::p",
-                storage=f"sqlite:///{storage}",
+                storage=resolved,
                 sampler=_build_sampler(phase.sampler, phase.search_space),
                 load_if_exists=True,
             )
@@ -215,21 +218,21 @@ def test_seeded_random_sequence_is_stable_across_top_up_batches(tmp_path: Path) 
             )
         loaded = optuna.load_study(
             study_name="stable-random::p",
-            storage=f"sqlite:///{storage}",
+            storage=resolved,
         )
         return [int(trial.params["x"]) for trial in loaded.trials]
 
-    expected = sampled(tmp_path / "single.db", [4])
-    assert expected == sampled(tmp_path / "ones.db", [1, 1, 1, 1])
-    assert expected == sampled(tmp_path / "uneven.db", [1, 3])
-    assert expected == sampled(tmp_path / "mixed.db", [2, 1, 1])
+    expected = sampled(tmp_path / "single.journal", [4])
+    assert expected == sampled(tmp_path / "ones.journal", [1, 1, 1, 1])
+    assert expected == sampled(tmp_path / "uneven.journal", [1, 3])
+    assert expected == sampled(tmp_path / "mixed.journal", [2, 1, 1])
 
 
 def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
     """A reconstructed GridSampler continues through its stored grid assignments."""
     search_space = {"x": CategoricalParam(type="categorical", choices=[1, 2, 3, 4])}
     sampler = Sampler(type="grid", seed=0)
-    storage = f"sqlite:///{tmp_path / 'grid.db'}"
+    storage = _resolve_storage(f"journal:///{tmp_path / 'grid.journal'}")
 
     for _ in range(2):
         study = optuna.create_study(
@@ -305,11 +308,7 @@ def test_persistent_execution_reattaches_configured_sampler_and_pruner(
         sampler=sampler,
         search_space=search_space,
     )
-    storage = (
-        f"journal:///{tmp_path / 'tpe.journal'}"
-        if sampler.type == "tpe"
-        else f"sqlite:///{tmp_path / f'{sampler.type}.db'}"
-    )
+    storage = f"journal:///{tmp_path / f'{sampler.type}.journal'}"
     exp = make_experiment(
         experiment=f"sampler_{sampler.type}",
         storage=storage,
@@ -387,11 +386,11 @@ def test_parallel_trials_e2e(tmp_path):
 @pytest.mark.integration
 def test_failed_trials_marked_fail_not_complete(tmp_path):
     """Process crashes should produce FAIL trials, not COMPLETE with inf."""
-    db_path = tmp_path / "phases.db"
+    db_path = tmp_path / "phases.journal"
     exp = make_experiment(
         experiment="fail_state_test",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{db_path}",
+        storage=f"journal:///{db_path}",
         trial_command="false {overrides}",
         name="a",
         n_trials=3,
@@ -401,7 +400,9 @@ def test_failed_trials_marked_fail_not_complete(tmp_path):
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="fail_state_test::a", storage=f"sqlite:///{db_path}")
+    study = optuna.load_study(
+        study_name="fail_state_test::a", storage=_resolve_storage(f"journal:///{db_path}")
+    )
     for trial in study.get_trials():
         # Every trial should be FAIL, not COMPLETE.
         assert trial.state == optuna.trial.TrialState.FAIL, (
@@ -501,7 +502,7 @@ def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
         run_experiment(expanded)
 
     assert _generation_path(initial).read_bytes() == generation_before
-    study = optuna.load_study(study_name="t::local", storage=initial.storage)
+    study = optuna.load_study(study_name="t::local", storage=_resolve_storage(initial.storage))
     assert len(study.get_trials(deepcopy=False)) == 1
 
 
@@ -604,11 +605,11 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     # Write metric only — constraint extractor will fail to find param_bytes.
     trainer = write_constant_trainer(tmp_path, key="eval_loss", value=1.0)
 
-    db = tmp_path / "phases.db"
+    db = tmp_path / "phases.journal"
     exp = make_experiment(
         experiment="c2",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{db}",
+        storage=f"journal:///{db}",
         trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
         metric=Metric(
             name="eval_loss",
@@ -632,7 +633,7 @@ def test_constraint_extractor_failure_marks_trial_fail(tmp_path):
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="c2::a", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="c2::a", storage=_resolve_storage(f"journal:///{db}"))
     for trial in study.get_trials():
         assert trial.state == optuna.trial.TrialState.FAIL, (
             f"Trial {trial.number} is {trial.state.name}; expected FAIL because "
@@ -813,7 +814,7 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
     exp = make_experiment(
         experiment="platform_check",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path}/platform.db",
+        storage=f"journal:///{tmp_path}/platform.journal",
         n_trials=1,
         search_space={"x": IntParam(type="int", low=0, high=1)},
     )
@@ -831,10 +832,11 @@ def test_runtime_platform_guard_feature_checks_and_dry_run(
 @pytest.mark.integration
 def test_max_consecutive_failures_aborts_phase(tmp_path):
     """Trial command always fails -> phase aborts before running n_trials."""
+    storage = f"journal:///{tmp_path}/fail.journal"
     exp = make_experiment(
         experiment="failtest",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path}/fail.db",
+        storage=storage,
         trial_command="false {overrides}",
         name="a",
         n_trials=100,
@@ -846,11 +848,8 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     # Verify only a small number of trials actually executed before the abort.
     # We can't predict exactly how many because Optuna may have a few in flight,
     # but it should be << 100.
-    import sqlite3
-
-    conn = sqlite3.connect(tmp_path / "fail.db")
-    n = conn.execute("SELECT COUNT(*) FROM trials").fetchone()[0]
-    conn.close()
+    study = optuna.load_study(study_name="failtest::a", storage=_resolve_storage(storage))
+    n = len(study.get_trials(deepcopy=False))
     assert n < 30, f"expected early abort, got {n} trials"
 
 
@@ -876,10 +875,10 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
         print("x=0.25")
         """,
     )
-    db = tmp_path / "abort.db"
+    db = tmp_path / "abort.journal"
     exp = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{db}",
+        storage=f"journal:///{db}",
         trial_command=f"python {trainer} {{overrides}}",
         override_format="argparse",
         n_trials=3,
@@ -890,7 +889,7 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     record = study.user_attrs[PHASE_ABORT_ATTR]
     assert record["policy"] == "max_consecutive_failures"
     assert record["consecutive_failures"] == 2
@@ -908,7 +907,7 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
 ) -> None:
     """Contradictory durable abort/trial counts are operator-visible study state."""
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
-    storage = f"sqlite:///{tmp_path / 'abort.db'}"
+    storage = f"journal:///{tmp_path / 'abort.journal'}"
 
     def experiment(n_trials: int) -> Experiment:
         return make_experiment(
@@ -924,7 +923,7 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment(3))
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
     cohort_digest = study.trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR]
     for sequence in (3, 4):
         study.add_trial(
@@ -1018,12 +1017,12 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
     """
     flag = tmp_path / "resume_enabled"
     trainer = write_flag_gated_trainer(tmp_path, flag)
-    db = tmp_path / "abort.db"
+    db = tmp_path / "abort.journal"
 
     def _exp(n_trials: int):
         return make_experiment(
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{db}",
+            storage=f"journal:///{db}",
             trial_command=f"python {trainer} {{overrides}}",
             override_format="argparse",
             n_trials=n_trials,
@@ -1038,7 +1037,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
     winners = run_experiment(_exp(6))
 
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
 
 
@@ -1055,12 +1054,12 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
             sys.exit(1)
         """,
     )
-    db = tmp_path / "topup.db"
+    db = tmp_path / "topup.journal"
 
     def _exp(n_trials: int) -> Experiment:
         return make_experiment(
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{db}",
+            storage=f"journal:///{db}",
             trial_command=f"python {trainer} {{overrides}}",
             override_format="argparse",
             n_trials=n_trials,
@@ -1075,7 +1074,7 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(_exp(4))
 
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     assert [trial.state.name for trial in study.trials] == ["COMPLETE", "FAIL", "FAIL", "FAIL"]
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in study.trials] == [
         1,
@@ -1093,10 +1092,10 @@ def test_outcome_ledger_recovers_when_abort_marker_write_fails(
 ) -> None:
     """A failed marker write cannot make an identical retry publish."""
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
-    db = tmp_path / "abort.db"
+    db = tmp_path / "abort.journal"
     exp = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{db}",
+        storage=f"journal:///{db}",
         trial_command=f"python {trainer} {{overrides}}",
         override_format="argparse",
         n_trials=2,
@@ -1117,7 +1116,7 @@ def test_outcome_ledger_recovers_when_abort_marker_write_fails(
     with pytest.raises(StudyStorageUnavailableError, match="abort marker could not be persisted"):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for trial in study.trials] == [
         "failure",
@@ -1166,11 +1165,11 @@ def test_transient_trial_outcome_write_failure_is_retried(
     ledger from firing on a momentarily busy one (PR #5 review / reviewer 2
     pass 2, blocker 4).
     """
-    db = tmp_path / "retry.db"
+    db = tmp_path / "retry.journal"
     exp = _outcome_write_experiment(
         tmp_path,
         trainer_body='print("x=0.5")',
-        storage=f"sqlite:///{db}",
+        storage=f"journal:///{db}",
     )
 
     real_set_user_attr = optuna.Trial.set_user_attr
@@ -1187,7 +1186,7 @@ def test_transient_trial_outcome_write_failure_is_retried(
 
     assert injected["n"] == 1
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     assert [trial.state.name for trial in study.trials] == ["COMPLETE", "COMPLETE"]
     assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in study.trials] == [1, 2]
     assert all(
@@ -1293,11 +1292,11 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     protocol, which writes the outcome *before* the terminal transition
     (PR #5 review / reviewer 2 pass 2, blocker 4).
     """
-    db = tmp_path / "outcome.db"
+    db = tmp_path / "outcome.journal"
     exp = _outcome_write_experiment(
         tmp_path,
         trainer_body=trainer_body,
-        storage=f"sqlite:///{db}",
+        storage=f"journal:///{db}",
         constraints=constraints,
     )
 
@@ -1309,7 +1308,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     with pytest.raises(StudyStorageUnavailableError, match="deliberately left RUNNING"):
         run_experiment(exp)
 
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     trials = study.get_trials(deepcopy=False)
     assert [trial.state for trial in trials] == [optuna.trial.TrialState.RUNNING]
     assert not [
@@ -1325,7 +1324,7 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     winners = run_experiment(exp)
 
     assert winners["p"].metric == pytest.approx(0.5)
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     trials = study.get_trials(deepcopy=False)
     assert [trial.state for trial in trials] == [
         optuna.trial.TrialState.FAIL,
@@ -1397,12 +1396,12 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     """
     import phasesweep.engine.trial as trial_mod
 
-    db = tmp_path / "abort.db"
+    db = tmp_path / "abort.journal"
 
     def _exp(n_trials: int) -> Experiment:
         return make_experiment(
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{db}",
+            storage=f"journal:///{db}",
             # This fixture must produce no metric, regardless of override rendering.
             trial_command="true {overrides}",
             n_trials=n_trials,
@@ -1455,7 +1454,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
         run_experiment(_exp(2))
 
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     record = study.user_attrs[PHASE_ABORT_ATTR]
     assert record["policy"] == "unsafe_process_cleanup"
     assert "cleanup could not be confirmed" in record["cause"]
@@ -1475,7 +1474,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     before = len(study.trials)
     with pytest.raises(ProcessCleanupUncertainError):
         run_experiment(_exp(3))
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     assert len(study.trials) == before
     assert list(_attempts_dir(_exp(3)).glob("*.json"))
     assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
@@ -1495,7 +1494,7 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(_exp(3))
 
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     assert len(study.trials) == before + 1
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
     assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
@@ -1516,12 +1515,12 @@ def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
     """
     flag = tmp_path / "resume_enabled"
     trainer = write_flag_gated_trainer(tmp_path, flag)
-    db = tmp_path / "abort.db"
+    db = tmp_path / "abort.journal"
 
     def _exp(n_trials: int):
         return make_experiment(
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{db}",
+            storage=f"journal:///{db}",
             trial_command=f"python {trainer} {{overrides}}",
             override_format="argparse",
             n_trials=n_trials,
@@ -1545,7 +1544,7 @@ def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
         run_experiment(_exp(6))
 
     # The durable abort was consumed before selection started...
-    study = optuna.load_study(study_name="t::p", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
 
     # ...so the identical replay republishes deterministically instead of
@@ -1685,7 +1684,7 @@ def test_noop_rerun_skips_gpu_discovery_and_target_mutation(
 
     assert rerun["p"].trial_number == first["p"].trial_number
     assert rerun["p"].metric == first["p"].metric
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 
@@ -1719,7 +1718,7 @@ def test_failed_gpu_topup_preserves_accepted_target_and_old_config(
     with pytest.raises(RuntimeError, match="no GPUs detected"):
         run_experiment(top_up)
 
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 
@@ -1795,7 +1794,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         print("x=" + str({_FIDELITY_LOSSES!r}[args.x]))
         """,
     )
-    storage_url = f"sqlite:///{tmp_path / 'fidelity.db'}"
+    storage_url = f"journal:///{tmp_path / 'fidelity.journal'}"
     exp = make_experiment(
         experiment="categorical_fidelity",
         workdir=tmp_path / "runs",
@@ -1839,7 +1838,9 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
     )
 
     # (b) FrozenTrial.params, read back out of persistent storage.
-    study = optuna.load_study(study_name="categorical_fidelity::pick", storage=storage_url)
+    study = optuna.load_study(
+        study_name="categorical_fidelity::pick", storage=_resolve_storage(storage_url)
+    )
     assert len(study.trials) == len(_FIDELITY_CHOICES)
     for trial in study.trials:
         _assert_identical_scalar(
@@ -1905,7 +1906,7 @@ def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
     (PR #5 review / reviewer 2, blocker 1).
     """
     param = CategoricalParam(type="categorical", choices=list(_FIDELITY_CHOICES))
-    storage_url = f"sqlite:///{tmp_path / 'round-trip.db'}"
+    storage_url = _resolve_storage(f"journal:///{tmp_path / 'round-trip.journal'}")
     study_name = f"round-trip::{sampler.type}"
     live: dict[int, Any] = {}
 

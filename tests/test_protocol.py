@@ -139,7 +139,7 @@ def _json_equals_gate_yaml(value_literal: str) -> str:
     """Return an experiment body whose only gate compares against ``value_literal``."""
     return f"""
     experiment: t
-    storage: ":memory:"
+    storage: null
     provenance: {{revision: test-fixture-v1}}
     trial_command: "echo {{overrides}}"
     override_format: argparse

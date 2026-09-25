@@ -260,7 +260,7 @@ def test_init_catalog_losing_publish_race_preserves_other_writer(
             raise FileExistsError(destination)
         original_link(source, destination, **_kwargs)  # type: ignore[arg-type]
 
-    monkeypatch.setattr("phasesweep.cli.os.link", lose_publish_race)
+    monkeypatch.setattr("phasesweep.runtime.files.os.link", lose_publish_race)
 
     result = CliRunner().invoke(
         cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]

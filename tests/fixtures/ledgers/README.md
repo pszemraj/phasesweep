@@ -6,8 +6,7 @@ Each directory is one fixture:
 
 ```
 <name>/manifest.json          inventory record: backend, modes, expected verdicts, provenance
-<name>/ledger/study.db        SQLite ledger        (sqlite fixtures)
-<name>/ledger/study.journal   journal ledger       (journal fixtures)
+<name>/ledger/study.journal   journal ledger
 <name>/artifact_root/t/...    the artifact tree that claimed that ledger
 <name>/mcp_state/...          MCP run store        (precutover-mcp-state only)
 ```
@@ -21,16 +20,11 @@ and snapshots the bytes before the read.
 
 | Fixture | Backend | Modes | Binding schema | tree | ledger-only | Derived from |
 | --- | --- | --- | --- | --- | --- | --- |
-| `current-sqlite` | sqlite | tree, ledger-only | 3 | ok | ok | — |
 | `current-journal` | journal | tree, ledger-only | 3 | ok | ok | — |
-| `current-sqlite-optuna40-versioninfo` | sqlite | tree, ledger-only | 3 | ok | ok | `current-sqlite` |
-| `precutover-schema2-sqlite` | sqlite | tree, ledger-only | 3 | schema-mismatch | schema-mismatch | `current-sqlite` |
 | `precutover-schema2-journal` | journal | tree, ledger-only | 3 | schema-mismatch | schema-mismatch | `current-journal` |
-| `precutover-unstamped-sqlite` | sqlite | tree, ledger-only | 3 | schema-mismatch | schema-mismatch | `current-sqlite` |
 | `precutover-unstamped-journal` | journal | tree, ledger-only | 3 | schema-mismatch | schema-mismatch | `current-journal` |
-| `precutover-binding2-sqlite` | sqlite | tree | 2 | root-conflict | — | `current-sqlite` |
-| `precutover-unmarked-tree-sqlite` | sqlite | tree | none | root-conflict | — | `current-sqlite` |
-| `release-0.3.1-sqlite` | sqlite | tree, ledger-only | 2 | root-conflict | schema-mismatch | — |
+| `precutover-binding2-journal` | journal | tree | 2 | root-conflict | — | `current-journal` |
+| `precutover-unmarked-tree-journal` | journal | tree | none | root-conflict | — | `current-journal` |
 | `release-0.3.1-journal` | journal | tree, ledger-only | 2 | root-conflict | schema-mismatch | — |
 | `precutover-mcp-state` | — | — | — | — | — | — |
 
@@ -40,40 +34,40 @@ validated first and decides the verdict on its own when it is pre-cutover.
 is the case no binding can answer and the ledger format scan must.
 
 Each fixture's `manifest.json` records the exact `derivation` applied to it --
-raw SQL for SQLite, a described JSONL rewrite for the journal, a JSON edit for
-the artifact-root binding. Derivations never run PhaseSweep code, so a fixture
+a described JSONL rewrite for the journal, or a JSON edit for the
+artifact-root binding. Derivations never run PhaseSweep code, so a fixture
 keeps testing the reader rather than the writer that produced it.
 
 ## Provenance
 
-`current-*`, `precutover-*`, and `current-sqlite-optuna40-versioninfo` are
-produced by the working tree's PhaseSweep. `release-0.3.1-sqlite` and
-`release-0.3.1-journal` are produced by the preserved 0.3.1 release itself, from
-a detached `v0.3.1` worktree, against the same Optuna range -- so the format
-boundary is tested against bytes the old release actually wrote, not a
-reconstruction of them. Every manifest carries `produced_by` with the
-phasesweep `git describe --tags --always --dirty`, Optuna, SQLite, and Python
-versions, plus the directory the generator ran from. A `release-<version>-*`
-manifest must record exactly `v<version>`, and every fixture with a ledger
-must declare at least one read mode; the fixture-documentation test refuses
-anything else.
+`current-journal` and `precutover-*` are produced by the working tree's
+PhaseSweep. `release-0.3.1-journal` is produced by the preserved 0.3.1 release
+itself, from a detached `v0.3.1` worktree, against the same Optuna range -- so
+the format boundary is tested against bytes the old release actually wrote,
+not a reconstruction of them. Every manifest carries `produced_by` with the
+phasesweep `git describe --tags --always --dirty`, Optuna, the interpreter's
+stdlib `sqlite3` module version (unrelated to any fixture's ledger backend --
+the journal is the only backend these fixtures produce), and Python versions,
+plus the directory the generator ran from. A `release-<version>-*` manifest
+must record exactly `v<version>`, and every fixture with a ledger must declare
+at least one read mode; the fixture-documentation test refuses anything else.
 
-The 0.3.1 pair predates the trainer-cwd pin described below, so their phase and
-experiment fingerprints embed the directory they were generated from and match
-no materialized config. That is harmless: every read path refuses those
-fixtures first, at `root-conflict` in `tree` mode and `schema-mismatch` in
-`ledger-only` mode, so no read ever compares their fingerprints.
+`release-0.3.1-journal` predates the trainer-cwd pin described below, so its
+phase and experiment fingerprints embed the directory it was generated from
+and match no materialized config. That is harmless: every read path refuses
+that fixture first, at `root-conflict` in `tree` mode and `schema-mismatch` in
+`ledger-only` mode, so no read ever compares its fingerprints.
 
 ## Regeneration
 
 Fixtures are regenerated, never hand-edited. From the repository root:
 
 ```sh
-python -m tests.fixtures.make_ledger_fixtures                 # everything but release-0.3.1-*
-python -m tests.fixtures.make_ledger_fixtures --only current-sqlite   # one fixture
+python -m tests.fixtures.make_ledger_fixtures                  # everything but release-0.3.1-journal
+python -m tests.fixtures.make_ledger_fixtures --only current-journal   # one fixture
 ```
 
-The 0.3.1 pair needs the tagged source on `PYTHONPATH`:
+`release-0.3.1-journal` needs the tagged source on `PYTHONPATH`:
 
 ```sh
 W=$(mktemp -d)/psw-0.3.1

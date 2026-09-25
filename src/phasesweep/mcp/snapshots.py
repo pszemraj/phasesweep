@@ -17,6 +17,7 @@ from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import ResultContext
 from phasesweep.engine.state import (
+    TRIAL_STATE_NAMES,
     PublicationState,
     Winner,
     WinnerSource,
@@ -163,13 +164,10 @@ class WinnerSnapshot(_SnapshotModel):
 
 def _winner_source_snapshot(
     winner: PhaseWinnerView | Winner,
-    *,
-    phase: str,
 ) -> WinnerSourceSnapshot:
     """Return the concrete source model for a stored or engine-returned winner.
 
     :param PhaseWinnerView | Winner winner: Winner whose source should be captured.
-    :param str phase: Phase under which the winner is exposed.
     :return WinnerSourceSnapshot: Concrete, validated source snapshot.
     """
     source = winner.source
@@ -211,7 +209,7 @@ def _winner_snapshot(
         incomplete=incomplete,
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
-        source=_winner_source_snapshot(winner, phase=phase),
+        source=_winner_source_snapshot(winner),
     )
 
 
@@ -281,7 +279,7 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
         attempted to execute.
     :return dict[str, Any]: JSON-serializable placeholder result snapshot.
     """
-    zero_counts = {state: 0 for state in ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")}
+    zero_counts: dict[str, int] = {state: 0 for state in TRIAL_STATE_NAMES}
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
             current_generation_id=None,

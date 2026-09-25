@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -79,6 +79,19 @@ class _PreflightCleanupReport:
         self.cleanup_confirmed = False
         if self.error is None:
             self.error = error
+
+    def record_generations(self, attempts: Mapping[str, _AttemptRecord]) -> None:
+        """Record the producing generation of each attempt that has one.
+
+        :param Mapping[str, _AttemptRecord] attempts: Recovered attempts keyed by id.
+        """
+        self.recovered_attempt_generations.update(
+            {
+                attempt_id: record.generation_id
+                for attempt_id, record in attempts.items()
+                if record.generation_id is not None
+            }
+        )
 
 
 def _trial_dir_for_reaping(
@@ -923,34 +936,39 @@ def _resolve_attempt_for_reaping(
     )
 
 
+@dataclass(frozen=True)
+class _AttemptRecord:
+    """One attempt's producing generation, owning phase, and trial number.
+
+    ``generation_id`` is ``None`` when the trial records no valid generation.
+    """
+
+    generation_id: str | None
+    phase_name: str
+    trial_number: int
+
+
 def _collect_attempt_generation(
     trial: optuna.trial.FrozenTrial,
     phase_name: str,
-    attempt_ids: set[str] | None,
-    attempt_generations: dict[str, str] | None,
-    attempt_locations: dict[str, tuple[str, int, str]] | None,
+    attempts: dict[str, _AttemptRecord] | None,
 ) -> None:
-    """Collect one trial's durable attempt, generation, and study-local locator.
+    """Collect one trial's durable attempt record, keyed by attempt id.
 
     :param optuna.trial.FrozenTrial trial: Trial whose durable identity is collected.
     :param str phase_name: Phase that owns ``trial``.
-    :param set[str] | None attempt_ids: Optional destination for known attempt IDs.
-    :param dict[str, str] | None attempt_generations: Optional attempt-to-generation map.
-    :param dict[str, tuple[str, int, str]] | None attempt_locations: Optional
-        attempt-to-phase/trial/generation locator map.
+    :param dict[str, _AttemptRecord] | None attempts: Optional destination for
+        each valid attempt id's generation, phase, and trial number.
     """
     attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
-    if not isinstance(attempt_id, str) or not attempt_id:
+    if attempts is None or not isinstance(attempt_id, str) or not attempt_id:
         return
-    if attempt_ids is not None:
-        attempt_ids.add(attempt_id)
     generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
-    if not isinstance(generation_id, str) or not generation_id:
-        return
-    if attempt_generations is not None:
-        attempt_generations[attempt_id] = generation_id
-    if attempt_locations is not None:
-        attempt_locations[attempt_id] = (phase_name, trial.number, generation_id)
+    attempts[attempt_id] = _AttemptRecord(
+        generation_id if isinstance(generation_id, str) and generation_id else None,
+        phase_name,
+        trial.number,
+    )
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:

@@ -3,7 +3,7 @@
 # MCP requires absolute workdir and storage paths so detached runs survive restarts and arbitrary client working directories. The catalog pins cwd to the repository root because the trainer command below is intentionally repo-relative.
 
 experiment: tiny_decoder_enwik8_hparams_mcp
-storage: sqlite:////tmp/phasesweep-mcp-tiny-decoder-enwik8/phases.db
+storage: journal:////tmp/phasesweep-mcp-tiny-decoder-enwik8/phases.journal
 provenance:
   trainer: "run-trial-v2+decoder-template@9c90a551"
   data: "enwik8-template-download"

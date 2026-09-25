@@ -1,9 +1,10 @@
-"""The single storage chokepoint: every Optuna/SQLite storage object is built here.
+"""The single storage chokepoint: every Optuna storage object is built here.
 
 No other module in ``phasesweep`` may construct storage. It may not name
-``optuna.create_study``, ``optuna.load_study``, ``RDBStorage``,
-``JournalStorage`` or its file backend, ``sqlalchemy.create_engine``, or
-``sqlite3.connect``, and it may not call ``optuna.Study``.
+``optuna.create_study``, ``optuna.load_study``, ``JournalStorage`` or its file
+backend, and it may not call ``optuna.Study``. No module, this one included,
+names ``RDBStorage``, ``sqlalchemy.create_engine``, or ``sqlite3.connect``:
+the only durable backend is an Optuna journal file.
 ``tests/test_ledger_contract.py`` enforces that statically and holds the full
 list. Concentrating the constructors here is what makes the durability
 invariants checkable: every path that touches a ledger goes through this
@@ -21,10 +22,10 @@ module's handles, in one fixed order.
    On a bound tree an unreadable scan is tolerated and recorded on the
    :class:`ValidatedLedger` it returns.
 3. Pure read paths stop there and read trial data through
-   :func:`read_phase_trial_stats`.
-4. :func:`claim_ledger` rescans strictly if the scan did not complete, first
-   letting SQLite roll back a transaction a crash interrupted
-   (:func:`roll_back_interrupted_transaction`). It then
+   :func:`read_trial_stats`, which captures the journal once for every phase.
+4. :func:`claim_ledger` rescans strictly if the scan did not complete, and
+   cuts a partial final record a crashed writer left, under Optuna's own
+   journal lock (:func:`repair_incomplete_journal_record`). It then
    discovers every existing phase study by opening it on live storage
    (:func:`open_existing_study`), checks each study's artifact root, re-reads
    the tree binding, and only then writes: the ledger's directory, the tree
@@ -40,31 +41,33 @@ attempt-registry recovery reaches a foreign ledger only through
 :func:`open_registry_study`, which scans that ledger's format first and never
 creates it.
 
-Pure reads, the format scan, and every existence probe use SQLite ``mode=ro``
-URIs and replayed journal snapshots (:class:`_JournalSnapshot`), never a live
-backend, so a status poll can never initialize, stamp, or recover a ledger it
-was only meant to observe. A ``mode=ro`` open cannot roll back a hot journal,
-so only a mutating caller, under the lock, lets SQLite finish that crash
-recovery; it opens the existing file read-write and never creates one.
+Pure reads, the format scan, and every existence probe replay a captured
+journal snapshot (:class:`_JournalSnapshot`), never a live backend, so a
+status poll can never initialize, stamp, or recover a ledger it was only
+meant to observe.
 """
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
 import os
-import shlex
-import sqlite3
-from collections.abc import Iterable, Mapping, Sequence
+import secrets
+import stat
+import threading
+import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
 import optuna
 from optuna.storages import JournalStorage
-from optuna.storages.journal import BaseJournalBackend
+from optuna.storages.journal import BaseJournalBackend, JournalFileSymlinkLock
 
 from phasesweep.config import Experiment, Phase
 from phasesweep.engine.artifact_roots import (
@@ -81,7 +84,6 @@ from phasesweep.engine.artifact_roots import (
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
-    LedgerTransactionInterruptedError,
     OperatorAction,
     PhaseSweepError,
     StudySchemaMismatchError,
@@ -101,10 +103,8 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
 )
 from phasesweep.runtime.files import (
-    file_url_path,
-    sqlite_database_path,
-    sqlite_existing_readwrite_uri,
-    sqlite_readonly_uri,
+    fsync_directory,
+    journal_file_path,
     storage_backend,
     storage_is_in_memory,
 )
@@ -117,9 +117,9 @@ __all__ = [
     "open_phase_study",
     "open_preview_study",
     "open_registry_study",
-    "read_phase_trial_stats",
-    "require_complete_journal",
-    "roll_back_interrupted_transaction",
+    "read_trial_stats",
+    "repair_incomplete_journal_record",
+    "resolved_ledger_path",
     "validate_ledger",
 ]
 
@@ -127,7 +127,7 @@ log = logging.getLogger(__name__)
 
 #: Which durable form a ledger takes. ``"memory"`` is deliberate no-ledger
 #: execution, so nothing about it is on disk to validate, bind, or reopen.
-Backend = Literal["memory", "sqlite", "journal"]
+Backend = Literal["memory", "journal"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,9 +138,8 @@ class ValidatedLedger:
     :func:`validate_ledger` checked the artifact-root binding first and only
     then scanned the ledger's format, and it did both without creating a study,
     constructing file-backed storage, or writing a byte. On a bound tree the
-    scan may have been unable to read the ledger, and on any tree it may have
-    stopped at a SQLite transaction a crash interrupted; the handle then says
-    so (:attr:`format_verified` is ``False``) and proves only the binding check.
+    scan may have been unable to read the ledger; the handle then says so
+    (:attr:`format_verified` is ``False``) and proves only the binding check.
     Read paths need nothing more, so this handle is all they take.
 
     It is deliberately *not* enough to create or open a study to run trials
@@ -149,7 +148,7 @@ class ValidatedLedger:
     nothing else. The type split does not keep this handle away from live
     storage, though: :func:`open_existing_study` takes it and returns a live,
     writable study. Pure read paths never call that opener; they read through
-    :func:`read_phase_trial_stats`, which never constructs file-backed storage.
+    :func:`read_trial_stats`, which never constructs file-backed storage.
     Outside this module, the one caller that opens existing studies live on
     this handle is MCP recovery. Because it reaps and tells trials through
     them, it applies the per-study artifact-root ownership check itself before
@@ -169,10 +168,8 @@ class ValidatedLedger:
     binding_state: BindingState
     #: Why the ledger-wide format scan did not complete, or ``None`` when it
     #: did. Only a bound tree tolerates an unreadable scan, so publication data
-    #: stays readable; any tree records an interrupted SQLite transaction, so a
-    #: locked caller can let SQLite roll it back. Nothing that depends on the
-    #: ledger's format may treat such a handle as scanned (see
-    #: :attr:`format_verified`).
+    #: stays readable. Nothing that depends on the ledger's format may treat
+    #: such a handle as scanned (see :attr:`format_verified`).
     format_scan_failure: StudyStorageUnavailableError | None
 
     @property
@@ -206,33 +203,17 @@ class ClaimedLedger(ValidatedLedger):
     studies: Mapping[str, optuna.Study]
 
 
-def _journal_path(url: str) -> Path:
-    """Resolve a ``journal:///`` storage URL to the journal file it names.
-
-    Every journal path in this module comes from here, so the directory
-    :func:`claim_ledger` prepares, the file the snapshot reader opens, and
-    the file the live backend appends to can never drift apart.
-
-    :param str url: Journal storage URL, including escaped ``file:`` forms.
-    :return Path: The journal file, with ``~`` expanded and nothing else resolved.
-    """
-    return Path(file_url_path(url)).expanduser()
-
-
 def _resolve_storage(url: str | None) -> Any:
-    """Translate a storage URL into an Optuna storage object or pass through.
+    """Translate a storage URL into an Optuna storage object.
 
     Recognized schemes:
-      * Any URL recognized by :func:`storage_is_in_memory` -> in-memory study
-        (not resumable).
+      * ``None`` (the only in-memory spelling) -> in-memory study (not resumable).
       * ``journal:///path.journal`` -> Optuna ``JournalStorage(JournalFileBackend(path))``.
         Safe for parallel ``n_jobs`` on a single host.
-      * ``sqlite:///path.db`` -> passed to Optuna unchanged.
 
     ``Experiment.resolved_storage`` selects the URL for ``storage: auto`` before
-    this helper is called. Explicit SQLite URLs are never rewritten; validation
-    rejects those with parallel jobs. Journal URLs also accept escaped
-    ``file:`` filenames with ``uri=true``, as generated by auto storage.
+    this helper is called. Journal URLs also accept escaped ``file:`` filenames
+    with ``uri=true``, as generated by auto storage.
 
     The ledger's parent directory is *not* created here. Resolving a URL is
     something read paths do too, and a read must never bring a ledger
@@ -240,22 +221,25 @@ def _resolve_storage(url: str | None) -> Any:
     it binds the tree.
 
     Args:
-        url: The resolved storage URL, or an in-memory sentinel.
+        url: The resolved journal storage URL, or ``None`` for in-memory.
 
     Returns:
-        ``None`` for in-memory; a configured ``JournalStorage`` for the
-        ``journal:///`` scheme; the SQLite URL unchanged otherwise.
+        ``None`` for in-memory; a configured ``JournalStorage`` otherwise.
+
+    :raises ValueError: ``url`` selects an unsupported local storage backend.
 
     """
-    if url is None or storage_is_in_memory(url):
+    if storage_is_in_memory(url):
         return None
-    if storage_backend(url) == "journal":
-        path = _journal_path(url)
-        log.info("Using JournalFileStorage at %s", path)
-        from optuna.storages.journal import JournalFileBackend
+    assert url is not None
+    backend = storage_backend(url)
+    if backend != "journal":
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
+    path = journal_file_path(url)
+    log.info("Using JournalFileStorage at %s", path)
+    from optuna.storages.journal import JournalFileBackend
 
-        return JournalStorage(JournalFileBackend(str(path)))
-    return url
+    return JournalStorage(JournalFileBackend(str(path)))
 
 
 def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> optuna.Study:
@@ -277,58 +261,6 @@ def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> op
         direction=experiment.metric.goal,
         load_if_exists=True,
     )
-
-
-def _sqlite_study_exists(storage_url: str, study_name: str) -> bool:
-    """Return whether a SQLite storage already contains the named study.
-
-    Strict and tri-state on purpose (PR #5 review / reviewer 2, issue 1):
-    callers use this verdict to decide whether root-binding and recovery
-    guards apply, so "the database could not be read" must never collapse
-    into "the study does not exist" -- a briefly locked file would then skip
-    the artifact-root check for a study that becomes readable one call later.
-    Only two conditions report absence: the database file does not exist, or
-    it exists without Optuna's schema (nothing ever created a study in it).
-    Every other read failure raises. Observational polling keeps its tolerant
-    reader (:func:`_sqlite_phase_trial_stats`), where ``available: false`` is
-    part of the contract.
-
-    :param str storage_url: SQLite storage URL to probe.
-    :param str study_name: Study whose existence is checked.
-    :return bool: ``True`` when the database contains the study, ``False``
-        when the database or its schema does not exist.
-    :raises StudyStorageUnavailableError: The database file exists but could
-        not be read (locked, corrupt, permission-denied, ...), so whether the
-        study exists cannot be determined.
-    """
-    uri = sqlite_readonly_uri(storage_url)
-    database = sqlite_database_path(storage_url)
-    if uri is None or database is None or not database.exists():
-        return False
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=0.1)
-        try:
-            row = conn.execute(
-                "SELECT 1 FROM studies WHERE study_name = ? LIMIT 1",
-                (study_name,),
-            ).fetchone()
-        finally:
-            conn.close()
-    except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc):
-            # The file exists but holds no Optuna schema: nothing ever
-            # created a study in it, which is genuine absence.
-            return False
-        raise StudyStorageUnavailableError(
-            f"SQLite storage {database} exists but could not be read while checking for "
-            f"study {study_name!r}."
-        ) from exc
-    except sqlite3.Error as exc:
-        raise StudyStorageUnavailableError(
-            f"SQLite storage {database} exists but could not be read while checking for "
-            f"study {study_name!r}."
-        ) from exc
-    return row is not None
 
 
 @dataclass
@@ -359,7 +291,8 @@ def _capture_journal(path: Path) -> bytes | None:
 
     :param Path path: Journal file to read.
     :return bytes | None: The file's bytes at the size it had when opened, or
-        ``None`` when it does not exist.
+        ``None`` when it does not exist, including when a component of its
+        directory is not a directory, so no journal can exist there.
     :raises OSError: The journal exists but could not be read.
     :raises ValueError: The journal shrank while it was being read.
     """
@@ -367,7 +300,9 @@ def _capture_journal(path: Path) -> bytes | None:
         with path.open("rb") as source:
             size = os.fstat(source.fileno()).st_size
             data = source.read(size)
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
+        # A path under a regular file holds no ledger; claim_ledger's directory
+        # creation then refuses the path as unusable, with its remedy.
         return None
     if len(data) != size:
         raise ValueError("The journal was truncated while its snapshot was being read.")
@@ -408,8 +343,8 @@ def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | 
 
     A final line Optuna would skip is skipped here too (:func:`_journal_records`),
     so a read reports the records a live load would see. Writing after that
-    line is a different matter, and every mutating path first refuses it
-    through :func:`require_complete_journal`.
+    line is a different matter, and every mutating path first removes it
+    through :func:`repair_incomplete_journal_record`.
 
     :param str storage_url: Journal storage URL to inspect.
     :param str label: Study or experiment named in an inspection failure.
@@ -417,7 +352,7 @@ def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | 
     :raises StudyStorageUnavailableError: The journal is unreadable, changed
         while it was read, or holds a malformed record before its last line.
     """
-    path = _journal_path(storage_url)
+    path = journal_file_path(storage_url)
     try:
         data = _capture_journal(path)
         if data is None:
@@ -430,51 +365,313 @@ def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | 
         ) from exc
 
 
-def _require_complete_journal(storage_url: str) -> None:
-    """Refuse to write through a journal whose final record is incomplete.
+def _scan_journal_before_write(path: Path) -> tuple[bytes, int] | None:
+    """Capture a journal a caller is about to write through, and find its complete prefix.
 
-    Optuna appends with no separator check, so its next record would be glued
-    onto the partial line: that record is lost, and once a later record follows
-    it, every reader, Optuna's included, fails on the journal for good. The
-    partial line is never truncated here. The experiment lock does not exclude
-    another experiment's append to a shared journal, so the line may be an
-    append still in flight, and removing it would destroy a live record. Only
-    the file lock Optuna's journal backend takes for every append excludes all
-    writers, and PhaseSweep does not take it. The operator's repair therefore
-    starts with stopping every writer and retrying, and the truncation command
-    it names checks the journal's size first, so a command copied from an
-    earlier refusal truncates nothing once that append has finished.
-
-    :param str storage_url: Journal storage URL a caller is about to write through.
-    :raises IncompleteJournalRecordError: The journal ends with a line Optuna
-        would skip.
-    :raises StudyStorageUnavailableError: The journal could not be read
-        completely.
+    :param Path path: Journal file to scan.
+    :return tuple[bytes, int] | None: The captured bytes and the offset just
+        past their last complete record, or ``None`` when no journal exists.
+    :raises StudyStorageUnavailableError: The journal could not be read, or a
+        malformed record is followed by another. An interrupted append damages
+        only the final record, so that is corruption, and nothing repairs it
+        automatically.
     """
-    path = _journal_path(storage_url)
     try:
         data = _capture_journal(path)
-        if data is None:
-            return
+    except (OSError, ValueError) as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {path} could not be read before writing to it: {exc}. "
+            "Nothing was written."
+        ) from exc
+    if data is None:
+        return None
+    try:
         _records, end = _journal_records(data)
+    except ValueError as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {path} holds a malformed record that other records follow. "
+            "An interrupted append damages only the final record, so this is corruption "
+            "and is never repaired automatically: restore the journal from a backup, "
+            f"including any `{path.name}.*.bak` copy a repair left beside it, or recover "
+            "it by hand. Nothing was written."
+        ) from exc
+    return data, end
+
+
+def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] | None:
+    """Back up a journal, then cut its incomplete final record; the caller holds its lock.
+
+    :param _JournalLock lock: The journal's Optuna journal lock, held by the caller.
+    :return tuple[Path, int] | None: The backup's path and the number of bytes
+        removed, or ``None`` when the final record had completed by the time
+        the lock was taken, so nothing needed repair.
+    :raises IncompleteJournalRecordError: The journal has another hard-linked
+        name, whose appends take a different lock; the backup or the
+        truncation failed; or, while the lock was held, another process
+        replaced it or the journal changed size.
+    :raises StudyStorageUnavailableError: The journal could not be read, holds
+        a malformed record before its last, or does not replay once repaired.
+    """
+    path = lock.path
+    scanned = _scan_journal_before_write(path)
+    if scanned is None or scanned[1] == len(scanned[0]):
+        return None
+    data, end = scanned
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    backup = path.with_name(f"{path.name}.{stamp}.bak")
+    try:
+        with path.open("r+b") as journal:
+            source = os.fstat(journal.fileno())
+            if source.st_nlink != 1:
+                raise IncompleteJournalRecordError(
+                    f"Journal storage {path} has {source.st_nlink} hard links. An append "
+                    "through another of those names takes a different journal lock, so its "
+                    f"incomplete final record was not repaired. Make {path} the journal's "
+                    "only name, then retry. Nothing was written."
+                )
+            # The copy holds every study and trial attribute the journal does, so
+            # it is created no more permissive than the journal; the umask can
+            # only narrow it further.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            with os.fdopen(os.open(backup, flags, stat.S_IMODE(source.st_mode)), "wb") as copy:
+                copy.write(data)
+                copy.flush()
+                os.fsync(copy.fileno())
+            fsync_directory(path.parent)
+            if not lock.held():
+                raise IncompleteJournalRecordError(
+                    f"Journal storage {path}: another process removed or replaced its journal "
+                    "lock during the repair, so its incomplete final record was not truncated. "
+                    f"The journal as it was is saved at {backup}. Retry to check it again. "
+                    "Nothing was appended.",
+                    action=OperatorAction.RETRY,
+                )
+            if os.fstat(journal.fileno()).st_size != len(data):
+                raise IncompleteJournalRecordError(
+                    f"Journal storage {path} changed while its journal lock was held for "
+                    "repair, so it was not truncated. The journal as it was is saved at "
+                    f"{backup}. Retry to check it again. Nothing was appended.",
+                    action=OperatorAction.RETRY,
+                )
+            journal.truncate(end)
+            os.fsync(journal.fileno())
+    except OSError as exc:
+        raise IncompleteJournalRecordError(
+            f"Journal storage {path} ends with an incomplete record that could not be "
+            f"repaired: {exc}. Restore write access to the journal and its directory, "
+            "then retry. Nothing was appended."
+        ) from exc
+    try:
+        repaired = _capture_journal(path)
+        if repaired is None or len(repaired) != end:
+            raise ValueError("the repaired journal does not end at its last complete record")
+        records, repaired_end = _journal_records(repaired)
+        if repaired_end != end:
+            raise ValueError("the repaired journal still ends with an incomplete record")
+        JournalStorage(_JournalSnapshot(records))
     except Exception as exc:
         raise StudyStorageUnavailableError(
-            f"Journal storage {path} could not be completely read before writing to it."
+            f"Journal storage {path} does not replay after its incomplete final record was "
+            f"removed. The journal as it was is saved at {backup}. Restore the journal "
+            "from a backup or recover it by hand. Nothing was appended."
         ) from exc
-    if end == len(data):
+    return backup, len(data) - end
+
+
+#: How long a repair waits for Optuna's journal lock before refusing. An
+#: append holds that lock for one write and fsync, so a lock held this long
+#: was almost certainly left by a writer killed mid-append, the same crash
+#: that leaves an incomplete final record.
+_JOURNAL_LOCK_WAIT_SECONDS = 30.0
+
+#: How often a repair refreshes the journal's modification time while it
+#: holds Optuna's journal lock. Optuna 4.2 and later force-release a lock
+#: whose journal a waiting writer has seen unchanged for 30 seconds.
+_JOURNAL_LOCK_REFRESH_SECONDS = 1.0
+
+
+class _JournalLock:
+    """Optuna's journal lock on one journal, taken and held by a repair.
+
+    Optuna's lock is a ``<journal>.lock`` symlink to the journal that records
+    no owner. Its ``acquire`` has no timeout, so a lock a killed writer left
+    behind can block it forever: Optuna 4.0 and 4.1 never release a stale
+    lock, and later releases retry forever when the symlink dangles. Those
+    later releases also remove a lock whose journal a waiting writer has seen
+    unchanged for 30 seconds, then take their own, and a repair can hold the
+    lock that long on a large journal.
+
+    :meth:`acquire` therefore waits at most :data:`_JOURNAL_LOCK_WAIT_SECONDS`
+    and never removes a lock it did not take. The journal's modification time
+    is refreshed before every attempt and, while the lock is held, every
+    :data:`_JOURNAL_LOCK_REFRESH_SECONDS`, so no waiting writer sees it
+    unchanged for long enough to take the lock over. The symlink is created
+    under a private name and hard-linked into place, and the private name
+    stays linked to it until release. While it does, the inode cannot be
+    reused, so :meth:`held` tells this lock from one another process created
+    after removing it, and :meth:`release` never removes that one.
+    """
+
+    def __init__(self, path: Path) -> None:
+        """Name the lock on one journal without taking it.
+
+        :param Path path: Journal to lock, as
+            :func:`~phasesweep.runtime.files.journal_file_path` returns it.
+        """
+        self.path = path
+        self.lock_file = Path(f"{path}.lock")  # Optuna's LOCK_FILE_SUFFIX
+        self._staged = path.with_name(f".{self.lock_file.name}.{secrets.token_hex(8)}.tmp")
+        self._releasing = threading.Event()
+        self._refresher = threading.Thread(
+            target=self._refresh, name=f"refresh {self.lock_file.name}", daemon=True
+        )
+
+    def _refresh(self) -> None:
+        """Refresh the journal's modification time until the lock is released."""
+        while not self._releasing.wait(_JOURNAL_LOCK_REFRESH_SECONDS):
+            with contextlib.suppress(OSError):
+                os.utime(self.path)
+
+    def acquire(self) -> None:
+        """Take the lock, or refuse once the bounded wait runs out.
+
+        :raises IncompleteJournalRecordError: The lock was still held when the
+            wait ran out, or it could not be created.
+        """
+        deadline = time.monotonic() + _JOURNAL_LOCK_WAIT_SECONDS
+        delay = 0.001
+        try:
+            os.symlink(self.path, self._staged)
+            while True:
+                # First, so an Optuna writer whose grace period ran out on an
+                # earlier lock sees the journal change once this one appears.
+                os.utime(self.path)
+                try:
+                    os.link(self._staged, self.lock_file, follow_symlinks=False)
+                except FileExistsError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise IncompleteJournalRecordError(
+                            f"Journal storage {self.path} ends with an incomplete record, and "
+                            f"its journal lock {self.lock_file} was still held after "
+                            f"{_JOURNAL_LOCK_WAIT_SECONDS:g} seconds, so the record was not "
+                            "repaired. A writer killed mid-append leaves both behind. If no "
+                            f"process is writing to this journal, remove {self.lock_file}, then "
+                            "retry. Nothing was written."
+                        ) from None
+                    time.sleep(min(delay, remaining))
+                    delay = min(delay * 2, 1.0)
+                else:
+                    self._refresher.start()
+                    return
+        except BaseException as exc:
+            self.release()
+            if isinstance(exc, OSError):
+                raise IncompleteJournalRecordError(
+                    f"Journal storage {self.path} ends with an incomplete record that could not "
+                    f"be repaired: its journal lock could not be taken: {exc}. Restore write "
+                    "access to the journal and its directory, then retry. Nothing was written."
+                ) from exc
+            raise
+
+    def held(self) -> bool:
+        """Report whether the lock in place is still the one this repair took.
+
+        :return bool: ``False`` when the lock is gone or another process's.
+        """
+        try:
+            lock, staged = self.lock_file.lstat(), self._staged.lstat()
+        except OSError:
+            return False
+        return (lock.st_dev, lock.st_ino) == (staged.st_dev, staged.st_ino)
+
+    def release(self) -> bool:
+        """Stop the refresh, and remove the lock only while it is this repair's.
+
+        :return bool: Whether the lock was removed. ``False`` means another
+            process had removed or replaced it, and its lock is left in place.
+        """
+        self._releasing.set()
+        if self._refresher.ident is not None:
+            self._refresher.join()
+        released = False
+        if self.held():
+            try:
+                JournalFileSymlinkLock(str(self.path)).release()
+            except RuntimeError:
+                pass
+            else:
+                released = True
+        with contextlib.suppress(OSError):
+            self._staged.unlink()
+        return released
+
+
+def _repair_incomplete_journal_record(storage_url: str) -> None:
+    """Cut a journal's incomplete final record under Optuna's journal lock.
+
+    A writer that dies mid-append leaves a final line Optuna's reader skips,
+    so no reader ever saw that operation. The next append would be glued onto
+    it: that record would be lost too, and once another record followed,
+    every read would fail. A locked caller about to write therefore repairs
+    the journal first, the standard append-only-log repair: keep the longest
+    prefix of complete records and discard the uncertain suffix.
+
+    The fast path takes no lock: a journal whose final record is complete
+    needs nothing. Otherwise the repair takes Optuna's
+    ``JournalFileSymlinkLock`` on the journal, the lock every Optuna append
+    takes, whatever process or experiment it comes from. While it is held no
+    process is mid-append, so the journal is scanned again under it. A final
+    line that is still incomplete can only be a crashed writer's, and an
+    append that finished while the lock was awaited leaves nothing to repair;
+    no offset from before the lock is ever used. The captured bytes are copied
+    to ``<journal>.<UTC stamp>.bak`` beside it, created no more permissive than
+    the journal, the journal is truncated after its last complete record and
+    fsynced, and it must replay before the lock is released. The lock is a
+    :class:`_JournalLock`: it refuses instead of waiting forever on a lock a
+    killed writer left behind, and keeps waiting Optuna writers from taking
+    it over however long the repair holds it. Once another process has
+    replaced it anyway, the repair neither truncates the journal nor
+    releases that process's lock.
+
+    :param str storage_url: Journal storage URL a caller is about to write through.
+    :raises IncompleteJournalRecordError: The record could not be repaired,
+        the journal lock stayed held past the wait, or another process
+        removed or replaced the journal lock during the repair.
+    :raises StudyStorageUnavailableError: The journal could not be read, holds
+        a malformed record before its last, or did not replay once repaired.
+    """
+    path = journal_file_path(storage_url)
+    scanned = _scan_journal_before_write(path)
+    if scanned is None or scanned[1] == len(scanned[0]):
         return
-    quoted = shlex.quote(str(path))
-    command = f'test "$(wc -c < {quoted})" -eq {len(data)} && truncate -s {end} -- {quoted}'
-    raise IncompleteJournalRecordError(
-        f"Journal storage {path} ends with an incomplete record: a writer crashed while "
-        "appending it, or is still appending it. Appending after it would corrupt the "
-        "journal permanently. Stop every process that uses this journal, then retry. If "
-        "the retry succeeds, the append had finished and nothing needs repair. If it is "
-        "refused again, back up the journal and run the command that refusal names to "
-        "truncate it after its last complete line; the command does nothing if the "
-        "journal has changed since its refusal. For the journal as this refusal saw it: "
-        f"`{command}`. Nothing was written."
+    log.warning(
+        "Journal storage %s ends with an incomplete record; taking its journal lock to repair it.",
+        path,
     )
+    lock = _JournalLock(path)
+    lock.acquire()
+    try:
+        repaired = _truncate_incomplete_journal_record(lock)
+    except BaseException:
+        lock.release()
+        raise
+    if not lock.release():
+        raise IncompleteJournalRecordError(
+            f"Journal storage {path}: another process removed or replaced its journal lock "
+            "while its incomplete final record was being repaired, so an append may have raced "
+            "the repair. That lock was left in place. Retry to check the journal again.",
+            action=OperatorAction.RETRY,
+        )
+    if repaired is not None:
+        backup, dropped = repaired
+        log.warning(
+            "Repaired journal storage %s: removed an incomplete final record of %d bytes "
+            "that no reader could see. The journal as it was is saved at %s.",
+            path,
+            dropped,
+            backup,
+        )
 
 
 def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.Study | None:
@@ -497,60 +694,18 @@ def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.St
         return None
 
 
-def _rollback_pending(exc: sqlite3.Error) -> bool:
-    """Return whether a read-only SQLite open failed only on a hot journal.
-
-    :param sqlite3.Error exc: Failure raised by a ``mode=ro`` connection.
-    :return bool: ``True`` when SQLite refused because rolling back an
-        interrupted transaction needs a write the read-only handle cannot make.
-    """
-    return getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_READONLY_ROLLBACK
-
-
-def _let_sqlite_roll_back(storage_url: str) -> None:
-    """Open an existing SQLite ledger read-write once so SQLite rolls back a hot journal.
-
-    SQLite finishes a crashed transaction's rollback itself, on the first read
-    through a connection that may write. ``mode=rw`` refuses a missing file
-    instead of creating it, so this can never bring a ledger into existence.
-
-    :param str storage_url: SQLite storage URL whose ledger holds a hot journal.
-    :raises LedgerTransactionInterruptedError: SQLite could not open the ledger
-        for writing or could not complete the rollback, so the interrupted
-        transaction remains until write access to the ledger is restored.
-    """
-    database = sqlite_database_path(storage_url)
-    uri = sqlite_existing_readwrite_uri(storage_url)
-    assert database is not None and uri is not None
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
-        try:
-            conn.execute("SELECT 1 FROM sqlite_master").fetchone()
-        finally:
-            conn.close()
-    except sqlite3.Error as exc:
-        # Still the interrupted transaction, but a locked open already failed
-        # to roll it back, so the ledger's write access is what must return.
-        raise LedgerTransactionInterruptedError(
-            f"SQLite storage {database} holds a transaction that a crash interrupted, and "
-            f"SQLite could not roll it back: {exc}. Restore write access to the ledger and "
-            "its directory before retrying.",
-            action=OperatorAction.RESTORE_LEDGER,
-        ) from exc
-
-
 def _scan_ledger_format(storage: str | None) -> None:
     """Reject pre-cutover PhaseSweep studies without mutating local storage.
 
     The check covers every PhaseSweep-shaped study in the selected local
     ledger, not only studies belonging to the current experiment name. This
     prevents a new experiment name or output directory from treating a
-    populated pre-cutover ledger as fresh. SQLite is opened read-only and a
-    journal is replayed from an observational snapshot before Optuna can
-    initialize, stamp, recover, or otherwise mutate the live backend.
+    populated pre-cutover ledger as fresh. The journal is replayed from an
+    observational snapshot before Optuna can initialize, stamp, recover, or
+    otherwise mutate the live backend.
 
     :param str | None storage: Resolved storage URL of the ledger to inspect,
-        or an in-memory sentinel.
+        or ``None`` for in-memory storage.
     :raises StudyStorageUnavailableError: An existing local ledger cannot be
         inspected without mutation.
     :raises StudySchemaMismatchError: A populated PhaseSweep study is unmarked,
@@ -560,103 +715,26 @@ def _scan_ledger_format(storage: str | None) -> None:
         return
     assert storage is not None
     backend = storage_backend(storage)
-    versions: list[tuple[str, object, bool]] = []
-    if backend == "sqlite":
-        database = sqlite_database_path(storage)
-        uri = sqlite_readonly_uri(storage)
-        if database is None or uri is None or not database.exists():
-            return
-        try:
-            conn = sqlite3.connect(uri, uri=True, timeout=0.1)
-            try:
-                # One read transaction, so every query below sees one snapshot.
-                # Autocommit SELECTs each see their own: a study stamped and given
-                # its first trial between two of them would read as unmarked yet
-                # populated, a pre-cutover state the ledger never held.
-                conn.execute("BEGIN")
-                tables = {
-                    str(row[0])
-                    for row in conn.execute(
-                        "SELECT name FROM sqlite_master WHERE type = 'table'"
-                    ).fetchall()
-                }
-                if "studies" not in tables:
-                    return
-                studies = [
-                    (int(study_id), str(name))
-                    for study_id, name in conn.execute(
-                        "SELECT study_id, study_name FROM studies"
-                    ).fetchall()
-                    if "::" in str(name)
-                ]
-                if not studies:
-                    return
-                attrs: dict[str, object] = {}
-                if "study_user_attributes" in tables:
-                    rows = conn.execute(
-                        """
-                        SELECT studies.study_name, study_user_attributes.value_json
-                        FROM studies
-                        JOIN study_user_attributes
-                          ON studies.study_id = study_user_attributes.study_id
-                        WHERE study_user_attributes.key = ?
-                        """,
-                        (STUDY_SCHEMA_ATTR,),
-                    ).fetchall()
-                    for study_name, value_json in rows:
-                        try:
-                            attrs[str(study_name)] = json.loads(value_json)
-                        except (TypeError, json.JSONDecodeError):
-                            attrs[str(study_name)] = value_json
-                populated_study_ids = (
-                    {
-                        int(study_id)
-                        for (study_id,) in conn.execute(
-                            "SELECT DISTINCT study_id FROM trials"
-                        ).fetchall()
-                    }
-                    if "trials" in tables
-                    else set()
-                )
-                versions = [
-                    (name, attrs.get(name), study_id in populated_study_ids)
-                    for study_id, name in studies
-                ]
-            finally:
-                conn.close()
-        except sqlite3.Error as exc:
-            if _rollback_pending(exc):
-                raise LedgerTransactionInterruptedError(
-                    f"SQLite storage {database} holds a transaction that a crash interrupted. "
-                    "Its committed state is intact, but SQLite rolls the transaction back only "
-                    "when it opens the ledger for writing, which a read never does. The next "
-                    "`phasesweep run` or `phasesweep mcp recover-run --confirm` holds the "
-                    "experiment lock and lets SQLite roll it back first. Nothing was written."
-                ) from exc
-            raise StudyStorageUnavailableError(
-                f"SQLite storage {database} could not be inspected for its PhaseSweep "
-                "format without mutation."
-            ) from exc
-    elif backend == "journal":
-        snapshot = _journal_snapshot_storage(storage, "the PhaseSweep format boundary")
-        if snapshot is None:
-            return
-        try:
-            versions = [
-                (
-                    study.study_name,
-                    study.user_attrs.get(STUDY_SCHEMA_ATTR),
-                    bool(snapshot.get_all_trials(study._study_id, deepcopy=False)),
-                )
-                for study in snapshot.get_all_studies()
-                if "::" in study.study_name
-            ]
-        except Exception as exc:
-            raise StudyStorageUnavailableError(
-                "Journal storage could not be replayed while checking its PhaseSweep format."
-            ) from exc
-    else:
+    if backend != "journal":
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
+    versions: list[tuple[str, object, bool]] = []
+    snapshot = _journal_snapshot_storage(storage, "the PhaseSweep format boundary")
+    if snapshot is None:
+        return
+    try:
+        versions = [
+            (
+                study.study_name,
+                study.user_attrs.get(STUDY_SCHEMA_ATTR),
+                bool(snapshot.get_all_trials(study._study_id, deepcopy=False)),
+            )
+            for study in snapshot.get_all_studies()
+            if "::" in study.study_name
+        ]
+    except Exception as exc:
+        raise StudyStorageUnavailableError(
+            "Journal storage could not be replayed while checking its PhaseSweep format."
+        ) from exc
 
     _validate_storage_versions(versions)
 
@@ -688,130 +766,44 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
         )
 
 
-def _load_existing_phase_study(experiment: Experiment, phase: Phase | str) -> optuna.Study | None:
+def _load_existing_phase_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.Study | None:
     """Load a phase study only if it already exists.
 
     Recovery and read-like paths must not call ``create_study(load_if_exists=True)`` because
-    that can create an empty study and make missing evidence look safe. This helper checks
-    persistent storage before delegating to Optuna's loader, then treats an absent study as
-    ``None``.
+    that can create an empty study and make missing evidence look safe. The study is opened
+    the way every existing journal study is (:func:`_open_existing_journal_study`), so an
+    absent study is ``None`` and nothing is created.
 
-    :param Experiment experiment: Parsed experiment config containing storage settings.
+    :param ValidatedLedger ledger: Handle naming the ledger the study lives in.
     :param Phase | str phase: Phase or historical phase name whose study is loaded.
     :return optuna.Study | None: Existing study, or ``None`` when no durable study exists.
     :raises StudyStorageUnavailableError: Persistent storage exists but
         could not be read, so whether the study exists cannot be determined;
         callers on mutating paths must abort rather than treat this as absence.
     """
-    storage = experiment.resolved_storage
-    if storage_is_in_memory(storage):
+    if ledger.backend == "memory":
         return None
-    assert storage is not None
-    backend = storage_backend(storage)
-    study_name = _phase_study_name(experiment, phase)
-    if backend == "sqlite":
-        if not _sqlite_study_exists(storage, study_name):
-            return None
-    elif backend == "journal":
-        if _load_journal_study_snapshot(storage, study_name) is None:
-            return None
-        # Preflight verified a complete snapshot. Mutating callers still use
-        # Optuna's normal backend, including its concurrent-append semantics.
-        return optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
-    else:
-        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
-    try:
-        return optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
-    except KeyError:
-        return None
-
-
-def _decoded_string_attr(value_json: object) -> str | None:
-    """Decode one JSON-encoded trial user attribute as a string.
-
-    :param object value_json: Raw ``trial_user_attributes.value_json`` cell.
-    :return str | None: The decoded value when it is a string; ``None`` for a
-        missing, unparsable, or non-string attribute.
-    """
-    if not isinstance(value_json, str):
-        return None
-    try:
-        value = json.loads(value_json)
-    except (TypeError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, str) else None
-
-
-_PHASE_TRIAL_STATS_SQL = """
-    WITH phase_trials AS (
-        SELECT trials.number,
-               trials.state,
-               generation.value_json AS generation_json,
-               attempt.value_json AS attempt_json,
-               schema.value_json AS schema_json
-        FROM trials
-        JOIN studies ON trials.study_id = studies.study_id
-        LEFT JOIN trial_user_attributes AS generation
-          ON trials.trial_id = generation.trial_id AND generation.key = :generation_key
-        LEFT JOIN trial_user_attributes AS attempt
-          ON trials.trial_id = attempt.trial_id AND attempt.key = :attempt_key
-        LEFT JOIN study_user_attributes AS schema
-          ON studies.study_id = schema.study_id AND schema.key = :study_schema_key
-        WHERE studies.study_name = :study_name
+    assert ledger.storage_url is not None
+    return _open_existing_journal_study(
+        ledger.storage_url, _phase_study_name(ledger.experiment, phase)
     )
-    SELECT 'count', NULL, state, generation_json, NULL, COUNT(*), schema_json
-    FROM phase_trials
-    GROUP BY state, generation_json, schema_json
-    UNION ALL
-    SELECT 'running', number, state, generation_json, attempt_json, 1, schema_json
-    FROM phase_trials
-    WHERE state = 'RUNNING'
-    UNION ALL
-    SELECT 'published', number, state, generation_json, attempt_json, 1, schema_json
-    FROM phase_trials
-    WHERE number = :published_trial_number
-"""
-
-
-def _phase_trial_stats_params(
-    experiment: Experiment,
-    phase: Phase,
-    published_trial: _TrialRef | None,
-) -> dict[str, str | int]:
-    """Return bind parameters for the observational phase-trial SQL query.
-
-    :param Experiment experiment: Config providing the phase's stable study name.
-    :param Phase phase: Phase whose study is queried.
-    :param _TrialRef | None published_trial: Published local trial whose number is included,
-        or ``None`` to bind ``published_trial_number`` to ``-1``.
-    :return dict[str, str | int]: Attribute keys, study name, and published trial number;
-        only the trial number from ``published_trial`` is used.
-    """
-    return {
-        "generation_key": GENERATION_ID_ATTR,
-        "attempt_key": ATTEMPT_ID_ATTR,
-        "study_schema_key": STUDY_SCHEMA_ATTR,
-        "study_name": _phase_study_name(experiment, phase),
-        "published_trial_number": published_trial.trial_number if published_trial else -1,
-    }
 
 
 def _unavailable_phase_trial_stats(
-    experiment: Experiment, phase: Phase, exc: BaseException
+    ledger: ValidatedLedger, phase: Phase, exc: BaseException
 ) -> _PhaseTrialStats:
     """Log a storage-read failure and return an unavailable phase-trial snapshot.
 
-    :param Experiment experiment: Config whose storage backend or local path is reported.
+    :param ValidatedLedger ledger: Handle whose storage is reported.
     :param Phase phase: Phase whose status read failed.
     :param BaseException exc: Read exception whose direct cause is reported when present.
     :return _PhaseTrialStats: Empty count maps and ``running_attempts=None`` with
         ``available=False``.
     """
-    # The interrupted refusal names its own remedy; its sqlite3 cause does not.
-    cause = exc if isinstance(exc, LedgerTransactionInterruptedError) else exc.__cause__ or exc
+    cause = exc.__cause__ or exc
     log.warning(
         "could not read status trial data from storage %s for phase %s: %s: %s",
-        experiment.resolved_storage,
+        ledger.storage_url,
         phase.name,
         type(cause).__name__,
         cause,
@@ -819,180 +811,76 @@ def _unavailable_phase_trial_stats(
     return _PhaseTrialStats({}, False, {}, None)
 
 
-def _sqlite_phase_trial_stats(
-    experiment: Experiment,
-    phase: Phase,
-    published_trial: _TrialRef | None = None,
-) -> _PhaseTrialStats:
-    """Return trial-state counts and RUNNING identities in one SQLite read.
+def _trial_stats(
+    ledger: ValidatedLedger, published_trials: Mapping[str, _TrialRef | None]
+) -> dict[str, _PhaseTrialStats]:
+    """Read every phase's counts and RUNNING identities from one journal capture.
 
-    Status polling must be read-only. Passing a fresh SQLite URL through
-    Optuna's storage constructor can create the database/schema and race the
-    runner's first ``create_study`` call. Opening the file in SQLite read-only
-    mode avoids both side effects: a missing, locked, or still-initializing DB
-    simply reports no counts for now. A confirmed missing file has known zero
-    counts; a failed read, including an unreadable schema, reports unavailable counts.
+    Every phase is answered from the same snapshot, so the phases describe one
+    moment and a status read replays the journal once whatever the phase
+    count. Confirmed absence reports available zero counts; read failures
+    report unavailable counts, for every phase when the capture itself fails.
 
-    Counts and RUNNING identities come from one CTE-backed statement, so one
-    storage snapshot. SQL aggregates terminal rows by state and generation,
-    while the ``UNION ALL`` arms return RUNNING identities and the requested
-    published trial. This
-    avoids transferring every historical trial on every status poll without
-    splitting the read into two snapshots that could disagree during a live
-    write (PR #5 review / reviewer 2, blocker 6).
-
-    :param Experiment experiment: Parsed experiment config containing the SQLite storage URL.
-    :param Phase phase: Phase whose stable Optuna study name is counted.
-    :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
-    :return _PhaseTrialStats: Counts, RUNNING identities, and an availability
-        flag; counts are empty, running attempts ``None``, and availability
-        false when the DB cannot be read safely.
+    :param ValidatedLedger ledger: Handle naming the ledger the studies live in.
+    :param Mapping[str, _TrialRef | None] published_trials: Published local trial to
+        verify in the snapshot, by phase name.
+    :return dict[str, _PhaseTrialStats]: One permissive result per configured
+        phase, by phase name, with explicit availability.
+    :raises StudySchemaMismatchError: A phase's study is populated under a
+        pre-cutover or unsupported schema.
     """
-    assert experiment.resolved_storage is not None
-    uri = sqlite_readonly_uri(experiment.resolved_storage)
-    if uri is None:
-        return _PhaseTrialStats({}, False, {}, None)
-    database = sqlite_database_path(experiment.resolved_storage)
-    assert database is not None
+    phases = ledger.experiment.phases
+    if ledger.backend == "memory":
+        return {phase.name: _PhaseTrialStats({}, False, {}, None) for phase in phases}
+    assert ledger.storage_url is not None
     try:
-        database.stat()
-    except FileNotFoundError:
-        return _PhaseTrialStats({}, True, {}, [])
-    except OSError as exc:
-        return _unavailable_phase_trial_stats(experiment, phase, exc)
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=0.1)
-        try:
-            rows = conn.execute(
-                _PHASE_TRIAL_STATS_SQL,
-                _phase_trial_stats_params(experiment, phase, published_trial),
-            ).fetchall()
-        finally:
-            conn.close()
-    except sqlite3.Error as exc:
-        return _unavailable_phase_trial_stats(experiment, phase, exc)
-    return _trial_stats_from_rows(
-        rows, study_name=_phase_study_name(experiment, phase), published_trial=published_trial
-    )
-
-
-def _trial_stats_from_rows(
-    rows: Iterable[Sequence[Any]], *, study_name: str, published_trial: _TrialRef | None = None
-) -> _PhaseTrialStats:
-    """Decode aggregated counts and RUNNING identities from a SQL snapshot.
-
-    :param Iterable[Sequence[Any]] rows: Rows from the observational SQL query.
-    :param str study_name: Study name used in damaged-row diagnostics.
-    :param _TrialRef | None published_trial: Expected local trial from the publication.
-    :return _PhaseTrialStats: Counts and running identities from the supplied rows.
-    """
-    counts: dict[str, int] = {}
-    generation_counts: dict[str, dict[str, int]] = {}
-    running_attempts: list[_TrialRef] = []
-    published_trial_available = False
-    study_schema: object = None
-    for row_kind, number, state, generation_json, attempt_json, tally, schema_json in rows:
-        try:
-            decoded_schema = (
-                json.loads(schema_json) if isinstance(schema_json, str) else schema_json
-            )
-        except (TypeError, json.JSONDecodeError):
-            decoded_schema = schema_json
-        state_name = str(state)
-        if study_schema is None:
-            study_schema = decoded_schema
-        generation_id = _decoded_string_attr(generation_json)
-        if row_kind == "count":
-            count = int(tally)
-            counts[state_name] = counts.get(state_name, 0) + count
-            if generation_id is not None:
-                states = generation_counts.setdefault(generation_id, {})
-                states[state_name] = states.get(state_name, 0) + count
-            continue
-        if row_kind == "published":
-            published_trial_available = (
-                state_name == "COMPLETE"
-                and _TrialRef(number, generation_id, _decoded_string_attr(attempt_json))
-                == published_trial
-            )
-            continue
-        if row_kind != "running":
-            continue
-        if not isinstance(number, int):
-            # Optuna assigns ``number`` in the same INSERT that creates the
-            # row, so a missing one is a damaged row rather than a race with
-            # a live writer. It still counts as RUNNING; it just has no
-            # identity to report.
-            log.warning(
-                "study %s has a RUNNING trial with no trial number; "
-                "omitting it from the reported running attempts",
-                study_name,
-            )
-            continue
-        running_attempts.append(
-            _TrialRef(
-                trial_number=number,
-                generation_id=generation_id,
-                attempt_id=_decoded_string_attr(attempt_json),
-            )
+        snapshot = _journal_snapshot_storage(
+            ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
         )
-    # The phase's own study answers to the same cutover rule as the ledger-wide
-    # scan. Its stamp is only visible here through its trial rows, so an empty
-    # study reads as unstamped and passes; judging an empty study's stamp is
-    # the job of the scan validate_ledger already ran.
-    _validate_storage_versions([(study_name, study_schema, bool(counts))])
-    return _PhaseTrialStats(
-        counts, True, generation_counts, running_attempts, published_trial_available
-    )
+    except Exception as exc:  # noqa: BLE001
+        return {phase.name: _unavailable_phase_trial_stats(ledger, phase, exc) for phase in phases}
+    stats: dict[str, _PhaseTrialStats] = {}
+    for phase in phases:
+        if snapshot is None:
+            stats[phase.name] = _PhaseTrialStats({}, True, {}, [])
+            continue
+        try:
+            stats[phase.name] = _phase_trial_stats(
+                snapshot,
+                _phase_study_name(ledger.experiment, phase),
+                published_trials.get(phase.name),
+            )
+        except StudySchemaMismatchError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            stats[phase.name] = _unavailable_phase_trial_stats(ledger, phase, exc)
+    return stats
 
 
 def _phase_trial_stats(
-    experiment: Experiment,
-    phase: Phase,
-    published_trial: _TrialRef | None = None,
+    snapshot: JournalStorage, study_name: str, published_trial: _TrialRef | None
 ) -> _PhaseTrialStats:
-    """Read counts and RUNNING identities without creating a missing study.
+    """Read one study's counts and RUNNING identities from a captured snapshot.
 
-    SQL backends use one SELECT statement; journal storage uses one trial list.
-    Counts, RUNNING identities, and published trial verification therefore
-    describe the same snapshot.
-    Confirmed absence reports available zero counts; read failures report
-    unavailable counts.
+    Counts, RUNNING identities, and published trial verification all come
+    from ``snapshot``, so they describe the same moment. An absent study
+    reports available zero counts.
 
-    :param Experiment experiment: Parsed experiment config containing storage settings.
-    :param Phase phase: Phase whose existing study is inspected.
+    :param JournalStorage snapshot: Captured journal replay to read.
+    :param str study_name: Ledger study name of the phase inspected.
     :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
-    :return _PhaseTrialStats: One permissive storage snapshot with explicit availability.
+    :return _PhaseTrialStats: The study's available counts and identities.
+    :raises StudySchemaMismatchError: The study is populated under a
+        pre-cutover or unsupported schema.
     """
-    if experiment.resolved_storage is None:
-        return _PhaseTrialStats({}, False, {}, None)
-    backend = storage_backend(experiment.resolved_storage)
-    if backend == "sqlite":
-        return _sqlite_phase_trial_stats(experiment, phase, published_trial)
-    if backend != "journal":
-        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     try:
-        snapshot = _journal_snapshot_storage(
-            experiment.resolved_storage,
-            f"study {_phase_study_name(experiment, phase)!r}",
-        )
-        if snapshot is None:
-            return _PhaseTrialStats({}, True, {}, [])
-        try:
-            study = optuna.load_study(
-                study_name=_phase_study_name(experiment, phase),
-                storage=snapshot,
-            )
-        except KeyError:
-            return _PhaseTrialStats({}, True, {}, [])
-        trials = study.get_trials(deepcopy=False)
-        _validate_storage_versions(
-            [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
-        )
-    except StudySchemaMismatchError:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        return _unavailable_phase_trial_stats(experiment, phase, exc)
+        study = optuna.load_study(study_name=study_name, storage=snapshot)
+    except KeyError:
+        return _PhaseTrialStats({}, True, {}, [])
+    trials = study.get_trials(deepcopy=False)
+    _validate_storage_versions(
+        [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
+    )
     counts: dict[str, int] = {}
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
@@ -1020,6 +908,24 @@ def _phase_trial_stats(
     )
 
 
+def resolved_ledger_path(experiment: Experiment) -> Path | None:
+    """Return the real path of the journal file an experiment's ledger lives in.
+
+    ``phasesweep status`` reports it so an operator can point Optuna's own
+    CLI, or a dashboard serving a copy, at the ledger. The path comes from
+    :func:`~phasesweep.runtime.files.journal_file_path` like every other
+    journal path, so it names the file Optuna opens and locks.
+
+    :param Experiment experiment: Experiment whose resolved storage is named.
+    :return Path | None: The journal file, or ``None`` for in-memory storage.
+    """
+    url = experiment.resolved_storage
+    if storage_is_in_memory(url):
+        return None
+    assert url is not None
+    return journal_file_path(url)
+
+
 def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> ValidatedLedger:
     """Build the handle that names one experiment's selected ledger.
 
@@ -1031,18 +937,15 @@ def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> Val
     url = experiment.resolved_storage
     backend: Backend
     ledger_path: Path | None = None
-    if url is None or storage_is_in_memory(url):
+    if storage_is_in_memory(url):
         backend = "memory"
     else:
+        assert url is not None
         named = storage_backend(url)
-        if named == "sqlite":
-            backend = "sqlite"
-            ledger_path = sqlite_database_path(url)
-        elif named == "journal":
-            backend = "journal"
-            ledger_path = _journal_path(url)
-        else:
+        if named != "journal":
             raise ValueError(f"Unsupported local storage backend: {named!r}.")
+        backend = "journal"
+        ledger_path = journal_file_path(url)
     return ValidatedLedger(
         experiment=experiment,
         experiment_name=experiment.experiment,
@@ -1072,14 +975,11 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     fresh" are different facts and must not collapse into one. Once the tree is
     ``"bound"`` its record already proves which ledger owns it, so a transient
     read failure is tolerated, letting frozen publication data stay readable,
-    but it is recorded on the handle rather than hidden. A transaction a crash
-    interrupted is recorded on either tree: SQLite's refusal already proves
-    the ledger exists and is not fresh, and only a locked mutating caller can
-    clear it, so refusing here would stop the one run that would. A handle
-    whose scan did not complete never stands in for one that did: trial-data
-    reads report the ledger unavailable, :func:`open_existing_study` refuses
-    it, and :func:`claim_ledger` runs the scan again, strictly, before it
-    writes anything. A :class:`StudySchemaMismatchError` always propagates.
+    but it is recorded on the handle rather than hidden. A handle whose scan
+    did not complete never stands in for one that did: trial-data reads report
+    the ledger unavailable, :func:`open_existing_study` refuses it, and
+    :func:`claim_ledger` runs the scan again, strictly, before it writes
+    anything. A :class:`StudySchemaMismatchError` always propagates.
 
     :param Experiment experiment: Experiment whose tree and ledger must agree.
     :return ValidatedLedger: Handle proving both checks ran, in that order, and
@@ -1089,8 +989,7 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     :raises StudySchemaMismatchError: The ledger holds pre-cutover or otherwise
         unsupported PhaseSweep study state.
     :raises StudyStorageUnavailableError: An unbound tree's ledger exists but
-        cannot be inspected without mutating it, for a reason other than an
-        interrupted transaction.
+        cannot be inspected without mutating it.
     """
     binding_state = _check_artifact_root_binding(experiment)
     ledger = _describe_ledger(experiment, binding_state)
@@ -1099,11 +998,9 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     try:
         _scan_ledger_format(ledger.storage_url)
     except StudyStorageUnavailableError as exc:
-        interrupted = isinstance(exc, LedgerTransactionInterruptedError)
-        if binding_state == "unbound" and not interrupted:
+        if binding_state == "unbound":
             raise
-        # The interrupted refusal names its own remedy; its sqlite3 cause does not.
-        cause = exc if interrupted else exc.__cause__ or exc
+        cause = exc.__cause__ or exc
         log.info(
             "format scan of storage %s did not complete; its trial data is reported "
             "unavailable and any claim rescans first: %s: %s",
@@ -1126,12 +1023,13 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
 
     The study returned is live: it is built on the ledger's real backend and
     can be written through, so this is not a read path's opener (those use
-    :func:`read_phase_trial_stats`). It never creates a study or a ledger
-    file, because absence is settled first by a read-only probe (SQLite
-    ``mode=ro``, or a complete journal snapshot). It checks nothing about
-    which artifact root owns the study. Its two callers do that before they
-    use the study: :func:`claim_ledger` before its first write, and MCP
-    recovery before it reaps anything.
+    :func:`read_trial_stats`). It never creates a study or a ledger
+    file, because absence is settled first by a read-only probe (a complete
+    journal snapshot), and the live replay must then agree with that snapshot
+    (:func:`_open_existing_journal_study`). It checks nothing about which
+    artifact root owns the study. Its two callers do that before they use
+    the study: :func:`claim_ledger` before its first write, and MCP recovery
+    before it reaps anything.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param Phase | str phase: Phase or historical phase name whose study is opened.
@@ -1145,90 +1043,64 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
         # Same type and remedy as the scan's refusal: an interrupted
         # transaction must not read as a ledger to restore.
         raise type(failure).rewrap(failure, str(failure)) from failure
-    return _load_existing_phase_study(ledger.experiment, phase)
+    return _load_existing_phase_study(ledger, phase)
 
 
-def roll_back_interrupted_transaction(ledger: ValidatedLedger) -> ValidatedLedger:
-    """Let SQLite roll back a transaction a crash interrupted, then rescan strictly.
+def repair_incomplete_journal_record(ledger: ValidatedLedger) -> None:
+    """Repair a journal ledger whose final record a crashed writer left partial.
 
-    Only a caller holding :func:`phasesweep.engine.locking._experiment_lock`
-    may call this: it is the one place a handle's ledger is opened for
-    writing before a claim, so every read path stays byte-for-byte read-only.
-    It acts only when :func:`validate_ledger` recorded
-    :class:`LedgerTransactionInterruptedError`. SQLite then rolls the hot
-    journal back on one read-write open of the existing file, which cannot
-    create it, and the format scan runs again, strictly, on the recovered
-    ledger. Any other handle is returned unchanged.
-
-    :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
-    :return ValidatedLedger: The handle, verified when SQLite finished its
-        rollback and the rescan passed; unchanged otherwise.
-    :raises LedgerTransactionInterruptedError: SQLite could not roll the
-        transaction back, routed to restoring the ledger's write access.
-    :raises StudyStorageUnavailableError: The rescan could not read the ledger.
-    :raises StudySchemaMismatchError: The rescan found pre-cutover or
-        otherwise unsupported PhaseSweep study state.
-    """
-    if not isinstance(ledger.format_scan_failure, LedgerTransactionInterruptedError):
-        return ledger
-    assert ledger.storage_url is not None
-    _let_sqlite_roll_back(ledger.storage_url)
-    _scan_ledger_format(ledger.storage_url)
-    return replace(ledger, format_scan_failure=None)
-
-
-def require_complete_journal(ledger: ValidatedLedger) -> None:
-    """Refuse a journal ledger whose final record a crash, or a live writer, left partial.
-
-    Reads tolerate that record exactly as Optuna does, but nothing may append
-    after it, so every path that may write refuses it before any live open:
-    :func:`claim_ledger`, :func:`open_registry_study`, and MCP recovery, whose
-    inspection previews the confirmed write and so refuses it too. The check
-    only reads. Unlike a SQLite hot journal, which SQLite rolls back under its
-    own lock, the partial record is never repaired here (see
-    :func:`_require_complete_journal`). A handle whose format scan did not
-    complete is left to the openers, which refuse it in the scan's own words.
+    Reads skip that record exactly as Optuna does, and removing it changes
+    nothing any reader sees, so only paths about to write repair it, each
+    holding the experiment lock and before any live open: :func:`claim_ledger`,
+    :func:`open_registry_study`, and a confirmed MCP recovery. Recovery
+    inspection leaves it to the confirmed write. A handle whose format scan
+    did not complete is left to the openers, which refuse it in the scan's
+    own words. The repair itself is :func:`_repair_incomplete_journal_record`.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
-    :raises IncompleteJournalRecordError: The journal ends with an incomplete
-        record; the message says to stop every writer and retry, and names a
-        size-guarded command that truncates it if the refusal persists.
-    :raises StudyStorageUnavailableError: The journal could not be read.
+    :raises IncompleteJournalRecordError: The record could not be repaired, or
+        the journal lock was lost during the repair.
+    :raises StudyStorageUnavailableError: The journal could not be read, holds
+        a malformed record before its last, or did not replay once repaired.
     """
     if ledger.backend != "journal" or not ledger.format_verified:
         return
     assert ledger.storage_url is not None
-    _require_complete_journal(ledger.storage_url)
+    _repair_incomplete_journal_record(ledger.storage_url)
 
 
-def read_phase_trial_stats(
-    ledger: ValidatedLedger,
-    phase: Phase,
-    published_trial: _TrialRef | None = None,
-) -> _PhaseTrialStats:
-    """Read one phase's counts and RUNNING identities from a validated ledger.
+def read_trial_stats(
+    ledger: ValidatedLedger, published_trials: Mapping[str, _TrialRef | None]
+) -> dict[str, _PhaseTrialStats]:
+    """Read every phase's counts and RUNNING identities from a validated ledger.
 
-    The snapshot is permissive by design -- an unreadable ledger reports
+    The read is permissive by design -- an unreadable ledger reports
     ``available=False`` rather than raising -- because the ledger's *format* was
     already settled by :func:`validate_ledger` before this handle existed. That
     is why no format argument appears here: the scan is not this read's job.
-    When the scan did not complete, the phase is reported unavailable without
+    When the scan did not complete, every phase is reported unavailable without
     being read, since counts read around that gap would present the ledger as
-    current-format when nothing verified it. The phase's own study still
+    current-format when nothing verified it. Each phase's own study still
     answers to the same cutover rule as a second line of defence.
 
+    The journal is captured here, once for every phase, rather than reused
+    from the format scan, so a caller that resolves the publication pointer
+    first reads a capture holding every trial that pointer published.
+
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
-    :param Phase phase: Phase whose existing study is inspected.
-    :param _TrialRef | None published_trial: Published local trial to verify in
-        this same snapshot.
-    :return _PhaseTrialStats: One permissive storage snapshot with explicit
-        availability.
-    :raises StudySchemaMismatchError: The phase's own study is populated under
-        a pre-cutover or unsupported schema.
+    :param Mapping[str, _TrialRef | None] published_trials: Published local trial to
+        verify in the same snapshot, by phase name.
+    :return dict[str, _PhaseTrialStats]: One permissive result per configured
+        phase, by phase name, with explicit availability.
+    :raises StudySchemaMismatchError: A phase's own study is populated under a
+        pre-cutover or unsupported schema.
     """
     if ledger.format_scan_failure is not None:
-        return _unavailable_phase_trial_stats(ledger.experiment, phase, ledger.format_scan_failure)
-    return _phase_trial_stats(ledger.experiment, phase, published_trial)
+        return {
+            phase.name: _unavailable_phase_trial_stats(ledger, phase, ledger.format_scan_failure)
+            for phase in ledger.experiment.phases
+        }
+    return _trial_stats(ledger, published_trials)
 
 
 # Creating a directory fails with these when the configured path itself is
@@ -1273,8 +1145,8 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     fine, no such study), *present* (loaded and kept), or *unavailable* -- and
     unavailable raises before any claim, reaping, or registry recovery runs.
     Swallowing a read failure and letting preflight read again would be unsafe:
-    a transient failure (for example, a brief SQLite lock) could succeed on the
-    second read and hand stale-trial reaping a study whose artifact-root
+    a transient failure (for example, a brief journal-ledger lock) could
+    succeed on the second read and hand stale-trial reaping a study whose artifact-root
     binding was never checked. The returned handle's ``studies`` is therefore
     the *only* discovery pass: the objects that passed the root check here are
     the exact objects preflight goes on to reap and validate.
@@ -1298,19 +1170,18 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     A handle whose format scan did not complete (a bound tree tolerated an
     unreadable ledger) is scanned again here, strictly, before discovery: a
     mutating caller must never proceed on a ledger whose foreign studies were
-    not format-checked, so the returned handle is always verified. When the
-    scan stopped at a transaction a crash interrupted, SQLite first rolls it
-    back (:func:`roll_back_interrupted_transaction`); the caller's lock is
-    what allows that write. A journal whose final record is partial is
-    refused before discovery opens it live (:func:`require_complete_journal`).
+    not format-checked, so the returned handle is always verified. A journal
+    whose final record a crashed writer left partial is repaired before
+    discovery opens it live (:func:`repair_incomplete_journal_record`).
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
     :param str | None from_phase: Resume point; earlier phases will not execute.
     :return ClaimedLedger: Bound handle carrying every existing phase study.
-    :raises StudyStorageUnavailableError: SQLite could not roll back an
-        interrupted transaction, the ledger's format could still not be
-        scanned, a journal's final record is incomplete, or a phase's
-        persistent storage could not be inspected.
+    :raises IncompleteJournalRecordError: A journal's partial final record
+        could not be repaired.
+    :raises StudyStorageUnavailableError: The ledger's format could still not
+        be scanned, the journal holds a malformed record before its last, or
+        a phase's persistent storage could not be inspected.
     :raises StudySchemaMismatchError: The rescan found pre-cutover or otherwise
         unsupported PhaseSweep study state.
     :raises PublishedStudyMissingError: A phase to execute has a published
@@ -1321,11 +1192,10 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     :raises PhaseSweepError: The ledger's directory could not be created;
         nothing was bound or claimed.
     """
-    ledger = roll_back_interrupted_transaction(ledger)
     if not ledger.format_verified:
         _scan_ledger_format(ledger.storage_url)
         ledger = replace(ledger, format_scan_failure=None)
-    require_complete_journal(ledger)
+    repair_incomplete_journal_record(ledger)
     experiment = ledger.experiment
     loaded: dict[str, optuna.Study] = {}
     for phase in experiment.phases:
@@ -1359,7 +1229,8 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
         )
     # The ledger's directory is the first write, so a path that cannot hold a
     # ledger fails before the tree is bound to it and the path can still be
-    # corrected. Both backends need it: SQLite creates only the file.
+    # corrected. A journal ledger needs it created; only its file is created
+    # for it.
     if ledger.ledger_path is not None:
         _create_ledger_directory(ledger.ledger_path.parent)
     # Both directions are now known-compatible. Claim the tree first, then
@@ -1463,10 +1334,41 @@ def _require_replay_matches_snapshot(
             )
         ):
             raise StudyStorageUnavailableError(
-                f"Journal storage {_journal_path(locator)} changed while "
+                f"Journal storage {journal_file_path(locator)} changed while "
                 f"study {snapshot.study_name!r} was being opened: trial {captured.number} "
                 "no longer matches the complete snapshot read first."
             )
+
+
+def _open_existing_journal_study(storage_url: str, study_name: str) -> optuna.Study | None:
+    """Open a journal study live only after a complete snapshot proves it exists.
+
+    Optuna's own loader would create a missing journal file before reporting
+    the study absent from it, so absence is settled first by a read-only
+    snapshot. The live study is what the caller writes through, with Optuna's
+    concurrent-append semantics, and its replay must agree with that snapshot:
+    a journal that loses the study or any of its trials between the two reads
+    is uncertain, not absent.
+
+    :param str storage_url: Journal storage URL holding the study.
+    :param str study_name: Study to open.
+    :return optuna.Study | None: The live study, or ``None`` when the complete
+        snapshot holds no such study.
+    :raises StudyStorageUnavailableError: The snapshot is unreadable or
+        incomplete, or the live replay disagrees with it.
+    """
+    snapshot = _load_journal_study_snapshot(storage_url, study_name)
+    if snapshot is None:
+        return None
+    try:
+        live = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage_url))
+    except KeyError as exc:
+        raise StudyStorageUnavailableError(
+            f"Journal storage {journal_file_path(storage_url)} lost study "
+            f"{study_name!r} between its complete snapshot and the live replay."
+        ) from exc
+    _require_replay_matches_snapshot(snapshot, live, storage_url)
+    return live
 
 
 def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
@@ -1480,19 +1382,18 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
     it is opened. This release wrote the registry entry, so the ledger it names
     was current-format when the attempt registered; pre-cutover state there now
     means the locator no longer names that ledger, and reaping through it would
-    write into state this release refuses. A SQLite transaction a crash
-    interrupted is rolled back before that scan is repeated, as
-    :func:`claim_ledger` does: every caller already holds the experiment lock
-    and is about to write through the study anyway. A journal whose final
-    record is partial is refused instead (:func:`require_complete_journal`).
+    write into state this release refuses. Every caller holds the experiment
+    lock and is about to write through the study, so a journal whose final
+    record a crashed writer left partial is then repaired, as
+    :func:`claim_ledger` repairs its own (:func:`_repair_incomplete_journal_record`).
 
-    Absence is confirmed without creating anything. A missing database or
-    journal, or a ledger that holds no such study, returns ``None``; Optuna's
-    own loaders would instead create the missing file and then report the
-    study absent from it. A journal is opened live only after a complete
-    read-only snapshot proves the study exists, and the live replay must then
-    agree with that snapshot, because a journal that loses trials between the
-    two reads is uncertain, not absent.
+    Absence is confirmed without creating anything. A missing journal, or a
+    ledger that holds no such study, returns ``None``; Optuna's own loaders
+    would instead create the missing file and then report the study absent
+    from it. A journal is opened live only after a complete read-only
+    snapshot proves the study exists, and the live replay must then agree
+    with that snapshot, because a journal that loses trials between the two
+    reads is uncertain, not absent.
 
     :param str locator: Storage URL recorded in (or recovered for) the entry.
     :param str study_name: Study the registry entry names.
@@ -1500,37 +1401,15 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
         confirms it does not hold one called ``study_name``.
     :raises StudySchemaMismatchError: The ledger holds pre-cutover or
         unsupported PhaseSweep study state.
+    :raises IncompleteJournalRecordError: The journal's partial final record
+        could not be repaired.
     :raises StudyStorageUnavailableError: The ledger exists but could not be
         read completely, or a journal changed while the study was being opened.
+    :raises ValueError: ``locator`` selects an unsupported local storage backend.
     """
     if storage_is_in_memory(locator):
         # An in-memory study died with the orchestrator that held it.
         return None
-    try:
-        _scan_ledger_format(locator)
-    except LedgerTransactionInterruptedError:
-        # Only locked preflight and confirmed recovery reach this opener, and
-        # the live open below would roll the journal back anyway.
-        _let_sqlite_roll_back(locator)
-        _scan_ledger_format(locator)
-    if storage_backend(locator) == "sqlite":
-        if not _sqlite_study_exists(locator, study_name):
-            return None
-        try:
-            return optuna.load_study(study_name=study_name, storage=_resolve_storage(locator))
-        except KeyError:
-            return None
-    # The scan refused every other backend, so this is a journal.
-    _require_complete_journal(locator)
-    snapshot = _load_journal_study_snapshot(locator, study_name)
-    if snapshot is None:
-        return None
-    try:
-        live = optuna.load_study(study_name=study_name, storage=_resolve_storage(locator))
-    except KeyError as exc:
-        raise StudyStorageUnavailableError(
-            f"Journal storage {_journal_path(locator)} lost study "
-            f"{study_name!r} between its complete snapshot and the live replay."
-        ) from exc
-    _require_replay_matches_snapshot(snapshot, live, locator)
-    return live
+    _scan_ledger_format(locator)
+    _repair_incomplete_journal_record(locator)
+    return _open_existing_journal_study(locator, study_name)

@@ -48,7 +48,7 @@ from phasesweep.engine.paths import (
     _winner_path,
 )
 from phasesweep.engine.publication import _last_successful_generation_id
-from phasesweep.errors import GpuConfigurationError, LockBusyError
+from phasesweep.errors import GpuConfigurationError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import UnsafeLockPathError, lock_dir
@@ -274,18 +274,18 @@ def test_run_installs_signal_handlers_before_config_load(
 
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: events.append("signals"))
 
-    def fake_load_config(_path: Path) -> object:
+    def fake_load_experiment(_path: Path) -> object:
         events.append("load")
         return config
 
-    def fake_run_config(loaded: object, *, from_phase: str | None, dry_run: bool) -> None:
+    def fake_run_experiment(loaded: object, *, from_phase: str | None, dry_run: bool) -> None:
         assert loaded is config
         assert from_phase is None
         assert dry_run is expected_dry_run
         events.append("run")
 
-    monkeypatch.setattr("phasesweep.cli.load_config", fake_load_config)
-    monkeypatch.setattr("phasesweep.cli.run_config", fake_run_config)
+    monkeypatch.setattr("phasesweep.cli.load_experiment", fake_load_experiment)
+    monkeypatch.setattr("phasesweep.cli.run_experiment", fake_run_experiment)
     args = ["run", str(config_path)]
     if expected_dry_run:
         args.append("--dry-run")
@@ -337,7 +337,7 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     p.write_text(
         textwrap.dedent(f"""
         experiment: t
-        storage: sqlite:///{tmp_path}/phases.db
+        storage: journal:///{tmp_path}/phases.journal
         provenance: {{revision: test-fixture-v1}}
         trial_command: "echo {{overrides}}"
         override_format: argparse
@@ -410,7 +410,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
 
 def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
     """Mutable compatibility files must not outrank immutable generation results."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment, config_path = materialized.experiment, materialized.config_path
     _winner_path(experiment, "p").write_text("trial_number: 99\n")
     _generation_path(experiment).write_text("generation_id: interrupted\n")
@@ -431,9 +431,9 @@ def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -
 
 def test_show_winners_rejects_a_foreign_storage_ledger(tmp_path: Path) -> None:
     """Winner-only CLI reads enforce the artifact tree's reverse ownership."""
-    owner_config = materialize("current-sqlite", tmp_path, mode="tree").config_path
+    owner_config = materialize("current-journal", tmp_path, mode="tree").config_path
     foreign_config = tmp_path / "foreign.yaml"
-    foreign_config.write_text(owner_config.read_text().replace("study.db", "foreign.db"))
+    foreign_config.write_text(owner_config.read_text().replace("study.journal", "foreign.journal"))
     result = CliRunner().invoke(cli_main, ["show-winners", str(foreign_config)])
 
     assert result.exit_code == 1
@@ -517,6 +517,8 @@ def test_status_cli_reports_phase_counts(tmp_path: Path) -> None:
     status_obj = yaml.safe_load(result.output)
     assert status_obj["current_generation_id"] is not None
     assert status_obj["published_generation_id"] == status_obj["current_generation_id"]
+    # The ledger file Optuna's own CLI and dashboard are pointed at.
+    assert status_obj["ledger_path"] == str((tmp_path / "studies.journal").resolve())
 
 
 @pytest.mark.integration
@@ -614,7 +616,7 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     likewise not answer "no winner yet" over it. Both commands are read-only,
     so they share one corrupted tree.
     """
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path = materialized.config_path
     generation_id = _corrupt_the_publication(materialized.experiment)
 
@@ -650,7 +652,7 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The claim-time provenance files feed the same reporting as any winner."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
@@ -682,7 +684,7 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     fails closed -- nothing unvalidatable may read as published -- but the
     reason names the permission denial and the user who can validate it.
     """
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment
     generation_id = _last_successful_generation_id(experiment)
     assert generation_id is not None
@@ -722,7 +724,7 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     assert invoke_cli_boundary(["show-winners", str(fresh_config)], monkeypatch) == 0
     capsys.readouterr()
 
-    config_path = materialize("current-sqlite", tmp_path, mode="tree").config_path
+    config_path = materialize("current-journal", tmp_path, mode="tree").config_path
 
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
     published = capsys.readouterr()
@@ -735,15 +737,15 @@ def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> 
     """Make ``phasesweep run`` reach the engine and fail with ``error``.
 
     :param pytest.MonkeyPatch monkeypatch: Fixture used to replace CLI collaborators.
-    :param BaseException error: Exception ``run_config`` raises once the CLI calls it.
+    :param BaseException error: Exception ``run_experiment`` raises once the CLI calls it.
     """
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_config", lambda _path: object())
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: object())
 
     def fail(*_args: object, **_kwargs: object) -> None:
         raise error
 
-    monkeypatch.setattr("phasesweep.cli.run_config", fail)
+    monkeypatch.setattr("phasesweep.cli.run_experiment", fail)
 
 
 @pytest.mark.parametrize(
@@ -926,7 +928,7 @@ def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
 
     Runtime lock configuration goes through the real validator in the next test.
     """
-    error = LockBusyError("another experiment process holds the lock")
+    error = ExperimentLockBusyError("another experiment process holds the lock")
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
     _stub_run_command(monkeypatch, error)
@@ -950,9 +952,9 @@ def test_cli_boundary_classifies_relative_lock_directory_as_operational(
     config_path.write_text("placeholder: true\n")
     monkeypatch.setenv("PHASESWEEP_LOCK_DIR", "relative-locks")
     monkeypatch.setattr("phasesweep.cli.install_signal_handlers", lambda: None)
-    monkeypatch.setattr("phasesweep.cli.load_config", lambda _path: object())
+    monkeypatch.setattr("phasesweep.cli.load_experiment", lambda _path: object())
     monkeypatch.setattr(
-        "phasesweep.cli.run_config",
+        "phasesweep.cli.run_experiment",
         lambda *_args, **_kwargs: lock_dir(),
     )
 
@@ -1050,7 +1052,6 @@ def test_expected_operational_failures_share_one_base() -> None:
         UnsafeProcessCleanupError,
         ExperimentLockBusyError,
         GpuConfigurationError,
-        LockBusyError,
         SamplerContinuationUnsupportedError,
         StudyContextConflictError,
         StudyFingerprintMismatchError,

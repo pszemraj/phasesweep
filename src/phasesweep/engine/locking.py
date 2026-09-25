@@ -86,11 +86,10 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
         or ``None`` for in-memory storage.
     """
     if storage_is_in_memory(experiment.resolved_storage):
-        # In-memory URLs (``sqlite:///:memory:`` and spellings thereof) have
-        # no shared backend to guard; locking their canonical identity would
-        # make two unrelated in-memory runs that share an experiment name
-        # contend on a lock naming a backend that does not exist (review
-        # v0.5.17 gap hunt).
+        # In-memory storage (``storage: null``) has no shared backend to
+        # guard; locking its canonical identity would make two unrelated
+        # in-memory runs that share an experiment name contend on a lock
+        # naming a backend that does not exist (review v0.5.17 gap hunt).
         return None
     storage_identity = canonical_storage_identity(experiment.resolved_storage)
     if storage_identity is None:

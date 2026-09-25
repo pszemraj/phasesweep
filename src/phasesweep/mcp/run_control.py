@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 
 from phasesweep.engine.artifacts import _load_winner
+from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
@@ -40,6 +41,8 @@ from phasesweep.mcp.errors import (
 )
 from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from phasesweep.mcp.runs import (
+    LAUNCH_ACK_BYTE,
+    LAUNCH_READY_BYTE,
     PreparedRun,
     RunHandle,
     RunState,
@@ -49,15 +52,18 @@ from phasesweep.mcp.runs import (
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
 from phasesweep.runtime.process import fd_ready
-from phasesweep.runtime.reaper import kill_stale_group, read_boot_id, read_proc_starttime
+from phasesweep.runtime.reaper import (
+    identity_from_earlier_boot,
+    kill_stale_group,
+    read_boot_id,
+    read_proc_starttime,
+)
 from phasesweep.runtime.time import utc_now_iso
 
 # The tools log on the server's channel, so one logger name covers everything served.
 log = logging.getLogger("phasesweep.mcp.server")
 
 _RUNNER_READY_TIMEOUT_SECONDS = 10.0
-_RUNNER_READY_BYTE = b"R"
-_RUNNER_ACK_BYTE = b"A"
 
 
 class _SpawnBookkeepingError(Exception):
@@ -466,11 +472,7 @@ class RunControl:
                 identity = self._runs.cleanup_identity(handle)
                 current_boot = read_boot_id()
                 same_boot = identity.boot_id is not None and identity.boot_id == current_boot
-                earlier_boot = (
-                    identity.boot_id is not None
-                    and current_boot is not None
-                    and identity.boot_id != current_boot
-                )
+                earlier_boot = identity_from_earlier_boot(identity.boot_id, current_boot)
                 # A prior boot proves cleanup without a signal. An unknown boot
                 # cannot make saved PID/starttime safe to signal after reboot.
                 runner_group_gone = earlier_boot or (
@@ -544,7 +546,14 @@ class RunControl:
         for phase in reg.experiment.phases[: names.index(from_phase)]:
             inherited = {parent: winners[parent] for parent in phase.inherits}
             try:
-                winners[phase.name] = _load_winner(reg.experiment, phase, inherited)
+                winners[phase.name] = _load_winner(
+                    reg.experiment,
+                    phase,
+                    inherited,
+                    published_generation_id=_last_successful_generation_id(
+                        reg.experiment, raise_on_manifest_error=True
+                    ),
+                )
             except FileNotFoundError:
                 raise ResumeNotReadyError(reg.id, from_phase, phase.name) from None
             except (
@@ -848,7 +857,7 @@ class RunControl:
                     )
                 readable = fd_ready(ready_read, timeout=_RUNNER_READY_TIMEOUT_SECONDS)
                 ready = os.read(ready_read, 1) if readable else b""
-                if ready != _RUNNER_READY_BYTE:
+                if ready != LAUNCH_READY_BYTE:
                     raise RuntimeError(
                         "detached runner did not persist its launch receipt before launch"
                     )
@@ -859,7 +868,7 @@ class RunControl:
             # runner but before os.write returns. From this point onward,
             # cleanup must assume separately-sessioned trials could start.
             runner_acknowledged = True
-            if os.write(ack_write, _RUNNER_ACK_BYTE) != len(_RUNNER_ACK_BYTE):
+            if os.write(ack_write, LAUNCH_ACK_BYTE) != len(LAUNCH_ACK_BYTE):
                 raise RuntimeError("could not acknowledge the detached runner launch")
             acknowledged_fd = ack_write
             ack_write = -1

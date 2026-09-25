@@ -10,7 +10,6 @@ error at the moment it is violated rather than a diff noticed afterwards.
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import os
@@ -256,33 +255,20 @@ def _rebind(experiment: Experiment, schema_version: int | None) -> None:
     path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _rebind_studies(experiment: Experiment, ledger: Path, backend: str) -> None:
-    """Point a copied ledger's study root bindings at the copied artifact root.
+def _rebind_studies(experiment: Experiment, ledger: Path) -> None:
+    """Point a copied journal's study root bindings at the copied artifact root.
 
     The reverse half of :func:`_rebind`. Each study records the absolute root
     it publishes into, so a copied study still names the generation-time tree,
     and a reader that checks per-study ownership would refuse the copy for a
     reason unrelated to the format boundary under test. Only that recorded
-    value is rewritten. SQLite gets a single ``UPDATE``, and each journal op
-    is re-encoded exactly as Optuna writes it, so everything else stays
-    byte-identical.
+    value is rewritten; each journal op is re-encoded exactly as Optuna writes
+    it, so everything else stays byte-identical.
 
     :param Experiment experiment: Experiment owning the copied artifact root.
-    :param Path ledger: Copied ``study.db`` or ``study.journal``.
-    :param str backend: ``"sqlite"`` or ``"journal"``.
+    :param Path ledger: Copied ``study.journal``.
     """
     root = _artifact_root_identity(experiment)
-    if backend == "sqlite":
-        conn = sqlite3.connect(ledger)
-        try:
-            with conn:
-                conn.execute(
-                    "UPDATE study_user_attributes SET value_json = ? WHERE key = ?",
-                    (json.dumps(root), ARTIFACT_ROOT_ATTR),
-                )
-        finally:
-            conn.close()
-        return
     lines = ledger.read_text(encoding="utf-8").splitlines(keepends=True)
     rebound: list[str] = []
     for line in lines:
@@ -335,7 +321,7 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
     )
     if mode == "tree":
         _rebind(experiment, fixture.manifest["binding_schema_version"])
-        _rebind_studies(experiment, root / "ledger" / LEDGER_FILENAME[backend], backend)
+        _rebind_studies(experiment, root / "ledger" / LEDGER_FILENAME)
     return Materialized(
         root=root,
         experiment=experiment,
@@ -349,51 +335,13 @@ def ledger_file(materialized: Materialized, backend: str) -> Path:
     """Return the ledger file inside a materialized fixture.
 
     :param Materialized materialized: Copied fixture.
-    :param str backend: Ledger backend recorded in the manifest.
-    :return Path: Absolute path to ``study.db`` or ``study.journal``.
+    :param str backend: Ledger backend recorded in the manifest; every
+        materialized fixture is ``"journal"``, kept as an explicit parameter
+        so a call site names what it expects to read.
+    :return Path: Absolute path to ``study.journal``.
     """
-    return materialized.ledger_dir / LEDGER_FILENAME[backend]
-
-
-def rollback_journal(database: Path) -> Path:
-    """Return the rollback journal SQLite keeps beside ``database``.
-
-    :param Path database: SQLite database file.
-    :return Path: Its ``-journal`` sibling.
-    """
-    return database.with_name(f"{database.name}-journal")
-
-
-def leave_hot_journal(database: Path) -> None:
-    """Leave ``database`` exactly as a crash in the middle of a commit leaves it.
-
-    A writer with a ten-page cache spills uncommitted pages into its database
-    file after journaling their originals. Copying both files while that
-    transaction is still open captures what a SIGKILL at that instant would
-    leave on disk: rewritten pages and a hot journal that restores them, with
-    no second process involved.
-
-    :param Path database: Existing SQLite ledger holding at least one study.
-    """
-    writer = database.with_name(f"{database.name}.writer")
-    shutil.copyfile(database, writer)
-    with contextlib.closing(sqlite3.connect(writer, isolation_level=None)) as conn:
-        conn.execute("PRAGMA cache_size=10")
-        conn.execute("BEGIN IMMEDIATE")
-        for index in range(2000):
-            conn.execute(
-                "INSERT INTO study_user_attributes (study_id, key, value_json) VALUES (1, ?, ?)",
-                (f"uncommitted-{index}", json.dumps("x" * 500)),
-            )
-        shutil.copyfile(writer, database)
-        shutil.copyfile(rollback_journal(writer), rollback_journal(database))
-    writer.unlink()
-    with (
-        pytest.raises(sqlite3.OperationalError) as refused,
-        contextlib.closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as probe,
-    ):
-        probe.execute("SELECT 1 FROM sqlite_master").fetchone()
-    assert refused.value.sqlite_errorcode == sqlite3.SQLITE_READONLY_ROLLBACK
+    assert backend == "journal", f"unsupported fixture ledger backend: {backend!r}"
+    return materialized.ledger_dir / LEDGER_FILENAME
 
 
 def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:

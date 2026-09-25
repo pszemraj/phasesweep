@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, assert_never
 
@@ -29,6 +29,7 @@ from phasesweep.config import (
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
+    TERMINAL_TRIAL_STATES,
 )
 
 
@@ -68,6 +69,24 @@ class _PhaseTrialStats:
     generation_counts: dict[str, dict[str, int]]
     running_attempts: list[_TrialRef] | None
     published_trial_available: bool = False
+
+
+def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
+    """Return the number of terminal trials in ``trials``.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
+    :return int: Number of trials with a finished state.
+    """
+    return sum(1 for trial in trials if trial.state.is_finished())
+
+
+def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
+    """Return the number of COMPLETE trials in ``trials``.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
+    :return int: Number of trials in :attr:`optuna.trial.TrialState.COMPLETE`.
+    """
+    return sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
 
 
 def _published_phase_trial_refs(
@@ -116,6 +135,22 @@ def _published_phase_trial_refs(
     return refs
 
 
+def _meets_published_trial_history_boundary(
+    finished: int, completed: int, expected: _TrialRef
+) -> bool:
+    """Return whether a study still holds the history a publication recorded.
+
+    :param int finished: Terminal trials the study holds now.
+    :param int completed: COMPLETE trials the study holds now.
+    :param _TrialRef expected: Published trial whose recorded counts, when
+        present, are the minimum.
+    :return bool: ``True`` when both counts meet the recorded boundary.
+    """
+    return (expected.finished_trials is None or finished >= expected.finished_trials) and (
+        expected.completed_trials is None or completed >= expected.completed_trials
+    )
+
+
 def _published_trial_history_available(
     stats: _PhaseTrialStats, published_trial: _TrialRef | None
 ) -> bool:
@@ -127,13 +162,9 @@ def _published_trial_history_available(
     """
     if not stats.available or not stats.published_trial_available or published_trial is None:
         return False
-    finished = sum(stats.counts.get(state, 0) for state in ("COMPLETE", "PRUNED", "FAIL"))
+    finished = sum(stats.counts.get(state, 0) for state in TERMINAL_TRIAL_STATES)
     completed = stats.counts.get("COMPLETE", 0)
-    return (
-        published_trial.finished_trials is None or finished >= published_trial.finished_trials
-    ) and (
-        published_trial.completed_trials is None or completed >= published_trial.completed_trials
-    )
+    return _meets_published_trial_history_boundary(finished, completed, published_trial)
 
 
 def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRef) -> bool:

@@ -8,7 +8,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
@@ -237,6 +237,12 @@ class WandbExtractor(_WandbSummarySource):
 ObjectiveExtractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
 Extractor = ObjectiveExtractor
 
+ExtractorKind = Literal["json", "json_envelope", "log_regex", "wandb"]
+"""The ``type`` of every objective extractor, as recorded evidence names it."""
+
+EXTRACTOR_KINDS: frozenset[ExtractorKind] = frozenset(get_args(ExtractorKind))
+""":data:`ExtractorKind` as a set, for checking a ``kind`` read back from disk."""
+
 
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
     """Describe which objective-evidence identities the extractor genuinely enforces.
@@ -331,7 +337,7 @@ class _ObjectiveEvidenceFields(BaseModel):
     :func:`objective_evidence_assurance` for exactly what each flag means.
     """
 
-    kind: Literal["json", "json_envelope", "log_regex", "wandb"]
+    kind: ExtractorKind
     attempt_location_scoped: bool
     attempt_identity_bound: bool
     source_identity_keyed: bool

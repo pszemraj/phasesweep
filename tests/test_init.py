@@ -8,12 +8,14 @@ import pytest
 import yaml
 from click.testing import CliRunner
 from optuna import create_study
+from optuna.storages import JournalStorage
+from optuna.storages.journal import JournalFileBackend
 
 from phasesweep import load_experiment
 from phasesweep.cli import _starter_experiment_text
 from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.registry import Registry
-from phasesweep.runtime.files import sqlite_uri_filename_path
+from phasesweep.runtime.files import file_url_path
 
 
 def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
@@ -30,8 +32,8 @@ def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
         assert experiment.experiment == "phasesweep_starter"
         assert Path(experiment.workdir).is_absolute()
         assert experiment.storage == "auto"
-        assert sqlite_uri_filename_path(experiment.resolved_storage) == str(
-            config_path.parent / "runs" / experiment.experiment / "study.db"
+        assert file_url_path(experiment.resolved_storage) == str(
+            config_path.parent / "runs" / experiment.experiment / "study.journal"
         )
         assert [phase.name for phase in experiment.phases] == ["depth", "learning_rate"]
         assert sum(phase.n_trials for phase in experiment.phases) == 4
@@ -111,7 +113,7 @@ def test_init_renders_destinations_containing_placeholder_literals(tmp_path: Pat
     assert _assert_starter_destination_round_trip(output) == runs_dir
 
 
-def test_init_preserves_question_mark_in_sqlite_path(tmp_path: Path) -> None:
+def test_init_preserves_question_mark_in_journal_path(tmp_path: Path) -> None:
     project = tmp_path / "local?sweeps"
     output = project / "experiment.yaml"
 
@@ -119,11 +121,12 @@ def test_init_preserves_question_mark_in_sqlite_path(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     experiment = load_experiment(output)
-    database = project / "runs" / experiment.experiment / "study.db"
-    assert sqlite_uri_filename_path(experiment.resolved_storage) == str(database)
+    database = project / "runs" / experiment.experiment / "study.journal"
+    resolved_path = file_url_path(experiment.resolved_storage)
+    assert resolved_path == str(database)
 
     database.parent.mkdir(parents=True)
-    create_study(storage=experiment.resolved_storage, study_name="path_check")
+    create_study(storage=JournalStorage(JournalFileBackend(resolved_path)), study_name="path_check")
     assert database.is_file()
     assert not (tmp_path / "local").exists()
 
@@ -181,7 +184,7 @@ def test_init_write_failure_does_not_claim_destination(
     def fail_fsync(_fd: int) -> None:
         raise OSError("fsync failed")
 
-    monkeypatch.setattr("phasesweep.cli.os.fsync", fail_fsync)
+    monkeypatch.setattr("phasesweep.runtime.files.os.fsync", fail_fsync)
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
@@ -206,7 +209,7 @@ def test_init_reports_publish_errors_without_a_traceback(
     def deny_hard_link(_source: Path, _destination: Path) -> None:
         raise PermissionError("hard links are not supported")
 
-    monkeypatch.setattr("phasesweep.cli.os.link", deny_hard_link)
+    monkeypatch.setattr("phasesweep.runtime.files.os.link", deny_hard_link)
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
@@ -228,7 +231,7 @@ def test_init_losing_publish_race_preserves_other_writer(
         destination.write_text("other process\n")
         raise FileExistsError(destination)
 
-    monkeypatch.setattr("phasesweep.cli.os.link", lose_publish_race)
+    monkeypatch.setattr("phasesweep.runtime.files.os.link", lose_publish_race)
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 

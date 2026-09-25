@@ -111,7 +111,7 @@ def mcp_experiment_config_text(
       lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
 """
     storage = (
-        f"storage: sqlite:///{tmp_path}/{name}.db\nprovenance: {{revision: test-fixture-v1}}\n"
+        f"storage: journal:///{tmp_path}/{name}.journal\nprovenance: {{revision: test-fixture-v1}}\n"
         if with_storage
         else ""
     )
@@ -137,7 +137,7 @@ def slow_mcp_config_text(
 ) -> str:
     return f"""\
 experiment: {name}
-storage: sqlite:///{tmp_path}/{name}.db
+storage: journal:///{tmp_path}/{name}.journal
 provenance: {{revision: test-fixture-v1}}
 workdir: {tmp_path}/runs/{name}
 trial_command: "{sys.executable} {trainer} --sleep {sleep} {{overrides}}"
@@ -237,6 +237,18 @@ def make_run_handle(
         visible_params_at_launch=visible_params_at_launch,
         boot_id=read_boot_id() if launch_state == "spawned" else None,
     )
+
+
+def live_runs(store: RunStore) -> list[RunHandle]:
+    """Every currently-running handle across all experiments.
+
+    Scanning calls ``state`` on each handle, which also reaps any runner
+    that has since exited - so this doubles as the cleanup sweep.
+
+    :param RunStore store: Store whose handles are scanned.
+    :return list[RunHandle]: All handles whose derived state is currently ``running``.
+    """
+    return [handle for handle in store.list_handles() if store.state(handle) == "running"]
 
 
 def claim_runner_handle(
@@ -457,7 +469,7 @@ def _drift_experiment(
     """Build the runnable experiment the tests publish and then edit: one phase unless ``phases``."""
     return make_experiment(
         experiment=name,
-        storage=f"sqlite:///{tmp_path / 'drift.db'}",
+        storage=f"journal:///{tmp_path / 'drift.journal'}",
         workdir=str(tmp_path / "runs"),
         execution=ExecutionContext(cwd=str(tmp_path)),
         trainer=trainer,

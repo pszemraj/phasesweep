@@ -189,10 +189,10 @@ acceptance result, not evidence of service readiness.
   run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
-Common package-root calls are `load_config`, `load_experiment`, `run_config`,
-`run_experiment`, and `config_status`. Schema types are exported from
-`phasesweep.config`. Tests that need internals import direct modules under
-`engine`, `evidence`, `runtime`, or `mcp`.
+Common package-root calls are `load_experiment`, `run_experiment`, and
+`experiment_status`. Schema types are exported from `phasesweep.config`. Tests
+that need internals import direct modules under `engine`, `evidence`,
+`runtime`, or `mcp`.
 
 Within `phasesweep.engine`, module ownership is intentionally direct:
 
@@ -200,7 +200,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 | --- | --- |
 | Experiment and phase orchestration | `run`, `phase` |
 | Resume selection and continuation preflight | `resume`, `study_policy`, `guards` |
-| Ledger storage: the only module that constructs Optuna or SQLite storage | `ledger` |
+| Ledger storage: the only module that constructs Optuna storage | `ledger` |
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
 | Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |

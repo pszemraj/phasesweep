@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, NoReturn
 import optuna
 
 from phasesweep.config import Experiment, Phase
+from phasesweep.config.common import is_sha256_hex
 from phasesweep.config.models import _wandb_query
 from phasesweep.engine.errors import (
     TrialEvidenceMissingError,
@@ -33,6 +34,7 @@ from phasesweep.evidence.evaluation import (
     json_float,
 )
 from phasesweep.evidence.models import (
+    EXTRACTOR_KINDS,
     JsonExtractor,
     ObjectiveExtractor,
     WandbExtractor,
@@ -40,6 +42,7 @@ from phasesweep.evidence.models import (
     _validate_trial_file_path,
     _WandbSummarySource,
 )
+from phasesweep.runtime.commands import TRAINER_INPUT_FILENAMES
 from phasesweep.runtime.files import (
     file_sha256,
 )
@@ -60,28 +63,23 @@ _TRIAL_EVIDENCE_REMEDY = (
 # before the trainer starts, so their absence is proof the directory is no
 # longer the one that attempt produced (PR #5 review / reviewer 2, blocker 7).
 _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
-_TRAINER_INPUT_FILENAMES = {
-    "yaml_file": "trainer_config.yaml",
-    "argparse": "overrides_resolved.json",
-    "hydra": "overrides_resolved.json",
-    "json_file": "overrides.json",
-}
 
 
 def _selection_candidate_identity(trial: optuna.trial.FrozenTrial) -> tuple[str, str] | None:
     """Return a trial's execution identity when it could win winner selection.
 
-    Mirrors the eligibility filter in
-    :func:`phasesweep.engine.selection.select_winner` exactly: COMPLETE state, a
-    finite value, a truthy feasibility attr, and nonempty generation/attempt
-    ids. A trial that fails any of these can never be selected, so declining to
-    verify its evidence is not result-biasing - unlike skipping an eligible
-    trial, which would change which trial wins.
+    The shared eligibility prefix used directly by both this module's
+    preflight and :func:`phasesweep.engine.selection.select_winner`: COMPLETE
+    state, a finite value, a truthy feasibility attr, and nonempty
+    generation/attempt ids. A trial that fails any of these can never be
+    selected, so declining to verify its evidence here is not result-biasing
+    - unlike skipping an eligible trial, which would change which trial wins.
 
-    The constraint-bounds half of that filter is deliberately *not* mirrored:
-    constraint bounds are config-mutable, so a trial outside today's bounds can
-    re-enter the candidate set under a later config and its evidence must still
-    be there when it does.
+    ``select_winner`` applies its own constraint-bounds filter on top of this
+    prefix; this function deliberately does not: constraint bounds are
+    config-mutable, so a trial outside today's bounds can re-enter the
+    candidate set under a later config and its evidence must still be there
+    when it does.
 
     :param optuna.trial.FrozenTrial trial: Persisted trial to classify.
     :return tuple[str, str] | None: ``(generation_id, attempt_id)`` for a
@@ -134,19 +132,6 @@ def _trial_objective_provenance(trial: optuna.trial.FrozenTrial) -> dict[str, An
     return parsed
 
 
-def _valid_sha256(value: object) -> bool:
-    """Recognize a SHA-256 digest as written by PhaseSweep.
-
-    :param object value: Recorded digest candidate.
-    :return bool: Whether it is a lowercase 64-character hex digest.
-    """
-    return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
-    )
-
-
 def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: str) -> None:
     """Require a present objective record to retain its source binding.
 
@@ -168,9 +153,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     if not isinstance(extractor, Mapping):
         fail("missing extractor identity")
     kind = extractor.get("kind")
-    if kind not in {"json", "json_envelope", "log_regex", "wandb"} or not _valid_sha256(
-        extractor.get("config_sha256")
-    ):
+    if kind not in EXTRACTOR_KINDS or not is_sha256_hex(extractor.get("config_sha256")):
         fail("invalid extractor identity")
     if not isinstance(provenance.get("recorded_at"), str) or not provenance["recorded_at"]:
         fail("missing capture time")
@@ -224,7 +207,7 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         or not source["path"]
         or type(source.get("size_bytes")) is not int
         or source["size_bytes"] < 0
-        or not _valid_sha256(source.get("sha256"))
+        or not is_sha256_hex(source.get("sha256"))
     ):
         fail("missing file source path, size, or digest")
     else:
@@ -326,7 +309,7 @@ def _verify_trainer_input_evidence(
     input_format = record.get("format")
     filename = record.get("filename")
     expected_filename = (
-        _TRAINER_INPUT_FILENAMES.get(input_format) if isinstance(input_format, str) else None
+        TRAINER_INPUT_FILENAMES.get(input_format) if isinstance(input_format, str) else None
     )
     if (
         record.get("schema_version") != TRAINER_INPUT_SCHEMA_VERSION
@@ -344,9 +327,7 @@ def _verify_trainer_input_evidence(
         not isinstance(recorded_size, int)
         or isinstance(recorded_size, bool)
         or recorded_size < 0
-        or not isinstance(recorded_digest, str)
-        or len(recorded_digest) != 64
-        or any(character not in "0123456789abcdef" for character in recorded_digest)
+        or not is_sha256_hex(recorded_digest)
     ):
         raise TrialEvidenceMissingError(
             f"{subject} has an invalid size or content identity in its "

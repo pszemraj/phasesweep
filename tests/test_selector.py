@@ -48,7 +48,7 @@ def _objective_provenance_json() -> str:
 
 def _make_exp(constraints=None, *, goal: str = "minimize"):
     exp = make_experiment(
-        storage=":memory:",
+        storage=None,
         trial_command="echo",
         constraints=constraints or [],
         phases=[Phase(name="p", n_trials=1, search_space={})],
@@ -255,11 +255,9 @@ def test_selection_is_quiet_when_candidates_share_one_environment(caplog):
     assert not [r for r in caplog.records if "environment" in r.getMessage()]
 
 
-def test_rejects_nan_constraint_values_defensively(tmp_path):
+def test_rejects_nan_constraint_values_defensively():
     """If a NaN somehow reaches user_attrs, the selector must reject it."""
-    db = tmp_path / "s.db"
-    storage = f"sqlite:///{db}"
-    study = optuna.create_study(study_name="t", storage=storage, direction="minimize")
+    study = optuna.create_study(study_name="t", direction="minimize")
 
     # Trial 0: clean, feasible.
     t0 = study.ask({"x": optuna.distributions.FloatDistribution(0, 1)})

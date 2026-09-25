@@ -118,33 +118,18 @@ class StudyStorageUnavailableError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER
 
 
-class LedgerTransactionInterruptedError(StudyStorageUnavailableError):
-    """Raised when a SQLite ledger holds a transaction a crash interrupted.
-
-    The crash left a hot rollback journal beside the database. SQLite rolls
-    it back on the next read-write open, but every read PhaseSweep makes
-    before the experiment lock opens the ledger ``mode=ro``, which cannot. The
-    committed state is intact, so restoring the ledger is the wrong remedy:
-    a command that holds the lock lets SQLite finish its own recovery first.
-    Routed to recovery because the one read that raises this to an operator
-    is ``recover-run`` inspection, whose confirmed form holds that lock. A
-    locked open whose rollback SQLite refuses raises it routed to restoring
-    the ledger's write access instead.
-    """
-
-    default_action: ClassVar[OperatorAction] = OperatorAction.RUN_RECOVER_RUN
-
-
 class IncompleteJournalRecordError(StudyStorageUnavailableError):
-    """Raised before a write when a journal ledger ends with a partial record.
+    """Raised before a write when a journal's partial final record could not be repaired.
 
-    Reads skip that record as Optuna does, but an append after it would be
-    glued onto it and corrupt the journal for good. The experiment lock does
-    not exclude another experiment's append to a shared journal, so the record
-    may be an append still in flight, and nothing repairs it automatically.
-    The message has the operator stop every writer and retry, and, for a
-    refusal that persists, names a truncation command that does nothing once
-    the journal has changed: the ledger repair this routes to.
+    A crashed writer's partial final record is normally cut under Optuna's
+    journal lock before any write. This names why that repair did not finish:
+    the lock, backup, or truncation failed, which restoring write access to
+    the ledger fixes; the lock stayed held past the repair's wait, which
+    removing a lock a killed writer left fixes; the journal has a second
+    hard-linked name, whose appends take another lock; or, while the lock
+    was held, the journal changed or another process took the lock over,
+    which a retry settles (``action`` is then ``RETRY``). The intact records
+    remain, so the ledger needs repair, not a copy from a backup.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER

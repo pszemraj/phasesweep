@@ -22,17 +22,20 @@ import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.resume as resume_ops
 from phasesweep._metadata import __version__
-from phasesweep.config import Config, Experiment
+from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import _metric_scoring_line, _metric_semantics_payload
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
-    LedgerTransactionInterruptedError,
     OperatorAction,
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
+from phasesweep.engine.publication import (
+    _last_successful_generation_id,
+    _published_winner_path_for,
+)
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
 from phasesweep.engine.state import GENERATION_SUMMARY_SCHEMA_VERSION, Winner
@@ -50,6 +53,9 @@ from phasesweep.runtime.shutdown import (
 )
 
 log = logging.getLogger("phasesweep.engine.run")
+
+# read_status phase keys the CLI status view replaces with ``name`` and ``winner``.
+_MCP_ONLY_PHASE_KEYS = frozenset({"phase", "winner_present", "running_attempts"})
 
 
 def _preflight_missing_reached_phase_environments(
@@ -70,11 +76,8 @@ def _preflight_missing_reached_phase_environments(
     :param str | None from_phase: Optional first phase this invocation can execute.
     :raises PhaseSweepError: A missing reached phase has an invalid launch environment.
     """
-    reached = from_phase is None
-    for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
-        if reached and phase.name not in existing_studies:
+    for _index, phase in experiment.phases_from(from_phase):
+        if phase.name not in existing_studies:
             _trainer_environment(experiment, phase.name)
 
 
@@ -169,48 +172,6 @@ def _terminal_report_from_cleanup(
     )
 
 
-@dataclass(frozen=True)
-class ExperimentRunOutcome:
-    """One published experiment invocation bound to its generation identity.
-
-    The winners and the generation id that produced them are materialized
-    together while the experiment lock is still held, so provenance consumers
-    can record exact lineage without re-reading mutable pointers after the lock
-    is released — an interleaving external top-up
-    would otherwise let a manifest name generation B while carrying winners
-    from generation A (review v0.5.14 / blocker 2).
-    """
-
-    generation_id: str
-    winners: Mapping[str, Winner]
-    phase_fingerprints: Mapping[str, str | None]
-
-
-def run_config(
-    config: Config,
-    *,
-    from_phase: str | None = None,
-    dry_run: bool = False,
-) -> dict[str, Winner]:
-    """Run an experiment config through the sole execution implementation.
-
-    :param Config config: Parsed experiment config.
-    :param str | None from_phase: Optional phase name to resume from.
-    :param bool dry_run: If ``True``, preview commands without launching subprocesses.
-    :return dict[str, Winner]: Experiment winners keyed by phase name.
-    """
-    return run_experiment(config, from_phase=from_phase, dry_run=dry_run)
-
-
-def config_status(config: Config) -> dict[str, Any]:
-    """Collect read-only status through the sole experiment implementation.
-
-    :param Config config: Parsed experiment config to inspect.
-    :return dict[str, Any]: Read-only experiment status payload.
-    """
-    return experiment_status(config)
-
-
 def run_experiment(
     experiment: Experiment,
     *,
@@ -254,7 +215,7 @@ def run_experiment(
 
     Returns:
         Mapping from phase name (in declaration order) to that phase's
-        :class:`Winner`. For dry runs the winners are midpoint placeholders.
+        :class:`Winner`. For dry runs the winners are placeholders.
 
     Raises:
         NoFeasibleTrialError: A phase exhausted ``max_consecutive_failures``
@@ -293,7 +254,7 @@ def run_experiment(
     # the same check until recovery proves a phase has new work remaining.
     if not path_ops._artifact_root_binding_path(experiment).exists():
         _preflight_trainer_environments(experiment, from_phase=from_phase)
-    outcome = _run_experiment_outcome(
+    winners = _run_experiment_outcome(
         experiment,
         from_phase=from_phase,
         terminal_callback=terminal_callback,
@@ -311,7 +272,7 @@ def run_experiment(
         # signalled exit without re-reading mutable publication pointers.
         exc.published_result_committed = True
         raise
-    return dict(outcome.winners)
+    return dict(winners)
 
 
 def _run_experiment_outcome(
@@ -321,13 +282,13 @@ def _run_experiment_outcome(
     terminal_callback: Callable[[TerminalReport], None] | None = None,
     publication_hook: PublicationHook | None = None,
     generation_id: str | None = None,
-) -> ExperimentRunOutcome:
-    """Run all phases and bind the winners to their published generation identity.
+) -> Mapping[str, Winner]:
+    """Run all phases and return the winners while the experiment lock is held.
 
     This is the non-dry-run engine core behind :func:`run_experiment`. The
-    returned :class:`ExperimentRunOutcome` is constructed while the experiment
-    lock is still held, so its ``generation_id`` is exactly the generation that
-    produced (and published) ``winners`` — never a later external top-up's.
+    winners are materialized while the experiment lock is still held, so they
+    are exactly those produced (and published) by this invocation's generation
+    — never a later external top-up's.
 
     :param Experiment experiment: Parsed experiment config.
     :param str | None from_phase: Optional resume point; see :func:`run_experiment`.
@@ -336,7 +297,7 @@ def _run_experiment_outcome(
     :param PublicationHook | None publication_hook: Optional required
         publication sidecar; see :func:`run_experiment`.
     :param str | None generation_id: Optional caller-owned invocation identity.
-    :return ExperimentRunOutcome: Winners bound to the publishing generation id.
+    :return Mapping[str, Winner]: Winners produced by this invocation's generation.
     :raises TrialEvidenceMissingError: Launch preflight found a trial eligible
         to win whose recorded evidence is no longer in this tree, or selection
         found the winner's objective source altered; raised before any trial
@@ -381,9 +342,9 @@ def _run_experiment_outcome(
                 "Artifact ownership could not be checked because required persistent "
                 f"study state is unavailable: {exc} Cleanup state is therefore unknown."
             )
-            if isinstance(exc, (LedgerTransactionInterruptedError, IncompleteJournalRecordError)):
-                # These name the repair of an otherwise intact ledger; restoring
-                # the whole ledger instead would be the wrong remedy.
+            if isinstance(exc, IncompleteJournalRecordError):
+                # A partial final record's repair did not finish, and it names its
+                # own remedy; restoring the whole ledger instead would be wrong.
                 raise ProcessCleanupUncertainError.rewrap(
                     exc, f"{unknown} For an MCP run, then run phasesweep mcp recover-run."
                 ) from exc
@@ -479,13 +440,7 @@ def _run_experiment_outcome(
                 winners=result,
                 cleanup_confirmed=True,
             )
-            return ExperimentRunOutcome(
-                generation_id=generation_id,
-                winners=MappingProxyType(dict(result)),
-                phase_fingerprints=MappingProxyType(
-                    {name: winner.phase_fingerprint for name, winner in result.items()}
-                ),
-            )
+            return MappingProxyType(dict(result))
         except BaseException as exc:
             terminal_error = exc
             control_error: BaseException | None = None
@@ -641,8 +596,6 @@ def _run_experiment_inner(
     Raises:
         TimeoutError: The whole-run wallclock deadline expired before a phase
             could start.
-        FileNotFoundError: A skipped phase has no persisted ``winner.yaml``
-            (re-raised on non-dry-run; dry runs substitute a placeholder).
 
     """
     dry_run = ledger is None
@@ -690,13 +643,19 @@ def _run_experiment_inner(
                     )
                 log.info("phase=%s SKIPPED (using preflight-validated winner)", phase.name)
             else:
+                # Only a dry run gets here: a real run preloads every skipped winner.
                 try:
-                    winners[phase.name] = artifact_io._load_winner(experiment, phase, inherited)
+                    winners[phase.name] = artifact_io._load_winner(
+                        experiment,
+                        phase,
+                        inherited,
+                        published_generation_id=_last_successful_generation_id(
+                            experiment, raise_on_manifest_error=True
+                        ),
+                    )
                     log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
                 except FileNotFoundError:
-                    if not dry_run:
-                        raise
-                    winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
+                    winners[phase.name] = _placeholder_winner(phase, inherited)
                     log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
             continue
         skip_until = False
@@ -765,14 +724,51 @@ def _run_experiment_inner(
     return winners
 
 
+def _cli_phase_payloads(
+    experiment: Experiment,
+    phases: list[dict[str, Any]],
+    published_generation_id: str | None,
+) -> list[dict[str, Any]]:
+    """Rebuild ``read_status``'s path-free phase payloads into the CLI's view.
+
+    ``experiment_status`` always calls :func:`phasesweep.engine.read.read_status`
+    unpinned, so each phase's winner is always scoped to the already-resolved
+    published generation, never a pinned one. This drops the MCP-only keys
+    (``phase``, ``winner_present``, ``running_attempts``) and adds ``name``
+    plus a resolved ``winner`` path -- the only place in this call that ever
+    puts a filesystem path in a status payload.
+
+    :param Experiment experiment: Experiment config with artifact root details.
+    :param list[dict[str, Any]] phases: Path-free phase payloads from ``read_status``.
+    :param str | None published_generation_id: Already-resolved last-success generation id.
+    :return list[dict[str, Any]]: Path-bearing phase payloads for the CLI status view.
+    """
+    cli_phases: list[dict[str, Any]] = []
+    for phase in phases:
+        winner_path = (
+            _published_winner_path_for(experiment, published_generation_id, phase["phase"])
+            if phase["winner_present"]
+            else None
+        )
+        cli_phases.append(
+            {
+                **{k: v for k, v in phase.items() if k not in _MCP_ONLY_PHASE_KEYS},
+                "name": phase["phase"],
+                "winner": None if winner_path is None else str(winner_path),
+            }
+        )
+    return cli_phases
+
+
 def experiment_status(experiment: Experiment) -> dict[str, Any]:
     """Collect read-only status for one experiment config.
 
     Built on a single :func:`phasesweep.engine.read.read_status` call, which
-    resolves the current pointer and the last-success pointer exactly once each
-    and reuses both for every phase's winner-path and trial-count lookup, so
-    one status object can never mix generation A's identity with generation B's
-    artifacts (review v0.5.15 / blocker 3).
+    resolves the current pointer and the last-success pointer exactly once
+    each. Every phase's winner path is then resolved by :func:`_cli_phase_payloads`
+    from that same captured published-generation id, so one status object can
+    never mix generation A's identity with generation B's artifacts (review
+    v0.5.15 / blocker 3).
 
     The returned mapping is the single experiment status snapshot shared by
     every caller, including ``phasesweep status <experiment>``. Its keys are
@@ -781,6 +777,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     * ``kind``: always ``"experiment"``.
     * ``experiment``: configured experiment name.
     * ``workdir``: experiment artifact root.
+    * ``ledger_path``: absolute path of the journal ledger, for Optuna's own
+      CLI or a dashboard copy; ``None`` for in-memory storage. The MCP read
+      view never carries it.
     * ``current_generation_id``, ``published_generation_id``,
       ``represented_generation_id``, ``is_published``: the identity split
       defined by :func:`phasesweep.engine.read.read_status` (unpinned mode, so
@@ -817,12 +816,14 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     :return dict[str, Any]: Status payload with generation identity plus per-phase
         winner paths and trial counts, as enumerated above.
     """
-    status = read_status(experiment, _include_winner_paths=True)
+    status = read_status(experiment)
     integrity = status["publication_integrity"]
+    ledger_path = ledger_ops.resolved_ledger_path(experiment)
     return {
         "kind": "experiment",
         "experiment": status["experiment"],
         "workdir": str(path_ops._experiment_dir(experiment)),
+        "ledger_path": None if ledger_path is None else str(ledger_path),
         "current_generation_id": status["current_generation_id"],
         "published_generation_id": status["published_generation_id"],
         "represented_generation_id": status["represented_generation_id"],
@@ -833,5 +834,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
             if integrity in {"failed", "permission_denied"}
             else {}
         ),
-        "phases": status["phases"],
+        "phases": _cli_phase_payloads(
+            experiment, status["phases"], status["published_generation_id"]
+        ),
     }

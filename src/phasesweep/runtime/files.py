@@ -9,13 +9,13 @@ import logging
 import os
 import secrets
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, ClassVar, Literal
-from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
+from typing import IO, ClassVar
+from urllib.parse import parse_qsl, quote, unquote, urlsplit
 
-from phasesweep.errors import LockBusyError, OperatorAction, PhaseSweepError
+from phasesweep.errors import OperatorAction, PhaseSweepError
 
 log = logging.getLogger("phasesweep.runtime.files")
 
@@ -421,24 +421,6 @@ def unlock_file(handle: IO[str]) -> None:
         fcntl.flock(handle, fcntl.LOCK_UN)
     with contextlib.suppress(OSError):
         handle.close()
-
-
-@contextlib.contextmanager
-def exclusive_lock(path: Path, *, busy_message: str) -> Iterator[None]:
-    """Hold a non-blocking exclusive flock for the context duration.
-
-    :param Path path: Lock file path to hold during the context.
-    :param str busy_message: Error message used when the lock is already held.
-    :raises LockBusyError: If the lock cannot be acquired immediately.
-    :return Iterator[None]: Context manager iterator for the held lock.
-    """
-    handle = try_lock_file(path)
-    if handle is None:
-        raise LockBusyError(busy_message)
-    try:
-        yield
-    finally:
-        unlock_file(handle)
 
 
 def fsync_directory(path: Path) -> None:
@@ -1133,34 +1115,90 @@ def atomic_write_text(path: Path, text: str) -> None:
         handle.write(text)
 
 
-def local_storage_url(path: Path, backend: str) -> str:
-    """Encode an absolute SQLite or journal filename as a local URI URL.
+def atomic_create_text(
+    path: Path,
+    text: str,
+    *,
+    validate: Callable[[Path], object] | None = None,
+) -> bool:
+    """Stage, optionally validate, and exclusively publish a UTF-8 text file.
 
-    :param Path path: Database or journal filename.
-    :param str backend: ``sqlite`` or ``journal``.
-    :return str: Absolute URL preserving reserved characters in the filename.
+    The text is written and fsynced to a hidden file beside ``path``, then
+    hard-linked into place, so ``path`` is either absent or complete. The
+    staged file is always removed. This is for workdir files with ordinary
+    permissions (``0o666`` masked by the umask), not the owner-only MCP state
+    store, and the directory fsync after the link is best-effort.
+
+    :param Path path: Destination that must not already exist.
+    :param str text: Complete UTF-8 text to publish.
+    :param Callable[[Path], object] | None validate: Optional callable run on
+        the staged file before publication; may raise to refuse the write.
+    :return bool: True when published, or False if another writer already
+        holds ``path``.
+    :raises FileExistsError: If ten randomized staging names beside ``path``
+        all collide.
+    :raises OSError: If the staged file cannot be written, or ``validate``
+        or the hard link otherwise fails.
     """
-    return f"{backend}:///file:{quote(str(path.resolve()), safe='/')}?uri=true"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged: Path | None = None
+    try:
+        handle: IO[str] | None = None
+        for _ in range(10):
+            candidate = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                handle = candidate.open("x", encoding="utf-8")
+            except FileExistsError:
+                continue
+            staged = candidate
+            break
+        if handle is None or staged is None:
+            raise FileExistsError(f"cannot create a staging file beside {path}")
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if validate is not None:
+            validate(staged)
+        try:
+            os.link(staged, path)
+        except FileExistsError:
+            return False
+        fsync_directory(path.parent)
+    finally:
+        if staged is not None:
+            with contextlib.suppress(OSError):
+                staged.unlink()
+    return True
+
+
+def local_storage_url(path: Path) -> str:
+    """Encode an absolute journal filename as a local URI URL.
+
+    :param Path path: Journal filename.
+    :return str: Absolute ``journal:///`` URL preserving reserved characters
+        in the filename.
+    """
+    return f"journal:///file:{quote(str(path.resolve()), safe='/')}?uri=true"
 
 
 def storage_backend(storage: str | None) -> str | None:
     """Return the logical backend name for an Optuna storage URL.
 
     Args:
-        storage: An Optuna storage URL (e.g. ``"sqlite:///x.db"`` or
-            ``"journal:///x.journal"``), or ``None`` for in-memory storage.
+        storage: An Optuna storage URL (e.g. ``"journal:///x.journal"`` or
+            ``"postgresql://host/db"``), or ``None`` for in-memory storage.
 
     Returns:
-        The dialect-collapsed scheme (``"sqlite"`` or ``"journal"``), or
-        ``None`` if ``storage`` is ``None``.
+        The URL's scheme with any ``+dialect`` suffix removed (e.g.
+        ``"journal"``, ``"postgresql"``), or ``None`` if ``storage`` is
+        ``None``.
 
     Examples:
-        >>> storage_backend("sqlite:///x.db")
-        'sqlite'
-        >>> storage_backend("sqlite+pysqlite:///x.db")
-        'sqlite'
         >>> storage_backend("journal:///x.journal")
         'journal'
+        >>> storage_backend("postgresql://h/db")
+        'postgresql'
         >>> storage_backend(None) is None
         True
 
@@ -1174,31 +1212,25 @@ def storage_backend(storage: str | None) -> str | None:
 def file_url_path(storage: str) -> str:
     """Return the filesystem path component of a phasesweep file-style URL.
 
-    SQLAlchemy's URL grammar for file-based backends uses three slashes for
-    relative paths and four for absolute POSIX paths (the fourth slash is the
-    root ``/``). We must preserve that distinction; ``lstrip("/")`` would
-    destroy absolute paths (review v0.5.9 / blocker 1).
+    This file-style URL grammar uses three slashes for relative paths and
+    four for absolute POSIX paths (the fourth slash is the root ``/``). We
+    must preserve that distinction; ``lstrip("/")`` would destroy absolute
+    paths (review v0.5.9 / blocker 1).
 
     Supported forms::
 
-        sqlite:///relative.db             -> relative.db
-        sqlite:///relative.db?timeout=30  -> relative.db
-        sqlite:////tmp/absolute.db        -> /tmp/absolute.db
-        sqlite+pysqlite:///relative.db    -> relative.db
-        sqlite+pysqlite:////tmp/x.db      -> /tmp/x.db
-        sqlite://                         -> ""
-        sqlite:///:memory:                -> :memory:
-        journal:///relative.journal       -> relative.journal
-        journal:////tmp/absolute.journal  -> /tmp/absolute.journal
+        journal:///relative.journal         -> relative.journal
+        journal:///relative.journal?x=1     -> relative.journal
+        journal:////tmp/absolute.journal    -> /tmp/absolute.journal
         journal:///file:/tmp/a%3Fb?uri=true -> /tmp/a?b
 
     Args:
         storage: A file-style storage URL whose scheme is already known to be
-            file-based (``sqlite``, ``journal``).
+            file-based (``journal``).
 
     Returns:
-        The bare filesystem path (or sentinel like ``":memory:"``), without
-        the scheme or leading slashes that belong to URL grammar.
+        The bare filesystem path, without the scheme or leading slashes that
+        belong to URL grammar.
 
     """
     rest = storage.split(":", 1)[1]
@@ -1207,21 +1239,17 @@ def file_url_path(storage: str) -> str:
         # POSIX absolute file path. The fourth slash IS the root ``/``.
         path = "/" + rest[4:]
     elif rest.startswith("///"):
-        # Relative file path (or :memory: sentinel) under SQLAlchemy grammar.
+        # Relative file path.
         path = rest[3:]
     elif rest.startswith("//"):
-        # Handles bare ``sqlite://`` (in-memory shorthand).
         path = rest[2:]
     else:
         path = rest
 
     path = path.split("?", 1)[0]
-    # SQLAlchemy treats '#' as a literal character in ordinary SQLite filenames.
-    # It becomes a fragment only when SQLite's file: URI handling is enabled.
-    if storage_backend(storage) != "sqlite" or _sqlite_uri_filename_enabled(storage, path):
-        path = path.split("#", 1)[0]
-    # Auto journal storage uses the same escaped file: URI convention as
-    # SQLite. Ordinary explicit journal paths keep their literal spelling.
+    path = path.split("#", 1)[0]
+    # Auto journal storage uses an escaped file: URI convention. Ordinary
+    # explicit journal paths keep their literal spelling.
     if (
         storage_backend(storage) == "journal"
         and path.startswith("file:")
@@ -1229,6 +1257,25 @@ def file_url_path(storage: str) -> str:
     ):
         return unquote(urlsplit(path).path)
     return path
+
+
+def journal_file_path(storage: str) -> Path:
+    """Resolve a ``journal:///`` storage URL to the real journal file it names.
+
+    Every journal path and identity comes from here: the file Optuna opens,
+    the journal lock beside it, the same-host storage identity, and the
+    recovery locator. Optuna's journal lock is a symlink named
+    ``<path>.lock`` whose target is ``<path>``, so the path must be real:
+    a relative target resolves against the lock's own directory and dangles,
+    and a symlinked alias of the journal names a second lock, so an append
+    through one spelling and a repair through the other never exclude each
+    other. Resolving also freezes an invocation-relative path against the
+    working directory it was given in.
+
+    :param str storage: Journal storage URL, including escaped ``file:`` forms.
+    :return Path: The journal file, with ``~`` expanded and symlinks resolved.
+    """
+    return Path(file_url_path(storage)).expanduser().resolve()
 
 
 def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
@@ -1239,15 +1286,6 @@ def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
     """
     query = storage.split("?", 1)[1].split("#", 1)[0] if "?" in storage else ""
     return parse_qsl(query, keep_blank_values=True)
-
-
-def storage_url_query_keys(storage: str) -> list[str]:
-    """Return a storage URL's query keys as spelled, repeats included, in order.
-
-    :param str storage: Storage URL whose query string should be inspected.
-    :return list[str]: Every query key, unchanged.
-    """
-    return [key for key, _value in _url_query_pairs(storage)]
 
 
 def storage_url_query_options(storage: str) -> dict[str, str]:
@@ -1268,224 +1306,42 @@ def _truthy_url_option(value: str | None) -> bool:
     return value is not None and value.lower() in {"1", "true", "yes", "on"}
 
 
-def _sqlite_uri_filename_enabled(storage: str, database: str | None = None) -> bool:
-    """Return whether SQLAlchemy will treat a SQLite ``file:`` path as a URI.
-
-    :param str storage: SQLite storage URL to inspect.
-    :param str | None database: Optional already-parsed database filename from the storage URL.
-    :return bool: True when the database uses a ``file:`` filename and the URL sets ``uri=true``.
-    """
-    database = file_url_path(storage) if database is None else database
-    if not database.startswith("file:"):
-        return False
-    return _truthy_url_option(storage_url_query_options(storage).get("uri"))
-
-
-def sqlite_uri_filename_path(storage: str) -> str | None:
-    """Return the local filesystem path named by a SQLite URI filename.
-
-    SQLAlchemy only treats a SQLite ``file:`` database string as a URI filename
-    when ``uri=true`` is present in the URL query. Without that flag,
-    ``sqlite:///file:literal.db`` is a literal filename and must keep the
-    ``file:`` prefix.
-
-    :param str storage: SQLite storage URL.
-    :return str | None: Decoded local filesystem path from the URI filename, or
-        ``None`` when the storage URL is not a local SQLite URI filename.
-    """
-    database = file_url_path(storage)
-    if not _sqlite_uri_filename_enabled(storage, database):
-        return None
-
-    parsed = urlsplit(database)
-    if parsed.scheme != "file":
-        return None
-    if parsed.netloc not in {"", "localhost"}:
-        return None
-    return unquote(parsed.path)
-
-
 def storage_is_in_memory(storage: str | None) -> bool:
     """Return whether ``storage`` names an in-memory Optuna backend.
 
-    :param str | None storage: Optuna storage URL, SQLite sentinel, or ``None``.
-    :return bool: ``True`` when the storage has no durable file-backed ledger.
+    :param str | None storage: Optuna storage URL, or ``None``.
+    :return bool: ``True`` when ``storage`` is ``None``, the only in-memory
+        spelling; ``False`` otherwise.
     """
-    if storage is None:
-        return True
-    if storage == ":memory:":
-        return True
-    if storage_backend(storage) != "sqlite":
-        return False
-
-    database = file_url_path(storage)
-    if database in {"", ":memory:"}:
-        return True
-    if not _sqlite_uri_filename_enabled(storage, database):
-        return False
-
-    options = storage_url_query_options(storage)
-    uri_path = sqlite_uri_filename_path(storage)
-    return (
-        uri_path in {"", ":memory:"}
-        or database.startswith("file::memory:")
-        or options.get("mode") == "memory"
-    )
-
-
-def sqlite_database_path(storage: str) -> Path | None:
-    """Return the filesystem path of a file-backed SQLite storage URL.
-
-    Lets callers distinguish "the database file does not exist" (so no study
-    can exist in it) from "the file exists but cannot be read right now"
-    (locked, corrupt, permission-denied), which must not be collapsed into
-    absence on paths that authorize mutation.
-
-    :param str storage: SQLite storage URL.
-    :return Path | None: Concrete database file path, or ``None`` for
-        in-memory storage.
-    """
-    if storage_is_in_memory(storage):
-        return None
-    database = file_url_path(storage)
-    if _sqlite_uri_filename_enabled(storage, database):
-        uri_path = sqlite_uri_filename_path(storage)
-        return Path(uri_path) if uri_path is not None else None
-    return Path(database)
-
-
-def sqlalchemy_sqlite_path(storage: str) -> Path | None:
-    """Return the database file Optuna's SQLAlchemy engine opens for a SQLite URL.
-
-    Optuna hands a SQLite URL to SQLAlchemy, so SQLAlchemy's reading of it,
-    not :func:`sqlite_database_path`'s, decides which file holds the ledger.
-    This runs the same URL parsing and ``create_connect_args`` the engine
-    runs, then applies SQLite's rule to the filename that produces: it is a
-    ``file:`` URI only when the connect arguments enable URIs and it starts
-    with ``file:``, and otherwise a plain filename.
-
-    :param str storage: SQLite storage URL.
-    :return Path | None: Absolute database path, or ``None`` when SQLite opens
-        an in-memory or temporary database instead of a file.
-    :raises ValueError: SQLAlchemy cannot parse the URL or build its connect
-        arguments, or the URI filename names another host.
-    """
-    from sqlalchemy.engine import make_url
-    from sqlalchemy.exc import SQLAlchemyError
-
-    try:
-        url = make_url(storage)
-        arguments, options = url.get_dialect()().create_connect_args(url)
-    except (SQLAlchemyError, TypeError, ValueError) as exc:
-        raise ValueError(str(exc)) from exc
-    database = str(arguments[0])
-    if not options.get("uri"):
-        return None if database == ":memory:" else Path(database).absolute()
-    if not database.startswith("file:"):
-        return None if database in {"", ":memory:"} else Path(database).absolute()
-    parsed = urlsplit(database)
-    if parsed.netloc not in {"", "localhost"}:
-        raise ValueError(f"the URI filename names host {parsed.netloc!r}")
-    path = unquote(parsed.path)
-    if path in {"", ":memory:"} or ("mode", "memory") in parse_qsl(parsed.query):
-        return None
-    return Path(path).absolute()
-
-
-def sqlite_readonly_uri(storage: str) -> str | None:
-    """Build a ``sqlite3.connect(..., uri=True)`` URI for read-only status reads.
-
-    The returned URI opens the configured persistent SQLite database in
-    ``mode=ro`` so status polling cannot create a missing DB or schema. SQLite
-    URI filenames such as ``sqlite:///file:/tmp/x.db?mode=rwc&uri=true`` are
-    preserved as URI filenames with the write mode replaced by ``mode=ro``.
-
-    :param str storage: SQLite storage URL.
-    :return str | None: Read-only SQLite URI, or ``None`` for in-memory storage.
-    """
-    return _sqlite_connect_uri(storage, "ro")
-
-
-def sqlite_existing_readwrite_uri(storage: str) -> str | None:
-    """Build a ``sqlite3.connect(..., uri=True)`` URI that writes but never creates.
-
-    Same file as :func:`sqlite_readonly_uri`, opened ``mode=rw``: SQLite may
-    write to an existing database, such as rolling back a journal a crash left
-    behind, but refuses to open a missing one rather than creating it.
-
-    :param str storage: SQLite storage URL.
-    :return str | None: Read-write SQLite URI, or ``None`` for in-memory storage.
-    """
-    return _sqlite_connect_uri(storage, "rw")
-
-
-def _sqlite_connect_uri(storage: str, mode: Literal["ro", "rw"]) -> str | None:
-    """Build a ``sqlite3`` URI for a SQLite storage URL's file in one open mode.
-
-    :param str storage: SQLite storage URL.
-    :param Literal["ro", "rw"] mode: SQLite ``mode`` URI parameter; neither creates a file.
-    :return str | None: SQLite URI, or ``None`` for in-memory storage.
-    """
-    if storage_is_in_memory(storage):
-        return None
-
-    database = file_url_path(storage)
-    if _sqlite_uri_filename_enabled(storage, database):
-        params = [
-            (key, value)
-            for key, value in _url_query_pairs(storage)
-            if key.lower() not in {"mode", "uri"}
-        ]
-        params.append(("mode", mode))
-        return f"{database}?{urlencode(params)}"
-
-    path = Path(database).resolve()
-    return f"file:{quote(str(path), safe='/')}?mode={mode}"
+    return storage is None
 
 
 def storage_recovery_locator(storage: str | None) -> str | None:
     """Freeze a storage URL for later recovery from a different working directory.
 
-    Relative SQLite and journal paths are invocation-relative. Active-attempt
-    recovery can happen after the caller changes directories, so the durable
-    locator must resolve those paths while the attempt is registered.
+    Relative journal paths are invocation-relative. Active-attempt recovery
+    can happen after the caller changes directories, so the durable locator
+    must resolve those paths while the attempt is registered.
 
     :param str | None storage: Configured Optuna storage URL.
     :return str | None: Operationally equivalent locator with file paths made
         absolute, or ``None`` for in-memory storage.
+    :raises ValueError: ``storage`` does not select a retained local backend.
     """
     if storage_is_in_memory(storage):
         return None
     assert storage is not None
     backend = storage_backend(storage)
-    if backend == "journal":
-        path = Path(file_url_path(storage)).expanduser().resolve()
-        return local_storage_url(path, "journal")
-    if backend != "sqlite":
+    if backend != "journal":
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
-
-    database = file_url_path(storage)
-    if _sqlite_uri_filename_enabled(storage, database):
-        uri_path = sqlite_uri_filename_path(storage)
-        if uri_path is None:
-            # A non-local ``file:`` authority is not cwd-relative.
-            return storage
-        frozen_database = "file:" + quote(str(Path(uri_path).resolve()), safe="/")
-    else:
-        frozen_database = str(Path(database).resolve())
-    scheme = storage.split(":", 1)[0]
-    query = f"?{storage.split('?', 1)[1]}" if "?" in storage else ""
-    return f"{scheme}:///{frozen_database}{query}"
+    return local_storage_url(journal_file_path(storage))
 
 
 def canonical_storage_identity(storage: str | None) -> str | None:
     """Stable same-host identity string for a storage URL.
 
-    File-based backends (SQLite, JournalStorage) are resolved to absolute
-    paths so two configs that differ only in relative vs. absolute spelling
-    still collide on the lock file. SQLite URLs additionally fold their
-    SQLAlchemy dialect (``sqlite+pysqlite:///`` etc.) onto the canonical
-    ``sqlite:///`` prefix so dialect choice never splits the lock.
+    JournalStorage is resolved to an absolute path so two configs that differ
+    only in relative vs. absolute spelling still collide on the lock file.
 
     :param str | None storage: An Optuna storage URL, or ``None`` for in-memory
         storage.
@@ -1496,32 +1352,7 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     """
     if storage is None:
         return None
-    if storage_is_in_memory(storage):
-        return "sqlite:///:memory:"
-
     backend = storage_backend(storage)
-
-    if backend == "sqlite":
-        database = file_url_path(storage)
-        uri_path = sqlite_uri_filename_path(storage)
-        if _sqlite_uri_filename_enabled(storage, database):
-            if storage_is_in_memory(storage):
-                return "sqlite:///:memory:"
-            if uri_path is None:
-                params = [
-                    (key, value)
-                    for key, value in _url_query_pairs(storage)
-                    if key.lower() not in {"mode", "uri"}
-                ]
-                query = urlencode(params)
-                return f"sqlite-uri:{database}" + (f"?{query}" if query else "")
-            database = uri_path
-        if database in ("", ":memory:"):
-            return "sqlite:///:memory:"
-        return "sqlite:///" + str(Path(database).resolve())
-
-    if backend == "journal":
-        path = file_url_path(storage)
-        return "journal:///" + str(Path(path).expanduser().resolve())
-
-    raise ValueError(f"Unsupported local storage backend: {backend!r}.")
+    if backend != "journal":
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
+    return "journal:///" + str(journal_file_path(storage))

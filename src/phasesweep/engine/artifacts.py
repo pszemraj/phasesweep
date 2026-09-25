@@ -6,10 +6,9 @@ import contextlib
 import csv
 import json
 import logging
-import os
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import optuna
 import yaml
@@ -26,10 +25,9 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.state import (
     Winner,
-    WinnerSourceKind,
     _parse_winner_source,
 )
-from phasesweep.runtime.files import atomic_text_writer, fsync_directory
+from phasesweep.runtime.files import atomic_create_text, atomic_text_writer
 
 log = logging.getLogger(__name__)
 
@@ -62,13 +60,11 @@ def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
 
     Unlike :func:`_write_yaml_atomic` (always-overwrite, used for mutable
     pointers), this is the create-exclusive primitive backing truly immutable
-    per-generation lifecycle records (review v0.5.15 / blocker 3): the file is
-    opened with ``O_CREAT | O_EXCL`` so a second call for an already-written
-    path can never clobber the first write, even a same-content rewrite. This
-    is a plain create-once-and-fsync, not a full atomic-rename dance like
-    :func:`atomic_text_writer` -- there is nothing to make atomic against a
-    concurrent *reader* here, only against a second *writer*, and ``O_EXCL``
-    already rules that out.
+    per-generation lifecycle records (review v0.5.15 / blocker 3): a second
+    call for an already-written path can never clobber the first write, even
+    a same-content rewrite. Delegates to :func:`atomic_create_text`, so
+    ``path`` is staged and fsynced beside itself and only hard-linked into
+    place once complete -- no reader can ever observe a partial write.
 
     :param Path path: Destination path to create; the parent directory is
         created if missing.
@@ -77,23 +73,8 @@ def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
         ``False`` when the destination already existed and nothing was
         written.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     text = yaml.safe_dump(payload, sort_keys=False)
-    try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-    except FileExistsError:
-        return False
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        with contextlib.suppress(OSError):
-            path.unlink(missing_ok=True)
-        raise
-    fsync_directory(path.parent)
-    return True
+    return atomic_create_text(path, text)
 
 
 @contextlib.contextmanager
@@ -198,7 +179,7 @@ def _save_winner(
     payload = {
         "phase": phase_name,
         "metric": {experiment.metric.name: winner.metric, "goal": experiment.metric.goal},
-        **_winner_common_payload(winner, phase_name),
+        **_winner_common_payload(winner),
         "phase_fingerprint": winner.phase_fingerprint,
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
@@ -207,11 +188,10 @@ def _save_winner(
     _write_yaml_atomic(path, payload)
 
 
-def _winner_common_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
+def _winner_common_payload(winner: Winner) -> dict[str, Any]:
     """Serialize winner fields shared by persisted and summary representations.
 
     :param Winner winner: Winner whose common fields should be serialized.
-    :param str phase_name: Phase exposed by this winner.
     :return dict[str, Any]: Shared trial, parameter, evidence, identity, and source fields.
     """
     payload = {
@@ -223,17 +203,16 @@ def _winner_common_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
         "completion": winner.completion,
         "generation_id": winner.generation_id,
         "attempt_id": winner.attempt_id,
-        "winner_source": _winner_source_payload(winner, phase_name),
+        "winner_source": _winner_source_payload(winner),
         "trainer_input": winner.trainer_input,
     }
     return payload
 
 
-def _winner_source_payload(winner: Winner, phase_name: str) -> dict[str, Any]:
+def _winner_source_payload(winner: Winner) -> dict[str, Any]:
     """Serialize the concrete source trial for an exposed winner.
 
     :param Winner winner: Winner whose recorded ``source`` is serialized.
-    :param str phase_name: Phase exposed by the winner source.
     :return dict[str, Any]: JSON-serializable winner-source payload with
         ``kind``, ``phase``, ``trial_number``, ``generation_id``, ``attempt_id``,
         keys.
@@ -306,6 +285,8 @@ def _load_winner(
     experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
+    *,
+    published_generation_id: str | None,
 ) -> Winner:
     """Load a phase winner from disk and verify it matches the *current* config.
 
@@ -329,6 +310,10 @@ def _load_winner(
         phase: The phase whose winner is being loaded.
         inherited_winners: Winners loaded for phases earlier in the chain;
             contribute to the recomputed fingerprint.
+        published_generation_id: Last-success generation id the caller
+            resolved with ``raise_on_manifest_error=True``, so its whole
+            manifest is already validated; ``None`` when nothing is published.
+            A caller loading several phases resolves it once.
 
     Returns:
         The reconstructed :class:`Winner` for ``phase``.
@@ -341,10 +326,6 @@ def _load_winner(
             the freshly computed one.
 
     """
-    published_generation_id = publication_ops._last_successful_generation_id(
-        experiment,
-        raise_on_manifest_error=True,
-    )
     path = publication_ops._published_winner_path_for(
         experiment, published_generation_id, phase.name
     )
@@ -427,17 +408,6 @@ def _load_winner(
             f"Winner file {path} has no valid attempt_id; refusing unscoped evidence."
         )
     source_data = data.get("winner_source")
-    if not isinstance(source_data, dict):
-        raise WinnerIntegrityError(
-            f"Winner file {path} has no valid winner_source; refusing ambiguous provenance."
-        )
-    source_kind = source_data.get("kind")
-    if source_kind != "phase_trial":
-        raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source kind.")
-    if set(source_data) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
-        raise WinnerIntegrityError(f"Winner file {path} has a removed winner_source field.")
-    if source_data.get("phase") != phase.name:
-        raise WinnerIntegrityError(f"Winner file {path} has an invalid winner_source phase.")
     if "promotion" in data:
         raise WinnerIntegrityError(f"Winner file {path} contains removed promotion data.")
 
@@ -450,7 +420,7 @@ def _load_winner(
     _warn_environment_drift(experiment, phase.name, stored_env_digest)
 
     try:
-        source = _parse_winner_source(source_data, cast(WinnerSourceKind, source_kind))
+        source = _parse_winner_source(source_data, expected_phase=phase.name)
         return Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),

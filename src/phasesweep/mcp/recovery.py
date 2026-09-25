@@ -17,6 +17,7 @@ from phasesweep.engine.artifact_roots import (
     _check_study_artifact_root,
 )
 from phasesweep.engine.attempts import (
+    _AttemptRecord,
     _inspect_active_attempts,
     _preflight_active_attempts,
     _PreflightCleanupReport,
@@ -32,27 +33,25 @@ from phasesweep.engine.cleanup import (
 from phasesweep.engine.errors import (
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
-    LedgerTransactionInterruptedError,
     PublishedStudyMissingError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.ledger import (
     open_existing_study,
-    require_complete_journal,
-    roll_back_interrupted_transaction,
+    repair_incomplete_journal_record,
     validate_ledger,
 )
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.errors import OperatorAction, PhaseSweepError
-from phasesweep.mcp.config_snapshot import load_experiment_snapshot
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     ProcessIdentity,
     RunHandle,
     RunStore,
     UnsupportedStateFormatError,
+    load_experiment_snapshot,
     write_status_file,
 )
 from phasesweep.mcp.snapshots import (
@@ -62,7 +61,12 @@ from phasesweep.mcp.snapshots import (
     parse_result_snapshot,
 )
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
-from phasesweep.runtime.reaper import is_same_live_process, kill_stale_group, read_boot_id
+from phasesweep.runtime.reaper import (
+    identity_from_earlier_boot,
+    is_same_live_process,
+    kill_stale_group,
+    read_boot_id,
+)
 from phasesweep.runtime.time import utc_now_iso
 
 
@@ -152,11 +156,7 @@ def recover_run(
             "runner boot id is unavailable; refusing automated process-group cleanup "
             "because PID reuse after reboot cannot be ruled out"
         )
-    earlier_boot = (
-        identity.boot_id is not None
-        and current_boot is not None
-        and identity.boot_id != current_boot
-    )
+    earlier_boot = identity_from_earlier_boot(identity.boot_id, current_boot)
     _require_dead_runner(identity, earlier_boot=earlier_boot, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
@@ -564,11 +564,10 @@ def _load_recovery_studies(
 
     Validation comes first and is read-only, so recovery refuses a tree bound
     to another ledger, or a pre-cutover ledger, before it opens anything and
-    without changing a byte. A confirmed recovery holds the experiment lock,
-    so it alone then lets SQLite roll back a transaction a crash interrupted;
-    inspection reports that ledger unavailable and leaves it untouched. Both
-    refuse a journal whose final record is partial, since inspection previews
-    a write that must not append after it. Each opened study then passes the read-only
+    without changing a byte. A confirmed recovery holds the experiment lock
+    and is about to write, so it then repairs a journal whose final record a
+    crashed writer left partial; inspection reads past that record as Optuna
+    does and leaves it for the confirmed write. Each opened study then passes the read-only
     ownership half of the check a run's claim applies, because recovery reaps
     and tells trials through these live objects: a study bound to another
     artifact root belongs to that root's runs, and recovering this tree must
@@ -581,7 +580,7 @@ def _load_recovery_studies(
     :param Experiment config: Experiment defining phase names and storage locations.
     :param _RecoveryNeeds needs: Recovery decisions that may require published-history checks.
     :param bool confirm: The caller holds the experiment lock for a confirmed
-        recovery, so SQLite may roll back an interrupted transaction.
+        recovery, so a partial final journal record may be repaired.
     :raises RunRecoveryError: The ledger is refused, a phase study belongs to
         another artifact root, or required storage or published studies cannot
         be read.
@@ -596,14 +595,11 @@ def _load_recovery_studies(
     try:
         ledger = validate_ledger(config)
         if confirm:
-            ledger = roll_back_interrupted_transaction(ledger)
-        # Inspection previews the confirmed write, so it refuses what that refuses.
-        require_complete_journal(ledger)
+            repair_incomplete_journal_record(ledger)
     except (
         ArtifactRootConflictError,
         StudySchemaMismatchError,
         IncompleteJournalRecordError,
-        LedgerTransactionInterruptedError,
     ) as exc:
         raise RunRecoveryError.rewrap(exc, str(exc)) from exc
     except StudyStorageUnavailableError as exc:
@@ -614,10 +610,6 @@ def _load_recovery_studies(
     for phase in config.phases:
         try:
             study = open_existing_study(ledger, phase)
-        except LedgerTransactionInterruptedError as exc:
-            # The ledger is intact: its own remedy, a confirmed recover-run,
-            # replaces the restore every other storage refusal needs.
-            raise RunRecoveryError.rewrap(exc, str(exc)) from exc
         except StudyStorageUnavailableError as exc:
             raise RunRecoveryError(
                 f"{exc}{unavailable_remedy}", action=OperatorAction.RESTORE_LEDGER
@@ -682,9 +674,7 @@ def _recover_trial_evidence(
     reaped_ids, reaped_locations = store.cleanup_recovered_attempt_evidence(handle)
     evidence = _CleanupEvidence(reaped_ids, reaped_locations)
     causal_attempt_ids = store.cleanup_uncertain_attempt_ids(handle)
-    inspected_attempt_ids: set[str] = set()
-    inspected_attempt_generations: dict[str, str] = {}
-    inspected_attempt_locations: dict[str, tuple[str, int, str]] = {}
+    inspected_attempts: dict[str, _AttemptRecord] = {}
     inspected_studies = 0
     if needs.cleanup_needed:
         loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
@@ -721,43 +711,35 @@ def _recover_trial_evidence(
                     study,
                     config,
                     phase.name,
-                    recovered_attempt_ids=inspected_attempt_ids,
-                    recovered_attempt_generations=inspected_attempt_generations,
-                    recovered_attempt_locations=inspected_attempt_locations,
+                    recovered_attempts=inspected_attempts,
                 )
                 evidence.reaped += _reap_stale_trials(
                     study,
                     config,
                     phase.name,
-                    recovered_attempt_ids=inspected_attempt_ids,
-                    recovered_attempt_generations=inspected_attempt_generations,
-                    recovered_attempt_locations=inspected_attempt_locations,
+                    recovered_attempts=inspected_attempts,
                 )
             else:
                 evidence.cleanup_recovered += _inspect_cleanup_uncertain_trials(
                     study,
                     phase.name,
-                    recovered_attempt_ids=inspected_attempt_ids,
-                    recovered_attempt_generations=inspected_attempt_generations,
-                    recovered_attempt_locations=inspected_attempt_locations,
+                    recovered_attempts=inspected_attempts,
                 )
                 evidence.reaped += _inspect_stale_running_trials(
                     study,
                     config,
                     phase.name,
-                    recovered_attempt_ids=inspected_attempt_ids,
-                    recovered_attempt_generations=inspected_attempt_generations,
-                    recovered_attempt_locations=inspected_attempt_locations,
+                    recovered_attempts=inspected_attempts,
                 )
-        for attempt_id in inspected_attempt_ids:
-            if (
-                inspected_attempt_generations.get(attempt_id) == run_id
-                or attempt_id in causal_attempt_ids
-            ):
+        for attempt_id, record in inspected_attempts.items():
+            if record.generation_id == run_id or attempt_id in causal_attempt_ids:
                 evidence.reaped_attempt_ids.add(attempt_id)
-                location = inspected_attempt_locations.get(attempt_id)
-                if location is not None:
-                    evidence.reaped_attempt_locations[attempt_id] = location
+                if record.generation_id is not None:
+                    evidence.reaped_attempt_locations[attempt_id] = (
+                        record.phase_name,
+                        record.trial_number,
+                        record.generation_id,
+                    )
     _require_cleanup_evidence(needs, evidence, inspected_studies)
     return evidence
 

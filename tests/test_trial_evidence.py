@@ -41,6 +41,7 @@ from phasesweep.engine import (
     TrialEvidenceMissingError,
     read_status,
 )
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _phase_study_name
 from phasesweep.engine.paths import (
     _experiment_dir,
@@ -215,7 +216,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     )
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'study.db'}",
+        storage=f"journal:///{tmp_path / 'study.journal'}",
         trial_command=f"{sys.executable} {trainer} --receipt {{trial_dir}}/receipt.json {{overrides}}",
         metric=Metric(extractor=remote) if consumers in {"primary", "combined"} else None,
         constraints=constraints,
@@ -303,7 +304,9 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         )
         with pytest.raises(PhaseSweepError, match="optional SDK"):
             run_experiment(increased)
-        study = optuna.load_study(study_name="t::next", storage=experiment.resolved_storage)
+        study = optuna.load_study(
+            study_name="t::next", storage=_resolve_storage(experiment.resolved_storage)
+        )
         assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
         assert len(study.trials) == 1
 
@@ -335,7 +338,7 @@ def _evidence_experiment(
     fixed_overrides: dict[str, object] | None = None,
     override_format: str = "argparse",
 ) -> Experiment:
-    """Build a one-phase experiment on sqlite storage with a seeded sampler.
+    """Build a one-phase experiment on journal storage with a seeded sampler.
 
     Persistent storage is what makes a top-up reselect an *existing* trial
     rather than starting over, which is the whole subject here.
@@ -382,7 +385,7 @@ def _trial_count(experiment: Experiment) -> int:
     """Return how many trials the persistent phase study holds."""
     study = optuna.load_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.storage),
     )
     return len(study.get_trials(deepcopy=False))
 
@@ -392,7 +395,7 @@ def _phase_trial_count(experiment: Experiment, phase_name: str) -> int:
     phase = next(phase for phase in experiment.phases if phase.name == phase_name)
     study = optuna.load_study(
         study_name=_phase_study_name(experiment, phase),
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.storage),
     )
     return len(study.get_trials(deepcopy=False))
 
@@ -459,7 +462,7 @@ def test_trial_records_the_exact_generated_trainer_input(
     input_path = _sole_trial_dir(experiment) / filename
     study = optuna.load_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.storage),
     )
     record = study.get_trials(deepcopy=False)[0].user_attrs[TRAINER_INPUT_ATTR]
 
@@ -564,7 +567,7 @@ def test_present_incomplete_objective_provenance_blocks_selection(
     run_experiment(experiment)
     study = optuna.load_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.storage),
     )
     trial = deepcopy(study.get_trials(deepcopy=False)[0])
     record = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
@@ -771,7 +774,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     )
     p_study = optuna.load_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.storage),
     )
     assert (
         payload["trainer_input"]
@@ -779,7 +782,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     )
     optuna.delete_study(
         study_name=_phase_study_name(experiment, experiment.phases[0]),
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.storage),
     )
 
     resumed = run_experiment(experiment, from_phase="q")
