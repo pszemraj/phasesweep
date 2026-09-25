@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -50,6 +51,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     requires_nonroot,
+    temporary_umask,
     write_constant_trainer,
 )
 from tests.ledger_fixtures import (
@@ -707,27 +709,34 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
     assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
 
 
-def test_journal_writers_lock_a_relative_journal_through_its_absolute_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("spelling", ["nested-relative", "symlink-alias"])
+def test_journal_writers_and_repair_lock_the_journals_real_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spelling: str
 ) -> None:
-    """Every journal lock symlink targets the journal's absolute path.
+    """Every journal lock is ``<real journal>.lock``, a symlink to the journal's real path.
 
-    Optuna's lock is a symlink whose target is the path its backend was
-    given, and a relative target resolves against the lock's directory. A
-    nested relative URL such as ``journal:///ledger/study.journal`` would then
-    leave the lock dangling, and a stale one could never be released. Both
-    Optuna's appends and the repair lock the absolute path instead.
+    Optuna's lock is a symlink named after, and pointing at, the path its
+    backend was given. A nested relative URL such as
+    ``journal:///ledger/study.journal`` would leave that symlink dangling, so
+    a stale lock could never be released. A file symlink to the journal
+    would name a second lock, so an append through one spelling and a repair
+    through the other would not exclude each other. Optuna's appends and the
+    repair both lock the resolved path instead.
     """
     monkeypatch.chdir(tmp_path)
     (tmp_path / "ledger").mkdir()
-    url = "journal:///ledger/study.journal"
-    journal = tmp_path / "ledger" / "study.journal"
-    targets: list[str] = []
+    journal = tmp_path.resolve() / "ledger" / "study.journal"
+    if spelling == "nested-relative":
+        url = "journal:///ledger/study.journal"
+    else:
+        (tmp_path / "alias.journal").symlink_to("ledger/study.journal")
+        url = f"journal:///{tmp_path}/alias.journal"
+    locks: set[tuple[str, str]] = set()
     real_symlink = os.symlink
 
     def recording_symlink(src: str, dst: str, *args: Any, **kwargs: Any) -> None:
         if os.fspath(dst).endswith(".lock"):
-            targets.append(os.fspath(src))
+            locks.add((os.fspath(dst), os.fspath(src)))
         real_symlink(src, dst, *args, **kwargs)
 
     monkeypatch.setattr(os, "symlink", recording_symlink)
@@ -737,9 +746,36 @@ def test_journal_writers_lock_a_relative_journal_through_its_absolute_path(
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
     engine_ledger._repair_incomplete_journal_record(url)
 
-    assert targets
-    assert set(targets) == {str(journal)}
+    assert locks == {(f"{journal}.lock", str(journal))}
     assert journal.read_bytes() == complete
+
+
+def test_repair_through_a_symlink_alias_is_excluded_by_the_real_names_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repair reaching a journal through a symlink never cuts a writer's in-flight record.
+
+    Two experiments may share one journal, one naming it through a file
+    symlink. An append still in flight through the real name looks exactly
+    like a crashed writer's partial record. The repair takes the same lock
+    that writer holds, so it waits and refuses, and the bytes stay whole.
+    """
+    real = tmp_path.resolve() / "real.journal"
+    alias = tmp_path / "alias.journal"
+    optuna.create_study(
+        study_name="s", storage=engine_ledger._resolve_storage(f"journal:///{real}")
+    )
+    alias.symlink_to(real)
+    in_flight = real.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
+    real.write_bytes(in_flight)
+    real.with_name(f"{real.name}.lock").symlink_to(real)  # the appending writer's lock
+    _manual_lock_clock(monkeypatch)
+
+    with pytest.raises(IncompleteJournalRecordError, match="still held"):
+        engine_ledger._repair_incomplete_journal_record(f"journal:///{alias}")
+
+    assert real.read_bytes() == in_flight
+    assert not alias.with_name(f"{alias.name}.lock").exists()
 
 
 def test_repair_truncates_only_while_holding_the_journal_lock(
@@ -765,6 +801,47 @@ def test_repair_truncates_only_while_holding_the_journal_lock(
 
     assert not lock_path.exists()
     assert journal.read_bytes() == complete
+
+
+def test_repair_backup_is_no_more_permissive_than_the_journal(tmp_path: Path) -> None:
+    """A private journal's backup stays private under a permissive umask.
+
+    The backup holds every study and trial attribute the journal does, so it
+    is created with the journal's mode, which the umask can only narrow.
+    """
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    journal = ledger_file(materialized, "journal")
+    journal.write_bytes(journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"])
+    journal.chmod(0o600)
+
+    with temporary_umask(0o022):
+        repair_incomplete_journal_record(validate_ledger(materialized.experiment))
+
+    (backup,) = journal.parent.glob(f"{journal.name}.*.bak")
+    assert stat.S_IMODE(backup.stat().st_mode) == 0o600
+
+
+def test_repair_refuses_a_journal_with_another_hard_linked_name(tmp_path: Path) -> None:
+    """A journal reachable by a second hard-linked name is never truncated.
+
+    An append through the other name takes that name's own journal lock, so
+    holding this name's lock proves nothing about it. The repair refuses
+    before writing a backup, and the journal keeps every byte.
+    """
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    journal = ledger_file(materialized, "journal")
+    damaged = journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
+    journal.write_bytes(damaged)
+    os.link(journal, tmp_path / "other-name.journal")
+
+    with pytest.raises(IncompleteJournalRecordError) as excinfo:
+        repair_incomplete_journal_record(validate_ledger(materialized.experiment))
+
+    assert excinfo.value.action == OperatorAction.RESTORE_LEDGER
+    assert "2 hard links" in str(excinfo.value)
+    assert journal.read_bytes() == damaged
+    assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
+    assert not journal.with_name(f"{journal.name}.lock").exists()
 
 
 def test_repair_refuses_a_journal_that_grew_under_its_lock(

@@ -1259,6 +1259,25 @@ def file_url_path(storage: str) -> str:
     return path
 
 
+def journal_file_path(storage: str) -> Path:
+    """Resolve a ``journal:///`` storage URL to the real journal file it names.
+
+    Every journal path and identity comes from here: the file Optuna opens,
+    the journal lock beside it, the same-host storage identity, and the
+    recovery locator. Optuna's journal lock is a symlink named
+    ``<path>.lock`` whose target is ``<path>``, so the path must be real:
+    a relative target resolves against the lock's own directory and dangles,
+    and a symlinked alias of the journal names a second lock, so an append
+    through one spelling and a repair through the other never exclude each
+    other. Resolving also freezes an invocation-relative path against the
+    working directory it was given in.
+
+    :param str storage: Journal storage URL, including escaped ``file:`` forms.
+    :return Path: The journal file, with ``~`` expanded and symlinks resolved.
+    """
+    return Path(file_url_path(storage)).expanduser().resolve()
+
+
 def _url_query_pairs(storage: str) -> list[tuple[str, str]]:
     """Return URL query pairs from a storage URL.
 
@@ -1315,8 +1334,7 @@ def storage_recovery_locator(storage: str | None) -> str | None:
     backend = storage_backend(storage)
     if backend != "journal":
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
-    path = Path(file_url_path(storage)).expanduser().resolve()
-    return local_storage_url(path)
+    return local_storage_url(journal_file_path(storage))
 
 
 def canonical_storage_identity(storage: str | None) -> str | None:
@@ -1337,5 +1355,4 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     backend = storage_backend(storage)
     if backend != "journal":
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
-    path = file_url_path(storage)
-    return "journal:///" + str(Path(path).expanduser().resolve())
+    return "journal:///" + str(journal_file_path(storage))

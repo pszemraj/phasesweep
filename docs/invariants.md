@@ -108,14 +108,18 @@ takes, whatever experiment or process it comes from, so while it is held no
 append is in flight. It scans the journal again under that lock, so an
 append that finished while the lock was awaited is never cut, and no offset
 read before the lock is ever used. It then copies the journal to
-`<journal>.<UTC stamp>.bak` beside it, checks the size is unchanged,
-truncates after the last complete record, fsyncs, and replays the result
-before releasing the lock. Optuna's own `acquire` can wait forever on a lock
-a killed writer left behind, so the repair takes the lock by the same
-symlink step itself and gives up after 30 seconds. It never removes a lock
-it did not take. Journal paths are made absolute before any backend or
-repair locks them, because the lock is a symlink to the journal path and a
-relative target would dangle. A repair that cannot take the lock within its
+`<journal>.<UTC stamp>.bak` beside it, created no more permissive than the
+journal, checks the size is unchanged, truncates after the last complete
+record, fsyncs, and replays the result before releasing the lock. Optuna's
+own `acquire` can wait forever on a lock a killed writer left behind, so the
+repair takes the lock by the same symlink step itself and gives up after 30
+seconds. It never removes a lock it did not take. The lock is a symlink named
+`<journal>.lock` that points at the journal, so every journal path, for
+Optuna's backend and the repair alike, comes from
+`runtime.files.journal_file_path`, which resolves symlinks: a relative target
+would dangle, and a symlinked alias would name a second lock that excludes
+nothing. A journal with a second hard-linked name has the same problem and
+is refused before any backup. A repair that cannot take the lock within its
 wait, write the backup, or truncate leaves the journal as it was and refuses
 with `RESTORE_LEDGER`, naming a lock left behind; a journal that grew under
 the lock is left untruncated and refused with `RETRY`. A malformed record
@@ -139,8 +143,11 @@ refused with `RESTORE_LEDGER` and the bytes unchanged.
 `tests/test_format_cutover.py::test_repair_leaves_an_append_that_finished_while_it_awaited_the_lock`,
 `tests/test_format_cutover.py::test_repair_waits_for_a_journal_lock_another_writer_holds`,
 `tests/test_format_cutover.py::test_repair_refuses_a_journal_lock_that_is_never_released`,
-`tests/test_format_cutover.py::test_journal_writers_lock_a_relative_journal_through_its_absolute_path`,
+`tests/test_format_cutover.py::test_journal_writers_and_repair_lock_the_journals_real_path`,
+`tests/test_format_cutover.py::test_repair_through_a_symlink_alias_is_excluded_by_the_real_names_writer`,
 `tests/test_format_cutover.py::test_repair_truncates_only_while_holding_the_journal_lock`,
+`tests/test_format_cutover.py::test_repair_backup_is_no_more_permissive_than_the_journal`,
+`tests/test_format_cutover.py::test_repair_refuses_a_journal_with_another_hard_linked_name`,
 `tests/test_format_cutover.py::test_repair_refuses_a_journal_that_grew_under_its_lock`,
 `tests/test_format_cutover.py::test_repair_that_cannot_write_beside_the_journal_leaves_it_unchanged`
 

@@ -141,7 +141,8 @@ ledger or its directory. A process killed while it appended to the journal
 can leave a partial final record, which every reader skips. The next
 `phasesweep run` or confirmed `phasesweep mcp recover-run` cuts it under
 Optuna's own journal lock, after saving the journal as
-`<ledger>.<UTC stamp>.bak` beside it. The killed process can also leave that
+`<ledger>.<UTC stamp>.bak` beside it, with permissions no broader than the
+ledger's. The killed process can also leave that
 lock behind, as `<ledger>.lock`. If the lock is still held after 30 seconds,
 the command refuses and names it: once no process is writing the ledger,
 remove the lock and run the command again. A record damaged anywhere before
@@ -157,8 +158,8 @@ the runtime.
 ### Inspect the ledger with Optuna
 
 The ledger is an ordinary Optuna journal holding one study per phase, named
-`<experiment>::<phase>`. `phasesweep status <config>` prints its absolute path
-as `ledger_path` (`null` for `storage: null`). Optuna's CLI reads the journal
+`<experiment>::<phase>`. `phasesweep status <config>` prints its real path,
+with symlinks resolved, as `ledger_path` (`null` for `storage: null`). Optuna's CLI reads the journal
 in place without writing to it, so these commands are safe while a sweep runs:
 
 ```bash

@@ -54,6 +54,7 @@ import errno
 import json
 import logging
 import os
+import stat
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
@@ -100,8 +101,8 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_VERSION,
 )
 from phasesweep.runtime.files import (
-    file_url_path,
     fsync_directory,
+    journal_file_path,
     storage_backend,
     storage_is_in_memory,
 )
@@ -200,24 +201,6 @@ class ClaimedLedger(ValidatedLedger):
     studies: Mapping[str, optuna.Study]
 
 
-def _journal_path(url: str) -> Path:
-    """Resolve a ``journal:///`` storage URL to the journal file it names.
-
-    Every journal path in this module comes from here, so the directory
-    :func:`claim_ledger` prepares, the file the snapshot reader opens, and
-    the file the live backend appends to can never drift apart. The path is
-    absolute because Optuna's journal lock is a symlink whose target is this
-    path. A relative target resolves against the lock's own directory, so a
-    nested relative URL would leave every lock dangling, and Optuna 4.2 and
-    later then retry forever instead of releasing a stale lock.
-
-    :param str url: Journal storage URL, including escaped ``file:`` forms.
-    :return Path: The journal file, with ``~`` expanded, made absolute against
-        the working directory, and symlinks left unresolved.
-    """
-    return Path(file_url_path(url)).expanduser().absolute()
-
-
 def _resolve_storage(url: str | None) -> Any:
     """Translate a storage URL into an Optuna storage object.
 
@@ -250,7 +233,7 @@ def _resolve_storage(url: str | None) -> Any:
     backend = storage_backend(url)
     if backend != "journal":
         raise ValueError(f"Unsupported local storage backend: {backend!r}.")
-    path = _journal_path(url)
+    path = journal_file_path(url)
     log.info("Using JournalFileStorage at %s", path)
     from optuna.storages.journal import JournalFileBackend
 
@@ -367,7 +350,7 @@ def _journal_snapshot_storage(storage_url: str, label: str) -> JournalStorage | 
     :raises StudyStorageUnavailableError: The journal is unreadable, changed
         while it was read, or holds a malformed record before its last line.
     """
-    path = _journal_path(storage_url)
+    path = journal_file_path(storage_url)
     try:
         data = _capture_journal(path)
         if data is None:
@@ -420,8 +403,9 @@ def _truncate_incomplete_journal_record(path: Path) -> tuple[Path, int] | None:
     :return tuple[Path, int] | None: The backup's path and the number of bytes
         removed, or ``None`` when the final record had completed by the time
         the lock was taken, so nothing needed repair.
-    :raises IncompleteJournalRecordError: The backup or the truncation failed,
-        or the journal changed size while the lock was held.
+    :raises IncompleteJournalRecordError: The journal has another hard-linked
+        name, whose appends take a different lock; the backup or the
+        truncation failed; or the journal changed size while the lock was held.
     :raises StudyStorageUnavailableError: The journal could not be read, holds
         a malformed record before its last, or does not replay once repaired.
     """
@@ -432,12 +416,24 @@ def _truncate_incomplete_journal_record(path: Path) -> tuple[Path, int] | None:
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     backup = path.with_name(f"{path.name}.{stamp}.bak")
     try:
-        with backup.open("xb") as copy:
-            copy.write(data)
-            copy.flush()
-            os.fsync(copy.fileno())
-        fsync_directory(path.parent)
         with path.open("r+b") as journal:
+            source = os.fstat(journal.fileno())
+            if source.st_nlink != 1:
+                raise IncompleteJournalRecordError(
+                    f"Journal storage {path} has {source.st_nlink} hard links. An append "
+                    "through another of those names takes a different journal lock, so its "
+                    f"incomplete final record was not repaired. Make {path} the journal's "
+                    "only name, then retry. Nothing was written."
+                )
+            # The copy holds every study and trial attribute the journal does, so
+            # it is created no more permissive than the journal; the umask can
+            # only narrow it further.
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+            with os.fdopen(os.open(backup, flags, stat.S_IMODE(source.st_mode)), "wb") as copy:
+                copy.write(data)
+                copy.flush()
+                os.fsync(copy.fileno())
+            fsync_directory(path.parent)
             if os.fstat(journal.fileno()).st_size != len(data):
                 raise IncompleteJournalRecordError(
                     f"Journal storage {path} changed while its journal lock was held for "
@@ -488,7 +484,8 @@ def _acquire_journal_lock(path: Path) -> JournalFileSymlinkLock:
     wait ends after :data:`_JOURNAL_LOCK_WAIT_SECONDS`. A lock this did not
     take is never removed; the refusal names it for the operator instead.
 
-    :param Path path: Journal to lock, as :func:`_journal_path` returns it.
+    :param Path path: Journal to lock, as
+        :func:`~phasesweep.runtime.files.journal_file_path` returns it.
     :return JournalFileSymlinkLock: Optuna's lock on the journal, now held.
     :raises IncompleteJournalRecordError: The lock was still held when the
         wait ran out, or its symlink could not be created.
@@ -540,7 +537,8 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
     line that is still incomplete can only be a crashed writer's, and an
     append that finished while the lock was awaited leaves nothing to repair;
     no offset from before the lock is ever used. The captured bytes are copied
-    to ``<journal>.<UTC stamp>.bak`` beside it, the journal is truncated after
+    to ``<journal>.<UTC stamp>.bak`` beside it, created no more permissive than
+    the journal, the journal is truncated after
     its last complete record and fsynced, and it must replay before the lock
     is released. The lock comes from :func:`_acquire_journal_lock`, which
     refuses instead of waiting forever on a lock a killed writer left behind.
@@ -555,7 +553,7 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
     :raises StudyStorageUnavailableError: The journal could not be read, holds
         a malformed record before its last, or did not replay once repaired.
     """
-    path = _journal_path(storage_url)
+    path = journal_file_path(storage_url)
     scanned = _scan_journal_before_write(path)
     if scanned is None or scanned[1] == len(scanned[0]):
         return
@@ -825,12 +823,12 @@ def _phase_trial_stats(
 
 
 def resolved_ledger_path(experiment: Experiment) -> Path | None:
-    """Return the absolute path of the journal file an experiment's ledger lives in.
+    """Return the real path of the journal file an experiment's ledger lives in.
 
     ``phasesweep status`` reports it so an operator can point Optuna's own
     CLI, or a dashboard serving a copy, at the ledger. The path comes from
-    :func:`_journal_path` like every other journal path here, absolute and
-    with symlinks unresolved, so it names the file Optuna opens.
+    :func:`~phasesweep.runtime.files.journal_file_path` like every other
+    journal path, so it names the file Optuna opens and locks.
 
     :param Experiment experiment: Experiment whose resolved storage is named.
     :return Path | None: The journal file, or ``None`` for in-memory storage.
@@ -839,7 +837,7 @@ def resolved_ledger_path(experiment: Experiment) -> Path | None:
     if storage_is_in_memory(url):
         return None
     assert url is not None
-    return _journal_path(url)
+    return journal_file_path(url)
 
 
 def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> ValidatedLedger:
@@ -861,7 +859,7 @@ def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> Val
         if named != "journal":
             raise ValueError(f"Unsupported local storage backend: {named!r}.")
         backend = "journal"
-        ledger_path = _journal_path(url)
+        ledger_path = journal_file_path(url)
     return ValidatedLedger(
         experiment=experiment,
         experiment_name=experiment.experiment,
@@ -1250,7 +1248,7 @@ def _require_replay_matches_snapshot(
             )
         ):
             raise StudyStorageUnavailableError(
-                f"Journal storage {_journal_path(locator)} changed while "
+                f"Journal storage {journal_file_path(locator)} changed while "
                 f"study {snapshot.study_name!r} was being opened: trial {captured.number} "
                 "no longer matches the complete snapshot read first."
             )
@@ -1280,7 +1278,7 @@ def _open_existing_journal_study(storage_url: str, study_name: str) -> optuna.St
         live = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage_url))
     except KeyError as exc:
         raise StudyStorageUnavailableError(
-            f"Journal storage {_journal_path(storage_url)} lost study "
+            f"Journal storage {journal_file_path(storage_url)} lost study "
             f"{study_name!r} between its complete snapshot and the live replay."
         ) from exc
     _require_replay_matches_snapshot(snapshot, live, storage_url)
