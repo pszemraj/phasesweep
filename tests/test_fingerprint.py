@@ -1077,19 +1077,24 @@ def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "entry",
-    ["generations", "attempts", "Attempts", "P", "study.journal"],
+    ["generations", "attempts", "Attempts", "P", "study.db", "study.journal"],
 )
 def test_unbound_known_phasesweep_state_names_the_blocking_entry(
     tmp_path: Path, entry: str
 ) -> None:
-    """Known unmarked engine state is refused with its blocking entry named."""
+    """Known unmarked engine state is refused with its blocking entry named.
+
+    ``study.db`` is the SQLite ledger ``storage: auto`` wrote before the
+    journal became the only ledger, so a root holding just that file is
+    still refused rather than bound to a new ``study.journal`` beside it.
+    """
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"journal:///{tmp_path / 'studies.journal'}",
+        storage="auto" if entry == "study.db" else f"journal:///{tmp_path / 'studies.journal'}",
     )
     state_entry = _experiment_dir(experiment) / entry
     state_entry.parent.mkdir(parents=True, exist_ok=True)
-    if entry == "study.journal":
+    if entry in {"study.db", "study.journal"}:
         state_entry.write_text("existing ledger\n")
     else:
         state_entry.mkdir()
