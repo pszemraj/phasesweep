@@ -54,6 +54,7 @@ import errno
 import json
 import logging
 import os
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -63,7 +64,7 @@ from typing import Any, Literal
 
 import optuna
 from optuna.storages import JournalStorage
-from optuna.storages.journal import BaseJournalBackend
+from optuna.storages.journal import BaseJournalBackend, JournalFileSymlinkLock
 
 from phasesweep.config import Experiment, Phase
 from phasesweep.engine.artifact_roots import (
@@ -204,12 +205,17 @@ def _journal_path(url: str) -> Path:
 
     Every journal path in this module comes from here, so the directory
     :func:`claim_ledger` prepares, the file the snapshot reader opens, and
-    the file the live backend appends to can never drift apart.
+    the file the live backend appends to can never drift apart. The path is
+    absolute because Optuna's journal lock is a symlink whose target is this
+    path. A relative target resolves against the lock's own directory, so a
+    nested relative URL would leave every lock dangling, and Optuna 4.2 and
+    later then retry forever instead of releasing a stale lock.
 
     :param str url: Journal storage URL, including escaped ``file:`` forms.
-    :return Path: The journal file, with ``~`` expanded and nothing else resolved.
+    :return Path: The journal file, with ``~`` expanded, made absolute against
+        the working directory, and symlinks left unresolved.
     """
-    return Path(file_url_path(url)).expanduser()
+    return Path(file_url_path(url)).expanduser().absolute()
 
 
 def _resolve_storage(url: str | None) -> Any:
@@ -464,6 +470,58 @@ def _truncate_incomplete_journal_record(path: Path) -> tuple[Path, int] | None:
     return backup, len(data) - end
 
 
+#: How long a repair waits for Optuna's journal lock before refusing. An
+#: append holds that lock for one write and fsync, so a lock held this long
+#: was almost certainly left by a writer killed mid-append, the same crash
+#: that leaves an incomplete final record.
+_JOURNAL_LOCK_WAIT_SECONDS = 30.0
+
+
+def _acquire_journal_lock(path: Path) -> JournalFileSymlinkLock:
+    """Take Optuna's journal lock on a journal, or refuse once a bounded wait runs out.
+
+    Optuna's own ``acquire`` has no timeout, and a lock a killed writer left
+    behind can block it forever: Optuna 4.0 and 4.1 never release a stale
+    lock, and later releases retry forever when the lock's symlink dangles.
+    The lock is taken here by the same exclusive step, creating the
+    ``<journal>.lock`` symlink to the journal, with the same backoff, and the
+    wait ends after :data:`_JOURNAL_LOCK_WAIT_SECONDS`. A lock this did not
+    take is never removed; the refusal names it for the operator instead.
+
+    :param Path path: Journal to lock, as :func:`_journal_path` returns it.
+    :return JournalFileSymlinkLock: Optuna's lock on the journal, now held.
+    :raises IncompleteJournalRecordError: The lock was still held when the
+        wait ran out, or its symlink could not be created.
+    """
+    target = str(path)
+    lock_file = Path(target + ".lock")  # Optuna's LOCK_FILE_SUFFIX
+    deadline = time.monotonic() + _JOURNAL_LOCK_WAIT_SECONDS
+    delay = 0.001
+    while True:
+        try:
+            os.symlink(target, lock_file)
+        except FileExistsError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise IncompleteJournalRecordError(
+                    f"Journal storage {path} ends with an incomplete record, and its journal "
+                    f"lock {lock_file} was still held after {_JOURNAL_LOCK_WAIT_SECONDS:g} "
+                    "seconds, so the record was not repaired. A writer killed mid-append "
+                    "leaves both behind. If no process is writing to this journal, remove "
+                    f"{lock_file}, then retry. Nothing was written."
+                ) from None
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 1.0)
+        except OSError as exc:
+            raise IncompleteJournalRecordError(
+                f"Journal storage {path} ends with an incomplete record that could not be "
+                f"repaired: its journal lock could not be taken: {exc}. Restore write access to "
+                "the journal's directory, then retry. Nothing was written."
+            ) from exc
+        else:
+            return JournalFileSymlinkLock(target)
+
+
 def _repair_incomplete_journal_record(storage_url: str) -> None:
     """Cut a journal's incomplete final record under Optuna's journal lock.
 
@@ -484,13 +542,16 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
     no offset from before the lock is ever used. The captured bytes are copied
     to ``<journal>.<UTC stamp>.bak`` beside it, the journal is truncated after
     its last complete record and fsynced, and it must replay before the lock
-    is released. Optuna releases a crashed writer's stale lock once the
-    journal has gone unchanged for its 30-second grace period, so the section
-    under the lock is kept to one scan, one copy, and one truncation.
+    is released. The lock comes from :func:`_acquire_journal_lock`, which
+    refuses instead of waiting forever on a lock a killed writer left behind.
+    Optuna 4.2 and later force-release a lock once the journal has gone
+    unchanged for 30 seconds, so the section under the lock is kept to one
+    scan, one copy, and one truncation.
 
     :param str storage_url: Journal storage URL a caller is about to write through.
-    :raises IncompleteJournalRecordError: The record could not be repaired, or
-        another process released the journal lock during the repair.
+    :raises IncompleteJournalRecordError: The record could not be repaired,
+        the journal lock stayed held past the wait, or another process
+        released the journal lock during the repair.
     :raises StudyStorageUnavailableError: The journal could not be read, holds
         a malformed record before its last, or did not replay once repaired.
     """
@@ -498,21 +559,11 @@ def _repair_incomplete_journal_record(storage_url: str) -> None:
     scanned = _scan_journal_before_write(path)
     if scanned is None or scanned[1] == len(scanned[0]):
         return
-    from optuna.storages.journal import JournalFileSymlinkLock
-
-    lock = JournalFileSymlinkLock(str(path))
     log.warning(
         "Journal storage %s ends with an incomplete record; taking its journal lock to repair it.",
         path,
     )
-    try:
-        lock.acquire()
-    except OSError as exc:
-        raise IncompleteJournalRecordError(
-            f"Journal storage {path} ends with an incomplete record that could not be "
-            f"repaired: its journal lock could not be taken: {exc}. Restore write access to "
-            "the journal's directory, then retry. Nothing was written."
-        ) from exc
+    lock = _acquire_journal_lock(path)
     try:
         repaired = _truncate_incomplete_journal_record(path)
     except BaseException:
@@ -778,8 +829,8 @@ def resolved_ledger_path(experiment: Experiment) -> Path | None:
 
     ``phasesweep status`` reports it so an operator can point Optuna's own
     CLI, or a dashboard serving a copy, at the ledger. The path comes from
-    :func:`_journal_path` like every other journal path here, and is made
-    absolute without resolving symlinks, so it names the file Optuna opens.
+    :func:`_journal_path` like every other journal path here, absolute and
+    with symlinks unresolved, so it names the file Optuna opens.
 
     :param Experiment experiment: Experiment whose resolved storage is named.
     :return Path | None: The journal file, or ``None`` for in-memory storage.
@@ -788,7 +839,7 @@ def resolved_ledger_path(experiment: Experiment) -> Path | None:
     if storage_is_in_memory(url):
         return None
     assert url is not None
-    return _journal_path(url).absolute()
+    return _journal_path(url)
 
 
 def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> ValidatedLedger:

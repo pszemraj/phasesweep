@@ -141,8 +141,11 @@ ledger or its directory. A process killed while it appended to the journal
 can leave a partial final record, which every reader skips. The next
 `phasesweep run` or confirmed `phasesweep mcp recover-run` cuts it under
 Optuna's own journal lock, after saving the journal as
-`<ledger>.<UTC stamp>.bak` beside it. A record damaged anywhere before the
-last is refused as corruption. Contributors will find the ordering rules
+`<ledger>.<UTC stamp>.bak` beside it. The killed process can also leave that
+lock behind, as `<ledger>.lock`. If the lock is still held after 30 seconds,
+the command refuses and names it: once no process is writing the ledger,
+remove the lock and run the command again. A record damaged anywhere before
+the last is refused as corruption. Contributors will find the ordering rules
 behind these guarantees, and the tests that hold them, in
 [durability invariants](invariants.md).
 

@@ -419,17 +419,15 @@ def _read_only_once_locked(journal: Path, monkeypatch: pytest.MonkeyPatch) -> It
     after the real lock is taken makes the backup the repair opens next fail.
     The directory's mode is restored on exit so the tree can be cleaned up.
     """
-    import optuna.storages.journal as journal_module
-
-    real_acquire = journal_module.JournalFileSymlinkLock.acquire
+    real_acquire = engine_ledger._acquire_journal_lock
     mode = journal.parent.stat().st_mode
 
-    def acquire_then_deny(self: object) -> bool:
-        acquired = real_acquire(self)
+    def acquire_then_deny(path: Path):
+        acquired = real_acquire(path)
         journal.parent.chmod(0o555)
         return acquired
 
-    monkeypatch.setattr(journal_module.JournalFileSymlinkLock, "acquire", acquire_then_deny)
+    monkeypatch.setattr(engine_ledger, "_acquire_journal_lock", acquire_then_deny)
     try:
         yield
     finally:

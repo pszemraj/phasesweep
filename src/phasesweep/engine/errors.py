@@ -124,9 +124,11 @@ class IncompleteJournalRecordError(StudyStorageUnavailableError):
     A crashed writer's partial final record is normally cut under Optuna's
     journal lock before any write. This names why that repair did not finish:
     the lock, backup, or truncation failed, which restoring write access to
-    the ledger fixes, or the journal changed or the lock was lost while it was
-    held, which a retry settles (``action`` is then ``RETRY``). The intact
-    records remain, so the ledger needs repair, not a copy from a backup.
+    the ledger fixes; the lock stayed held past the repair's wait, which
+    removing a lock a killed writer left fixes; or the journal changed or the
+    lock was lost while it was held, which a retry settles (``action`` is then
+    ``RETRY``). The intact records remain, so the ledger needs repair, not a
+    copy from a backup.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_LEDGER

@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import optuna
 import pytest
@@ -597,28 +602,144 @@ def test_repair_leaves_an_append_that_finished_while_it_awaited_the_lock(
     repair's rescan runs under the lock, no offset from before the lock is
     ever used: nothing is truncated, and no backup is written.
     """
-    import optuna.storages.journal as journal_module
-
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     journal = ledger_file(materialized, "journal")
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
 
-    real_acquire = journal_module.JournalFileSymlinkLock.acquire
+    real_acquire = engine_ledger._acquire_journal_lock
 
-    def finish_append_then_acquire(self: object) -> bool:
+    def finish_append_then_acquire(path: Path):
         journal.write_bytes(complete)
-        return real_acquire(self)
+        return real_acquire(path)
 
-    monkeypatch.setattr(
-        journal_module.JournalFileSymlinkLock, "acquire", finish_append_then_acquire
-    )
+    monkeypatch.setattr(engine_ledger, "_acquire_journal_lock", finish_append_then_acquire)
 
     repair_incomplete_journal_record(validate_ledger(experiment))
 
     assert journal.read_bytes() == complete
     assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
+
+
+def _manual_lock_clock(
+    monkeypatch: pytest.MonkeyPatch, on_pause: Callable[[], None] | None = None
+) -> dict[str, float]:
+    """Replace the repair's lock-wait clock with a manual one each pause advances."""
+    clock = {"now": 0.0, "pauses": 0.0}
+
+    def pause(seconds: float) -> None:
+        clock["now"] += seconds
+        clock["pauses"] += 1
+        if on_pause is not None:
+            on_pause()
+
+    monkeypatch.setattr(
+        engine_ledger, "time", SimpleNamespace(monotonic=lambda: clock["now"], sleep=pause)
+    )
+    return clock
+
+
+def test_repair_waits_for_a_journal_lock_another_writer_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A journal lock held when the repair starts is awaited, then taken, not refused on sight."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    journal = ledger_file(materialized, "journal")
+    complete = journal.read_bytes()
+    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    lock_path = journal.with_name(f"{journal.name}.lock")
+    lock_path.symlink_to(journal)
+    ledger = validate_ledger(materialized.experiment)
+    clock = _manual_lock_clock(monkeypatch, on_pause=lock_path.unlink)
+
+    repair_incomplete_journal_record(ledger)
+
+    assert clock["pauses"] == 1
+    assert journal.read_bytes() == complete
+    assert len(list(journal.parent.glob(f"{journal.name}.*.bak"))) == 1
+    assert not lock_path.exists()
+
+
+@pytest.mark.parametrize("lock_target", ["journal", "dangling"])
+def test_repair_refuses_a_journal_lock_that_is_never_released(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock_target: str
+) -> None:
+    """A journal lock a killed writer left behind ends the repair in a bounded refusal.
+
+    Optuna 4.0 and 4.1 wait on such a lock forever, and later releases retry
+    forever when its symlink dangles, as a lock taken through a nested
+    relative journal path does. The repair gives up once its wait has run
+    out, leaves the lock and the journal as they were, and names the lock to
+    remove. It runs in a thread so a wait that never ends fails the test
+    instead of hanging the suite.
+    """
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    journal = ledger_file(materialized, "journal")
+    damaged = journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
+    journal.write_bytes(damaged)
+    lock_path = journal.with_name(f"{journal.name}.lock")
+    target = str(journal) if lock_target == "journal" else f"ledger/{journal.name}"
+    lock_path.symlink_to(target)
+    ledger = validate_ledger(materialized.experiment)
+    clock = _manual_lock_clock(monkeypatch)
+
+    raised: list[BaseException] = []
+
+    def repair() -> None:
+        try:
+            repair_incomplete_journal_record(ledger)
+        except BaseException as exc:  # noqa: BLE001 - handed to the assertions below
+            raised.append(exc)
+
+    worker = threading.Thread(target=repair, daemon=True)
+    worker.start()
+    worker.join(timeout=10.0)
+
+    assert not worker.is_alive()
+    assert clock["now"] == pytest.approx(engine_ledger._JOURNAL_LOCK_WAIT_SECONDS)
+    assert len(raised) == 1
+    assert isinstance(raised[0], IncompleteJournalRecordError)
+    assert raised[0].action == OperatorAction.RESTORE_LEDGER
+    assert f"remove {lock_path}" in str(raised[0])
+    assert journal.read_bytes() == damaged
+    assert os.readlink(lock_path) == target
+    assert not list(journal.parent.glob(f"{journal.name}.*.bak"))
+
+
+def test_journal_writers_lock_a_relative_journal_through_its_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every journal lock symlink targets the journal's absolute path.
+
+    Optuna's lock is a symlink whose target is the path its backend was
+    given, and a relative target resolves against the lock's directory. A
+    nested relative URL such as ``journal:///ledger/study.journal`` would then
+    leave the lock dangling, and a stale one could never be released. Both
+    Optuna's appends and the repair lock the absolute path instead.
+    """
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "ledger").mkdir()
+    url = "journal:///ledger/study.journal"
+    journal = tmp_path / "ledger" / "study.journal"
+    targets: list[str] = []
+    real_symlink = os.symlink
+
+    def recording_symlink(src: str, dst: str, *args: Any, **kwargs: Any) -> None:
+        if os.fspath(dst).endswith(".lock"):
+            targets.append(os.fspath(src))
+        real_symlink(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "symlink", recording_symlink)
+
+    optuna.create_study(study_name="s", storage=engine_ledger._resolve_storage(url))
+    complete = journal.read_bytes()
+    journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
+    engine_ledger._repair_incomplete_journal_record(url)
+
+    assert targets
+    assert set(targets) == {str(journal)}
+    assert journal.read_bytes() == complete
 
 
 def test_repair_truncates_only_while_holding_the_journal_lock(
