@@ -6,7 +6,6 @@ import hashlib
 import json
 import logging
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any, Literal
 
 import optuna
@@ -21,6 +20,9 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.optuna import (
+    _completed_trial_count,
+    _finished_trial_count,
+    _meets_published_trial_history_boundary,
     _published_phase_trial_refs,
     _published_trial_matches,
 )
@@ -104,39 +106,6 @@ def _artifact_root_binding_payload(experiment: Experiment) -> dict[str, Any]:
     }
 
 
-def _auto_storage_backend_conflict(experiment: Experiment, raw: Any) -> str | None:
-    """Explain when parallelism selects the other auto-storage ledger.
-
-    :param Experiment experiment: Config whose selected backend is being checked.
-    :param Any raw: Recorded artifact-root binding.
-    :return str | None: Actionable diagnostic for a backend change, otherwise ``None``.
-    """
-    if experiment.storage != "auto" or not isinstance(raw, dict):
-        return None
-    recorded_root = raw.get("artifact_root")
-    if (
-        raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
-        or raw.get("experiment") != experiment.experiment
-        or not isinstance(recorded_root, str)
-        or not Path(recorded_root).is_absolute()
-    ):
-        return None
-    parallel = any(phase.n_jobs > 1 for phase in experiment.phases)
-    backend, previous = ("sqlite", "study.db") if parallel else ("journal", "study.journal")
-    selected = "study.journal" if parallel else "study.db"
-    # Reconstruct lexically: a moved tree's previous root may no longer exist.
-    identity = f"{backend}:///{Path(recorded_root) / previous}"
-    if raw.get("storage_key") != hashlib.sha256(identity.encode("utf-8")).hexdigest():
-        return None
-    return (
-        f"Artifact root {_artifact_root_identity(experiment)!r} is bound to {previous}, "
-        f"but storage: auto now selects {selected} because n_jobs changed between "
-        "sequential and parallel execution. Restore the previous n_jobs setting to "
-        "continue this tree, or use a new experiment name or workdir for the new backend. "
-        "No trial ran and nothing was published."
-    )
-
-
 def _root_durable_state_entry(experiment: Experiment) -> str | None:
     """Return the first known PhaseSweep state entry in an unbound root.
 
@@ -160,6 +129,8 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         "generation.yaml",
         "generations",
         "last_successful_generation.yaml",
+        # The SQLite ledger `storage: auto` created before the journal became the
+        # only ledger. Nothing writes it now, but a root holding one is not fresh.
         "study.db",
         "study.journal",
         "summary.yaml",
@@ -250,9 +221,6 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
             action=OperatorAction.USE_PRIOR_RELEASE,
         )
     if raw != expected:
-        backend_conflict = _auto_storage_backend_conflict(experiment, raw)
-        if backend_conflict is not None:
-            raise ArtifactRootConflictError(backend_conflict, action=OperatorAction.FIX_CONFIG)
         raise ArtifactRootConflictError(
             f"Artifact root {expected['artifact_root']!r} is bound to a different storage "
             f"ledger or experiment than {experiment.experiment!r}. Use the config that owns "
@@ -401,11 +369,9 @@ def _check_published_phase_studies(
     if publication.state == "failed":
         raise PublicationIntegrityError(publication.error or "Published result is invalid.")
     published_trials = _published_phase_trial_refs(publication.summary)
-    reached = from_phase is None
-    for phase_name in (phase.name for phase in experiment.phases):
-        if phase_name == from_phase:
-            reached = True
-        if not reached or phase_name not in published_trials:
+    for _index, phase in experiment.phases_from(from_phase):
+        phase_name = phase.name
+        if phase_name not in published_trials:
             continue
         study = loaded.get(phase_name)
         expected = published_trials[phase_name]
@@ -417,15 +383,9 @@ def _check_published_phase_studies(
                     _published_trial_matches(trial, expected) for trial in trials
                 )
                 if matched and expected is not None:
-                    finished = sum(trial.state.is_finished() for trial in trials)
-                    completed = sum(
-                        trial.state == optuna.trial.TrialState.COMPLETE for trial in trials
-                    )
-                    if (
-                        expected.finished_trials is None or finished >= expected.finished_trials
-                    ) and (
-                        expected.completed_trials is None or completed >= expected.completed_trials
-                    ):
+                    finished = _finished_trial_count(trials)
+                    completed = _completed_trial_count(trials)
+                    if _meets_published_trial_history_boundary(finished, completed, expected):
                         continue
                     missing = (
                         f"has only {finished} terminal and {completed} complete trials, below "

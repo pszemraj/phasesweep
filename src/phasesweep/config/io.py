@@ -7,7 +7,7 @@ from typing import Any
 
 import yaml
 
-from phasesweep.config.models import Config, Experiment
+from phasesweep.config.models import Experiment
 
 
 class ConfigError(ValueError):
@@ -121,7 +121,7 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     return data
 
 
-def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
+def load_experiment_bytes(data: bytes, source: str | Path = "<bytes>") -> Experiment:
     """Parse and validate a config from an already-read byte snapshot.
 
     Args:
@@ -151,27 +151,6 @@ def load_config_bytes(data: bytes, source: str | Path = "<bytes>") -> Config:
     return Experiment.model_validate(parsed)
 
 
-def load_config(path: str | Path) -> Config:
-    """Parse and validate a single experiment YAML.
-
-    Args:
-        path: Filesystem path to a phasesweep YAML file.
-
-    Returns:
-        :class:`Experiment` parsed from the YAML.
-
-    Raises:
-        OSError: ``path`` cannot be read.
-        ConfigError: The file is not UTF-8 text, the YAML cannot be parsed
-            (including duplicate mapping keys), or the top level is not a mapping.
-        pydantic.ValidationError: The parsed mapping fails :class:`Experiment`
-            model validation.
-
-    """
-    path_obj = Path(path)
-    return load_config_bytes(path_obj.read_bytes(), source=path_obj)
-
-
 def load_experiment(path: str | Path) -> Experiment:
     """Parse and validate a single experiment YAML.
 
@@ -194,4 +173,5 @@ def load_experiment(path: str | Path) -> Experiment:
         pydantic.ValidationError: Any Pydantic / cross-phase validation failure.
 
     """
-    return load_config(path)
+    path_obj = Path(path)
+    return load_experiment_bytes(path_obj.read_bytes(), source=path_obj)

@@ -19,7 +19,7 @@ import phasesweep.mcp.recovery as mcp_recovery
 import phasesweep.mcp.runs as mcp_runs
 from phasesweep.config import (
     Experiment,
-    load_config,
+    load_experiment,
 )
 from phasesweep.engine import (
     NoFeasibleTrialError,
@@ -30,8 +30,9 @@ from phasesweep.engine.artifact_roots import (
     _bind_study_artifact_root,
     _write_artifact_root_binding,
 )
-from phasesweep.engine.attempts import _register_active_attempt
+from phasesweep.engine.attempts import _AttemptRecord, _register_active_attempt
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _attempts_dir,
@@ -67,6 +68,7 @@ from tests.mcp_helpers import (
     _catalog,
     _config,
     claim_runner_handle,
+    live_runs,
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
@@ -112,12 +114,12 @@ def _interrupt_first_cleanup_clear() -> Callable[[RunStore, RunHandle], None]:
 
 
 def _load_first_phase_study(config: Path) -> optuna.Study:
-    exp = load_config(config)
+    exp = load_experiment(config)
     assert isinstance(exp, Experiment)
     phase = exp.phases[0]
     return optuna.load_study(
         study_name=f"{exp.experiment}::{phase.name}",
-        storage=exp.storage,
+        storage=_resolve_storage(exp.resolved_storage),
     )
 
 
@@ -165,7 +167,7 @@ def _stage_stale_running_recovery_scaffold(
         boot_id=recorded_boot_id,
     )
     attempt_id = f"stale-attempt-{trial_number}"
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
@@ -493,12 +495,12 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
         started_at=started_at,
     )
 
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     phase = experiment.phases[0]
     study = optuna.create_study(
         study_name=f"{experiment.experiment}::{phase.name}",
-        storage=experiment.storage,
+        storage=_resolve_storage(experiment.resolved_storage),
         direction="minimize",
     )
     mark_current_format(experiment, study)
@@ -627,7 +629,7 @@ def test_recovery_preserves_status_written_after_initial_read(
     reg = registry.get("srv")
     run_id = "srv-status-during-recovery"
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     snapshot = capture_result_snapshot(experiment, generation_id=run_id)
 
@@ -774,7 +776,7 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     assert _load_phase_trial(config, later_trial).state == optuna.trial.TrialState.RUNNING
     assert store.state(handle) == "failed"
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
     status = app.status(run_id=run_id)
@@ -882,7 +884,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     # (review v0.5.16 / blocker 2).
     assert store.state(handle) == "succeeded"
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
     unavailable = app.status(run_id=run_id)
     assert unavailable["result_source"] == "terminal_snapshot_unavailable"
     assert unavailable["run"]["state"] == "succeeded"
@@ -937,7 +939,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     finalize after the registered supervisor is confirmed gone.
     """
     config = _config(tmp_path)
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
@@ -1053,7 +1055,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         generation_id=later_generation_id,
         persist_trial_attrs=not anonymous_snapshot,
     )
-    experiment = load_config(attempt_config)
+    experiment = load_experiment(attempt_config)
     assert isinstance(experiment, Experiment)
     phase = experiment.phases[0]
     study = _load_first_phase_study(attempt_config)
@@ -1081,7 +1083,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
         # realistic shape is therefore a tree owned by the config being
         # recovered, with only the registry entry still naming the old
         # locator -- which is exactly the reconciliation under test.
-        recovery_experiment = load_config(config)
+        recovery_experiment = load_experiment(config)
         assert isinstance(recovery_experiment, Experiment)
         _write_artifact_root_binding(recovery_experiment)
 
@@ -1255,7 +1257,7 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     status_kwargs: dict[str, object] = {}
     if expect_running_before_confirm:
-        exp = load_config(config)
+        exp = load_experiment(config)
         assert isinstance(exp, Experiment)
         status_kwargs["result_snapshot"] = capture_result_snapshot(exp)
     write_unsafe_cleanup_status(store, run_id, **status_kwargs)
@@ -1541,11 +1543,10 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
         generation_id=run_id,
     )
     attempt_id = f"stale-attempt-{trial_number}"
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     study = _load_first_phase_study(config)
-    reconciled_attempt_ids: set[str] = set()
-    reconciled_attempt_generations: dict[str, str] = {}
+    reconciled_attempts: dict[str, _AttemptRecord] = {}
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         lambda _identity: True,
@@ -1559,11 +1560,14 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
             study,
             experiment,
             experiment.phases[0].name,
-            recovered_attempt_ids=reconciled_attempt_ids,
-            recovered_attempt_generations=reconciled_attempt_generations,
+            recovered_attempts=reconciled_attempts,
         )
         == 1
     )
+    reconciled_attempt_ids = set(reconciled_attempts)
+    reconciled_attempt_generations = {
+        aid: record.generation_id for aid, record in reconciled_attempts.items()
+    }
     assert reconciled_attempt_ids == {attempt_id}
     assert reconciled_attempt_generations == {attempt_id: run_id}
 
@@ -1591,7 +1595,7 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
     assert recovery["reaped_running_trials"] == 0
     assert recovery["cleanup_uncertain_terminal_trials"] == 0
     assert store.state(handle) == "cancelled"
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 @pytest.mark.integration
@@ -1648,7 +1652,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     assert phase["trials"]["RUNNING"] == 0
     assert phase["trials"]["FAIL"] == 1
     assert store.state(handle) == "cancelled"
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 def test_operator_recovery_consumes_terminal_cleanup_evidence(
@@ -1706,7 +1710,7 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     store, handle, trial_number, config, recover = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=False
     )
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     write_unsafe_cleanup_status(
         store,
@@ -1746,7 +1750,7 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     assert retry.exit_code == 0, retry.output
     recovery = json.loads(recovery_record.read_text())
     assert recovery["cleanup_confirmed"] is True
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
@@ -1781,7 +1785,7 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
 
     assert retry.exit_code == 0, retry.output
     assert not store.cleanup_uncertain_path(run_id).exists()
-    assert store.live_runs() == []
+    assert live_runs(store) == []
 
 
 @pytest.mark.parametrize(

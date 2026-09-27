@@ -26,7 +26,7 @@ from phasesweep.engine.locking import (
     _experiment_lock,
     _run_lock_paths,
 )
-from phasesweep.errors import LockBusyError, PhaseSweepError
+from phasesweep.errors import PhaseSweepError
 from phasesweep.runtime import files as runtime_files
 from tests.conftest import (
     make_experiment,
@@ -192,21 +192,6 @@ def test_lock_dir_rejects_missing_or_unsafe_override(
     with pytest.raises(runtime_files.UnsafeLockPathError, match="Unsafe lock directory"):
         runtime_files.lock_dir()
     assert issubclass(runtime_files.UnsafeLockPathError, PhaseSweepError)
-
-
-def test_busy_generic_lock_is_an_operational_error(tmp_path: Path) -> None:
-    """Lock contention belongs to the CLI's expected error boundary."""
-    lock_path = tmp_path / "busy.lock"
-    held = runtime_files.try_lock_file(lock_path)
-    assert held is not None
-    try:
-        with (
-            pytest.raises(LockBusyError, match="already busy"),
-            runtime_files.exclusive_lock(lock_path, busy_message="already busy"),
-        ):
-            pytest.fail("the held lock must not be reacquired")
-    finally:
-        runtime_files.unlock_file(held)
 
 
 def test_lock_open_rejects_symlink_before_gpu_diagnostics_write(
@@ -700,10 +685,10 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
     this (review v0.5.6 / blocker 1).
     """
     exp_a = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'a.db'}"
+        workdir=str(tmp_path / "runs"), storage=f"journal:///{tmp_path / 'a.journal'}"
     )
     exp_b = make_experiment(
-        workdir=str(tmp_path / "runs"), storage=f"sqlite:///{tmp_path / 'b.db'}"
+        workdir=str(tmp_path / "runs"), storage=f"journal:///{tmp_path / 'b.journal'}"
     )
 
     with (  # noqa: SIM117 — testing that the inner enter raises
@@ -717,16 +702,16 @@ def test_run_lock_collides_for_different_storage_same_output_dir(
 @pytest.mark.parametrize(
     ("storage_a_name", "storage_b_name"),
     [
-        pytest.param("a.db", "b.db", id="different-storage-and-name"),
-        pytest.param("shared.db", "shared.db", id="shared-storage-different-name"),
+        pytest.param("a.journal", "b.journal", id="different-storage-and-name"),
+        pytest.param("shared.journal", "shared.journal", id="shared-storage-different-name"),
     ],
 )
 def test_run_lock_does_not_collide_for_distinct_experiment_names(
     tmp_path: Path, storage_a_name: str, storage_b_name: str
 ) -> None:
     """Distinct experiment namespaces do not share output or storage locks."""
-    storage_a = f"sqlite:///{tmp_path / storage_a_name}"
-    storage_b = f"sqlite:///{tmp_path / storage_b_name}"
+    storage_a = f"journal:///{tmp_path / storage_a_name}"
+    storage_b = f"journal:///{tmp_path / storage_b_name}"
     exp_a = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_a)
     exp_b = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_b)
     # make_experiment hardcodes experiment="t"; clone exp_b with another name.
@@ -799,11 +784,10 @@ import sys
 from phasesweep.config import Experiment
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.errors import ExperimentLockBusyError
-from phasesweep.errors import LockBusyError
 try:
     with _experiment_lock(Experiment.model_validate_json(sys.argv[1])):
         print("acquired")
-except (ExperimentLockBusyError, LockBusyError):
+except ExperimentLockBusyError:
     print("busy")
     sys.exit(2)
 """,
@@ -825,25 +809,11 @@ except (ExperimentLockBusyError, LockBusyError):
     assert all(path.stat().st_ino == inode for path, inode in lock_inodes.items())
 
 
-def test_in_memory_url_spellings_take_no_storage_lock(tmp_path: Path) -> None:
-    """Every in-memory storage spelling yields only the output lock.
-
-    ``sqlite:///:memory:``-style URLs previously produced a storage lock
-    naming a backend that does not exist, so two unrelated in-memory runs
-    sharing an experiment name (but nothing else) contended spuriously
-    (review v0.5.17 gap hunt).
-    """
-    for storage in ("sqlite://", "sqlite:///:memory:", "sqlite+pysqlite:///:memory:"):
-        exp = make_experiment(workdir=str(tmp_path / "runs"), storage="sqlite:///u.db")
-        exp = exp.model_copy(update={"storage": storage})
-        assert len(_run_lock_paths(exp)) == 1, storage
-
-
 def test_run_experiment_holds_experiment_lock_for_duration(tmp_path: Path) -> None:
     """A second concurrent ``run_experiment`` against the same experiment
     fails fast with the expected error while the run lock is held.
     """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
+    storage = f"journal:///{tmp_path / 'shared.journal'}"
     exp_a = make_experiment(
         workdir=str(tmp_path / "runs_a"),
         storage=storage,
@@ -884,7 +854,7 @@ def test_run_experiment_dry_run_does_not_take_experiment_lock(tmp_path: Path) ->
     A user inspecting an experiment's plan while a real run is in progress is
     a legitimate workflow.
     """
-    storage = f"sqlite:///{tmp_path / 'shared.db'}"
+    storage = f"journal:///{tmp_path / 'shared.journal'}"
     exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage)
     exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage)
 

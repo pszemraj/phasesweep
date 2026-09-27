@@ -2,15 +2,11 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
-import os
-import secrets
 import shlex
 import sys
 import traceback
-from collections.abc import Callable, Iterator
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -18,7 +14,7 @@ from typing import Any
 import click
 import yaml
 
-from phasesweep.config import ConfigError, Experiment, load_config
+from phasesweep.config import ConfigError, Experiment, load_experiment
 from phasesweep.config.models import _metric_scoring_line
 from phasesweep.config.search import sampler_capability_line
 from phasesweep.engine import (
@@ -26,8 +22,8 @@ from phasesweep.engine import (
     PublicationAccessError,
     PublicationIntegrityError,
     UnsafeProcessCleanupError,
-    config_status,
-    run_config,
+    experiment_status,
+    run_experiment,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
@@ -46,7 +42,7 @@ from phasesweep.mcp.registry import (
 )
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import report_objective
-from phasesweep.runtime.files import fsync_directory, private_atomic_write_text
+from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
@@ -147,7 +143,7 @@ def _load_cli_config(path: Path) -> Experiment:
     from pydantic import ValidationError
 
     try:
-        return load_config(path)
+        return load_experiment(path)
     except ConfigError:
         raise
     except (ValidationError, ValueError) as exc:
@@ -170,64 +166,6 @@ def _starter_experiment_text(target: Path) -> str:
     # Keep non-ASCII workdir characters literal to avoid JSON's UTF-16 surrogate
     # pairs.
     return template.replace("__PHASESWEEP_WORKDIR__", json.dumps(str(runs_dir), ensure_ascii=False))
-
-
-@contextlib.contextmanager
-def _staged_text(destination: Path, text: str) -> Iterator[Path]:
-    """Write and fsync text beside a destination without publishing it.
-
-    :param Path destination: Eventual destination used to locate and name the staging file.
-    :param str text: Complete UTF-8 text to stage.
-    :raises FileExistsError: If ten randomized staging names collide.
-    :return Iterator[Path]: Staging path, removed when the context exits.
-    """
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    staged: Path | None = None
-    try:
-        handle = None
-        for _ in range(10):
-            candidate = destination.with_name(f".{destination.name}.{secrets.token_hex(8)}.tmp")
-            try:
-                handle = candidate.open("x", encoding="utf-8")
-            except FileExistsError:
-                continue
-            staged = candidate
-            break
-        if handle is None or staged is None:
-            raise FileExistsError(f"cannot create a staging file beside {destination}")
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        yield staged
-    finally:
-        if staged is not None:
-            with contextlib.suppress(OSError):
-                staged.unlink()
-
-
-def _publish_staged_text(
-    destination: Path,
-    text: str,
-    *,
-    validate: Callable[[Path], object] | None = None,
-) -> bool:
-    """Stage, optionally validate, and exclusively publish a text file.
-
-    :param Path destination: Destination that must not already exist.
-    :param str text: Complete UTF-8 text to publish.
-    :param Callable[[Path], object] | None validate: Optional staged-file validator.
-    :return bool: True when published, or False if another writer won the destination race.
-    """
-    with _staged_text(destination, text) as staged:
-        if validate is not None:
-            validate(staged)
-        try:
-            os.link(staged, destination)
-        except FileExistsError:
-            return False
-        fsync_directory(destination.parent)
-    return True
 
 
 @cli.command(
@@ -259,7 +197,7 @@ def init(output: Path) -> None:
         raise click.exceptions.Exit(2)
     text = _starter_experiment_text(target)
     try:
-        if not _publish_staged_text(target, text):
+        if not atomic_create_text(target, text):
             click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
             raise click.exceptions.Exit(2)
     except OSError as exc:
@@ -377,7 +315,7 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
             click.echo(f"--from-phase={from_phase!r} not in {valid}", err=True)
             sys.exit(2)
     try:
-        run_config(config, from_phase=from_phase, dry_run=dry_run)
+        run_experiment(config, from_phase=from_phase, dry_run=dry_run)
     except UnsafeProcessCleanupError as exc:
         # A trial's cleanup refusal describes the leak, and the study keeps
         # that text as the cause a later phase-abort refusal quotes, so the
@@ -497,7 +435,7 @@ def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
     the pointer, so the exit status can never disagree with what the operator
     was shown.
 
-    :param dict[str, Any] payload: ``config_status`` payload already rendered.
+    :param dict[str, Any] payload: ``experiment_status`` payload already rendered.
     :raises PublicationAccessError: Publication validation was denied by permissions.
     :raises PublicationIntegrityError: A reported publication no longer validates.
     """
@@ -614,7 +552,7 @@ def status(config_path: Path) -> None:
     :raises PublicationIntegrityError: The reported publication no longer validates.
     """
     config = _load_cli_config(config_path)
-    payload = config_status(config)
+    payload = experiment_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     _raise_on_failed_publication(payload)
 
@@ -856,7 +794,7 @@ def _write_catalog_scaffold(output: Path, from_configs: tuple[Path, ...]) -> boo
             registry = Registry.load(staged)
             private_atomic_write_text(registry.state_dir / "origin", str(output.resolve()) + "\n")
 
-        if not _publish_staged_text(output, text, validate=validate_scaffold):
+        if not atomic_create_text(output, text, validate=validate_scaffold):
             click.echo(
                 f"phasesweep mcp init-catalog: {output} already exists; refusing to "
                 "overwrite. Pass -o to choose another name.",

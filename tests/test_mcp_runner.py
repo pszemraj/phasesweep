@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
@@ -25,7 +24,7 @@ import yaml
 import phasesweep.engine.generation as generation_ops
 import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.optuna as engine_optuna
-from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_config
+from phasesweep.config import ExecutionContext, Experiment, Phase, Sampler, load_experiment
 from phasesweep.engine import (
     ActiveAttemptPersistenceError,
     ArtifactRootConflictError,
@@ -73,6 +72,7 @@ from tests.conftest import (
 )
 from tests.mcp_helpers import (
     claim_runner_handle,
+    live_runs,
     make_mcp_app,
     make_run_handle,
     runner_argv,
@@ -163,7 +163,7 @@ def _constant_trial_config(tmp_path: Path, name: str) -> tuple[Path, str]:
 
 
 def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path) -> Path:
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     deadline = time.time() + 25
     while time.time() < deadline:
         if proc.poll() is not None:
@@ -277,7 +277,7 @@ runner._write_status(
 def test_runner_finalizes_pre_captured_terminal_snapshot(tmp_path: Path) -> None:
     config = _slow_config(tmp_path)
     status_path = tmp_path / "status.json"
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     snapshot = mcp_runner.capture_result_snapshot(experiment)
 
@@ -400,7 +400,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
     config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
     run_experiment(experiment)
     generation_before = _generation_path(experiment).read_bytes()
-    (_experiment_dir(experiment) / "study.db").unlink()
+    (_experiment_dir(experiment) / "study.journal").unlink()
 
     snapshot = mcp_runner.capture_result_snapshot(experiment)
     assert snapshot["status"]["phases"][0]["published_study_unavailable"] is True
@@ -447,30 +447,31 @@ def test_missing_published_study_is_an_operator_preflight_failure(
     assert handle is not None
     assert store.recovery_required(handle) is False
     assert _generation_path(experiment).read_bytes() == generation_before
-    assert not (_experiment_dir(experiment) / "study.db").exists()
+    assert not (_experiment_dir(experiment) / "study.journal").exists()
 
 
 @pytest.mark.parametrize("history", ["fresh", "published", "resume"])
 @pytest.mark.parametrize(
-    ("backend", "damage"),
-    [
-        ("sqlite", "header"),
-        ("journal", "garbage"),
-        ("journal", "truncated"),
-        pytest.param("journal", "permission-denied", marks=requires_nonroot),
-    ],
+    "damage",
+    ["corrupt-interior", pytest.param("permission-denied", marks=requires_nonroot)],
 )
 @pytest.mark.integration
 def test_damaged_storage_recovery_restores_catalog_capacity(
-    tmp_path: Path, backend: str, damage: str, history: str
+    tmp_path: Path, damage: str, history: str
 ) -> None:
-    """Repairing a pre-launch ledger failure must let operator recovery release its slot."""
+    """Repairing a pre-launch ledger failure must let operator recovery release its slot.
+
+    A torn or garbage *final* record is now self-repaired before a write, so
+    only damage a repair may never cut remains here: a malformed record
+    another record follows (never repaired, an interior corruption cannot be
+    an in-flight append) and a permission denial (the repair itself refused).
+    """
     published = history != "fresh"
     from_phase = "q" if history == "resume" else None
-    ledger = tmp_path / ("study.db" if backend == "sqlite" else "study.journal")
+    ledger = tmp_path / "study.journal"
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"{backend}:///{ledger}",
+        storage=f"journal:///{ledger}",
         n_trials=1,
         trial_command="echo x=0.5 {overrides}",
         execution=ExecutionContext(cwd=str(tmp_path), inherit_env="none"),
@@ -513,15 +514,9 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     )
     healthy = ledger.read_bytes() if published else b""
     generation_before = _generation_path(experiment).read_bytes() if published else None
-    damaged = (
-        healthy
-        if damage == "permission-denied"
-        else (
-            b"invalid sqlite header" + healthy[21:]
-            if backend == "sqlite"
-            else healthy + (b"garbage\n" if damage == "garbage" else b'{"op_code":')
-        )
-    )
+    # A valid record follows the malformed one, so no repair may ever cut it.
+    trailer = healthy.rstrip(b"\n").split(b"\n")[-1] if healthy else b'{"op_code": 0}'
+    damaged = healthy if damage == "permission-denied" else healthy + b"garbage\n" + trailer + b"\n"
     ledger.write_bytes(damaged)
     original_mode = ledger.stat().st_mode
     if damage == "permission-denied":
@@ -536,12 +531,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             timeout=30,
         )
         assert refused_run.returncode != 0
-        if backend == "journal" and damage != "permission-denied":
-            # The bad last line's own repair, not a restore of the whole ledger.
-            assert f"truncate -s {len(healthy)} " in refused_run.stderr
-            assert "Restore the original complete storage ledger" not in refused_run.stderr
-        else:
-            assert "Restore the original complete storage ledger" in refused_run.stderr
+        assert "Restore the original complete storage ledger" in refused_run.stderr
 
         run_id = "damaged-storage"
         digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -600,13 +590,8 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         for confirm in (False, True):
             blocked = recover_run_cli(state_dir, run_id, confirm=confirm)
             assert blocked.exit_code != 0
-            if backend == "journal" and damage != "permission-denied":
-                # A bad last line is repaired by truncating it, never by recovery.
-                assert "ends with an incomplete record" in blocked.output
-                assert f"truncate -s {len(healthy)} " in blocked.output
-            else:
-                assert "could not be" in blocked.output
-                assert "Restore the original complete storage ledger" in blocked.output
+            assert "could not be" in blocked.output
+            assert "Restore the original complete storage ledger" in blocked.output
             if damage == "permission-denied":
                 assert ledger.stat().st_mode & 0o777 == 0
             else:
@@ -643,7 +628,7 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
     assert confirmed.exit_code == 0, confirmed.output
     assert store.state(handle) == "failed"
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
     recovered_status = app.status(run_id=run_id)
     assert recovered_status["run"]["state"] == "failed"
     assert recovered_status["run"]["recovery_required"] is False
@@ -667,7 +652,7 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     tmp_path: Path,
 ) -> None:
     config_path = _slow_config(tmp_path)
-    experiment = load_config(config_path)
+    experiment = load_experiment(config_path)
     assert isinstance(experiment, Experiment)
     store = RunStore(tmp_path / "state")
     run_id = "lock-busy"
@@ -731,7 +716,7 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
     )
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        storage=f"journal:///{tmp_path / 'studies.journal'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
         override_format="argparse",
         phases=[
@@ -800,10 +785,11 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
 ) -> None:
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        storage=f"journal:///{tmp_path / 'studies.journal'}",
         phases=[Phase(name="p", n_trials=1, sampler=SEEDED_RANDOM, search_space={})],
     )
-    study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    journal = _resolve_storage(experiment.resolved_storage)
+    study = optuna.create_study(study_name="t::p", storage=journal, direction="minimize")
     mark_current_format(experiment, study)
     trial = study.ask()
     trial.set_user_attr("phasesweep_generation_id", "old-generation")
@@ -830,7 +816,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
     assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
 
-@pytest.mark.parametrize("storage_kind", ["none", "corrupt-sqlite"])
+@pytest.mark.parametrize("storage_kind", ["none", "corrupt-journal"])
 def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -843,10 +829,11 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     reviewer 2, blocker 6).
     """
     storage = None
-    if storage_kind == "corrupt-sqlite":
-        ledger = tmp_path / "studies.db"
-        ledger.write_text("not a database\n", encoding="utf-8")
-        storage = f"sqlite:///{ledger}"
+    if storage_kind == "corrupt-journal":
+        ledger = tmp_path / "studies.journal"
+        # A bad line that another line follows is corruption, not a final record.
+        ledger.write_bytes(b"not a journal record\n" * 2)
+        storage = f"journal:///{ledger}"
     experiment = make_experiment(workdir=tmp_path / "runs", storage=storage, n_trials=1)
 
     def fail_redundant_read(*args: object, **kwargs: object) -> None:
@@ -856,8 +843,8 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     # imports its own study helpers: any study load at all fails the capture.
     monkeypatch.setattr(optuna, "load_study", fail_redundant_read)
 
-    if storage_kind == "corrupt-sqlite":
-        with pytest.raises(StudyStorageUnavailableError, match="could not be inspected"):
+    if storage_kind == "corrupt-journal":
+        with pytest.raises(StudyStorageUnavailableError, match="could not be completely read"):
             mcp_runner.capture_result_snapshot(experiment)
         assert not _experiment_dir(experiment).exists()
         return
@@ -879,33 +866,32 @@ def test_publication_snapshot_rebinds_unavailable_trial_data_only_after_commit(
     """A pre-commit storage failure describes the new publication only after commit."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        storage=f"journal:///{tmp_path / 'studies.journal'}",
         trial_command="echo x=0.5 {overrides}",
         n_trials=1,
     )
     generation_id = f"storage-unavailable-{'commit' if pointer_commits else 'abort'}"
     capture_reads = 0
-    original_stats = engine_ledger._sqlite_phase_trial_stats
+    original_stats = engine_ledger._trial_stats
 
     def transient_capture_failure(
-        experiment: Experiment,
-        phase: Phase,
-        published_trial: engine_optuna._TrialRef | None = None,
-    ) -> engine_optuna._PhaseTrialStats:
+        ledger: engine_ledger.ValidatedLedger,
+        published_trials: Mapping[str, engine_optuna._TrialRef | None],
+    ) -> dict[str, engine_optuna._PhaseTrialStats]:
         nonlocal capture_reads
-        if _generation_summary_path(experiment, generation_id).is_file():
+        if _generation_summary_path(ledger.experiment, generation_id).is_file():
             capture_reads += 1
 
-            def locked_connect(*_args: object, **_kwargs: object) -> None:
-                raise sqlite3.OperationalError("database is locked")
+            def locked_read(*_args: object, **_kwargs: object) -> None:
+                raise OSError("journal storage is locked")
 
             with monkeypatch.context() as capture_patch:
-                capture_patch.setattr(engine_ledger.sqlite3, "connect", locked_connect)
-                return original_stats(experiment, phase, published_trial)
+                capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
+                return original_stats(ledger, published_trials)
 
-        return original_stats(experiment, phase, published_trial)
+        return original_stats(ledger, published_trials)
 
-    monkeypatch.setattr(engine_ledger, "_sqlite_phase_trial_stats", transient_capture_failure)
+    monkeypatch.setattr(engine_ledger, "_trial_stats", transient_capture_failure)
     if not pointer_commits:
         pointer_path = _last_successful_generation_path(experiment)
         original_write = generation_ops.artifact_io._write_yaml_atomic
@@ -1011,6 +997,9 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
     unrecoverable by design -- so a completed run's frozen result was lost to
     storage flakiness that the tolerant status read itself shrugs off. The
     fatal read simply no longer happens.
+
+    The one tolerant read replays a journal snapshot through ``optuna.load_study``,
+    so exactly one load succeeds and any reload after it fails.
     """
     experiment = make_experiment(
         persistent=tmp_path, trainer=write_constant_trainer(tmp_path), n_trials=1
@@ -1024,16 +1013,19 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
     assert report.winners
 
     loads = 0
+    real_load_study = optuna.load_study
 
-    def refuse_to_load(*args: object, **kwargs: object) -> None:
+    def fail_on_reload(*args: object, **kwargs: object) -> optuna.Study:
         nonlocal loads
         loads += 1
-        raise StudyStorageUnavailableError("database is locked")
+        if loads > 1:
+            raise StudyStorageUnavailableError("database is locked")
+        return real_load_study(*args, **kwargs)
 
     # Patched on Optuna itself rather than on a PhaseSweep helper, so no
     # import binding can hide a study reload from this test. Every remaining
     # storage read must be the tolerant one read_status performs.
-    monkeypatch.setattr(optuna, "load_study", refuse_to_load)
+    monkeypatch.setattr(optuna, "load_study", fail_on_reload)
 
     snapshot = mcp_runner.capture_result_snapshot(
         experiment,
@@ -1041,7 +1033,7 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
         engine_winners=report.winners,
     )
 
-    assert loads == 0
+    assert loads == 1
     phase = snapshot["status"]["phases"][0]
     assert phase["trial_data_available"] is True
     assert phase["running_attempts"] == []
@@ -1068,10 +1060,11 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     """RUNNING identities come from the one tolerant read, unchanged in shape."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        storage=f"journal:///{tmp_path / 'studies.journal'}",
         phases=[Phase(name="p", n_trials=2, sampler=SEEDED_RANDOM, search_space={})],
     )
-    study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    journal = _resolve_storage(experiment.resolved_storage)
+    study = optuna.create_study(study_name="t::p", storage=journal, direction="minimize")
     mark_current_format(experiment, study)
     identified = study.ask()
     identified.set_user_attr("phasesweep_generation_id", "current-generation")
@@ -1306,7 +1299,7 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     assert terminal["returncode"] == 0
     assert terminal["error_class"] is None
     assert terminal["failure"] is None
-    assert _last_successful_generation_id(load_config(config_path)) == run_id
+    assert _last_successful_generation_id(load_experiment(config_path)) == run_id
 
 
 @pytest.mark.parametrize("from_phase", [None, "b"])
@@ -1878,7 +1871,7 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
 
     assert not store.status_path(run_id).exists()
     assert any("no terminal MCP evidence" in record.getMessage() for record in caplog.records)
-    assert _last_successful_generation_id(load_config(config_path)) is None
+    assert _last_successful_generation_id(load_experiment(config_path)) is None
     # The consequence the exit code has to carry: this identity is exactly what
     # the runner persisted for itself (spawned, this live process), and with no
     # status.json the run stays ``running`` and holds its concurrency slot.
@@ -1921,30 +1914,25 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     )
     with open_private_text(store.config_snapshot_path(run_id), "x") as output:
         output.write(config_path.read_text())
-    experiment = load_config(config_path)
-    original_stats = engine_ledger._sqlite_phase_trial_stats
+    experiment = load_experiment(config_path)
+    original_stats = engine_ledger._trial_stats
 
     def unavailable_during_prepared_capture(
-        captured_experiment: Experiment,
-        phase: Phase,
-        published_trial: engine_optuna._TrialRef | None = None,
-    ) -> engine_optuna._PhaseTrialStats:
-        if _generation_summary_path(captured_experiment, run_id).is_file():
+        ledger: engine_ledger.ValidatedLedger,
+        published_trials: Mapping[str, engine_optuna._TrialRef | None],
+    ) -> dict[str, engine_optuna._PhaseTrialStats]:
+        if _generation_summary_path(ledger.experiment, run_id).is_file():
 
-            def locked_connect(*_args: object, **_kwargs: object) -> None:
-                raise sqlite3.OperationalError("database is locked")
+            def locked_read(*_args: object, **_kwargs: object) -> None:
+                raise OSError("journal storage is locked")
 
             with monkeypatch.context() as capture_patch:
-                capture_patch.setattr(engine_ledger.sqlite3, "connect", locked_connect)
-                return original_stats(captured_experiment, phase, published_trial)
+                capture_patch.setattr(engine_ledger, "_journal_snapshot_storage", locked_read)
+                return original_stats(ledger, published_trials)
 
-        return original_stats(captured_experiment, phase, published_trial)
+        return original_stats(ledger, published_trials)
 
-    monkeypatch.setattr(
-        engine_ledger,
-        "_sqlite_phase_trial_stats",
-        unavailable_during_prepared_capture,
-    )
+    monkeypatch.setattr(engine_ledger, "_trial_stats", unavailable_during_prepared_capture)
 
     if crash_boundary == "before_pointer":
         original_prepare = mcp_runner._RunnerPublicationHook.prepare

@@ -38,9 +38,9 @@ parameter keys. Keep it at `none` unless exposing those values is intended.
 Side effects are opt-in: `allow.launch`, `allow.cancel`, and
 `allow.from_phase` default to false.
 
-MCP experiments must use a persistent local SQLite, Journal, or `auto`
-ledger, an absolute `workdir`, and an absolute storage path after `auto` is
-resolved. Set an absolute `execution.cwd` when it is present. In-memory and
+MCP experiments must use a persistent local journal or `auto` ledger, an
+absolute `workdir`, and an absolute storage path after `auto` is resolved.
+Set an absolute `execution.cwd` when it is present. In-memory and
 external-database storage are not durable detached-run targets.
 
 Follow [MCP setup](mcp_setup.md) to create, review, and validate a catalog.

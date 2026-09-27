@@ -7,14 +7,13 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
 import optuna
 
-from phasesweep.config import Experiment, Gate, Phase
+from phasesweep.config import Experiment, Phase
 from phasesweep.config.search import _placeholder_values_for
 from phasesweep.engine.artifacts import _write_trials_csv
 from phasesweep.engine.attempts import (
@@ -32,7 +31,12 @@ from phasesweep.engine.errors import (
 from phasesweep.engine.evidence import _verify_winner_objective_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
 from phasesweep.engine.ledger import ClaimedLedger, open_phase_study, open_preview_study
-from phasesweep.engine.optuna import _phase_study_name, _suggest
+from phasesweep.engine.optuna import (
+    _completed_trial_count,
+    _finished_trial_count,
+    _phase_study_name,
+    _suggest,
+)
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
@@ -64,8 +68,10 @@ from phasesweep.engine.state import (
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
     _AcceptedPartialDecision,
+    _consecutive_failure_threshold_tripped,
     _load_accepted_partial_decision,
     _load_phase_policy_state,
+    _next_consecutive_failures,
     _record_allocation_context,
     _record_trial_target,
     _validate_environment_cohort,
@@ -90,6 +96,36 @@ from phasesweep.runtime.shutdown import PhaseSweepShutdown
 log = logging.getLogger("phasesweep.engine.phase")
 
 
+def _winner_completion(
+    *,
+    requested_trials: int,
+    finished_trials: int,
+    completed_trials: int,
+    incomplete: bool,
+    reason: str | None,
+    timeout_scope: str | None,
+) -> dict[str, Any]:
+    """Build the completion metadata a phase's :class:`Winner` persists.
+
+    :param int requested_trials: Trial target the phase was configured to reach.
+    :param int finished_trials: Terminal trial count backing this completion.
+    :param int completed_trials: COMPLETE trial count backing this completion.
+    :param bool incomplete: Whether the phase stopped short of its trial target.
+    :param str | None reason: Why the phase is incomplete, or ``None`` when complete.
+    :param str | None timeout_scope: Timeout guard that stopped the phase, or ``None``
+        when the phase did not stop on a timeout.
+    :return dict[str, Any]: Completion metadata in the shape ``Winner.completion`` expects.
+    """
+    return {
+        "requested_trials": requested_trials,
+        "finished_trials": finished_trials,
+        "completed_trials": completed_trials,
+        "incomplete": incomplete,
+        "reason": reason,
+        "timeout_scope": timeout_scope,
+    }
+
+
 def _partial_completion_for_replay(
     study: optuna.Study,
     decision: _AcceptedPartialDecision,
@@ -107,7 +143,7 @@ def _partial_completion_for_replay(
     """
     trials = study.get_trials(deepcopy=False)
     finished_trials = _finished_trial_count(trials)
-    completed_trials = sum(1 for trial in trials if trial.state == optuna.trial.TrialState.COMPLETE)
+    completed_trials = _completed_trial_count(trials)
     if (
         outcome_sequence != decision.outcome_sequence
         or finished_trials != decision.finished_trials
@@ -118,14 +154,14 @@ def _partial_completion_for_replay(
             "decision was committed. Use a new experiment name, or archive/delete "
             "the inconsistent study."
         )
-    return {
-        "requested_trials": decision.trial_target,
-        "finished_trials": decision.finished_trials,
-        "completed_trials": decision.completed_trials,
-        "incomplete": True,
-        "reason": "timeout",
-        "timeout_scope": decision.timeout_scope,
-    }
+    return _winner_completion(
+        requested_trials=decision.trial_target,
+        finished_trials=decision.finished_trials,
+        completed_trials=decision.completed_trials,
+        incomplete=True,
+        reason="timeout",
+        timeout_scope=decision.timeout_scope,
+    )
 
 
 class _PolicyStateWriteError(StudyStorageUnavailableError):
@@ -160,7 +196,7 @@ class _TrialOutcomeUnrecordedAbort(BaseException):
 
 # Delays between the bounded retries of the per-trial outcome write. The write
 # is a single small user-attr row, so a transient backend fault (a locked
-# SQLite file, a momentary connection drop) usually clears within a few
+# journal ledger, a momentary connection drop) usually clears within a few
 # hundred milliseconds; anything longer is an outage the phase must not
 # outrun. len() + 1 total attempts.
 _OUTCOME_WRITE_RETRY_DELAYS = (0.05, 0.25)
@@ -198,15 +234,6 @@ class CsvSnapshotThrottle:
         self.last_write_at = now
 
 
-def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of terminal trials in ``trials``.
-
-    :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
-    :return int: Number of trials with a finished state.
-    """
-    return sum(1 for trial in trials if trial.state.is_finished())
-
-
 def _composed_overrides(
     phase: Phase,
     sampled: dict[str, Any],
@@ -234,15 +261,6 @@ def _composed_overrides(
     out.update(phase.fixed_overrides)
     out.update(sampled)
     return out
-
-
-def _phase_gates(phase: Phase) -> list[Gate]:
-    """Return a phase's local gates in declaration order.
-
-    :param Phase phase: Phase whose local gates are evaluated.
-    :return list[Gate]: Phase-local gates in evaluation order.
-    """
-    return list(phase.gates)
 
 
 def _active_phase_abort(
@@ -372,7 +390,7 @@ def _run_phase(
         ledger: The claimed ledger, for ``experiment``, that this phase opens
             its live study through. ``None`` is a dry run: render an example
             trial command against an in-memory preview study and return a
-            placeholder midpoint winner instead of launching any subprocesses.
+            placeholder winner instead of launching any subprocesses.
         run_deadline: Optional ``time.monotonic()`` deadline inherited from
             the experiment-level wallclock guard.
 
@@ -467,9 +485,8 @@ def _run_phase(
             }
             active_abort["policy"] = policy_state.fatal_policy or "fatal_trial_exception"
             study.set_user_attr(PHASE_ABORT_ATTR, active_abort)
-        if (
-            active_abort is None
-            and policy_state.consecutive_failures >= phase.max_consecutive_failures
+        if active_abort is None and _consecutive_failure_threshold_tripped(
+            policy_state.consecutive_failures, phase
         ):
             active_abort = _failure_policy_abort_record(
                 phase,
@@ -514,16 +531,14 @@ def _run_phase(
             inherited_winners,
             study,
             phase_fingerprint=phase_fingerprint,
-            completion={
-                "requested_trials": phase.n_trials,
-                "finished_trials": _finished_trial_count(trials_after),
-                "completed_trials": sum(
-                    1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE
-                ),
-                "incomplete": False,
-                "reason": None,
-                "timeout_scope": None,
-            },
+            completion=_winner_completion(
+                requested_trials=phase.n_trials,
+                finished_trials=_finished_trial_count(trials_after),
+                completed_trials=_completed_trial_count(trials_after),
+                incomplete=False,
+                reason=None,
+                timeout_scope=None,
+            ),
         )
 
     # Compose and validate the launch environment only after recovery proves
@@ -699,12 +714,9 @@ def _run_phase(
                 write_error = None
                 _completion_sequence = next_sequence
                 recorded_outcomes[trial.number] = outcome
-                if outcome in {"failure", "fatal"}:
-                    _consecutive_failures += 1
-                elif outcome == "success":
-                    _consecutive_failures = 0
-                threshold_tripped = (not abort["flag"]) and (
-                    _consecutive_failures >= phase.max_consecutive_failures
+                _consecutive_failures = _next_consecutive_failures(_consecutive_failures, outcome)
+                threshold_tripped = (not abort["flag"]) and _consecutive_failure_threshold_tripped(
+                    _consecutive_failures, phase
                 )
                 fatal_tripped = outcome == "fatal"
                 if not threshold_tripped and not fatal_tripped:
@@ -953,7 +965,7 @@ def _run_phase(
         result = extract_trial_result(
             experiment=experiment,
             executed=executed,
-            gates=_phase_gates(phase),
+            gates=phase.gates,
             deadline=optimize_deadline,
         )
         if result.deadline_exhausted:
@@ -1228,7 +1240,7 @@ def _run_phase(
 
     trials_after = study.get_trials(deepcopy=False)
     finished_after = _finished_trial_count(trials_after)
-    completed_after = sum(1 for t in trials_after if t.state == optuna.trial.TrialState.COMPLETE)
+    completed_after = _completed_trial_count(trials_after)
     # Scheduler-level deadline causality: the phase is short of its trial
     # target and the clock is spent, so the budget — not the observation order
     # — is what left work undone. Being short of the target is the whole test:
@@ -1325,14 +1337,14 @@ def _run_phase(
             inherited_winners,
             study,
             phase_fingerprint=phase_fingerprint,
-            completion={
-                "requested_trials": phase.n_trials,
-                "finished_trials": finished_after,
-                "completed_trials": completed_after,
-                "incomplete": accepted_partial_timeout,
-                "reason": "timeout" if accepted_partial_timeout else None,
-                "timeout_scope": timeout_source if accepted_partial_timeout else None,
-            },
+            completion=_winner_completion(
+                requested_trials=phase.n_trials,
+                finished_trials=finished_after,
+                completed_trials=completed_after,
+                incomplete=accepted_partial_timeout,
+                reason="timeout" if accepted_partial_timeout else None,
+                timeout_scope=timeout_source if accepted_partial_timeout else None,
+            ),
         )
     except NoFeasibleTrialError as exc:
         if deadline_exhausted["flag"]:
@@ -1425,8 +1437,9 @@ def _dry_run_phase(
         remaining: Number of trials that *would* run; logged for the user.
 
     Returns:
-        A :class:`Winner` placeholder built from midpoint params so downstream
-        dry-run previews see consistent inherited context.
+        A :class:`Winner` placeholder built from the previewed sample, or from
+        each parameter's low bound or first choice, so downstream dry-run
+        previews see consistent inherited context.
 
     """
     log.info("DRY RUN phase=%s would launch %d trials", phase.name, remaining)
@@ -1446,12 +1459,10 @@ def _dry_run_phase(
             phase=phase.name,
             run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
             trainer_config=experiment.trainer_config,
-            write_files=False,
         )
         log.info("DRY RUN example command:\n  %s", cmd)
 
     return _placeholder_winner(
-        experiment,
         phase,
         inherited_winners,
         sampled_params=sampled,
@@ -1459,7 +1470,6 @@ def _dry_run_phase(
 
 
 def _placeholder_winner(
-    experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
     *,
@@ -1469,11 +1479,10 @@ def _placeholder_winner(
 
     A phase whose command was previewed reuses that command's sampled values so
     downstream previews inherit one coherent hypothetical chain. A skipped
-    phase without a preview uses deterministic midpoint/first-choice values.
+    phase without a preview uses each parameter's low bound or first choice.
     Both paths include inherited effective overrides.
 
     Args:
-        experiment: Parsed experiment supplying the execution environment.
         phase: The phase whose placeholder winner is needed.
         inherited_winners: Winners from earlier phases in the chain.
         sampled_params: Values used in the displayed preview command, or
@@ -1497,14 +1506,14 @@ def _placeholder_winner(
         metric=float("nan"),
         constraints={},
         gates=[],
-        completion={
-            "requested_trials": phase.n_trials,
-            "finished_trials": 0,
-            "completed_trials": 0,
-            "incomplete": True,
-            "reason": "dry_run",
-            "timeout_scope": None,
-        },
+        completion=_winner_completion(
+            requested_trials=phase.n_trials,
+            finished_trials=0,
+            completed_trials=0,
+            incomplete=True,
+            reason="dry_run",
+            timeout_scope=None,
+        ),
         source=WinnerSource(
             kind="phase_trial",
             phase=phase.name,

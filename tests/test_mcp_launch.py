@@ -19,6 +19,7 @@ import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.ledger as engine_ledger
 import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
@@ -28,7 +29,7 @@ from phasesweep.config import (
     IntParam,
     Phase,
     Sampler,
-    load_config,
+    load_experiment,
 )
 from phasesweep.engine import (
     TerminalReport,
@@ -81,6 +82,7 @@ from tests.mcp_helpers import (
     _drift_experiment,
     _write_experiment_config,
     claim_runner_handle,
+    live_runs,
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
@@ -532,7 +534,7 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     assert handle.launch_state == "launching"
     assert store.state(handle) == "failed"
     assert not store.recovery_required(handle)
-    assert store.live_runs() == []
+    assert live_runs(store) == []
     terminal = store.recorded_terminal_status(handle)
     assert terminal is not None
     assert terminal["error_class"] == "OSError"
@@ -762,7 +764,7 @@ def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -
         restarted.launch("srv")
 
     assert store.recovery_required(pending)
-    assert store.live_runs() == [pending]
+    assert live_runs(store) == [pending]
 
 
 def test_restarted_server_reaps_abandoned_transaction_before_retry(
@@ -1374,7 +1376,7 @@ def test_audit_log_records_side_effects_without_sensitive_fields(
     assert "already has a running sweep" in busy_record["error"]
 
     blob = audit_path.read_text()
-    for needle in ("train.py", "sqlite", str(config), str(tmp_path / "runs")):
+    for needle in ("train.py", "journal", str(config), str(tmp_path / "runs")):
         assert needle not in blob
     assert captured["cmd"]  # sanity: the launch path really reached Popen
 
@@ -1541,12 +1543,12 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     search_space: {}
 """,
     )
-    experiment = load_config(config)
+    experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
     for phase in experiment.phases:
         study = optuna.create_study(
             study_name=f"{experiment.experiment}::{phase.name}",
-            storage=experiment.storage,
+            storage=engine_ledger._resolve_storage(experiment.resolved_storage),
             direction="minimize",
         )
         # Two populated, unmarked studies model a pre-cutover local ledger.
@@ -1598,7 +1600,7 @@ def test_launch_bookkeeping_failure_preserves_runner_status(
     patch_popen_capture(monkeypatch)
 
     def interrupted_update(handle: RunHandle) -> None:
-        experiment = load_config(config)
+        experiment = load_experiment(config)
         assert isinstance(experiment, Experiment)
         write_run_status(
             store,

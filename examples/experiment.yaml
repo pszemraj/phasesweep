@@ -5,7 +5,7 @@
 # Phase 3: with n_layers + lr locked, tune regularization (wd, dropout).
 
 experiment: tiny_lm_16mb
-storage: sqlite:///./runs/phases.db
+storage: journal:///./runs/phases.journal
 provenance:
   revision: "phasesweep-fake-trainer-v1"
 workdir: ./runs

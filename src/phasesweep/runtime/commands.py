@@ -18,6 +18,16 @@ import yaml
 
 _CliOverrideFormat = Literal["argparse", "hydra"]
 
+# The trainer-input file each ``override_format`` leaves in a trial directory.
+# The trial writer and the evidence verifier both read it; the names are part
+# of the documented output layout.
+TRAINER_INPUT_FILENAMES: dict[str, str] = {
+    "yaml_file": "trainer_config.yaml",
+    "argparse": "overrides_resolved.json",
+    "hydra": "overrides_resolved.json",
+    "json_file": "overrides.json",
+}
+
 
 class _OverrideValueError(TypeError):
     """A value outside the scalar/list CLI override contract."""
@@ -141,18 +151,6 @@ def dump_json_file_overrides(overrides: dict[str, Any]) -> str:
             current = current.setdefault(part, {})
         current[parts[-1]] = value
     return dump_overrides_json(nested)
-
-
-def write_json_file(overrides: dict[str, Any], trial_dir: Path) -> Path:
-    """Write the nested overrides-only JSON consumed by the trainer.
-
-    :param dict[str, Any] overrides: Resolved dotted overrides.
-    :param Path trial_dir: Attempt directory.
-    :return Path: Written trainer input.
-    """
-    path = trial_dir / "overrides.json"
-    path.write_text(dump_json_file_overrides(overrides), encoding="utf-8")
-    return path
 
 
 def format_argparse(overrides: dict[str, Any]) -> str:
@@ -333,36 +331,6 @@ def dump_trial_trainer_config_yaml(
     return dump_trainer_config_yaml(compose_trainer_config(base, overrides))
 
 
-def write_trainer_config_yaml(
-    trainer_config: dict[str, Any],
-    overrides: dict[str, Any],
-    trial_dir: Path,
-    *,
-    substitutions: dict[str, str] | None = None,
-) -> Path:
-    """Materialize the complete trainer YAML consumed by one trial.
-
-    :param dict[str, Any] trainer_config: Operator-authored base trainer config.
-    :param dict[str, Any] overrides: Composed inherited, fixed, and sampled values.
-    :param Path trial_dir: Per-trial directory receiving ``trainer_config.yaml``.
-    :param dict[str, str] | None substitutions: Runtime placeholders expanded
-        recursively in base-config string values before overrides are applied.
-    :raises TypeError: The complete config contains an unsupported YAML value.
-    :raises ValueError: Override composition or YAML validation fails.
-    :return Path: Path to the generated complete trainer config.
-    """
-    path = trial_dir / "trainer_config.yaml"
-    path.write_text(
-        dump_trial_trainer_config_yaml(
-            trainer_config,
-            overrides,
-            substitutions=substitutions,
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
 def render_command(
     template: str,
     overrides: dict[str, Any],
@@ -373,13 +341,16 @@ def render_command(
     phase: str,
     run_name: str,
     trainer_config: dict[str, Any] | None = None,
-    write_files: bool = True,
     materialized_input_path: Path | None = None,
 ) -> str:
     """Substitute placeholders in the user's trial_command template.
 
     Path substitutions (``{trial_dir}``, ``{config_path}``, ``{overrides_path}``)
-    are shell-quoted.
+    are shell-quoted. This function never writes a trainer input file: the
+    launch path materializes it separately and passes back its exact path via
+    ``materialized_input_path``; without one, rendering stays filesystem-pure
+    while still exercising the exact composition and serializer used at
+    launch, for dry-run previews and config validation.
 
     Args:
         template: The user's ``trial_command`` template with ``{...}``
@@ -394,9 +365,6 @@ def render_command(
             identifier used for ``{run_name}``.
         trainer_config: Base trainer configuration embedded in the PhaseSweep
             YAML. Used only by ``yaml_file``.
-        write_files: When ``False``, render paths without writing
-            ``trainer_config.yaml``. Used by dry-run previews so they are
-            filesystem-pure.
         materialized_input_path: Exact generated input already written by the
             launch path. When supplied for a file mode, command rendering uses
             this path without serializing or rewriting the input.
@@ -409,8 +377,6 @@ def render_command(
             dotted override cannot be composed into ``trainer_config``.
         TypeError: A configured value cannot be represented by the selected
             command or generated-file format.
-        OSError: ``write_files`` is true and a generated trainer input cannot
-            be written.
 
     """
     config_path = ""
@@ -425,22 +391,11 @@ def render_command(
         }
         if materialized_input_path is not None:
             config_path = str(materialized_input_path)
-        elif write_files:
-            config_path = str(
-                write_trainer_config_yaml(
-                    base,
-                    overrides,
-                    trial_dir,
-                    substitutions=config_substitutions,
-                )
-            )
         else:
             # Dry-run and config validation remain filesystem-pure while still
             # exercising the exact composition and serializer used at launch.
-            expanded_base = _substitute_trainer_config_placeholders(base, config_substitutions)
-            payload = compose_trainer_config(expanded_base, overrides)
-            dump_trainer_config_yaml(payload)
-            config_path = str(trial_dir / "trainer_config.yaml")
+            dump_trial_trainer_config_yaml(base, overrides, substitutions=config_substitutions)
+            config_path = str(trial_dir / TRAINER_INPUT_FILENAMES["yaml_file"])
         overrides_str = ""
     elif fmt == "argparse":
         overrides_str = format_argparse(overrides)
@@ -449,11 +404,9 @@ def render_command(
     elif fmt == "json_file":
         if materialized_input_path is not None:
             overrides_path = str(materialized_input_path)
-        elif write_files:
-            overrides_path = str(write_json_file(overrides, trial_dir))
         else:
             dump_json_file_overrides(overrides)
-            overrides_path = str(trial_dir / "overrides.json")
+            overrides_path = str(trial_dir / TRAINER_INPUT_FILENAMES["json_file"])
         overrides_str = ""
     else:
         raise ValueError(f"Unknown override_format: {fmt}")

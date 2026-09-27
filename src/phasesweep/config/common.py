@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Annotated, TypeAlias
+from typing import Annotated, TypeAlias, TypeGuard
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict
 
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+_SHA256_HEX_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def is_sha256_hex(value: object) -> TypeGuard[str]:
+    """Recognize a SHA-256 digest as written by PhaseSweep.
+
+    :param object value: Candidate digest to check.
+    :return bool: Whether ``value`` is a lowercase 64-character hex digest.
+    """
+    return isinstance(value, str) and bool(_SHA256_HEX_PATTERN.fullmatch(value))
 
 
 def _reject_boolean_number(value: object) -> object:

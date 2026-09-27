@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from phasesweep import __version__
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
-from phasesweep.engine.state import WinnerSourceKind
+from phasesweep.engine.state import TrialStateName, WinnerSourceKind
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
 from phasesweep.mcp.errors import CatalogError, McpToolError
@@ -314,7 +314,7 @@ class PhaseStatusPayload(_ToolPayload):
     """Per-phase status without filesystem paths."""
 
     phase: PhaseName
-    trials: dict[Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL"], int] = Field(
+    trials: dict[TrialStateName, int] = Field(
         description="Dense cumulative study counts; every state key is always present."
     )
     running_trials_total: int = Field(ge=0, description="Cumulative RUNNING study rows.")

@@ -27,11 +27,12 @@ import signal
 import sys
 import time
 
-# Single source of truth for the wire frame's header width:
-# phasesweep.runtime.process._encode_launch_payload reads this constant
+# Single source of truth for the wire frame's header width and the readiness
+# frame's leading tag: phasesweep.runtime.process reads both constants
 # directly (the parent already imports this module).
 _HEADER_LEN = 10
 _READY_PID_WIDTH = 10
+_READY_TAG = b"R"
 _TRAINER_ROOT_EXITED = b"X"
 _DESCENDANTS_REAPED = b"D"
 _GROUP_POLL_SECONDS = 0.05
@@ -243,7 +244,7 @@ def _run_trainer(ready_fd: int, ack_fd: int) -> int:
     except OSError:
         return 74
 
-    ready_frame = b"R" + f"{os.getpid():0{_READY_PID_WIDTH}d}".encode("ascii")
+    ready_frame = _READY_TAG + f"{os.getpid():0{_READY_PID_WIDTH}d}".encode("ascii")
     try:
         os.write(ready_fd, ready_frame)
     finally:

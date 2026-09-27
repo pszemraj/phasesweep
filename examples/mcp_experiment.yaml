@@ -1,7 +1,7 @@
 # MCP-safe variant of the toy example. It uses absolute scratch paths because MCP servers must survive restarts and launches from arbitrary working directories.
 
 experiment: tiny_lm_16mb_mcp
-storage: sqlite:////tmp/phasesweep-mcp-tiny-lm/phases.db
+storage: journal:////tmp/phasesweep-mcp-tiny-lm/phases.journal
 provenance:
   revision: "phasesweep-fake-trainer-v1"
 workdir: /tmp/phasesweep-mcp-tiny-lm/runs

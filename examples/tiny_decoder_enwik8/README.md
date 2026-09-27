@@ -29,7 +29,7 @@ phasesweep run examples/tiny_decoder_enwik8/gpu_smoke.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/gpu_smoke.yaml
 ```
 
-The smoke config uses in-memory Optuna storage so every `run` invocation executes both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies that final-checkpoint evaluation used CUDA. Use [inspection commands](../../docs/runtime.md#inspection-commands) to read the saved winners. The full config below uses SQLite for persistent status and reuse.
+The smoke config uses in-memory Optuna storage so every `run` invocation executes both trials without accumulating a reusable study. Its winner must also pass a `runtime.device_type == 'cuda'` evidence gate, which verifies that final-checkpoint evaluation used CUDA. Use [inspection commands](../../docs/runtime.md#inspection-commands) to read the saved winners. The full config below uses an Optuna journal file for persistent status and reuse.
 
 Use the full three-phase example only when you intentionally want the longer experiment:
 
@@ -40,7 +40,7 @@ phasesweep run examples/tiny_decoder_enwik8/experiment.yaml
 phasesweep show-winners examples/tiny_decoder_enwik8/experiment.yaml
 ```
 
-A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 batches each). A resumed study launches only the attempts still needed to reach that target. Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.db` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`. The phase comments in [`experiment.yaml`](experiment.yaml) explain the learning-rate, weight-decay, and gradient-clipping order.
+A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 batches each). A resumed study launches only the attempts still needed to reach that target. Runtime depends on the local hardware and software stack. Unlike the smoke config, the full configs leave device discovery to the runtime and do not enforce or gate CUDA use. Outputs land under `examples/tiny_decoder_enwik8/runs/`: the Optuna study at `runs/phases.journal` and per-trial workdirs with `stdout.log`/`stderr.log` under `runs/trials/`. The phase comments in [`experiment.yaml`](experiment.yaml) explain the learning-rate, weight-decay, and gradient-clipping order.
 
 The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#objective-evidence-constraints-and-gates) validates that report.
 

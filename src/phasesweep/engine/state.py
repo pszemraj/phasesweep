@@ -4,12 +4,27 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast, get_args
 
 WinnerSourceKind = Literal["phase_trial"]
 
 PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
 """Verdict on a last-success pointer, including inaccessible validation evidence."""
+
+TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL"]
+"""Name of an Optuna ``TrialState`` member, as status payloads report it."""
+
+TRIAL_STATE_NAMES: tuple[TrialStateName, ...] = (
+    "WAITING",
+    "RUNNING",
+    "COMPLETE",
+    "PRUNED",
+    "FAIL",
+)
+"""Every trial-state name, in the key order status payloads use."""
+
+TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "PRUNED", "FAIL")
+"""The trial states Optuna reports as finished."""
 
 
 @dataclass(frozen=True)
@@ -23,38 +38,61 @@ class WinnerSource:
     attempt_id: str | None
 
 
-def _parse_winner_source(
-    source_data: Mapping[str, Any], source_kind: WinnerSourceKind
-) -> WinnerSource:
-    """Reconstruct a persisted ``winner_source`` mapping into a :class:`WinnerSource`.
+def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
+    """Validate and reconstruct a persisted ``winner_source`` mapping.
 
-    Shared by :func:`phasesweep.engine.artifacts._load_winner` and
-    :func:`phasesweep.engine.read.read_winner`, which differ only in what they
-    do when this raises: the former wraps it as
-    :class:`phasesweep.engine.errors.WinnerIntegrityError`,
-    while the latter treats the winner as absent. Callers must validate ``source_kind``
-    against :data:`WinnerSourceKind` themselves before calling this, since each
-    site fails differently on an invalid kind.
+    Owns every well-formedness check a caller needs before trusting a
+    ``winner_source`` block: that it is a mapping, that its ``kind`` is a
+    recognized :data:`WinnerSourceKind`, that it has exactly the five
+    required keys, and that its ``phase`` agrees with ``expected_phase`` (the
+    phase the caller is reading a winner *for* — a mismatch means the winner
+    was copied or misattributed across phases). Shared by
+    :func:`phasesweep.engine.artifacts._load_winner`,
+    :func:`phasesweep.engine.read.read_winner`, and
+    :func:`phasesweep.engine.publication_validation._validate_generation_manifest`,
+    which differ only in what they do when this raises: the first two wrap it
+    as :class:`phasesweep.engine.errors.WinnerIntegrityError` or treat the
+    winner as absent, respectively, while the manifest validator wraps it as
+    :class:`phasesweep.engine.errors.PublicationIntegrityError`.
 
-    :param Mapping[str, Any] source_data: Parsed ``winner_source`` block from a
-        persisted ``winner.yaml``.
-    :param WinnerSourceKind source_kind: The already-validated source kind.
-    :raises KeyError: A required field (``phase``, ``trial_number``) is missing.
-    :raises TypeError | ValueError: A field cannot be coerced to its expected type.
+    :param object data: Parsed ``winner_source`` block from a persisted
+        ``winner.yaml``.
+    :param str expected_phase: Phase name the caller expects this source to
+        name.
+    :raises ValueError: ``data`` is not a mapping, its ``kind`` is not a
+        recognized :data:`WinnerSourceKind`, it is missing a required key or
+        carries an extra one, a field cannot be coerced to its expected
+        type, or its ``phase`` disagrees with ``expected_phase``.
     :return WinnerSource: The reconstructed source.
     """
+    if not isinstance(data, Mapping):
+        raise ValueError("no valid winner_source; refusing ambiguous provenance")
+    kind = data.get("kind")
+    if kind not in get_args(WinnerSourceKind):
+        raise ValueError("invalid winner_source kind")
+    if set(data) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
+        raise ValueError("removed winner_source field")
+    phase = data.get("phase")
+    if not isinstance(phase, str) or not phase:
+        raise ValueError("invalid winner_source phase")
+    if phase != expected_phase:
+        raise ValueError(f"winner_source names phase {phase!r}, expected {expected_phase!r}")
+    try:
+        trial_number = int(data["trial_number"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid winner_source trial_number") from exc
     return WinnerSource(
-        kind=source_kind,
-        phase=str(source_data["phase"]),
-        trial_number=int(source_data["trial_number"]),
+        kind=cast(WinnerSourceKind, kind),
+        phase=phase,
+        trial_number=trial_number,
         generation_id=(
-            str(source_data["generation_id"])
-            if isinstance(source_data.get("generation_id"), str) and source_data["generation_id"]
+            str(data["generation_id"])
+            if isinstance(data.get("generation_id"), str) and data["generation_id"]
             else None
         ),
         attempt_id=(
-            str(source_data["attempt_id"])
-            if isinstance(source_data.get("attempt_id"), str) and source_data["attempt_id"]
+            str(data["attempt_id"])
+            if isinstance(data.get("attempt_id"), str) and data["attempt_id"]
             else None
         ),
     )
@@ -187,10 +225,7 @@ GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
 # survive the loss of that launcher's own state directory.
 REPRODUCIBILITY_SCHEMA_VERSION = 2
 
-GenerationIdSource = Literal["caller", "engine"]
-"""Who supplied a generation's identity: an external launcher, or the engine."""
-_MANIFEST_ARTIFACT_KINDS = frozenset({"winner"})
-_ARTIFACT_FILENAMES = {"winner": "winner.yaml"}
+WINNER_FILENAME = "winner.yaml"
 # Manifest kinds that name a file in the generation namespace root rather than
 # a phase. Their entries carry ``path`` instead of ``phase``; both are required
 # in every current-format generation.

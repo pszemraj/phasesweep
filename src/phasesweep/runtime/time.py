@@ -18,3 +18,19 @@ def utc_now_iso(
     :return str: Timezone-aware UTC timestamp.
     """
     return datetime.now(UTC).isoformat(timespec=timespec)
+
+
+def parse_utc_iso(value: object) -> datetime | None:
+    """Parse a timezone-aware ISO-8601 timestamp, tolerating malformed values.
+
+    :param object value: Raw timestamp from persisted state.
+    :return datetime | None: Parsed timestamp, or ``None`` for non-string,
+        malformed, or timezone-naive values.
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None

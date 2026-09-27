@@ -17,6 +17,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     TrialTargetRegressionError,
 )
+from phasesweep.engine.optuna import _finished_trial_count
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -47,6 +48,39 @@ class _PhasePolicyState:
     fatal_sequence: int | None
     fatal_cause: str | None
     fatal_policy: str | None
+
+
+def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
+    """Apply one terminal outcome to a running consecutive-failure count.
+
+    Shared by live recording and replay reconstruction so both apply the
+    same consecutive-failure policy transition.
+
+    :param int consecutive_failures: Count observed before ``outcome``.
+    :param str outcome: Terminal outcome. ``"failure"`` or ``"fatal"``
+        increments the count, ``"success"`` resets it to zero, and any other
+        outcome (e.g. ``"pruned"``, ``"cancelled"``) leaves it unchanged.
+    :return int: The count after applying ``outcome``.
+    """
+    if outcome in {"failure", "fatal"}:
+        return consecutive_failures + 1
+    if outcome == "success":
+        return 0
+    return consecutive_failures
+
+
+def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Phase) -> bool:
+    """Return whether a phase's consecutive-failure abort threshold is met.
+
+    Shared by the live per-outcome check and the startup replay check so
+    both compare the same count against the same threshold.
+
+    :param int consecutive_failures: Current consecutive-failure count.
+    :param Phase phase: Phase config supplying ``max_consecutive_failures``.
+    :return bool: True when ``consecutive_failures`` meets or exceeds the
+        phase's threshold.
+    """
+    return consecutive_failures >= phase.max_consecutive_failures
 
 
 @dataclass(frozen=True)
@@ -233,10 +267,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     for sequence, trial_number, outcome, cause, policy in events:
         if sequence <= recovery_boundary:
             continue
-        if outcome == "success":
-            consecutive_failures = 0
-        elif outcome in {"failure", "fatal"}:
-            consecutive_failures += 1
+        consecutive_failures = _next_consecutive_failures(consecutive_failures, outcome)
         if outcome == "fatal" and fatal_trial_number is None:
             fatal_trial_number = trial_number
             fatal_sequence = sequence
@@ -322,7 +353,7 @@ def _accepted_trial_target(study: optuna.Study) -> int:
     :raises StudySchemaMismatchError: The stored target is not a positive int,
         or is lower than the number of already-finished trials.
     """
-    finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+    finished = _finished_trial_count(study.get_trials(deepcopy=False))
     stored = study.user_attrs.get(TRIAL_TARGET_ATTR)
     if stored is None:
         if not study.get_trials(deepcopy=False):
@@ -376,7 +407,7 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
         (``tpe`` or ``cmaes``) and either raises its previously accepted trial
         target or was interrupted before reaching it.
     """
-    finished = sum(1 for trial in study.get_trials(deepcopy=False) if trial.state.is_finished())
+    finished = _finished_trial_count(study.get_trials(deepcopy=False))
     if phase.sampler.type not in NON_RESUMABLE_SAMPLERS or finished == 0:
         return
 

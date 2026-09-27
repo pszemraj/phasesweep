@@ -26,8 +26,8 @@ from phasesweep.config import (
     Sampler,
     check_bounds,
 )
-from phasesweep.config.common import _find_prefix_collisions
-from phasesweep.config.search import grid_search_space
+from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
+from phasesweep.config.search import _placeholder_value_for, grid_search_space
 from phasesweep.engine.optuna import _build_sampler
 from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
 
@@ -157,6 +157,35 @@ def test_check_bounds_rejects_non_finite_values():
 def test_sampler_rejects_negative_n_startup_trials():
     with pytest.raises(ValidationError):
         Sampler(type="tpe", n_startup_trials=-1)
+
+
+@pytest.mark.parametrize("sampler_type", ["random", "grid", "cmaes"])
+def test_sampler_rejects_non_default_n_startup_trials_off_tpe(sampler_type: str) -> None:
+    """A non-default n_startup_trials on a sampler that ignores it is refused.
+
+    Only TPE reads n_startup_trials, yet it is part of the semantic phase
+    fingerprint, so a value that changes nothing would still split studies.
+    """
+    with pytest.raises(ValidationError, match="n_startup_trials"):
+        Sampler(type=sampler_type, n_startup_trials=999)
+
+
+def test_sampler_accepts_tpe_with_non_default_n_startup_trials() -> None:
+    """TPE is the one sampler type that actually reads n_startup_trials."""
+    sampler = Sampler(type="tpe", n_startup_trials=999)
+    assert sampler.n_startup_trials == 999
+
+
+@pytest.mark.parametrize("sampler_type", ["random", "grid", "cmaes"])
+def test_sampler_accepts_default_n_startup_trials_off_tpe(sampler_type: str) -> None:
+    """Explicitly spelling out the default n_startup_trials on a non-tpe sampler is fine.
+
+    This is checked by value, not by whether the field was explicitly set:
+    config snapshot fixtures serialize every field, including
+    n_startup_trials: 10 on sampler.type: random, and must keep loading.
+    """
+    sampler = Sampler(type=sampler_type, n_startup_trials=10)
+    assert sampler.n_startup_trials == 10
 
 
 @pytest.mark.parametrize(
@@ -549,6 +578,26 @@ def test_find_prefix_collisions() -> None:
         assert _find_prefix_collisions(keys) == expected, case
 
 
+def test_is_sha256_hex() -> None:
+    """Only a ``str`` of exactly 64 lowercase hex characters is accepted."""
+    valid = "a" * 64
+    cases = [
+        ("valid_lowercase_hex", valid, True),
+        ("valid_digits_only", "0" * 64, True),
+        ("uppercase_rejected", "A" * 64, False),
+        ("too_short", valid[:-1], False),
+        ("too_long", valid + "a", False),
+        ("non_hex_character", "g" * 64, False),
+        ("empty_string", "", False),
+        ("not_a_string_int", 0, False),
+        ("not_a_string_none", None, False),
+        ("not_a_string_bytes", b"a" * 64, False),
+    ]
+
+    for case, value, expected in cases:
+        assert is_sha256_hex(value) is expected, case
+
+
 def test_rejects_dotted_prefix_collisions() -> None:
     """Dotted key collisions are rejected locally and through inheritance."""
     cases = [
@@ -712,7 +761,7 @@ def test_distinct_phase_names_with_same_field_keys_accepted(tmp_path: Path) -> N
     """
     body = """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 override_format: argparse
@@ -850,3 +899,44 @@ def test_cmaes_phase_loads_when_package_present() -> None:
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     assert exp.phases[0].sampler.type == "cmaes"
+
+
+@pytest.mark.parametrize(
+    ("override_format", "template"),
+    [
+        ("yaml_file", "python train.py --config {config_path}"),
+        ("argparse", "python train.py {overrides}"),
+        ("hydra", "python train.py {overrides}"),
+        ("json_file", "python train.py {overrides_path}"),
+    ],
+)
+def test_extreme_float_bounds_load_under_every_override_format(
+    override_format: str, template: str
+) -> None:
+    """A legal near-float64-max FloatParam loads under every override format.
+
+    Config load renders the trial command with a placeholder value for each
+    parameter, and every format refuses a non-finite value, so the
+    placeholder for ``low=1e308, high=1.1e308`` must stay finite.
+    """
+    exp = make_experiment(
+        trial_command=template,
+        override_format=override_format,
+        search_space={"lr": FloatParam(type="float", low=1e308, high=1.1e308)},
+        n_trials=1,
+    )
+    assert exp.override_format == override_format
+
+
+def test_placeholder_value_for_stepped_int_is_on_the_lattice() -> None:
+    """The placeholder for a stepped IntParam is a point on its step lattice."""
+    param = IntParam(type="int", low=0, high=6, step=2)
+    value = _placeholder_value_for(param)
+    assert value == param.low
+    assert (value - param.low) % param.step == 0
+
+
+def test_placeholder_value_for_categorical_is_first_choice() -> None:
+    """The placeholder for a categorical param is its first listed choice."""
+    param = CategoricalParam(type="categorical", choices=["b", "a", "c"])
+    assert _placeholder_value_for(param) == "b"

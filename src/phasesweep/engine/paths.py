@@ -8,6 +8,7 @@ from phasesweep.config import Experiment
 from phasesweep.engine.state import (
     GENERATION_CONFIG_SNAPSHOT_FILENAME,
     GENERATION_REPRODUCIBILITY_FILENAME,
+    WINNER_FILENAME,
 )
 
 
@@ -165,7 +166,7 @@ def _generation_winner_path(experiment: Experiment, generation_id: str, phase_na
     :param str phase_name: Phase name whose generation-scoped winner path is requested.
     :return Path: Path to the phase's winner YAML file within the generation namespace.
     """
-    return _generation_dir(experiment, generation_id) / "phases" / phase_name / "winner.yaml"
+    return _generation_dir(experiment, generation_id) / "phases" / phase_name / WINNER_FILENAME
 
 
 def _last_successful_generation_path(experiment: Experiment) -> Path:
@@ -204,4 +205,4 @@ def _winner_path(experiment: Experiment, phase_name: str) -> Path:
     :param str phase_name: Phase name whose winner path is requested.
     :return Path: Path to the persisted winner YAML file.
     """
-    return _phase_dir(experiment, phase_name) / "winner.yaml"
+    return _phase_dir(experiment, phase_name) / WINNER_FILENAME

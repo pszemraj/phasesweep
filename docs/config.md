@@ -53,12 +53,13 @@ phases:
       optimizer.lr: {type: float, low: 0.00001, high: 0.001, log: true}
 ```
 
-Use `sqlite:///...` for a persistent sequential local ledger and
-`journal:///...` for same-host parallel trials. `storage: auto` selects
-`study.db` in `<workdir>/<experiment>/` when every phase has `n_jobs: 1`, or
-`study.journal` there otherwise. Persistent storage requires a nonempty
-`provenance` mapping. External database URLs are unsupported and rejected
-before connection or artifact creation.
+Use an explicit `journal:///...` URL for persistent local storage, on one
+host, at any `n_jobs`. `storage: auto` always resolves to `study.journal` in
+`<workdir>/<experiment>/`, regardless of `n_jobs`. Persistent storage requires
+a nonempty `provenance` mapping. Any other value, including a `sqlite:///...`
+URL, `:memory:`, or an external database URL, is refused at config load; the
+message names `storage: auto`, `journal:///path/to/study.journal`, and
+`storage: null` as the supported forms.
 
 > [!NOTE]
 > `storage: null`, or omitting `storage` entirely, runs an in-memory disposable
@@ -153,6 +154,10 @@ Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid has
 at most 4,096 concrete combinations, counted before trials are materialized.
 Its trial target must equal that cardinality unless `allow_partial_grid: true`
 is set. CMA-ES accepts numeric spaces only.
+
+`sampler.n_startup_trials` applies only to `tpe`; the other sampler types
+must leave it at its default (10) or config load fails, since they never
+read it.
 
 For persistent storage, `random`, `tpe`, and `cmaes` need a seed. TPE and
 CMA-ES also require `acknowledge_nonresumable: true`: their target must finish

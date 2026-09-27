@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import string
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -43,11 +43,8 @@ from phasesweep.evidence.models import (
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     local_storage_url,
-    sqlalchemy_sqlite_path,
-    sqlite_database_path,
     storage_backend,
     storage_is_in_memory,
-    storage_url_query_keys,
 )
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
@@ -532,13 +529,9 @@ class Experiment(_Frozen):
     storage: str | None = Field(
         default=None,
         description=(
-            "Local Optuna storage URL, or auto for study.db inside the experiment artifact "
-            "namespace (study.journal when any phase has n_jobs > 1). "
-            "Use sqlite:///path.db for resumable single-job studies, "
-            "journal:///path.journal for parallel studies, or null for non-resumable "
-            "in-memory runs. "
-            "Explicit SQLite URLs are never rewritten to JournalStorage. Changing auto's "
-            "backend changes storage identity and cannot resume an existing tree."
+            "Local Optuna journal storage URL, auto for study.journal inside the "
+            "experiment artifact namespace, or null for non-resumable in-memory runs. "
+            "Use journal:///path.journal for an explicit, resumable, parallel-safe study."
         ),
     )
     workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
@@ -582,49 +575,49 @@ class Experiment(_Frozen):
     def resolved_storage(self) -> str | None:
         """Resolve auto storage within this experiment's artifact namespace.
 
-        :return str | None: Absolute auto URL, or the explicit storage unchanged.
+        :return str | None: Absolute auto journal URL, or the explicit storage
+            unchanged.
         """
         if self.storage != "auto":
             return self.storage
         root = Path(self.workdir).expanduser().resolve() / self.experiment
-        parallel = any(phase.n_jobs > 1 for phase in self.phases)
-        return local_storage_url(
-            root / ("study.journal" if parallel else "study.db"),
-            "journal" if parallel else "sqlite",
-        )
+        return local_storage_url(root / "study.journal")
+
+    def phases_from(self, from_phase: str | None) -> Iterator[tuple[int, Phase]]:
+        """Yield the phases a run resuming at ``from_phase`` reaches, in order.
+
+        :param str | None from_phase: Optional resume point; phases before it
+            are skipped. ``None`` reaches every phase from the start.
+        :return Iterator[tuple[int, Phase]]: Each reached phase paired with
+            its declaration index. Empty if ``from_phase`` names no phase.
+        """
+        reached = from_phase is None
+        for index, phase in enumerate(self.phases):
+            reached = reached or phase.name == from_phase
+            if reached:
+                yield index, phase
 
     @field_validator("storage")
     @classmethod
     def _storage_is_local(cls, value: str | None) -> str | None:
-        """Allow only in-memory, local SQLite, local Journal, and auto storage.
+        """Allow only null, auto, and local journal storage.
 
         :param str | None value: Configured Optuna storage locator.
-        :raises ValueError: The locator selects an unsupported storage backend,
-            or a SQLite URL names a different database to PhaseSweep than to
-            the SQLAlchemy engine Optuna opens it through.
+        :raises ValueError: The locator is not null, ``"auto"``, or a
+            ``journal:///`` URL.
         :return str | None: The validated locator, unchanged.
         """
-        backend = storage_backend(value)
-        if (
-            value is None
-            or value == "auto"
-            or (storage_is_in_memory(value) and backend != "sqlite")
-        ):
+        if value is None or value == "auto":
             return value
-        if backend not in {"sqlite", "journal"}:
+        backend = storage_backend(value)
+        if backend != "journal":
             raise ValueError(
-                "storage must be in-memory, sqlite:///, journal:///, or auto; "
-                f"got backend {backend!r}."
+                "storage must be null, auto, or a journal:/// URL; got "
+                f"{value!r}. PhaseSweep keeps its persistent ledger in an Optuna "
+                "journal file: use `storage: auto` for <workdir>/<experiment>/study.journal, "
+                "`storage: journal:///path/to/study.journal` for an explicit file, or "
+                "`storage: null` for an in-memory dry run."
             )
-        if backend == "sqlite":
-            # A URI filename naming another host resolves to no file here; SQLite
-            # refuses to open it only after a run has bound the tree to it.
-            if not storage_is_in_memory(value) and sqlite_database_path(value) is None:
-                raise ValueError(
-                    f"SQLite storage must name a local database file; {value!r} names a "
-                    "remote host."
-                )
-            _require_one_sqlite_database(value)
         canonical_storage_identity(value)
         return value
 
@@ -776,7 +769,6 @@ class Experiment(_Frozen):
                 )
 
             _validate_sampler_search_space(phase)
-            _validate_storage_policy(self.resolved_storage, phase)
             _validate_sampler_resumability(self.resolved_storage, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
@@ -792,71 +784,6 @@ class Experiment(_Frozen):
         if len(names) != 1 + len(self.constraints):
             raise ValueError("Metric and constraint names must all be distinct.")
         return self
-
-
-def _require_one_sqlite_database(storage: str) -> None:
-    """Refuse a SQLite URL whose database PhaseSweep and SQLAlchemy read differently.
-
-    PhaseSweep maps the URL to a file itself for its read-only scans, probes,
-    storage identity, and locks, while Optuna opens it through SQLAlchemy's
-    SQLite dialect. Wherever the two parsers disagree, every check guards one
-    file while trials are written to another, so only URLs that name the same
-    database to both, compared as resolved absolute paths, are accepted. A
-    repeated option and a SQLite ``vfs`` are refused outright: SQLAlchemy
-    turns the first into a tuple, and the second can keep the ledger out of
-    the file every check reads.
-
-    :param str storage: SQLite storage URL that already names a local file or memory.
-    :raises ValueError: The URL repeats an option, selects a VFS, cannot be
-        parsed by SQLAlchemy, or names a different database to each parser.
-    """
-    keys = [key.lower() for key in storage_url_query_keys(storage)]
-    repeated = sorted({key for key in keys if keys.count(key) > 1})
-    if repeated:
-        raise ValueError(
-            f"SQLite storage must set each URL option once; {storage!r} repeats "
-            f"{', '.join(repeated)}."
-        )
-    if "vfs" in keys:
-        raise ValueError(
-            f"SQLite storage must use SQLite's default file access; {storage!r} selects a vfs."
-        )
-    try:
-        opened = sqlalchemy_sqlite_path(storage)
-    except ValueError as exc:
-        raise ValueError(
-            f"SQLite storage must be a URL SQLAlchemy can open; {storage!r} is not: {exc}"
-        ) from exc
-    checked = sqlite_database_path(storage)
-    targets = [
-        "an in-memory database" if path is None else str(path.resolve())
-        for path in (checked, opened)
-    ]
-    if targets[0] != targets[1]:
-        raise ValueError(
-            f"SQLite storage must name one database file to PhaseSweep and to SQLAlchemy; "
-            f"{storage!r} names {targets[0]} to PhaseSweep but {targets[1]} to SQLAlchemy, "
-            "which Optuna opens it through."
-        )
-
-
-def _validate_storage_policy(storage: str | None, phase: Phase) -> None:
-    """Reject SQLite storage for parallel phases.
-
-    :param str | None storage: Experiment-level storage URL, or ``None`` for memory.
-    :param Phase phase: The phase whose parallelism is being validated.
-    :raises ValueError: SQLite storage is used with ``n_jobs > 1``.
-    """
-    if storage is None:
-        return
-    backend = storage_backend(storage)
-    if phase.n_jobs > 1 and backend == "sqlite":
-        raise ValueError(
-            f"Phase {phase.name!r} has n_jobs={phase.n_jobs} with SQLite storage. "
-            "SQLite serializes writers and will deadlock under "
-            "parallel Optuna access. Use storage: journal:///path.journal for a "
-            "single-host parallel sweep."
-        )
 
 
 def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
@@ -878,10 +805,10 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
        at config load instead.
 
     ``grid`` is exempt from both: it enumerates a fixed matrix and resumes from
-    stored grid assignments. In-memory storage (``None`` or the sentinels
-    recognized by :func:`phasesweep.runtime.files.storage_is_in_memory`) is
-    exempt entirely — there is no durable study to reproduce or resume, so the
-    ``sampler`` block stays optional and the ``tpe`` default remains fine.
+    stored grid assignments. In-memory storage (``storage: null``, the only
+    in-memory spelling) is exempt entirely — there is no durable study to
+    reproduce or resume, so the ``sampler`` block stays optional and the
+    ``tpe`` default remains fine.
 
     :param str | None storage: Experiment-level storage URL, or ``None``.
     :param Phase phase: Phase whose sampler contract is checked.
@@ -889,7 +816,7 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
         stochastic without an explicit ``seed``, or is non-resumable without
         ``acknowledge_nonresumable: true``.
     """
-    if storage is None or storage_is_in_memory(storage):
+    if storage_is_in_memory(storage):
         return
 
     sampler = phase.sampler
@@ -1149,7 +1076,6 @@ def _validate_trial_command_template(
             phase=phase.name,
             run_name=f"{experiment.experiment}-{phase.name}-validate",
             trainer_config=experiment.trainer_config,
-            write_files=False,
         )
     except KeyError as exc:
         # str.format raises KeyError(name) for unknown placeholders.
@@ -1270,6 +1196,3 @@ def _wandb_query(
             if isinstance(gate, WandbSummaryRequiredGate)
         ),
     )
-
-
-Config = Experiment

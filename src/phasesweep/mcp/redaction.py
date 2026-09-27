@@ -12,6 +12,7 @@ from typing import Any, Literal, TypeAlias
 
 from phasesweep.engine import PhaseWinnerView
 from phasesweep.engine.read import ResultContext
+from phasesweep.engine.state import TERMINAL_TRIAL_STATES, TRIAL_STATE_NAMES
 from phasesweep.mcp.registry import VisibleParamsPolicy
 from phasesweep.mcp.snapshots import McpPublicationState
 
@@ -20,8 +21,6 @@ ResultSource: TypeAlias = Literal[
     "frozen_run_snapshot",
     "terminal_snapshot_unavailable",
 ]
-
-_TRIAL_STATES = ("WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL")
 
 
 def intersect_visible_params(
@@ -221,15 +220,13 @@ def status_payload(
     phases = []
     for phase in status["phases"]:
         raw_counts = phase["trials"]
-        counts = {state: int(raw_counts.get(state, 0)) for state in _TRIAL_STATES}
+        counts = {state: int(raw_counts.get(state, 0)) for state in TRIAL_STATE_NAMES}
         raw_generation_counts = phase.get("generation_trials") or {}
         generation_counts = {
-            state: int(raw_generation_counts.get(state, 0)) for state in _TRIAL_STATES
+            state: int(raw_generation_counts.get(state, 0)) for state in TRIAL_STATE_NAMES
         }
-        terminal_trials_total = counts["COMPLETE"] + counts["PRUNED"] + counts["FAIL"]
-        terminal_trials_this_run = (
-            generation_counts["COMPLETE"] + generation_counts["PRUNED"] + generation_counts["FAIL"]
-        )
+        terminal_trials_total = sum(counts[state] for state in TERMINAL_TRIAL_STATES)
+        terminal_trials_this_run = sum(generation_counts[state] for state in TERMINAL_TRIAL_STATES)
         terminal_trials_before_run = max(
             0,
             terminal_trials_total - terminal_trials_this_run,

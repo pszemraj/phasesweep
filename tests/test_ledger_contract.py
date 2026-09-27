@@ -22,6 +22,11 @@ every storage-private helper is reached only through the ledger's public handle
 API, so any entry added to either one is a new bypass that needs a stated
 reason.
 
+Optuna's journal is PhaseSweep's only durable backend, so SQLite and generic
+SQLAlchemy-RDB constructors (:data:`BANNED_EVERYWHERE`) are refused even inside
+the chokepoint itself; only the journal/Optuna entry points in
+:data:`BANNED_LEAVES`/:data:`BANNED_CALLS` are allowed there.
+
 Each detector also runs over synthetic source that must trip it, so a detector
 that stops finding anything fails here instead of passing every real module.
 
@@ -79,6 +84,17 @@ BANNED_LEAVES: dict[str, frozenset[str]] = {
 BANNED_CALLS: dict[str, frozenset[str]] = {
     "optuna": frozenset({"Study"}),
     "sqlite3": frozenset({"Connection"}),
+}
+
+#: Leaves among :data:`BANNED_LEAVES`/:data:`BANNED_CALLS` that are banned even
+#: inside :data:`CHOKEPOINT` itself. Optuna's journal is the only durable
+#: backend PhaseSweep has, so SQLite and generic SQLAlchemy-RDB storage have no
+#: legitimate constructor anywhere in the package -- not even in the one
+#: module allowed to build the journal's own live storage.
+BANNED_EVERYWHERE: dict[str, frozenset[str]] = {
+    "optuna": frozenset({"RDBStorage"}),
+    "sqlalchemy": frozenset({"create_engine", "engine_from_config"}),
+    "sqlite3": frozenset({"connect", "Connection"}),
 }
 
 #: Banned storage entry points still reachable outside the chokepoint.
@@ -356,15 +372,27 @@ def private_ledger_references(
 
 
 def test_storage_constructors_are_called_only_in_the_ledger_module() -> None:
-    """Only the ledger module may reach Optuna/sqlite3 storage constructors."""
+    """Only the ledger module may reach Optuna's journal constructors; SQLite/RDB ones nowhere."""
     chokepoint = SRC / CHOKEPOINT
     assert chokepoint.is_file(), (
         f"{CHOKEPOINT} does not exist; update CHOKEPOINT in this module when the "
         "ledger module is renamed or moved."
     )
-    assert banned_references(chokepoint), (
+    chokepoint_references = banned_references(chokepoint)
+    assert chokepoint_references, (
         f"{CHOKEPOINT} no longer constructs any storage; the chokepoint moved and "
         "CHOKEPOINT here is stale."
+    )
+    sqlite_or_rdb_in_chokepoint = {
+        qualified
+        for qualified in chokepoint_references
+        if qualified.rpartition(".")[2]
+        in BANNED_EVERYWHERE.get(qualified.split(".", 1)[0], frozenset())
+    }
+    assert not sqlite_or_rdb_in_chokepoint, (
+        f"{CHOKEPOINT} references SQLite/RDB storage: {sqlite_or_rdb_in_chokepoint}. "
+        "The journal is PhaseSweep's only durable backend now, so SQLite/RDB "
+        "constructors are banned everywhere, including the chokepoint itself."
     )
 
     found: dict[str, set[str]] = {}

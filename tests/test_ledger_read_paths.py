@@ -1,13 +1,13 @@
 """Every read path, against every golden ledger, writes nothing and refuses honestly.
 
-Two durability invariants meet here. A read path never creates a study, never
-constructs file-backed storage, and opens SQLite ``mode=ro`` (invariant 6); and
-it validates the artifact-root binding and then the ledger format *before* any
-bind, claim, or open, leaving the bytes untouched when it refuses (invariant 2).
-The golden fixtures under ``tests/fixtures/ledgers`` supply the pre-cutover
-shapes those refusals exist for, produced by real PhaseSweep runs -- including
-two by the preserved 0.3.1 release itself -- rather than by a test that guesses
-what old bytes look like.
+Two durability invariants meet here. A read path never creates a study and
+never constructs file-backed storage (invariant 3); and it validates the
+artifact-root binding and then the ledger format *before* any bind, claim, or
+open, leaving the bytes untouched when it refuses (invariant 2). The golden
+fixtures under ``tests/fixtures/ledgers`` supply the pre-cutover shapes those
+refusals exist for, produced by real PhaseSweep runs -- including the
+preserved 0.3.1 release itself -- rather than by a test that guesses what old
+bytes look like.
 
 ``mcp-recover-inspect`` is held to the weaker half on purpose: recovery
 preflight legitimately needs live ``Study`` objects, so it is not under the
@@ -22,7 +22,6 @@ every pure read says ``ok``.
 from __future__ import annotations
 
 import json
-import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -62,17 +61,12 @@ from tests.recovery_helpers import load_only_recovery_needs
 #: regeneration, not a smaller matrix, so it is asserted by name.
 REQUIRED_FIXTURES = (
     "current-journal",
-    "current-sqlite",
-    "current-sqlite-optuna40-versioninfo",
-    "precutover-binding2-sqlite",
+    "precutover-binding2-journal",
     "precutover-mcp-state",
     "precutover-schema2-journal",
-    "precutover-schema2-sqlite",
-    "precutover-unmarked-tree-sqlite",
+    "precutover-unmarked-tree-journal",
     "precutover-unstamped-journal",
-    "precutover-unstamped-sqlite",
     "release-0.3.1-journal",
-    "release-0.3.1-sqlite",
 )
 
 #: Read paths that must not construct file-backed storage at all.
@@ -300,7 +294,7 @@ def test_recovery_inspect_never_writes_to_a_golden_ledger(
 
 
 @pytest.mark.parametrize(
-    "fixture_name", ["precutover-schema2-sqlite", "precutover-unstamped-journal"]
+    "fixture_name", ["precutover-schema2-journal", "precutover-unstamped-journal"]
 )
 def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_path: Path) -> None:
     """Recovery refuses a pre-cutover ledger in the engine's own words.
@@ -346,32 +340,20 @@ def test_precutover_mcp_state_is_refused_without_writing(entry_point: str, tmp_p
     assert tree_changes(before, tree_snapshot(root)) == {}
 
 
-@pytest.mark.parametrize("fixture_name", ["current-sqlite", "current-journal"])
-def test_current_fixture_carries_this_release_format(fixture_name: str, tmp_path: Path) -> None:
-    """The reference fixtures still declare the schema versions this release writes."""
+def test_current_fixture_carries_this_release_format(tmp_path: Path) -> None:
+    """The reference fixture still declares the schema versions this release writes."""
+    fixture_name = "current-journal"
     fixture = fixture_by_name(fixture_name)
     materialized = materialize(fixture_name, tmp_path, mode="tree")
-    backend = str(fixture.manifest["backend"])
-    ledger = ledger_file(materialized, backend)
+    ledger = ledger_file(materialized, "journal")
 
-    if backend == "sqlite":
-        conn = sqlite3.connect(f"file:{ledger}?mode=ro", uri=True)
-        try:
-            rows = conn.execute(
-                "SELECT value_json FROM study_user_attributes WHERE key = ?",
-                (STUDY_SCHEMA_ATTR,),
-            ).fetchall()
-        finally:
-            conn.close()
-        stamps = [json.loads(value_json) for (value_json,) in rows]
-    else:
-        stamps = [
-            record["user_attr"][STUDY_SCHEMA_ATTR]
-            for record in (
-                json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line
-            )
-            if record.get("op_code") == 2 and STUDY_SCHEMA_ATTR in record.get("user_attr", {})
-        ]
+    stamps = [
+        record["user_attr"][STUDY_SCHEMA_ATTR]
+        for record in (
+            json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line
+        )
+        if record.get("op_code") == 2 and STUDY_SCHEMA_ATTR in record.get("user_attr", {})
+    ]
 
     assert stamps == [STUDY_SCHEMA_VERSION], (
         f"{fixture_name} stamps {stamps}, not the current study schema "
@@ -421,64 +403,6 @@ def test_fixture_fingerprints_do_not_depend_on_the_working_directory(
     summary = yaml.safe_load((generation / "summary.yaml").read_text())
     assert winner["phase_fingerprint"] == _phase_fingerprint(experiment, phase, {})
     assert summary["config_fingerprint"] == _experiment_semantic_fingerprint(experiment)
-
-
-@pytest.mark.parametrize("fixture_name", ["current-sqlite", "current-sqlite-optuna40-versioninfo"])
-def test_sqlite_reader_never_touches_optuna_version_tables(
-    fixture_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """PhaseSweep's SQLite reads ignore Optuna's own version bookkeeping.
-
-    Optuna's SQLite schema has been frozen across the whole supported range
-    (``SCHEMA_VERSION = 12``, alembic head ``v3.2.0.a`` from 4.0 through 4.9):
-    the only version-bearing bytes are ``version_info.library_version`` and
-    ``alembic_version.version_num``. Reading either would make PhaseSweep's
-    verdict depend on which Optuna wrote the ledger rather than on what the
-    ledger contains, so the ``optuna40`` fixture -- whose recorded library
-    version says 4.0.0 while its schema does not differ by one byte -- must
-    read exactly like the reference fixture.
-    """
-    materialized = materialize(fixture_name, tmp_path, mode="tree")
-    real_connect = sqlite3.connect
-    statements: list[str] = []
-
-    class RecordingConnection(sqlite3.Connection):
-        """Connection that records every statement the reader issues."""
-
-        def execute(self, sql: str, *params: Any) -> sqlite3.Cursor:
-            """Record one statement, then run it.
-
-            :param str sql: Statement the reader issued.
-            :return sqlite3.Cursor: Cursor over the executed statement.
-            """
-            statements.append(sql)
-            return super().execute(sql, *params)
-
-        def executemany(self, sql: str, *params: Any) -> sqlite3.Cursor:
-            """Record one repeated statement, then run it.
-
-            :param str sql: Statement the reader issued.
-            :return sqlite3.Cursor: Cursor over the executed statement.
-            """
-            statements.append(sql)
-            return super().executemany(sql, *params)
-
-    def recording_connect(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
-        """Open the database through the recording connection class.
-
-        :param Any database: Database string or URI the reader passed.
-        :return sqlite3.Connection: Recording connection to that database.
-        """
-        kwargs["factory"] = RecordingConnection
-        return real_connect(database, *args, **kwargs)
-
-    monkeypatch.setattr(sqlite3, "connect", recording_connect)
-    status = read_status(materialized.experiment)
-
-    assert statements, "the status read issued no SQL"
-    offending = [sql for sql in statements if "version_info" in sql or "alembic_version" in sql]
-    assert not offending, f"{fixture_name} read Optuna version bookkeeping: {offending}"
-    assert status["phases"][0]["trial_data_available"] is True
 
 
 def test_required_ledger_fixtures_are_present() -> None:

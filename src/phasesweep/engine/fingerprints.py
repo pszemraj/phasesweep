@@ -17,6 +17,8 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
 
+log = logging.getLogger(__name__)
+
 _RUN_CONTROL_KEYS = frozenset(
     {
         # Fields excluded from the fingerprint because they don't change trial
@@ -95,6 +97,25 @@ def _semantic_payload_digest(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _semantic_core(experiment: Experiment) -> dict[str, Any]:
+    """Return the experiment-level fields both semantic fingerprints hash.
+
+    :param Experiment experiment: Experiment whose command, trainer input,
+        environment, execution, provenance, metric, and constraints are read.
+    :return dict[str, Any]: JSON-serializable payload fragment.
+    """
+    return {
+        "trial_command": experiment.trial_command,
+        "trainer_config": experiment.trainer_config,
+        "override_format": experiment.override_format,
+        "env": dict(sorted(experiment.env.items())),
+        "execution": _execution_identity(experiment),
+        "provenance": dict(sorted(experiment.provenance.items())),
+        "metric": experiment.metric.model_dump(mode="json"),
+        "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+    }
+
+
 def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
     """Hash the experiment semantics that give a published result its meaning.
 
@@ -115,14 +136,7 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
     payload = {
         "fingerprint_schema_version": EXPERIMENT_FINGERPRINT_SCHEMA_VERSION,
         "experiment": experiment.experiment,
-        "trial_command": experiment.trial_command,
-        "trainer_config": experiment.trainer_config,
-        "override_format": experiment.override_format,
-        "env": dict(sorted(experiment.env.items())),
-        "execution": _execution_identity(experiment),
-        "provenance": dict(sorted(experiment.provenance.items())),
-        "metric": experiment.metric.model_dump(mode="json"),
-        "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+        **_semantic_core(experiment),
         "phases": [
             {"name": phase.name, **_semantic_phase_dump(phase)} for phase in experiment.phases
         ],
@@ -177,14 +191,7 @@ def _phase_semantic_payload(
     semantic_phase = _semantic_phase_dump(phase)
     payload = {
         "fingerprint_schema_version": FINGERPRINT_SCHEMA_VERSION,
-        "trial_command": experiment.trial_command,
-        "trainer_config": experiment.trainer_config,
-        "provenance": dict(sorted(experiment.provenance.items())),
-        "override_format": experiment.override_format,
-        "env": dict(sorted(experiment.env.items())),
-        "execution": _execution_identity(experiment),
-        "metric": experiment.metric.model_dump(mode="json"),
-        "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+        **_semantic_core(experiment),
         "phase": semantic_phase,
         "inherited_effective_overrides": {
             parent: inherited_winners[parent].effective_overrides for parent in phase.inherits
@@ -264,6 +271,3 @@ def _verify_fingerprint(
             f"old study, or rename the phase."
         )
     return fp
-
-
-log = logging.getLogger(__name__)

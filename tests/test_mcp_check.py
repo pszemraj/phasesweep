@@ -22,7 +22,7 @@ def _relative_workdir_config(tmp_path: Path, name: str) -> str:
 
 def _relative_storage_config(tmp_path: Path, name: str) -> str:
     return mcp_experiment_config_text(tmp_path, name=name).replace(
-        f"storage: sqlite:///{tmp_path}/{name}.db", "storage: sqlite:///relative.db"
+        f"storage: journal:///{tmp_path}/{name}.journal", "storage: journal:///relative.journal"
     )
 
 
@@ -88,7 +88,7 @@ def test_check_catalog_collects_failures_past_the_first(tmp_path: Path) -> None:
     assert verdicts["good"].ok
     assert "absolute workdir" in (verdicts["bad-workdir"].error or "")
     assert "set workdir to an absolute path" in (verdicts["bad-workdir"].suggestion or "")
-    assert "absolute sqlite storage path" in (verdicts["bad-storage"].error or "")
+    assert "absolute journal storage path" in (verdicts["bad-storage"].error or "")
     assert "use an absolute path" in (verdicts["bad-storage"].suggestion or "")
     assert not (tmp_path / "state").exists()
     # Registry.load stays fail-fast on the same catalog.

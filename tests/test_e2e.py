@@ -33,7 +33,7 @@ def _prep(tmp_path: Path) -> Path:
     text = EXAMPLE_YAML.read_text()
     runs_dir = tmp_path / "runs"
     for old, new in (
-        ("./runs/phases.db", str(runs_dir / "phases.db")),
+        ("./runs/phases.journal", str(runs_dir / "phases.journal")),
         ("./runs", str(runs_dir)),
         ("python -m phasesweep.examples.fake_train", f"python {trainer.resolve()}"),
     ):

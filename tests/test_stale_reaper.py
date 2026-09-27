@@ -37,6 +37,7 @@ from phasesweep.engine import (
     run_experiment,
 )
 from phasesweep.engine.attempts import (
+    _AttemptRecord,
     _inspect_active_attempts,
     _preflight_active_attempts,
     _PreflightCleanupReport,
@@ -195,13 +196,13 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         with open(args.out, 'w') as f: json.dump({'x': 1.0}, f)
         """,
     )
-    db = tmp_path / "p.db"
-    storage = f"sqlite:///{db}"
+    db = tmp_path / "p.journal"
+    storage = f"journal:///{db}"
 
     # Manually create a study and inject a RUNNING trial + fingerprint.
     study = optuna.create_study(
         study_name="t::a",
-        storage=storage,
+        storage=engine_ledger._resolve_storage(storage),
         direction="minimize",
     )
     study.set_user_attr("phasesweep_fingerprint", "OLD-FINGERPRINT")
@@ -300,7 +301,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         print("metric=1.0")
         """,
     )
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = Experiment(
         experiment="cross_phase_orphan",
         storage=storage,
@@ -361,7 +362,7 @@ def test_current_schema_rejects_terminal_trial_without_policy_outcome(
     tmp_path: Path,
 ) -> None:
     """Current-schema terminal rows must carry reconstructable policy state."""
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = make_experiment(
         experiment="missing_outcome",
         storage=storage,
@@ -370,7 +371,7 @@ def test_current_schema_rejects_terminal_trial_without_policy_outcome(
     )
     study = optuna.create_study(
         study_name="missing_outcome::p",
-        storage=storage,
+        storage=engine_ledger._resolve_storage(storage),
         direction="minimize",
     )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
@@ -478,6 +479,38 @@ def test_mixed_preflight_errors_keep_cleanup_uncertainty_actionable(
 
     with pytest.raises(ProcessCleanupUncertainError, match="multiple unsafe studies"):
         _preflight_existing_studies(_claimed_over(experiment, studies))
+
+
+def test_preflight_keeps_attempts_reaped_before_a_later_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attempts already failed before a later trial refuses stay in the cleanup report."""
+    experiment = make_experiment(workdir=tmp_path / "runs")
+    phase_name = experiment.phases[0].name
+    studies = {phase_name: optuna.create_study(study_name=phase_name, direction="minimize")}
+
+    def reap_one_then_refuse(
+        _study: optuna.Study,
+        _experiment: Experiment,
+        name: str,
+        *,
+        recovered_attempts: dict[str, _AttemptRecord],
+        **_kwargs: object,
+    ) -> int:
+        recovered_attempts["reaped"] = _AttemptRecord("gen-reaped", name, 0)
+        recovered_attempts["no-generation"] = _AttemptRecord(None, name, 1)
+        raise ProcessCleanupUncertainError("a later trial's cleanup is uncertain")
+
+    monkeypatch.setattr("phasesweep.engine.guards._reap_stale_trials", reap_one_then_refuse)
+    report = _PreflightCleanupReport()
+
+    with pytest.raises(ProcessCleanupUncertainError, match="cleanup is uncertain"):
+        _preflight_existing_studies(_claimed_over(experiment, studies), cleanup_report=report)
+
+    assert report.recovered_attempt_ids == {"reaped", "no-generation"}
+    assert report.recovered_attempt_generations == {"reaped": "gen-reaped"}
+    assert report.cleanup_confirmed is False
 
 
 def test_registry_storage_failure_marks_cleanup_report_uncertain(
@@ -925,7 +958,7 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'allocation.db'}",
+        storage=f"journal:///{tmp_path / 'allocation.journal'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
         override_format="argparse",
         n_trials=3,
@@ -945,7 +978,9 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
     winners = run_experiment(exp)
 
     assert winners["p"].metric == pytest.approx(1.0)
-    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    study = optuna.load_study(
+        study_name="t::p", storage=engine_ledger._resolve_storage(exp.storage)
+    )
     trials = study.get_trials(deepcopy=False)
     assert [trial.state for trial in trials] == [
         optuna.trial.TrialState.FAIL,
@@ -965,7 +1000,7 @@ def test_allocation_context_covers_first_environment_write_failure(
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'first-write.db'}",
+        storage=f"journal:///{tmp_path / 'first-write.journal'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
         override_format="argparse",
         n_trials=1,
@@ -991,7 +1026,9 @@ def test_allocation_context_covers_first_environment_write_failure(
     winners = run_experiment(resumed)
 
     assert winners["p"].metric == pytest.approx(1.0)
-    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    study = optuna.load_study(
+        study_name="t::p", storage=engine_ledger._resolve_storage(exp.storage)
+    )
     trials = study.get_trials(deepcopy=False)
     assert [trial.state for trial in trials] == [
         optuna.trial.TrialState.FAIL,
@@ -1098,7 +1135,7 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
     exp = make_experiment(
         experiment="prelaunch",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'p.db'}",
+        storage=f"journal:///{tmp_path / 'p.journal'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
         override_format="argparse",
         n_trials=2,
@@ -1129,7 +1166,7 @@ def test_exited_attempt_recovers_without_signalling(
     exp = make_experiment(
         experiment="exited",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'e.db'}",
+        storage=f"journal:///{tmp_path / 'e.journal'}",
     )
     study, trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="exited-attempt")
     child = subprocess.Popen(["sleep", "30"], start_new_session=True)
@@ -1178,15 +1215,15 @@ def test_recovery_refuses_a_study_bound_to_another_artifact_root(
     ledger_dir = tmp_path / "shared-ledger"
     ledger_dir.mkdir()
     owner = _write_config(
-        tmp_path / "b.yaml", backend="sqlite", ledger_dir=ledger_dir, workdir=tmp_path / "b"
+        tmp_path / "b.yaml", backend="journal", ledger_dir=ledger_dir, workdir=tmp_path / "b"
     )
     config_a = tmp_path / "a.yaml"
     recovering = _write_config(
-        config_a, backend="sqlite", ledger_dir=ledger_dir, workdir=tmp_path / "a"
+        config_a, backend="journal", ledger_dir=ledger_dir, workdir=tmp_path / "a"
     )
     study, trial_dir, owned_number = fabricate_stale_trial(owner, "p", attempt_id="b-attempt")
     write_attempt_lifecycle(trial_dir, attempt_id="b-attempt", state="allocated")
-    ledger_file = ledger_dir / "study.db"
+    ledger_file = ledger_dir / "study.journal"
     before = ledger_file.read_bytes()
 
     state_dir = tmp_path / "mcp-state"
@@ -1247,11 +1284,11 @@ def _fabricate_registered_journal_attempt(
     return experiment, ledger, _attempts_dir(experiment) / f"{attempt_id}.json"
 
 
-@pytest.mark.parametrize("tail", [b"{}\n", b"not-json\n", b"not-json", b'{"unterminated"'])
+@pytest.mark.parametrize("tail", [b"{}\n", b"not-json\n{}\n"])
 def test_registry_retains_attempt_when_journal_snapshot_is_unreadable(
     tmp_path: Path, tail: bytes
 ) -> None:
-    """Malformed journal tails cannot discard a stale-attempt recovery record."""
+    """A journal that stays unreadable cannot discard a stale-attempt recovery record."""
     experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
         tmp_path, attempt_id="journal-attempt"
     )
@@ -1263,6 +1300,40 @@ def test_registry_retains_attempt_when_journal_snapshot_is_unreadable(
 
     assert ledger.read_bytes() == ledger_before
     assert entry_path.read_bytes() == entry_before
+
+
+@pytest.mark.parametrize("tail", [b"not-json\n", b"not-json", b'{"unterminated"'])
+def test_registry_reads_its_attempt_after_repairing_a_partial_journal_record(
+    tmp_path: Path, tail: bytes
+) -> None:
+    """A partial final record is cut first, so the attempt is read as on a healthy journal."""
+    (tmp_path / "healthy").mkdir()
+    (tmp_path / "torn").mkdir()
+    healthy_experiment, healthy_ledger, healthy_entry = _fabricate_registered_journal_attempt(
+        tmp_path / "healthy", attempt_id="journal-attempt"
+    )
+    _preflight_active_attempts(healthy_experiment, _PreflightCleanupReport())
+    experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
+        tmp_path / "torn", attempt_id="journal-attempt"
+    )
+    complete = ledger.read_bytes()
+    ledger.write_bytes(complete + tail)
+
+    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+
+    (backup,) = ledger.parent.glob(f"{ledger.name}.*.bak")
+    assert backup.read_bytes() == complete + tail
+    assert ledger.read_bytes().startswith(complete)
+    assert not list(healthy_ledger.parent.glob(f"{healthy_ledger.name}.*.bak"))
+    assert not entry_path.exists()
+    assert not healthy_entry.exists()
+
+    def trial_states(experiment: Experiment) -> list[optuna.trial.TrialState]:
+        storage = engine_ledger._resolve_storage(experiment.resolved_storage)
+        study = optuna.load_study(study_name="journal-attempt::p", storage=storage)
+        return [trial.state for trial in study.get_trials(deepcopy=False)]
+
+    assert trial_states(experiment) == trial_states(healthy_experiment)
 
 
 def test_registry_retains_attempt_when_live_journal_loses_snapshotted_trial(
@@ -1302,34 +1373,36 @@ def test_registry_discards_attempt_for_a_confirmed_missing_journal_study(tmp_pat
     assert not entry_path.exists()
 
 
-def test_registry_discards_attempt_whose_sqlite_ledger_is_gone_without_recreating_it(
+def test_registry_discards_attempt_whose_journal_ledger_is_gone_without_recreating_it(
     tmp_path: Path,
 ) -> None:
-    """A deleted SQLite locator is confirmed absent, and inspecting it creates nothing.
+    """A deleted journal locator is confirmed absent, and inspecting it creates nothing.
 
-    Optuna's own loader would create the missing database before reporting the
-    study absent from it, leaving an empty ledger at a locator recovery was
-    only inspecting. A missing file already proves the study is gone.
+    ``open_registry_study`` documents this directly: Optuna's own loader would
+    create the missing file before reporting the study absent from it, leaving
+    an empty ledger at a locator recovery was only inspecting; a missing file
+    already proves the study is gone, and the journal snapshot reader never
+    constructs anything that could bring it into existence.
     """
 
     def _exp(db_name: str) -> Experiment:
         return make_experiment(
             experiment="gone-ledger",
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{tmp_path / db_name}",
+            storage=f"journal:///{tmp_path / db_name}",
             n_trials=1,
         )
 
-    gone = tmp_path / "gone.db"
+    gone = tmp_path / "gone.journal"
     _study, trial_dir, _number = fabricate_registered_attempt(
-        _exp("gone.db"), "p", attempt_id="gone-attempt"
+        _exp("gone.journal"), "p", attempt_id="gone-attempt"
     )
     write_attempt_lifecycle(trial_dir, attempt_id="gone-attempt", state="allocated")
-    entry_path = _attempts_dir(_exp("gone.db")) / "gone-attempt.json"
+    entry_path = _attempts_dir(_exp("gone.journal")) / "gone-attempt.json"
     gone.unlink()
 
     report = _PreflightCleanupReport()
-    _preflight_active_attempts(_exp("current.db"), report)
+    _preflight_active_attempts(_exp("current.journal"), report)
 
     assert not entry_path.exists()
     assert not gone.exists()
@@ -1350,29 +1423,30 @@ def test_registry_refuses_a_foreign_ledger_holding_pre_cutover_state(tmp_path: P
         return make_experiment(
             experiment="foreign-ledger",
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{tmp_path / db_name}",
+            storage=f"journal:///{tmp_path / db_name}",
             n_trials=1,
         )
 
-    current = _exp("current.db")
-    foreign_db = tmp_path / "foreign.db"
-    foreign_url = f"sqlite:///{foreign_db}"
+    current = _exp("current.journal")
+    foreign_db = tmp_path / "foreign.journal"
+    foreign_url = f"journal:///{foreign_db}"
+    foreign_storage = engine_ledger._resolve_storage(foreign_url)
     # The tree belongs to the configured ledger, so the run passes its own
     # validation and claim and reaches the registry scan.
     mark_current_format(current)
     stale = optuna.create_study(
-        study_name="foreign-ledger::p", storage=foreign_url, direction="minimize"
+        study_name="foreign-ledger::p", storage=foreign_storage, direction="minimize"
     )
     stale.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     stale_trial = stale.ask()
-    legacy = optuna.create_study(study_name="legacy::p", storage=foreign_url)
+    legacy = optuna.create_study(study_name="legacy::p", storage=foreign_storage)
     legacy.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
     trial_dir = tmp_path / "foreign-attempt"
     trial_dir.mkdir()
     write_attempt_lifecycle(trial_dir, attempt_id="foreign-attempt", state="allocated")
     # Registered through the foreign config, so the entry records that ledger.
     _register_active_attempt(
-        _exp("foreign.db"),
+        _exp("foreign.journal"),
         attempt_id="foreign-attempt",
         phase_name="p",
         study_name="foreign-ledger::p",
@@ -1391,12 +1465,11 @@ def test_registry_refuses_a_foreign_ledger_holding_pre_cutover_state(tmp_path: P
     assert foreign_db.read_bytes() == ledger_before
 
 
-@pytest.mark.parametrize("backend", ["sqlite", "journal"])
 @pytest.mark.parametrize(
     "identity_change", [None, "attempt", "generation", "missing-attempt", "missing-generation"]
 )
 def test_registry_terminal_cleanup_requires_matching_attempt_identity(
-    tmp_path: Path, backend: str, identity_change: str | None
+    tmp_path: Path, identity_change: str | None
 ) -> None:
     """A stale registry entry cannot consume a replacement trial's cleanup evidence."""
     from phasesweep.engine.cleanup import _iter_cleanup_uncertain_trials
@@ -1404,7 +1477,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     experiment = make_experiment(
         experiment="terminal-identity",
         workdir=tmp_path / "runs",
-        storage=f"{backend}:///{tmp_path / 'ledger'}",
+        storage=f"journal:///{tmp_path / 'ledger.journal'}",
     )
     old_dir = tmp_path / "old-attempt"
     old_dir.mkdir()
@@ -1484,7 +1557,7 @@ def test_attempt_registry_refuses_unsafe_private_authority(
     experiment = make_experiment(
         experiment="unsafe-registry",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'study.db'}",
+        storage=f"journal:///{tmp_path / 'study.journal'}",
     )
     trial_dir = _experiment_dir(experiment) / "p" / "trial_00000__unsafe"
     trial_dir.mkdir(parents=True)
@@ -1530,10 +1603,10 @@ def test_relative_registry_storage_recovers_from_the_registration_cwd(
     experiment = make_experiment(
         experiment="relative-registry",
         workdir=tmp_path / "runs",
-        storage="sqlite:///studies.db",
+        storage="journal:///studies.journal",
         n_trials=1,
     )
-    study, trial_dir, stale_number = fabricate_registered_attempt(
+    _study, trial_dir, stale_number = fabricate_registered_attempt(
         experiment,
         "p",
         attempt_id="relative-attempt",
@@ -1544,9 +1617,17 @@ def test_relative_registry_storage_recovers_from_the_registration_cwd(
     report = _PreflightCleanupReport()
     _preflight_active_attempts(experiment, report)
 
+    # The journal backend reopens its file on every read, so a handle built on
+    # the relative URL would now follow the new cwd; read the original ledger
+    # through its absolute path instead.
+    registered_ledger = f"journal:///{registration_cwd / 'studies.journal'}"
+    study = optuna.load_study(
+        study_name="relative-registry::p",
+        storage=engine_ledger._resolve_storage(registered_ledger),
+    )
     assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
     assert report.recovered_attempt_ids == {"relative-attempt"}
-    assert not (recovery_cwd / "studies.db").exists()
+    assert not (recovery_cwd / "studies.journal").exists()
     assert not list(_attempts_dir(experiment).glob("*.json"))
 
 
@@ -1557,7 +1638,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
     experiment = make_experiment(
         experiment="partial-registration",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'partial.db'}",
+        storage=f"journal:///{tmp_path / 'partial.journal'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
         override_format="argparse",
         n_trials=2,
@@ -1588,16 +1669,12 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
     assert not list(_attempts_dir(experiment).glob("*.json"))
 
 
-@pytest.mark.parametrize("storage", [":memory:", "sqlite:///:memory:", "sqlite://"])
-def test_in_memory_attempt_registry_accepts_locatorless_entries(
-    tmp_path: Path,
-    storage: str,
-) -> None:
+def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) -> None:
     """In-memory attempts have an identity but intentionally no recovery URL."""
     experiment = make_experiment(
         experiment="memory-registry",
         workdir=tmp_path / "runs",
-        storage=storage,
+        storage=None,
     )
     trial_dir = _experiment_dir(experiment) / "p" / "trial_00000__memory-attempt"
     trial_dir.mkdir(parents=True)
@@ -1622,7 +1699,7 @@ def test_registry_generation_conflict_is_study_schema_mismatch(tmp_path: Path) -
     experiment = make_experiment(
         experiment="registry-conflict",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'conflict.db'}",
+        storage=f"journal:///{tmp_path / 'conflict.journal'}",
     )
     _study, trial_dir, _number = fabricate_registered_attempt(
         experiment,
@@ -1649,7 +1726,7 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
     overlapped the new sweep. The registry scan is phase-graph-independent.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
-    storage = f"sqlite:///{tmp_path / 'r.db'}"
+    storage = f"journal:///{tmp_path / 'r.journal'}"
 
     def _exp(phase_name: str) -> Experiment:
         return make_experiment(
@@ -1706,7 +1783,7 @@ def test_wandb_worker_parent_death_is_recovered_after_phase_removal(
     from phasesweep.runtime.reaper import read_stale_process_identity
 
     old = make_experiment(
-        workdir=tmp_path / "runs", storage=f"sqlite:///{tmp_path / 'study.db'}", n_trials=1
+        workdir=tmp_path / "runs", storage=f"journal:///{tmp_path / 'study.journal'}", n_trials=1
     )
     study, trial_dir, number = fabricate_registered_attempt(old, "p", attempt_id="remote-attempt")
     started = tmp_path / "worker-started"
@@ -1771,25 +1848,25 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
         return make_experiment(
             experiment="movedstorage",
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{tmp_path / db_name}",
+            storage=f"journal:///{tmp_path / db_name}",
             trial_command=f"{sys.executable} {trainer} {{overrides}}",
             override_format="argparse",
             n_trials=1,
         )
 
-    old_exp = _exp("old.db")
+    old_exp = _exp("old.journal")
     old_study, trial_dir, stale_number = fabricate_registered_attempt(
         old_exp, "p", attempt_id="moved-attempt"
     )
     write_attempt_lifecycle(trial_dir, attempt_id="moved-attempt", state="allocated")
 
     report = _PreflightCleanupReport()
-    _preflight_active_attempts(_exp("new.db"), report)
+    _preflight_active_attempts(_exp("new.journal"), report)
 
     assert old_study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
     assert not list((tmp_path / "runs" / "movedstorage" / "attempts").glob("*.json"))
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
-        run_experiment(_exp("new.db"))
+        run_experiment(_exp("new.journal"))
 
 
 @pytest.mark.parametrize("failure_site", ["lifecycle", "registry"])
@@ -1816,7 +1893,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
         print("x=0.5")
         """,
     )
-    storage = f"sqlite:///{tmp_path / 'registry.db'}"
+    storage = f"journal:///{tmp_path / 'registry.journal'}"
 
     def _exp(n_trials: int) -> Experiment:
         return make_experiment(
@@ -1866,7 +1943,9 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert not list(phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"))
 
     # The failure is a visible, valid terminal row - not an invisible RUNNING one.
-    study = optuna.load_study(study_name="unregistrable::p", storage=storage)
+    study = optuna.load_study(
+        study_name="unregistrable::p", storage=engine_ledger._resolve_storage(storage)
+    )
     (trial,) = study.get_trials(deepcopy=False)
     assert trial.state == optuna.trial.TrialState.FAIL
     assert trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "fatal"

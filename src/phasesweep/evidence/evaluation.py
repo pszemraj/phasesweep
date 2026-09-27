@@ -162,7 +162,11 @@ class TrialContext:
 
 
 def _extract_json(
-    ctx: TrialContext, cfg: JsonExtractor, provenance: dict[str, Any] | None = None
+    ctx: TrialContext,
+    cfg: JsonExtractor,
+    provenance: dict[str, Any] | None = None,
+    *,
+    deadline: float | None = None,
 ) -> float:
     """Read a JSON file in the trial directory and extract a numeric value.
 
@@ -172,6 +176,8 @@ def _extract_json(
             dotted lookup key inside it.
         provenance: Optional sink that receives the frozen evidence ``source``
             payload on success (review v0.5.17 / finding F).
+        deadline: Unused; accepted for parity with the shared extractor
+            dispatch signature.
 
     Returns:
         The numeric value at the configured key.
@@ -211,7 +217,11 @@ def _extract_json(
 
 
 def _extract_json_envelope(
-    ctx: TrialContext, cfg: JsonEnvelopeExtractor, provenance: dict[str, Any] | None = None
+    ctx: TrialContext,
+    cfg: JsonEnvelopeExtractor,
+    provenance: dict[str, Any] | None = None,
+    *,
+    deadline: float | None = None,
 ) -> float:
     """Validate and extract an attempt-bound JSON result envelope.
 
@@ -220,6 +230,8 @@ def _extract_json_envelope(
     :param dict[str, Any] | None provenance: Optional sink that receives the
         frozen evidence ``source`` payload — envelope digest plus the
         validated evaluation metadata — on success (review v0.5.17 / finding F).
+    :param float | None deadline: Unused; accepted for parity with the shared
+        extractor dispatch signature.
     :raises ExtractorError: If the envelope is missing, malformed, or belongs to
         another execution attempt.
     :return float: Validated objective value from the envelope.
@@ -309,7 +321,11 @@ def _extract_json_envelope(
 
 
 def _extract_log_regex(
-    ctx: TrialContext, cfg: LogRegexExtractor, provenance: dict[str, Any] | None = None
+    ctx: TrialContext,
+    cfg: LogRegexExtractor,
+    provenance: dict[str, Any] | None = None,
+    *,
+    deadline: float | None = None,
 ) -> float:
     """Scan a log file line-by-line and return the value of a named regex group.
 
@@ -324,6 +340,8 @@ def _extract_log_regex(
             were examined (review v0.5.17 / finding F). ``select: "first"``
             stops *matching* at the first hit but still reads the remaining
             bytes so the digest always covers the full file.
+        deadline: Unused; accepted for parity with the shared extractor
+            dispatch signature.
 
     Returns:
         The selected numeric value across all matches.
@@ -543,7 +561,7 @@ def _extract_wandb(
     return value
 
 
-_DISPATCH: dict[type, Callable[[TrialContext, Any, dict[str, Any] | None], float]] = {
+_DISPATCH: dict[type, Callable[..., float]] = {
     JsonExtractor: _extract_json,
     JsonEnvelopeExtractor: _extract_json_envelope,
     LogRegexExtractor: _extract_log_regex,
@@ -613,11 +631,7 @@ def run_extractor(
         raise DeadlineExceededError(
             "Phase/run wallclock deadline exceeded before evidence extraction."
         )
-    value = (
-        _extract_wandb(ctx, cfg, provenance, deadline=deadline)
-        if isinstance(cfg, WandbExtractor)
-        else fn(ctx, cfg, provenance)
-    )
+    value = fn(ctx, cfg, provenance, deadline=deadline)
     if provenance is not None:
         provenance["recorded_at"] = utc_now_iso(timespec="seconds")
     return value

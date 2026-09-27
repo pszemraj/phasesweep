@@ -6,7 +6,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from phasesweep import load_config, load_experiment
+from phasesweep import load_experiment
 from phasesweep.config import (
     ConfigError,
     Constraint,
@@ -177,6 +177,41 @@ def test_phase_composition_accepts_a_linear_chain() -> None:
     assert [phase.name for phase in experiment.phases] == ["base", "tune", "final"]
 
 
+def test_phases_from_selects_reached_phases_by_name() -> None:
+    experiment = make_experiment(
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"model.depth": 8}),
+            Phase(
+                name="tune",
+                n_trials=1,
+                inherits=["base"],
+                search_space={"learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3}},
+            ),
+            Phase(name="final", n_trials=1, inherits=["tune"], fixed_overrides={"seed": 0}),
+        ]
+    )
+
+    # None reaches every phase from the start.
+    assert [(index, phase.name) for index, phase in experiment.phases_from(None)] == [
+        (0, "base"),
+        (1, "tune"),
+        (2, "final"),
+    ]
+    # The first phase's name reaches the same full sequence as None.
+    assert [(index, phase.name) for index, phase in experiment.phases_from("base")] == [
+        (0, "base"),
+        (1, "tune"),
+        (2, "final"),
+    ]
+    # A middle phase's name skips everything declared before it.
+    assert [(index, phase.name) for index, phase in experiment.phases_from("tune")] == [
+        (1, "tune"),
+        (2, "final"),
+    ]
+    # An unknown name never becomes "reached", so nothing is yielded.
+    assert list(experiment.phases_from("unknown")) == []
+
+
 def test_phase_composition_accepts_a_same_origin_diamond() -> None:
     experiment = make_experiment(
         phases=[
@@ -260,7 +295,7 @@ def test_phase_composition_rejects_invalid_origins(phases: list[Phase], match: s
         pytest.param(
             """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {trial_dir}"
 metric:
@@ -282,7 +317,7 @@ phases:
         pytest.param(
             """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo"
 metric:
@@ -303,7 +338,7 @@ phases:
         pytest.param(
             """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 override_format: argparse
@@ -326,7 +361,7 @@ phases:
         pytest.param(
             """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 override_format: argparse
@@ -505,7 +540,7 @@ def test_execution_rejects_ambiguous_environment_classification() -> None:
     [
         """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "first {overrides}"
 trial_command: "second {overrides}"
@@ -521,7 +556,7 @@ phases:
 """,
         """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 override_format: argparse
@@ -538,7 +573,7 @@ phases:
 """,
         """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {overrides}"
 override_format: argparse
@@ -565,7 +600,7 @@ def test_yaml_merge_keys_allow_explicit_overrides(tmp_path: Path) -> None:
     """Explicit keys may override values inherited through a YAML merge key."""
     body = """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo"
 override_format: argparse
@@ -592,7 +627,7 @@ phases:
 def test_duplicate_yaml_merge_keys_rejected(tmp_path: Path) -> None:
     body = """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo"
 metric:
@@ -618,7 +653,7 @@ phases:
 def test_override_format_n_jobs_and_failure_limit_defaults(tmp_path):
     body = """
 experiment: t
-storage: ":memory:"
+storage: null
 provenance: {revision: test-fixture-v1}
 trial_command: "echo {config_path}"
 metric:
@@ -657,7 +692,7 @@ def test_suite_config_is_rejected_before_artifacts(
     )
 
     with pytest.raises(ConfigError, match="suite configs are no longer supported"):
-        load_config(path)
+        load_experiment(path)
     assert not (tmp_path / "runs").exists()
 
 
@@ -672,7 +707,7 @@ def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
     config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
 
     with pytest.raises(ConfigError) as excinfo:
-        load_config(config_path)
+        load_experiment(config_path)
 
     assert str(config_path) in str(excinfo.value)
 
@@ -747,7 +782,7 @@ def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
     ``_validate_sampler_continuation`` hard-rejects a mid-target resume — but
     only after the operator has already been interrupted.
     """
-    body = _sampler_policy_yaml(storage=f"sqlite:///{tmp_path}/phases.db", sampler=sampler)
+    body = _sampler_policy_yaml(storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler)
     with pytest.raises(ValueError, match=message) as excinfo:
         load_experiment(write_yaml(tmp_path, body))
     assert "'lr'" in str(excinfo.value)
@@ -765,7 +800,7 @@ def test_persistent_storage_accepts_seeded_and_acknowledged_samplers(
     tmp_path: Path, sampler: str
 ) -> None:
     """A seeded sampler with the required acknowledgement loads unchanged."""
-    body = _sampler_policy_yaml(storage=f"sqlite:///{tmp_path}/phases.db", sampler=sampler)
+    body = _sampler_policy_yaml(storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler)
     experiment = load_experiment(write_yaml(tmp_path, body))
     assert experiment.phases[0].sampler.seed is not None
 
@@ -788,7 +823,7 @@ def test_sampler_seed_accepts_optuna_domain_boundaries(sampler_type: str, seed: 
 def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_path: Path) -> None:
     """Grid enumerates a fixed matrix and resumes from stored assignments, so it is exempt."""
     body = _sampler_policy_yaml(
-        storage=f"sqlite:///{tmp_path}/phases.db",
+        storage=f"journal:///{tmp_path}/phases.journal",
         sampler="{ type: grid }",
         n_trials=3,
         search_space="{ lr: { type: float, low: 0.0, high: 1.0, step: 0.5 } }",
@@ -798,11 +833,15 @@ def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_pat
     assert experiment.phases[0].sampler.acknowledge_nonresumable is False
 
 
-@pytest.mark.parametrize("storage", [None, '":memory:"'])
+@pytest.mark.parametrize("storage", [None, "null"], ids=["omitted", "explicit_null"])
 def test_in_memory_storage_keeps_the_sampler_block_optional(
     tmp_path: Path, storage: str | None
 ) -> None:
-    """Without a durable study there is nothing to resume, so the tpe default stands."""
+    """Without a durable study there is nothing to resume, so the tpe default stands.
+
+    Covers both spellings that leave ``storage`` in-memory: the field omitted
+    entirely, and an explicit ``storage: null``.
+    """
     experiment = load_experiment(write_yaml(tmp_path, _sampler_policy_yaml(storage=storage)))
     assert experiment.phases[0].sampler.type == "tpe"
     assert experiment.phases[0].sampler.seed is None

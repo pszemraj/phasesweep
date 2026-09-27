@@ -13,7 +13,7 @@ following:
 
 - a fresh artifact root (`<workdir>/<experiment>`), including for in-memory
   storage;
-- a fresh local SQLite or Journal ledger, if the experiment is persistent; and
+- a fresh local journal ledger, if the experiment is persistent; and
 - a fresh MCP `state_dir`, if the experiment is launched through MCP.
 
 The runtime checks an existing artifact root and local ledger before it creates
@@ -41,7 +41,7 @@ demo/
   .gitignore
   artifact_root_binding.json
   run.log
-  study.db                        # storage: auto with sequential phases
+  study.journal                   # storage: auto
   generation.yaml
   last_successful_generation.yaml
   summary.yaml
@@ -112,17 +112,9 @@ lock namespace and the MCP `state_dir`.
 ## Storage and locks
 
 `storage: null` is in-memory and ends with the process. Persistent local
-storage is one of:
-
-- `sqlite:///...` for sequential phases;
-- `journal:///...` for same-host parallel phases; or
-- `auto`, which chooses a sibling `study.db` or `study.journal` according to
-  whether any phase has `n_jobs > 1`.
-
-A SQLite URL must name the same database file to PhaseSweep and to the
-SQLAlchemy engine Optuna opens it through. Config load refuses spellings the
-two read differently, such as `?uri=true` without a `file:` filename, a
-repeated option, a `vfs`, or `..` after a symlink.
+storage is an explicit `journal:///...` URL, or `auto`, which always resolves
+to a sibling `study.journal`. The journal backend supports parallel trials
+(`n_jobs > 1`) on one host.
 
 The selected artifact root and ledger are bound to each other in both
 directions:
@@ -130,7 +122,7 @@ directions:
 ```mermaid
 flowchart LR
     root["artifact root<br/>workdir/experiment"]
-    ledger["local ledger<br/>SQLite or Journal"]
+    ledger["local ledger<br/>journal"]
     root -->|"artifact_root_binding.json names this ledger"| ledger
     ledger -->|"each phase study names this root"| root
     other_ledger["a second ledger"] -.->|"refused: the root names another ledger"| root
@@ -139,27 +131,60 @@ flowchart LR
 
 A reused root therefore cannot combine a second ledger's trial counts with the
 first ledger's publication, and a reused ledger cannot publish into a second
-tree. Both refusals happen before any trial runs and write nothing. If changing
-`n_jobs` would make `auto` choose the other backend, the run is refused;
-restore the prior setting or start a fresh namespace.
+tree. Both refusals happen before any trial runs and write nothing.
 
 No command writes to the artifact root or its ledger until it has checked the
 tree's binding and then the ledger's format. When a check fails, the command
-stops and leaves both byte-for-byte as they were. The one write that comes
-earlier is SQLite's own: when a crash interrupted a commit, the next
-`phasesweep run` or confirmed `phasesweep mcp recover-run` lets SQLite roll
-that transaction back before the format check, while read-only commands
-report the ledger's trial data unavailable and leave it alone. Read-only commands,
+stops and leaves both byte-for-byte as they were. Read-only commands,
 including `status`, `show-winners`, and `run --dry-run`, never create a missing
-ledger or its directory. Contributors will find the ordering rules behind these
-guarantees, and the tests that hold them, in
+ledger or its directory. A process killed while it appended to the journal
+can leave a partial final record, which every reader skips. The next
+`phasesweep run` or confirmed `phasesweep mcp recover-run` cuts it under
+Optuna's own journal lock, after saving the journal as
+`<ledger>.<UTC stamp>.bak` beside it, with permissions no broader than the
+ledger's. The killed process can also leave that
+lock behind, as `<ledger>.lock`. If the lock is still held after 30 seconds,
+the command refuses and names it: once no process is writing the ledger,
+remove the lock and run the command again. A record damaged anywhere before
+the last is refused as corruption. Contributors will find the ordering rules
+behind these guarantees, and the tests that hold them, in
 [durability invariants](invariants.md).
 
 Persistent phases use same-host locks. A concurrent CLI or MCP launch for the
 same experiment waits or fails safely according to the operation; it never
-merges two active orchestrators. SQLite is sequential at the PhaseSweep
-configuration level. Journal storage supports local parallel trials. External
-database backends are not part of the runtime.
+merges two active orchestrators. External database backends are not part of
+the runtime.
+
+### Inspect the ledger with Optuna
+
+The ledger is an ordinary Optuna journal holding one study per phase, named
+`<experiment>::<phase>`. `phasesweep status <config>` prints its real path,
+with symlinks resolved, as `ledger_path` (`null` for `storage: null`). Optuna's CLI reads the journal
+in place without writing to it, so these commands are safe while a sweep runs:
+
+```bash
+optuna studies --storage <ledger_path> --storage-class JournalFileBackend
+optuna trials --study-name '<experiment>::<phase>' --storage <ledger_path> --storage-class JournalFileBackend
+optuna best-trial --study-name '<experiment>::<phase>' --storage <ledger_path> --storage-class JournalFileBackend
+```
+
+Copy `ledger_path` exactly: Optuna creates an empty journal at a path that
+does not exist yet.
+
+For the web dashboard, install `optuna-dashboard` and serve a copy of the
+ledger:
+
+```bash
+python -m pip install optuna-dashboard
+cp <ledger_path> /tmp/<experiment>.journal
+optuna-dashboard /tmp/<experiment>.journal
+```
+
+> [!WARNING]
+> Never point `optuna-dashboard` at the ledger itself. The dashboard can
+> rename, delete, and write to studies, and a changed phase study no longer
+> matches the results PhaseSweep published from it. The copy is a snapshot;
+> copy the ledger again to see newer trials.
 
 ## Trial execution and evidence
 
@@ -232,7 +257,9 @@ Use `validate`, `run --dry-run`, `status`, and `show-winners` to review an
 experiment without launching work; an ordinary `run` invocation launches
 trials. `--from-phase` requires valid earlier winners. These reads inspect only
 the current-format local experiment; use the original 0.3.1 environment for
-existing 0.3.1 state.
+existing 0.3.1 state. For per-trial tables and plots, point Optuna's own tools
+at the ledger as described in
+[Inspect the ledger with Optuna](#inspect-the-ledger-with-optuna).
 
 > [!TIP]
 > `status` and `show-winners` take no lock and never write to the artifact root

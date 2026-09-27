@@ -3,7 +3,7 @@
 # The trainer consumes the complete YAML that PhaseSweep materializes for each trial.
 
 experiment: tiny_decoder_enwik8_hparams
-storage: sqlite:///./examples/tiny_decoder_enwik8/runs/phases.db
+storage: journal:///./examples/tiny_decoder_enwik8/runs/phases.journal
 provenance:
   trainer: "run-trial-v2+decoder-template@9c90a551"
   data: "enwik8-template-download"

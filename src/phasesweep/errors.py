@@ -131,12 +131,6 @@ class UnsafeProcessCleanupError(ProcessCleanupUncertainError):
     """
 
 
-class LockBusyError(PhaseSweepError):
-    """Raised when a required same-host lock is already held."""
-
-    default_action: ClassVar[OperatorAction] = OperatorAction.RETRY
-
-
 class GpuConfigurationError(PhaseSweepError):
     """Raised when configured GPU isolation cannot be honored safely."""
 

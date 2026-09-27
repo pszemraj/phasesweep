@@ -39,6 +39,7 @@ from phasesweep.evidence.evaluation import (
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, compose_wandb_environment
 from phasesweep.runtime.commands import (
+    TRAINER_INPUT_FILENAMES,
     dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
     render_command,
@@ -204,12 +205,8 @@ def _preflight_trainer_environments(
     :raises PhaseSweepError: A composed runtime environment disables required
         remote evidence or conflicts with its managed identity.
     """
-    reached = from_phase is None
-    for phase in experiment.phases:
-        if phase.name == from_phase:
-            reached = True
-        if reached:
-            _trainer_environment(experiment, phase.name)
+    for _index, phase in experiment.phases_from(from_phase):
+        _trainer_environment(experiment, phase.name)
 
 
 def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
@@ -484,8 +481,8 @@ def prepare_trainer_input(
     atomic_write_text(resolved_path, resolved_text)
 
     run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+    filename = TRAINER_INPUT_FILENAMES[experiment.override_format]
     if experiment.override_format == "yaml_file":
-        filename = "trainer_config.yaml"
         text = dump_trial_trainer_config_yaml(
             experiment.trainer_config,
             overrides,
@@ -497,10 +494,8 @@ def prepare_trainer_input(
             },
         )
     elif experiment.override_format == "json_file":
-        filename = "overrides.json"
         text = dump_json_file_overrides(overrides)
     else:
-        filename = "overrides_resolved.json"
         text = resolved_text
 
     if filename != resolved_path.name:

@@ -103,8 +103,11 @@ effective_overrides:
 ```
 
 The starter uses `storage: auto`, so its ledger and outputs live together under
-`<workdir>/<experiment>/`. See [runtime behavior](docs/runtime.md) for state
-layout, current-format requirements, locks, cleanup, GPU isolation, and resume.
+`<workdir>/<experiment>/`. The ledger is an Optuna journal: `phasesweep status`
+prints its path, and Optuna's own CLI and dashboard can
+[read it](docs/runtime.md#inspect-the-ledger-with-optuna). See
+[runtime behavior](docs/runtime.md) for state layout, current-format
+requirements, locks, cleanup, GPU isolation, and resume.
 
 ## Use your own trainer
 

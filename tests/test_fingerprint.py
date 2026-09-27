@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib
 import json
 import shutil
-import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -52,7 +51,7 @@ from phasesweep.engine.fingerprints import (
     FINGERPRINT_SCHEMA_VERSION,
     _phase_fingerprint,
 )
-from phasesweep.engine.ledger import ClaimedLedger, _sqlite_study_exists
+from phasesweep.engine.ledger import ClaimedLedger, _resolve_storage
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
     _attempts_dir,
@@ -86,6 +85,7 @@ from phasesweep.engine.state import (
 from phasesweep.engine.trial import ProcessCleanupUncertainError, _environment_identity
 from phasesweep.runtime.files import (
     atomic_text_writer,
+    file_url_path,
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
@@ -98,6 +98,37 @@ from tests.conftest import (
     write_trainer,
 )
 from tests.ledger_fixtures import materialize, tree_snapshot
+
+#: Optuna journal op code for ``SET_TRIAL_USER_ATTR``. Mirrors
+#: ``optuna.storages.journal._storage.JournalOperation`` and
+#: ``tests/fixtures/make_ledger_fixtures.py``'s own local copies.
+_JOURNAL_SET_TRIAL_USER_ATTR = 8
+
+
+def _drop_trial_user_attr_records(storage: str, key: str) -> None:
+    """Rewrite a journal ledger, dropping every trial user-attribute record for ``key``.
+
+    The journal equivalent of ``DELETE FROM trial_user_attributes WHERE key = ?``:
+    every trial in the ledger loses the attribute, not just one study's. Mirrors
+    ``tests/fixtures/make_ledger_fixtures.py``'s journal-record-editing approach.
+
+    :param str storage: ``journal:///`` storage URL for the ledger.
+    :param str key: Trial user-attribute key to drop everywhere it is set.
+    """
+    ledger = Path(file_url_path(storage))
+    records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line]
+    kept = [
+        record
+        for record in records
+        if not (
+            record.get("op_code") == _JOURNAL_SET_TRIAL_USER_ATTR
+            and key in record.get("user_attr", {})
+        )
+    ]
+    if len(kept) == len(records):
+        raise RuntimeError(f"no trial user-attribute record found for key {key!r}")
+    body = "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in kept)
+    ledger.write_text(body, encoding="utf-8")
 
 
 def test_wandb_managed_defaults_and_rotating_credentials_do_not_change_cohort(monkeypatch):
@@ -183,7 +214,7 @@ def test_fingerprint_mismatch_raises(tmp_path):
         return make_experiment(
             experiment="fp_test",
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{tmp_path / 'phases.db'}",
+            storage=f"journal:///{tmp_path / 'phases.journal'}",
             trial_command=f"python {trainer} {{overrides}}",
             metric=Metric(
                 name="eval_loss",
@@ -210,16 +241,15 @@ def test_fingerprint_mismatch_raises(tmp_path):
 
 def test_persistent_storage_requires_declared_provenance(tmp_path: Path) -> None:
     payload = make_experiment().model_dump()
-    payload["storage"] = f"sqlite:///{tmp_path / 'studies.db'}"
+    payload["storage"] = f"journal:///{tmp_path / 'studies.journal'}"
 
     with pytest.raises(ValueError, match="Persistent storage requires.*provenance"):
         Experiment.model_validate(payload)
 
 
-@pytest.mark.parametrize("storage", [":memory:", "sqlite://", "sqlite:///:memory:"])
-def test_in_memory_storage_does_not_require_provenance(storage: str) -> None:
+def test_in_memory_storage_does_not_require_provenance() -> None:
     payload = make_experiment().model_dump()
-    payload["storage"] = storage
+    payload["storage"] = None
 
     experiment = Experiment.model_validate(payload)
 
@@ -235,7 +265,7 @@ def test_late_child_fingerprint_failure_preserves_last_successful_results(
     experiment = _two_phase_experiment(
         workdir=tmp_path / "runs",
         trainer=trainer,
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        storage=f"journal:///{tmp_path / 'studies.journal'}",
     )
     run_experiment(experiment)
     protected_paths = [
@@ -300,7 +330,10 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     # second one (lr, or the summary) did not. Either way, reads resolve via
     # the generation-scoped artifact once any generation has published.
     assert {view.phase for view in read_winners(experiment)} == {"arch", "lr"}
-    assert _load_winner(experiment, experiment.phases[0], {}) is not None
+    assert (
+        _load_winner(experiment, experiment.phases[0], {}, published_generation_id=generation_id)
+        is not None
+    )
 
 
 def test_fingerprint_changes_when_parent_winner_changes():
@@ -596,7 +629,7 @@ def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
     with pytest.raises(StudyFingerprintMismatchError, match="No trial was allocated"):
         run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
@@ -628,7 +661,7 @@ def test_identical_semantic_environment_resumes_persistent_study(
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", "/tmp/outer-objective-b.json")
     run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
     base = _environment_identity(experiment)
     assert not {
@@ -654,7 +687,7 @@ def test_passthrough_token_rotation_resumes_persistent_study(
     monkeypatch.setenv("WANDB_API_KEY", "rotated-secret")
     run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
 
 
@@ -671,16 +704,12 @@ def test_populated_study_without_environment_identity_fails_closed(
     monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
     run_experiment(experiment)
     assert experiment.storage is not None
-    with sqlite3.connect(experiment.storage.removeprefix("sqlite:///")) as connection:
-        connection.execute(
-            "DELETE FROM trial_user_attributes WHERE key = ?",
-            (TRAINER_ENV_DIGEST_ATTR,),
-        )
+    _drop_trial_user_attr_records(experiment.storage, TRAINER_ENV_DIGEST_ATTR)
 
     with pytest.raises(StudySchemaMismatchError, match="cannot guess.*environment cohort"):
         run_experiment(_with_trial_target(experiment, 2))
 
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
@@ -747,11 +776,11 @@ def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
 def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     """End-to-end: run with n_trials=2, then n_trials=4 -> 4 total trials in same study."""
     trainer = write_constant_trainer(tmp_path, key="eval_loss")
-    db = tmp_path / "phases.db"
+    db = tmp_path / "phases.journal"
     experiment = make_experiment(
         experiment="topup",
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{db}",
+        storage=f"journal:///{db}",
         trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
         metric=Metric(
             name="eval_loss",
@@ -767,7 +796,7 @@ def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     # Bump n_trials and re-run; this must not error on fingerprint.
     run_experiment(_with_trial_target(experiment, 4))
 
-    study = optuna.load_study(study_name="topup::a", storage=f"sqlite:///{db}")
+    study = optuna.load_study(study_name="topup::a", storage=_resolve_storage(f"journal:///{db}"))
     finished = [t for t in study.get_trials() if t.state.is_finished()]
     assert len(finished) == 4, f"expected 4 trials after top-up, got {len(finished)}"
 
@@ -806,7 +835,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
     identical startup suggestions (review v0.5.14 / blocker 3).
     """
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     phase = Phase(
         name="p",
         n_trials=3,
@@ -818,7 +847,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
     assert len(study.trials) == 1
 
@@ -826,7 +855,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
     with pytest.raises(SamplerContinuationUnsupportedError, match="interrupted at 1/3"):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
     assert len(study.trials) == 1
 
     top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
@@ -836,7 +865,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
     ):
         run_experiment(top_up)
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
     assert len(study.trials) == 1
 
 
@@ -869,13 +898,13 @@ def test_stateful_sampler_completed_target_reruns_as_noop(
 ) -> None:
     """A stateful study that reached its accepted target republishes without new trials."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     phase = Phase(name="p", n_trials=2, sampler=sampler, search_space=search_space)
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     first = run_experiment(experiment)
     rerun = run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
     assert len(study.trials) == 2
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 2
     assert rerun["p"].trial_number == first["p"].trial_number
@@ -885,7 +914,7 @@ def test_stateful_sampler_completed_target_reruns_as_noop(
 @pytest.mark.integration
 def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     phase = Phase(
         name="p",
         n_trials=3,
@@ -900,7 +929,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     with pytest.raises(TrialTargetRegressionError, match="accepted a target of 3"):
         run_experiment(lowered)
 
-    study = optuna.load_study(study_name="t::p", storage=storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
     assert len(study.trials) == 3
     assert winners["p"].completion["finished_trials"] == 3
@@ -911,7 +940,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
 def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path) -> None:
     """A bound child makes an ancestor top-up a non-destructive preflight refusal."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = _two_phase_experiment(
         workdir=tmp_path / "runs",
         trainer=trainer,
@@ -925,14 +954,16 @@ def test_upstream_top_up_is_rejected_before_bound_chain_mutation(tmp_path: Path)
         *(_winner_path(experiment, phase.name) for phase in experiment.phases),
     ]
     before = {path: path.read_bytes() for path in protected_paths}
-    parent_before = optuna.load_study(study_name="t::arch", storage=storage).trials
+    parent_before = optuna.load_study(
+        study_name="t::arch", storage=_resolve_storage(storage)
+    ).trials
     topped_up_parent = experiment.phases[0].model_copy(update={"n_trials": 2})
     topped_up = experiment.model_copy(update={"phases": [topped_up_parent, experiment.phases[1]]})
 
     with pytest.raises(RuntimeError, match="dependent phase study.*new experiment name"):
         run_experiment(topped_up)
 
-    parent_after = optuna.load_study(study_name="t::arch", storage=storage).trials
+    parent_after = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage)).trials
     assert len(parent_after) == len(parent_before) == 1
     assert {path: path.read_bytes() for path in protected_paths} == before
 
@@ -968,7 +999,7 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
 def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path: Path) -> None:
     """One persistent study cannot back two publication roots (review v0.5.19 / finding F5)."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
     run_experiment(bound)
     bound_root = _experiment_dir(bound)
@@ -977,7 +1008,7 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     assert set(before) > {"."}
 
     for phase in bound.phases:
-        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
 
     moved = bound.model_copy(update={"workdir": str(tmp_path / "runs_b")})
@@ -990,7 +1021,7 @@ def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path
     assert "fresh artifact root and local storage" in message
     assert tree_snapshot(bound_root) == before
     for phase in bound.phases:
-        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(bound_root)
 
 
@@ -1005,7 +1036,7 @@ def test_same_workdir_top_up_keeps_the_artifact_root_binding(tmp_path: Path) -> 
     )
     run_experiment(topped_up)
 
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert study.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(experiment))
     assert len([trial for trial in study.trials if trial.state.is_finished()]) == 2
 
@@ -1014,7 +1045,7 @@ def test_binding_claim_ignores_its_atomic_staging_file(tmp_path: Path) -> None:
     """A concurrent binding reader must not misclassify the writer's temp file."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        storage=f"journal:///{tmp_path / 'studies.journal'}",
     )
     binding_path = _artifact_root_binding_path(experiment)
     with atomic_text_writer(binding_path) as staged:
@@ -1032,7 +1063,7 @@ def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
     """A note or OS metadata file does not make a fresh root durable run state."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        storage=f"journal:///{tmp_path / 'studies.journal'}",
     )
     root = _experiment_dir(experiment)
     root.mkdir(parents=True)
@@ -1051,10 +1082,15 @@ def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
 def test_unbound_known_phasesweep_state_names_the_blocking_entry(
     tmp_path: Path, entry: str
 ) -> None:
-    """Known unmarked engine state is refused with its blocking entry named."""
+    """Known unmarked engine state is refused with its blocking entry named.
+
+    ``study.db`` is the SQLite ledger ``storage: auto`` wrote before the
+    journal became the only ledger, so a root holding just that file is
+    still refused rather than bound to a new ``study.journal`` beside it.
+    """
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage=f"sqlite:///{tmp_path / 'studies.db'}",
+        storage="auto" if entry == "study.db" else f"journal:///{tmp_path / 'studies.journal'}",
     )
     state_entry = _experiment_dir(experiment) / entry
     state_entry.parent.mkdir(parents=True, exist_ok=True)
@@ -1071,7 +1107,7 @@ def test_unbound_known_phasesweep_state_names_the_blocking_entry(
 
 def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     """One tree cannot mix publication files from one DB with counts from another."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     owner = materialized.experiment
     published = _last_successful_generation_id(owner)
     assert published is not None
@@ -1082,7 +1118,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     assert len(binding["storage_key"]) == 64
     assert all(character in "0123456789abcdef" for character in binding["storage_key"])
 
-    foreign = owner.model_copy(update={"storage": f"sqlite:///{tmp_path / 'foreign.db'}"})
+    foreign = owner.model_copy(update={"storage": f"journal:///{tmp_path / 'foreign.journal'}"})
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         run_experiment(foreign)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
@@ -1094,7 +1130,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         read_winners(foreign)
 
-    assert not (tmp_path / "foreign.db").exists()
+    assert not (tmp_path / "foreign.journal").exists()
     assert _last_successful_generation_id(owner) == published
     assert {path.name for path in generation_dir.iterdir()} == generations_before
     owner_status = read_status(owner)
@@ -1114,7 +1150,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
     registration_cwd.mkdir()
     foreign_cwd.mkdir()
     experiment = make_experiment(
-        workdir=tmp_path / "runs", storage="sqlite:///ledger.db", trainer=trainer, n_trials=1
+        workdir=tmp_path / "runs", storage="journal:///ledger.journal", trainer=trainer, n_trials=1
     )
     monkeypatch.chdir(registration_cwd)
     run_experiment(experiment)
@@ -1128,7 +1164,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
         read_status(experiment)
 
-    assert not (foreign_cwd / "ledger.db").exists()
+    assert not (foreign_cwd / "ledger.journal").exists()
     assert binding_path.read_bytes() == binding_before
     assert _last_successful_generation_id(experiment) == generation_before
 
@@ -1171,7 +1207,9 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
     experiment = experiment.model_copy(
         update={"metric": experiment.metric.model_copy(update={"goal": "maximize"})}
     )
-    study = optuna.create_study(study_name="t::p", storage=experiment.storage, direction="minimize")
+    study = optuna.create_study(
+        study_name="t::p", storage=_resolve_storage(experiment.storage), direction="minimize"
+    )
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
     with pytest.raises(StudySchemaMismatchError, match="config requires maximize"):
@@ -1182,7 +1220,7 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
 
 def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     """A populated pre-cutover study is refused without mutation."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     storage = experiment.storage
     root = _experiment_dir(experiment)
@@ -1196,7 +1234,8 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
     assert "fresh artifact root" in message
     assert "nothing was written" in message.lower()
     assert (
-        ARTIFACT_ROOT_ATTR not in optuna.load_study(study_name="t::p", storage=storage).user_attrs
+        ARTIFACT_ROOT_ATTR
+        not in optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).user_attrs
     )
     # The refusal is not allowed to cost the tree its existing publication.
     assert _last_successful_generation_id(experiment) is not None
@@ -1221,14 +1260,15 @@ def _unbound_two_phase_studies(
     :param str bound_root: Artifact root recorded on the ``lr`` study.
     :param int arch_trials: COMPLETE trials to seed into the ``arch`` study.
     """
+    resolved = _resolve_storage(storage)
     arch = optuna.create_study(
-        study_name=f"{experiment.experiment}::arch", storage=storage, direction="minimize"
+        study_name=f"{experiment.experiment}::arch", storage=resolved, direction="minimize"
     )
     arch.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     for _ in range(arch_trials):
         arch.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
     lr = optuna.create_study(
-        study_name=f"{experiment.experiment}::lr", storage=storage, direction="minimize"
+        study_name=f"{experiment.experiment}::lr", storage=resolved, direction="minimize"
     )
     lr.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     lr.set_user_attr(ARTIFACT_ROOT_ATTR, bound_root)
@@ -1243,7 +1283,7 @@ def test_refused_multi_phase_binding_claims_nothing(tmp_path: Path, arch_trials:
     already had a binding pointing at it (re-review v0.5.19 / blocker B3).
     """
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
     offered = _two_phase_experiment(workdir=tmp_path / "runs_b", trainer=trainer, storage=storage)
     _unbound_two_phase_studies(
@@ -1253,8 +1293,9 @@ def test_refused_multi_phase_binding_claims_nothing(tmp_path: Path, arch_trials:
     with pytest.raises(ArtifactRootConflictError):
         run_experiment(offered)
 
-    arch = optuna.load_study(study_name="t::arch", storage=storage)
-    lr = optuna.load_study(study_name="t::lr", storage=storage)
+    resolved = _resolve_storage(storage)
+    arch = optuna.load_study(study_name="t::arch", storage=resolved)
+    lr = optuna.load_study(study_name="t::lr", storage=resolved)
     assert ARTIFACT_ROOT_ATTR not in arch.user_attrs
     assert lr.user_attrs[ARTIFACT_ROOT_ATTR] == str(_experiment_dir(bound))
 
@@ -1272,19 +1313,19 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     import phasesweep.engine.ledger as ledger
 
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
     for phase in experiment.phases:
         study = optuna.create_study(
-            study_name=f"t::{phase.name}", storage=storage, direction="minimize"
+            study_name=f"t::{phase.name}", storage=_resolve_storage(storage), direction="minimize"
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     real_loader = ledger._load_existing_phase_study
 
-    def _fail_for_lr(exp: Experiment, phase: Phase) -> optuna.Study | None:
+    def _fail_for_lr(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
         if phase.name == "lr":
             raise RuntimeError("storage went away")
-        return real_loader(exp, phase)
+        return real_loader(handle, phase)
 
     monkeypatch.setattr(ledger, "_load_existing_phase_study", _fail_for_lr)
 
@@ -1294,7 +1335,7 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
     assert isinstance(excinfo.value.__cause__, StudyStorageUnavailableError)
 
     for phase in experiment.phases:
-        study = optuna.load_study(study_name=f"t::{phase.name}", storage=storage)
+        study = optuna.load_study(study_name=f"t::{phase.name}", storage=_resolve_storage(storage))
         assert ARTIFACT_ROOT_ATTR not in study.user_attrs
 
 
@@ -1302,8 +1343,14 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The published-phase existence read keeps strict storage-error semantics."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    """The published-phase existence read keeps strict storage-error semantics.
+
+    Opening a study reads its trials too, so the failure is confined to the
+    published check rather than raised from every ``get_trials`` call.
+    """
+    import phasesweep.engine.ledger as ledger
+
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     published = _last_successful_generation_id(experiment)
     assert published is not None
@@ -1315,7 +1362,14 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
     def fail_trial_read(*_args: object, **_kwargs: object) -> list[optuna.trial.FrozenTrial]:
         raise RuntimeError("storage went away during trial read")
 
-    monkeypatch.setattr(optuna.Study, "get_trials", fail_trial_read)
+    real_check = ledger._check_published_phase_studies
+
+    def check_while_reads_fail(*args: object, **kwargs: object) -> None:
+        with monkeypatch.context() as reads:
+            reads.setattr(optuna.Study, "get_trials", fail_trial_read)
+            real_check(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "_check_published_phase_studies", check_while_reads_fail)
 
     with pytest.raises(ProcessCleanupUncertainError) as excinfo:
         run_experiment(experiment)
@@ -1338,15 +1392,16 @@ def test_published_study_requirement_starts_at_from_phase(
 ) -> None:
     """Skipped winners survive ledger loss; phases that execute still need history."""
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
     original = run_experiment(experiment)
     published = _last_successful_generation_id(experiment)
     generation_before = _generation_path(experiment).read_bytes()
-    optuna.delete_study(study_name=f"t::{missing_phase}", storage=storage)
+    resolved = _resolve_storage(storage)
+    optuna.delete_study(study_name=f"t::{missing_phase}", storage=resolved)
     if replacement == "empty":
         study = optuna.create_study(
-            study_name=f"t::{missing_phase}", storage=storage, direction="minimize"
+            study_name=f"t::{missing_phase}", storage=resolved, direction="minimize"
         )
         study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
 
@@ -1361,10 +1416,10 @@ def test_published_study_requirement_starts_at_from_phase(
         assert winners["arch"].trial_number == original["arch"].trial_number
         assert _last_successful_generation_id(experiment) != published
         if replacement == "absent":
-            assert "t::arch" not in optuna.get_all_study_names(storage=storage)
+            assert "t::arch" not in optuna.get_all_study_names(storage=resolved)
         else:
-            assert not optuna.load_study(study_name="t::arch", storage=storage).trials
-        assert len(optuna.load_study(study_name="t::lr", storage=storage).trials) == 1
+            assert not optuna.load_study(study_name="t::arch", storage=resolved).trials
+        assert len(optuna.load_study(study_name="t::lr", storage=resolved).trials) == 1
 
 
 @pytest.mark.parametrize("tree_state", ["fresh", "published", "missing-ledger"])
@@ -1382,7 +1437,7 @@ def test_invalid_from_phase_is_rejected_before_state_writes(
     if tree_state != "fresh":
         run_experiment(experiment)
         if tree_state == "missing-ledger":
-            (_experiment_dir(experiment) / "study.db").unlink()
+            (_experiment_dir(experiment) / "study.journal").unlink()
     pointer = _generation_path(experiment)
     pointer_before = pointer.read_bytes() if pointer.exists() else None
     generations = _experiment_dir(experiment) / "generations"
@@ -1396,7 +1451,7 @@ def test_invalid_from_phase_is_rejected_before_state_writes(
     if tree_state == "fresh":
         assert not Path(experiment.workdir).exists()
     elif tree_state == "missing-ledger":
-        assert not (_experiment_dir(experiment) / "study.db").exists()
+        assert not (_experiment_dir(experiment) / "study.journal").exists()
 
 
 @pytest.mark.integration
@@ -1407,7 +1462,7 @@ def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
     import phasesweep.engine.run as engine_run
 
     trainer = write_constant_trainer(tmp_path)
-    ledger = tmp_path / "studies.db"
+    ledger = tmp_path / "studies.journal"
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(experiment)
     published = _last_successful_generation_id(experiment)
@@ -1466,7 +1521,7 @@ def _fabricate_interrupted_attempt(
     """
     phase_name = experiment.phases[0].name
     study_name = f"{experiment.experiment}::{phase_name}"
-    study = optuna.load_study(study_name=study_name, storage=storage)
+    study = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
     trial = study.ask()
     trial_dir = _phase_dir(experiment, phase_name) / f"trial_{trial.number:05d}__stale"
     trial_dir.mkdir(parents=True, exist_ok=True)
@@ -1501,7 +1556,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     import phasesweep.engine.ledger as ledger
 
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment_a = make_experiment(
         workdir=tmp_path / "runs_a", storage=storage, trainer=trainer, n_trials=1
     )
@@ -1516,11 +1571,11 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     real_loader = ledger._load_existing_phase_study
     calls = {"count": 0}
 
-    def _fail_first_read(exp: Experiment, phase: Phase) -> optuna.Study | None:
+    def _fail_first_read(handle: ledger.ValidatedLedger, phase: Phase) -> optuna.Study | None:
         calls["count"] += 1
         if calls["count"] == 1:
             raise RuntimeError("transient storage failure")
-        return real_loader(exp, phase)
+        return real_loader(handle, phase)
 
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr(ledger, "_load_existing_phase_study", _fail_first_read)
@@ -1534,7 +1589,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     # producing a root conflict would mean discovery ran twice.
     assert not any(isinstance(error, ArtifactRootConflictError) for error in chain)
 
-    after_transient = optuna.load_study(study_name=study_name, storage=storage)
+    after_transient = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
     assert (
         after_transient.get_trials(deepcopy=False)[stale_number].state
         == optuna.trial.TrialState.RUNNING
@@ -1547,7 +1602,7 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
     with pytest.raises(ArtifactRootConflictError):
         run_experiment(experiment_b)
 
-    after_conflict = optuna.load_study(study_name=study_name, storage=storage)
+    after_conflict = optuna.load_study(study_name=study_name, storage=_resolve_storage(storage))
     assert (
         after_conflict.get_trials(deepcopy=False)[stale_number].state
         == optuna.trial.TrialState.RUNNING
@@ -1557,68 +1612,13 @@ def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path)
 
 
 @pytest.mark.integration
-def test_sqlite_study_probe_raises_while_the_database_is_locked(tmp_path: Path) -> None:
-    """An unreadable database is never reported as study absence.
-
-    A briefly locked file collapsing into "no such study" would skip the
-    artifact-root check for a study that becomes readable one call later
-    (PR #5 review / reviewer 2, issue 1).
-    """
-    trainer = write_constant_trainer(tmp_path)
-    db_path = tmp_path / "studies.db"
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
-    run_experiment(experiment)
-    storage = experiment.resolved_storage
-    study_name = f"{experiment.experiment}::{experiment.phases[0].name}"
-    assert _sqlite_study_exists(storage, study_name) is True
-
-    # BEGIN EXCLUSIVE holds the write lock until this connection closes, and
-    # the probe connects with timeout=0.1, so the refusal is deterministic.
-    locker = sqlite3.connect(db_path, isolation_level=None, timeout=10)
-    try:
-        locker.execute("BEGIN EXCLUSIVE")
-        with pytest.raises(StudyStorageUnavailableError):
-            _sqlite_study_exists(storage, study_name)
-    finally:
-        locker.close()
-
-    assert _sqlite_study_exists(storage, study_name) is True
-
-
-def test_sqlite_study_probe_reports_absence_only_for_genuine_absence(tmp_path: Path) -> None:
-    """Missing file and schema-less file are the only two absence verdicts."""
-    trainer = write_constant_trainer(tmp_path)
-
-    never_created = make_experiment(
-        workdir=tmp_path / "runs_missing",
-        storage=f"sqlite:///{tmp_path / 'never-created.db'}",
-        trainer=trainer,
-        n_trials=1,
-    )
-    assert not (tmp_path / "never-created.db").exists()
-    assert _sqlite_study_exists(never_created.resolved_storage, "t::p") is False
-
-    schemaless_path = tmp_path / "schemaless.db"
-    sqlite3.connect(schemaless_path).close()
-    assert schemaless_path.exists()
-    schemaless = make_experiment(
-        workdir=tmp_path / "runs_schemaless",
-        storage=f"sqlite:///{schemaless_path}",
-        trainer=trainer,
-        n_trials=1,
-    )
-    assert _sqlite_study_exists(schemaless.resolved_storage, "t::p") is False
-
-
-@pytest.mark.parametrize("storage", [None, "sqlite:///:memory:"])
-@pytest.mark.integration
 def test_fresh_and_repeated_in_memory_roots_record_explicit_no_ledger_bindings(
-    tmp_path: Path, storage: str | None
+    tmp_path: Path,
 ) -> None:
     """In-memory runs record an explicit no-ledger binding for each artifact root."""
     trainer = write_constant_trainer(tmp_path)
     experiment = make_experiment(
-        workdir=tmp_path / "runs_a", storage=storage, trainer=trainer, n_trials=1
+        workdir=tmp_path / "runs_a", storage=None, trainer=trainer, n_trials=1
     )
     run_experiment(experiment)
     run_experiment(experiment)
@@ -1638,16 +1638,13 @@ def test_fresh_and_repeated_in_memory_roots_record_explicit_no_ledger_bindings(
         }
 
 
-@pytest.mark.parametrize("in_memory_storage", [None, "sqlite:///:memory:"])
-def test_persistent_bound_root_rejects_an_in_memory_configuration(
-    tmp_path: Path, in_memory_storage: str | None
-) -> None:
+def test_persistent_bound_root_rejects_an_in_memory_configuration(tmp_path: Path) -> None:
     """A durable publication tree cannot be reused with an ephemeral ledger."""
-    materialized = materialize("current-sqlite", tmp_path, mode="tree")
+    materialized = materialize("current-journal", tmp_path, mode="tree")
     owner = materialized.experiment
     status_before = read_status(owner)
 
-    offered = owner.model_copy(update={"storage": in_memory_storage})
+    offered = owner.model_copy(update={"storage": None})
     with pytest.raises(
         ArtifactRootConflictError, match="bound to a different storage ledger"
     ) as excinfo:
@@ -1680,7 +1677,7 @@ def test_generation_id_reuse_is_rejected_without_overwriting_history(tmp_path: P
         run_experiment(experiment, generation_id=generation_id)
 
     assert {path: path.read_bytes() for path in protected} == before
-    study = optuna.load_study(study_name="t::p", storage=experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert len(study.trials) == 1
 
 
@@ -1776,7 +1773,7 @@ def test_from_phase_ignores_lower_trial_target_on_skipped_phase(tmp_path: Path) 
     """A skipped phase's run-control budget cannot block an unrelated resume."""
     trainer = write_constant_trainer(tmp_path)
     workdir = tmp_path / "runs"
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     exp_v1 = _two_phase_experiment(
         workdir=workdir,
         trainer=trainer,
@@ -1795,7 +1792,7 @@ def test_from_phase_ignores_lower_trial_target_on_skipped_phase(tmp_path: Path) 
 
     assert winners2["arch"].trial_number == winners1["arch"].trial_number
     assert winners2["arch"].metric == winners1["arch"].metric
-    study = optuna.load_study(study_name="t::arch", storage=storage)
+    study = optuna.load_study(study_name="t::arch", storage=_resolve_storage(storage))
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
     assert len(study.trials) == 3
 
@@ -1806,7 +1803,7 @@ def test_from_phase_preflight_consumes_run_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trainer = write_constant_trainer(tmp_path)
-    storage = f"sqlite:///{tmp_path / 'studies.db'}"
+    storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = _two_phase_experiment(
         workdir=tmp_path / "runs",
         trainer=trainer,
@@ -1917,7 +1914,7 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
     assert data["trainer_env_digest"] == identity.digest
     assert data["trainer_inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
 
-    study = optuna.load_study(study_name="t::p", storage=exp.storage)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
     attrs = study.get_trials(deepcopy=False)[0].user_attrs
     names = attrs[TRAINER_ENV_NAMES_ATTR]
     assert attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest
@@ -2008,13 +2005,13 @@ def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
     from tests.conftest import make_experiment, write_trainer
 
     trainer = write_trainer(tmp_path, "print('x=1.0')")
-    db = tmp_path / "fp.db"
+    db = tmp_path / "fp.journal"
 
     def _exp(command: str) -> Experiment:
         return make_experiment(
             experiment="fp_poison",
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{db}",
+            storage=f"journal:///{db}",
             trial_command=command,
             n_trials=1,
         )
@@ -2041,13 +2038,13 @@ def test_zero_trial_crash_after_target_record_does_not_poison_fingerprint(
     import phasesweep.engine.phase as phase_module
 
     trainer = write_trainer(tmp_path, "print('x=1.0')")
-    db = tmp_path / "fp-target.db"
+    db = tmp_path / "fp-target.journal"
 
     def _exp(command: str) -> Experiment:
         return make_experiment(
             experiment="fp_target_poison",
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{db}",
+            storage=f"journal:///{db}",
             trial_command=command,
             n_trials=1,
             gpu_policy="none",
@@ -2066,7 +2063,7 @@ def test_zero_trial_crash_after_target_record_does_not_poison_fingerprint(
 
     study = optuna.load_study(
         study_name="fp_target_poison::p",
-        storage=f"sqlite:///{db}",
+        storage=_resolve_storage(f"journal:///{db}"),
     )
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert study.trials == []
@@ -2081,13 +2078,13 @@ def test_fingerprint_mismatch_still_raises_once_a_trial_exists(tmp_path: Path) -
     from tests.conftest import make_experiment, write_trainer
 
     trainer = write_trainer(tmp_path, "print('x=1.0')")
-    db = tmp_path / "fp2.db"
+    db = tmp_path / "fp2.journal"
 
     def _exp(command: str) -> Experiment:
         return make_experiment(
             experiment="fp_guard",
             workdir=tmp_path / "runs",
-            storage=f"sqlite:///{db}",
+            storage=f"journal:///{db}",
             trial_command=command,
             n_trials=1,
         )

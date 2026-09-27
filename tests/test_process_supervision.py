@@ -1357,15 +1357,15 @@ def test_supervisor_ready_wait_is_capped_by_deadline(
 
     slow_supervisor = tmp_path / "slow_supervisor.py"
     source = Path(supervisor.__file__).read_text()
-    ready_frame = '    ready_frame = b"R" + f"{os.getpid():0{_READY_PID_WIDTH}d}".encode("ascii")\n'
-    assert ready_frame in source
+    line = '    ready_frame = _READY_TAG + f"{os.getpid():0{_READY_PID_WIDTH}d}".encode("ascii")\n'
+    assert line in source
     slow_supervisor.write_text(
         source.replace(
-            ready_frame,
+            line,
             (
                 f"    with open({str(child_pid_path)!r}, 'w', encoding='utf-8') as child_file:\n"
                 "        child_file.write(str(os.getpid()))\n"
-                "    time.sleep(1.0)\n" + ready_frame
+                "    time.sleep(1.0)\n" + line
             ),
             1,
         )

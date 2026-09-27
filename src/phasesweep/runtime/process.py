@@ -689,7 +689,7 @@ def _spawn_blocked_supervisor(
             the exception carries the cleanup confirmation.
         RuntimeError: If the supervisor does not signal readiness within
             ``_SUPERVISOR_READY_TIMEOUT_SECONDS``, or signals something other
-            than ``b"R"``.
+            than ``_supervisor._READY_TAG``.
         UnsafeProcessCleanupError: A supervisor was spawned, launch failed or
             was interrupted, and terminating that process could not be confirmed.
 
@@ -736,7 +736,7 @@ def _spawn_blocked_supervisor(
                 "trial launch deadline expired while waiting for the supervisor",
                 pid=proc.pid,
             )
-        if ready_frame is None or not ready_frame.startswith(b"R"):
+        if ready_frame is None or not ready_frame.startswith(_supervisor._READY_TAG):
             raise RuntimeError("trial supervisor did not become ready before launch")
         try:
             trainer_pid = int(ready_frame[1:].decode("ascii"))

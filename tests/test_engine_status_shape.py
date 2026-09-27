@@ -1,7 +1,7 @@
-"""Public shape contract for ``config_status`` / ``experiment_status``.
+"""Public shape contract for ``experiment_status``.
 
-``config_status`` is a documented package-root API (docs/development.md) and
-``phasesweep status`` renders its payload verbatim, so its key set is a
+``experiment_status`` is a documented package-root API (docs/development.md)
+and ``phasesweep status`` renders its payload verbatim, so its key set is a
 contract for downstream consumers. These tests pin the experiment payload so
 that changes to the public CLI shape do not drift unnoticed.
 """
@@ -10,18 +10,19 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from phasesweep import config_status
+from phasesweep import experiment_status
 from phasesweep.config import Experiment
 from phasesweep.engine import read_status
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _last_successful_generation_id
-from phasesweep.engine.run import experiment_status
-from tests.ledger_fixtures import materialize
+from tests.conftest import make_experiment
+from tests.ledger_fixtures import ledger_file, materialize
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",
     "experiment",
     "workdir",
+    "ledger_path",
     "current_generation_id",
     "published_generation_id",
     "represented_generation_id",
@@ -35,6 +36,7 @@ FAILED_PUBLICATION_STATUS_KEYS = [
     "kind",
     "experiment",
     "workdir",
+    "ledger_path",
     "current_generation_id",
     "published_generation_id",
     "represented_generation_id",
@@ -93,17 +95,20 @@ reviewer 2, blocker 6); the CLI phase payload keeps exactly
 
 def _published(tmp_path: Path) -> Experiment:
     """Return the config that reads the golden fixture's two-trial publication."""
-    return materialize("current-sqlite", tmp_path, mode="tree").experiment
+    return materialize("current-journal", tmp_path, mode="tree").experiment
 
 
-def test_experiment_config_status_shape_is_pinned(tmp_path: Path) -> None:
+def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
     """A standalone experiment payload carries generation identity plus phases."""
-    experiment = _published(tmp_path)
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    experiment = materialized.experiment
 
-    payload = config_status(experiment)
+    payload = experiment_status(experiment)
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert not READ_STATUS_ONLY_KEYS & set(payload)
+    assert payload["ledger_path"] == str(ledger_file(materialized, "journal").resolve())
+    assert "ledger_path" not in read_status(experiment)
     assert payload["kind"] == "experiment"
     assert payload["is_published"] is True
     assert payload["publication_integrity"] == "ok"
@@ -153,7 +158,7 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
 
-    payload = config_status(experiment)
+    payload = experiment_status(experiment)
 
     assert list(payload) == FAILED_PUBLICATION_STATUS_KEYS
     assert not READ_STATUS_ONLY_KEYS & set(payload)
@@ -163,3 +168,11 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     assert payload["represented_generation_id"] is None
     assert payload["is_published"] is False
     assert payload["phases"][0]["winner"] is None
+
+
+def test_in_memory_status_names_no_ledger(tmp_path: Path) -> None:
+    """``storage: null`` has no ledger file, so ``ledger_path`` is null."""
+    payload = experiment_status(make_experiment(workdir=tmp_path / "runs"))
+
+    assert list(payload) == EXPERIMENT_STATUS_KEYS
+    assert payload["ledger_path"] is None

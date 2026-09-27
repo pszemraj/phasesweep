@@ -10,6 +10,7 @@ loses nothing and there is no stale-state write race.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -20,8 +21,9 @@ from pathlib import Path
 from typing import IO, Literal, TypeGuard, cast
 from uuid import UUID, uuid4
 
-from phasesweep.config.common import SAFE_NAME_PATTERN
-from phasesweep.mcp.time import parse_utc_iso
+from phasesweep.config import Experiment
+from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
+from phasesweep.config.io import load_experiment_bytes
 from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,
@@ -35,12 +37,27 @@ from phasesweep.runtime.files import (
     unlock_file,
     validate_private_dir,
 )
-from phasesweep.runtime.reaper import is_same_live_process, read_boot_id, reap_child
+from phasesweep.runtime.reaper import (
+    identity_from_earlier_boot,
+    is_same_live_process,
+    read_boot_id,
+    reap_child,
+)
+from phasesweep.runtime.time import parse_utc_iso
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
 
+# Single source of truth for the launch handshake: phasesweep.mcp.runner writes
+# LAUNCH_READY_BYTE once its process identity is durable, and
+# phasesweep.mcp.run_control writes LAUNCH_ACK_BYTE once it has recorded that
+# receipt, settling ownership of the spawned process.
+LAUNCH_READY_BYTE = b"R"
+LAUNCH_ACK_BYTE = b"A"
+
 __all__ = [
+    "LAUNCH_ACK_BYTE",
+    "LAUNCH_READY_BYTE",
     "ProcessIdentity",
     "PreparedRun",
     "RunHandle",
@@ -48,7 +65,6 @@ __all__ = [
     "RunState",
     "RunStore",
     "UnsupportedStateFormatError",
-    "identity_from_earlier_boot",
     "write_status_file",
 ]
 
@@ -187,61 +203,21 @@ def write_status_file(status_path: Path, payload: dict[str, object]) -> None:
 def write_status_file_if_absent(status_path: Path, payload: dict[str, object]) -> bool:
     """Atomically create a server failure only while no runner status exists.
 
+    Thin wrapper over :func:`_strict_atomic_create_text`, so it shares every
+    durability step of a runner-written status file (temp file, fsync,
+    link, directory fsync) -- including that a post-link directory-fsync
+    failure unlinks the just-created status file rather than leaving an
+    unsynced one behind.
+
     :param Path status_path: Destination ``status.json`` path for the run.
     :param dict[str, object] payload: JSON-serializable server failure payload.
     :return bool: Whether this call created the status; ``False`` if one already exists.
     """
-    temporary = status_path.with_name(f".{status_path.name}.{uuid4().hex}.tmp")
-    parent_fd = -1
     try:
-        with open_private_text(temporary, "x") as output:
-            output.write(json.dumps(payload, indent=2) + "\n")
-            output.flush()
-            os.fsync(output.fileno())
-        parent_fd = open_directory_fd(status_path.parent, create=False, private_final=True)
-        try:
-            os.link(
-                temporary.name,
-                status_path.name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            return False
-        os.fsync(parent_fd)
-        return True
-    finally:
-        if parent_fd >= 0:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary.name, dir_fd=parent_fd)
-            os.close(parent_fd)
-        else:
-            with contextlib.suppress(OSError):
-                temporary.unlink()
-
-
-def identity_from_earlier_boot(boot_id: str | None) -> bool:
-    """Return whether a recorded boot identity proves its process cannot exist.
-
-    PID plus ``/proc`` start time is unique only within one boot: after a
-    reboot the kernel restarts both counters, so a saved pair can match an
-    unrelated process. A recorded boot id that differs from the current one
-    settles the question in the safe direction - nothing launched under the
-    earlier boot survived it, so the process and every descendant it ever had
-    are conclusively gone and cleanup needs no signal. An unknown boot id on
-    either side (a handle written before boot ids were recorded, or a host
-    without ``/proc/sys/kernel/random/boot_id``) yields ``False``. Callers
-    performing cleanup must separately refuse to signal when either boot id
-    is unknown.
-
-    :param str | None boot_id: Boot identity recorded when the process launched.
-    :return bool: Whether both boot ids are known and differ.
-    """
-    if boot_id is None:
+        _strict_atomic_create_text(status_path, json.dumps(payload, indent=2) + "\n")
+    except FileExistsError:
         return False
-    current = read_boot_id()
-    return current is not None and current != boot_id
+    return True
 
 
 @dataclass(frozen=True)
@@ -295,6 +271,22 @@ class PreparedRun:
     def close(self) -> None:
         """Release this server process's copy of the launch lease."""
         self.lease.close()
+
+
+def load_experiment_snapshot(path: Path, expected_sha256: str, *, source: str) -> Experiment:
+    """Read, verify, and parse one immutable experiment snapshot.
+
+    :param Path path: Snapshot file to read.
+    :param str expected_sha256: Digest recorded with the run handle.
+    :param str source: Human-readable parser source label.
+    :raises OSError: If the snapshot cannot be read.
+    :raises ValueError: If its digest or syntax is invalid.
+    :return Experiment: Verified experiment configuration.
+    """
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
+        raise ValueError("run snapshot hash mismatch")
+    return load_experiment_bytes(data, source=source)
 
 
 class RunStore:
@@ -1002,11 +994,7 @@ class RunStore:
             handle.experiment_id
         ):
             return None
-        if (
-            type(handle.config_sha256) is not str
-            or len(handle.config_sha256) != 64
-            or any(character not in "0123456789abcdef" for character in handle.config_sha256)
-        ):
+        if not is_sha256_hex(handle.config_sha256):
             return None
         if type(handle.allow_cancel) is not bool:
             return None
@@ -1269,7 +1257,7 @@ class RunStore:
         :param RunHandle handle: Run handle whose recorded boot should be checked.
         :return bool: Whether the recorded boot id is known and differs from this boot.
         """
-        return identity_from_earlier_boot(self.cleanup_identity(handle).boot_id)
+        return identity_from_earlier_boot(self.cleanup_identity(handle).boot_id, read_boot_id())
 
     def latest_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the newest persisted handle for an experiment deterministically.
@@ -1291,16 +1279,6 @@ class RunStore:
             matching,
             key=lambda handle: (datetime.fromisoformat(handle.started_at), handle.run_id),
         )
-
-    def live_runs(self) -> list[RunHandle]:
-        """Every currently-running handle across all experiments.
-
-        Scanning calls ``state`` on each handle, which also reaps any runner
-        that has since exited - so this doubles as the cleanup sweep.
-
-        :return list[RunHandle]: All handles whose derived state is currently ``running``.
-        """
-        return [handle for handle in self.list_handles() if self.state(handle) == "running"]
 
     def recovery_required(self, handle: RunHandle) -> bool:
         """Return whether operator cleanup or snapshot recovery is required.
@@ -1441,7 +1419,7 @@ class RunStore:
             handle.launch_state == "spawned"
             and handle.pid is not None
             and handle.pid_starttime is not None
-            and not identity_from_earlier_boot(handle.boot_id)
+            and not identity_from_earlier_boot(handle.boot_id, read_boot_id())
             and is_same_live_process(handle.pid, handle.pid_starttime)
         )
 
