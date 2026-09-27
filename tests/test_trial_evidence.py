@@ -839,7 +839,10 @@ def test_deleting_a_carried_winners_source_generation_fails_read_and_write(
     assert published_generation_id(experiment) is None
 
 
-@pytest.mark.parametrize("damage", ["missing", "edited", "coherently_changed"])
+@pytest.mark.parametrize(
+    "damage",
+    ["missing", "edited", "coherently_changed", "invalid_winner_yaml", "invalid_summary_yaml"],
+)
 def test_published_source_generation_damage_fails_integrity(tmp_path: Path, damage: str) -> None:
     """A carried result cannot outlive or contradict its published source."""
     experiment, source_generation, _ = _tree_with_a_carried_winner(tmp_path)
@@ -848,6 +851,12 @@ def test_published_source_generation_damage_fails_integrity(tmp_path: Path, dama
     if damage == "missing":
         winner_path.unlink()
         diagnostic = "published but holds no winner record"
+    elif damage == "invalid_winner_yaml":
+        winner_path.write_text("updated_at: 2026-99-99\n", encoding="utf-8")
+        diagnostic = "not parseable"
+    elif damage == "invalid_summary_yaml":
+        (source_dir / "summary.yaml").write_text("updated_at: 2026-99-99\n", encoding="utf-8")
+        diagnostic = "summary is unreadable or invalid"
     else:
         winner = yaml.safe_load(winner_path.read_text())
         winner["metric"][experiment.metric.name] = 0.9

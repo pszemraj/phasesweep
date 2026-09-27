@@ -523,7 +523,7 @@ def _validate_winner_source_generation(
         ) from exc
     try:
         source_payload = yaml.safe_load(content)
-    except yaml.YAMLError as exc:
+    except (ValueError, yaml.YAMLError) as exc:
         raise fail(
             f"source generation {source_generation!r} winner artifact for phase "
             f"{phase_name!r} is not parseable"
@@ -545,7 +545,7 @@ def _validate_winner_source_generation(
                     f"source generation {source_generation!r} summary"
                 )
             ) from exc
-        except (OSError, yaml.YAMLError) as exc:
+        except (OSError, ValueError, yaml.YAMLError) as exc:
             raise fail(
                 f"source generation {source_generation!r} summary is unreadable or invalid"
             ) from exc
