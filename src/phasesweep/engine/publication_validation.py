@@ -737,7 +737,7 @@ def _read_pointer_target(pointer_path: Path, *, experiment_name: str) -> _Pointe
         raise PublicationAccessError(
             _unreadable_artifact_permission_detail("last-success pointer")
         ) from exc
-    except (OSError, UnicodeError, yaml.YAMLError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
     if (
         not isinstance(payload, dict)

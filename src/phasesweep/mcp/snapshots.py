@@ -368,7 +368,7 @@ def capture_result_snapshot(
             lifecycle = yaml.safe_load(
                 _generation_record_path(experiment, generation_id).read_text()
             )
-        except (OSError, yaml.YAMLError):
+        except (OSError, ValueError, yaml.YAMLError):
             lifecycle = None
         if lifecycle is not None and (
             not isinstance(lifecycle, Mapping) or lifecycle.get("generation_id") != generation_id

@@ -31,8 +31,10 @@ from phasesweep.engine import PublishedStudyMissingError, read_status, read_winn
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
+    _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
+    _last_successful_generation_path,
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
@@ -861,6 +863,45 @@ def test_pinned_reads_treat_malformed_winner_as_absent(
         snapshot = capture_result_snapshot(experiment, generation_id=generation_id)
         assert snapshot["winners"] == []
         assert snapshot["status"]["represented_generation_id"] == generation_id
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(b"\xff", id="invalid-utf8"),
+        pytest.param(b"updated_at: 2026-99-99\n", id="invalid-timestamp"),
+    ],
+)
+@pytest.mark.parametrize(
+    "artifact", ["current_pointer", "last_success_pointer", "summary", "lifecycle"]
+)
+def test_reads_tolerate_malformed_generation_metadata(
+    tmp_path: Path, contents: bytes, artifact: str
+) -> None:
+    from phasesweep.mcp.snapshots import capture_result_snapshot
+
+    experiment = _published(tmp_path)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    paths = {
+        "current_pointer": _generation_path(experiment),
+        "last_success_pointer": _last_successful_generation_path(experiment),
+        "summary": _generation_summary_path(experiment, generation_id),
+        "lifecycle": _generation_record_path(experiment, generation_id),
+    }
+    paths[artifact].write_bytes(contents)
+
+    status = read_status(experiment, generation_id=generation_id)
+    snapshot = capture_result_snapshot(experiment, generation_id=generation_id)
+
+    integrity = "failed" if artifact in {"last_success_pointer", "summary"} else "ok"
+    assert status["publication_integrity"] == integrity
+    assert snapshot["status"]["publication_integrity"] == integrity
+    assert snapshot["status"]["represented_generation_id"] == generation_id
+    assert len(snapshot["winners"]) == 1
+    assert snapshot["winners"][0]["phase"] == "p"
+    if artifact == "current_pointer":
+        assert status["current_generation_id"] is None
 
 
 def test_read_status_reuses_the_pointer_authenticated_summary(

@@ -375,7 +375,7 @@ def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None
         return None
     try:
         payload = yaml.safe_load(summary_path.read_text())
-    except (OSError, yaml.YAMLError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
     if not isinstance(payload, Mapping):
         return None
@@ -437,7 +437,7 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     """
     try:
         generation = yaml.safe_load(_generation_path(experiment).read_text())
-    except (OSError, yaml.YAMLError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
     if not isinstance(generation, Mapping):
         return None
