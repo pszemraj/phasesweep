@@ -51,7 +51,7 @@ from phasesweep.engine.paths import (
     _summary_path,
     _winner_path,
 )
-from phasesweep.engine.phase import CsvSnapshotThrottle
+from phasesweep.engine.phase import CsvSnapshotThrottle, _PhaseExecution
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -64,10 +64,20 @@ from phasesweep.engine.state import (
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.engine.study_policy import _load_phase_policy_state
-from phasesweep.engine.trial import ExecutedTrial, TrialExecutionError, extract_trial_result
+from phasesweep.engine.study_policy import (
+    _consecutive_failure_threshold_tripped,
+    _load_phase_policy_state,
+    _record_recovery_boundary,
+)
+from phasesweep.engine.trial import (
+    ExecutedTrial,
+    TrialExecutionError,
+    _environment_identity,
+    extract_trial_result,
+)
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
@@ -1596,6 +1606,60 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     assert record["consecutive_failures"] == 2
     states = sorted(t.state.name for t in study.get_trials(deepcopy=False))
     assert states == ["COMPLETE", "FAIL", "FAIL"]
+
+
+@pytest.mark.parametrize(
+    "outcomes",
+    [
+        ["failure", "failure", "success", "failure", "failure"],
+        ["success", "pruned", "failure", "cancelled", "failure"],
+        ["fatal", "success", "failure"],
+    ],
+)
+def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str]) -> None:
+    """A restarted run reconstructs the same streak and trips live recording saw.
+
+    After every recorded outcome, the live completion order must match what
+    ``_load_phase_policy_state`` replays from the durable outcome ledger, and
+    a recovery boundary must reset both to the same streak.
+    """
+    experiment = make_experiment(max_consecutive_failures=2)
+    phase = experiment.phases[0]
+    study = optuna.create_study()
+    run = _PhaseExecution(
+        experiment=experiment,
+        phase=phase,
+        study=study,
+        inherited_winners={},
+        generation_id="generation",
+        environment_identity=_environment_identity(experiment, phase.name),
+        gpu_pool=None,  # type: ignore[arg-type]  # outcome transitions never launch
+        optimize_deadline=None,
+        timeout_source=None,
+    )
+    for outcome in outcomes:
+        trial = study.ask()
+        trial.set_user_attr(
+            TRIAL_OUTCOME_ATTR,
+            {
+                "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+                "sequence": run.completion_sequence + 1,
+                "outcome": outcome,
+            },
+        )
+        tripped = run.advance(trial.number, outcome)
+        replayed = _load_phase_policy_state(study)
+        assert run.completion_sequence == replayed.max_sequence
+        assert run.consecutive_failures == replayed.consecutive_failures
+        assert tripped == (
+            outcome == "fatal"
+            or _consecutive_failure_threshold_tripped(replayed.consecutive_failures, phase)
+        )
+
+    _record_recovery_boundary(study, phase, run.completion_sequence)
+    run.resume_from(_load_phase_policy_state(study))
+    assert run.completion_sequence == len(outcomes)
+    assert run.consecutive_failures == 0
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])

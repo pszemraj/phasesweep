@@ -285,6 +285,38 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     )
 
 
+def _record_recovery_boundary(
+    study: optuna.Study,
+    phase: Phase,
+    recovered_abort_sequence: int,
+) -> None:
+    """Durably acknowledge one phase abort as recovered.
+
+    Outcomes recorded up to the study's current largest sequence stop counting
+    toward the consecutive-failure streak that :func:`_load_phase_policy_state`
+    replays, and the abort at ``recovered_abort_sequence`` is known to be
+    consumed, so a later run clears its marker instead of raising it again.
+    The caller clears ``PHASE_ABORT_ATTR`` only after this write is durable.
+
+    :param optuna.Study study: Study whose recovery boundary is written.
+    :param Phase phase: Phase whose ``n_trials`` the recovery runs toward.
+    :param int recovered_abort_sequence: Completion sequence of the abort
+        being acknowledged.
+    :raises StudySchemaMismatchError: The study's durable failure-policy state
+        is malformed.
+    """
+    current = _load_phase_policy_state(study)
+    study.set_user_attr(
+        PHASE_RECOVERY_ATTR,
+        {
+            "schema_version": PHASE_RECOVERY_SCHEMA_VERSION,
+            "recovered_abort_sequence": recovered_abort_sequence,
+            "start_after_sequence": current.max_sequence,
+            "trial_target": phase.n_trials,
+        },
+    )
+
+
 def _validate_study_schema(study: optuna.Study) -> None:
     """Initialize an empty study or reject populated incompatible storage.
 

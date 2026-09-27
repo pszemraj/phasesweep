@@ -282,7 +282,7 @@ the attempts, not either claim.
 No Optuna trial reaches a terminal state before its durable outcome record is
 written; a failed outcome write leaves the trial `RUNNING` for recovery.
 
-**Held by:** `engine.phase._run_phase`, which writes the outcome attribute
+**Held by:** `engine.phase._record_outcome`, which writes the outcome attribute
 before any terminal transition and raises
 `engine.phase._TrialOutcomeUnrecordedAbort` when it cannot\
 **Test:** `tests/test_runtime_behavior.py::test_persistent_outcome_write_failure_leaves_trial_running_until_recovery`
