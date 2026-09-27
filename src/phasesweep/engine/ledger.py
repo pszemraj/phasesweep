@@ -1055,7 +1055,7 @@ def read_trial_stats(
     When the scan did not complete, every phase is reported unavailable without
     being read, since counts read around that gap would present the ledger as
     current-format when nothing verified it. Each phase's own study still
-    answers to the same cutover rule as a second line of defence.
+    answers to the same format rule as a second line of defence.
 
     The journal is captured here, once for every phase, rather than reused
     from the format scan, so a caller that resolves the publication pointer

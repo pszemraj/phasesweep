@@ -211,7 +211,7 @@ flowchart TD
   continuation, current-format publication, and read-only views.
 - `tests/test_storage_urls.py`, `tests/test_locking.py`,
   `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local
-  storage, locks, format cutover, and output layout.
+  storage, locks, format checks, and output layout.
 - `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`,
   `tests/test_error_routing.py`, and `tests/test_tier_guard.py`: the storage
   chokepoint, read paths and recovery inspection against the golden ledger
