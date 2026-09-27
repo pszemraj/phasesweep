@@ -944,11 +944,8 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
             Phase(name="final", inherits=["schedule"], n_trials=1, search_space={}),
         ]
     )
-    parent_study = SimpleNamespace(
-        user_attrs={},
-        get_trials=lambda *, deepcopy: [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE)],
-    )
-    grandchild_study = SimpleNamespace(user_attrs={"phasesweep_fingerprint": "bound-grandchild"})
+    parent_study = _fake_top_up_study(completed=1)
+    grandchild_study = _fake_top_up_study(completed=1, fingerprint="bound-grandchild")
 
     with pytest.raises(RuntimeError, match=r"dependent phase study/studies \['final'\]"):
         _reject_bound_descendant_topups(
