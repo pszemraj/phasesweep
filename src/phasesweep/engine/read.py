@@ -223,7 +223,7 @@ def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
         return None
     try:
         loaded = yaml.safe_load(path.read_text())
-    except (OSError, yaml.YAMLError):
+    except (OSError, ValueError, yaml.YAMLError):
         # Partially-written or malformed file (or unlinked between the is_file
         # check and the read): report as no-winner-yet rather than raising.
         return None

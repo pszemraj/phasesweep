@@ -837,6 +837,32 @@ def test_read_winner_rejects_a_winner_source_naming_another_phase(tmp_path: Path
     assert read_winner(experiment, "p", generation_id=generation_id) is None
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(b"\xff", id="invalid-utf8"),
+        pytest.param(b"completed_at: 2026-99-99\n", id="invalid-timestamp"),
+    ],
+)
+@pytest.mark.parametrize("reader", ["winner", "snapshot"])
+def test_pinned_reads_treat_malformed_winner_as_absent(
+    tmp_path: Path, contents: bytes, reader: str
+) -> None:
+    from phasesweep.mcp.snapshots import capture_result_snapshot
+
+    experiment = _published(tmp_path)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    _generation_winner_path(experiment, generation_id, "p").write_bytes(contents)
+
+    if reader == "winner":
+        assert read_winner(experiment, "p", generation_id=generation_id) is None
+    else:
+        snapshot = capture_result_snapshot(experiment, generation_id=generation_id)
+        assert snapshot["winners"] == []
+        assert snapshot["status"]["represented_generation_id"] == generation_id
+
+
 def test_read_status_reuses_the_pointer_authenticated_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
