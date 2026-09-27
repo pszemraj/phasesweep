@@ -21,17 +21,11 @@ pytest
 ruff check .
 ruff format --check .
 mypy src
-scripts/check_installed_wheel.sh
 ```
 
 > [!IMPORTANT]
-> Run `pytest` by itself, with no concurrent lint, type check, or build job:
+> Run `pytest` by itself, with no concurrent lint or type check:
 > process-supervision and timeout tests are timing-sensitive.
-
-The installed-wheel script builds and installs into a temporary location,
-verifies the package and console entry points outside the checkout, and
-exercises the starter's validation, dry run, execution, replay, and catalog
-scaffolding. It leaves no acceptance artifacts in the repository.
 
 ### Git hooks
 
@@ -124,8 +118,7 @@ Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier
 guard hook runs, and the three contract tests plus
 `tests/test_ledger_read_paths.py`, all imported from `src/` without building
 the package. That test step runs on one Python version and stays within about
-20 seconds; the full suite and installed wheel check stay local to control CI
-cost. Hardware tests remain opt-in.
+20 seconds; the full suite stays local to control CI cost. Hardware tests remain opt-in.
 
 The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
 read-only inspection behavior depends on that range; do not widen it without
