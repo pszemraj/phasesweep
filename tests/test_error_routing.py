@@ -52,7 +52,7 @@ from phasesweep.engine.attempts import (
     _PreflightCleanupReport,
     _register_active_attempt,
 )
-from phasesweep.engine.cleanup import _inspect_cleanup_uncertain_trials, _reap_stale_trials
+from phasesweep.engine.cleanup import _reap_stale_trials, _recover_cleanup_uncertain_trials
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -516,7 +516,7 @@ def _reap_unreadable_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> o
     """Reap stale trials from a study whose trial list cannot be read."""
     study = optuna.create_study(study_name="t::p")
     monkeypatch.setattr(optuna.Study, "get_trials", _raiser(_storage_gone()))
-    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p")
+    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p", confirm=True)
 
 
 def _recover_while_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -636,7 +636,7 @@ def _scan_registry(
         trial_dir.mkdir()
         damage(_registered_entry(experiment, trial_dir))
         patch(monkeypatch)
-        return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+        return _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     return trigger
 
@@ -1014,7 +1014,7 @@ def _preflight_registered_trial_without_attempt(
     running.set_user_attr(TRIAL_DIR_ATTR, str(attempt_dir))
     running.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(running, state=optuna.trial.TrialState.FAIL)
-    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+    return _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
 
 def _inspect_uncertain(*kept: str) -> Trigger:
@@ -1034,7 +1034,8 @@ def _inspect_uncertain(*kept: str) -> Trigger:
             uncertain.set_user_attr(key, identity[key])
         uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
         study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
-        return _inspect_cleanup_uncertain_trials(study, "p")
+        experiment = make_experiment(workdir=tmp_path / "runs")
+        return _recover_cleanup_uncertain_trials(study, experiment, "p", confirm=False)
 
     return trigger
 
@@ -1088,7 +1089,7 @@ def _reap_running_trial(tmp_path: Path, **attrs: object) -> object:
     running = study.ask()
     for key, value in attrs.items():
         running.set_user_attr(key, value)
-    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p")
+    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p", confirm=True)
 
 
 def _reap_trial_with_invalid_trial_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:

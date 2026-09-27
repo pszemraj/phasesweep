@@ -122,7 +122,7 @@ def _preflight_existing_studies(
     # are recovered before any current-config validation or launch (review
     # v0.5.17 / blocker 3).
     try:
-        _preflight_active_attempts(experiment, report)
+        _preflight_active_attempts(experiment, report, confirm=True)
     except Exception as exc:
         if isinstance(exc, (ProcessCleanupUncertainError, StudyStorageUnavailableError)):
             report.mark_uncertain(exc)
@@ -145,6 +145,7 @@ def _preflight_existing_studies(
                     study,
                     experiment,
                     phase.name,
+                    confirm=True,
                     recovered_attempts=recovered_terminal_attempts,
                 )
             finally:
@@ -158,6 +159,7 @@ def _preflight_existing_studies(
                     study,
                     experiment,
                     phase.name,
+                    confirm=True,
                     recovered_attempts=reaped_attempts,
                     uncertain_attempt_ids=report.uncertain_attempt_ids,
                 )

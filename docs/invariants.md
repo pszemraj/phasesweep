@@ -340,13 +340,18 @@ returning the `ValidatedPublication` that
 #### 14. A PID alone is never authority
 
 A process is identified by PID, start time, and boot id together, and a
-differing boot id settles a reboot without signalling anything.
+differing boot id settles a reboot without signalling anything. A stale
+attempt is signalled through one procedure, whichever source found it: the
+attempt registry, a stale `RUNNING` trial, or a terminal trial that recorded
+cleanup uncertainty.
 
 **Held by:** `runtime.reaper.identity_from_earlier_boot`,
 `mcp.runs.RunStore.from_earlier_boot`, `runtime.reaper.is_same_live_process`,
-`runtime.reaper.cleanup_stale_trial_process`\
+`runtime.reaper.cleanup_stale_trial_process`, whose only caller is
+`engine.attempts._resolve_attempt`\
 **Tests:** `tests/test_mcp_runs.py::test_state_cleanup_uncertain_on_pid_reuse_mismatch`,
-`tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`
+`tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`,
+`tests/test_attempt_resolution.py::test_only_resolve_attempt_signals_a_stale_process_group`
 
 #### 15. A dead runner stays live until recovery decides
 

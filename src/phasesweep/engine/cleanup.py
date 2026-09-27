@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
 from pathlib import Path
 
 import optuna
@@ -12,18 +11,17 @@ from phasesweep.config import Experiment
 from phasesweep.engine.attempts import (
     _AttemptRecord,
     _cleanup_recovered_trial_numbers,
-    _collect_attempt_generation,
-    _read_trial_process_identity,
+    _CleanupUncertainTrialDiscovery,
+    _fail_stale_running_trial,
     _record_cleanup_recovery,
-    _record_stale_trial_failure,
-    _resolve_attempt_for_reaping,
+    _require_trial_attempt,
+    _resolve_attempt,
+    _trial_attempt_record,
     _trial_dir_for_reaping,
     _trial_requires_cleanup_recovery,
+    _TrialDiscovery,
 )
-from phasesweep.engine.errors import (
-    OperatorAction,
-    StudyStorageUnavailableError,
-)
+from phasesweep.engine.errors import OperatorAction
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -31,11 +29,6 @@ from phasesweep.engine.state import (
 )
 from phasesweep.engine.study_policy import _restore_prelaunch_environment_identity
 from phasesweep.engine.trial import ProcessCleanupUncertainError
-from phasesweep.errors import RERUN_CLEANUP_RECOVERY
-from phasesweep.runtime.reaper import (
-    StaleProcessIdentity,
-    cleanup_stale_trial_process,
-)
 
 log = logging.getLogger(__name__)
 
@@ -45,20 +38,29 @@ def _reap_stale_trials(
     experiment: Experiment,
     phase_name: str,
     *,
+    confirm: bool,
     recovered_attempts: dict[str, _AttemptRecord] | None = None,
     uncertain_attempt_ids: set[str] | None = None,
 ) -> int:
-    """Mark RUNNING trials as FAIL after killing orphaned process groups.
+    """Resolve each stale RUNNING trial's attempt, then mark the trial FAIL.
+
+    Inspection (``mcp recover-run`` preflight) validates the same evidence
+    without signalling a process or writing state. The follow-up confirmed
+    call must still find the same RUNNING trials so it can reap them and
+    persist recovery evidence atomically with clearing MCP cleanup
+    uncertainty.
 
     :param optuna.Study study: Study whose stale RUNNING trials should be reaped.
     :param Experiment experiment: Experiment used to locate trial directories.
     :param str phase_name: Name of the phase containing the stale trials.
+    :param bool confirm: Clean orphaned process groups and mark each stale
+        trial FAIL when true; otherwise only validate and count.
     :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
-        mapping from each attempt id whose durable state was changed to FAIL
-        to its generation, phase, and trial number.
+        mapping from each attempt id whose trial was marked FAIL (or, when
+        inspecting, would be) to its record.
     :param set[str] | None uncertain_attempt_ids: Optional collector for exact
         attempt identities whose cleanup could not be proven.
-    :return int: Number of stale RUNNING trials marked as failed.
+    :return int: Number of stale RUNNING trials marked FAIL, or found when inspecting.
     :raises ProcessCleanupUncertainError: The study's trials cannot be
         inspected, or a stale trial's directory, attempt identity, or process
         cleanup could not be proven safe.
@@ -77,69 +79,41 @@ def _reap_stale_trials(
             "Restore the original complete storage ledger and access to it before retrying.",
             action=OperatorAction.RESTORE_LEDGER,
         ) from exc
+    discovery = _TrialDiscovery(study.study_name)
     for trial in trials:
         if trial.state != optuna.trial.TrialState.RUNNING:
             continue
         attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+        record: _AttemptRecord | None
         try:
             trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
-
             if TRIAL_DIR_ATTR in trial.user_attrs:
-                _resolve_attempt_for_reaping(trial, trial_dir, study.study_name)
+                record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
+                _resolve_attempt(record, discovery, confirm=confirm)
             else:
-                _restore_prelaunch_environment_identity(study, trial)
+                # The launch path records the directory before any process can
+                # start, so this allocation launched nothing to resolve.
+                record = _trial_attempt_record(trial, phase_name, trial_dir)
+                if confirm:
+                    _restore_prelaunch_environment_identity(study, trial)
         except ProcessCleanupUncertainError:
             if uncertain_attempt_ids is not None and isinstance(attempt_id, str) and attempt_id:
                 uncertain_attempt_ids.add(attempt_id)
             raise
 
-        _record_stale_trial_failure(study, trial)
-        _record_cleanup_recovery(study, trial)
-        try:
-            study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-        except Exception as exc:
-            raise StudyStorageUnavailableError(
-                f"Stale process cleanup completed for RUNNING trial {trial.number}, "
-                f"but Optuna state could not be updated to FAIL. Refusing to continue "
-                f"with an inconsistent study. trial_dir={trial_dir}"
-            ) from exc
-
-        _collect_attempt_generation(trial, phase_name, recovered_attempts)
-
-        log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
-        count += 1
-    return count
-
-
-def _inspect_stale_running_trials(
-    study: optuna.Study,
-    experiment: Experiment,
-    phase_name: str,
-    *,
-    recovered_attempts: dict[str, _AttemptRecord] | None = None,
-) -> int:
-    """Count stale RUNNING trials without signaling processes or writing state.
-
-    Used by ``mcp recover-run`` preflight mode. The follow-up ``--confirm`` call
-    must still find the same RUNNING trials so it can reap them and persist
-    recovery evidence atomically with clearing MCP cleanup uncertainty.
-
-    :param optuna.Study study: Study whose stale RUNNING trials should be inspected.
-    :param Experiment experiment: Experiment used to locate trial directories.
-    :param str phase_name: Name of the phase containing the stale trials.
-    :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
-        mapping from each attempt id a confirmed pass would reap to its
-        generation, phase, and trial number.
-    :return int: Number of stale RUNNING trials found.
-    """
-    count = 0
-    for trial in study.get_trials(deepcopy=False):
-        if trial.state != optuna.trial.TrialState.RUNNING:
-            continue
-        trial_dir = _trial_dir_for_reaping(trial, experiment, phase_name, study.study_name)
-        if TRIAL_DIR_ATTR in trial.user_attrs:
-            _resolve_attempt_for_reaping(trial, trial_dir, study.study_name, inspect_only=True)
-        _collect_attempt_generation(trial, phase_name, recovered_attempts)
+        if confirm:
+            _fail_stale_running_trial(
+                study,
+                trial,
+                failure_message=(
+                    f"Stale process cleanup completed for RUNNING trial {trial.number}, "
+                    f"but Optuna state could not be updated to FAIL. Refusing to continue "
+                    f"with an inconsistent study. trial_dir={trial_dir}"
+                ),
+            )
+            log.warning("Reaped stale RUNNING trial %d in study %s", trial.number, study.study_name)
+        if recovered_attempts is not None and record is not None:
+            recovered_attempts[record.attempt_id] = record
         count += 1
     return count
 
@@ -221,31 +195,12 @@ def _trial_dir_for_cleanup_recovery(
     return Path(stored)
 
 
-def _iter_cleanup_uncertain_trials(
-    study: optuna.Study,
-) -> Iterator[tuple[optuna.trial.FrozenTrial, Path, StaleProcessIdentity]]:
-    """Yield unconsumed terminal trials with their validated process identity.
-
-    :param optuna.Study study: Study whose cleanup evidence should be inspected.
-    :return Iterator: Eligible trial, persisted trial directory, and process identity.
-    """
-    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
-    for trial in study.get_trials(deepcopy=False):
-        if (
-            trial.state.is_finished()
-            and trial.number not in recovered_trial_numbers
-            and _trial_requires_cleanup_recovery(trial)
-        ):
-            trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
-            identity = _read_trial_process_identity(trial, trial_dir, study.study_name)
-            yield trial, trial_dir, identity
-
-
 def _recover_cleanup_uncertain_trials(
     study: optuna.Study,
     experiment: Experiment,
     phase_name: str,
     *,
+    confirm: bool,
     recovered_attempts: dict[str, _AttemptRecord] | None = None,
 ) -> int:
     """Confirm cleanup for terminal trials that explicitly recorded uncertainty.
@@ -253,62 +208,38 @@ def _recover_cleanup_uncertain_trials(
     ``UnsafeProcessCleanupError`` can leave an Optuna trial in a terminal FAIL state with
     ``phasesweep_cleanup_confirmed=false``. The normal stale reaper intentionally visits
     only RUNNING trials, so operator recovery needs this separate fail-closed inspection
-    before clearing MCP cleanup uncertainty.
+    before clearing MCP cleanup uncertainty. Inspection (``mcp recover-run``
+    preflight) validates each trial's persisted identity without signalling or writing.
 
     :param optuna.Study study: Existing Optuna study for the phase being recovered.
     :param Experiment experiment: Parsed experiment, used for diagnostics.
     :param str phase_name: Name of the phase being recovered.
+    :param bool confirm: Clean each recorded process group and consume its
+        evidence in the study's recovery ledger when true; otherwise only
+        validate and count.
     :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
-        mapping from each attempt id whose cleanup was confirmed to its
-        generation, phase, and trial number.
-    :return int: Number of cleanup-uncertain terminal trials confirmed clean.
+        mapping from each attempt id whose cleanup was confirmed (or, when
+        inspecting, would be) to its record.
+    :return int: Number of cleanup-uncertain terminal trials confirmed clean,
+        or found when inspecting.
     :raises ProcessCleanupUncertainError: A recorded trial cannot be inspected or cleaned.
     """
-    recovered = 0
-    for trial, trial_dir, identity in _iter_cleanup_uncertain_trials(study):
-        safe_to_clear = cleanup_stale_trial_process(identity)
-        if not safe_to_clear:
-            raise ProcessCleanupUncertainError(
-                f"Refusing to clear cleanup uncertainty for trial {trial.number} in "
-                f"study {study.study_name}: process cleanup could not be confirmed. "
-                f"experiment={experiment.experiment} phase={phase_name} "
-                f"trial_dir={trial_dir} pid={identity.pid} pgid={identity.pgid}. "
-                f"Investigate (e.g. `ps -o pid,pgid,cmd -p {identity.pid}`), then "
-                f"{RERUN_CLEANUP_RECOVERY}."
-            )
-        _record_cleanup_recovery(study, trial)
-        _collect_attempt_generation(trial, phase_name, recovered_attempts)
-        recovered += 1
-        log.warning(
-            "Confirmed cleanup for terminal cleanup-uncertain trial %d in study %s "
-            "(pid=%s pgid=%s)",
-            trial.number,
-            study.study_name,
-            identity.pid,
-            identity.pgid,
-        )
-    return recovered
-
-
-def _inspect_cleanup_uncertain_trials(
-    study: optuna.Study,
-    phase_name: str,
-    *,
-    recovered_attempts: dict[str, _AttemptRecord] | None = None,
-) -> int:
-    """Count recoverable terminal cleanup evidence without signals or writes.
-
-    :param optuna.Study study: Existing study inspected by recovery preflight.
-    :param str phase_name: Name of the phase containing the recovered trials.
-    :param dict[str, _AttemptRecord] | None recovered_attempts: Optional
-        mapping from each attempt id a confirmed pass would recover to its
-        generation, phase, and trial number.
-    :return int: Number of unconsumed terminal trials that record cleanup uncertainty.
-    :raises ProcessCleanupUncertainError: A trial lacks the persisted identity
-        required for a safe confirmed recovery.
-    """
+    recovered_trial_numbers = _cleanup_recovered_trial_numbers(study)
+    discovery = _CleanupUncertainTrialDiscovery(study.study_name, experiment.experiment)
     count = 0
-    for trial, _trial_dir, _identity in _iter_cleanup_uncertain_trials(study):
-        _collect_attempt_generation(trial, phase_name, recovered_attempts)
+    for trial in study.get_trials(deepcopy=False):
+        if not (
+            trial.state.is_finished()
+            and trial.number not in recovered_trial_numbers
+            and _trial_requires_cleanup_recovery(trial)
+        ):
+            continue
+        trial_dir = _trial_dir_for_cleanup_recovery(trial, study.study_name)
+        record = _require_trial_attempt(trial, phase_name, trial_dir, study.study_name)
+        _resolve_attempt(record, discovery, confirm=confirm)
+        if confirm:
+            _record_cleanup_recovery(study, trial)
+        if recovered_attempts is not None:
+            recovered_attempts[record.attempt_id] = record
         count += 1
     return count

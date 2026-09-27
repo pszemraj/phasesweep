@@ -438,7 +438,7 @@ def _run_phase(
     if not dry_run:
         _validate_study_direction(study, experiment.metric.goal)
         _validate_study_schema(study)
-        _reap_stale_trials(study, experiment, phase.name)
+        _reap_stale_trials(study, experiment, phase.name, confirm=True)
         policy_state = _load_phase_policy_state(study)
         phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
         _validate_trial_target(study, phase)

@@ -208,10 +208,6 @@ def _stage_stale_running_recovery_scaffold(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         cleanup_trial_stub,
     )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
-        cleanup_trial_stub,
-    )
     recover = partial(recover_run_cli, registry.state_dir, run_id, confirm=True)
     return app, store, handle, attempt_id, recover
 
@@ -239,7 +235,6 @@ def _stage_terminal_uncertain_run(
 
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
     recover = partial(recover_run_cli, registry.state_dir, run_id, confirm=True)
     return store, handle, trial_number, config, recover
 
@@ -985,7 +980,6 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
         _counting_success_callback(runner_cleanup_calls),
     )
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", trial_cleanup)
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", trial_cleanup)
 
     dry = recover_run_cli(registry.state_dir, run_id)
 
@@ -1112,10 +1106,6 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *args, **kwargs: True)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: True,
-    )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: True,
     )
     recovery_path = store.cleanup_recovery_path(earlier_run_id)
@@ -1285,7 +1275,6 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process", fake_trial_cleanup
     )
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_trial_cleanup)
 
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
@@ -1551,15 +1540,12 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         lambda _identity: True,
     )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
-        lambda _identity: True,
-    )
     assert (
         _reap_stale_trials(
             study,
             experiment,
             experiment.phases[0].name,
+            confirm=True,
             recovered_attempts=reconciled_attempts,
         )
         == 1
@@ -1673,7 +1659,6 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
 
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
 
     stage_dead_run(store, first_run, config, reg.id, cleanup_uncertain=False)
     write_unsafe_cleanup_status(store, first_run)

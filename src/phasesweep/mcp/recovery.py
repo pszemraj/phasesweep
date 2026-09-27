@@ -18,14 +18,11 @@ from phasesweep.engine.artifact_roots import (
 )
 from phasesweep.engine.attempts import (
     _AttemptRecord,
-    _inspect_active_attempts,
     _preflight_active_attempts,
     _PreflightCleanupReport,
     _retire_active_attempt,
 )
 from phasesweep.engine.cleanup import (
-    _inspect_cleanup_uncertain_trials,
-    _inspect_stale_running_trials,
     _previously_recovered_attempt_locations,
     _reap_stale_trials,
     _recover_cleanup_uncertain_trials,
@@ -656,9 +653,9 @@ def _recover_trial_evidence(
 ) -> _CleanupEvidence:
     """Collect attributable cleanup evidence, optionally reconciling attempts and trials.
 
-    When cleanup is needed, both modes read run, registry, and study evidence. Confirmed recovery
-    invokes the cleanup helpers; preflight uses their inspection counterparts and does not
-    persist the collected run evidence.
+    When cleanup is needed, both modes read run, registry, and study evidence through the same
+    cleanup helpers. Confirmed recovery lets them signal and write; preflight only validates
+    and does not persist the collected run evidence.
 
     :param RunStore store: Existing run store containing prior cleanup evidence and attempt IDs.
     :param RunHandle handle: Durable handle for the run being recovered.
@@ -678,15 +675,16 @@ def _recover_trial_evidence(
     inspected_studies = 0
     if needs.cleanup_needed:
         loaded_studies = _load_recovery_studies(config, needs, confirm=confirm)
+        active_report = _PreflightCleanupReport()
+        registered_attempts = _preflight_active_attempts(
+            config, active_report, confirm=confirm, retain_recovery_evidence=True
+        )
         if confirm:
-            active_report = _PreflightCleanupReport()
-            registered_attempts = _preflight_active_attempts(
-                config, active_report, retain_recovery_evidence=True
-            )
             registered_evidence = active_report.recovered_attempt_generations
             evidence.registered_recovery_attempt_ids.update(active_report.recovered_attempt_ids)
         else:
-            registered_attempts = _inspect_active_attempts(config)
+            # Preflight cannot know which entries a confirmed pass will reap,
+            # so every registered attempt stands as potential evidence.
             registered_evidence = registered_attempts
         evidence.registered_attempts_reconciled = len(registered_attempts)
         evidence.reaped_attempt_ids.update(
@@ -706,31 +704,20 @@ def _recover_trial_evidence(
             )
             evidence.reaped_attempt_ids.update(previously_recovered)
             evidence.reaped_attempt_locations.update(previously_recovered)
-            if confirm:
-                evidence.cleanup_recovered += _recover_cleanup_uncertain_trials(
-                    study,
-                    config,
-                    phase.name,
-                    recovered_attempts=inspected_attempts,
-                )
-                evidence.reaped += _reap_stale_trials(
-                    study,
-                    config,
-                    phase.name,
-                    recovered_attempts=inspected_attempts,
-                )
-            else:
-                evidence.cleanup_recovered += _inspect_cleanup_uncertain_trials(
-                    study,
-                    phase.name,
-                    recovered_attempts=inspected_attempts,
-                )
-                evidence.reaped += _inspect_stale_running_trials(
-                    study,
-                    config,
-                    phase.name,
-                    recovered_attempts=inspected_attempts,
-                )
+            evidence.cleanup_recovered += _recover_cleanup_uncertain_trials(
+                study,
+                config,
+                phase.name,
+                confirm=confirm,
+                recovered_attempts=inspected_attempts,
+            )
+            evidence.reaped += _reap_stale_trials(
+                study,
+                config,
+                phase.name,
+                confirm=confirm,
+                recovered_attempts=inspected_attempts,
+            )
         for attempt_id, record in inspected_attempts.items():
             if record.generation_id == run_id or attempt_id in causal_attempt_ids:
                 evidence.reaped_attempt_ids.add(attempt_id)

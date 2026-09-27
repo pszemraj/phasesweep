@@ -38,7 +38,6 @@ from phasesweep.engine import (
 )
 from phasesweep.engine.attempts import (
     _AttemptRecord,
-    _inspect_active_attempts,
     _preflight_active_attempts,
     _PreflightCleanupReport,
     _record_stale_trial_failure,
@@ -498,8 +497,20 @@ def test_preflight_keeps_attempts_reaped_before_a_later_refusal(
         recovered_attempts: dict[str, _AttemptRecord],
         **_kwargs: object,
     ) -> int:
-        recovered_attempts["reaped"] = _AttemptRecord("gen-reaped", name, 0)
-        recovered_attempts["no-generation"] = _AttemptRecord(None, name, 1)
+        recovered_attempts["reaped"] = _AttemptRecord(
+            attempt_id="reaped",
+            trial_dir=Path("."),
+            generation_id="gen-reaped",
+            phase_name=name,
+            trial_number=0,
+        )
+        recovered_attempts["no-generation"] = _AttemptRecord(
+            attempt_id="no-generation",
+            trial_dir=Path("."),
+            generation_id=None,
+            phase_name=name,
+            trial_number=1,
+        )
         raise ProcessCleanupUncertainError("a later trial's cleanup is uncertain")
 
     monkeypatch.setattr("phasesweep.engine.guards._reap_stale_trials", reap_one_then_refuse)
@@ -1050,7 +1061,7 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
     trial.set_user_attr(TRIAL_DIR_ATTR, bad_value)
 
     with pytest.raises(RuntimeError, match="invalid persisted"):
-        _reap_stale_trials(study, exp, exp.phases[0].name)
+        _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
@@ -1091,10 +1102,8 @@ def test_reaper_reports_storage_failures_after_cleanup(
             boot_id="test-boot",
         )
 
-    monkeypatch.setattr("phasesweep.engine.attempts._read_trial_process_identity", fake_identity)
-    monkeypatch.setattr("phasesweep.engine.cleanup._read_trial_process_identity", fake_identity)
+    monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", lambda _: True)
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", lambda _: True)
 
     if failure_site == "outcome":
         patch_rejected_trial_user_attr(
@@ -1116,7 +1125,7 @@ def test_reaper_reports_storage_failures_after_cleanup(
         )
 
     with pytest.raises(StudyStorageUnavailableError, match=match):
-        _reap_stale_trials(study, exp, exp.phases[0].name)
+        _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
     # The trial must NOT have been marked FAIL (because tell raised).
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
@@ -1195,9 +1204,8 @@ def test_exited_attempt_recovers_without_signalling(
         raise AssertionError("an 'exited' attempt must never be signalled")
 
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", _no_signal)
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", _no_signal)
 
-    assert _reap_stale_trials(study, exp, "p") == 1
+    assert _reap_stale_trials(study, exp, "p", confirm=True) == 1
     assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
 
 
@@ -1296,7 +1304,7 @@ def test_registry_retains_attempt_when_journal_snapshot_is_unreadable(
     ledger_before = ledger.read_bytes()
     entry_before = entry_path.read_bytes()
 
-    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+    _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     assert ledger.read_bytes() == ledger_before
     assert entry_path.read_bytes() == entry_before
@@ -1312,14 +1320,14 @@ def test_registry_reads_its_attempt_after_repairing_a_partial_journal_record(
     healthy_experiment, healthy_ledger, healthy_entry = _fabricate_registered_journal_attempt(
         tmp_path / "healthy", attempt_id="journal-attempt"
     )
-    _preflight_active_attempts(healthy_experiment, _PreflightCleanupReport())
+    _preflight_active_attempts(healthy_experiment, _PreflightCleanupReport(), confirm=True)
     experiment, ledger, entry_path = _fabricate_registered_journal_attempt(
         tmp_path / "torn", attempt_id="journal-attempt"
     )
     complete = ledger.read_bytes()
     ledger.write_bytes(complete + tail)
 
-    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+    _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     (backup,) = ledger.parent.glob(f"{ledger.name}.*.bak")
     assert backup.read_bytes() == complete + tail
@@ -1354,7 +1362,7 @@ def test_registry_retains_attempt_when_live_journal_loses_snapshotted_trial(
 
     monkeypatch.setattr(engine_ledger, "_load_journal_study_snapshot", snapshot_then_truncate)
 
-    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+    _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     assert ledger.read_bytes() == create_study_only
     assert entry_path.read_bytes() == entry_before
@@ -1368,7 +1376,7 @@ def test_registry_discards_attempt_for_a_confirmed_missing_journal_study(tmp_pat
     storage = engine_ledger._resolve_storage(experiment.resolved_storage)
     optuna.delete_study(study_name="journal-attempt::p", storage=storage)
 
-    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+    _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     assert not entry_path.exists()
 
@@ -1402,7 +1410,7 @@ def test_registry_discards_attempt_whose_journal_ledger_is_gone_without_recreati
     gone.unlink()
 
     report = _PreflightCleanupReport()
-    _preflight_active_attempts(_exp("current.journal"), report)
+    _preflight_active_attempts(_exp("current.journal"), report, confirm=True)
 
     assert not entry_path.exists()
     assert not gone.exists()
@@ -1472,7 +1480,7 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     tmp_path: Path, identity_change: str | None
 ) -> None:
     """A stale registry entry cannot consume a replacement trial's cleanup evidence."""
-    from phasesweep.engine.cleanup import _iter_cleanup_uncertain_trials
+    from phasesweep.engine.cleanup import _recover_cleanup_uncertain_trials
 
     experiment = make_experiment(
         experiment="terminal-identity",
@@ -1520,25 +1528,32 @@ def test_registry_terminal_cleanup_requires_matching_attempt_identity(
     report = _PreflightCleanupReport()
     if identity_change == "generation":
         with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
-            _preflight_active_attempts(experiment, report)
+            _preflight_active_attempts(experiment, report, confirm=True)
     elif identity_change in {"missing-attempt", "missing-generation"}:
         with pytest.raises(ProcessCleanupUncertainError, match="identity is missing") as exc_info:
-            _preflight_active_attempts(experiment, report)
+            _preflight_active_attempts(experiment, report, confirm=True)
         assert "Restore the original storage ledger" in str(exc_info.value)
         assert "before retrying recovery" in str(exc_info.value)
         assert report.uncertain_attempt_ids == {"old-attempt"}
     else:
-        _preflight_active_attempts(experiment, report)
+        _preflight_active_attempts(experiment, report, confirm=True)
 
     if identity_change is None:
         assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [0]
         assert report.recovered_attempt_ids == {"old-attempt"}
-        assert list(_iter_cleanup_uncertain_trials(study)) == []
+        assert (
+            _recover_cleanup_uncertain_trials(
+                study, experiment, experiment.phases[0].name, confirm=False
+            )
+            == 0
+        )
     else:
         assert CLEANUP_RECOVERED_TRIALS_ATTR not in study.user_attrs
         assert report.recovered_attempt_ids == set()
         with pytest.raises(ProcessCleanupUncertainError) as exc_info:
-            list(_iter_cleanup_uncertain_trials(study))
+            _recover_cleanup_uncertain_trials(
+                study, experiment, experiment.phases[0].name, confirm=False
+            )
         assert "Restore the original storage ledger" in str(exc_info.value)
     assert bool(list(_attempts_dir(experiment).glob("*.json"))) == (
         identity_change in {"generation", "missing-attempt", "missing-generation"}
@@ -1587,7 +1602,7 @@ def test_attempt_registry_refuses_unsafe_private_authority(
         entry_path.symlink_to(target)
 
     with pytest.raises(ProcessCleanupUncertainError, match="registry|entry"):
-        _inspect_active_attempts(experiment)
+        _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=False)
 
 
 def test_relative_registry_storage_recovers_from_the_registration_cwd(
@@ -1615,7 +1630,7 @@ def test_relative_registry_storage_recovers_from_the_registration_cwd(
 
     monkeypatch.chdir(recovery_cwd)
     report = _PreflightCleanupReport()
-    _preflight_active_attempts(experiment, report)
+    _preflight_active_attempts(experiment, report, confirm=True)
 
     # The journal backend reopens its file on every read, so a handle built on
     # the relative URL would now follow the new cwd; read the original ledger
@@ -1689,7 +1704,7 @@ def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) 
         generation_id="memory-generation",
     )
 
-    _preflight_active_attempts(experiment, _PreflightCleanupReport())
+    _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     assert not list(_attempts_dir(experiment).glob("*.json"))
 
@@ -1713,7 +1728,7 @@ def test_registry_generation_conflict_is_study_schema_mismatch(tmp_path: Path) -
     entry_path.write_text(json.dumps(entry))
 
     with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
-        _preflight_active_attempts(experiment, _PreflightCleanupReport())
+        _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
 
 @pytest.mark.integration
@@ -1822,7 +1837,7 @@ poll_wandb_summary(base_url="https://example.test", entity="e", project="p",
             }
         )
         report = _PreflightCleanupReport()
-        _preflight_active_attempts(removed, report)
+        _preflight_active_attempts(removed, report, confirm=True)
         assert report.cleanup_confirmed
         assert report.recovered_attempt_ids == {"remote-attempt"}
         assert study.get_trials()[number].state == optuna.trial.TrialState.FAIL
@@ -1861,7 +1876,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
     write_attempt_lifecycle(trial_dir, attempt_id="moved-attempt", state="allocated")
 
     report = _PreflightCleanupReport()
-    _preflight_active_attempts(_exp("new.journal"), report)
+    _preflight_active_attempts(_exp("new.journal"), report, confirm=True)
 
     assert old_study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
     assert not list((tmp_path / "runs" / "movedstorage" / "attempts").glob("*.json"))

@@ -1447,10 +1447,6 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         lambda _identity: cleanup_safe["value"],
     )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
-        lambda _identity: cleanup_safe["value"],
-    )
     with pytest.raises(ProcessCleanupUncertainError, match="cleanup could not be confirmed"):
         run_experiment(_exp(2))
 
