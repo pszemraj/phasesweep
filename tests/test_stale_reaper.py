@@ -53,13 +53,13 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
-    PHASE_ABORT_ATTR,
     PHASE_FINGERPRINT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
@@ -1967,7 +1967,9 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
     assert trial.state == optuna.trial.TrialState.FAIL
     assert trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "fatal"
     assert message in trial.user_attrs[TRIAL_OUTCOME_ATTR]["cause"]
-    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "active_attempt_persistence"
+    assert trial.user_attrs[TRIAL_OUTCOME_ATTR][TRIAL_OUTCOME_ABORT_KEY]["policy"] == (
+        "active_attempt_persistence"
+    )
 
     # Restoring writes does not erase the abort; a higher target explicitly recovers it.
     monkeypatch.setattr(attempts_mod, "private_atomic_write_text", real_atomic_write_text)

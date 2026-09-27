@@ -57,12 +57,12 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
-    PHASE_ABORT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
@@ -91,6 +91,7 @@ from tests.conftest import (
     write_flag_gated_trainer,
     write_param_echo_trainer,
     write_trainer,
+    write_trial_zero_trainer,
 )
 
 
@@ -890,7 +891,8 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
         run_experiment(exp)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    record = study.user_attrs[PHASE_ABORT_ATTR]
+    record = _load_phase_policy_state(study).abort
+    assert record is not None
     assert record["policy"] == "max_consecutive_failures"
     assert record["consecutive_failures"] == 2
 
@@ -1038,7 +1040,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
 
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
 
 
 @pytest.mark.integration
@@ -1082,51 +1084,40 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
         3,
         4,
     ]
-    assert study.user_attrs[PHASE_ABORT_ATTR]["consecutive_failures"] == 3
+    abort = _load_phase_policy_state(study).abort
+    assert abort is not None
+    assert abort["consecutive_failures"] == 3
     assert _last_successful_generation_path(_exp(4)).read_text() == published_before
 
 
 @pytest.mark.integration
-def test_outcome_ledger_recovers_when_abort_marker_write_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A failed marker write cannot make an identical retry publish."""
-    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
-    db = tmp_path / "abort.journal"
-    exp = make_experiment(
-        workdir=tmp_path / "runs",
-        storage=f"journal:///{db}",
-        trial_command=f"python {trainer} {{overrides}}",
-        override_format="argparse",
+def test_changing_the_failure_limit_never_reinterprets_recorded_outcomes(tmp_path: Path) -> None:
+    """``max_consecutive_failures`` governs new work, not outcomes already recorded.
+
+    The limit is a run control outside the phase fingerprint. Lowering it must
+    neither abort a completed phase nor leave state behind that restoring the
+    limit cannot undo.
+    """
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="raise SystemExit(1)")
+    original = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
         n_trials=2,
         max_consecutive_failures=2,
-        sampler={"type": "random", "seed": 7},
+        gpu_policy="none",
+    )
+    lowered = original.model_copy(
+        update={"phases": [original.phases[0].model_copy(update={"max_consecutive_failures": 1})]}
     )
 
-    real_set_user_attr = optuna.Study.set_user_attr
-    failed = {"once": False}
-
-    def fail_first_abort_marker(study: optuna.Study, key: str, value: object) -> None:
-        if key == PHASE_ABORT_ATTR and isinstance(value, dict) and not failed["once"]:
-            failed["once"] = True
-            raise RuntimeError("injected abort-marker write failure")
-        real_set_user_attr(study, key, value)
-
-    monkeypatch.setattr(optuna.Study, "set_user_attr", fail_first_abort_marker)
-    with pytest.raises(StudyStorageUnavailableError, match="abort marker could not be persisted"):
-        run_experiment(exp)
-
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
-    assert [trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for trial in study.trials] == [
-        "failure",
-        "failure",
-    ]
-
-    monkeypatch.setattr(optuna.Study, "set_user_attr", real_set_user_attr)
-    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
-        run_experiment(exp)
-    assert not _last_successful_generation_path(exp).exists()
+    first = run_experiment(original)
+    assert run_experiment(lowered)["p"].attempt_id == first["p"].attempt_id
+    study = optuna.load_study(
+        study_name="t::p", storage=_resolve_storage(original.resolved_storage)
+    )
+    assert _load_phase_policy_state(study).consecutive_failures == 1
+    assert _load_phase_policy_state(study).abort is None
+    assert run_experiment(original)["p"].attempt_id == first["p"].attempt_id
 
 
 def _outcome_write_experiment(
@@ -1451,7 +1442,8 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
         run_experiment(_exp(2))
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    record = study.user_attrs[PHASE_ABORT_ATTR]
+    record = _load_phase_policy_state(study).abort
+    assert record is not None
     assert record["policy"] == "unsafe_process_cleanup"
     assert "cleanup could not be confirmed" in record["cause"]
     unsafe_trial = next(
@@ -1497,17 +1489,17 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
 
 
 @pytest.mark.integration
-def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
+def test_recovered_abort_is_retired_before_selection_survives_selection_crash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The durable abort clear must precede winner selection.
+    """A top-up's recovery boundary retires the recorded abort before selection.
 
-    A top-up that died mid-selection used to leave the durable abort record
-    behind; the next identical invocation then reported "previously aborted"
-    and — for stateful samplers — rejected the advised raise-n_trials remedy
-    too, wedging the phase (review v0.5.17 gap hunt). Selection is
-    deterministic from durable trial data, so clearing first is safe: the
-    replay re-derives the same winner.
+    A top-up that died mid-selection used to leave the durable abort behind;
+    the next identical invocation then reported "previously aborted" and — for
+    stateful samplers — rejected the advised raise-n_trials remedy too,
+    wedging the phase (review v0.5.17 gap hunt). The boundary is durable
+    before any new trial runs, and selection is deterministic from durable
+    trial data, so the replay re-derives the same winner.
     """
     flag = tmp_path / "resume_enabled"
     trainer = write_flag_gated_trainer(tmp_path, flag)
@@ -1539,9 +1531,9 @@ def test_stale_abort_record_cleared_before_selection_survives_selection_crash(
     with pytest.raises(RuntimeError, match="simulated crash"):
         run_experiment(_exp(6))
 
-    # The durable abort was consumed before selection started...
+    # The recorded abort was retired before selection started...
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
 
     # ...so the identical replay republishes deterministically instead of
     # wedging on "previously aborted".
@@ -1559,6 +1551,9 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     finishing between two failures' callbacks could erase them. The decision
     now happens in the objective's completion-order critical section: with the
     success still sleeping, the abort must be tripped at completion sequence 2.
+    The abort is recorded with that outcome, so the success recorded after it
+    resets the replayed streak but not the decision, and an identical retry
+    stays refused instead of publishing the success.
     """
     trainer = write_trainer(
         tmp_path / "trainer.py",
@@ -1589,13 +1584,24 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
         run_experiment(exp)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
-    record = study.user_attrs[PHASE_ABORT_ATTR]
+    outcomes = sorted(
+        (trial.user_attrs[TRIAL_OUTCOME_ATTR] for trial in study.trials),
+        key=lambda outcome: outcome["sequence"],
+    )
+    assert [outcome["outcome"] for outcome in outcomes] == ["failure", "failure", "success"]
     # The abort was decided when the second failure recorded its outcome —
-    # before the sleeping success could reset the consecutive counter.
+    # before the sleeping success could reset the consecutive counter — and
+    # is written with that outcome.
+    record = outcomes[1][TRIAL_OUTCOME_ABORT_KEY]
     assert record["completion_sequence"] == 2
     assert record["consecutive_failures"] == 2
-    states = sorted(t.state.name for t in study.get_trials(deepcopy=False))
-    assert states == ["COMPLETE", "FAIL", "FAIL"]
+    replayed = _load_phase_policy_state(study)
+    assert replayed.consecutive_failures == 0
+    assert replayed.abort == record
+
+    with pytest.raises(NoFeasibleTrialError, match="previously aborted"):
+        run_experiment(exp)
+    assert not _last_successful_generation_path(exp).exists()
 
 
 @pytest.mark.parametrize(
@@ -1610,8 +1616,9 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
     """A restarted run reconstructs the same streak and trips live recording saw.
 
     After every recorded outcome, the live completion order must match what
-    ``_load_phase_policy_state`` replays from the durable outcome ledger, and
-    a recovery boundary must reset both to the same streak.
+    ``_load_phase_policy_state`` replays from the durable outcome ledger, the
+    first abort recorded must survive later outcomes, and a recovery boundary
+    must reset the streak and retire the abort.
     """
     experiment = make_experiment(max_consecutive_failures=2)
     phase = experiment.phases[0]
@@ -1627,17 +1634,22 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
         optimize_deadline=None,
         timeout_source=None,
     )
+    first_abort: dict[str, Any] | None = None
     for outcome in outcomes:
         trial = study.ask()
-        trial.set_user_attr(
-            TRIAL_OUTCOME_ATTR,
-            {
-                "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
-                "sequence": run.completion_sequence + 1,
-                "outcome": outcome,
-            },
-        )
+        abort = run.abort_decision(trial.number, outcome, cause=None, fatal_policy=None)
+        payload: dict[str, Any] = {
+            "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+            "sequence": run.completion_sequence + 1,
+            "outcome": outcome,
+        }
+        if abort is not None:
+            payload[TRIAL_OUTCOME_ABORT_KEY] = abort
+        trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
         tripped = run.advance(trial.number, outcome)
+        if abort is not None:
+            run.abort_recorded = True
+            first_abort = abort
         replayed = _load_phase_policy_state(study)
         assert run.completion_sequence == replayed.max_sequence
         assert run.consecutive_failures == replayed.consecutive_failures
@@ -1645,11 +1657,15 @@ def test_live_outcome_transition_agrees_with_durable_replay(outcomes: list[str])
             outcome == "fatal"
             or _consecutive_failure_threshold_tripped(replayed.consecutive_failures, phase)
         )
+        assert replayed.abort == first_abort
+    assert first_abort is not None
 
     _record_recovery_boundary(study, phase, run.completion_sequence)
-    run.resume_from(_load_phase_policy_state(study))
+    replayed = _load_phase_policy_state(study)
+    run.resume_from(replayed)
     assert run.completion_sequence == len(outcomes)
     assert run.consecutive_failures == 0
+    assert replayed.abort is None
 
 
 @pytest.mark.parametrize("n_jobs", [1, 2])
@@ -1697,7 +1713,7 @@ def test_unexpected_objective_error_is_phase_fatal_and_durable(
         if trial.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "fatal"
     )
     assert fatal["cause"] == "RuntimeError: injected objective implementation bug"
-    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unexpected_objective_exception"
+    assert fatal[TRIAL_OUTCOME_ABORT_KEY]["policy"] == "unexpected_objective_exception"
     assert not _last_successful_generation_path(exp).exists()
     assert list(_attempts_dir(exp).glob("*.json")) == []
 

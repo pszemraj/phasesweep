@@ -206,8 +206,14 @@ detection.
 Trial, phase, and experiment timeouts are cooperative run controls. On a
 trial timeout PhaseSweep terminates the supervised process group and records a
 terminal failed attempt after cleanup. The `max_consecutive_failures` threshold
-also stops a broken phase. When both stop the same phase short of its target,
-the timeout decides the outcome: with `allow_incomplete_on_timeout` the phase
+also stops a broken phase. The abort is recorded with the outcome that trips
+it, so a trial that succeeds afterwards cannot turn the phase back into a
+result, and a rerun stays refused until `n_trials` is raised. Changing
+`max_consecutive_failures` governs new work only: it never aborts a completed
+phase retroactively, and a resumed phase whose failure streak already meets
+the new limit launches nothing until `n_trials` or the limit is raised. When a
+timeout and the threshold both stop the same phase short of its target, the
+timeout decides the outcome: with `allow_incomplete_on_timeout` the phase
 publishes the winner its completed trials earned, and without it the run stops
 as a timeout, so a retry with a larger budget does not replay the failure
 abort. `n_trials` counts terminal attempts, so failed and pruned attempts

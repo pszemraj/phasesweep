@@ -17,7 +17,7 @@ from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import PHASE_ABORT_ATTR, PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
 from phasesweep.evidence import TrialContext
@@ -256,7 +256,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "cancelled"
     ]
     assert len(deadline_trials) == 1
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
     assert _load_phase_policy_state(study).consecutive_failures == 0
 
 
@@ -442,7 +442,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         study_name="refused_partial_timeout_abort::p",
         storage=_resolve_storage(exp.storage),
     )
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
     assert _load_phase_policy_state(study).consecutive_failures == 0
 
     # The operator's documented remedy is now viable: with a fresh/larger
@@ -494,13 +494,13 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
     assert exc_info.value.published_result_committed is False
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
     assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "cancelled"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
 
 
 @pytest.mark.parametrize("lease_timeout", [True, False])
@@ -753,7 +753,9 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
         run_experiment(experiment)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unexpected_objective_exception"
+    abort = _load_phase_policy_state(study).abort
+    assert abort is not None
+    assert abort["policy"] == "unexpected_objective_exception"
 
 
 @pytest.mark.integration

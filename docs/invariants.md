@@ -35,6 +35,9 @@ the MCP layer.
 5. A published result is read once, by publication validation. Consumers
    use PublicationPointer.validated and never reopen a published artifact
    by path.
+6. A phase abort is written with the outcome that trips it. Replay honors
+   recorded aborts and never re-derives one from the current
+   max_consecutive_failures, which governs new work only.
 ```
 
 > [!IMPORTANT]
@@ -285,7 +288,22 @@ before any terminal transition and raises
 `engine.phase._TrialOutcomeUnrecordedAbort` when it cannot\
 **Test:** `tests/test_runtime_behavior.py::test_persistent_outcome_write_failure_leaves_trial_running_until_recovery`
 
-#### 11. An unreadable ledger means cleanup is uncertain
+#### 11. An abort is recorded with the outcome that trips it
+
+A phase abort is written in the same record as the outcome that trips it, and
+replay honors the first abort recorded after the recovery boundary. A later
+success resets the failure streak but never a recorded abort, and a changed
+`max_consecutive_failures` governs new work only, never recorded outcomes.
+
+**Held by:** `engine.phase._record_outcome`, which writes the record
+`engine.phase._PhaseExecution.abort_decision` returns with the outcome;
+`engine.study_policy._load_phase_policy_state`, which replays it;
+`engine.phase._resume_phase`, which applies the current limit only before new
+work\
+**Tests:** `tests/test_runtime_behavior.py::test_parallel_failure_threshold_uses_completion_order`,
+`tests/test_runtime_behavior.py::test_changing_the_failure_limit_never_reinterprets_recorded_outcomes`
+
+#### 12. An unreadable ledger means cleanup is uncertain
 
 A ledger that cannot be read makes cleanup uncertain, never confirmed, and the
 attempt stays registered for a later retry. A journal's partial final record
@@ -303,7 +321,7 @@ which marks the cleanup report uncertain\
 
 ### Publication
 
-#### 12. Publication is a transaction
+#### 13. Publication is a transaction
 
 The generation's own summary and winners are read back and validated before
 `last_successful_generation.yaml` commits, a failure before the commit leaves
@@ -316,7 +334,7 @@ commit lands.
 write\
 **Test:** `tests/test_publication_transaction.py::test_shutdown_signal_during_publication_is_absorbed_until_committed`
 
-#### 13. A published result is read once
+#### 14. A published result is read once
 
 Validation reads every published artifact once, refusing symlinks and paths
 outside the generations root, and returns what it read. `show-winners`,
@@ -335,7 +353,7 @@ returning the `ValidatedPublication` that
 
 ### MCP runs
 
-#### 14. A PID alone is never authority
+#### 15. A PID alone is never authority
 
 A process is identified by PID, start time, and boot id together, and a
 differing boot id settles a reboot without signalling anything. A stale
@@ -351,7 +369,7 @@ cleanup uncertainty.
 `tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`,
 `tests/test_attempt_resolution.py::test_only_resolve_attempt_signals_a_stale_process_group`
 
-#### 15. A dead runner stays live until recovery decides
+#### 16. A dead runner stays live until recovery decides
 
 A dead runner with no terminal status stays in the live set until `recover-run`
 decides; liveness alone never concludes a run.
@@ -362,7 +380,7 @@ decides; liveness alone never concludes a run.
 
 ### Errors and fixtures
 
-#### 16. Wraps keep the operator's remediation
+#### 17. Wraps keep the operator's remediation
 
 Every operator-facing error declares one remediation, and a wrap preserves it
 instead of replacing it with the wrapper's own advice. Alternatives route the
@@ -382,7 +400,7 @@ own; unconfirmed cleanup adds recover-run after the repair.
 `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`,
 `tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`
 
-#### 17. Refusals are tested against a real ledger
+#### 18. Refusals are tested against a real ledger
 
 Refusals are tested against a ledger produced by the public API, and read
 paths run under a patch that records and raises on any file-backed storage
@@ -415,7 +433,7 @@ test that spawns a real process without the `integration` marker (see
 
 When a detached runner is SIGKILLed or the host crashes, the run handle
 survives with no terminal status. `RunStore.state` deliberately keeps that run
-live (invariant 15), because a dead runner with no status is indistinguishable
+live (invariant 16), because a dead runner with no status is indistinguishable
 from one whose trials are still being reaped, so the run holds one of the
 experiment's capacity slots and no later launch can proceed. `recover-run` is
 the only path that reads the durable evidence and decides. It opens studies

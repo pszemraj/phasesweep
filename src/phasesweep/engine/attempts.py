@@ -29,6 +29,7 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
 )
@@ -64,6 +65,8 @@ class _ParsedTrialOutcome:
     outcome: str
     cause: str | None
     policy: str | None
+    abort: dict[str, Any] | None
+    """The phase abort this outcome tripped, recorded with the outcome itself."""
 
 
 @dataclass
@@ -465,13 +468,41 @@ def _registry_attempt_record(entry: Mapping[str, Any], entry_path: Path) -> _Att
     )
 
 
+def _valid_abort_record(value: object, *, sequence: int) -> bool:
+    """Return whether the abort record stored with an outcome is well formed.
+
+    :param object value: Raw abort record carried by a terminal outcome.
+    :param int sequence: Completion sequence of the outcome that carries it.
+    :return bool: Whether the record names that sequence, a positive trial
+        target, and a non-empty policy and cause.
+    """
+    if not isinstance(value, dict):
+        return False
+    completion_sequence = value.get("completion_sequence")
+    trial_target = value.get("trial_target")
+    policy = value.get("policy")
+    cause = value.get("cause")
+    return (
+        value.get("schema_version") == 1
+        and type(completion_sequence) is int
+        and completion_sequence == sequence
+        and type(trial_target) is int
+        and trial_target >= 1
+        and isinstance(policy, str)
+        and bool(policy)
+        and isinstance(cause, str)
+        and bool(cause)
+    )
+
+
 def _parsed_trial_outcome(value: Any) -> _ParsedTrialOutcome | None:
     """Return the ordered outcome fields when a trial attr is well formed.
 
     :param Any value: Raw ``TRIAL_OUTCOME_ATTR`` user-attr value to validate.
     :return _ParsedTrialOutcome | None: Validated outcome, including the fatal
-        policy needed to distinguish cleanup uncertainty from ordinary errors;
-        ``None`` when the payload is malformed.
+        policy needed to distinguish cleanup uncertainty from ordinary errors
+        and the abort record a failure or fatal outcome tripped; ``None`` when
+        the payload is malformed.
     """
     if not isinstance(value, dict):
         return None
@@ -480,6 +511,7 @@ def _parsed_trial_outcome(value: Any) -> _ParsedTrialOutcome | None:
     outcome = value.get("outcome")
     cause = value.get("cause")
     policy = value.get("policy")
+    abort = value.get(TRIAL_OUTCOME_ABORT_KEY)
     if (
         schema_version != TRIAL_OUTCOME_SCHEMA_VERSION
         or type(sequence) is not int
@@ -489,6 +521,13 @@ def _parsed_trial_outcome(value: Any) -> _ParsedTrialOutcome | None:
         or (
             policy is not None and (outcome != "fatal" or not isinstance(policy, str) or not policy)
         )
+        or (
+            abort is not None
+            and (
+                outcome not in {"failure", "fatal"}
+                or not _valid_abort_record(abort, sequence=sequence)
+            )
+        )
     ):
         return None
     return _ParsedTrialOutcome(
@@ -496,6 +535,7 @@ def _parsed_trial_outcome(value: Any) -> _ParsedTrialOutcome | None:
         outcome=outcome,
         cause=cause,
         policy=policy,
+        abort=abort,
     )
 
 
@@ -523,9 +563,10 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
     """Persist a failure-policy outcome before marking a stale trial ``FAIL``.
 
     An objective may have written its outcome immediately before the
-    orchestrator died. Preserve a recorded fatal exception or explicit host
-    cancellation; convert a not-yet-committed success/prune to failure because
-    recovery is about to commit the trial as ``FAIL``. Malformed or duplicate
+    orchestrator died. Preserve a recorded failure, fatal exception, or explicit
+    host cancellation, with any abort it tripped; convert a not-yet-committed
+    success/prune to failure because recovery is about to commit the trial as
+    ``FAIL``. Recovery itself never records an abort decision. Malformed or duplicate
     records are replaced with a fresh sequence so current-schema validation
     can still diagnose any other corrupt row without stranding this stale
     process.
@@ -548,11 +589,13 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
     used_sequences = [parsed.sequence for parsed in parsed_by_trial.values()]
     existing = parsed_by_trial.get(trial.number)
     policy: str | None = None
+    abort: dict[str, Any] | None = None
     if existing is not None and used_sequences.count(existing.sequence) == 1:
         sequence = existing.sequence
         outcome = existing.outcome
         cause = existing.cause
         policy = existing.policy
+        abort = existing.abort
         if outcome not in {"failure", "fatal", "cancelled"}:
             outcome = "failure"
             cause = "orchestrator stopped before Optuna committed the terminal trial state"
@@ -571,6 +614,8 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
         payload["cause"] = cause
     if policy is not None:
         payload["policy"] = policy
+    if abort is not None:
+        payload[TRIAL_OUTCOME_ABORT_KEY] = abort
     try:
         active_trial = optuna.Trial(study, trial._trial_id)
         active_trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)

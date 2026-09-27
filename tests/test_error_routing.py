@@ -65,11 +65,14 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
-    PHASE_ABORT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ABORT_KEY,
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
+    TRIAL_TARGET_ATTR,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.wandb import require_wandb_sdk
@@ -105,9 +108,7 @@ from tests.recovery_helpers import load_only_recovery_needs
 
 # Classes proving the module sweep reached past the error modules themselves.
 # If an import ever stops happening, these vanish from the walk and say so.
-_SWEEP_WITNESSES = frozenset(
-    {"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError", "_PolicyStateWriteError"}
-)
+_SWEEP_WITNESSES = frozenset({"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError"})
 
 
 def _import_every_module() -> None:
@@ -1202,20 +1203,71 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     )
 
 
-def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Re-run a phase whose study durably aborted at its current trial target."""
-    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    phase = experiment.phases[0]
-    study = optuna.load_study(
+def _append_failure_outcomes(
+    study: optuna.Study, count: int, *, abort_for: Phase | None = None
+) -> None:
+    """Append failed trials after the study's last outcome, the last carrying an abort.
+
+    :param optuna.Study study: The golden fixture's phase study.
+    :param int count: Failed trials to append.
+    :param Phase | None abort_for: Phase whose consecutive-failure abort the last
+        appended outcome records, or ``None`` to record no abort.
+    """
+    trials = study.get_trials(deepcopy=False)
+    digest = trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR]
+    last = max(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials)
+    for sequence in range(last + 1, last + count + 1):
+        outcome: dict[str, object] = {
+            "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+            "sequence": sequence,
+            "outcome": "failure",
+        }
+        if abort_for is not None and sequence == last + count:
+            outcome[TRIAL_OUTCOME_ABORT_KEY] = _failure_policy_abort_record(
+                abort_for,
+                consecutive_failures=count,
+                completion_sequence=sequence,
+                trial_target=abort_for.n_trials,
+            )
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.FAIL,
+                user_attrs={TRAINER_ENV_DIGEST_ATTR: digest, TRIAL_OUTCOME_ATTR: outcome},
+            )
+        )
+
+
+def _fixture_study(experiment: Experiment) -> optuna.Study:
+    """Open the golden fixture's phase study for direct edits."""
+    return optuna.load_study(
         study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
     )
-    study.set_user_attr(
-        PHASE_ABORT_ATTR,
-        _failure_policy_abort_record(
-            phase, consecutive_failures=2, completion_sequence=2, trial_target=phase.n_trials
-        ),
-    )
-    return run_experiment(experiment)
+
+
+def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Re-run a phase whose outcome ledger recorded an abort at its current trial target."""
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    study = _fixture_study(experiment)
+    phase = experiment.phases[0].model_copy(update={"n_trials": 4})
+    _append_failure_outcomes(study, 2, abort_for=phase)
+    study.set_user_attr(TRIAL_TARGET_ATTR, 4)
+    return run_experiment(experiment.model_copy(update={"phases": [phase]}))
+
+
+def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resume, at its accepted target, a phase whose failure streak meets a lowered limit.
+
+    The fixture's trials carry the environment digest of the shell that generated
+    it, so preflight's cohort check (routed by ``environment_cohort_changed``) is
+    stubbed to keep this case independent of the ambient environment.
+    """
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    study = _fixture_study(experiment)
+    _append_failure_outcomes(study, 2)
+    study.set_user_attr(TRIAL_TARGET_ATTR, 5)
+    monkeypatch.setattr(guards, "_validate_environment_cohort", lambda study, digest: None)
+    phase = experiment.phases[0].model_copy(update={"n_trials": 5, "max_consecutive_failures": 2})
+    return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 
 
 def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1455,7 +1507,14 @@ ORIGIN_CASES = (
         trigger=_rerun_aborted_phase,
         raised=NoFeasibleTrialError,
         action=OperatorAction.FIX_CONFIG,
-        message="Increase n_trials above 2 to explicitly schedule new recovery attempts",
+        message="Increase n_trials above 4 to explicitly schedule new recovery attempts",
+    ),
+    RoutingCase(
+        id="failure_streak_at_limit",
+        trigger=_resume_with_streak_at_limit,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.FIX_CONFIG,
+        message="meets max_consecutive_failures=2, so it launches no more trials",
     ),
     RoutingCase(
         id="winner_incomplete_without_opt_in",

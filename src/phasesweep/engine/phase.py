@@ -50,7 +50,6 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     OVERRIDES_ATTR,
-    PHASE_ABORT_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
     RETURN_CODE_ATTR,
@@ -58,6 +57,7 @@ from phasesweep.engine.state import (
     TRAINER_ENV_NAMES_ATTR,
     TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
     Winner,
@@ -166,10 +166,6 @@ def _partial_completion_for_replay(
     )
 
 
-class _PolicyStateWriteError(StudyStorageUnavailableError):
-    """Raised when durable failure-policy state cannot be persisted."""
-
-
 class _DeadlineTrialExecutionError(TrialExecutionError):
     """Raised when a trial fails specifically because a run deadline expired."""
 
@@ -265,57 +261,6 @@ def _composed_overrides(
     return out
 
 
-def _active_phase_abort(
-    study: optuna.Study,
-    *,
-    recovered_abort_sequence: int | None,
-) -> dict[str, Any] | None:
-    """Return the validated active abort record, clearing a superseded marker.
-
-    :param optuna.Study study: Study whose ``PHASE_ABORT_ATTR`` user attr is
-        read and, when superseded, cleared.
-    :param int | None recovered_abort_sequence: Completion sequence of an
-        already-acknowledged recovery, or ``None``. When it equals the
-        persisted record's ``completion_sequence``, that record is cleared
-        and treated as superseded.
-    :raises StudySchemaMismatchError: The persisted attr is not a dict, or its
-        fields fail schema validation.
-    :return dict[str, Any] | None: The validated abort record, or ``None`` if
-        no abort is persisted or the persisted one was just superseded.
-    """
-    raw = study.user_attrs.get(PHASE_ABORT_ATTR)
-    if raw is None:
-        return None
-    if not isinstance(raw, dict):
-        raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has malformed {PHASE_ABORT_ATTR!r}={raw!r}. "
-            "Use a new experiment name, or archive/delete the inconsistent study."
-        )
-    sequence = raw.get("completion_sequence")
-    trial_target = raw.get("trial_target")
-    policy = raw.get("policy")
-    cause = raw.get("cause")
-    if (
-        raw.get("schema_version") != 1
-        or type(sequence) is not int
-        or sequence < 1
-        or type(trial_target) is not int
-        or trial_target < 1
-        or not isinstance(policy, str)
-        or not policy
-        or not isinstance(cause, str)
-        or not cause
-    ):
-        raise StudySchemaMismatchError(
-            f"Study {study.study_name!r} has malformed {PHASE_ABORT_ATTR!r} fields: "
-            f"{raw!r}. Use a new experiment name, or archive/delete the inconsistent study."
-        )
-    if recovered_abort_sequence == sequence:
-        study.set_user_attr(PHASE_ABORT_ATTR, None)
-        return None
-    return raw
-
-
 def _failure_policy_abort_record(
     phase: Phase,
     *,
@@ -334,7 +279,7 @@ def _failure_policy_abort_record(
     :param int trial_target: Durable accepted ``n_trials`` target to attach
         to the record.
     :return dict[str, Any]: A ``schema_version=1`` abort record ready to
-        persist as ``PHASE_ABORT_ATTR``.
+        record with the tripping outcome.
     """
     return {
         "schema_version": 1,
@@ -366,7 +311,7 @@ def _fatal_abort_record(
         to the record.
     :param str cause: Explanation the operator reads.
     :return dict[str, Any]: A ``schema_version=1`` abort record ready to
-        persist as ``PHASE_ABORT_ATTR``.
+        record with the fatal outcome.
     """
     return {
         "schema_version": 1,
@@ -382,7 +327,7 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: dict[str, Any]) -> None
 
     :param Phase phase: Phase whose accepted trial target is quoted in the
         message.
-    :param dict[str, Any] abort_record: Persisted abort record; supplies
+    :param dict[str, Any] abort_record: Recorded abort; supplies
         ``trial_target`` and ``cause``.
     :raises NoFeasibleTrialError: Always; this function never returns
         normally.
@@ -393,6 +338,26 @@ def _raise_prior_phase_abort(phase: Phase, abort_record: dict[str, Any]) -> None
         f"{abort_record['cause']} Refusing to reinterpret those terminal attempts as a "
         f"successful phase. Increase n_trials above {trial_target} to explicitly schedule "
         "new recovery attempts, or use a new experiment name.",
+        action=OperatorAction.FIX_CONFIG,
+    )
+
+
+def _raise_streak_at_limit(phase: Phase, consecutive_failures: int, trial_target: int) -> None:
+    """Refuse new work while the resumed failure streak meets the current limit.
+
+    :param Phase phase: Phase whose current ``max_consecutive_failures`` the
+        streak meets.
+    :param int consecutive_failures: Replayed consecutive-failure count.
+    :param int trial_target: Durable accepted ``n_trials`` target.
+    :raises NoFeasibleTrialError: Always; this function never returns
+        normally.
+    """
+    raise NoFeasibleTrialError(
+        f"Phase {phase.name!r} has {consecutive_failures} consecutive failed/infeasible "
+        f"trials, which meets max_consecutive_failures={phase.max_consecutive_failures}, so "
+        f"it launches no more trials at its accepted n_trials={trial_target}. Increase "
+        f"n_trials above {trial_target} to explicitly schedule new recovery attempts, raise "
+        "max_consecutive_failures, or use a new experiment name.",
         action=OperatorAction.FIX_CONFIG,
     )
 
@@ -419,17 +384,18 @@ def _resume_phase(
     Reaps stale trials, replays the failure policy from the durable outcomes,
     and verifies the phase fingerprint and trial target. An accepted
     partial-timeout decision at the current target replays as the phase's
-    winner. A durable abort, including one reconstructed from the outcome
-    ledger, is refused unless the raised ``n_trials`` authorizes recovering
-    from it.
+    winner. An abort recorded in the outcome ledger, or a replayed streak that
+    meets the current limit while work remains, is refused unless the raised
+    ``n_trials`` authorizes recovering from it.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being resumed.
     :param dict[str, Winner] inherited_winners: Winners loaded for phases
         earlier in the chain.
     :param optuna.Study study: The phase's live study.
-    :raises NoFeasibleTrialError: The phase aborted at an accepted target its
-        current ``n_trials`` does not exceed.
+    :raises NoFeasibleTrialError: The phase aborted, or its streak meets the
+        current limit with work remaining, at an accepted target its current
+        ``n_trials`` does not exceed.
     :raises TimeoutError: An accepted partial-timeout decision replays with
         no feasible trial.
     :raises StudySchemaMismatchError: Durable phase state is malformed or
@@ -450,9 +416,9 @@ def _resume_phase(
     partial_decision = _load_accepted_partial_decision(study)
     if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
         # This terminal decision is the authority even if a crash landed
-        # before the separate historical abort marker was cleared. Replay
-        # deterministic selection; never reinterpret the timeout's unused
-        # slots as permission to launch more trainers.
+        # before the timeout's recovery boundary consumed a recorded abort.
+        # Replay deterministic selection; never reinterpret the timeout's
+        # unused slots as permission to launch more trainers.
         completion = _partial_completion_for_replay(
             study,
             partial_decision,
@@ -472,35 +438,31 @@ def _resume_phase(
                 f"Phase {phase.name!r} hit its {partial_decision.timeout_scope} deadline "
                 "before any feasible trial could complete; no winner can be selected."
             ) from exc
-    accepted_target = _accepted_trial_target(study)
-    active_abort = _active_phase_abort(
-        study,
-        recovered_abort_sequence=policy_state.recovered_abort_sequence,
-    )
-    if active_abort is None and policy_state.fatal_trial_number is not None:
-        assert policy_state.fatal_sequence is not None
-        active_abort = _fatal_abort_record(
-            policy=policy_state.fatal_policy or "fatal_trial_exception",
-            completion_sequence=policy_state.fatal_sequence,
-            trial_target=accepted_target,
-            cause=(
-                f"trial {policy_state.fatal_trial_number} hit an unexpected fatal "
-                f"objective error: {policy_state.fatal_cause or 'no cause recorded'}"
-            ),
-        )
-        study.set_user_attr(PHASE_ABORT_ATTR, active_abort)
-    if active_abort is None and _consecutive_failure_threshold_tripped(
-        policy_state.consecutive_failures, phase
+    # An abort is the decision recorded with the outcome that tripped it, so a
+    # later success resetting the streak, or a changed max_consecutive_failures,
+    # never undoes it.
+    active_abort = policy_state.abort
+    if active_abort is not None and phase.n_trials <= active_abort["trial_target"]:
+        _raise_prior_phase_abort(phase, active_abort)
+    if (
+        active_abort is None
+        and _finished_trial_count(study.get_trials(deepcopy=False)) < phase.n_trials
+        and _consecutive_failure_threshold_tripped(policy_state.consecutive_failures, phase)
     ):
+        # The current limit governs new work only. A replayed streak that
+        # already meets it (failures recovered from a stopped orchestrator, or
+        # a lowered limit) launches nothing until n_trials is raised. Nothing is
+        # recorded here, so a phase with no work left publishes, and restoring
+        # the limit restores the phase.
+        accepted_target = _accepted_trial_target(study)
+        if phase.n_trials <= accepted_target:
+            _raise_streak_at_limit(phase, policy_state.consecutive_failures, accepted_target)
         active_abort = _failure_policy_abort_record(
             phase,
             consecutive_failures=policy_state.consecutive_failures,
             completion_sequence=policy_state.max_sequence,
             trial_target=accepted_target,
         )
-        study.set_user_attr(PHASE_ABORT_ATTR, active_abort)
-    if active_abort is not None and phase.n_trials <= active_abort["trial_target"]:
-        _raise_prior_phase_abort(phase, active_abort)
     return _PhaseResume(
         policy_state=policy_state,
         phase_fingerprint=phase_fingerprint,
@@ -576,6 +538,7 @@ class _PhaseExecution:
     # Shared by the consecutive-failure and fatal-error paths. Queued
     # objectives check it inside the GPU lease and prune before launching.
     aborted: bool = False
+    # Set once an outcome carrying this execution's abort record is durable.
     abort_recorded: bool = False
     deadline_exhausted: bool = False
     # Optuna's threaded optimize path can log an uncaught objective exception,
@@ -595,6 +558,48 @@ class _PhaseExecution:
         """
         self.completion_sequence = policy_state.max_sequence
         self.consecutive_failures = policy_state.consecutive_failures
+
+    def abort_decision(
+        self,
+        trial_number: int,
+        outcome: str,
+        *,
+        cause: str | None,
+        fatal_policy: str | None,
+    ) -> dict[str, Any] | None:
+        """Return the abort record that recording ``outcome`` next would trip.
+
+        Changes nothing: the caller holds ``outcome_lock`` and writes the
+        record with the outcome, before :meth:`advance` applies it, so the
+        decision is exactly as durable as the outcome. Only the phase
+        execution's first abort is recorded.
+
+        :param int trial_number: Trial whose outcome is about to be recorded.
+        :param str outcome: The terminal outcome about to be recorded.
+        :param str | None cause: The outcome's recorded cause, if any.
+        :param str | None fatal_policy: The fatal policy of a ``"fatal"`` outcome.
+        :return dict[str, Any] | None: The abort record for the outcome's
+            completion sequence, or ``None`` when it trips nothing new.
+        """
+        if self.abort_recorded:
+            return None
+        sequence = self.completion_sequence + 1
+        if outcome == "fatal":
+            return _fatal_abort_record(
+                policy=fatal_policy or "fatal_trial_exception",
+                completion_sequence=sequence,
+                trial_target=self.phase.n_trials,
+                cause=cause or f"trial {trial_number} hit a fatal objective error",
+            )
+        streak = _next_consecutive_failures(self.consecutive_failures, outcome)
+        if self.aborted or not _consecutive_failure_threshold_tripped(streak, self.phase):
+            return None
+        return _failure_policy_abort_record(
+            self.phase,
+            consecutive_failures=streak,
+            completion_sequence=sequence,
+            trial_target=self.phase.n_trials,
+        )
 
     def advance(self, trial_number: int, outcome: str) -> bool:
         """Apply one durably recorded outcome in completion order.
@@ -694,17 +699,15 @@ def _record_outcome(
     here — the order objective threads pass through ``run.outcome_lock`` —
     not trial-number order. The per-trial outcome is written before the
     counter changes or the objective returns, so a restarted process can
-    reconstruct the same streak. Any persistence failure aborts this
-    invocation; it is never downgraded to a warning. The two writes fail
-    differently on purpose: the trial ledger row must exist before Optuna
-    can be allowed to commit any terminal state for the trial, while the
-    phase abort marker is written after that row is already durable and
-    can therefore be reconstructed from it on the next run.
+    reconstruct the same streak. An outcome that trips the phase's first
+    abort carries that abort record in the same write, so the decision is
+    exactly as durable as the outcome: a later peer success resets the
+    streak but never the recorded abort. Any persistence failure aborts this
+    invocation; it is never downgraded to a warning.
 
     A no-op if ``trial.number`` is already in ``run.recorded_outcomes``.
-    Advances ``run`` through :meth:`_PhaseExecution.advance` and — once a
-    threshold or fatal outcome trips — stops launches and, the first time
-    only, persists an abort record to the study's ``PHASE_ABORT_ATTR``.
+    Advances ``run`` through :meth:`_PhaseExecution.advance` and, once a
+    threshold or fatal outcome trips, stops launches.
 
     Args:
         run: The phase execution the outcome belongs to.
@@ -722,9 +725,6 @@ def _record_outcome(
             be persisted, even after ``_OUTCOME_WRITE_ATTEMPTS`` tries.
             The fatal-abort slot is set first, and the trial is left
             ``RUNNING`` for stale-attempt recovery.
-        _PolicyStateWriteError: The phase abort marker could not be
-            persisted. This trial's outcome row is already durable, so the
-            next run reconstructs the abort from the ledger.
 
     """
     # INVARIANT: no terminal Optuna row may exist without its outcome
@@ -747,6 +747,9 @@ def _record_outcome(
         with run.outcome_lock:
             if trial.number in run.recorded_outcomes:
                 return
+            abort_record = run.abort_decision(
+                trial.number, outcome, cause=cause, fatal_policy=fatal_policy
+            )
             payload: dict[str, Any] = {
                 "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
                 "sequence": run.completion_sequence + 1,
@@ -756,6 +759,8 @@ def _record_outcome(
                 payload["cause"] = cause
             if fatal_policy is not None:
                 payload["policy"] = fatal_policy
+            if abort_record is not None:
+                payload[TRIAL_OUTCOME_ABORT_KEY] = abort_record
             try:
                 trial.set_user_attr(TRIAL_OUTCOME_ATTR, payload)
             except Exception as exc:
@@ -766,33 +771,8 @@ def _record_outcome(
             if not run.advance(trial.number, outcome):
                 return
             run.stop_launches()
-            if run.abort_recorded:
+            if abort_record is None:
                 return
-            if outcome == "fatal":
-                abort_record = _fatal_abort_record(
-                    policy=fatal_policy or "fatal_trial_exception",
-                    completion_sequence=run.completion_sequence,
-                    trial_target=run.phase.n_trials,
-                    cause=cause or f"trial {trial.number} hit a fatal objective error",
-                )
-            else:
-                abort_record = _failure_policy_abort_record(
-                    run.phase,
-                    consecutive_failures=run.consecutive_failures,
-                    completion_sequence=run.completion_sequence,
-                    trial_target=run.phase.n_trials,
-                )
-            try:
-                run.study.set_user_attr(PHASE_ABORT_ATTR, abort_record)
-            except Exception as exc:
-                error = _PolicyStateWriteError(
-                    f"Trial {trial.number} durably recorded completion sequence "
-                    f"{run.completion_sequence}, but the phase abort marker could not be "
-                    "persisted. Refusing to continue; the durable outcome ledger will "
-                    "reconstruct the abort on the next run."
-                )
-                run.record_fatal(error)
-                raise error from exc
             run.abort_recorded = True
             break
     if write_error is not None:
@@ -1081,9 +1061,6 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         # ``_execute_objective`` needs the guard: the same abort raised
         # from inside a sibling handler already bypasses the rest.
         raise
-    except _PolicyStateWriteError as exc:
-        run.record_fatal(exc)
-        raise
     except optuna.TrialPruned as exc:
         _record_outcome(run, trial, "pruned", cause=str(exc))
         raise
@@ -1248,11 +1225,11 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
             "terminal trials without an accepted timeout; refusing to publish "
             "an incomplete winner."
         )
-    persisted_abort = study.user_attrs.get(PHASE_ABORT_ATTR)
+    current_policy_state = _load_phase_policy_state(study)
+    recorded_abort = current_policy_state.abort
     if accepted_partial_timeout:
-        current_policy_state = _load_phase_policy_state(study)
         recovered_abort_sequence = (
-            persisted_abort["completion_sequence"] if persisted_abort is not None else None
+            recorded_abort["completion_sequence"] if recorded_abort is not None else None
         )
         # This is the terminal-decision transaction boundary. If the write
         # fails, selection/publication never starts and a retry may spend a
@@ -1271,17 +1248,13 @@ def _finish_phase(run: _PhaseExecution, *, phase_fingerprint: str) -> Winner:
                 "recovered_abort_sequence": recovered_abort_sequence,
             },
         )
-    if persisted_abort is not None:
+    if recorded_abort is not None and timed_out_incomplete:
         # A deadline takes precedence over a failure streak whether or not the
         # operator accepts a partial winner. Record that the timeout consumed
         # this exact abort before either selection or TimeoutError: otherwise
         # the documented remedy for a refused partial result (retry with a
-        # larger timeout) would reconstruct and raise the stale failure abort.
-        if timed_out_incomplete:
-            _record_recovery_boundary(study, phase, persisted_abort["completion_sequence"])
-        # Clear before selection. Selection is deterministic from durable
-        # trial data, so a crash during it re-derives the same winner.
-        study.set_user_attr(PHASE_ABORT_ATTR, None)
+        # larger timeout) would replay the recorded failure abort.
+        _record_recovery_boundary(study, phase, recorded_abort["completion_sequence"])
     if timed_out_incomplete and not phase.allow_incomplete_on_timeout:
         raise TimeoutError(
             f"Phase {phase.name!r} timed out via {run.timeout_source or 'wallclock'} guard "
@@ -1483,12 +1456,9 @@ def _run_phase(
         # once the larger target is durable.
         study.set_user_attr(PHASE_DECISION_ATTR, None)
     if resume.recovery_abort is not None:
+        # The boundary retires the recorded abort and starts a new streak, so
+        # this execution's own first abort is recorded afresh.
         _record_recovery_boundary(study, phase, resume.recovery_abort["completion_sequence"])
-        # The recovery boundary is durable before the marker is cleared. If
-        # clearing fails or this process dies here, the next invocation sees
-        # that this exact abort was already acknowledged and safely retries
-        # the clear instead of resetting the streak again.
-        study.set_user_attr(PHASE_ABORT_ATTR, None)
         run.resume_from(_load_phase_policy_state(study))
     try:
         try:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 import optuna
 
@@ -43,11 +43,9 @@ class _PhasePolicyState:
 
     max_sequence: int
     consecutive_failures: int
-    recovered_abort_sequence: int | None
-    fatal_trial_number: int | None
-    fatal_sequence: int | None
-    fatal_cause: str | None
-    fatal_policy: str | None
+    abort: dict[str, Any] | None
+    """The first abort recorded after the recovery boundary, if any. A later
+    outcome resets the streak but never this recorded decision."""
 
 
 def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
@@ -72,8 +70,10 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
 def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Phase) -> bool:
     """Return whether a phase's consecutive-failure abort threshold is met.
 
-    Shared by the live per-outcome check and the startup replay check so
-    both compare the same count against the same threshold.
+    Shared by the live per-outcome check and the check before a resumed
+    phase launches new work, so both compare the same count against the same
+    threshold. Replay never applies it to recorded outcomes: the abort each
+    outcome tripped is recorded with that outcome.
 
     :param int consecutive_failures: Current consecutive-failure count.
     :param Phase phase: Phase config supplying ``max_consecutive_failures``.
@@ -189,8 +189,7 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         per-trial outcome attrs are read and validated.
     :return _PhasePolicyState: Reconstructed state: the highest recorded
         outcome sequence, the consecutive-failure count since the last
-        recovery boundary, the recovered abort sequence (if any), and the
-        first fatal trial's number/sequence/cause (if any).
+        recovery boundary, and the first abort recorded after it (if any).
     :raises StudySchemaMismatchError: ``PHASE_RECOVERY_ATTR`` or a terminal
         trial's outcome attr is malformed, two trials share a completion
         sequence, or the recovery boundary exceeds the largest recorded
@@ -198,7 +197,6 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     """
     recovery = study.user_attrs.get(PHASE_RECOVERY_ATTR)
     recovery_boundary = 0
-    recovered_abort_sequence: int | None = None
     if recovery is not None:
         if not isinstance(recovery, dict):
             raise _phase_policy_schema_error(
@@ -222,9 +220,8 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
                 study, f"{PHASE_RECOVERY_ATTR!r} has malformed fields: {recovery!r}"
             )
         recovery_boundary = raw_recovery_boundary
-        recovered_abort_sequence = raw_recovered_abort_sequence
 
-    events: list[tuple[int, int, str, str | None, str | None]] = []
+    events: list[tuple[int, str, dict[str, Any] | None]] = []
     seen_sequences: dict[int, int] = {}
     for trial in study.get_trials(deepcopy=False):
         raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
@@ -238,9 +235,6 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         if parsed is None:
             continue
         sequence = parsed.sequence
-        outcome = parsed.outcome
-        cause = parsed.cause
-        policy = parsed.policy
         other_trial = seen_sequences.get(sequence)
         if other_trial is not None:
             raise _phase_policy_schema_error(
@@ -248,9 +242,9 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
                 f"trials {other_trial} and {trial.number} both use completion sequence {sequence}",
             )
         seen_sequences[sequence] = trial.number
-        events.append((sequence, trial.number, outcome, cause, policy))
+        events.append((sequence, parsed.outcome, parsed.abort))
 
-    events.sort()
+    events.sort(key=lambda event: event[0])
     max_sequence = events[-1][0] if events else 0
     if recovery_boundary > max_sequence:
         raise _phase_policy_schema_error(
@@ -260,28 +254,18 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         )
 
     consecutive_failures = 0
-    fatal_trial_number: int | None = None
-    fatal_sequence: int | None = None
-    fatal_cause: str | None = None
-    fatal_policy: str | None = None
-    for sequence, trial_number, outcome, cause, policy in events:
+    abort: dict[str, Any] | None = None
+    for sequence, outcome, recorded_abort in events:
         if sequence <= recovery_boundary:
             continue
         consecutive_failures = _next_consecutive_failures(consecutive_failures, outcome)
-        if outcome == "fatal" and fatal_trial_number is None:
-            fatal_trial_number = trial_number
-            fatal_sequence = sequence
-            fatal_cause = cause
-            fatal_policy = policy
+        if abort is None:
+            abort = recorded_abort
 
     return _PhasePolicyState(
         max_sequence=max_sequence,
         consecutive_failures=consecutive_failures,
-        recovered_abort_sequence=recovered_abort_sequence,
-        fatal_trial_number=fatal_trial_number,
-        fatal_sequence=fatal_sequence,
-        fatal_cause=fatal_cause,
-        fatal_policy=fatal_policy,
+        abort=abort,
     )
 
 
@@ -294,9 +278,8 @@ def _record_recovery_boundary(
 
     Outcomes recorded up to the study's current largest sequence stop counting
     toward the consecutive-failure streak that :func:`_load_phase_policy_state`
-    replays, and the abort at ``recovered_abort_sequence`` is known to be
-    consumed, so a later run clears its marker instead of raising it again.
-    The caller clears ``PHASE_ABORT_ATTR`` only after this write is durable.
+    replays, and an abort recorded with any of them stops being the phase's
+    active abort. The record names the consumed abort for the audit trail.
 
     :param optuna.Study study: Study whose recovery boundary is written.
     :param Phase phase: Phase whose ``n_trials`` the recovery runs toward.

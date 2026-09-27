@@ -144,15 +144,17 @@ GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 3
+STUDY_SCHEMA_VERSION = 4
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
-# after a restart. Every terminal trial in a current-schema study has one.
+# after a restart. Every terminal trial in a current-schema study has one. The
+# outcome that trips a phase abort carries that abort record under
+# ``TRIAL_OUTCOME_ABORT_KEY``, so the decision is as durable as the outcome and
+# a restarted orchestrator cannot reinterpret the same terminal trials as a
+# completed phase.
 TRIAL_OUTCOME_ATTR = "phasesweep_trial_outcome"
 TRIAL_OUTCOME_SCHEMA_VERSION = 1
-# Durable phase-abort record. A restarted orchestrator cannot reinterpret the
-# same terminal trials as a completed phase.
-PHASE_ABORT_ATTR = "phasesweep_phase_abort"
+TRIAL_OUTCOME_ABORT_KEY = "abort"
 # Durable boundary established when the operator explicitly raises n_trials
 # after an abort. Outcomes through this sequence belong to the aborted attempt;
 # later failures form the new recovery streak.

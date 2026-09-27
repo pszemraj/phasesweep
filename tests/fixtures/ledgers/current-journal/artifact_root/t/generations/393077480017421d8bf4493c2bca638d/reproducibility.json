@@ -5,7 +5,7 @@
     "sha256": "6c4ffb5ca8ab8302a7a72e58dedcc9d7c53a0fde5ed3b724456e7ce162773c54"
   },
   "experiment": "t",
-  "generation_id": "efd6a5955a4e4af0885629f9bc85c284",
+  "generation_id": "393077480017421d8bf4493c2bca638d",
   "generation_id_source": "engine",
   "phase_config_fingerprints": [
     {
@@ -13,7 +13,7 @@
       "sha256": "8fafcf3620928b3e6a68034eb691d8321e814371772d75e97c79d666c544a2d0"
     }
   ],
-  "phasesweep_version": "0.3.2.dev1+gb9933cc87",
+  "phasesweep_version": "0.3.3",
   "provenance": {
     "revision": "golden-fixture-v1"
   },
@@ -23,6 +23,6 @@
     "generation_summary": 3,
     "phase_fingerprint": 6,
     "reproducibility": 2,
-    "study_storage": 3
+    "study_storage": 4
   }
 }
