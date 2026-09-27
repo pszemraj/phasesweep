@@ -203,6 +203,8 @@ def _validate_generation_manifest(
     generation_dir: Path,
     generation_id: str,
     summary: Mapping[str, Any],
+    *,
+    validated: dict[str, ValidatedPublication | None] | None = None,
 ) -> ValidatedPublication:
     """Validate one generation's complete result graph against its summary manifest.
 
@@ -225,19 +227,29 @@ def _validate_generation_manifest(
     blocker 7): the cited namespace holds the evidence behind the number, so a
     publication whose source generation is absent - or which disagrees with the
     winner that source published - is not a result this tree can stand behind.
+    The provenance graph shares ancestors, so one top-level call validates
+    each generation it reaches at most once, through ``validated``.
 
     :param Path generation_dir: The generation's immutable namespace directory.
     :param str generation_id: Generation id the summary must belong to (used
         for error text and to tell a carried-forward winner from a local one;
         ownership is checked by the caller).
     :param Mapping[str, Any] summary: Parsed generation summary payload.
+    :param dict[str, ValidatedPublication | None] | None validated: Generations
+        this top-level call has validated, keyed by id, with ``None`` for one
+        still being validated. Only the recursive source check passes it; the
+        default starts a fresh map, so a later read sees any change on disk.
     :raises PublicationAccessError: An artifact cannot be read by the current user.
     :raises PublicationIntegrityError: The manifest is missing, malformed, any artifact is
-        absent, altered, unparsable, or inconsistent with the summary, or a
-        winner cites a source generation this tree does not hold.
+        absent, altered, unparsable, or inconsistent with the summary, a
+        winner cites a source generation this tree does not hold, or the
+        provenance graph loops back on a generation still being validated.
     :return ValidatedPublication: The summary, its phase plan and metric
         semantics, and every winner exactly as this validation read it.
     """
+    if validated is None:
+        validated = {}
+    validated[generation_id] = None
 
     def _fail(reason: str) -> PublicationIntegrityError:
         """Build one uniformly labeled manifest-validation error.
@@ -413,6 +425,7 @@ def _validate_generation_manifest(
                 payload,
                 _fail,
                 _permission_fail,
+                validated,
             )
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
@@ -426,13 +439,15 @@ def _validate_generation_manifest(
                 raise _fail(
                     f"namespace contains an unlisted winner artifact for phase {phase_dir.name!r}"
                 )
-    return ValidatedPublication(
+    result = ValidatedPublication(
         generation_id=generation_id,
         summary=summary,
         phase_plan=phase_plan,
         metric=metric,
         winners=winners,
     )
+    validated[generation_id] = result
+    return result
 
 
 def _validate_winner_source_generation(
@@ -443,6 +458,7 @@ def _validate_winner_source_generation(
     payload: Mapping[str, Any],
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
+    validated: dict[str, ValidatedPublication | None],
 ) -> None:
     """Validate a carried winner against its source in this tree.
 
@@ -466,6 +482,12 @@ def _validate_winner_source_generation(
     same-tree invariant, and the summary carve-out still catches a published
     source that lost its winner record.
 
+    A published source is validated once per top-level call and its cited
+    winner is taken from that validation, so the bytes compared are the bytes
+    its manifest hashed. A source still being validated means the provenance
+    graph loops, which fails closed. An unpublished source has no manifest, so
+    its winner file, when present, is read and parsed directly.
+
     :param Path generation_dir: The publishing generation's namespace directory.
     :param str generation_id: The publishing generation's own id.
     :param str phase_name: Phase exposing the winner being validated.
@@ -477,10 +499,15 @@ def _validate_winner_source_generation(
         uniformly labeled manifest-validation error.
     :param Callable[[str], PublicationAccessError] permission_fail: Builder for
         a permission-specific validation error.
-    :raises PublicationAccessError: The source winner cannot be read by the current user.
+    :param dict[str, ValidatedPublication | None] validated: The top-level
+        call's map of validated generations, shared with
+        :func:`_validate_generation_manifest`.
+    :raises PublicationAccessError: The source winner or summary cannot be read by the
+        current user.
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when the cited source
         generation is unsafely named, absent from this tree, has a damaged
-        published manifest, or recorded a different winning result.
+        published manifest, recorded a different winning result, or is a
+        generation this same call is already validating (a provenance cycle).
     """
     source_generation = payload["generation_id"]
     if source_generation == generation_id:
@@ -499,8 +526,10 @@ def _validate_winner_source_generation(
             f"{source_generation!r} which does not exist in this tree"
         )
     source_winner_path = source_dir / "phases" / phase_name / WINNER_FILENAME
+    source_summary_path = source_dir / GENERATION_SUMMARY_FILENAME
+    source_is_published = source_summary_path.is_file()
     if not source_winner_path.is_file():
-        if (source_dir / GENERATION_SUMMARY_FILENAME).is_file():
+        if source_is_published:
             raise fail(
                 f"winner for phase {phase_name!r} cites source generation "
                 f"{source_generation!r}, which published but holds no winner record "
@@ -508,63 +537,87 @@ def _validate_winner_source_generation(
             )
         # Unpublished source namespace: the crash-recovery case above.
         return
-    try:
-        content = _read_unlinked_bytes(source_winner_path, root=generation_dir.parent)
-    except PermissionError as exc:
-        raise permission_fail(
-            _unreadable_artifact_permission_detail(
-                f"source generation {source_generation!r} winner artifact for phase {phase_name!r}"
+
+    if source_is_published:
+        if source_generation in validated:
+            cached = validated[source_generation]
+            if cached is None:
+                raise fail(
+                    f"winner for phase {phase_name!r} cites source generation "
+                    f"{source_generation!r}, which is already on this provenance path "
+                    f"(provenance cycle through {generation_id!r} and {source_generation!r})"
+                )
+            validated_source = cached
+        else:
+            try:
+                source_summary = yaml.safe_load(
+                    _read_unlinked_bytes(source_summary_path, root=generation_dir.parent)
+                )
+            except PermissionError as exc:
+                raise permission_fail(
+                    _unreadable_artifact_permission_detail(
+                        f"source generation {source_generation!r} summary"
+                    )
+                ) from exc
+            except (OSError, ValueError, yaml.YAMLError) as exc:
+                raise fail(
+                    f"source generation {source_generation!r} summary is unreadable or invalid"
+                ) from exc
+            if not isinstance(source_summary, Mapping):
+                raise fail(f"source generation {source_generation!r} summary is not a mapping")
+            if source_summary.get("experiment") != expected_experiment:
+                raise fail(
+                    f"source generation {source_generation!r} summary names a different experiment"
+                )
+            if source_summary.get("generation_id") != source_generation:
+                raise fail(
+                    f"source generation {source_generation!r} summary names a different generation"
+                )
+            try:
+                validated_source = _validate_generation_manifest(
+                    source_dir, source_generation, source_summary, validated=validated
+                )
+            except PublicationAccessError as exc:
+                raise permission_fail(str(exc)) from exc
+            except PublicationIntegrityError as exc:
+                raise fail(
+                    f"source generation {source_generation!r} does not validate: {exc}"
+                ) from exc
+        source_winner = validated_source.winners.get(phase_name)
+        if source_winner is None:
+            raise fail(
+                f"winner for phase {phase_name!r} cites source generation "
+                f"{source_generation!r}, which published but holds no winner record "
+                f"for source phase {phase_name!r}"
             )
-        ) from exc
-    except OSError as exc:
-        raise fail(
-            f"source generation {source_generation!r} winner artifact for phase "
-            f"{phase_name!r} is missing or unreadable"
-        ) from exc
-    try:
-        source_payload = yaml.safe_load(content)
-    except (ValueError, yaml.YAMLError) as exc:
-        raise fail(
-            f"source generation {source_generation!r} winner artifact for phase "
-            f"{phase_name!r} is not parseable"
-        ) from exc
-    if not isinstance(source_payload, Mapping):
-        raise fail(
-            f"source generation {source_generation!r} winner artifact for phase "
-            f"{phase_name!r} is not a mapping"
-        )
-    source_summary_path = source_dir / GENERATION_SUMMARY_FILENAME
-    if source_summary_path.is_file():
+        source_payload = source_winner.payload
+    else:
+        # Unpublished source: no manifest vouches for its winner, so read it here.
         try:
-            source_summary = yaml.safe_load(
-                _read_unlinked_bytes(source_summary_path, root=generation_dir.parent)
-            )
+            content = _read_unlinked_bytes(source_winner_path, root=generation_dir.parent)
         except PermissionError as exc:
             raise permission_fail(
                 _unreadable_artifact_permission_detail(
-                    f"source generation {source_generation!r} summary"
+                    f"source generation {source_generation!r} winner artifact for phase {phase_name!r}"
                 )
             ) from exc
-        except (OSError, ValueError, yaml.YAMLError) as exc:
+        except OSError as exc:
             raise fail(
-                f"source generation {source_generation!r} summary is unreadable or invalid"
+                f"source generation {source_generation!r} winner artifact for phase "
+                f"{phase_name!r} is missing or unreadable"
             ) from exc
-        if not isinstance(source_summary, Mapping):
-            raise fail(f"source generation {source_generation!r} summary is not a mapping")
-        if source_summary.get("experiment") != expected_experiment:
-            raise fail(
-                f"source generation {source_generation!r} summary names a different experiment"
-            )
-        if source_summary.get("generation_id") != source_generation:
-            raise fail(
-                f"source generation {source_generation!r} summary names a different generation"
-            )
         try:
-            _validate_generation_manifest(source_dir, source_generation, source_summary)
-        except PublicationAccessError as exc:
-            raise permission_fail(str(exc)) from exc
-        except PublicationIntegrityError as exc:
-            raise fail(f"source generation {source_generation!r} does not validate: {exc}") from exc
+            source_payload = yaml.safe_load(content)
+        except (ValueError, yaml.YAMLError) as exc:
+            raise fail(
+                f"source generation {source_generation!r} winner artifact for phase "
+                f"{phase_name!r} is not parseable"
+            ) from exc
+        if not isinstance(source_payload, Mapping):
+            raise fail(
+                f"source generation {source_generation!r} winner artifact for phase "
+                f"{phase_name!r} is not a mapping"
+            )
     expected = {
         "phase": phase_name,
         "trial_number": payload.get("trial_number"),

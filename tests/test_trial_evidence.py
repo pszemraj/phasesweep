@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
@@ -24,6 +25,7 @@ import pytest
 import yaml
 
 import phasesweep.engine.evidence as evidence_ops
+import phasesweep.engine.publication_validation as validation_ops
 from phasesweep import run_experiment
 from phasesweep.config import (
     Constraint,
@@ -813,6 +815,127 @@ def _tree_with_a_carried_winner(tmp_path: Path) -> tuple[Experiment, str, str]:
     return experiment, source_generation, carrying_generation
 
 
+def _two_phase_evidence_experiment(tmp_path: Path) -> Experiment:
+    """Build a two-phase experiment on journal storage, both phases constant and seeded.
+
+    Both phases resolve the same constant trainer every trial, so a top-up
+    over persistent storage reselects each phase's trial 0 without launching
+    any new trial -- the shape needed for a later generation to carry both
+    phases' winners from the very same earlier generation.
+    """
+    trainer = write_constant_trainer(tmp_path)
+    return make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        phases=[
+            Phase(name="p", n_trials=1, sampler=Sampler(type="random", seed=0)),
+            Phase(name="q", n_trials=1, sampler=Sampler(type="random", seed=1)),
+        ],
+    )
+
+
+def _tree_with_two_carried_winners_from_one_source(tmp_path: Path) -> tuple[Experiment, str, str]:
+    """Publish a two-phase experiment twice, so both phases carry from the first generation.
+
+    The second (top-up) generation reselects both phases' already-completed
+    trials without launching new ones, so both of its winners cite the same
+    earlier, published source generation -- the shared-ancestor shape that
+    made per-path revalidation exponential in top-up history.
+
+    :return tuple[Experiment, str, str]: The experiment plus the source and
+        carrying generation ids.
+    """
+    experiment = _two_phase_evidence_experiment(tmp_path)
+    run_experiment(experiment)
+    source_generation = published_generation_id(experiment)
+    assert source_generation is not None
+    run_experiment(experiment)
+    carrying_generation = published_generation_id(experiment)
+    assert carrying_generation is not None
+    assert carrying_generation != source_generation
+    for phase_name in ("p", "q"):
+        payload = yaml.safe_load(
+            _generation_winner_path(experiment, carrying_generation, phase_name).read_text()
+        )
+        assert payload["winner_source"]["generation_id"] == source_generation
+    return experiment, source_generation, carrying_generation
+
+
+def test_shared_source_generation_is_validated_once_per_top_level_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two carried winners citing the same published source share one validation pass.
+
+    Revalidating a shared ancestor once per path that reaches it grows
+    exponentially with top-up history, so one top-level check reads every
+    artifact exactly once, and the next check still sees later damage.
+    """
+    experiment, source_generation, _carrying = _tree_with_two_carried_winners_from_one_source(
+        tmp_path
+    )
+
+    reads: Counter[Path] = Counter()
+    original_read = validation_ops._read_unlinked_bytes
+
+    def _counting_read(path: Path, *, root: Path) -> bytes:
+        reads[path] += 1
+        return original_read(path, root=root)
+
+    monkeypatch.setattr(validation_ops, "_read_unlinked_bytes", _counting_read)
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "ok"
+    repeated = {path: count for path, count in reads.items() if count != 1}
+    assert not repeated, f"artifact(s) read more than once by one top-level check: {repeated}"
+
+    # The shared map is scoped to that one top-level call, not cached across
+    # independent reads: damaging the shared source afterward must still be
+    # seen by the next read.
+    source_winner_path = _generation_winner_path(experiment, source_generation, "p")
+    winner = yaml.safe_load(source_winner_path.read_text())
+    winner["params"]["x"] = 999
+    source_winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+
+    pointer_after_damage = _resolve_publication_pointer(experiment)
+    assert pointer_after_damage.state == "failed"
+
+
+def test_carried_winners_source_citing_the_carrying_generation_fails_without_recursion(
+    tmp_path: Path,
+) -> None:
+    """A tampered tree whose source cites its own carrier fails, instead of recursing forever.
+
+    Coherently rewrites the older (source) generation's own published winner
+    to claim it was itself carried from the newer generation that in fact
+    carries a winner from it -- a two-generation provenance cycle. The
+    manifest fails closed instead of recursing without bound.
+    """
+    experiment, source_generation, carrying_generation = _tree_with_a_carried_winner(tmp_path)
+
+    winner_path = _generation_winner_path(experiment, source_generation, "p")
+    winner = yaml.safe_load(winner_path.read_text())
+    winner["generation_id"] = carrying_generation
+    winner["winner_source"]["generation_id"] = carrying_generation
+    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
+
+    summary_path = _generation_summary_path(experiment, source_generation)
+    summary = yaml.safe_load(summary_path.read_text())
+    phase_item = next(item for item in summary["phases"] if item["name"] == "p")
+    phase_item["generation_id"] = carrying_generation
+    phase_item["winner_source"]["generation_id"] = carrying_generation
+    artifact = next(
+        item
+        for item in summary["artifacts"]
+        if item.get("kind") == "winner" and item.get("phase") == "p"
+    )
+    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+
+    status = read_status(experiment)
+    assert status["publication_integrity"] == "failed"
+    assert "provenance cycle" in str(status["publication_error"])
+
+
 def test_deleting_a_carried_winners_source_generation_fails_read_and_write(
     tmp_path: Path,
 ) -> None:
@@ -853,7 +976,9 @@ def test_published_source_generation_damage_fails_integrity(tmp_path: Path, dama
         diagnostic = "published but holds no winner record"
     elif damage == "invalid_winner_yaml":
         winner_path.write_text("updated_at: 2026-99-99\n", encoding="utf-8")
-        diagnostic = "not parseable"
+        # The cited payload comes from the source's validated manifest, whose
+        # hash check catches the swapped file before anything parses it.
+        diagnostic = "does not match its recorded hash"
     elif damage == "invalid_summary_yaml":
         (source_dir / "summary.yaml").write_text("updated_at: 2026-99-99\n", encoding="utf-8")
         diagnostic = "summary is unreadable or invalid"
