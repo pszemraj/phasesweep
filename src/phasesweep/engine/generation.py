@@ -151,7 +151,7 @@ def _recorded_generation_state(record_path: Path) -> str | None:
     """
     try:
         payload = yaml.safe_load(record_path.read_text())
-    except (OSError, yaml.YAMLError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
     if not isinstance(payload, dict):
         return None

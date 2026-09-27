@@ -588,6 +588,38 @@ def test_generation_record_is_write_once(tmp_path: Path) -> None:
     assert _generation_record_path(experiment, generation_id).read_bytes() == first_content
 
 
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(b"\xff", id="invalid-utf8"),
+        pytest.param(b"state: published\nupdated_at: 2026-99-99\n", id="invalid-timestamp"),
+    ],
+)
+def test_record_refusal_logs_a_malformed_existing_record(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    contents: bytes,
+) -> None:
+    """A malformed existing record is refused and logged with no recorded state."""
+    experiment, generation_id = _golden_publication(tmp_path)
+    record_path = _generation_record_path(experiment, generation_id)
+    record_path.write_bytes(contents)
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.generation"):
+        generation_ops._write_generation_state(
+            experiment,
+            generation_id=generation_id,
+            state="failed",
+            from_phase=None,
+            publish_current=False,
+        )
+
+    assert record_path.read_bytes() == contents
+    refusals = [r for r in caplog.records if "Refusing to rewrite" in r.message]
+    assert len(refusals) == 1
+    assert "existing state None" in refusals[0].getMessage()
+
+
 @pytest.mark.integration
 def test_successful_publication_never_logs_a_record_refusal(
     tmp_path: Path,
