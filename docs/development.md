@@ -119,7 +119,7 @@ one's process group; a signal-0 liveness probe passes. A test that signals its
 own PID on purpose, to drive a shutdown handler, carries
 `@pytest.mark.signals_own_pid`, which lifts only that one target.
 
-GitHub Actions intentionally has one Linux pull-request static-check job for
+GitHub Actions intentionally has one Linux pull-request check job for
 Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier
 guard hook runs, and the three contract tests plus
 `tests/test_ledger_read_paths.py`, all imported from `src/` without building
