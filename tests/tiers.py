@@ -1,6 +1,6 @@
 """Static classifier that decides which tests belong to the integration tier.
 
-The fast review tier is ``pytest -m "not hardware and not integration"``. A test
+The fast review tier is ``pytest -m "not live and not integration"``. A test
 belongs to the integration tier when it manages real processes, waits on
 wall-clock time, drives a multi-step durable recovery workflow, or is otherwise
 slow. This module enforces the part of that rule a test's own source shows: a
@@ -108,7 +108,7 @@ SLEEP_IN_SOURCE_STRING = re.compile(r"\bsleep\(")
 SLOW_CALL_SECONDS = 1.0
 
 #: Markers that already keep a test out of the fast tier.
-TIER_MARKERS = frozenset({"integration", "hardware"})
+TIER_MARKERS = frozenset({"integration", "live"})
 
 _FunctionDef = ast.FunctionDef | ast.AsyncFunctionDef
 

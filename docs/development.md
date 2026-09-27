@@ -68,18 +68,31 @@ add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain
 
 ### Test tiers
 
-Plain `pytest` above is the authoritative non-hardware suite and stays the
-merge and release check. While iterating, two subsets are available:
+Plain `pytest` above is the authoritative suite and stays the merge and
+release check. While iterating, two subsets are available:
 
 ```bash
-pytest -m "not hardware and not integration"   # fast review tier
-pytest -m "integration and not hardware"       # integration tier only
+pytest -m "not live and not integration"   # fast review tier
+pytest -m "integration and not live"       # integration tier only
 ```
 
 > [!NOTE]
-> A `-m` on the command line *replaces* the `-m 'not hardware'` in `addopts`
+> A `-m` on the command line *replaces* the `-m 'not live'` in `addopts`
 > rather than adding to it, which is why both commands above spell out
-> `not hardware`.
+> `not live`.
+
+`@pytest.mark.live` tests use real host hardware or a live external service,
+so every run leaves them out unless `-m live` selects them. The W&B round
+trip in `tests/test_wandb_live.py` runs a two-phase W&B-only sweep with a
+pure-Python trainer. It checks the attempt-keyed remote captures,
+publication, inherited parameters, and a replay that reads no W&B state. It
+needs a project the current W&B credentials may write to, and skips without
+one:
+
+```bash
+PHASESWEEP_WANDB_ENTITY=YOUR_ENTITY PHASESWEEP_WANDB_PROJECT=YOUR_PROJECT \
+  pytest -m live tests/test_wandb_live.py
+```
 
 A test is `@pytest.mark.integration` when it manages real processes, waits on
 wall-clock time, drives a multi-step durable recovery workflow, or is otherwise
@@ -118,7 +131,7 @@ Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier
 guard hook runs, and the three contract tests plus
 `tests/test_ledger_read_paths.py`, all imported from `src/` without building
 the package. That test step runs on one Python version and stays within about
-20 seconds; the full suite stays local to control CI cost. Hardware tests remain opt-in.
+20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
 
 The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and
 read-only inspection behavior depends on that range; do not widen it without
@@ -126,48 +139,9 @@ targeted validation.
 
 The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's
 summary decoding and error behavior with controlled responses, plus supervised
-worker fixtures for deadlines, cleanup faults, and recovery. They do not certify
-live service access. Input tests use the real Hydra 1.3 parser and entrypoint;
-rendering itself has no Hydra runtime dependency.
-
-### Manual W&B-only training acceptance
-
-With PyTorch already available and access to an authorized W&B project, manually
-run the [acceptance driver](../scripts/accept_wandb_training.py) in a fresh
-temporary output directory:
-
-```bash
-python scripts/accept_wandb_training.py \
-  --entity YOUR_ENTITY --project YOUR_PROJECT \
-  --workdir /tmp/phasesweep-wandb-acceptance
-```
-
-To exercise one GPU lease across the same four sequential attempts, use a fresh
-work directory and select a host GPU:
-
-```bash
-python scripts/accept_wandb_training.py \
-  --entity YOUR_ENTITY --project YOUR_PROJECT \
-  --device cuda --gpu-id 0 \
-  --workdir /tmp/phasesweep-wandb-gpu-acceptance
-```
-
-This makes four sequential training runs on the selected device. The
-[standalone trainer](../examples/wandb_linear_train.py) fits one weight to
-`y = 2x` using 64 fixed examples and 20 full-batch SGD steps, then evaluates
-32 held-out examples. Phase one compares learning rates 0.01 and 0.1; phase two
-inherits the winner and compares weight decay 0 and 0.01. Its objective goes
-only to W&B; its parameter receipt remains parameters-only, and a separate
-device receipt confirms where the model and tensors executed. There is no
-PhaseSweep trainer import, objective mirror, or dataset download.
-
-The driver prints its launch budget, checks the four attempt identities,
-targets, finite measured scores, minimization, publication, consumed inherited
-parameters, and replay without more trials or remote reads. Trainer and poll
-caps are each 120 seconds, phase caps 600 seconds, and the experiment cap 1,200
-seconds; process cleanup grace remains separate. This manual service check is
-outside both the default suite and CI. Unavailable live access is a blocked
-acceptance result, not evidence of service readiness.
+worker fixtures for deadlines, cleanup faults, and recovery; only the live W&B
+round trip reaches the service. Input tests use the real Hydra 1.3 parser and
+entrypoint; rendering itself has no Hydra runtime dependency.
 
 ## Package map
 

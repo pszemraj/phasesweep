@@ -34,7 +34,7 @@ from phasesweep.runtime.gpu import (
 )
 from phasesweep.runtime.process import run_supervised
 
-# Bound before any monkeypatching so hardware tests can restore the real probe.
+# Bound before any monkeypatching so live tests can restore the real probe.
 _real_detect_gpu_inventory = _detect_gpu_inventory
 _real_detect_gpu_uuid_map = _detect_gpu_uuid_map
 _TEST_UUID_MAP = {str(index): f"GPU-test-{index}" for index in range(16)}
@@ -912,7 +912,7 @@ def test_pid_stamp_failure_releases_the_flock(monkeypatch) -> None:
     assert len(released) == 1
 
 
-@pytest.mark.hardware
+@pytest.mark.live
 @pytest.mark.skipif(shutil.which("nvidia-smi") is None, reason="nvidia-smi is not installed")
 def test_real_nvidia_smi_resolves_index_zero_to_a_uuid(monkeypatch) -> None:
     """On real GPU hardware, index 0 locks under the UUID nvidia-smi reports for it."""
