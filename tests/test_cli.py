@@ -918,29 +918,6 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
     assert not (tmp_path / "runs").exists()
 
 
-def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Lock contention is a failure, not a bug.
-
-    Runtime lock configuration goes through the real validator in the next test.
-    """
-    error = ExperimentLockBusyError("another experiment process holds the lock")
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, error)
-
-    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert str(error) in captured.err
-    assert "Traceback" not in captured.err
-    assert "internal error" not in captured.err
-
-
 def test_cli_boundary_classifies_relative_lock_directory_as_operational(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

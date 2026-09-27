@@ -1055,17 +1055,6 @@ def test_gpu_policy_whole_node_accepts_distinct_gpu_ids() -> None:
     assert phase.gpu_ids == [0, 1]
 
 
-def test_gpu_policy_whole_node_rejects_duplicate_gpu_devices() -> None:
-    with pytest.raises(ValueError, match="whole_node.*requires unique device tokens"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            gpu_policy="whole_node",
-            gpu_devices=["GPU-uuid-a", "GPU-uuid-a"],
-            search_space={"x": IntParam(type="int", low=0, high=1)},
-        )
-
-
 def test_gpu_policy_whole_node_rejects_duplicate_gpu_devices_after_stripping() -> None:
     """Whitespace is not a distinguishing feature: the runtime strips tokens
     before deduping, so the declared count must be counted post-strip too."""

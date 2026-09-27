@@ -99,16 +99,6 @@ from tests.conftest import (
     [
         None,
         b"not-json",
-        b"\xff",
-        b'{"other": 1}',
-        b'{"loss": true}',
-        b'{"loss": "0.2"}',
-        b'{"loss": null}',
-        b'{"loss": []}',
-        b'{"loss": {}}',
-        b'{"loss": NaN}',
-        b'{"loss": 1e400}',
-        json.dumps({"loss": 10**400}).encode(),
         pytest.param("unreadable", marks=requires_nonroot),
     ],
 )

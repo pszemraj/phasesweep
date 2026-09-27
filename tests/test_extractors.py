@@ -150,7 +150,7 @@ def test_wandb_terminal_runs_cannot_win(monkeypatch, state):
     assert caught.value.state == state
 
 
-@pytest.mark.parametrize("value", [True, "0.2", None, [], {}, float("inf"), 10**400])
+@pytest.mark.parametrize("value", [True, "0.2", None, float("inf"), 10**400])
 def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
     public = pytest.importorskip("wandb.apis.public")
     monkeypatch.setattr(

@@ -868,20 +868,7 @@ def test_cmaes_phase_rejected_at_config_load_when_package_missing(
     # any other import, and monkeypatch restores the real module after.
     monkeypatch.setitem(sys.modules, "cmaes", None)
 
-    with pytest.raises(ValidationError, match=r"cmaes.*not installed"):
-        make_experiment(
-            sampler=Sampler(type="cmaes", seed=0),
-            search_space={"x": IntParam(type="int", low=0, high=10)},
-        )
-
-
-def test_cmaes_missing_package_error_names_the_install_fix(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The rejection tells the operator exactly how to repair the environment."""
-    monkeypatch.setitem(sys.modules, "cmaes", None)
-
-    with pytest.raises(ValidationError) as excinfo:
+    with pytest.raises(ValidationError, match=r"cmaes.*not installed") as excinfo:
         make_experiment(
             sampler=Sampler(type="cmaes", seed=0),
             search_space={"x": IntParam(type="int", low=0, high=10)},

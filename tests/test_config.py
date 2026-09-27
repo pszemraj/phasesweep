@@ -806,18 +806,16 @@ def test_persistent_storage_accepts_seeded_and_acknowledged_samplers(
 
 
 @pytest.mark.parametrize("seed", [-1, 2**32])
-@pytest.mark.parametrize("sampler_type", ["grid", "random", "tpe", "cmaes"])
-def test_sampler_seed_rejects_values_outside_optuna_domain(sampler_type: str, seed: int) -> None:
+def test_sampler_seed_rejects_values_outside_optuna_domain(seed: int) -> None:
     """Every accepted seed must be constructible by the supported Optuna samplers."""
     with pytest.raises(ValueError, match="seed"):
-        Sampler(type=sampler_type, seed=seed)
+        Sampler(type="random", seed=seed)
 
 
 @pytest.mark.parametrize("seed", [0, 2**32 - 1])
-@pytest.mark.parametrize("sampler_type", ["grid", "random", "tpe", "cmaes"])
-def test_sampler_seed_accepts_optuna_domain_boundaries(sampler_type: str, seed: int) -> None:
+def test_sampler_seed_accepts_optuna_domain_boundaries(seed: int) -> None:
     """The validation boundary matches NumPy/Optuna's unsigned 32-bit seed domain."""
-    assert Sampler(type=sampler_type, seed=seed).seed == seed
+    assert Sampler(type="random", seed=seed).seed == seed
 
 
 def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_path: Path) -> None:

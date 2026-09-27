@@ -802,33 +802,15 @@ def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     assert len(finished) == 4, f"expected 4 trials after top-up, got {len(finished)}"
 
 
-@pytest.mark.parametrize(
-    ("sampler", "search_space"),
-    [
-        # These cases exist to exercise the stateful samplers on persistent
-        # storage, which requires the config-level non-resumable acknowledgement;
-        # the acknowledgement does not weaken the runtime continuation guard.
-        pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True),
-            {"x": IntParam(type="int", low=0, high=10)},
-            id="tpe",
-        ),
-        pytest.param(
-            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
-            {
-                "x": FloatParam(type="float", low=0.0, high=1.0),
-                "y": FloatParam(type="float", low=0.0, high=1.0),
-            },
-            id="cmaes",
-        ),
-    ],
-)
+# The runtime continuation guard keys only on NON_RESUMABLE_SAMPLERS
+# membership, so one stateful sampler stands for TPE and CMA-ES. Persistent
+# storage requires the config-level non-resumable acknowledgement, which does
+# not weaken that guard.
+_STATEFUL_SAMPLER = Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True)
+
+
 @pytest.mark.integration
-def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
-    tmp_path: Path,
-    sampler: Sampler,
-    search_space: dict,
-) -> None:
+def test_stateful_sampler_rejects_interrupted_resume_and_top_up(tmp_path: Path) -> None:
     """A partially complete TPE/CMA-ES study can be neither resumed nor topped up.
 
     Optuna storage does not persist process-local sampler state, so a fresh
@@ -841,8 +823,8 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
         name="p",
         n_trials=3,
         max_consecutive_failures=1,
-        sampler=sampler,
-        search_space=search_space,
+        sampler=_STATEFUL_SAMPLER,
+        search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
@@ -870,37 +852,17 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(
     assert len(study.trials) == 1
 
 
-@pytest.mark.parametrize(
-    ("sampler", "search_space"),
-    [
-        # These cases exist to exercise the stateful samplers on persistent
-        # storage, which requires the config-level non-resumable acknowledgement;
-        # the acknowledgement does not weaken the runtime continuation guard.
-        pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True),
-            {"x": IntParam(type="int", low=0, high=10)},
-            id="tpe",
-        ),
-        pytest.param(
-            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
-            {
-                "x": FloatParam(type="float", low=0.0, high=1.0),
-                "y": FloatParam(type="float", low=0.0, high=1.0),
-            },
-            id="cmaes",
-        ),
-    ],
-)
 @pytest.mark.integration
-def test_stateful_sampler_completed_target_reruns_as_noop(
-    tmp_path: Path,
-    sampler: Sampler,
-    search_space: dict,
-) -> None:
+def test_stateful_sampler_completed_target_reruns_as_noop(tmp_path: Path) -> None:
     """A stateful study that reached its accepted target republishes without new trials."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
-    phase = Phase(name="p", n_trials=2, sampler=sampler, search_space=search_space)
+    phase = Phase(
+        name="p",
+        n_trials=2,
+        sampler=_STATEFUL_SAMPLER,
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     first = run_experiment(experiment)
     rerun = run_experiment(experiment)

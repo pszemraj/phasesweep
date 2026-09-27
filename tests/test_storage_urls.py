@@ -147,18 +147,16 @@ def test_explicit_journal_storage_allows_parallel_jobs(tmp_path: Path) -> None:
     load_experiment(p)
 
 
-@pytest.mark.parametrize("storage", ["postgresql://user:pass@host/db", "mysql://user@host/db"])
-def test_external_storage_is_rejected_at_config_load(tmp_path: Path, storage: str) -> None:
-    """Only null, auto, and explicit journal:/// storage are supported."""
-    path = _storage_policy_config(tmp_path, storage=storage, n_jobs=1)
-
-    with pytest.raises(ValidationError, match="storage must be null, auto, or a journal:/// URL"):
-        load_experiment(path)
-
-
 @pytest.mark.parametrize(
     "storage",
-    ["sqlite:///x.db", "sqlite:///:memory:", "sqlite://", ":memory:", "postgresql://h/db"],
+    [
+        "sqlite:///x.db",
+        "sqlite:///:memory:",
+        "sqlite://",
+        ":memory:",
+        "postgresql://user:pass@host/db",
+        "mysql://user@host/db",
+    ],
 )
 def test_non_journal_storage_is_refused_at_config_load(tmp_path: Path, storage: str) -> None:
     """Every spelling but null, auto, and journal:/// is refused, with the remedy spelled out."""
