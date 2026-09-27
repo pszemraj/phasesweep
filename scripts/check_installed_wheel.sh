@@ -236,6 +236,7 @@ import optuna
 import yaml
 
 from phasesweep import load_experiment
+from phasesweep.engine.ledger import _resolve_storage
 
 experiment = load_experiment("experiment.yaml")
 assert experiment.execution.inherit_env == "none"
@@ -244,7 +245,7 @@ counts = {}
 for phase in ("depth", "learning_rate"):
     study = optuna.load_study(
         study_name=f"{experiment.experiment}::{phase}",
-        storage=experiment.resolved_storage,
+        storage=_resolve_storage(experiment.resolved_storage),
     )
     trials = study.get_trials()
     counts[phase] = len(trials)
