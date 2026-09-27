@@ -127,10 +127,7 @@ def _resolve_publication_pointer(
     pointer_path = path_ops._last_successful_generation_path(experiment)
     try:
         target = validation_ops._read_pointer_target(
-            pointer_path,
-            id_key="generation_id",
-            owner_key="experiment",
-            owner_name=experiment.experiment,
+            pointer_path, experiment_name=experiment.experiment
         )
     except PublicationAccessError as exc:
         return PublicationPointer(state="permission_denied", generation_id=None, error=str(exc))
@@ -140,12 +137,8 @@ def _resolve_publication_pointer(
     try:
         summary = validation_ops._read_pointer_target_summary(
             path_ops._generation_summary_path(experiment, generation_id),
-            id_key="generation_id",
-            target_id=generation_id,
-            owner_key="experiment",
-            owner_name=experiment.experiment,
-            expected_size_bytes=target.summary_size_bytes,
-            expected_sha256=target.summary_sha256,
+            experiment_name=experiment.experiment,
+            target=target,
         )
     except PublicationAccessError as exc:
         return PublicationPointer(

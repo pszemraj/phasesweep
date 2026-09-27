@@ -263,7 +263,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     )
 
     stamp_artifact_root(study, exp)
-    identity = _environment_identity(exp)
+    identity = _environment_identity(exp, "a")
     t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
     t.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
     claimed = engine_ledger.claim_ledger(engine_ledger.validate_ledger(exp))
@@ -998,7 +998,7 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.COMPLETE,
     ]
-    identity = _environment_identity(exp)
+    identity = _environment_identity(exp, "p")
     assert all(trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest for trial in trials)
 
 

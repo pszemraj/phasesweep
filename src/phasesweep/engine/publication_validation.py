@@ -261,8 +261,6 @@ def _validate_generation_manifest(
 
     if summary.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
         raise _fail(f"unsupported summary schema_version {summary.get('schema_version')!r}")
-    if "promotion_decisions" in summary:
-        raise _fail("summary contains removed promotion decisions")
     metric = summary.get("metric")
     if (
         not isinstance(metric, Mapping)
@@ -344,8 +342,6 @@ def _validate_generation_manifest(
         if payload.get("phase") != name:
             raise _fail(f"{kind} artifact for phase {name!r} names a different phase")
         if kind == "winner":
-            if "promotion" in payload:
-                raise _fail(f"winner for phase {name!r} contains removed promotion data")
             item = phase_items[name]
             if payload.get("trial_number") != item.get("trial_number"):
                 raise _fail(f"winner for phase {name!r} disagrees with the summary trial number")
@@ -413,7 +409,6 @@ def _validate_generation_manifest(
                 generation_dir,
                 generation_id,
                 name,
-                source_phase,
                 summary.get("experiment"),
                 payload,
                 _fail,
@@ -431,10 +426,6 @@ def _validate_generation_manifest(
                 raise _fail(
                     f"namespace contains an unlisted winner artifact for phase {phase_dir.name!r}"
                 )
-            if (phase_dir / "promotion.yaml").is_file():
-                raise _fail(
-                    f"namespace contains removed promotion artifact for phase {phase_dir.name!r}"
-                )
     return ValidatedPublication(
         generation_id=generation_id,
         summary=summary,
@@ -448,7 +439,6 @@ def _validate_winner_source_generation(
     generation_dir: Path,
     generation_id: str,
     phase_name: str,
-    source_phase: object,
     expected_experiment: object,
     payload: Mapping[str, Any],
     fail: Callable[[str], PublicationIntegrityError],
@@ -479,7 +469,6 @@ def _validate_winner_source_generation(
     :param Path generation_dir: The publishing generation's namespace directory.
     :param str generation_id: The publishing generation's own id.
     :param str phase_name: Phase exposing the winner being validated.
-    :param object source_phase: Recorded phase that owns the source winner artifact.
     :param object expected_experiment: Experiment identity the source summary must retain.
     :param Mapping[str, Any] payload: Parsed winner artifact, whose
         ``generation_id``/``attempt_id``/``trial_number`` the caller has
@@ -494,11 +483,8 @@ def _validate_winner_source_generation(
         published manifest, or recorded a different winning result.
     """
     source_generation = payload["generation_id"]
-    same_generation = source_generation == generation_id
-    if same_generation and source_phase == phase_name:
+    if source_generation == generation_id:
         return
-    if not isinstance(source_phase, str) or not SAFE_NAME_PATTERN.fullmatch(source_phase):
-        raise fail(f"winner for phase {phase_name!r} has no valid winner_source phase")
     if not SAFE_NAME_PATTERN.fullmatch(source_generation):
         # A corrupt or hostile winner could otherwise steer the lookups below
         # out of the generations root with a traversal component.
@@ -506,19 +492,19 @@ def _validate_winner_source_generation(
             f"winner for phase {phase_name!r} cites source generation "
             f"{source_generation!r}, which is not a valid generation name"
         )
-    source_dir = generation_dir if same_generation else generation_dir.parent / source_generation
+    source_dir = generation_dir.parent / source_generation
     if source_dir.is_symlink() or not source_dir.is_dir():
         raise fail(
             f"winner for phase {phase_name!r} cites source generation "
             f"{source_generation!r} which does not exist in this tree"
         )
-    source_winner_path = source_dir / "phases" / source_phase / WINNER_FILENAME
+    source_winner_path = source_dir / "phases" / phase_name / WINNER_FILENAME
     if not source_winner_path.is_file():
         if (source_dir / GENERATION_SUMMARY_FILENAME).is_file():
             raise fail(
                 f"winner for phase {phase_name!r} cites source generation "
                 f"{source_generation!r}, which published but holds no winner record "
-                f"for source phase {source_phase!r}"
+                f"for source phase {phase_name!r}"
             )
         # Unpublished source namespace: the crash-recovery case above.
         return
@@ -527,29 +513,28 @@ def _validate_winner_source_generation(
     except PermissionError as exc:
         raise permission_fail(
             _unreadable_artifact_permission_detail(
-                f"source generation {source_generation!r} winner artifact for phase "
-                f"{source_phase!r}"
+                f"source generation {source_generation!r} winner artifact for phase {phase_name!r}"
             )
         ) from exc
     except OSError as exc:
         raise fail(
             f"source generation {source_generation!r} winner artifact for phase "
-            f"{source_phase!r} is missing or unreadable"
+            f"{phase_name!r} is missing or unreadable"
         ) from exc
     try:
         source_payload = yaml.safe_load(content)
     except yaml.YAMLError as exc:
         raise fail(
             f"source generation {source_generation!r} winner artifact for phase "
-            f"{source_phase!r} is not parseable"
+            f"{phase_name!r} is not parseable"
         ) from exc
     if not isinstance(source_payload, Mapping):
         raise fail(
             f"source generation {source_generation!r} winner artifact for phase "
-            f"{source_phase!r} is not a mapping"
+            f"{phase_name!r} is not a mapping"
         )
     source_summary_path = source_dir / GENERATION_SUMMARY_FILENAME
-    if source_summary_path.is_file() and not same_generation:
+    if source_summary_path.is_file():
         try:
             source_summary = yaml.safe_load(
                 _read_unlinked_bytes(source_summary_path, root=generation_dir.parent)
@@ -581,7 +566,7 @@ def _validate_winner_source_generation(
         except PublicationIntegrityError as exc:
             raise fail(f"source generation {source_generation!r} does not validate: {exc}") from exc
     expected = {
-        "phase": source_phase,
+        "phase": phase_name,
         "trial_number": payload.get("trial_number"),
         "generation_id": source_generation,
         "attempt_id": payload.get("attempt_id"),
@@ -734,22 +719,14 @@ class _PointerTarget:
     summary_sha256: str
 
 
-def _read_pointer_target(
-    pointer_path: Path,
-    *,
-    id_key: str,
-    owner_key: str,
-    owner_name: str,
-) -> _PointerTarget | None:
+def _read_pointer_target(pointer_path: Path, *, experiment_name: str) -> _PointerTarget | None:
     """Read one last-success pointer's target id, validating the pointer itself.
 
     :param Path pointer_path: Pointer YAML file to read.
-    :param str id_key: Payload key holding the target generation id.
-    :param str owner_key: Payload key naming the owning experiment.
-    :param str owner_name: Expected owner name the pointer must record.
+    :param str experiment_name: Experiment the pointer must name.
     :return _PointerTarget | None: A safe-name target and exact summary-byte identity, or
         ``None`` when the pointer is missing, unreadable, malformed, names
-        another owner, or carries an unsafe id.
+        another experiment, or carries an unsafe id.
     :raises PublicationAccessError: The pointer cannot be read by the current user.
     """
     try:
@@ -765,10 +742,10 @@ def _read_pointer_target(
     if (
         not isinstance(payload, dict)
         or payload.get("schema_version") != PUBLICATION_POINTER_SCHEMA_VERSION
-        or payload.get(owner_key) != owner_name
+        or payload.get("experiment") != experiment_name
     ):
         return None
-    target_id = payload.get(id_key)
+    target_id = payload.get("generation_id")
     if not isinstance(target_id, str) or not SAFE_NAME_PATTERN.fullmatch(target_id):
         return None
     summary_size_bytes = payload.get("summary_size_bytes")
@@ -789,34 +766,25 @@ def _read_pointer_target(
 def _read_pointer_target_summary(
     summary_path: Path,
     *,
-    id_key: str,
-    target_id: str,
-    owner_key: str,
-    owner_name: str,
-    expected_size_bytes: int | None = None,
-    expected_sha256: str | None = None,
+    experiment_name: str,
+    target: _PointerTarget,
 ) -> dict[str, Any] | None:
     """Read a pointer target's own immutable summary and confirm its identity.
 
-    Replaces the old record-state check (``_record_is_complete``): the
-    per-generation lifecycle record is now informational and written *after*
+    The per-generation lifecycle record is informational and written *after*
     the last-success pointer commit (review v0.5.15 / blocker 3), so requiring
     ``state == "complete"``/``"published"`` on it would create a crash window
     where a just-committed publication reads back as nothing-published. This
-    fails closed on the pointer target's own immutable *summary*: it must
-    parse as a mapping naming this exact owner and id. Callers holding a
-    schema-versioned summary additionally validate the complete artifact
-    manifest (:func:`_validate_generation_manifest`; review v0.5.16 /
-    blocker 3) — this helper only performs the identity gate common to
-    experiment pointers.
+    fails closed on the pointer target's own immutable *summary*: its bytes
+    must match the pointer's anchors, and it must parse as a mapping naming
+    this exact experiment and generation. Callers then validate the complete
+    artifact manifest (:func:`_validate_generation_manifest`; review v0.5.16 /
+    blocker 3).
 
     :param Path summary_path: Immutable generation summary YAML file to read.
-    :param str id_key: Summary key holding the generation id.
-    :param str target_id: Generation id the summary must name.
-    :param str owner_key: Summary key naming the owning experiment.
-    :param str owner_name: Expected owner name the summary must carry.
-    :param int | None expected_size_bytes: Pointer-recorded exact summary byte length.
-    :param str | None expected_sha256: Pointer-recorded SHA-256 of the exact summary bytes.
+    :param str experiment_name: Experiment the summary must name.
+    :param _PointerTarget target: Pointer-recorded generation id and exact
+        summary byte length and SHA-256.
     :return dict[str, Any] | None: The parsed summary when readable and
         correctly named; ``None`` otherwise.
     :raises PublicationAccessError: The summary cannot be read by the current user.
@@ -830,11 +798,11 @@ def _read_pointer_target_summary(
         ) from exc
     except OSError:
         return None
-    if expected_size_bytes is not None and len(content) != expected_size_bytes:
+    if len(content) != target.summary_size_bytes:
         raise PublicationIntegrityError(
             "Generation summary byte length does not match the last-success pointer."
         )
-    if expected_sha256 is not None and hashlib.sha256(content).hexdigest() != expected_sha256:
+    if hashlib.sha256(content).hexdigest() != target.summary_sha256:
         raise PublicationIntegrityError(
             "Generation summary digest does not match the last-success pointer."
         )
@@ -844,8 +812,8 @@ def _read_pointer_target_summary(
         return None
     if (
         isinstance(summary, dict)
-        and summary.get(owner_key) == owner_name
-        and summary.get(id_key) == target_id
+        and summary.get("experiment") == experiment_name
+        and summary.get("generation_id") == target.generation_id
     ):
         return summary
     return None

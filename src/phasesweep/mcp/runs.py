@@ -1347,29 +1347,18 @@ class RunStore:
             return attempt_ids, {}
         recovered_ids = payload.get("reaped_attempt_ids")
         locations = payload.get("reaped_attempt_locations")
+        # _read_cleanup_recovery already refused malformed ids and locations.
         if not isinstance(recovered_ids, list):
             return attempt_ids, {}
-        authorized = {value for value in recovered_ids if isinstance(value, str) and value}
+        authorized = set(recovered_ids)
         attempt_ids.update(authorized)
         if not isinstance(locations, dict):
             return attempt_ids, {}
-        result: dict[str, tuple[str, int, str]] = {}
-        for attempt_id, raw in locations.items():
-            if attempt_id not in authorized or not isinstance(raw, dict):
-                continue
-            phase = raw.get("phase")
-            trial_number = raw.get("trial_number")
-            generation_id = raw.get("generation_id")
-            if (
-                isinstance(phase, str)
-                and phase
-                and type(trial_number) is int
-                and trial_number >= 0
-                and isinstance(generation_id, str)
-                and generation_id
-            ):
-                result[attempt_id] = (phase, trial_number, generation_id)
-        return attempt_ids, result
+        return attempt_ids, {
+            attempt_id: (raw["phase"], raw["trial_number"], raw["generation_id"])
+            for attempt_id, raw in locations.items()
+            if attempt_id in authorized
+        }
 
     def cleanup_uncertain_attempt_ids(self, handle: RunHandle) -> set[str]:
         """Return exact attempts the runner reported as cleanup-uncertain.

@@ -102,12 +102,7 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
 )
-from phasesweep.runtime.files import (
-    fsync_directory,
-    journal_file_path,
-    storage_backend,
-    storage_is_in_memory,
-)
+from phasesweep.runtime.files import fsync_directory, journal_file_path
 
 __all__ = [
     "ClaimedLedger",
@@ -229,12 +224,8 @@ def _resolve_storage(url: str | None) -> Any:
     :raises ValueError: ``url`` selects an unsupported local storage backend.
 
     """
-    if storage_is_in_memory(url):
+    if url is None:
         return None
-    assert url is not None
-    backend = storage_backend(url)
-    if backend != "journal":
-        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     path = journal_file_path(url)
     log.info("Using JournalFileStorage at %s", path)
     from optuna.storages.journal import JournalFileBackend
@@ -711,12 +702,8 @@ def _scan_ledger_format(storage: str | None) -> None:
     :raises StudySchemaMismatchError: A populated PhaseSweep study is unmarked,
         or a PhaseSweep study uses a pre-cutover/unsupported schema.
     """
-    if storage_is_in_memory(storage):
+    if storage is None:
         return
-    assert storage is not None
-    backend = storage_backend(storage)
-    if backend != "journal":
-        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     versions: list[tuple[str, object, bool]] = []
     snapshot = _journal_snapshot_storage(storage, "the PhaseSweep format boundary")
     if snapshot is None:
@@ -920,9 +907,8 @@ def resolved_ledger_path(experiment: Experiment) -> Path | None:
     :return Path | None: The journal file, or ``None`` for in-memory storage.
     """
     url = experiment.resolved_storage
-    if storage_is_in_memory(url):
+    if url is None:
         return None
-    assert url is not None
     return journal_file_path(url)
 
 
@@ -932,20 +918,10 @@ def _describe_ledger(experiment: Experiment, binding_state: BindingState) -> Val
     :param Experiment experiment: Experiment whose resolved storage is described.
     :param BindingState binding_state: Verdict :func:`_check_artifact_root_binding` reached.
     :return ValidatedLedger: Handle recording the ledger's backend and location.
-    :raises ValueError: The resolved storage names an unsupported local backend.
     """
     url = experiment.resolved_storage
-    backend: Backend
-    ledger_path: Path | None = None
-    if storage_is_in_memory(url):
-        backend = "memory"
-    else:
-        assert url is not None
-        named = storage_backend(url)
-        if named != "journal":
-            raise ValueError(f"Unsupported local storage backend: {named!r}.")
-        backend = "journal"
-        ledger_path = journal_file_path(url)
+    backend: Backend = "memory" if url is None else "journal"
+    ledger_path = None if url is None else journal_file_path(url)
     return ValidatedLedger(
         experiment=experiment,
         experiment_name=experiment.experiment,
@@ -1407,7 +1383,7 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
         read completely, or a journal changed while the study was being opened.
     :raises ValueError: ``locator`` selects an unsupported local storage backend.
     """
-    if storage_is_in_memory(locator):
+    if locator is None:
         # An in-memory study died with the orchestrator that held it.
         return None
     _scan_ledger_format(locator)

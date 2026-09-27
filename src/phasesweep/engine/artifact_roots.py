@@ -32,7 +32,6 @@ from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
 from phasesweep.runtime.files import (
     atomic_write_text,
     canonical_storage_identity,
-    storage_is_in_memory,
 )
 from phasesweep.runtime.json import strict_json_loads
 
@@ -66,9 +65,7 @@ def _artifact_root_binding_applies(experiment: Experiment) -> bool:
         its own format record; only a persistent ledger also needs to record
         the root that owns it across invocations.
     """
-    return experiment.resolved_storage is not None and not storage_is_in_memory(
-        experiment.resolved_storage
-    )
+    return experiment.resolved_storage is not None
 
 
 ARTIFACT_ROOT_BINDING_SCHEMA_VERSION = 3
@@ -87,7 +84,7 @@ def _artifact_root_storage_key(experiment: Experiment) -> str | None:
         storage identity, or ``None`` for deliberate no-ledger execution.
     """
     storage_identity = canonical_storage_identity(experiment.resolved_storage)
-    if storage_identity is None or storage_is_in_memory(experiment.resolved_storage):
+    if storage_identity is None:
         return None
     return hashlib.sha256(storage_identity.encode("utf-8")).hexdigest()
 

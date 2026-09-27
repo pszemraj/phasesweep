@@ -44,7 +44,6 @@ from phasesweep.runtime.files import (
     canonical_storage_identity,
     local_storage_url,
     storage_backend,
-    storage_is_in_memory,
 )
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
@@ -634,7 +633,7 @@ class Experiment(_Frozen):
         ]
         if invalid:
             raise ValueError(f"provenance keys and values must be nonempty strings: {invalid}")
-        if not storage_is_in_memory(self.resolved_storage) and not self.provenance:
+        if self.resolved_storage is not None and not self.provenance:
             raise ValueError(
                 "Persistent storage requires a nonempty provenance mapping that identifies "
                 "the trainer, data, and dependency revision used by this experiment."
@@ -816,7 +815,7 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
         stochastic without an explicit ``seed``, or is non-resumable without
         ``acknowledge_nonresumable: true``.
     """
-    if storage_is_in_memory(storage):
+    if storage is None:
         return
 
     sampler = phase.sampler

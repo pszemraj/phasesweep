@@ -722,38 +722,6 @@ def _reseal_winner(experiment: Experiment, generation_id: str, winner: Mapping[s
     reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
 
-@pytest.mark.parametrize(
-    "removed_artifact", ["promotion_decisions", "promotion.yaml", "winner promotion"]
-)
-def test_manifest_rejects_removed_promotion_artifacts(
-    tmp_path: Path,
-    removed_artifact: str,
-) -> None:
-    """Current-format publications cannot silently adopt removed promotion state."""
-    experiment, generation_id = _golden_publication(tmp_path)
-
-    if removed_artifact == "promotion_decisions":
-        summary_path = _generation_summary_path(experiment, generation_id)
-        summary = yaml.safe_load(summary_path.read_text())
-        summary[removed_artifact] = []
-        summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-        reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
-    elif removed_artifact == "winner promotion":
-        winner_path = _generation_winner_path(experiment, generation_id, "p")
-        winner = yaml.safe_load(winner_path.read_text())
-        winner["promotion"] = {"promoted": True}
-        _reseal_winner(experiment, generation_id, winner)
-    else:
-        promotion_path = (
-            _generation_dir(experiment, generation_id) / "phases" / "p" / removed_artifact
-        )
-        promotion_path.write_text("removed: true\n")
-
-    assert _resolve_publication_pointer(experiment).state == "failed"
-    assert read_status(experiment)["publication_integrity"] == "failed"
-    assert read_winner(experiment, "p") is None
-
-
 def test_load_winner_rejects_linked_winner_with_current_summary(tmp_path: Path) -> None:
     """Strict resume rejects a linked winner from a current-format publication."""
     experiment, generation_id = _golden_publication(tmp_path)

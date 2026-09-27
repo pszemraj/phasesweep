@@ -927,7 +927,6 @@ def _new_private_temp_fd(parent_fd: int, leaf: str) -> tuple[int, str]:
 def _private_atomic_writer(
     path: Path,
     *,
-    newline: str | None = None,
     require_private_dir: bool = True,
 ) -> Iterator[IO[str]]:
     """Write to a private temporary file, then atomically replace a validated destination.
@@ -945,8 +944,6 @@ def _private_atomic_writer(
     file is unlinked and ``path`` is left untouched.
 
     :param Path path: Destination path to replace.
-    :param str | None newline: Newline handling passed to the text-mode
-        ``open`` call.
     :param bool require_private_dir: Whether the destination directory must
         itself be owner-only. ``True`` for the hardened namespaces (locks, MCP
         ``state_dir``). ``False`` for an owner-only FILE inside an
@@ -973,7 +970,7 @@ def _private_atomic_writer(
         # Keep the raw descriptor as the sole owner until the outer ``finally``.
         # A shutdown between wrapping it and invalidating ``fd`` would otherwise
         # leave both the stream and cleanup path closing the same descriptor.
-        stream = os.fdopen(fd, "w", encoding="utf-8", newline=newline, closefd=False)
+        stream = os.fdopen(fd, "w", encoding="utf-8", closefd=False)
         with stream as handle:
             yield handle
             handle.flush()
@@ -1270,11 +1267,16 @@ def journal_file_path(storage: str) -> Path:
     and a symlinked alias of the journal names a second lock, so an append
     through one spelling and a repair through the other never exclude each
     other. Resolving also freezes an invocation-relative path against the
-    working directory it was given in.
+    working directory it was given in. It is also the one place a locator
+    that names another backend is refused.
 
     :param str storage: Journal storage URL, including escaped ``file:`` forms.
+    :raises ValueError: ``storage`` does not name a journal file.
     :return Path: The journal file, with ``~`` expanded and symlinks resolved.
     """
+    backend = storage_backend(storage)
+    if backend != "journal":
+        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     return Path(file_url_path(storage)).expanduser().resolve()
 
 
@@ -1306,16 +1308,6 @@ def _truthy_url_option(value: str | None) -> bool:
     return value is not None and value.lower() in {"1", "true", "yes", "on"}
 
 
-def storage_is_in_memory(storage: str | None) -> bool:
-    """Return whether ``storage`` names an in-memory Optuna backend.
-
-    :param str | None storage: Optuna storage URL, or ``None``.
-    :return bool: ``True`` when ``storage`` is ``None``, the only in-memory
-        spelling; ``False`` otherwise.
-    """
-    return storage is None
-
-
 def storage_recovery_locator(storage: str | None) -> str | None:
     """Freeze a storage URL for later recovery from a different working directory.
 
@@ -1328,12 +1320,8 @@ def storage_recovery_locator(storage: str | None) -> str | None:
         absolute, or ``None`` for in-memory storage.
     :raises ValueError: ``storage`` does not select a retained local backend.
     """
-    if storage_is_in_memory(storage):
+    if storage is None:
         return None
-    assert storage is not None
-    backend = storage_backend(storage)
-    if backend != "journal":
-        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     return local_storage_url(journal_file_path(storage))
 
 
@@ -1352,7 +1340,4 @@ def canonical_storage_identity(storage: str | None) -> str | None:
     """
     if storage is None:
         return None
-    backend = storage_backend(storage)
-    if backend != "journal":
-        raise ValueError(f"Unsupported local storage backend: {backend!r}.")
     return "journal:///" + str(journal_file_path(storage))

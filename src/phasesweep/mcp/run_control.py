@@ -344,11 +344,6 @@ class RunControl:
                 handle: RunHandle | None = None
                 try:
                     handle = self._spawn(reg, from_phase, preparation)
-                    if handle.pid_starttime is None:
-                        raise RuntimeError(
-                            "spawned runner has no Linux /proc start time; refused launch because "
-                            "later cancellation could not distinguish PID reuse"
-                        )
                     self._runs.update(handle)
                 except _SpawnBookkeepingError as spawn_exc:
                     self._record_launch_failure(

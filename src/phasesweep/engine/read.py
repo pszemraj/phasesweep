@@ -181,8 +181,6 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
         effective_overrides = data.get("effective_overrides") or {}
         if not isinstance(effective_overrides, Mapping):
             return None
-        if "promotion" in data:
-            return None
         source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
         return PhaseWinnerView(
             phase=phase_name,
@@ -382,8 +380,6 @@ def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None
     if not isinstance(payload, Mapping):
         return None
     if payload.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
-        return None
-    if "promotion_decisions" in payload:
         return None
     return payload
 

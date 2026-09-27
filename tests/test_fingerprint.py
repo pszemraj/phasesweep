@@ -137,11 +137,11 @@ def test_wandb_managed_defaults_and_rotating_credentials_do_not_change_cohort(mo
     monkeypatch.setenv("WANDB_API_KEY", "first")
     monkeypatch.setenv("WANDB_RUN_ID", "old")
     monkeypatch.setenv("WANDB_PROJECT", "old")
-    first = _environment_identity(experiment)
+    first = _environment_identity(experiment, "p")
     monkeypatch.setenv("WANDB_API_KEY", "rotated")
     monkeypatch.setenv("WANDB_RUN_ID", "different")
     monkeypatch.setenv("WANDB_PROJECT", "different")
-    second = _environment_identity(experiment)
+    second = _environment_identity(experiment, "p")
     assert first.digest == second.digest
     assert second.values["WANDB_API_KEY"] == "rotated"
     assert second.values["WANDB_PROJECT"] == "p"
@@ -664,7 +664,7 @@ def test_identical_semantic_environment_resumes_persistent_study(
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0, 1]
-    base = _environment_identity(experiment)
+    base = _environment_identity(experiment, "p")
     assert not {
         "WANDB_RUN_ID",
         "PHASESWEEP_TRIAL_ID",
@@ -1873,7 +1873,7 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
 
     run_experiment(exp)
 
-    identity = _environment_identity(exp)
+    identity = _environment_identity(exp, "p")
     data = yaml.safe_load(_winner_path(exp, "p").read_text())
     assert data["trainer_env_digest"] == identity.digest
     assert data["trainer_inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
