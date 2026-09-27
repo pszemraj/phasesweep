@@ -34,13 +34,10 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
     _generation_winner_path,
 )
-from phasesweep.engine.publication import (
-    _last_successful_generation_id,
-    _resolve_publication_pointer,
-)
+from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
 from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
-from tests.ledger_fixtures import ledger_file, materialize, tree_snapshot
+from tests.ledger_fixtures import ledger_file, materialize, published_generation_id, tree_snapshot
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -526,7 +523,7 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
         n_trials=3,
     )
     run_experiment(experiment)
-    published = _last_successful_generation_id(experiment)
+    published = published_generation_id(experiment)
     assert published is not None
     generation_before = _generation_path(experiment).read_bytes()
     generation_dirs_before = {
@@ -566,7 +563,7 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     )
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
     assert _generation_path(experiment).read_bytes() == generation_before
-    assert _last_successful_generation_id(experiment) == published
+    assert published_generation_id(experiment) == published
     assert {
         path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
     } == generation_dirs_before
@@ -821,14 +818,14 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
 def test_read_winner_rejects_a_winner_source_naming_another_phase(tmp_path: Path) -> None:
     """A winner_source citing another phase reads as absent, not as that phase's winner.
 
-    Reads by explicit ``generation_id`` go straight to
-    ``engine.read._read_winner_path`` without passing through
-    ``publication_validation``, so this proves the phase-agreement check now
-    lives in the permissive reader itself (``_parse_winner_source``), not
-    only in the stricter manifest validator.
+    Reads of a generation that is not the validated publication (here, one
+    whose winner was edited after publishing, so it no longer validates) go
+    through the permissive ``engine.read._read_winner_path``, so this proves
+    the phase-agreement check now lives in the permissive reader itself
+    (``_parse_winner_source``), not only in the stricter manifest validator.
     """
     experiment = _published(tmp_path)
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")

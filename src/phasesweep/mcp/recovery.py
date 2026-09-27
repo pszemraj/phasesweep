@@ -540,8 +540,8 @@ def _publication_recovery_action(
         publication = _resolve_publication_pointer(config)
         if publication.state == "ok":
             if publication.generation_id == needs.prepared_publication_generation:
-                assert publication.summary is not None
-                return "commit", publication.summary
+                assert publication.validated is not None
+                return "commit", publication.validated.summary
             return "abort", None
         if publication.state == "absent":
             return "abort", None

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
@@ -24,10 +22,9 @@ class PublicationPointer:
     "Nothing was ever published" and "the recorded publication no longer
     validates" are different operational facts with opposite remedies, and
     collapsing both into ``None`` made a corrupt result tree indistinguishable
-    from a fresh one (review v0.5.18 / finding F4). The reporting surfaces
-    resolve through this type; path-construction helpers keep the boolean
-    :func:`_last_successful_generation_id` view, since all non-``ok`` states
-    mean the same thing to them: nothing may be read as published.
+    from a fresh one (review v0.5.18 / finding F4). Every non-``ok`` state
+    means the same thing to a consumer of published results: nothing may be
+    read as published, so ``validated`` is ``None``.
 
     ``error`` is deliberately path-free: it names artifacts by role rather than
     location, so any reporting surface could quote it safely -- though the MCP
@@ -42,8 +39,11 @@ class PublicationPointer:
     when ``absent`` or when the pointer itself is the unreadable part."""
     error: str | None
     """Validation diagnostic for ``failed`` and ``permission_denied`` states."""
-    summary: Mapping[str, Any] | None = field(default=None, compare=False, repr=False)
-    """Exact pointer-authenticated parsed summary, for consumers that need its fields."""
+    validated: validation_ops.ValidatedPublication | None = field(
+        default=None, compare=False, repr=False
+    )
+    """Everything the validation read, set exactly when ``state`` is ``ok``.
+    Consumers show and resume from it rather than rereading any artifact."""
 
 
 def _unresolvable_pointer(pointer_path: Path, owner_label: str) -> PublicationPointer:
@@ -166,10 +166,14 @@ def _resolve_publication_pointer(
         )
     generation_dir = path_ops._generation_dir(experiment, generation_id)
     if raise_on_manifest_error:
-        validation_ops._validate_generation_manifest(generation_dir, generation_id, summary)
+        validated = validation_ops._validate_generation_manifest(
+            generation_dir, generation_id, summary
+        )
     else:
         try:
-            validation_ops._validate_generation_manifest(generation_dir, generation_id, summary)
+            validated = validation_ops._validate_generation_manifest(
+                generation_dir, generation_id, summary
+            )
         except PublicationAccessError as exc:
             log.warning("%s", exc)
             return PublicationPointer(
@@ -180,41 +184,9 @@ def _resolve_publication_pointer(
         except PublicationIntegrityError as exc:
             log.warning("%s", exc)
             return PublicationPointer(state="failed", generation_id=generation_id, error=str(exc))
-    return PublicationPointer(state="ok", generation_id=generation_id, error=None, summary=summary)
-
-
-def _last_successful_generation_id(
-    experiment: Experiment,
-    *,
-    raise_on_manifest_error: bool = False,
-) -> str | None:
-    """Return the last-success generation id, failing closed on any invalidity.
-
-    The boolean-blind view of :func:`_resolve_publication_pointer`, kept for
-    the path-construction and resume callers to which "never published" and
-    "published but corrupt" mean the same thing: nothing here may be read as
-    published. Every caller that *reports* publication state to an operator or
-    agent must use the four-state resolver instead (review v0.5.18 / finding
-    F4).
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param bool raise_on_manifest_error: Re-raise a versioned publication's
-        manifest error for an actionable resume failure instead of returning
-        ``None`` as read-only status APIs require.
-    :raises PublicationAccessError: ``raise_on_manifest_error`` is set and a
-        manifest artifact cannot be read as the current user.
-    :raises PublicationIntegrityError: ``raise_on_manifest_error`` is set and
-        the target's artifact manifest does not validate.
-    :return str | None: The last-successful generation id, or ``None`` if the
-        pointer or its target summary is missing, unreadable, malformed,
-        unsafely named, owned by another experiment, or fails manifest
-        validation.
-    """
-    pointer = _resolve_publication_pointer(
-        experiment,
-        raise_on_manifest_error=raise_on_manifest_error,
+    return PublicationPointer(
+        state="ok", generation_id=generation_id, error=None, validated=validated
     )
-    return pointer.generation_id if pointer.state == "ok" else None
 
 
 def _published_winner_path_for(
@@ -233,16 +205,3 @@ def _published_winner_path_for(
     if published_generation_id is None:
         return None
     return path_ops._generation_winner_path(experiment, published_generation_id, phase_name)
-
-
-def _published_winner_path(experiment: Experiment, phase_name: str) -> Path | None:
-    """Return one authoritative last-success winner path.
-
-    :param Experiment experiment: Experiment config with artifact root details.
-    :param str phase_name: Phase name whose published winner path is requested.
-    :return Path | None: The immutable generation-scoped winner path, or
-        ``None`` when no last-success generation was resolved.
-    """
-    return _published_winner_path_for(
-        experiment, _last_successful_generation_id(experiment), phase_name
-    )

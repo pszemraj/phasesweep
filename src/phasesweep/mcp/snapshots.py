@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine import PhaseWinnerView, read_status, read_winners
+from phasesweep.engine import PhaseWinnerView, read_result, read_status
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
@@ -383,8 +383,8 @@ def capture_result_snapshot(
     # including the RUNNING identities in each phase's ``running_attempts``
     # (``None`` where ``trial_data_available`` is false). This capture must
     # never reread a study afterwards (PR #5 review / reviewer 2, blocker 6).
-    status = read_status(experiment, generation_id=generation_id)
     if engine_winners is not None:
+        status = read_status(experiment, generation_id=generation_id)
         # The engine's terminal report is the authority on a successful
         # outcome (review v0.5.16 / blocker 2); freeze exactly what it
         # returned instead of re-reading the winner files.
@@ -392,23 +392,15 @@ def capture_result_snapshot(
             _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
         ]
     else:
-        # Winners must be scoped to the generation this snapshot *represents*,
-        # not the (possibly different) true current pointer: a pinned capture
-        # wants exactly its own generation's winners even when a newer
-        # generation has since become current (review v0.5.15 / blocker 3).
-        # They are enumerated under that generation's own recorded phase plan
-        # for the same reason: an unpinned capture can represent an older
-        # publication whose phase names this config no longer declares, and
-        # reading it through today's names would freeze a snapshot that omits
-        # winners which exist (review v0.5.16 / blocker 4).
-        winner_snapshots = [
-            _winner_snapshot(winner.phase, winner)
-            for winner in read_winners(
-                experiment,
-                generation_id=status["represented_generation_id"],
-                phase_names=status["result_phase_plan"],
-            )
-        ]
+        # One resolution supplies both the status and the winners of the
+        # generation this snapshot *represents*, not the (possibly different)
+        # true current pointer: a pinned capture wants exactly its own
+        # generation's winners even when a newer generation has since become
+        # current (review v0.5.15 / blocker 3). A published generation's
+        # winners are the bytes its validation read, enumerated under its own
+        # recorded phase plan (review v0.5.16 / blocker 4).
+        status, winner_views = read_result(experiment, generation_id=generation_id)
+        winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
             current_generation_id=status["current_generation_id"],

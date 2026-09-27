@@ -47,7 +47,6 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _winner_path,
 )
-from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
@@ -60,7 +59,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_param_echo_trainer,
 )
-from tests.ledger_fixtures import materialize
+from tests.ledger_fixtures import materialize, published_generation_id
 from tests.recovery_helpers import recover_run_cli
 
 
@@ -596,7 +595,7 @@ def _corrupt_the_publication(experiment: Experiment) -> str:
     :param Experiment experiment: Experiment whose published generation should be corrupted.
     :return str: The corrupted generation id.
     """
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
@@ -654,7 +653,7 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     """The claim-time provenance files feed the same reporting as any winner."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     record = _generation_dir(experiment, generation_id) / "reproducibility.json"
     record.write_bytes(record.read_bytes() + b"\n")
@@ -686,7 +685,7 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     snapshot = _generation_dir(experiment, generation_id) / "config.snapshot.yaml"
     original_mode = stat.S_IMODE(snapshot.stat().st_mode)

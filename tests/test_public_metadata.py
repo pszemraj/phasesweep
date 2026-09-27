@@ -22,9 +22,9 @@ import phasesweep.evidence as evidence
 from phasesweep.engine import errors as engine_errors
 from phasesweep.engine import run_experiment
 from phasesweep.engine.paths import _generation_dir
-from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.evidence import evaluation as evidence_evaluation
 from tests.conftest import make_experiment, write_constant_trainer
+from tests.ledger_fixtures import published_generation_id
 
 PYPROJECT_PATH = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
@@ -128,7 +128,7 @@ def test_published_generation_metadata_never_exposes_configured_secrets(
     )
     run_experiment(experiment)
 
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     generation_dir = _generation_dir(experiment, generation_id)
 

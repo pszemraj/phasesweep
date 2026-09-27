@@ -19,10 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from phasesweep.engine.artifacts import _load_winner
-from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.resume import _accept_skipped_winner, _published_for_resume
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
@@ -533,50 +530,53 @@ class RunControl:
         return result
 
     def _require_resume_ready(self, reg: RegisteredExperiment, from_phase: str) -> None:
-        """Verify that every earlier phase has a compatible persisted winner.
+        """Verify that every earlier phase has a winner the resume may build on.
+
+        Applies the run preflight's own acceptance rule to each skipped phase,
+        against one resolution of the publication, so a launch is refused
+        before spawning for anything the runner's preflight would refuse after.
 
         :param RegisteredExperiment reg: Registered experiment being resumed.
         :param str from_phase: Requested phase to resume from.
-        :raises ResumeNotReadyError: If an earlier phase has no persisted
-            winner, or its stored winner is unreadable or incompatible with the
-            current config.
+        :raises ResumeNotReadyError: If an earlier phase has no published
+            winner, or its winner or source evidence is unusable or
+            incompatible with the current config.
         """
-        names = reg.phase_names
+        skipped = reg.experiment.phases[: reg.phase_names.index(from_phase)]
+        if not skipped:
+            return
         winners: dict[str, Winner] = {}
-        for phase in reg.experiment.phases[: names.index(from_phase)]:
-            inherited = {parent: winners[parent] for parent in phase.inherits}
-            try:
-                winners[phase.name] = _load_winner(
-                    reg.experiment,
-                    phase,
-                    inherited,
-                    published_generation_id=_last_successful_generation_id(
-                        reg.experiment, raise_on_manifest_error=True
-                    ),
+        # A publication that does not resolve is reported against the first
+        # skipped phase, the one whose winner it withholds first.
+        phase = skipped[0]
+        try:
+            publication = _published_for_resume(reg.experiment)
+            for phase in skipped:
+                winners[phase.name] = _accept_skipped_winner(
+                    reg.experiment, phase, winners, publication
                 )
-            except FileNotFoundError:
-                raise ResumeNotReadyError(reg.id, from_phase, phase.name) from None
-            except (
-                RuntimeError,
-                KeyError,
-                TypeError,
-                ValueError,
-                AttributeError,
-                OSError,
-                yaml.YAMLError,
-            ) as exc:
-                log.info(
-                    "resume preflight rejected winner for experiment=%s phase=%s: %s",
-                    reg.id,
-                    phase.name,
-                    exc,
-                )
-                raise ResumeNotReadyError(
-                    reg.id,
-                    from_phase,
-                    phase.name,
-                    reason="has no compatible winner for the current config",
-                ) from None
+        except FileNotFoundError:
+            raise ResumeNotReadyError(reg.id, from_phase, phase.name) from None
+        except (
+            RuntimeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            AttributeError,
+            OSError,
+        ) as exc:
+            log.info(
+                "resume preflight rejected winner for experiment=%s phase=%s: %s",
+                reg.id,
+                phase.name,
+                exc,
+            )
+            raise ResumeNotReadyError(
+                reg.id,
+                from_phase,
+                phase.name,
+                reason="has no compatible winner for the current config",
+            ) from None
 
     @staticmethod
     def _current_config_bytes(reg: RegisteredExperiment) -> bytes:

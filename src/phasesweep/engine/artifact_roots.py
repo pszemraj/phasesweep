@@ -368,7 +368,9 @@ def _check_published_phase_studies(
         raise PublicationAccessError(publication.error or "Published result is unreadable.")
     if publication.state == "failed":
         raise PublicationIntegrityError(publication.error or "Published result is invalid.")
-    published_trials = _published_phase_trial_refs(publication.summary)
+    published_trials = _published_phase_trial_refs(
+        None if publication.validated is None else publication.validated.summary
+    )
     for _index, phase in experiment.phases_from(from_phase):
         phase_name = phase.name
         if phase_name not in published_trials:

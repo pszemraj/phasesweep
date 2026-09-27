@@ -9,7 +9,7 @@ import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import yaml
 
@@ -29,6 +29,72 @@ from phasesweep.engine.state import (
     _parse_winner_source,
 )
 from phasesweep.runtime.files import file_sha256, nofollow_flag
+
+
+class PlannedPhase(NamedTuple):
+    """One entry of a generation's recorded phase plan."""
+
+    name: str
+    comment: str | None
+
+
+@dataclass(frozen=True)
+class ValidatedWinner:
+    """One published winner artifact exactly as manifest validation read it."""
+
+    content: bytes
+    """The exact bytes whose digest matched the manifest."""
+    payload: Mapping[str, Any]
+    """The mapping decoded from ``content``."""
+
+
+@dataclass(frozen=True)
+class ValidatedPublication:
+    """Everything one manifest validation read, for consumers to use instead of rereading.
+
+    Every published result a reader shows or resumes from comes from this
+    object, so what is consumed is exactly what was validated: no consumer
+    reopens a published artifact by path after validation returns.
+    """
+
+    generation_id: str
+    summary: Mapping[str, Any]
+    """The validated generation summary."""
+    phase_plan: tuple[PlannedPhase, ...]
+    """The recorded phase plan, whose names are safe path components."""
+    metric: Mapping[str, Any]
+    """The summary's metric semantics, checked against the config snapshot."""
+    winners: Mapping[str, ValidatedWinner]
+    """Every manifest-listed winner, keyed by the phase that exposes it."""
+
+
+def _parse_phase_plan(raw: object) -> tuple[PlannedPhase, ...] | None:
+    """Parse a summary's recorded phase plan.
+
+    Plan names become path components, so an entry that is not a mapping with a
+    safe name and an optional string comment invalidates the whole plan: a
+    partially parsed plan under-reports a publication as badly as the current
+    config does. Publication validation refuses such a plan; permissive reads
+    of an unvalidated generation fall back to the current config instead.
+
+    :param object raw: The summary's ``phase_plan`` value.
+    :return tuple[PlannedPhase, ...] | None: Recorded phases in execution
+        order, or ``None`` when the plan is absent, empty, or malformed.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    plan: list[PlannedPhase] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            return None
+        name = item.get("name")
+        comment = item.get("comment")
+        if not isinstance(name, str) or not SAFE_NAME_PATTERN.fullmatch(name):
+            return None
+        if comment is not None and not isinstance(comment, str):
+            return None
+        plan.append(PlannedPhase(name, comment))
+    return tuple(plan)
 
 
 def _read_unlinked_bytes(path: Path, *, root: Path) -> bytes:
@@ -137,7 +203,7 @@ def _validate_generation_manifest(
     generation_dir: Path,
     generation_id: str,
     summary: Mapping[str, Any],
-) -> None:
+) -> ValidatedPublication:
     """Validate one generation's complete result graph against its summary manifest.
 
     "Published" must mean the immutable result is internally complete
@@ -169,6 +235,8 @@ def _validate_generation_manifest(
     :raises PublicationIntegrityError: The manifest is missing, malformed, any artifact is
         absent, altered, unparsable, or inconsistent with the summary, or a
         winner cites a source generation this tree does not hold.
+    :return ValidatedPublication: The summary, its phase plan and metric
+        semantics, and every winner exactly as this validation read it.
     """
 
     def _fail(reason: str) -> PublicationIntegrityError:
@@ -232,6 +300,9 @@ def _validate_generation_manifest(
         _fail,
         _permission_fail,
     )
+    phase_plan = _parse_phase_plan(summary.get("phase_plan"))
+    if phase_plan is None:
+        raise _fail("summary phase plan is malformed")
 
     raw_phases = summary.get("phases")
     if not isinstance(raw_phases, list):
@@ -251,6 +322,7 @@ def _validate_generation_manifest(
         if kind == "winner" and name not in phase_items:
             raise _fail(f"artifact manifest lists a winner for unknown phase {name!r}")
 
+    winners: dict[str, ValidatedWinner] = {}
     for (kind, name), entry in listed.items():
         artifact_path = generation_dir / "phases" / name / WINNER_FILENAME
         try:
@@ -272,6 +344,8 @@ def _validate_generation_manifest(
         if payload.get("phase") != name:
             raise _fail(f"{kind} artifact for phase {name!r} names a different phase")
         if kind == "winner":
+            if "promotion" in payload:
+                raise _fail(f"winner for phase {name!r} contains removed promotion data")
             item = phase_items[name]
             if payload.get("trial_number") != item.get("trial_number"):
                 raise _fail(f"winner for phase {name!r} disagrees with the summary trial number")
@@ -347,6 +421,7 @@ def _validate_generation_manifest(
             )
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
+            winners[name] = ValidatedWinner(content=content, payload=payload)
     phases_dir = generation_dir / "phases"
     if phases_dir.is_dir():
         for phase_dir in phases_dir.iterdir():
@@ -360,6 +435,13 @@ def _validate_generation_manifest(
                 raise _fail(
                     f"namespace contains removed promotion artifact for phase {phase_dir.name!r}"
                 )
+    return ValidatedPublication(
+        generation_id=generation_id,
+        summary=summary,
+        phase_plan=phase_plan,
+        metric=metric,
+        winners=winners,
+    )
 
 
 def _validate_winner_source_generation(

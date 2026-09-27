@@ -14,9 +14,8 @@ from phasesweep import experiment_status
 from phasesweep.config import Experiment
 from phasesweep.engine import read_status
 from phasesweep.engine.paths import _generation_winner_path
-from phasesweep.engine.publication import _last_successful_generation_id
 from tests.conftest import make_experiment
-from tests.ledger_fixtures import ledger_file, materialize
+from tests.ledger_fixtures import ledger_file, materialize, published_generation_id
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",
@@ -152,7 +151,7 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
     natural next move was to re-run over the evidence.
     """
     experiment = _published(tmp_path)
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")

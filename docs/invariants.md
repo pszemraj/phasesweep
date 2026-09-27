@@ -23,15 +23,18 @@ the MCP layer.
    study, checks every study's root before any write, writes the tree
    binding, then claims empty studies. Only the ClaimedLedger it returns
    reaches open_phase_study.
-3. Pure read paths (read_status, read_winners, CLI status and show-winners,
-   the MCP result snapshot) never construct file-backed storage and never
-   write bytes. Recovery inspection validates binding and format before any
-   open and refuses a pre-cutover ledger with the bytes unchanged.
+3. Pure read paths (read_status, read_winners, read_result, CLI status and
+   show-winners, the MCP result snapshot) never construct file-backed storage
+   and never write bytes. Recovery inspection validates binding and format
+   before any open and refuses a pre-cutover ledger with the bytes unchanged.
 4. src/phasesweep/engine/ledger.py is the only module that constructs Optuna
    storage, and no other module imports its private names. No module
    constructs sqlite3, SQLAlchemy, or Optuna RDB storage at all.
    tests/test_ledger_contract.py enforces both, and its ratchets are empty,
    so a new site anywhere else fails.
+5. A published result is read once, by publication validation. Consumers
+   use PublicationPointer.validated and never reopen a published artifact
+   by path.
 ```
 
 > [!IMPORTANT]
@@ -209,8 +212,9 @@ before its `_claim_study_artifact_root` loop\
 
 #### 6. Read paths construct and write nothing
 
-`read_status`, `read_winners`, CLI `status` and `show-winners`, and the MCP
-result snapshot build no file-backed storage, write no bytes, and report a
+`read_status`, `read_winners`, `read_result`, CLI `status` and
+`show-winners`, and the MCP result snapshot build no file-backed storage,
+write no bytes, and report a
 phase whose format scan did not complete as unavailable rather than counting
 its trials.
 
@@ -314,9 +318,26 @@ commit lands.
 write\
 **Test:** `tests/test_publication_transaction.py::test_shutdown_signal_during_publication_is_absorbed_until_committed`
 
+#### 13. A published result is read once
+
+Validation reads every published artifact once, refusing symlinks and paths
+outside the generations root, and returns what it read. `show-winners`,
+`read_status`, `read_winners`, `read_result`, the MCP result snapshot and
+winner reads, and a `--from-phase` resume all show or build on those bytes;
+none reopens a published artifact by path. A generation that is not the
+validated publication, such as a pinned, unfinished, or failed one, is read
+from its files under the permissive read contract.
+
+**Held by:** `engine.publication_validation._validate_generation_manifest`,
+returning the `ValidatedPublication` that
+`engine.publication.PublicationPointer.validated` carries, consumed by
+`engine.read._represented_winners`, `cli._show_experiment_winners`, and
+`engine.artifacts._load_winner`\
+**Test:** `tests/test_publication_transaction.py::test_published_reads_consume_the_bytes_validation_read`
+
 ### MCP runs
 
-#### 13. A PID alone is never authority
+#### 14. A PID alone is never authority
 
 A process is identified by PID, start time, and boot id together, and a
 differing boot id settles a reboot without signalling anything.
@@ -327,7 +348,7 @@ differing boot id settles a reboot without signalling anything.
 **Tests:** `tests/test_mcp_runs.py::test_state_cleanup_uncertain_on_pid_reuse_mismatch`,
 `tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`
 
-#### 14. A dead runner stays live until recovery decides
+#### 15. A dead runner stays live until recovery decides
 
 A dead runner with no terminal status stays in the live set until `recover-run`
 decides; liveness alone never concludes a run.
@@ -338,7 +359,7 @@ decides; liveness alone never concludes a run.
 
 ### Errors and fixtures
 
-#### 15. Wraps keep the operator's remediation
+#### 16. Wraps keep the operator's remediation
 
 Every operator-facing error declares one remediation, and a wrap preserves it
 instead of replacing it with the wrapper's own advice. Alternatives route the
@@ -358,7 +379,7 @@ own; unconfirmed cleanup adds recover-run after the repair.
 `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`,
 `tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`
 
-#### 16. Refusals are tested against real ledgers
+#### 17. Refusals are tested against real ledgers
 
 Refusals are tested against ledgers produced by the public API and by the
 preserved `v0.3.1` tag, and read paths run under a patch that records and
@@ -391,7 +412,7 @@ test that spawns a real process without the `integration` marker (see
 
 When a detached runner is SIGKILLed or the host crashes, the run handle
 survives with no terminal status. `RunStore.state` deliberately keeps that run
-live (invariant 14), because a dead runner with no status is indistinguishable
+live (invariant 15), because a dead runner with no status is indistinguishable
 from one whose trials are still being reaped, so the run holds one of the
 experiment's capacity slots and no later launch can proceed. `recover-run` is
 the only path that reads the durable evidence and decides. It opens studies

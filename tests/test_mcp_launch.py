@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -20,6 +21,7 @@ import pytest
 import yaml
 
 import phasesweep.engine.ledger as engine_ledger
+import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
@@ -39,7 +41,9 @@ from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaM
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_record_path,
+    _phase_dir,
 )
+from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
 )
@@ -282,6 +286,59 @@ def test_resume_rejects_incompatible_winner_before_spawn(
     with pytest.raises(ResumeNotReadyError, match="compatible winner"):
         app.launch("srv", from_phase="q")
 
+    assert store.list_handles() == []
+
+
+@pytest.mark.integration
+def test_resume_gate_applies_the_run_preflight_acceptance_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate validates the manifest once and refuses a skipped winner whose evidence is gone."""
+    trainer = write_constant_trainer(tmp_path)
+    p = Phase(
+        name="p",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"lr": IntParam(type="int", low=1, high=2)},
+    )
+    q = Phase(
+        name="q",
+        inherits=["p"],
+        n_trials=1,
+        sampler=Sampler(type="random", seed=1),
+        search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
+    )
+    published = _drift_experiment(tmp_path, trainer, phases=[p, q])
+    run_experiment(published)
+    # The operator appends phase r, which resumes from q's published winner,
+    # after q's source trial tree has been removed.
+    r = Phase(
+        name="r",
+        inherits=["q"],
+        n_trials=1,
+        sampler=Sampler(type="random", seed=2),
+        search_space={"bs": IntParam(type="int", low=1, high=2)},
+    )
+    config = tmp_path / "srv.yaml"
+    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phases=[p, q, r]))
+    shutil.rmtree(_phase_dir(published, "q"))
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+
+    original_validate = validation_ops._validate_generation_manifest
+    calls = 0
+
+    def counting_validate(*args: Any, **kwargs: Any) -> ValidatedPublication:
+        nonlocal calls
+        calls += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(validation_ops, "_validate_generation_manifest", counting_validate)
+
+    with pytest.raises(ResumeNotReadyError, match="earlier phase 'q' has no compatible winner"):
+        app.launch("srv", from_phase="r")
+
+    assert calls == 1
     assert store.list_handles() == []
 
 

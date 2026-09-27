@@ -65,11 +65,7 @@ from phasesweep.engine.paths import (
     _summary_path,
     _winner_path,
 )
-from phasesweep.engine.publication import (
-    _last_successful_generation_id,
-    _published_winner_path,
-)
-from phasesweep.engine.resume import _reject_bound_descendant_topups
+from phasesweep.engine.resume import _published_for_resume, _reject_bound_descendant_topups
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
     ATTEMPT_ID_ATTR,
@@ -97,7 +93,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import materialize, tree_snapshot
+from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
 
 #: Optuna journal op code for ``SET_TRIAL_USER_ATTR``. Mirrors
 #: ``optuna.storages.journal._storage.JournalOperation`` and
@@ -324,14 +320,19 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
 
     assert set(winners) == {"arch", "lr"}
     assert _last_successful_generation_path(experiment).is_file()
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     # The first (arch) convenience copy completed before the injected failure; the
     # second one (lr, or the summary) did not. Either way, reads resolve via
     # the generation-scoped artifact once any generation has published.
     assert {view.phase for view in read_winners(experiment)} == {"arch", "lr"}
     assert (
-        _load_winner(experiment, experiment.phases[0], {}, published_generation_id=generation_id)
+        _load_winner(
+            experiment,
+            experiment.phases[0],
+            {},
+            publication=_published_for_resume(experiment),
+        )
         is not None
     )
 
@@ -1109,7 +1110,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
     """One tree cannot mix publication files from one DB with counts from another."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     owner = materialized.experiment
-    published = _last_successful_generation_id(owner)
+    published = published_generation_id(owner)
     assert published is not None
     generation_dir = _experiment_dir(owner) / "generations"
     generations_before = {path.name for path in generation_dir.iterdir()}
@@ -1131,7 +1132,7 @@ def test_artifact_tree_rejects_a_second_storage_ledger(tmp_path: Path) -> None:
         read_winners(foreign)
 
     assert not (tmp_path / "foreign.journal").exists()
-    assert _last_successful_generation_id(owner) == published
+    assert published_generation_id(owner) == published
     assert {path.name for path in generation_dir.iterdir()} == generations_before
     owner_status = read_status(owner)
     assert owner_status["publication_integrity"] == "ok"
@@ -1156,7 +1157,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
     run_experiment(experiment)
     binding_path = _artifact_root_binding_path(experiment)
     binding_before = binding_path.read_bytes()
-    generation_before = _last_successful_generation_id(experiment)
+    generation_before = published_generation_id(experiment)
 
     monkeypatch.chdir(foreign_cwd)
     with pytest.raises(ArtifactRootConflictError, match="different storage ledger"):
@@ -1166,7 +1167,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
 
     assert not (foreign_cwd / "ledger.journal").exists()
     assert binding_path.read_bytes() == binding_before
-    assert _last_successful_generation_id(experiment) == generation_before
+    assert published_generation_id(experiment) == generation_before
 
 
 @pytest.mark.integration
@@ -1238,7 +1239,7 @@ def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
         not in optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).user_attrs
     )
     # The refusal is not allowed to cost the tree its existing publication.
-    assert _last_successful_generation_id(experiment) is not None
+    assert published_generation_id(experiment) is not None
     assert_published_winner_evidence_local(root)
 
 
@@ -1352,7 +1353,7 @@ def test_published_phase_trial_read_failure_preserves_cleanup_uncertainty(
 
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
-    published = _last_successful_generation_id(experiment)
+    published = published_generation_id(experiment)
     assert published is not None
     generation_before = _generation_path(experiment).read_bytes()
     generation_dirs_before = {
@@ -1395,7 +1396,7 @@ def test_published_study_requirement_starts_at_from_phase(
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     experiment = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer, storage=storage)
     original = run_experiment(experiment)
-    published = _last_successful_generation_id(experiment)
+    published = published_generation_id(experiment)
     generation_before = _generation_path(experiment).read_bytes()
     resolved = _resolve_storage(storage)
     optuna.delete_study(study_name=f"t::{missing_phase}", storage=resolved)
@@ -1409,12 +1410,12 @@ def test_published_study_requirement_starts_at_from_phase(
         with pytest.raises(PublishedStudyMissingError, match="phase 'lr'"):
             run_experiment(experiment, from_phase="lr")
         assert _generation_path(experiment).read_bytes() == generation_before
-        assert _last_successful_generation_id(experiment) == published
+        assert published_generation_id(experiment) == published
     else:
         winners = run_experiment(experiment, from_phase="lr")
         assert winners["arch"].params == original["arch"].params
         assert winners["arch"].trial_number == original["arch"].trial_number
-        assert _last_successful_generation_id(experiment) != published
+        assert published_generation_id(experiment) != published
         if replacement == "absent":
             assert "t::arch" not in optuna.get_all_study_names(storage=resolved)
         else:
@@ -1465,7 +1466,7 @@ def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
     ledger = tmp_path / "studies.journal"
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
     run_experiment(experiment)
-    published = _last_successful_generation_id(experiment)
+    published = published_generation_id(experiment)
 
     def lose_ledger(*_args: object, **_kwargs: object) -> None:
         ledger.unlink()
@@ -1477,7 +1478,7 @@ def test_ledger_loss_during_execution_preserves_cleanup_uncertainty(
         run_experiment(experiment, terminal_callback=reports.append)
     assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert reports[0].cleanup_confirmed is False
-    assert _last_successful_generation_id(experiment) == published
+    assert published_generation_id(experiment) == published
 
 
 def _exception_chain(error: BaseException) -> list[BaseException]:
@@ -1626,8 +1627,8 @@ def test_fresh_and_repeated_in_memory_roots_record_explicit_no_ledger_bindings(
     run_experiment(moved)
     run_experiment(moved)
 
-    assert _last_successful_generation_id(experiment) is not None
-    assert _last_successful_generation_id(moved) is not None
+    assert published_generation_id(experiment) is not None
+    assert published_generation_id(moved) is not None
     for configured in (experiment, moved):
         binding = json.loads(_artifact_root_binding_path(configured).read_text())
         assert binding == {
@@ -1873,8 +1874,9 @@ def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) ->
     exp = _two_phase_experiment(workdir=tmp_path / "runs", trainer=trainer)
     run_experiment(exp)
 
-    arch_winner_path = _published_winner_path(exp, "arch")
-    assert arch_winner_path is not None
+    generation_id = published_generation_id(exp)
+    assert generation_id is not None
+    arch_winner_path = _generation_winner_path(exp, generation_id, "arch")
     data = yaml.safe_load(arch_winner_path.read_text())
     data["phase_fingerprint"] = "0" * 64
     arch_winner_path.write_text(yaml.safe_dump(data, sort_keys=False))

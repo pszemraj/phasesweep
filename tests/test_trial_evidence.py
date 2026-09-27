@@ -55,10 +55,7 @@ from phasesweep.engine.paths import (
     _phase_dir,
     _trial_dir_for,
 )
-from phasesweep.engine.publication import (
-    _last_successful_generation_id,
-    _resolve_publication_pointer,
-)
+from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import (
     OBJECTIVE_PROVENANCE_ATTR,
@@ -70,6 +67,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
+from tests.ledger_fixtures import published_generation_id
 
 # Every test here drives a real sweep through external trainer processes before
 # it can check what selection published, so the whole module is integration tier.
@@ -596,13 +594,13 @@ def test_untouched_tree_still_publishes_a_clean_topup(tmp_path: Path) -> None:
     """Positive control: the guard costs an intact tree nothing."""
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
-    first_generation = _last_successful_generation_id(experiment)
+    first_generation = published_generation_id(experiment)
 
     topup = _evidence_experiment(tmp_path, n_trials=2)
     winners = run_experiment(topup)
 
     assert _trial_count(topup) == 2
-    second_generation = _last_successful_generation_id(topup)
+    second_generation = published_generation_id(topup)
     assert second_generation is not None
     assert second_generation != first_generation
     # Constant objective: trial 0 still wins on the tie break, so this is also
@@ -681,7 +679,7 @@ def test_carried_winner_requires_its_original_generated_input(tmp_path: Path) ->
     experiment = _evidence_experiment(tmp_path, override_format="yaml_file")
     run_experiment(experiment)
     run_experiment(experiment)
-    carrying_generation = _last_successful_generation_id(experiment)
+    carrying_generation = published_generation_id(experiment)
     assert carrying_generation is not None
     pointer_before = _pointer_bytes(experiment)
     (_sole_trial_dir(experiment) / "trainer_config.yaml").unlink()
@@ -689,7 +687,7 @@ def test_carried_winner_requires_its_original_generated_input(tmp_path: Path) ->
     with pytest.raises(TrialEvidenceMissingError, match="trainer_config.yaml"):
         run_experiment(experiment)
 
-    assert _last_successful_generation_id(experiment) == carrying_generation
+    assert published_generation_id(experiment) == carrying_generation
     assert _pointer_bytes(experiment) == pointer_before
 
 
@@ -767,7 +765,7 @@ def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(
     """Winner serialization supplies enough evidence identity to skip a missing study."""
     experiment, _marker = _from_phase_evidence_experiment(tmp_path)
     run_experiment(experiment)
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     payload = yaml.safe_load(
         (_generations_dir(experiment) / generation_id / "phases" / "p" / "winner.yaml").read_text()
@@ -804,10 +802,10 @@ def _tree_with_a_carried_winner(tmp_path: Path) -> tuple[Experiment, str, str]:
     """
     experiment = _evidence_experiment(tmp_path)
     run_experiment(experiment)
-    source_generation = _last_successful_generation_id(experiment)
+    source_generation = published_generation_id(experiment)
     assert source_generation is not None
     run_experiment(experiment)
-    carrying_generation = _last_successful_generation_id(experiment)
+    carrying_generation = published_generation_id(experiment)
     assert carrying_generation is not None
     assert carrying_generation != source_generation
     payload = _published_winner_payload(experiment, carrying_generation)
@@ -838,7 +836,7 @@ def test_deleting_a_carried_winners_source_generation_fails_read_and_write(
     with pytest.raises(RuntimeError, match="does not exist in this tree"):
         run_experiment(_evidence_experiment(tmp_path))
     assert _pointer_bytes(experiment) == pointer_before
-    assert _last_successful_generation_id(experiment) is None
+    assert published_generation_id(experiment) is None
 
 
 @pytest.mark.parametrize("damage", ["missing", "edited", "coherently_changed"])
@@ -953,7 +951,7 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
     assert crashed_dir.is_dir()
     assert not (crashed_dir / "summary.yaml").exists()
     assert not (crashed_dir / "phases").exists()
-    assert _last_successful_generation_id(crashing) is None
+    assert published_generation_id(crashing) is None
 
     recovery_marker.write_text("ok\n")
     recovering = _evidence_experiment(
@@ -967,7 +965,7 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
 
     assert winners["p"].trial_number == 0
     assert winners["p"].generation_id == crashed_generation
-    published = _last_successful_generation_id(recovering)
+    published = published_generation_id(recovering)
     assert published is not None
     payload = _published_winner_payload(recovering, published)
     assert payload["winner_source"]["generation_id"] == crashed_generation

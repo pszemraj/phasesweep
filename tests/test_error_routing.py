@@ -60,7 +60,7 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
 )
 from phasesweep.engine.phase import _failure_policy_abort_record
-from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
@@ -97,6 +97,7 @@ from tests.ledger_fixtures import (
     Materialized,
     ledger_file,
     materialize,
+    published_generation_id,
     republish_as_incomplete,
 )
 from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
@@ -980,7 +981,7 @@ def _reconcile_prepared_over_damaged_publication(
 ) -> object:
     """Reconcile a prepared publication after the last-success target lost its summary."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    published = _last_successful_generation_id(experiment)
+    published = published_generation_id(experiment)
     assert published is not None
     _generation_summary_path(experiment, published).unlink()
     needs = replace(
@@ -1217,9 +1218,7 @@ def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         experiment,
         experiment.phases[0],
         {},
-        published_generation_id=_last_successful_generation_id(
-            experiment, raise_on_manifest_error=True
-        ),
+        publication=_published_for_resume(experiment),
     )
 
 
@@ -1233,9 +1232,7 @@ def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         experiment.model_copy(update={"phases": [edited]}),
         edited,
         {},
-        published_generation_id=_last_successful_generation_id(
-            experiment, raise_on_manifest_error=True
-        ),
+        publication=_published_for_resume(experiment),
     )
 
 
