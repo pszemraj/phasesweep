@@ -1194,6 +1194,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
             pgid=None,
             pid_starttime=None,
             started_at=started_at,
+            visible_params_at_launch="none",
             launch_state="launching",
         )
     )

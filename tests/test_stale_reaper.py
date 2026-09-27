@@ -1418,11 +1418,11 @@ def test_registry_discards_attempt_whose_journal_ledger_is_gone_without_recreati
     assert report.recovered_attempt_ids == set()
 
 
-def test_registry_refuses_a_foreign_ledger_holding_pre_cutover_state(tmp_path: Path) -> None:
+def test_registry_refuses_a_foreign_ledger_holding_unsupported_state(tmp_path: Path) -> None:
     """A registry entry cannot reap through a ledger this release refuses.
 
     This release wrote the entry, so the ledger it names was current-format
-    when the attempt registered. Pre-cutover state there now means the locator
+    when the attempt registered. Unsupported state there now means the locator
     no longer names that ledger, so the run stops with the entry and the
     foreign ledger's bytes both intact instead of marking a trial FAIL in it.
     """
@@ -1447,8 +1447,10 @@ def test_registry_refuses_a_foreign_ledger_holding_pre_cutover_state(tmp_path: P
     )
     stale.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     stale_trial = stale.ask()
-    legacy = optuna.create_study(study_name="legacy::p", storage=foreign_storage)
-    legacy.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    foreign_unmarked_study = optuna.create_study(study_name="legacy::p", storage=foreign_storage)
+    foreign_unmarked_study.add_trial(
+        optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE)
+    )
     trial_dir = tmp_path / "foreign-attempt"
     trial_dir.mkdir()
     write_attempt_lifecycle(trial_dir, attempt_id="foreign-attempt", state="allocated")
@@ -1466,7 +1468,7 @@ def test_registry_refuses_a_foreign_ledger_holding_pre_cutover_state(tmp_path: P
     entry_before = entry_path.read_bytes()
     ledger_before = foreign_db.read_bytes()
 
-    with pytest.raises(StudySchemaMismatchError, match=r"pre-cutover.*'legacy::p'"):
+    with pytest.raises(StudySchemaMismatchError, match=r"unsupported.*'legacy::p'"):
         run_experiment(current)
 
     assert entry_path.read_bytes() == entry_before

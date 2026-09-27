@@ -206,7 +206,7 @@ def make_run_handle(
     starttime: int | None = None,
     launch_state: RunLaunchState = "spawned",
     allow_cancel: bool = False,
-    visible_params_at_launch: VisibleParamsPolicy | None = "none",
+    visible_params_at_launch: VisibleParamsPolicy = "none",
 ) -> RunHandle:
     if launch_state == "launching":
         process_id = None
@@ -258,7 +258,7 @@ def claim_runner_handle(
     config_sha256: str,
     started_at: str,
     experiment_id: str = "srv",
-    visible_params_at_launch: VisibleParamsPolicy | None = "none",
+    visible_params_at_launch: VisibleParamsPolicy = "none",
 ) -> None:
     """Create the launch reservation a real MCP server owns before spawning."""
     store.create(

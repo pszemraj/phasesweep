@@ -12,8 +12,6 @@ class OperatorAction(StrEnum):
     The message stays authoritative about *what* went wrong; this says *what to
     do next*, so callers can route a failure without parsing prose.
 
-    ``USE_PRIOR_RELEASE``
-        Operate the existing state under the preserved pre-cutover release.
     ``FRESH_NAMESPACE``
         Start again under a new experiment name, artifact root, or local
         storage instead of reusing the bound one.
@@ -40,7 +38,6 @@ class OperatorAction(StrEnum):
     inherit a remediation, and defects do not subclass :class:`PhaseSweepError`.
     """
 
-    USE_PRIOR_RELEASE = "use_prior_release"
     FRESH_NAMESPACE = "fresh_namespace"
     RESTORE_LEDGER = "restore_ledger"
     RESTORE_TREE = "restore_tree"

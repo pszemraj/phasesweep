@@ -76,18 +76,16 @@ class PhaseStatusSnapshot(_SnapshotModel):
     published_study_unavailable: bool | None = None
     """Whether the published study was unavailable at capture time.
 
-    ``None`` means availability was not checked, as in older frozen snapshots
-    or pre-generation placeholders. It is not evidence of study availability.
+    ``None`` means availability was not checked, as in pre-generation
+    placeholders. It is not evidence of study availability.
     """
     running_attempts: list[RunningAttemptSnapshot] | None = None
     """RUNNING rows the frozen counts describe, or ``None`` when unknown.
 
     ``None`` means the capture read no trial data for this phase, i.e. it
     pairs with ``trial_data_available: false`` -- an empty list would assert
-    there are no RUNNING rows. Snapshots frozen before this field existed also
-    parse as ``None``, which is the truthful reading: they recorded no
-    identities. A phase with known trial counts always carries a list, empty
-    when nothing is RUNNING, including a confirmed absent study.
+    there are no RUNNING rows. A phase with known trial counts always carries
+    a list, empty when nothing is RUNNING, including a confirmed absent study.
     """
 
 
@@ -130,8 +128,9 @@ class StatusSnapshot(_SnapshotModel):
     """Whether the represented generation's config matched at capture time.
 
     Run-scoped MCP reads recompute this from the frozen represented-config
-    fingerprint and current catalog config; snapshots frozen before that
-    fingerprint existed parse as ``None``.
+    fingerprint and current catalog config; it is ``None`` when no comparison
+    config is available, or when the represented summary recorded no
+    fingerprint.
     """
 
     result_phase_plan: list[str]
@@ -479,16 +478,16 @@ def finalize_result_snapshot(
     """Finalize a previously captured snapshot without rereading shared state.
 
     A phase whose capture recorded no RUNNING identities (``running_attempts``
-    is ``None``, which pairs with ``trial_data_available: false``, and is also
-    how a snapshot frozen before that field existed parses) is left exactly as
-    captured: there is nothing to reconcile the cleanup report against, and its
-    counts were never read either.
+    is ``None``, which pairs with ``trial_data_available: false``) is left
+    exactly as captured: there is nothing to reconcile the cleanup report
+    against, and its counts were never read either.
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
     :param Mapping[str, tuple[str, int, str]] | None confirmed_attempt_locations:
         Reconciled attempt ids mapped to phase, trial number, and generation;
-        used when the frozen row predates its Optuna identity attrs.
+        used when the frozen row was captured before its Optuna identity attrs
+        were set.
     :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
     :raises RuntimeError: If the cleanup report names more recovered attempts
         than the snapshot counts as RUNNING, for a phase or for the represented

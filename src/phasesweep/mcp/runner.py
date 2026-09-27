@@ -121,9 +121,6 @@ class FailurePayload(FailureCausePayload):
 # has no phrase: it is implied after any operator step, and is the agent's to
 # make when it is the routed action.
 _OPERATOR_STEPS: dict[OperatorAction, str] = {
-    OperatorAction.USE_PRIOR_RELEASE: (
-        "operate the existing state with the preserved PhaseSweep release that wrote it"
-    ),
     OperatorAction.FRESH_NAMESPACE: (
         "use a new experiment name, or a fresh artifact root and local storage"
     ),

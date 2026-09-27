@@ -648,12 +648,15 @@ def test_recovery_preserves_status_written_after_initial_read(
     assert terminal["result_snapshot_state"] == "complete"
 
 
-@pytest.mark.parametrize("unknown_side", ["saved", "current"])
 def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    unknown_side: str,
 ) -> None:
+    """A spawned handle always records its own boot id; only the current lookup can fail.
+
+    A recovery-time boot id read failure still must not signal, since it
+    cannot rule out PID reuse after a reboot.
+    """
     current_boot = read_boot_id()
     if current_boot is None:
         pytest.skip("boot id unavailable on this platform")
@@ -661,22 +664,18 @@ def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-recovery-unknown-boot"
-    handle = replace(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-            pid=reaped_pid(),
-            starttime=111,
-        ),
-        boot_id=None if unknown_side == "saved" else current_boot,
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=reaped_pid(),
+        starttime=111,
     )
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     store.mark_cleanup_uncertain(handle)
-    if unknown_side == "current":
-        monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
-        monkeypatch.setattr(mcp_recovery, "read_boot_id", lambda: None, raising=False)
+    monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_recovery, "read_boot_id", lambda: None, raising=False)
     signalled: list[object] = []
 
     def record_signal(*args: object, **kwargs: object) -> bool:
@@ -943,7 +942,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
 
     # A real run binds the tree in preflight, long before it registers an
     # attempt into it. Fabricating the registry entry without the binding would
-    # leave a tree this release correctly reads as unmarked pre-cutover state.
+    # leave a tree this release correctly reads as unmarked PhaseSweep state.
     mark_current_format(experiment)
     attempt_id = "registry-only-attempt"
     trial_dir = _experiment_dir(experiment) / "p" / "trial_registry_only"

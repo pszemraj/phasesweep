@@ -98,7 +98,7 @@ class UnsupportedStateFormatError(ValueError):
 
     Still a ``ValueError`` for every caller that refuses a bad state directory
     that way. The subclass lets operator recovery tell this refusal, whose
-    remedy is the preserved release, apart from a state directory that is
+    remedy is a fresh MCP state directory, apart from a state directory that is
     simply missing.
     """
 
@@ -239,16 +239,17 @@ class RunHandle:
     config_sha256: str
     pid: int | None
     pgid: int | None
-    pid_starttime: int | None  # /proc start time for PID-reuse-safe liveness; None off-Linux
+    # /proc start time for PID-reuse-safe liveness. None only on the pre-spawn
+    # "launching" placeholder: a spawned handle is never persisted without it
+    # (see mcp/runner.py _persist_spawned_handle and mcp/run_control.py _spawn).
+    pid_starttime: int | None
     started_at: str  # ISO-8601 UTC
+    visible_params_at_launch: Literal["none", "all"] | list[str]
     launch_state: RunLaunchState = "spawned"
     allow_cancel: bool = False
-    # ``None`` is reserved for handles written before launch-time visibility
-    # was persisted. Readers treat it as ``none`` rather than consulting the
-    # current catalog, which could reveal values hidden at launch.
-    visible_params_at_launch: Literal["none", "all"] | list[str] | None = None
-    # Boot that pid/pid_starttime belong to; None off-Linux and in handles
-    # written before boot ids were recorded.
+    # Boot that pid/pid_starttime belong to. None only on the pre-spawn
+    # "launching" placeholder: a spawned handle is never persisted without it
+    # (see mcp/runner.py _persist_spawned_handle and mcp/run_control.py _spawn).
     boot_id: str | None = None
 
 
@@ -316,8 +317,8 @@ class RunStore:
 
         The format marker decides what a failure means. With a marker, the
         path is a state directory and anything else wrong with it is damage.
-        Without one, run handles make it state from the preserved release, and
-        their absence means the path names some other directory. A path whose
+        Without one, run handles make it unmarked PhaseSweep state, and their
+        absence means the path names some other directory. A path whose
         ancestors cannot be walked never reaches a state directory at all.
 
         :param Path state_dir: Existing MCP state directory containing ``runs/``
@@ -436,8 +437,8 @@ class RunStore:
 
         A marker is written only for a namespace with no durable run-store
         evidence. A pre-marker state that already contains handles, logs,
-        leases, or audit records belongs to the preserved 0.3.1 runtime and
-        is refused by this release.
+        leases, or audit records is unmarked PhaseSweep state and is refused
+        by this release.
 
         :return bool: Whether this fresh namespace needs its first marker.
         :raises ValueError: The namespace contains unsupported or unmarked
@@ -523,15 +524,14 @@ class RunStore:
             self._require_supported_format_marker()
 
     def _format_refusal(self, detail: str) -> UnsupportedStateFormatError:
-        """Build the actionable refusal for pre-cutover MCP state.
+        """Build the actionable refusal for unmarked or unsupported MCP state.
 
         :param str detail: Specific format-boundary failure observed.
         :return UnsupportedStateFormatError: Refusal that directs the operator to a safe path.
         """
         return UnsupportedStateFormatError(
             f"MCP state directory {self._format_marker_path.parent} {detail}; "
-            "use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime "
-            "for existing state."
+            "use a fresh MCP state directory."
         )
 
     @contextlib.contextmanager
@@ -1007,7 +1007,7 @@ class RunStore:
                 type(key) is str and key and key == key.strip() for key in visible_params
             ) or len(set(visible_params)) != len(visible_params):
                 return None
-        elif visible_params is not None:
+        else:
             return None
         if handle.launch_state not in {"launching", "spawned"}:
             return None
@@ -1028,9 +1028,9 @@ class RunStore:
                 return None
             if type(handle.pgid) is not int or handle.pgid <= 0:
                 return None
-            if handle.pid_starttime is not None and (
-                type(handle.pid_starttime) is not int or handle.pid_starttime <= 0
-            ):
+            if type(handle.pid_starttime) is not int or handle.pid_starttime <= 0:
+                return None
+            if handle.boot_id is None:
                 return None
         return handle
 
@@ -1529,26 +1529,22 @@ class RunStore:
         ):
             return None
         reaped_attempt_ids = payload.get("reaped_attempt_ids")
-        if reaped_attempt_ids is not None and (
-            not isinstance(reaped_attempt_ids, list)
-            or any(not isinstance(value, str) or not value for value in reaped_attempt_ids)
+        if not isinstance(reaped_attempt_ids, list) or any(
+            not isinstance(value, str) or not value for value in reaped_attempt_ids
         ):
             return None
         locations = payload.get("reaped_attempt_locations")
-        if locations is not None and (
-            not isinstance(locations, dict)
-            or any(
-                not isinstance(attempt_id, str)
-                or not attempt_id
-                or not isinstance(raw, dict)
-                or not isinstance(raw.get("phase"), str)
-                or not raw.get("phase")
-                or type(raw.get("trial_number")) is not int
-                or raw["trial_number"] < 0
-                or not isinstance(raw.get("generation_id"), str)
-                or not raw.get("generation_id")
-                for attempt_id, raw in locations.items()
-            )
+        if not isinstance(locations, dict) or any(
+            not isinstance(attempt_id, str)
+            or not attempt_id
+            or not isinstance(raw, dict)
+            or not isinstance(raw.get("phase"), str)
+            or not raw.get("phase")
+            or type(raw.get("trial_number")) is not int
+            or raw["trial_number"] < 0
+            or not isinstance(raw.get("generation_id"), str)
+            or not raw.get("generation_id")
+            for attempt_id, raw in locations.items()
         ):
             return None
         return payload

@@ -47,6 +47,7 @@ from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
 )
+from phasesweep.errors import OperatorAction
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
@@ -1308,9 +1309,16 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A spawned handle can never legitimately lack a boot id.
+
+    The fake runner here writes one anyway (bypassing the real runner's own
+    refusal), so the server's identity read must not trust it: the receipt
+    is unreadable rather than a legitimate live handle, and the launch still
+    ends in a recorded failure.
+    """
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    patch_popen_capture(monkeypatch)
+    captured = patch_popen_capture(monkeypatch)
     monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
     monkeypatch.setattr("tests.mcp_helpers.read_boot_id", lambda: None)
     monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *_args, **_kwargs: True)
@@ -1318,8 +1326,11 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     with pytest.raises(RuntimeError, match="boot id"):
         app.launch("srv")
 
-    (pending,) = store.list_handles()
-    assert store.state(pending) == "failed"
+    assert store.list_handles() == []
+    run_id = captured["cmd"][captured["cmd"].index("--run-id") + 1]
+    assert store.get(run_id) is None
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["returncode"] == 1
 
 
 def test_runner_does_not_persist_a_receipt_without_boot_identity(
@@ -1608,7 +1619,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
             storage=engine_ledger._resolve_storage(experiment.resolved_storage),
             direction="minimize",
         )
-        # Two populated, unmarked studies model a pre-cutover local ledger.
+        # Two populated, unmarked studies model an unsupported local ledger.
         study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
         study.add_trial(
             optuna.trial.create_trial(
@@ -1628,7 +1639,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
         started_at=started_at,
     )
 
-    with pytest.raises(StudySchemaMismatchError, match="pre-cutover or unsupported"):
+    with pytest.raises(StudySchemaMismatchError, match="unsupported PhaseSweep study state"):
         runner_main(
             runner_argv(
                 store,
@@ -1644,9 +1655,10 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     assert terminal["result_snapshot_state"] == "complete"
     assert terminal["failure"]["code"] == "study_schema_mismatch"
     assert terminal["failure"]["retryable"] is False
-    # Pre-cutover state routes to the release that wrote it, which keeps the
-    # study, rather than to archiving it for a fresh one.
-    assert "preserved PhaseSweep release" in terminal["failure"]["remediation"]
+    # Unsupported state routes to starting fresh, rather than to archiving
+    # this study and continuing under the current one.
+    remediation = terminal["failure"]["remediation"]
+    assert mcp_runner._OPERATOR_STEPS[OperatorAction.FRESH_NAMESPACE] in remediation
 
 
 def test_launch_bookkeeping_failure_preserves_runner_status(

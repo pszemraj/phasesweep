@@ -126,9 +126,6 @@ def _root_durable_state_entry(experiment: Experiment) -> str | None:
         "generation.yaml",
         "generations",
         "last_successful_generation.yaml",
-        # The SQLite ledger `storage: auto` created before the journal became the
-        # only ledger. Nothing writes it now, but a root holding one is not fresh.
-        "study.db",
         "study.journal",
         "summary.yaml",
         *(phase.name.casefold() for phase in experiment.phases),
@@ -165,7 +162,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
     Study attributes bind ledger to tree. This reverse record binds tree to
     ledger, preventing a second database from combining its trial counts with
     another database's publication. Existing unmarked PhaseSweep state is
-    pre-cutover state and is refused by this release.
+    refused as an unsupported format.
 
     This is step one of the fixed ledger order, so it is strictly read-only: it
     neither writes the record (:func:`_write_artifact_root_binding`) nor opens
@@ -178,7 +175,7 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
         this experiment and ledger; ``"unbound"`` when it records nothing yet.
     :raises ArtifactRootConflictError: The binding cannot be validated as the
         current user, is malformed or names another owner, or the root holds
-        unmarked pre-cutover PhaseSweep state.
+        unmarked PhaseSweep state.
     """
     path = _artifact_root_binding_path(experiment)
     expected = _artifact_root_binding_payload(experiment)
@@ -188,12 +185,10 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
         durable_entry = _root_durable_state_entry(experiment)
         if durable_entry is not None:
             raise ArtifactRootConflictError(
-                f"Artifact root {expected['artifact_root']!r} contains pre-cutover "
+                f"Artifact root {expected['artifact_root']!r} contains unmarked "
                 f"PhaseSweep state entry {durable_entry!r} but no supported format marker. "
                 "Use a fresh artifact root and fresh local storage with this PhaseSweep "
-                "release, or use the preserved PhaseSweep 0.3.1 environment to operate "
-                "the existing state. Nothing was written.",
-                action=OperatorAction.USE_PRIOR_RELEASE,
+                "release. Nothing was written.",
             ) from None
         return "unbound"
     except PermissionError as exc:
@@ -211,11 +206,9 @@ def _check_artifact_root_binding(experiment: Experiment) -> BindingState:
         ) from exc
     if isinstance(raw, dict) and raw.get("schema_version") != ARTIFACT_ROOT_BINDING_SCHEMA_VERSION:
         raise ArtifactRootConflictError(
-            f"Artifact root {expected['artifact_root']!r} uses unsupported pre-cutover "
-            f"PhaseSweep format {raw.get('schema_version')!r}. Use a fresh artifact root "
-            "and fresh local storage with this PhaseSweep release, or use the preserved "
-            "PhaseSweep 0.3.1 environment to operate the existing state. Nothing was written.",
-            action=OperatorAction.USE_PRIOR_RELEASE,
+            f"Artifact root {expected['artifact_root']!r} uses unsupported PhaseSweep "
+            f"format {raw.get('schema_version')!r}. Use a fresh artifact root and fresh "
+            "local storage with this PhaseSweep release. Nothing was written.",
         )
     if raw != expected:
         raise ArtifactRootConflictError(
@@ -284,10 +277,8 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
         if trial_count:
             raise ArtifactRootConflictError(
                 f"Study {study.study_name!r} holds {trial_count} trial(s) but records no "
-                "artifact root and is pre-cutover state. Use a fresh artifact root and "
-                "local storage with this release, or use the preserved PhaseSweep 0.3.1 "
-                "environment to operate the existing state. Nothing was written.",
-                action=OperatorAction.USE_PRIOR_RELEASE,
+                "artifact root, which is unsupported PhaseSweep state. Use a fresh "
+                "artifact root and local storage with this release. Nothing was written.",
             )
         return True
     _check_study_artifact_root(study, experiment)

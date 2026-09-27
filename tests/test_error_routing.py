@@ -190,6 +190,14 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     assert foreign.action is RunRecoveryError.default_action
 
 
+_UNMARKED_STUDY_REMEDY_MARKERS = {
+    "study schema": "fresh artifact root",
+    "trial target": "fresh local ledger",
+    "environment cohort": "new experiment name",
+    "phase fingerprint": "fresh local ledger",
+}
+
+
 @pytest.mark.parametrize(
     ("label", "call"),
     [
@@ -212,12 +220,13 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
         ),
     ],
 )
-def test_pre_cutover_refusals_route_to_the_prior_release(label, call):
+def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
+    """A populated study with no PhaseSweep attrs is unsupported state, not just a config mismatch."""
     with pytest.raises(PhaseSweepError) as excinfo:
         call()
-    assert excinfo.value.action is OperatorAction.USE_PRIOR_RELEASE, label
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE, label
     # The routed action is additional to, not a replacement for, the remedy prose.
-    assert "0.3.1" in str(excinfo.value), label
+    assert _UNMARKED_STUDY_REMEDY_MARKERS[label] in str(excinfo.value), label
 
 
 def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
@@ -527,8 +536,8 @@ def _recover_while_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ob
         return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
 
 
-def _recover_over_pre_cutover_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover from a state directory the 0.3.1 runtime left: run handles, no format marker."""
+def _recover_over_unmarked_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover from a state directory holding run handles but no format marker."""
     state_dir = tmp_path / "mcp-state"
     RunStore(state_dir).create(make_run_handle(run_id="wrap-recover"))
     (state_dir / _STATE_FORMAT_MARKER_NAME).unlink()
@@ -673,14 +682,12 @@ def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.Monk
     return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
-def _refuse_as_prior_release(study: optuna.Study) -> None:
+def _refuse_mixed_types_same_remedy(study: optuna.Study) -> None:
     """Refuse each phase with a different type that names the same remedy."""
     error_type = (
         StudySchemaMismatchError if study.study_name == "t::a" else StudyFingerprintMismatchError
     )
-    raise error_type(
-        f"{study.study_name} predates this release.", action=OperatorAction.USE_PRIOR_RELEASE
-    )
+    raise error_type(f"{study.study_name} is unsupported.", action=OperatorAction.FRESH_NAMESPACE)
 
 
 def _preflight(
@@ -711,15 +718,15 @@ def _preflight(
     return trigger
 
 
-def _two_precutover_studies() -> dict[str, optuna.Study]:
-    """Return two populated studies that predate the schema stamp."""
+def _two_unmarked_studies() -> dict[str, optuna.Study]:
+    """Return two populated studies with no PhaseSweep schema stamp."""
     return {"a": _populated_study("t::a"), "b": _populated_study("t::b")}
 
 
 def _refuse_schema_differently(study: optuna.Study) -> None:
     """Refuse each phase with the same type but a different remedy."""
     action = (
-        OperatorAction.USE_PRIOR_RELEASE
+        OperatorAction.RESTORE_LEDGER
         if study.study_name == "t::a"
         else OperatorAction.FRESH_NAMESPACE
     )
@@ -829,11 +836,11 @@ WRAP_CASES = (
     RoutingCase(
         # Composed: the inbound refusal is a ValueError carrying no action, so the
         # site supplies the one its message names.
-        id="recover_run_pre_cutover_state",
-        trigger=_recover_over_pre_cutover_state,
+        id="recover_run_unmarked_state",
+        trigger=_recover_over_unmarked_state,
         raised=RunRecoveryError,
-        action=OperatorAction.USE_PRIOR_RELEASE,
-        message="use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime",
+        action=OperatorAction.FRESH_NAMESPACE,
+        message="use a fresh MCP state directory",
     ),
     RoutingCase(
         # Composed: a path with no run-store layout is a wrong argument, even
@@ -931,15 +938,15 @@ WRAP_CASES = (
     ),
     RoutingCase(
         id="preflight_same_type_aggregate",
-        trigger=_preflight(_two_precutover_studies),
+        trigger=_preflight(_two_unmarked_studies),
         raised=StudySchemaMismatchError,
-        action=OperatorAction.USE_PRIOR_RELEASE,
+        action=OperatorAction.FRESH_NAMESPACE,
         message=_PREFLIGHT_AGGREGATE,
     ),
     RoutingCase(
         # One type does not make one remedy: disagreeing refusals route to reading them.
         id="preflight_same_type_aggregate_disagreeing",
-        trigger=_preflight(_two_precutover_studies, schema_check=_refuse_schema_differently),
+        trigger=_preflight(_two_unmarked_studies, schema_check=_refuse_schema_differently),
         raised=StudySchemaMismatchError,
         action=OperatorAction.INSPECT_LOGS,
         message=_PREFLIGHT_AGGREGATE,
@@ -954,9 +961,9 @@ WRAP_CASES = (
     ),
     RoutingCase(
         id="preflight_mixed_aggregate_agreeing",
-        trigger=_preflight(_two_precutover_studies, schema_check=_refuse_as_prior_release),
+        trigger=_preflight(_two_unmarked_studies, schema_check=_refuse_mixed_types_same_remedy),
         raised=PhaseSweepError,
-        action=OperatorAction.USE_PRIOR_RELEASE,
+        action=OperatorAction.FRESH_NAMESPACE,
         message=_PREFLIGHT_AGGREGATE,
     ),
 )
@@ -1575,7 +1582,6 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
 # did not route fails as surely as one that omits a step.
 _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
     {
-        OperatorAction.USE_PRIOR_RELEASE: "preserved PhaseSweep release",
         OperatorAction.FRESH_NAMESPACE: "new experiment name",
         OperatorAction.RESTORE_LEDGER: "storage ledger",
         OperatorAction.RESTORE_TREE: "repair the experiment tree",

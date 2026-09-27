@@ -281,7 +281,7 @@ def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
     A test that constructs studies through Optuna directly skips the engine's
     own create path, so nothing stamps the study schema and nothing records the
     tree's ownership. Every read path then correctly refuses the state as
-    pre-cutover. This is the one place that repairs both halves, so the
+    unmarked. This is the one place that repairs both halves, so the
     equivalence between "the engine wrote it" and "the test built it" is
     asserted once instead of drifting across six copies.
 

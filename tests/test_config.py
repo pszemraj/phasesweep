@@ -676,26 +676,6 @@ def test_plain_json_extractor_is_a_primary_objective() -> None:
     assert metric.extractor.type == "json"
 
 
-def test_suite_config_is_rejected_before_artifacts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The removed top-level selector must not be ignored as an experiment field."""
-    # With no workdir an experiment writes under ./runs, so that is where to look.
-    monkeypatch.chdir(tmp_path)
-    path = write_yaml(
-        tmp_path,
-        """
-        suite: retired
-        defaults: {}
-        studies: []
-        """,
-    )
-
-    with pytest.raises(ConfigError, match="suite configs are no longer supported"):
-        load_experiment(path)
-    assert not (tmp_path / "runs").exists()
-
-
 def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
     """A parser/scanner error must carry the file path, not PyYAML's stream label.
 

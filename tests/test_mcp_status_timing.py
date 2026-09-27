@@ -59,6 +59,7 @@ def _handle(run_id: str, *, started_at: str) -> RunHandle:
         pgid=pid,
         pid_starttime=None,
         started_at=started_at,
+        visible_params_at_launch="none",
     )
 
 

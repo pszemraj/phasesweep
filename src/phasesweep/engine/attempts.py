@@ -608,7 +608,7 @@ def _registry_attempt_fail_stale_trial(
         and the entry must be retained for a later retry.
     :raises StudySchemaMismatchError: The registry and trial record
         conflicting generation identities, or the ledger the entry names
-        holds pre-cutover or unsupported PhaseSweep study state.
+        holds unsupported PhaseSweep study state.
     :raises ProcessCleanupUncertainError: A terminal trial lacks the identity
         needed to attribute confirmed cleanup to the registry's attempt.
     :raises StudyStorageUnavailableError: The stale RUNNING trial could not be
@@ -633,7 +633,7 @@ def _registry_attempt_fail_stale_trial(
         trials = study.get_trials(deepcopy=False)
     except StudySchemaMismatchError:
         # The entry was written by this release, so its ledger was current
-        # when the attempt registered. Pre-cutover state there now is not
+        # when the attempt registered. Unsupported state there now is not
         # something to reap through; it stops the run with the entry intact.
         raise
     except Exception:  # noqa: BLE001 - unreachable storage keeps the entry for retry

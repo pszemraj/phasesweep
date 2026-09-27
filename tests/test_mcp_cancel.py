@@ -151,12 +151,11 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
     assert result["recovery_required"] is True
 
 
-@pytest.mark.parametrize("unknown_side", ["saved", "current"])
 def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    unknown_side: str,
 ) -> None:
+    """A host whose own boot id is unreadable cannot rule out PID reuse."""
     current_boot = read_boot_id()
     if current_boot is None:
         pytest.skip("boot id unavailable on this platform")
@@ -170,12 +169,11 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
             starttime=111,
             allow_cancel=True,
         ),
-        boot_id=None if unknown_side == "saved" else current_boot,
+        boot_id=current_boot,
     )
     store.create(handle)
-    if unknown_side == "current":
-        monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
-        monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
     signalled: list[object] = []
 
     def record_signal(*args: object, **kwargs: object) -> bool:

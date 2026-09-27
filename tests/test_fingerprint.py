@@ -1040,24 +1040,19 @@ def test_fresh_binding_ignores_unrelated_operator_files(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "entry",
-    ["generations", "attempts", "Attempts", "P", "study.db", "study.journal"],
+    ["generations", "attempts", "Attempts", "P", "study.journal"],
 )
 def test_unbound_known_phasesweep_state_names_the_blocking_entry(
     tmp_path: Path, entry: str
 ) -> None:
-    """Known unmarked engine state is refused with its blocking entry named.
-
-    ``study.db`` is the SQLite ledger ``storage: auto`` wrote before the
-    journal became the only ledger, so a root holding just that file is
-    still refused rather than bound to a new ``study.journal`` beside it.
-    """
+    """Known unmarked engine state is refused with its blocking entry named."""
     experiment = make_experiment(
         workdir=tmp_path / "runs",
-        storage="auto" if entry == "study.db" else f"journal:///{tmp_path / 'studies.journal'}",
+        storage=f"journal:///{tmp_path / 'studies.journal'}",
     )
     state_entry = _experiment_dir(experiment) / entry
     state_entry.parent.mkdir(parents=True, exist_ok=True)
-    if entry in {"study.db", "study.journal"}:
+    if entry == "study.journal":
         state_entry.write_text("existing ledger\n")
     else:
         state_entry.mkdir()
@@ -1182,7 +1177,7 @@ def test_preexisting_empty_study_with_wrong_direction_is_rejected(tmp_path: Path
 
 
 def test_populated_unbound_study_requires_fresh_state(tmp_path: Path) -> None:
-    """A populated pre-cutover study is refused without mutation."""
+    """A populated but unmarked study is refused without mutation."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
     storage = experiment.storage

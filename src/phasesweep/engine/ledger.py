@@ -686,12 +686,12 @@ def _load_journal_study_snapshot(storage_url: str, study_name: str) -> optuna.St
 
 
 def _scan_ledger_format(storage: str | None) -> None:
-    """Reject pre-cutover PhaseSweep studies without mutating local storage.
+    """Reject unsupported PhaseSweep studies without mutating local storage.
 
     The check covers every PhaseSweep-shaped study in the selected local
     ledger, not only studies belonging to the current experiment name. This
     prevents a new experiment name or output directory from treating a
-    populated pre-cutover ledger as fresh. The journal is replayed from an
+    populated unsupported ledger as fresh. The journal is replayed from an
     observational snapshot before Optuna can initialize, stamp, recover, or
     otherwise mutate the live backend.
 
@@ -700,7 +700,7 @@ def _scan_ledger_format(storage: str | None) -> None:
     :raises StudyStorageUnavailableError: An existing local ledger cannot be
         inspected without mutation.
     :raises StudySchemaMismatchError: A populated PhaseSweep study is unmarked,
-        or a PhaseSweep study uses a pre-cutover/unsupported schema.
+        or a PhaseSweep study uses an unsupported schema.
     """
     if storage is None:
         return
@@ -745,11 +745,9 @@ def _validate_storage_versions(versions: Iterable[tuple[str, object, bool]]) -> 
     if unsupported:
         detail = ", ".join(f"{name!r} ({version!r})" for name, version in unsupported)
         raise StudySchemaMismatchError(
-            "The selected local storage ledger contains pre-cutover or unsupported "
-            f"PhaseSweep study state: {detail}. Use a fresh local storage ledger and "
-            "artifact root with this PhaseSweep release, or use the preserved PhaseSweep "
-            "0.3.1 environment to operate the existing state. Nothing was written.",
-            action=OperatorAction.USE_PRIOR_RELEASE,
+            "The selected local storage ledger contains unsupported PhaseSweep study "
+            f"state: {detail}. Use a fresh local storage ledger and artifact root with "
+            "this PhaseSweep release. Nothing was written.",
         )
 
 
@@ -813,8 +811,8 @@ def _trial_stats(
         verify in the snapshot, by phase name.
     :return dict[str, _PhaseTrialStats]: One permissive result per configured
         phase, by phase name, with explicit availability.
-    :raises StudySchemaMismatchError: A phase's study is populated under a
-        pre-cutover or unsupported schema.
+    :raises StudySchemaMismatchError: A phase's study is populated under an
+        unsupported schema.
     """
     phases = ledger.experiment.phases
     if ledger.backend == "memory":
@@ -857,8 +855,8 @@ def _phase_trial_stats(
     :param str study_name: Ledger study name of the phase inspected.
     :param _TrialRef | None published_trial: Published local trial to verify in this snapshot.
     :return _PhaseTrialStats: The study's available counts and identities.
-    :raises StudySchemaMismatchError: The study is populated under a
-        pre-cutover or unsupported schema.
+    :raises StudySchemaMismatchError: The study is populated under an
+        unsupported schema.
     """
     try:
         study = optuna.load_study(study_name=study_name, storage=snapshot)
@@ -941,7 +939,7 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     fixed order's first two steps in that order. The binding check comes first
     because a tree bound to a different ledger has to be refused before this
     process reads a single row of the ledger it was offered. The format scan
-    comes second because a pre-cutover ledger has to be refused before anything
+    comes second because an unsupported ledger has to be refused before anything
     opens it. Neither step creates a study, constructs file-backed storage, or
     writes a byte, so a refusal leaves both the tree and the ledger exactly as
     they were.
@@ -961,9 +959,9 @@ def validate_ledger(experiment: Experiment) -> ValidatedLedger:
     :return ValidatedLedger: Handle proving both checks ran, in that order, and
         recording whether the format scan completed.
     :raises ArtifactRootConflictError: The tree records a different owner, is
-        unreadable, or holds unmarked pre-cutover PhaseSweep state.
-    :raises StudySchemaMismatchError: The ledger holds pre-cutover or otherwise
-        unsupported PhaseSweep study state.
+        unreadable, or holds unmarked PhaseSweep state.
+    :raises StudySchemaMismatchError: The ledger holds unsupported PhaseSweep
+        study state.
     :raises StudyStorageUnavailableError: An unbound tree's ledger exists but
         cannot be inspected without mutating it.
     """
@@ -1068,8 +1066,8 @@ def read_trial_stats(
         verify in the same snapshot, by phase name.
     :return dict[str, _PhaseTrialStats]: One permissive result per configured
         phase, by phase name, with explicit availability.
-    :raises StudySchemaMismatchError: A phase's own study is populated under a
-        pre-cutover or unsupported schema.
+    :raises StudySchemaMismatchError: A phase's own study is populated under an
+        unsupported schema.
     """
     if ledger.format_scan_failure is not None:
         return {
@@ -1158,8 +1156,8 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     :raises StudyStorageUnavailableError: The ledger's format could still not
         be scanned, the journal holds a malformed record before its last, or
         a phase's persistent storage could not be inspected.
-    :raises StudySchemaMismatchError: The rescan found pre-cutover or otherwise
-        unsupported PhaseSweep study state.
+    :raises StudySchemaMismatchError: The rescan found unsupported PhaseSweep
+        study state.
     :raises PublishedStudyMissingError: A phase to execute has a published
         result whose local trial identity is missing from durable storage.
     :raises ArtifactRootConflictError: A phase study is already bound to a
@@ -1354,9 +1352,9 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
     a run that moved its storage, or a foreign locator recorded by an earlier
     orchestrator - so this is the one opener that takes a bare locator instead
     of a validated handle, and it does the validation itself, first: the
-    locator's whole ledger is scanned for pre-cutover state before any study in
+    locator's whole ledger is scanned for unsupported state before any study in
     it is opened. This release wrote the registry entry, so the ledger it names
-    was current-format when the attempt registered; pre-cutover state there now
+    was current-format when the attempt registered; unsupported state there now
     means the locator no longer names that ledger, and reaping through it would
     write into state this release refuses. Every caller holds the experiment
     lock and is about to write through the study, so a journal whose final
@@ -1375,8 +1373,8 @@ def open_registry_study(locator: str, study_name: str) -> optuna.Study | None:
     :param str study_name: Study the registry entry names.
     :return optuna.Study | None: The live study, or ``None`` when the ledger
         confirms it does not hold one called ``study_name``.
-    :raises StudySchemaMismatchError: The ledger holds pre-cutover or
-        unsupported PhaseSweep study state.
+    :raises StudySchemaMismatchError: The ledger holds unsupported PhaseSweep
+        study state.
     :raises IncompleteJournalRecordError: The journal's partial final record
         could not be repaired.
     :raises StudyStorageUnavailableError: The ledger exists but could not be

@@ -123,7 +123,7 @@ def recover_run(
     try:
         store = RunStore.open_existing(state_dir)
     except UnsupportedStateFormatError as exc:
-        raise RunRecoveryError(str(exc), action=OperatorAction.USE_PRIOR_RELEASE) from None
+        raise RunRecoveryError(str(exc), action=OperatorAction.FRESH_NAMESPACE) from None
     except ValueError as exc:
         # Not a state directory at all: the path given is what needs fixing.
         raise RunRecoveryError(str(exc), action=OperatorAction.FIX_CONFIG) from None
@@ -560,7 +560,7 @@ def _load_recovery_studies(
     before allowing recovery to treat the run as having no owned trial.
 
     Validation comes first and is read-only, so recovery refuses a tree bound
-    to another ledger, or a pre-cutover ledger, before it opens anything and
+    to another ledger, or an unsupported ledger, before it opens anything and
     without changing a byte. A confirmed recovery holds the experiment lock
     and is about to write, so it then repairs a journal whose final record a
     crashed writer left partial; inspection reads past that record as Optuna
