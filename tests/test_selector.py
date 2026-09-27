@@ -24,9 +24,13 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_INPUT_ATTR,
     constraint_attr,
 )
 from tests.conftest import make_experiment
+
+# Allocation writes both attrs on every trial before its trainer runs.
+_ALLOCATION_ATTRS = {TRAINER_ENV_DIGEST_ATTR: "a" * 64, TRAINER_INPUT_ATTR: {"schema_version": 1}}
 
 
 def _objective_provenance_json() -> str:
@@ -67,7 +71,7 @@ def _add_trial(
     feasible=True,
     constraint_vals=None,
     params=None,
-    env_digest=None,
+    env_digest="a" * 64,
     extra_user_attrs=None,
 ):
     distributions: dict = {}
@@ -80,9 +84,9 @@ def _add_trial(
         GENERATION_ID_ATTR: "generation-test",
         ATTEMPT_ID_ATTR: f"attempt-{len(study.trials)}",
         OBJECTIVE_PROVENANCE_ATTR: _objective_provenance_json(),
+        **_ALLOCATION_ATTRS,
+        TRAINER_ENV_DIGEST_ATTR: env_digest,
     }
-    if env_digest is not None:
-        user_attrs[TRAINER_ENV_DIGEST_ATTR] = env_digest
     user_attrs.update(extra_user_attrs or {})
     for cn, cv in (constraint_vals or {}).items():
         user_attrs[constraint_attr(cn)] = cv
@@ -246,8 +250,6 @@ def test_selection_is_quiet_when_candidates_share_one_environment(caplog):
     study = _make_study()
     _add_trial(study, 1.0, params={"x": 0}, env_digest="a" * 64)
     _add_trial(study, 0.5, params={"x": 1}, env_digest="a" * 64)
-    # A candidate without an optional digest must not count as a second environment.
-    _add_trial(study, 0.9, params={"x": 2})
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
         select_winner(study, exp, phase_name="p")
@@ -265,6 +267,8 @@ def test_rejects_nan_constraint_values_defensively():
     t0.set_user_attr(GENERATION_ID_ATTR, "generation-test")
     t0.set_user_attr(ATTEMPT_ID_ATTR, "attempt-0")
     t0.set_user_attr(OBJECTIVE_PROVENANCE_ATTR, _objective_provenance_json())
+    for key, value in _ALLOCATION_ATTRS.items():
+        t0.set_user_attr(key, value)
     t0.set_user_attr(constraint_attr("size"), 100.0)
     study.tell(t0, 0.5)
 
@@ -274,6 +278,8 @@ def test_rejects_nan_constraint_values_defensively():
     t1.set_user_attr(GENERATION_ID_ATTR, "generation-test")
     t1.set_user_attr(ATTEMPT_ID_ATTR, "attempt-1")
     t1.set_user_attr(OBJECTIVE_PROVENANCE_ATTR, _objective_provenance_json())
+    for key, value in _ALLOCATION_ATTRS.items():
+        t1.set_user_attr(key, value)
     t1.set_user_attr(constraint_attr("size"), float("nan"))
     study.tell(t1, 0.1)  # Better metric, but invalid.
 

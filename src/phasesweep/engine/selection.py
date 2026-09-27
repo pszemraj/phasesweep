@@ -36,19 +36,18 @@ class SelectedTrial:
     trial_number: int
     params: dict[str, Any]
     metric: float
+    generation_id: str
+    attempt_id: str
+    # Frozen evidence provenance recorded when the trial's objective was
+    # extracted (review v0.5.17 / finding F).
+    objective_provenance: dict[str, Any]
+    # Digest of the trainer environment this trial ran under (review v0.5.18 /
+    # finding F3).
+    trainer_env_digest: str
+    # Versioned identity of the exact generated input consumed by the trainer.
+    trainer_input: dict[str, Any]
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
-    generation_id: str = ""
-    attempt_id: str = ""
-    # Frozen evidence provenance recorded when the trial's objective was
-    # extracted (review v0.5.17 / finding F); None for trials persisted
-    # before the record existed.
-    objective_provenance: dict[str, Any] | None = None
-    # Digest of the trainer environment this trial ran under (review v0.5.18 /
-    # finding F3); None for trials persisted before the record existed.
-    trainer_env_digest: str | None = None
-    # Versioned identity of the exact generated input consumed by the trainer.
-    trainer_input: dict[str, Any] | None = None
 
 
 class NoFeasibleTrialError(PhaseSweepError):
@@ -174,11 +173,6 @@ def select_winner(
             )
         gates = parsed_gates
 
-    provenance = _trial_objective_provenance(best)
-
-    env_digest = best.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
-    raw_trainer_input = best.user_attrs.get(TRAINER_INPUT_ATTR)
-
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
@@ -187,9 +181,11 @@ def select_winner(
         gates=gates,
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
-        objective_provenance=provenance,
-        trainer_env_digest=env_digest if isinstance(env_digest, str) and env_digest else None,
-        trainer_input=(dict(raw_trainer_input) if isinstance(raw_trainer_input, dict) else None),
+        objective_provenance=_trial_objective_provenance(best),
+        # Allocation writes both before the trainer can run, so every
+        # completed trial carries them.
+        trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
+        trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
     )
 
 
@@ -208,11 +204,7 @@ def _warn_mixed_environments(
     :param optuna.Study study: Study the survivors came from, read only for its
         name and only when a divergence is being reported.
     """
-    digests = {
-        digest
-        for trial in survivors
-        if isinstance(digest := trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR), str) and digest
-    }
+    digests = {trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] for trial in survivors}
     if len(digests) < 2:
         return
     log.warning(

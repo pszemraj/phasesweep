@@ -34,8 +34,8 @@ class WinnerSource:
     kind: WinnerSourceKind
     phase: str
     trial_number: int
-    generation_id: str | None
-    attempt_id: str | None
+    generation_id: str
+    attempt_id: str
 
 
 def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
@@ -79,22 +79,20 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
         raise ValueError(f"winner_source names phase {phase!r}, expected {expected_phase!r}")
     try:
         trial_number = int(data["trial_number"])
-    except (KeyError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError("invalid winner_source trial_number") from exc
+    generation_id = data["generation_id"]
+    attempt_id = data["attempt_id"]
+    if not isinstance(generation_id, str) or not generation_id:
+        raise ValueError("invalid winner_source generation_id")
+    if not isinstance(attempt_id, str) or not attempt_id:
+        raise ValueError("invalid winner_source attempt_id")
     return WinnerSource(
         kind=cast(WinnerSourceKind, kind),
         phase=phase,
         trial_number=trial_number,
-        generation_id=(
-            str(data["generation_id"])
-            if isinstance(data.get("generation_id"), str) and data["generation_id"]
-            else None
-        ),
-        attempt_id=(
-            str(data["attempt_id"])
-            if isinstance(data.get("attempt_id"), str) and data["attempt_id"]
-            else None
-        ),
+        generation_id=generation_id,
+        attempt_id=attempt_id,
     )
 
 
@@ -109,8 +107,8 @@ class Winner:
     space, fixed overrides, env, metric, or trial command and then resuming
     would silently inherit the *old* winner against the *new* parent config.
 
-    ``None`` only on placeholder winners produced for the dry-run skip path,
-    which never get persisted.
+    Every optional field is ``None`` only on placeholder winners produced for
+    the dry-run skip path, which never get persisted.
     """
 
     trial_number: int
@@ -126,8 +124,7 @@ class Winner:
     source: WinnerSource | None = None
     # Frozen evidence provenance captured when the winning objective was
     # extracted: extractor config fingerprint plus source digest / frozen
-    # remote summary subset (review v0.5.17 / finding F). None for dry-run
-    # placeholders and winners persisted before the record existed.
+    # remote summary subset (review v0.5.17 / finding F).
     objective_provenance: dict[str, Any] | None = None
     # Versioned identity of the generated input consumed by the source trial.
     # Persisted with the winner so --from-phase can verify carried evidence
@@ -137,8 +134,7 @@ class Winner:
     # SHA-256 of its composed trainer environment after explicitly classified
     # ``passthrough_env`` values are removed, plus the ``inherit_env`` contract.
     # Variable NAMES stay on the trial attrs — the winner file keeps the
-    # compact identity. None for dry-run placeholders, for winners persisted
-    # before the record existed, and for trials that predate it.
+    # compact identity.
     trainer_env_digest: str | None = None
     trainer_inherit_env: str | list[str] | None = None
 

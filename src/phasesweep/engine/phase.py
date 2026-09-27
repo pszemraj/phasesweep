@@ -1582,9 +1582,7 @@ def _select_phase_winner(
             attempt_id=selected.attempt_id,
         ),
         objective_provenance=selected.objective_provenance,
-        trainer_input=(
-            dict(selected.trainer_input) if selected.trainer_input is not None else None
-        ),
+        trainer_input=dict(selected.trainer_input),
         # The digest comes from the winning TRIAL — a top-up can select a
         # trial an earlier invocation ran under another environment — while
         # the environment contract is config, identical for every trial in the study
@@ -1687,12 +1685,5 @@ def _placeholder_winner(
             incomplete=True,
             reason="dry_run",
             timeout_scope=None,
-        ),
-        source=WinnerSource(
-            kind="phase_trial",
-            phase=phase.name,
-            trial_number=-1,
-            generation_id=None,
-            attempt_id=None,
         ),
     )

@@ -144,8 +144,8 @@ class WinnerSourceSnapshot(_SnapshotModel):
     kind: WinnerSourceKind
     phase: str
     trial_number: int
-    generation_id: str | None = None
-    attempt_id: str | None = None
+    generation_id: str
+    attempt_id: str
 
 
 class WinnerSnapshot(_SnapshotModel):
