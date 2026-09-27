@@ -218,8 +218,7 @@ def _write_config(
     two paths substituted. Neither path is part of the experiment's semantic
     fingerprint, and the builder pins the trainer cwd, so a fixture the current
     generator produced reports ``published_config_matches_current`` from any
-    checkout path. The ``release-*`` fixtures carry their release's own
-    fingerprints; every read refuses them before comparing one.
+    checkout path.
 
     :param Path config_path: Where to write the YAML.
     :param str backend: Ledger backend recorded in the manifest.
