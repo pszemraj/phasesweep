@@ -55,13 +55,8 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 `state_dir` is private, owner-only state for handles, logs, audit entries, and
 frozen terminal snapshots. Its root carries a format marker, and the server
 refuses an unmarked, malformed, or unsupported durable state directory before
-creating or repairing it.
-
-> [!IMPORTANT]
-> Use a fresh state directory for the consolidated release. Do not point this
-> release at old MCP state and do not try to migrate, adopt, or repair it. Use
-> the preserved PhaseSweep 0.3.1 environment to inspect or recover existing
-> 0.3.1 state.
+creating or repairing it. There is no migration, adoption, or repair path for
+a refused directory: point `state_dir` at a fresh path instead.
 
 ## Tool workflow
 

@@ -26,7 +26,7 @@ the MCP layer.
 3. Pure read paths (read_status, read_winners, read_result, CLI status and
    show-winners, the MCP result snapshot) never construct file-backed storage
    and never write bytes. Recovery inspection validates binding and format
-   before any open and refuses a pre-cutover ledger with the bytes unchanged.
+   before any open and refuses an unsupported ledger with the bytes unchanged.
 4. src/phasesweep/engine/ledger.py is the only module that constructs Optuna
    storage, and no other module imports its private names. No module
    constructs sqlite3, SQLAlchemy, or Optuna RDB storage at all.
@@ -145,8 +145,7 @@ refused with `RESTORE_LEDGER` and the bytes unchanged.
 `claim_ledger`, `open_registry_study`, and confirmed recovery\
 **Tests:** `tests/test_format_cutover.py::test_validate_ledger_on_a_fresh_root_creates_nothing`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
-`tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`
-(its `release-0.3.1` cells pin the binding check before the format scan),
+`tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`,
 `tests/test_engine_read.py::test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_before_writes`,
 `tests/test_engine_read.py::test_journal_malformed_record_before_its_end_never_means_absent`,
 `tests/test_format_cutover.py::test_writers_repair_a_partial_final_journal_record`,
@@ -228,8 +227,8 @@ its trials.
 
 Recovery validates the binding and the format before it opens any study, never
 claims, refuses a study bound to another artifact root before it reaps
-anything, and refuses a pre-cutover ledger or an incomplete scan with the bytes
-unchanged. A confirmed recovery holds the experiment lock and is about to
+anything, and refuses an unsupported ledger or an incomplete scan with the
+bytes unchanged. A confirmed recovery holds the experiment lock and is about to
 write, so it repairs a journal whose last line is partial, as a run's claim
 does; inspection reads past that line as Optuna does and writes nothing.
 
@@ -240,7 +239,6 @@ does; inspection reads past that line as Optuna does and writes nothing.
 complete, with `engine.artifact_roots._check_study_artifact_root` on every
 opened study\
 **Tests:** `tests/test_ledger_read_paths.py::test_recovery_inspect_never_writes_to_a_golden_ledger`,
-`tests/test_ledger_read_paths.py::test_recovery_study_load_rewraps_the_engine_refusal`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_stale_reaper.py::test_recovery_refuses_a_study_bound_to_another_artifact_root`,
 `tests/test_format_cutover.py::test_writers_repair_a_partial_final_journal_record`
@@ -384,11 +382,11 @@ own; unconfirmed cleanup adds recover-run after the repair.
 `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`,
 `tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`
 
-#### 17. Refusals are tested against real ledgers
+#### 17. Refusals are tested against a real ledger
 
-Refusals are tested against ledgers produced by the public API and by the
-preserved `v0.3.1` tag, and read paths run under a patch that records and
-raises on any file-backed storage construction.
+Refusals are tested against a ledger produced by the public API, and read
+paths run under a patch that records and raises on any file-backed storage
+construction.
 
 **Held by:** `tests/fixtures/make_ledger_fixtures.py`,
 `tests/ledger_fixtures.py::forbid_file_backed_storage`\

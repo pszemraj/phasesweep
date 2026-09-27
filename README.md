@@ -51,13 +51,6 @@ importing PhaseSweep.
 
 Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
 
-> [!IMPORTANT]
-> This breaking release accepts only fresh current-format state. When upgrading
-> from 0.3.1, use a fresh artifact root and local ledger (plus a fresh MCP state
-> directory when applicable); there is no migration, adoption, or repair path.
-> Use the preserved 0.3.1 environment for existing state. See the
-> [fresh-state cutover](docs/runtime.md#fresh-state-cutover) for the full scope.
-
 ```bash
 pip install git+https://github.com/pszemraj/phasesweep.git
 phasesweep --version
@@ -152,7 +145,7 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 
 - [Configuration guide](docs/config.md): Experiment YAML, search spaces, inheritance, gates, and objective extractors.
 - [Configuration reference](docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
-- [Runtime behavior](docs/runtime.md): filesystem layout, fresh-state cutover, locks, GPU leases, process supervision, fingerprints, and resume.
+- [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
 - [MCP setup](docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.
 - [MCP operator reference](docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.
 - [Toy experiment and MCP catalog](examples/experiment.yaml): a checkout-local CLI example backed by the packaged fake trainer, plus an [MCP catalog](examples/catalog.yaml) whose detached-run state and experiment outputs use absolute scratch paths under `/tmp`.

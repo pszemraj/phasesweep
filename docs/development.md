@@ -214,8 +214,8 @@ flowchart TD
   storage, locks, format cutover, and output layout.
 - `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`,
   `tests/test_error_routing.py`, and `tests/test_tier_guard.py`: the storage
-  chokepoint, read paths and recovery inspection against golden ledger
-  fixtures, operator-action routing, and the integration-marker guard.
+  chokepoint, read paths and recovery inspection against the golden ledger
+  fixture, operator-action routing, and the integration-marker guard.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots,
   detached launch, status, cancellation, and recovery.
 - `tests/test_init.py` and `tests/test_reporting.py`: starter creation,
