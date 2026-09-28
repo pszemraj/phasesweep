@@ -417,6 +417,31 @@ construction.
 `tests/test_ledger_read_paths.py::test_required_ledger_fixtures_are_present`,
 `tests/test_ledger_read_paths.py::test_every_ledger_fixture_is_documented`
 
+### Confound verdicts
+
+#### 19. A confound verdict never joins a fingerprint or gets read as clean
+
+The confound block is computed once per selection and frozen onto the winner;
+`n/a` means a check could not run and must never be rendered or counted as
+`ok`. No downstream phase fingerprint depends on any block's content, so an
+observation can never invalidate a study or block a top-up, and a top-up that
+reselects the same trial for a larger ranked population publishes a fresh
+block rather than reusing the old one. A `--from-phase` resume carries the
+parent winner's block verbatim. Because the block lives in `winner.yaml`, it
+is manifest-covered: an edited verdict fails `publication_integrity` like any
+other tampered artifact.
+
+**Held by:** `engine.confound._assess_population`, `engine.confound._validate_check`
+refusing an `n/a` record without a `reason`, `engine.fingerprints._phase_fingerprint`,
+which never reads `Winner.confound`, and
+`engine.publication_validation._validate_generation_manifest`, which calls
+`engine.confound._validate_confound_block`\
+**Tests:** `tests/test_confound.py::test_verdicts_are_three_distinct_values_and_not_checked_is_never_ok`,
+`tests/test_confound.py::test_confound_block_never_moves_a_downstream_fingerprint`,
+`tests/test_confound.py::test_published_block_is_manifest_covered`,
+`tests/test_confound.py::test_top_up_reselection_publishes_a_fresh_block_for_its_larger_population`,
+`tests/test_confound.py::test_inheriting_phases_are_warned_and_from_phase_carries_the_block`
+
 ## Decision record: recovery machinery
 
 Three pieces of machinery exist only to survive a hard exit. Each is cheap to

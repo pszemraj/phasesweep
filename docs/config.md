@@ -234,7 +234,11 @@ These scoring decisions are separate:
 - W&B selects an exact finished-summary key; ordinary JSON selects a saved
   path and dotted key.
 - Envelope `policy` and `expected_step` validate reported metadata. They do
-  not cause evaluation or checkpoint loading.
+  not cause evaluation or checkpoint loading. Leaving `checkpoint` and
+  `expected_step` unpinned lets ranked trials report different values for
+  either; selection's `evaluation_point` confound check flags that spread
+  (see [runtime behavior](runtime.md#confound-verdicts)). Pinning either
+  makes the check trivially `ok`.
 
 The trainer owns evaluation cadence, early stopping, checkpoint selection,
 and custom aggregation. PhaseSweep has one experiment-level metric and does

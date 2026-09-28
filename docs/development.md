@@ -171,6 +171,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 | Locks and stale-attempt cleanup | `locking`, `attempts`, `cleanup` |
 | Root ownership and retained evidence checks | `artifact_roots`, `evidence` |
 | Paths, state records, and fingerprints | `paths`, `state`, `fingerprints` |
+| Advisory confound verdicts on the ranked population, frozen at selection | `confound` |
 | Publication and read-only views | `generation`, `publication`, `publication_validation`, `read` |
 
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery);

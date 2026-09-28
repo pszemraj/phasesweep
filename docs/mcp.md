@@ -122,14 +122,35 @@ still validates:
 For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and
 report the condition.
 
+Every winner also carries a `confound` payload: advisory verdicts on the
+population selection ranked to choose it, frozen at selection time. `flagged`
+lists the checks below whose verdict is `heterogeneous`; report each one with
+its counts before relying on the winner or proposing a run whose phases
+inherit it.
+
+| Check | Verdict meaning |
+| --- | --- |
+| `evaluation_point` | `heterogeneous`: ranked objectives were measured at different checkpoints or steps (`distinct_checkpoints`, `distinct_steps`, `winner_step`). `n/a`: the extractor reports no evaluation metadata, or only one trial was ranked. |
+| `survivorship` | `heterogeneous`: excluded trials (`infeasible` + `failed` + `pruned`) were at least as numerous as `ranked` ones. Always checked, never `n/a`. |
+| `tie` | `heterogeneous`: the winner tied exactly with `tied_trials` other ranked trials that used different params. `n/a`: only one trial was ranked. |
+
+`ok` means a check ran and found nothing; `n/a` means it could not run and
+must never be read as clean. Evidence strings (a checkpoint label may be a
+path) stay out of this payload; only enums and integers cross the MCP
+boundary. The verdicts are advisory: they do not invalidate the result, and
+only the operator decides whether to re-run.
+
 `recovery_required: true` means cleanup, launch handoff, or snapshot
 finalization needs operator recovery. Agents should stop rather than guessing
 at process or result state; [run state and recovery](#run-state-and-recovery)
 shows where each case comes from.
 
 Winner results describe selected values, not convergence curves, robustness,
-causality, or unreturned trial history. Treat `<redacted>` values as deliberate
-catalog policy, not missing data.
+causality, or unreturned trial history. The `confound` payload is the one
+exception: it flags comparability issues in the population selection ranked,
+not robustness of the winner itself, and never blocks or qualifies the
+selected value. Treat `<redacted>` values as deliberate catalog policy, not
+missing data.
 
 The operator may configure W&B, ordinary JSON, log, or envelope scoring.
 Frozen result reads preserve the producing reader's assurance fields and need

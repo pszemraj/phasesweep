@@ -54,6 +54,38 @@ shareable generation identity record. Trial directories retain local evidence
 and attempt lifecycle information used for supported continuation and winner
 validation.
 
+### Confound verdicts
+
+Each phase's `winner.yaml` carries a `confound` block: advisory verdicts on
+the population that selection ranked to pick the winner, computed once and
+frozen at selection time. It never blocks selection or publication, and it
+never joins a fingerprint, so an observation on a winner can never invalidate
+a study or block a top-up; a top-up that reselects the same trial for a
+larger population publishes a fresh block, and `--from-phase` carries the
+parent winner's block verbatim. Because it lives in `winner.yaml`, it is
+manifest-covered: editing a verdict after publication fails
+`publication_integrity`.
+
+The block runs three checks, each `ok` (checked, nothing found),
+`heterogeneous` (checked, found a potential confound, with evidence), or
+`n/a` (could not be checked — never treat this as clean):
+
+- `evaluation_point`: whether the ranked trials' `json_envelope` objectives
+  were all measured at the same checkpoint and step. `n/a` for other
+  extractor kinds, which report no evaluation metadata, or when only one
+  trial was ranked.
+- `survivorship`: whether the winner was ranked among at most half of what
+  ran, counting infeasible, failed, and pruned trials against the ranked
+  ones. This check always runs.
+- `tie`: whether the trial-number tiebreak chose between trials with
+  different params tied on the exact metric value, rather than between
+  repeats of one configuration. `n/a` with one ranked trial.
+
+Selection logs one `WARNING` naming every flagged check and its numbers, and
+a phase that is about to build on a flagged parent winner logs its own
+`WARNING` before it runs. `phasesweep show-winners` prints the raw
+`winner.yaml`, including the full evidence behind each check.
+
 > [!WARNING]
 > `config.snapshot.yaml` is private because it can contain command and
 > environment values. PhaseSweep writes a `.gitignore` containing `*` whenever
