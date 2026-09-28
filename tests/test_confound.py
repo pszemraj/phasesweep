@@ -389,8 +389,21 @@ def test_top_up_reselection_publishes_a_fresh_block_for_its_larger_population(
     assert second["confound"]["checks"]["tie"]["detail"] == {"tied_trials": [1, 2]}
 
 
+def _inheritance_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return inheritance warnings logged since the last clear."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "phasesweep.engine.run" and "inherits the winner" in record.getMessage()
+    ]
+
+
 @pytest.mark.integration
-def test_from_phase_carries_the_parent_block_verbatim(tmp_path: Path) -> None:
+def test_inheriting_phases_are_warned_and_from_phase_carries_the_block(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The flag reaches every phase that builds on it, whichever path resolved the parent."""
+    caplog.set_level(logging.WARNING, logger="phasesweep")
     experiment = make_experiment(
         persistent=tmp_path,
         trainer=write_constant_trainer(tmp_path),
@@ -411,8 +424,17 @@ def test_from_phase_carries_the_parent_block_verbatim(tmp_path: Path) -> None:
         ],
     )
     first = run_experiment(experiment)
+    in_process = _inheritance_warnings(caplog)
+    caplog.clear()
     second = run_experiment(experiment, from_phase="child")
+    resumed = _inheritance_warnings(caplog)
 
+    # The constant trainer ties both parent trials with different params.
     assert first["parent"].confound is not None
+    assert _flagged_checks(first["parent"].confound) == ["tie"]
     assert second["parent"].confound == first["parent"].confound
     assert set(CONFOUND_CHECKS) == set(second["parent"].confound["checks"])
+    for warnings in (in_process, resumed):
+        assert len(warnings) == 1
+        assert warnings[0].startswith("[child] inherits the winner of phase 'parent'")
+        assert "tie: trial(s) 1 matched" in warnings[0]
