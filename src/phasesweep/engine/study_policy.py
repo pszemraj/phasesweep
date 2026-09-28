@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, NamedTuple, TypedDict
 
 import optuna
 
@@ -182,6 +182,48 @@ def _phase_policy_schema_error(study: optuna.Study, detail: str) -> StudySchemaM
     )
 
 
+class _RecoveryRecord(NamedTuple):
+    """A validated ``PHASE_RECOVERY_ATTR`` record."""
+
+    start_after_sequence: int
+    trial_target: int
+
+
+def _load_recovery_record(study: optuna.Study) -> _RecoveryRecord | None:
+    """Validate the study's recovery record.
+
+    :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` is read.
+    :raises StudySchemaMismatchError: The record is malformed.
+    :return _RecoveryRecord | None: The boundary and accepted target it
+        records, or ``None`` when no abort was ever recovered.
+    """
+    recovery = study.user_attrs.get(PHASE_RECOVERY_ATTR)
+    if recovery is None:
+        return None
+    if not isinstance(recovery, dict):
+        raise _phase_policy_schema_error(
+            study, f"{PHASE_RECOVERY_ATTR!r} must be an object, got {recovery!r}"
+        )
+    schema_version = recovery.get("schema_version")
+    start_after_sequence = recovery.get("start_after_sequence")
+    recovered_abort_sequence = recovery.get("recovered_abort_sequence")
+    trial_target = recovery.get("trial_target")
+    if (
+        schema_version != PHASE_RECOVERY_SCHEMA_VERSION
+        or type(start_after_sequence) is not int
+        or start_after_sequence < 1
+        or type(recovered_abort_sequence) is not int
+        or recovered_abort_sequence < 1
+        or recovered_abort_sequence > start_after_sequence
+        or type(trial_target) is not int
+        or trial_target < 1
+    ):
+        raise _phase_policy_schema_error(
+            study, f"{PHASE_RECOVERY_ATTR!r} has malformed fields: {recovery!r}"
+        )
+    return _RecoveryRecord(start_after_sequence, trial_target)
+
+
 def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     """Validate and reconstruct the durable consecutive-failure state.
 
@@ -195,31 +237,8 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         sequence, or the recovery boundary exceeds the largest recorded
         sequence.
     """
-    recovery = study.user_attrs.get(PHASE_RECOVERY_ATTR)
-    recovery_boundary = 0
-    if recovery is not None:
-        if not isinstance(recovery, dict):
-            raise _phase_policy_schema_error(
-                study, f"{PHASE_RECOVERY_ATTR!r} must be an object, got {recovery!r}"
-            )
-        schema_version = recovery.get("schema_version")
-        raw_recovery_boundary = recovery.get("start_after_sequence")
-        raw_recovered_abort_sequence = recovery.get("recovered_abort_sequence")
-        recovery_target = recovery.get("trial_target")
-        if (
-            schema_version != PHASE_RECOVERY_SCHEMA_VERSION
-            or type(raw_recovery_boundary) is not int
-            or raw_recovery_boundary < 1
-            or type(raw_recovered_abort_sequence) is not int
-            or raw_recovered_abort_sequence < 1
-            or raw_recovered_abort_sequence > raw_recovery_boundary
-            or type(recovery_target) is not int
-            or recovery_target < 1
-        ):
-            raise _phase_policy_schema_error(
-                study, f"{PHASE_RECOVERY_ATTR!r} has malformed fields: {recovery!r}"
-            )
-        recovery_boundary = raw_recovery_boundary
+    recovery = _load_recovery_record(study)
+    recovery_boundary = 0 if recovery is None else recovery.start_after_sequence
 
     events: list[tuple[int, str, dict[str, Any] | None]] = []
     seen_sequences: dict[int, int] = {}
@@ -280,6 +299,9 @@ def _record_recovery_boundary(
     toward the consecutive-failure streak that :func:`_load_phase_policy_state`
     replays, and an abort recorded with any of them stops being the phase's
     active abort. The record names the consumed abort for the audit trail.
+    It also accepts ``phase.n_trials`` as the trial target
+    (:func:`_accepted_trial_target`), so the raised target that authorizes a
+    recovery and the recovery itself become durable in this one write.
 
     :param optuna.Study study: Study whose recovery boundary is written.
     :param Phase phase: Phase whose ``n_trials`` the recovery runs toward.
@@ -360,11 +382,19 @@ def _validate_study_direction(
 def _accepted_trial_target(study: optuna.Study) -> int:
     """Return the durable target for a current-format study.
 
+    A recovery record accepts its target in the same write that retires an
+    abort (:func:`_record_recovery_boundary`), and that write lands before
+    ``TRIAL_TARGET_ATTR`` catches up. Reading both keeps a crash between the
+    two from dropping the recovery's authorization or letting the old target
+    run the recovered phase.
+
     :param optuna.Study study: Study whose accepted trial target is read.
-    :return int: The stored ``phasesweep_trial_target`` user attr, or zero for
-        a newly initialized empty study.
+    :return int: The larger of the stored ``phasesweep_trial_target`` user
+        attr and the recovery record's target, or zero for a newly initialized
+        empty study.
     :raises StudySchemaMismatchError: The stored target is not a positive int,
-        or is lower than the number of already-finished trials.
+        is lower than the number of already-finished trials, or the recovery
+        record is malformed.
     """
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     stored = study.user_attrs.get(TRIAL_TARGET_ATTR)
@@ -381,7 +411,8 @@ def _accepted_trial_target(study: optuna.Study) -> int:
             f"for {finished} terminal trial(s). Use a new experiment name, or archive/delete "
             "the inconsistent study before running again."
         )
-    return stored
+    recovery = _load_recovery_record(study)
+    return stored if recovery is None else max(stored, recovery.trial_target)
 
 
 def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:

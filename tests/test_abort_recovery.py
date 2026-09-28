@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import optuna
 import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config import Experiment
-from phasesweep.engine import StudySchemaMismatchError
+from phasesweep.engine import StudySchemaMismatchError, TrialTargetRegressionError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
+    PHASE_RECOVERY_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.engine.study_policy import _load_phase_policy_state
+from phasesweep.engine.study_policy import _ALLOCATION_CONTEXT_ATTR, _load_phase_policy_state
 from tests.conftest import (
     make_experiment,
     write_flag_gated_trainer,
@@ -229,3 +231,88 @@ def test_changing_the_failure_limit_never_reinterprets_recorded_outcomes(tmp_pat
     assert _load_phase_policy_state(study).consecutive_failures == 1
     assert _load_phase_policy_state(study).abort is None
     assert run_experiment(original)["p"].attempt_id == first["p"].attempt_id
+
+
+@pytest.mark.parametrize(
+    ("failing_attr", "old_target_refusal"),
+    [
+        (PHASE_RECOVERY_ATTR, NoFeasibleTrialError),
+        (TRIAL_TARGET_ATTR, TrialTargetRegressionError),
+        (_ALLOCATION_CONTEXT_ATTR, TrialTargetRegressionError),
+    ],
+)
+@pytest.mark.integration
+def test_interrupted_recovery_keeps_the_raised_target_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing_attr: str,
+    old_target_refusal: type[Exception],
+) -> None:
+    """A failed write while accepting a recovery target neither spends nor transfers it.
+
+    Raising ``n_trials`` authorizes recovering from a streak that meets a
+    lowered limit. Whichever write of that transition fails, the old target
+    still cannot run the recovery, and an identical retry runs it without
+    demanding a further raise.
+    """
+    import phasesweep.engine.phase as phase_module
+
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            raise SystemExit(1)
+        print("x=0.5")
+        """,
+    )
+    initial = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=2,
+        max_consecutive_failures=2,
+        gpu_policy="none",
+    )
+
+    def with_target(n_trials: int) -> Experiment:
+        phase = initial.phases[0].model_copy(
+            update={"n_trials": n_trials, "max_consecutive_failures": 1}
+        )
+        return initial.model_copy(update={"phases": [phase]})
+
+    real_after_trial = phase_module._after_trial
+
+    def stop_after_first_outcome(*args: Any, **kwargs: Any) -> None:
+        real_after_trial(*args, **kwargs)
+        raise RuntimeError("simulated orchestrator stop")
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(phase_module, "_after_trial", stop_after_first_outcome)
+        with pytest.raises(RuntimeError, match="simulated orchestrator stop"):
+            run_experiment(initial)
+
+    real_set_user_attr = optuna.Study.set_user_attr
+
+    def fail_write(study: optuna.Study, key: str, value: Any) -> None:
+        if key == failing_attr:
+            raise RuntimeError("simulated storage failure")
+        real_set_user_attr(study, key, value)
+
+    with monkeypatch.context() as ctx:
+        ctx.setattr(optuna.Study, "set_user_attr", fail_write)
+        with pytest.raises(RuntimeError, match="simulated storage failure"):
+            run_experiment(with_target(3))
+
+    def trial_states() -> list[str]:
+        study = optuna.load_study(
+            study_name="t::p", storage=_resolve_storage(initial.resolved_storage)
+        )
+        return [trial.state.name for trial in study.trials]
+
+    assert trial_states() == ["FAIL"]
+    with pytest.raises(old_target_refusal):
+        run_experiment(with_target(2))
+    assert trial_states() == ["FAIL"]
+
+    assert run_experiment(with_target(3))["p"].metric == pytest.approx(0.5)
+    assert trial_states() == ["FAIL", "COMPLETE", "COMPLETE"]

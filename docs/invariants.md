@@ -294,14 +294,19 @@ A phase abort is written in the same record as the outcome that trips it, and
 replay honors the first abort recorded after the recovery boundary. A later
 success resets the failure streak but never a recorded abort, and a changed
 `max_consecutive_failures` governs new work only, never recorded outcomes.
+Recovering from an abort accepts the raised `n_trials` in the same record that
+retires the abort, so an interrupted recovery keeps its authorization and the
+old target never runs it.
 
 **Held by:** `engine.phase._record_outcome`, which writes the record
 `engine.phase._PhaseExecution.abort_decision` returns with the outcome;
 `engine.study_policy._load_phase_policy_state`, which replays it;
 `engine.phase._resume_phase`, which applies the current limit only before new
-work\
+work; `engine.study_policy._record_recovery_boundary`, whose record
+`engine.study_policy._accepted_trial_target` reads as an accepted target\
 **Tests:** `tests/test_runtime_behavior.py::test_parallel_failure_threshold_uses_completion_order`,
-`tests/test_abort_recovery.py::test_changing_the_failure_limit_never_reinterprets_recorded_outcomes`
+`tests/test_abort_recovery.py::test_changing_the_failure_limit_never_reinterprets_recorded_outcomes`,
+`tests/test_abort_recovery.py::test_interrupted_recovery_keeps_the_raised_target_authorization`
 
 #### 12. An unreadable ledger means cleanup is uncertain
 

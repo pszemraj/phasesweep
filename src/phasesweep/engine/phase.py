@@ -1446,6 +1446,14 @@ def _run_phase(
     # Recording it earlier would strand the study at a target no invocation
     # ever launched work toward, making the previously working config a
     # rejected regression (review v0.5.14 / blocker 4).
+    if resume.recovery_abort is not None:
+        # The recovery record accepts the raised target in the same write that
+        # retires the abort and starts a new streak, so this execution's own
+        # first abort is recorded afresh. Because it lands before the target
+        # attr, a crash between the two keeps the authorization the raised
+        # target granted, and the old target still cannot run the recovery.
+        _record_recovery_boundary(study, phase, resume.recovery_abort["completion_sequence"])
+        run.resume_from(_load_phase_policy_state(study))
     _record_trial_target(study, phase)
     if (
         resume.partial_decision is not None
@@ -1455,11 +1463,6 @@ def _run_phase(
         # a terminal partial decision. The old record is no longer actionable
         # once the larger target is durable.
         study.set_user_attr(PHASE_DECISION_ATTR, None)
-    if resume.recovery_abort is not None:
-        # The boundary retires the recorded abort and starts a new streak, so
-        # this execution's own first abort is recorded afresh.
-        _record_recovery_boundary(study, phase, resume.recovery_abort["completion_sequence"])
-        run.resume_from(_load_phase_policy_state(study))
     try:
         try:
             _record_allocation_context(
