@@ -311,6 +311,26 @@ def poll_wandb_summary(
     return capture
 
 
+def _summary_lookup(summary: Mapping[str, Any], key: str) -> tuple[bool, Any]:
+    """Find a key in a finished summary the way W&B's runs table names it.
+
+    An exact key wins. Otherwise ``head.tail`` names the aggregate that
+    ``define_metric(head, summary=tail)`` stores as ``{tail: value}`` under
+    ``head``, so ``eval/loss.min`` reads ``summary["eval/loss"]["min"]``.
+
+    :param Mapping[str, Any] summary: Decoded finished-run summary.
+    :param str key: Configured summary key.
+    :return tuple[bool, Any]: Whether the key is present, and its raw value.
+    """
+    if key in summary:
+        return True, summary[key]
+    head, dot, tail = key.rpartition(".")
+    aggregate = summary.get(head) if dot else None
+    if isinstance(aggregate, Mapping) and tail in aggregate:
+        return True, aggregate[tail]
+    return False, None
+
+
 def _poll_wandb_summary(
     *,
     base_url: str,
@@ -380,16 +400,19 @@ def _poll_wandb_summary(
                     raise WandbRunTerminalError(run_id, run.state)
                 if run.state == "finished":
                     summary = run.summary_metrics
-                    if all(key in summary for key in required):
+                    found = {key: _summary_lookup(summary, key) for key in required}
+                    if all(present for present, _ in found.values()):
                         values = {}
-                        for key in required:
-                            value = json_float(summary[key], label=key)
+                        for key, (_, raw) in found.items():
+                            value = json_float(raw, label=key)
                             if not math.isfinite(value):
                                 raise ValueError(f"W&B metric {key!r} is non-finite.")
                             values[key] = value
                         capture = {
                             "values": values,
-                            "present_keys": sorted(key for key in presence_keys if key in summary),
+                            "present_keys": sorted(
+                                key for key in presence_keys if _summary_lookup(summary, key)[0]
+                            ),
                             "retrieved_at": utc_now_iso(timespec="microseconds"),
                         }
                         if time.monotonic() >= deadline:

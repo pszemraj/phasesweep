@@ -260,6 +260,12 @@ metric:
     timeout_seconds: 120
 ```
 
+Summary keys are named as the W&B runs table shows them. An exact key wins;
+otherwise `eval/loss.min` reads the aggregate that
+`define_metric("eval/loss", summary="min")` stores under `eval/loss`. A bare
+`eval/loss` whose summary is such an aggregate is not a scalar and fails the
+trial.
+
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share
 one finished-summary capture. Only requested numeric values and gate-presence

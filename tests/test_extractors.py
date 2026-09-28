@@ -150,18 +150,48 @@ def test_wandb_terminal_runs_cannot_win(monkeypatch, state):
     assert caught.value.state == state
 
 
-@pytest.mark.parametrize("value", [True, "0.2", None, float("inf"), 10**400])
-def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
+@pytest.mark.parametrize("aggregated", [False, True], ids=["flat", "aggregated"])
+@pytest.mark.parametrize("value", [True, "0.2", None, float("inf"), 10**400, {"min": 0.2}])
+def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value, aggregated):
+    public = pytest.importorskip("wandb.apis.public")
+    summary = {"loss": {"min": value}} if aggregated else {"loss": value}
+    monkeypatch.setattr(
+        public,
+        "Api",
+        lambda **kwargs: SimpleNamespace(
+            run=lambda path: SimpleNamespace(state="finished", summary_metrics=summary)
+        ),
+    )
+    with pytest.raises(ValueError):
+        _wandb_poll(required_keys=["loss.min" if aggregated else "loss"])
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected", "present"),
+    [
+        ({"eval/loss": {"min": 0.2, "last": 0.3}}, 0.2, ["eval/loss.last"]),
+        ({"eval/loss.min": 0.1, "eval/loss": {"min": 0.2}}, 0.1, []),
+    ],
+    ids=["aggregated", "exact-key-wins"],
+)
+def test_wandb_reads_aggregated_summary_keys_as_the_runs_table_names_them(
+    monkeypatch, summary, expected, present
+):
+    # define_metric("eval/loss", summary="min") stores {"eval/loss": {"min": v}},
+    # which the runs table shows as eval/loss.min.
     public = pytest.importorskip("wandb.apis.public")
     monkeypatch.setattr(
         public,
         "Api",
         lambda **kwargs: SimpleNamespace(
-            run=lambda path: SimpleNamespace(state="finished", summary_metrics={"loss": value})
+            run=lambda path: SimpleNamespace(state="finished", summary_metrics=summary)
         ),
     )
-    with pytest.raises(ValueError):
-        _wandb_poll(required_keys=["loss"])
+    capture = _wandb_poll(
+        required_keys=["eval/loss.min"], presence_keys=["eval/loss.last", "eval/loss.max"]
+    )
+    assert capture["values"] == {"eval/loss.min": expected}
+    assert capture["present_keys"] == present
 
 
 def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
