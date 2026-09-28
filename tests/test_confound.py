@@ -46,8 +46,17 @@ _PRUNED = optuna.trial.TrialState.PRUNED
 _RUNNING = optuna.trial.TrialState.RUNNING
 
 
-def _envelope(checkpoint: str = "final.pt", step: int = 1000) -> dict[str, Any]:
-    """Return a current-format ``json_envelope`` objective provenance record."""
+def _envelope(
+    checkpoint: str = "final.pt", step: int = 1000, *, tokens: int | None = None
+) -> dict[str, Any]:
+    """Return a current-format ``json_envelope`` objective provenance record.
+
+    With ``tokens``, the extractor declared ``evaluation_axis: tokens`` and the
+    trainer reported that position beside its step.
+    """
+    progress = (
+        {"axis": "step", "value": step} if tokens is None else {"axis": "tokens", "value": tokens}
+    )
     return {
         "schema_version": 1,
         "extractor": {"kind": "json_envelope", "config_sha256": "0" * 64},
@@ -63,7 +72,7 @@ def _envelope(checkpoint: str = "final.pt", step: int = 1000) -> dict[str, Any]:
                 "policy": "final",
                 "checkpoint": checkpoint,
                 "step": step,
-                "progress": {"axis": "step", "value": step},
+                "progress": progress,
             },
         },
     }
@@ -186,50 +195,81 @@ def test_evaluation_point_agreement_is_ok_with_grouped_evidence() -> None:
     check = block["checks"]["evaluation_point"]
     assert check == {
         "verdict": "ok",
-        "detail": {
-            "checkpoint": [{"value": "final.pt", "trials": [0, 1]}],
-            "step": [{"value": 1000, "trials": [0, 1]}],
-        },
+        "detail": {"axis": "step", "values": [{"value": 1000, "trials": [0, 1]}]},
+    }
+
+
+def test_fixed_token_sweep_compares_tokens_not_steps_or_checkpoints() -> None:
+    """Batch sizes differ, so steps and step-named checkpoints do; tokens match."""
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2), (_COMPLETE, 0.3, 3))
+    records = {
+        number: _envelope(f"checkpoint-{steps}", steps, tokens=2_000_000)
+        for number, steps in enumerate([4000, 2000, 1000])
+    }
+    block = _assess(trials, trials, provenance=records)
+
+    assert block["checks"]["evaluation_point"] == {
+        "verdict": "ok",
+        "detail": {"axis": "tokens", "values": [{"value": 2_000_000, "trials": [0, 1, 2]}]},
     }
 
 
 @pytest.mark.parametrize(
-    ("records", "field", "groups"),
+    ("records", "axis", "groups"),
     [
         pytest.param(
             {0: _envelope(step=1000), 1: _envelope(step=1000), 2: _envelope(step=400)},
             "step",
             [{"value": 400, "trials": [2]}, {"value": 1000, "trials": [0, 1]}],
-            id="step",
+            id="envelope-step",
         ),
         pytest.param(
-            {0: _envelope(checkpoint="best.pt"), 1: _envelope(), 2: _envelope()},
-            "checkpoint",
-            [{"value": "best.pt", "trials": [0]}, {"value": "final.pt", "trials": [1, 2]}],
-            id="checkpoint",
+            {0: _envelope(tokens=2000), 1: _envelope(tokens=2000), 2: _envelope(tokens=800)},
+            "tokens",
+            [{"value": 800, "trials": [2]}, {"value": 2000, "trials": [0, 1]}],
+            id="truncated-token-budget",
+        ),
+        pytest.param(
+            {0: _wandb(1000), 1: _wandb(1000), 2: _wandb(400)},
+            "eval/step",
+            [{"value": 400, "trials": [2]}, {"value": 1000, "trials": [0, 1]}],
+            id="wandb-step-metric",
         ),
     ],
 )
 def test_evaluation_point_disagreement_is_heterogeneous(
-    records: dict[int, dict[str, Any]], field: str, groups: list[dict[str, Any]]
+    records: dict[int, dict[str, Any]], axis: str, groups: list[dict[str, Any]]
 ) -> None:
     trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2), (_COMPLETE, 0.3, 3))
     block = _assess(trials, trials, provenance=records)
 
     check = block["checks"]["evaluation_point"]
-    assert check["verdict"] == "heterogeneous"
-    assert check["detail"][field] == groups
+    assert check == {"verdict": "heterogeneous", "detail": {"axis": axis, "values": groups}}
     assert _flagged_checks(block) == ["evaluation_point"]
-    assert f"2 distinct {field}s" in _describe_flagged(block)[0]
+    values = ", ".join(str(group["value"]) for group in groups)
+    assert f"2 distinct {axis} values ({values})" in _describe_flagged(block)[0]
 
 
-def test_evaluation_point_is_not_checked_without_envelope_metadata() -> None:
-    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
-    block = _assess(trials, trials)
+@pytest.mark.parametrize(
+    ("records", "reason"),
+    [
+        pytest.param(None, "log_regex objectives report no evaluation position", id="log_regex"),
+        pytest.param(
+            {0: _wandb(1000), 1: _wandb(None), 2: _wandb(None)},
+            "trial(s) 1, 2 recorded no eval/step position",
+            id="wandb-unlocated",
+        ),
+    ],
+)
+def test_evaluation_point_is_not_checked_without_every_position(
+    records: dict[int, dict[str, Any]] | None, reason: str
+) -> None:
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2), (_COMPLETE, 0.3, 3))
+    block = _assess(trials, trials, provenance=records)
 
     check = block["checks"]["evaluation_point"]
     assert check["verdict"] == "n/a"
-    assert "log_regex" in check["reason"]
+    assert reason in check["reason"]
 
 
 @pytest.mark.parametrize(
@@ -317,6 +357,21 @@ def _mutated(path: tuple[Any, ...], value: Any) -> dict[str, Any]:
         pytest.param(("checks", "survivorship", "detail", "failed"), -1, id="negative-count"),
         pytest.param(("checks", "survivorship", "detail", "failed"), True, id="bool-count"),
         pytest.param(("checks", "tie", "detail", "tied_trials"), ["1"], id="string-trial"),
+        pytest.param(
+            ("checks", "evaluation_point"),
+            {"verdict": "ok", "detail": {"step": [{"value": 1000, "trials": [0, 1]}]}},
+            id="axis-less-evidence",
+        ),
+        pytest.param(
+            ("checks", "evaluation_point"),
+            {"verdict": "ok", "detail": {"axis": "", "values": [{"value": 1, "trials": [0]}]}},
+            id="empty-axis",
+        ),
+        pytest.param(
+            ("checks", "evaluation_point"),
+            {"verdict": "ok", "detail": {"axis": "step", "values": [{"value": -1, "trials": [0]}]}},
+            id="negative-position",
+        ),
     ],
 )
 def test_validator_rejects_malformed_blocks(path: tuple[Any, ...], value: Any) -> None:
@@ -324,13 +379,16 @@ def test_validator_rejects_malformed_blocks(path: tuple[Any, ...], value: Any) -
         _validate_confound_block(_mutated(path, value))
 
 
-def test_summary_keeps_only_verdicts_and_counts() -> None:
-    """The agent-visible projection drops every reported string."""
+def test_summary_keeps_only_verdicts_and_numbers() -> None:
+    """The agent-visible projection drops every reported or configured string."""
     trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 2), (_FAIL, None, 3))
     block = _assess(
         trials,
         trials[:2],
-        provenance={0: _envelope(checkpoint="/abs/ckpt.pt"), 1: _envelope(step=5)},
+        provenance={
+            0: _envelope(checkpoint="/abs/ckpt.pt", tokens=2000),
+            1: _envelope(tokens=1000),
+        },
     )
 
     summary = _confound_summary(block, winner_trial=0)
@@ -339,9 +397,8 @@ def test_summary_keeps_only_verdicts_and_counts() -> None:
         "flagged": ["evaluation_point", "tie"],
         "evaluation_point": {
             "verdict": "heterogeneous",
-            "distinct_checkpoints": 2,
-            "distinct_steps": 2,
-            "winner_step": 1000,
+            "distinct_values": 2,
+            "winner_value": 2000,
         },
         "survivorship": {
             "verdict": "ok",
@@ -352,7 +409,9 @@ def test_summary_keeps_only_verdicts_and_counts() -> None:
         },
         "tie": {"verdict": "heterogeneous", "tied_trials": 1},
     }
-    assert "/abs/ckpt.pt" not in json.dumps(summary)
+    rendered = json.dumps(summary)
+    assert "/abs/ckpt.pt" not in rendered
+    assert "tokens" not in rendered
 
 
 def test_summary_reports_unchecked_counts_as_null() -> None:
@@ -361,9 +420,8 @@ def test_summary_reports_unchecked_counts_as_null() -> None:
 
     assert summary["evaluation_point"] == {
         "verdict": "n/a",
-        "distinct_checkpoints": None,
-        "distinct_steps": None,
-        "winner_step": None,
+        "distinct_values": None,
+        "winner_value": None,
     }
     assert summary["tie"] == {"verdict": "n/a", "tied_trials": None}
 
@@ -448,7 +506,7 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     ]
     assert len(warnings) == 1
     assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
-    assert "2 distinct steps (400, 1000)" in warnings[0]
+    assert "2 distinct step values (400, 1000)" in warnings[0]
     assert "ranked among 2 of 4 terminal trials" in warnings[0]
 
 

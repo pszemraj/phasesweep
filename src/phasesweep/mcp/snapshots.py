@@ -34,6 +34,7 @@ from phasesweep.evidence.models import _ObjectiveEvidenceFields
 log = logging.getLogger("phasesweep.mcp.snapshots")
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
+NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
@@ -161,17 +162,24 @@ _VERDICT_DESCRIPTION = (
 
 
 class EvaluationPointSummary(_SnapshotModel):
-    """Whether every ranked objective was measured at one checkpoint and step."""
+    """Whether every ranked objective was measured at one training position.
+
+    Positions are on the experiment's configured evaluation axis -- the
+    progress axis its sweep holds fixed, such as optimizer step or tokens.
+    """
 
     verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
-    distinct_checkpoints: NonNegativeInt | None = Field(
-        description="Checkpoint labels the ranked trials reported; null when not checked."
+    distinct_values: NonNegativeInt | None = Field(
+        description=(
+            "Distinct positions on the configured evaluation axis the ranked objectives "
+            "were measured at; null when not checked."
+        )
     )
-    distinct_steps: NonNegativeInt | None = Field(
-        description="Evaluation steps the ranked trials reported; null when not checked."
-    )
-    winner_step: NonNegativeInt | None = Field(
-        description="Step the winning objective was measured at; null when not checked."
+    winner_value: NonNegativeInt | NonNegativeFloat | None = Field(
+        description=(
+            "Position on the configured evaluation axis the winning objective was "
+            "measured at; null when not checked."
+        )
     )
 
 

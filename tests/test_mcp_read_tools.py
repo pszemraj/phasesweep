@@ -110,7 +110,7 @@ def test_run_results_carry_path_free_confound_verdicts(tmp_path: Path) -> None:
     confound = GetRunResultsResult.model_validate(payload).phases[0].confound
 
     assert confound.evaluation_point.verdict == "n/a"
-    assert confound.evaluation_point.distinct_steps is None
+    assert confound.evaluation_point.distinct_values is None
     assert confound.survivorship.ranked >= 1
     assert confound.flagged == [
         name

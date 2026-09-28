@@ -19,6 +19,7 @@ objective provenance and passes the records in.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal, get_args
 
@@ -38,7 +39,8 @@ CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 
 CONFOUND_SCHEMA_VERSION = 1
 
-_EVALUATION_FIELDS = ("checkpoint", "step")
+# Objective kinds whose provenance records a position on the evaluation axis.
+_POSITIONED_KINDS = frozenset({"json_envelope", "wandb"})
 _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "failed", "pruned")
 # Where a terminal trial that selection did not rank is counted. A COMPLETE
 # trial outside the ranked set failed feasibility, a gate, or a constraint.
@@ -85,13 +87,16 @@ def _evaluation_point(
     ranked: Sequence[optuna.trial.FrozenTrial],
     provenance: Mapping[int, Mapping[str, Any]],
 ) -> dict[str, Any]:
-    """Check that every ranked objective was measured at one checkpoint and step.
+    """Check that every ranked objective was measured at one training position.
 
-    Only a ``json_envelope`` objective reports where it was measured. The
-    extractor kind and config are fingerprinted, and the envelope's objective
-    name, split, and policy are enforced at extraction, so the reported
-    checkpoint and step are the only evaluation identity that can differ
-    between trials -- and only when the config leaves them unpinned.
+    The position is on the extractor's declared ``evaluation_axis`` -- the
+    progress axis the sweep holds fixed: optimizer step, tokens for a
+    fixed-token sweep, or a W&B step metric. ``json_envelope`` objectives
+    report it; ``wandb`` objectives locate it in run history. Comparing any
+    other axis would flag designed differences: a fixed-token batch-size sweep
+    ends trials at different steps, and checkpoint labels usually embed the
+    step. The axis is part of the fingerprinted extractor config, so every
+    ranked trial declares the same one.
 
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number.
     :param Mapping[int, Mapping[str, Any]] provenance: Their objective provenance.
@@ -101,17 +106,19 @@ def _evaluation_point(
         return _not_checked("only one trial was ranked")
     records = [(trial.number, provenance[trial.number]) for trial in ranked]
     kinds = sorted({record["extractor"]["kind"] for _, record in records})
-    if kinds != ["json_envelope"]:
+    if len(kinds) != 1 or kinds[0] not in _POSITIONED_KINDS:
+        return _not_checked(f"{', '.join(kinds)} objectives report no evaluation position")
+    positions = [(number, record["source"]["evaluation"]["progress"]) for number, record in records]
+    axes = sorted({progress["axis"] for _, progress in positions})
+    if len(axes) != 1:
+        return _not_checked(f"ranked objectives declare different axes ({', '.join(axes)})")
+    unknown = [str(number) for number, progress in positions if progress["value"] is None]
+    if unknown:
         return _not_checked(
-            f"{', '.join(kinds)} objectives report no evaluation checkpoint or step"
+            f"trial(s) {', '.join(unknown)} recorded no {axes[0]} position for their objective"
         )
-    detail = {
-        field: _groups(
-            (number, record["source"]["evaluation"][field]) for number, record in records
-        )
-        for field in _EVALUATION_FIELDS
-    }
-    return _checked(any(len(groups) > 1 for groups in detail.values()), detail)
+    groups = _groups((number, progress["value"]) for number, progress in positions)
+    return _checked(len(groups) > 1, {"axis": axes[0], "values": groups})
 
 
 def _survivorship(
@@ -251,34 +258,42 @@ def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
 
 
 def _validate_evaluation_detail(detail: object) -> dict[str, Any]:
-    """Validate evaluation-point evidence: value groups per evaluation field.
+    """Validate evaluation-point evidence: the axis and its position groups.
 
     :param object detail: Parsed evidence.
-    :raises ValueError: A field is missing or a group is malformed.
+    :raises ValueError: The axis is missing, or a group is malformed.
     :return dict[str, Any]: The validated evidence.
     """
-    if not isinstance(detail, Mapping) or set(detail) != set(_EVALUATION_FIELDS):
-        raise ValueError("confound evaluation_point evidence must group checkpoint and step")
-    parsed: dict[str, Any] = {}
-    for field in _EVALUATION_FIELDS:
-        groups = detail[field]
-        if not isinstance(groups, list) or not groups:
-            raise ValueError(f"confound evaluation_point {field} has no groups")
-        parsed[field] = []
-        for group in groups:
-            if not isinstance(group, Mapping) or set(group) != {"value", "trials"}:
-                raise ValueError(f"confound evaluation_point {field} group is malformed")
-            value = group["value"]
-            valid = (
-                isinstance(value, str) and bool(value)
-                if field == "checkpoint"
-                else type(value) is int and value >= 0
-            )
-            trials = _trial_numbers(group["trials"], label=f"evaluation_point {field} trials")
-            if not valid or not trials:
-                raise ValueError(f"confound evaluation_point {field} group is malformed")
-            parsed[field].append({"value": value, "trials": trials})
-    return parsed
+    if not isinstance(detail, Mapping) or set(detail) != {"axis", "values"}:
+        raise ValueError("confound evaluation_point evidence must name its axis and values")
+    axis, groups = detail["axis"], detail["values"]
+    if not isinstance(axis, str) or not axis:
+        raise ValueError("confound evaluation_point axis is not a nonempty string")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("confound evaluation_point has no value groups")
+    parsed = []
+    for group in groups:
+        if not isinstance(group, Mapping) or set(group) != {"value", "trials"}:
+            raise ValueError("confound evaluation_point value group is malformed")
+        trials = _trial_numbers(group["trials"], label="evaluation_point trials")
+        if not _is_position(group["value"]) or not trials:
+            raise ValueError("confound evaluation_point value group is malformed")
+        parsed.append({"value": group["value"], "trials": trials})
+    return {"axis": axis, "values": parsed}
+
+
+def _is_position(value: object) -> bool:
+    """Whether ``value`` is a finite, non-negative JSON number (not a bool).
+
+    :param object value: Parsed group value.
+    :return bool: Whether it is a valid evaluation-axis position.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
 
 
 def _validate_survivorship_detail(detail: object) -> dict[str, Any]:
@@ -353,13 +368,10 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
     for name in _flagged_checks(block):
         detail = block["checks"][name]["detail"]
         if name == "evaluation_point":
-            spread = [
-                f"{len(groups)} distinct {field}s ({_logged_values(groups)})"
-                for field, groups in detail.items()
-                if len(groups) > 1
-            ]
+            groups = detail["values"]
             lines.append(
-                f"evaluation_point: ranked objectives were measured at {' and '.join(spread)}"
+                f"evaluation_point: ranked objectives were measured at {len(groups)} distinct "
+                f"{detail['axis']} values ({_logged_values(groups)})"
             )
         elif name == "survivorship":
             total = sum(detail[key] for key in _SURVIVORSHIP_COUNTS)
@@ -378,39 +390,33 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
 
 
 def _confound_summary(block: Mapping[str, Any], *, winner_trial: int) -> dict[str, Any]:
-    """Project a validated block onto the enums and counts agents may see.
+    """Project a validated block onto the enums and numbers agents may see.
 
-    Evidence can hold strings a trainer reported -- a checkpoint label may be
-    a path -- so the projection keeps only verdicts, check names, and
-    integers. The full evidence stays in ``winner.yaml`` for operators.
+    Evidence holds operator- and trainer-authored strings -- the axis is a
+    config key, like the metric keys MCP never returns -- so the projection
+    keeps only verdicts, check names, counts, and the winner's position. The
+    full evidence stays in ``winner.yaml`` for operators.
 
     :param Mapping[str, Any] block: A validated confound block.
     :param int winner_trial: Trial number of the winner the block belongs to.
-    :return dict[str, Any]: The path-free summary, one entry per check plus
+    :return dict[str, Any]: The string-free summary, one entry per check plus
         the ``flagged`` check names.
     """
     checks = block["checks"]
     evaluation = checks["evaluation_point"]
-    evaluation_detail = evaluation.get("detail")
+    groups = evaluation["detail"]["values"] if "detail" in evaluation else None
     tie = checks["tie"]
     return {
         "flagged": list(_flagged_checks(block)),
         "evaluation_point": {
             "verdict": evaluation["verdict"],
-            "distinct_checkpoints": (
-                len(evaluation_detail["checkpoint"]) if evaluation_detail else None
-            ),
-            "distinct_steps": len(evaluation_detail["step"]) if evaluation_detail else None,
-            "winner_step": (
+            "distinct_values": len(groups) if groups is not None else None,
+            "winner_value": (
                 next(
-                    (
-                        group["value"]
-                        for group in evaluation_detail["step"]
-                        if winner_trial in group["trials"]
-                    ),
+                    (group["value"] for group in groups if winner_trial in group["trials"]),
                     None,
                 )
-                if evaluation_detail
+                if groups is not None
                 else None
             ),
         },
