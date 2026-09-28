@@ -19,6 +19,7 @@ from phasesweep.engine.confound import (
     CONFOUND_CHECKS,
     CONFOUND_VERDICTS,
     _assess_population,
+    _confound_summary,
     _describe_flagged,
     _flagged_checks,
     _validate_confound_block,
@@ -250,6 +251,11 @@ def _mutated(path: tuple[Any, ...], value: Any) -> dict[str, Any]:
         pytest.param(("checks", "speed"), {"verdict": "ok", "detail": {}}, id="unknown-check"),
         pytest.param(("checks", "tie", "verdict"), "clean", id="unknown-verdict"),
         pytest.param(("checks", "evaluation_point", "reason"), ..., id="n/a-without-reason"),
+        pytest.param(
+            ("checks", "survivorship"),
+            {"verdict": "n/a", "reason": "skipped"},
+            id="survivorship-n/a",
+        ),
         pytest.param(("checks", "survivorship", "detail"), ..., id="checked-without-detail"),
         pytest.param(("checks", "survivorship", "detail", "failed"), -1, id="negative-count"),
         pytest.param(("checks", "survivorship", "detail", "failed"), True, id="bool-count"),
@@ -259,6 +265,50 @@ def _mutated(path: tuple[Any, ...], value: Any) -> dict[str, Any]:
 def test_validator_rejects_malformed_blocks(path: tuple[Any, ...], value: Any) -> None:
     with pytest.raises(ValueError, match="confound"):
         _validate_confound_block(_mutated(path, value))
+
+
+def test_summary_keeps_only_verdicts_and_counts() -> None:
+    """The agent-visible projection drops every reported string."""
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 2), (_FAIL, None, 3))
+    block = _assess(
+        trials,
+        trials[:2],
+        provenance={0: _envelope(checkpoint="/abs/ckpt.pt"), 1: _envelope(step=5)},
+    )
+
+    summary = _confound_summary(block, winner_trial=0)
+
+    assert summary == {
+        "flagged": ["evaluation_point", "tie"],
+        "evaluation_point": {
+            "verdict": "heterogeneous",
+            "distinct_checkpoints": 2,
+            "distinct_steps": 2,
+            "winner_step": 1000,
+        },
+        "survivorship": {
+            "verdict": "ok",
+            "ranked": 2,
+            "infeasible": 0,
+            "failed": 1,
+            "pruned": 0,
+        },
+        "tie": {"verdict": "heterogeneous", "tied_trials": 1},
+    }
+    assert "/abs/ckpt.pt" not in json.dumps(summary)
+
+
+def test_summary_reports_unchecked_counts_as_null() -> None:
+    trials = _trials((_COMPLETE, 0.5, 1))
+    summary = _confound_summary(_assess(trials, trials), winner_trial=0)
+
+    assert summary["evaluation_point"] == {
+        "verdict": "n/a",
+        "distinct_checkpoints": None,
+        "distinct_steps": None,
+        "winner_step": None,
+    }
+    assert summary["tie"] == {"verdict": "n/a", "tied_trials": None}
 
 
 def test_validator_rejects_an_absent_block() -> None:
