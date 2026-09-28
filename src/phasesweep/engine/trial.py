@@ -241,7 +241,7 @@ class EnvironmentIdentity:
 
 def _environment_identity(
     experiment: Experiment,
-    phase_name: str | None = None,
+    phase_name: str,
     *,
     require_wandb_online: bool = True,
 ) -> EnvironmentIdentity:
@@ -266,17 +266,12 @@ def _environment_identity(
     themselves never enter config metadata.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
-    :param str | None phase_name: Phase whose remote consumers normalize W&B
-        defaults. May be omitted only for a single-phase experiment.
+    :param str phase_name: Phase whose remote consumers normalize W&B defaults.
     :param bool require_wandb_online: Reject offline/disabled W&B modes when the
         caller is preparing new remote work.
     :return EnvironmentIdentity: Digest, sorted variable names, and the
         composed name-to-value mapping the digest covers.
     """
-    if phase_name is None:
-        if len(experiment.phases) != 1:
-            raise ValueError("phase_name is required for a multi-phase environment identity.")
-        phase_name = experiment.phases[0].name
     env = _trainer_environment(
         experiment,
         phase_name,

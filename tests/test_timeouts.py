@@ -13,11 +13,12 @@ from phasesweep import run_experiment
 from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
 from phasesweep.engine import PhaseSweepError
 from phasesweep.engine.artifacts import _load_winner
+from phasesweep.engine.errors import OperatorAction, WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
-from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.selection import NoFeasibleTrialError
-from phasesweep.engine.state import PHASE_ABORT_ATTR, PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
+from phasesweep.engine.state import PHASE_DECISION_ATTR, TRIAL_OUTCOME_ATTR
 from phasesweep.engine.study_policy import _load_phase_policy_state
 from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
 from phasesweep.evidence import TrialContext
@@ -170,10 +171,46 @@ def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_pat
             current,
             current.phases[0],
             {},
-            published_generation_id=_last_successful_generation_id(
-                current, raise_on_manifest_error=True
-            ),
+            publication=_published_for_resume(current),
         )
+
+
+@pytest.mark.integration
+def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
+    tmp_path: Path,
+) -> None:
+    """A rerun without the opt-in refuses the accepted partial decision it would replay.
+
+    The opt-in is outside the phase fingerprint, so this is the only check
+    between it and a republished incomplete result. The refusal launches no
+    work and leaves the decision and the publication as they were.
+    """
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
+    exp = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=5,
+        gpu_policy="none",
+        timeout_seconds_per_phase=4.0,
+        allow_incomplete_on_timeout=True,
+    )
+    assert run_experiment(exp)["p"].completion["incomplete"] is True
+
+    def load() -> optuna.Study:
+        return optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+
+    trials_before = len(load().trials)
+    decision_before = load().user_attrs[PHASE_DECISION_ATTR]
+    published_before = _last_successful_generation_path(exp).read_text()
+    strict = exp.model_copy(
+        update={"phases": [exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False})]}
+    )
+    with pytest.raises(WinnerIntegrityError, match="Refusing to replay it") as refused:
+        run_experiment(strict)
+    assert refused.value.action is OperatorAction.FIX_CONFIG
+    assert len(load().trials) == trials_before
+    assert load().user_attrs[PHASE_DECISION_ATTR] == decision_before
+    assert _last_successful_generation_path(exp).read_text() == published_before
 
 
 @pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
@@ -213,9 +250,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         current,
         current.phases[0],
         {},
-        published_generation_id=_last_successful_generation_id(
-            current, raise_on_manifest_error=True
-        ),
+        publication=_published_for_resume(current),
     )
     assert loaded.completion["incomplete"] is False
 
@@ -260,7 +295,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "cancelled"
     ]
     assert len(deadline_trials) == 1
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
     assert _load_phase_policy_state(study).consecutive_failures == 0
 
 
@@ -446,7 +481,7 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         study_name="refused_partial_timeout_abort::p",
         storage=_resolve_storage(exp.storage),
     )
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
     assert _load_phase_policy_state(study).consecutive_failures == 0
 
     # The operator's documented remedy is now viable: with a fresh/larger
@@ -498,13 +533,13 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
     assert exc_info.value.published_result_committed is False
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
     assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "cancelled"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    assert study.user_attrs.get(PHASE_ABORT_ATTR) is None
+    assert _load_phase_policy_state(study).abort is None
 
 
 @pytest.mark.parametrize("lease_timeout", [True, False])
@@ -757,7 +792,9 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
         run_experiment(experiment)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    assert study.user_attrs[PHASE_ABORT_ATTR]["policy"] == "unexpected_objective_exception"
+    abort = _load_phase_policy_state(study).abort
+    assert abort is not None
+    assert abort["policy"] == "unexpected_objective_exception"
 
 
 @pytest.mark.integration

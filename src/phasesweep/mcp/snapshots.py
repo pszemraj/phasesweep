@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from phasesweep.config import Experiment
 from phasesweep.config.models import _metric_semantics_payload
-from phasesweep.engine import PhaseWinnerView, read_status, read_winners
+from phasesweep.engine import PhaseWinnerView, read_result, read_status
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
@@ -76,18 +76,16 @@ class PhaseStatusSnapshot(_SnapshotModel):
     published_study_unavailable: bool | None = None
     """Whether the published study was unavailable at capture time.
 
-    ``None`` means availability was not checked, as in older frozen snapshots
-    or pre-generation placeholders. It is not evidence of study availability.
+    ``None`` means availability was not checked, as in pre-generation
+    placeholders. It is not evidence of study availability.
     """
     running_attempts: list[RunningAttemptSnapshot] | None = None
     """RUNNING rows the frozen counts describe, or ``None`` when unknown.
 
     ``None`` means the capture read no trial data for this phase, i.e. it
     pairs with ``trial_data_available: false`` -- an empty list would assert
-    there are no RUNNING rows. Snapshots frozen before this field existed also
-    parse as ``None``, which is the truthful reading: they recorded no
-    identities. A phase with known trial counts always carries a list, empty
-    when nothing is RUNNING, including a confirmed absent study.
+    there are no RUNNING rows. A phase with known trial counts always carries
+    a list, empty when nothing is RUNNING, including a confirmed absent study.
     """
 
 
@@ -130,8 +128,9 @@ class StatusSnapshot(_SnapshotModel):
     """Whether the represented generation's config matched at capture time.
 
     Run-scoped MCP reads recompute this from the frozen represented-config
-    fingerprint and current catalog config; snapshots frozen before that
-    fingerprint existed parse as ``None``.
+    fingerprint and current catalog config; it is ``None`` when no comparison
+    config is available, or when the represented summary recorded no
+    fingerprint.
     """
 
     result_phase_plan: list[str]
@@ -144,8 +143,8 @@ class WinnerSourceSnapshot(_SnapshotModel):
     kind: WinnerSourceKind
     phase: str
     trial_number: int
-    generation_id: str | None = None
-    attempt_id: str | None = None
+    generation_id: str
+    attempt_id: str
 
 
 class WinnerSnapshot(_SnapshotModel):
@@ -369,7 +368,7 @@ def capture_result_snapshot(
             lifecycle = yaml.safe_load(
                 _generation_record_path(experiment, generation_id).read_text()
             )
-        except (OSError, yaml.YAMLError):
+        except (OSError, ValueError, yaml.YAMLError):
             lifecycle = None
         if lifecycle is not None and (
             not isinstance(lifecycle, Mapping) or lifecycle.get("generation_id") != generation_id
@@ -383,8 +382,8 @@ def capture_result_snapshot(
     # including the RUNNING identities in each phase's ``running_attempts``
     # (``None`` where ``trial_data_available`` is false). This capture must
     # never reread a study afterwards (PR #5 review / reviewer 2, blocker 6).
-    status = read_status(experiment, generation_id=generation_id)
     if engine_winners is not None:
+        status = read_status(experiment, generation_id=generation_id)
         # The engine's terminal report is the authority on a successful
         # outcome (review v0.5.16 / blocker 2); freeze exactly what it
         # returned instead of re-reading the winner files.
@@ -392,23 +391,15 @@ def capture_result_snapshot(
             _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
         ]
     else:
-        # Winners must be scoped to the generation this snapshot *represents*,
-        # not the (possibly different) true current pointer: a pinned capture
-        # wants exactly its own generation's winners even when a newer
-        # generation has since become current (review v0.5.15 / blocker 3).
-        # They are enumerated under that generation's own recorded phase plan
-        # for the same reason: an unpinned capture can represent an older
-        # publication whose phase names this config no longer declares, and
-        # reading it through today's names would freeze a snapshot that omits
-        # winners which exist (review v0.5.16 / blocker 4).
-        winner_snapshots = [
-            _winner_snapshot(winner.phase, winner)
-            for winner in read_winners(
-                experiment,
-                generation_id=status["represented_generation_id"],
-                phase_names=status["result_phase_plan"],
-            )
-        ]
+        # One resolution supplies both the status and the winners of the
+        # generation this snapshot *represents*, not the (possibly different)
+        # true current pointer: a pinned capture wants exactly its own
+        # generation's winners even when a newer generation has since become
+        # current (review v0.5.15 / blocker 3). A published generation's
+        # winners are the bytes its validation read, enumerated under its own
+        # recorded phase plan (review v0.5.16 / blocker 4).
+        status, winner_views = read_result(experiment, generation_id=generation_id)
+        winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
     snapshot = RunResultSnapshot(
         status=StatusSnapshot(
             current_generation_id=status["current_generation_id"],
@@ -487,16 +478,16 @@ def finalize_result_snapshot(
     """Finalize a previously captured snapshot without rereading shared state.
 
     A phase whose capture recorded no RUNNING identities (``running_attempts``
-    is ``None``, which pairs with ``trial_data_available: false``, and is also
-    how a snapshot frozen before that field existed parses) is left exactly as
-    captured: there is nothing to reconcile the cleanup report against, and its
-    counts were never read either.
+    is ``None``, which pairs with ``trial_data_available: false``) is left
+    exactly as captured: there is nothing to reconcile the cleanup report
+    against, and its counts were never read either.
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
     :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
     :param Mapping[str, tuple[str, int, str]] | None confirmed_attempt_locations:
         Reconciled attempt ids mapped to phase, trial number, and generation;
-        used when the frozen row predates its Optuna identity attrs.
+        used when the frozen row was captured before its Optuna identity attrs
+        were set.
     :return dict[str, Any]: Validated terminal snapshot with truthful trial states.
     :raises RuntimeError: If the cleanup report names more recovered attempts
         than the snapshot counts as RUNNING, for a phase or for the represented

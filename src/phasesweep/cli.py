@@ -28,10 +28,7 @@ from phasesweep.engine import (
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.paths import _experiment_dir
-from phasesweep.engine.publication import (
-    _published_winner_path_for,
-    _resolve_publication_pointer,
-)
+from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.registry import (
@@ -471,7 +468,9 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     A published result is rendered against the phase plan recorded in its own
     generation summary: old evidence must never be decorated with the current
     config's annotations, and a config that has drifted since publication is
-    labeled historical instead of silently reinterpreted.
+    labeled historical instead of silently reinterpreted. Each winner prints
+    the exact bytes publication validation read, never a second read of the
+    file.
 
     :param Experiment experiment: Experiment whose published winners are rendered.
     :raises PublicationAccessError: This user cannot validate the publication.
@@ -493,40 +492,28 @@ def _show_experiment_winners(experiment: Experiment) -> None:
             str(publication.error),
             _experiment_dir(experiment),
         )
-    generation_id = publication.generation_id
+    validated = publication.validated
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
-    if generation_id is not None:
-        summary = publication.summary
-        if isinstance(summary, dict):
-            stored_plan = summary.get("phase_plan")
-            if isinstance(stored_plan, list) and all(
-                isinstance(item, dict) and isinstance(item.get("name"), str) for item in stored_plan
-            ):
-                phase_plan = [
-                    (
-                        str(item["name"]),
-                        item["comment"] if isinstance(item.get("comment"), str) else None,
-                    )
-                    for item in stored_plan
-                ]
-            stored_fingerprint = summary.get("config_fingerprint")
-            if isinstance(
-                stored_fingerprint, str
-            ) and stored_fingerprint != _experiment_semantic_fingerprint(experiment):
-                click.echo(
-                    "# Historical experiment result: published generation "
-                    f"{generation_id} does not match the current config."
-                )
-                click.echo("# Rendering the saved phase plan and annotations.")
+    if validated is not None:
+        phase_plan = [(phase.name, phase.comment) for phase in validated.phase_plan]
+        stored_fingerprint = validated.summary.get("config_fingerprint")
+        if isinstance(
+            stored_fingerprint, str
+        ) and stored_fingerprint != _experiment_semantic_fingerprint(experiment):
+            click.echo(
+                "# Historical experiment result: published generation "
+                f"{validated.generation_id} does not match the current config."
+            )
+            click.echo("# Rendering the saved phase plan and annotations.")
 
     for name, comment in phase_plan:
-        wpath = _published_winner_path_for(experiment, generation_id, name)
-        if wpath is not None and wpath.is_file():
+        winner = None if validated is None else validated.winners.get(name)
+        if winner is not None:
             click.echo(f"=== {name} ===")
             # Show design-intent before numerical results so the reader frames
             # them against the original hypothesis instead of the other way around.
             _render_phase_comment(comment, prefix="# ")
-            click.echo(wpath.read_text())
+            click.echo(winner.content.decode("utf-8"))
         else:
             click.echo(f"=== {name} === (no winner yet)")
             _render_phase_comment(comment, prefix="# ")

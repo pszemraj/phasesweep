@@ -71,7 +71,7 @@ def _experiment(tmp_path: Path, *, storage: str | None) -> Experiment:
 
 
 @pytest.mark.parametrize("durable_entry", ["generations", "attempts"])
-def test_pre_cutover_memory_output_is_refused_before_mutation(
+def test_unmarked_output_root_is_refused_before_mutation(
     tmp_path: Path, durable_entry: str
 ) -> None:
     """Completed and interrupted unmarked memory-backed trees are never adopted."""
@@ -79,12 +79,12 @@ def test_pre_cutover_memory_output_is_refused_before_mutation(
     root = _experiment_dir(experiment)
     state = root / durable_entry
     state.mkdir(parents=True)
-    (state / "old-state").write_text("0.3.1\n", encoding="utf-8")
+    (state / "old-state").write_text("stale\n", encoding="utf-8")
     before = tree_snapshot(root)
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=r"pre-cutover.*fresh artifact root.*0\.3\.1.*Nothing was written",
+        match=r"unmarked PhaseSweep state.*fresh artifact root.*Nothing was written",
     ):
         run_experiment(experiment)
 
@@ -92,7 +92,7 @@ def test_pre_cutover_memory_output_is_refused_before_mutation(
     assert not _artifact_root_binding_path(experiment).exists()
 
 
-def test_pre_cutover_artifact_binding_version_is_refused_before_mutation(
+def test_unsupported_artifact_binding_version_is_refused_before_mutation(
     tmp_path: Path,
 ) -> None:
     """An old binding marker cannot authorize a current-format artifact tree."""
@@ -117,7 +117,7 @@ def test_pre_cutover_artifact_binding_version_is_refused_before_mutation(
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=r"unsupported pre-cutover.*format 2.*fresh artifact root",
+        match=r"unsupported PhaseSweep format 2.*fresh artifact root",
     ):
         run_experiment(experiment)
 
@@ -149,7 +149,7 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
 
     with pytest.raises(
         StudySchemaMismatchError,
-        match=r"old_experiment::removed_phase.*fresh local storage ledger.*0\.3\.1",
+        match=r"old_experiment::removed_phase.*fresh local storage ledger",
     ):
         run_experiment(experiment)
 
@@ -163,7 +163,7 @@ def test_old_populated_ledger_is_refused_with_a_fresh_output_root(
 
 @pytest.mark.parametrize("leftover_study", ["t::retired", "other_experiment::phase"])
 @pytest.mark.integration
-def test_bound_root_status_refuses_empty_stamped_legacy_studies(
+def test_bound_root_status_refuses_empty_stamped_unsupported_studies(
     tmp_path: Path, leftover_study: str
 ) -> None:
     """Status rejects empty retired or foreign studies with an old format stamp."""
@@ -173,7 +173,7 @@ def test_bound_root_status_refuses_empty_stamped_legacy_studies(
     leftover = optuna.create_study(study_name=leftover_study, storage=_resolve_storage(storage))
     leftover.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION - 1)
 
-    with pytest.raises(StudySchemaMismatchError, match="pre-cutover or unsupported"):
+    with pytest.raises(StudySchemaMismatchError, match="unsupported PhaseSweep study state"):
         read_status(experiment)
 
 
@@ -352,15 +352,15 @@ def test_claim_ledger_writes_tree_binding_before_claiming_studies(
         assert study.user_attrs[ARTIFACT_ROOT_ATTR] == reclaimed.artifact_root
 
 
-def _bound_tree_with_legacy_study(tmp_path: Path, *, legacy: bool = True) -> Experiment:
-    """Build a bound current-format tree whose ledger may also hold pre-cutover state.
+def _bound_tree_with_foreign_study(tmp_path: Path, *, foreign: bool = True) -> Experiment:
+    """Build a bound current-format tree whose ledger may also hold unsupported state.
 
     The phase study is current-format and root-claimed, so every refusal these
     tests observe comes from the ledger-wide format scan and its handling, not
     from the phase study itself.
 
     :param Path tmp_path: Test-owned directory for the tree and the ledger.
-    :param bool legacy: Add a populated, unmarked ``legacy::p`` study, which
+    :param bool foreign: Add a populated, unmarked ``legacy::p`` study, which
         only a completed format scan can see.
     :return Experiment: Experiment whose tree is bound to that ledger.
     """
@@ -370,9 +370,11 @@ def _bound_tree_with_legacy_study(tmp_path: Path, *, legacy: bool = True) -> Exp
     study.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment).resolve()))
     mark_current_format(experiment, study)
-    if legacy:
-        old = optuna.create_study(study_name="legacy::p", storage=_resolve_storage(storage))
-        old.add_trial(optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE))
+    if foreign:
+        other = optuna.create_study(study_name="legacy::p", storage=_resolve_storage(storage))
+        other.add_trial(
+            optuna.trial.create_trial(value=0.5, state=optuna.trial.TrialState.COMPLETE)
+        )
     return experiment
 
 
@@ -408,7 +410,7 @@ def test_inconclusive_scan_on_a_bound_tree_never_reports_unchecked_counts(
     completed scan can tell. Counts read around that gap would present the
     ledger as current-format when nothing verified it.
     """
-    experiment = _bound_tree_with_legacy_study(tmp_path)
+    experiment = _bound_tree_with_foreign_study(tmp_path)
     with pytest.raises(StudySchemaMismatchError, match="'legacy::p'"):
         read_status(experiment)
     _scan_fails(monkeypatch, times=1)
@@ -430,7 +432,7 @@ def test_unverified_handle_records_the_gap_and_opens_nothing_live(
     unverified handle must not open one: it would read and then reap studies
     in a ledger whose format nothing checked.
     """
-    experiment = _bound_tree_with_legacy_study(tmp_path)
+    experiment = _bound_tree_with_foreign_study(tmp_path)
     _scan_fails(monkeypatch, times=1)
 
     ledger = validate_ledger(experiment)
@@ -448,11 +450,11 @@ def test_claim_rescans_an_unverified_ledger_before_discovery(
     """A run never proceeds on a ledger whose format scan did not complete.
 
     Claiming mutates the tree and studies, so the scan validation tolerated has
-    to complete before discovery: the pre-cutover study then refuses the run,
+    to complete before discovery: the unsupported study then refuses the run,
     and a second unreadable scan stops it as unavailable storage. Nothing is
     written either way.
     """
-    experiment = _bound_tree_with_legacy_study(tmp_path)
+    experiment = _bound_tree_with_foreign_study(tmp_path)
     ledger_file = tmp_path / "current.journal"
     before = ledger_file.read_bytes()
     scans = _scan_fails(monkeypatch, times=1 if second_scan == "completes" else 2)
@@ -473,7 +475,7 @@ def test_verified_handle_reads_and_claims_after_one_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A completed scan is trusted as before: counts are real and claim scans no more."""
-    experiment = _bound_tree_with_legacy_study(tmp_path, legacy=False)
+    experiment = _bound_tree_with_foreign_study(tmp_path, foreign=False)
     scans = _scan_fails(monkeypatch, times=0)
 
     ledger = validate_ledger(experiment)

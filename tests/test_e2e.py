@@ -11,12 +11,19 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from unittest.mock import patch
 
+import optuna
 import pytest
 import yaml
 
 from phasesweep import load_experiment, run_experiment
-from tests.conftest import copy_fake_train
+from phasesweep.config import IntParam, Phase, Sampler
+from phasesweep.engine.fingerprints import _phase_fingerprint
+from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.phase import GpuPool
+from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR
+from tests.conftest import copy_fake_train, make_experiment, write_constant_trainer
 
 # A full three-phase sweep against the real fake trainer: every test here spawns
 # trainer subprocesses and runs for seconds, not milliseconds.
@@ -101,3 +108,66 @@ def test_full_sweep_and_replay(tmp_path):
     assert winners2["regularization"].params == winners["regularization"].params
     # Reloaded winners preserve the frozen provenance record verbatim.
     assert winners2["depth"].objective_provenance == provenance
+
+
+def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_study(
+    tmp_path: Path,
+) -> None:
+    """An upstream top-up is not blocked by a fingerprinted child with no trials.
+
+    ``_resume_phase`` stamps a child study's fingerprint before
+    ``GpuPool.create``, so a child that fails GPU preflight leaves a
+    fingerprinted study with zero trials. No child result exists whose meaning
+    could change, so the parent top-up completes and the child binds to the
+    new inherited configuration.
+    """
+    trainer = write_constant_trainer(tmp_path)
+    parent = Phase(
+        name="parent",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        gpu_policy="none",
+        search_space={"x": IntParam(type="int", low=0, high=9)},
+    )
+    child = Phase(
+        name="child",
+        inherits=["parent"],
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        gpu_policy="none",
+        search_space={},
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[parent, child])
+    storage = _resolve_storage(experiment.resolved_storage)
+    real_create = GpuPool.create
+    calls = 0
+
+    def fail_child_once(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected child GPU preflight failure")
+        return real_create(**kwargs)
+
+    with (
+        patch("phasesweep.engine.phase.GpuPool.create", side_effect=fail_child_once),
+        pytest.raises(RuntimeError, match="injected child GPU preflight failure"),
+    ):
+        run_experiment(experiment)
+
+    child_study = optuna.load_study(study_name="t::child", storage=storage)
+    assert child_study.get_trials(deepcopy=False) == []
+    assert isinstance(child_study.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
+
+    # No GpuPool patch here: the parent top-up must succeed outright now.
+    topped_up = experiment.model_copy(
+        update={"phases": [parent.model_copy(update={"n_trials": 2}), child]}
+    )
+    winners = run_experiment(topped_up)
+
+    parent_study = optuna.load_study(study_name="t::parent", storage=storage)
+    child_study_after = optuna.load_study(study_name="t::child", storage=storage)
+    assert len(parent_study.trials) == 2
+    assert child_study_after.get_trials(deepcopy=False)
+    expected_fingerprint = _phase_fingerprint(topped_up, child, {"parent": winners["parent"]})
+    assert child_study_after.user_attrs[PHASE_FINGERPRINT_ATTR] == expected_fingerprint

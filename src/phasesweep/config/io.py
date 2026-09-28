@@ -144,10 +144,6 @@ def load_experiment_bytes(data: bytes, source: str | Path = "<bytes>") -> Experi
     except UnicodeDecodeError as exc:
         raise ConfigError(f"{source}: config must be UTF-8 text: {exc}") from exc
     parsed = _load_yaml_mapping_from_text(text, source)
-    if "suite" in parsed:
-        raise ConfigError(
-            f"{source}: suite configs are no longer supported. Define one complete experiment YAML."
-        )
     return Experiment.model_validate(parsed)
 
 
@@ -168,8 +164,8 @@ def load_experiment(path: str | Path) -> Experiment:
 
     Raises:
         OSError: ``path`` cannot be read.
-        ConfigError: YAML parse error, top-level is not a mapping, duplicate
-            mapping keys, or the file is a removed suite config.
+        ConfigError: YAML parse error, top-level is not a mapping, or duplicate
+            mapping keys.
         pydantic.ValidationError: Any Pydantic / cross-phase validation failure.
 
     """

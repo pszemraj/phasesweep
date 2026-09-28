@@ -22,6 +22,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.read import (
     PhaseWinnerView,
+    read_result,
     read_status,
     read_winner,
     read_winners,
@@ -63,6 +64,7 @@ __all__ = [
     "Winner",
     "WinnerIntegrityError",
     "experiment_status",
+    "read_result",
     "read_status",
     "read_winner",
     "read_winners",

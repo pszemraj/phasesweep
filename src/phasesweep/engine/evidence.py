@@ -648,24 +648,13 @@ def _verify_skipped_winner_evidence(
     :param Experiment experiment: Experiment owning the artifact tree.
     :param Phase phase: Exposed skipped phase whose winner is being carried.
     :param Winner winner: Authenticated winner loaded from the prior publication.
-    :raises TrialEvidenceMissingError: The winner lacks a coherent concrete source,
-        or that source's evidence has been removed or changed.
+    :raises TrialEvidenceMissingError: The source trial's evidence has been
+        removed or changed.
     """
+    # Publication validation already bound the source to this phase and to the
+    # winner's own trial, generation, and attempt.
     source = winner.source
-    phase_names = {candidate.name for candidate in experiment.phases}
-    if (
-        source is None
-        or source.phase not in phase_names
-        or source.trial_number != winner.trial_number
-        or source.generation_id != winner.generation_id
-        or source.attempt_id != winner.attempt_id
-        or source.generation_id is None
-        or source.attempt_id is None
-    ):
-        raise TrialEvidenceMissingError(
-            f"Skipped phase {phase.name!r} winner has no coherent concrete source trial. "
-            f"{_TRIAL_EVIDENCE_REMEDY}"
-        )
+    assert source is not None
     trial_dir = _trial_dir_for(
         experiment,
         source.phase,

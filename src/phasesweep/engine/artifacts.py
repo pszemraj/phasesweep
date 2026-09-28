@@ -15,14 +15,13 @@ import yaml
 
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
-import phasesweep.engine.publication as publication_ops
-import phasesweep.engine.publication_validation as publication_validation_ops
 from phasesweep.config import Experiment, Phase
 from phasesweep.engine.errors import (
     OperatorAction,
     StudyFingerprintMismatchError,
     WinnerIntegrityError,
 )
+from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import (
     Winner,
     _parse_winner_source,
@@ -162,9 +161,8 @@ def _save_winner(
     placeholder winners (dry-run skip) are never saved.
 
     ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
-    produced the winning trial (review v0.5.18 / finding F3). Both are
-    ``None`` on winners selected from trials that predate the record; neither
-    ever carries ambient variable values.
+    produced the winning trial (review v0.5.18 / finding F3). Neither ever
+    carries ambient variable values.
 
     Args:
         experiment: Parsed experiment config; supplies the metric name used
@@ -218,8 +216,7 @@ def _winner_source_payload(winner: Winner) -> dict[str, Any]:
         keys.
     """
     source = winner.source
-    if source is None:
-        raise WinnerIntegrityError("A persisted winner requires explicit source provenance.")
+    assert source is not None, "only the never-persisted dry-run placeholder has no source"
     return {
         "kind": source.kind,
         "phase": source.phase,
@@ -238,22 +235,19 @@ _ENVIRONMENT_DRIFT_WARNED: set[tuple[str, str, str]] = set()
 def _warn_environment_drift(
     experiment: Experiment,
     phase_name: str,
-    stored_digest: str | None,
+    stored_digest: str,
 ) -> None:
     """Warn once when an inherited winner was produced under another environment.
 
     Persistent-study preflight separately refuses a top-up across semantic
     environment cohorts. ``--from-phase`` deliberately skips this phase, so no
     trial is allocated into that study; this warning tells the operator that a
-    later phase is building on a winner from another cohort. Winners without a
-    recorded digest predate the record and are left alone.
+    later phase is building on a winner from another cohort.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
     :param str phase_name: Phase whose winner was loaded, used in the warn-once key.
-    :param str | None stored_digest: Digest recorded on the loaded winner.
+    :param str stored_digest: Digest recorded on the loaded winner.
     """
-    if stored_digest is None:
-        return
     # Deferred: ``engine.trial`` pulls in the evidence/W&B stack, which the
     # read-only paths that import this module never need.
     from phasesweep.engine.trial import _environment_identity
@@ -286,9 +280,9 @@ def _load_winner(
     phase: Phase,
     inherited_winners: dict[str, Winner],
     *,
-    published_generation_id: str | None,
+    publication: ValidatedPublication | None,
 ) -> Winner:
-    """Load a phase winner from disk and verify it matches the *current* config.
+    """Load a published phase winner and verify it matches the *current* config.
 
     ``--from-phase`` skips earlier phases by reading their persisted winners.
     Without verification, editing a parent phase's YAML between runs leaves
@@ -296,85 +290,51 @@ def _load_winner(
     parent config — a correctness bug, not just a performance one.
 
     We re-compute the fingerprint of the current parent ``phase`` against the
-    currently-resolved ``inherited_winners`` and refuse the load if either
-    (a) the stored winner has no fingerprint, or
-    or (b) the fingerprints disagree (review v0.5.6 / blocker 3).
+    currently-resolved ``inherited_winners`` and refuse the load if the
+    fingerprints disagree (review v0.5.6 / blocker 3).
 
     A recorded semantic environment digest that disagrees with this process is
     a warning on this explicit skipped-phase path; ordinary study top-ups are
-    refused before allocation (see :func:`_warn_environment_drift`). Winners
-    written before those fields existed load with it set to ``None``.
+    refused before allocation (see :func:`_warn_environment_drift`).
+
+    The winner is decoded from the bytes publication validation read, never
+    reread from disk, so what a resume builds on is exactly what was
+    validated. That validation already proved the winner's phase, generation
+    and attempt ids, fingerprint format, source, and completion shape; this
+    function checks only what depends on the current config.
 
     Args:
         experiment: Parsed experiment config.
         phase: The phase whose winner is being loaded.
         inherited_winners: Winners loaded for phases earlier in the chain;
             contribute to the recomputed fingerprint.
-        published_generation_id: Last-success generation id the caller
-            resolved with ``raise_on_manifest_error=True``, so its whole
-            manifest is already validated; ``None`` when nothing is published.
-            A caller loading several phases resolves it once.
+        publication: The last-success publication the caller resolved with
+            ``raise_on_manifest_error=True``; ``None`` when nothing is
+            published. A caller loading several phases resolves it once.
 
     Returns:
         The reconstructed :class:`Winner` for ``phase``.
 
     Raises:
-        FileNotFoundError: ``winner.yaml`` does not exist for the phase.
-        WinnerIntegrityError: The file is unreadable, incomplete, ambiguously
-            scoped, or incompatible with the current partial-result policy.
+        FileNotFoundError: The publication holds no winner for the phase.
+        WinnerIntegrityError: The winner is incomplete or incompatible with
+            the current partial-result policy.
         StudyFingerprintMismatchError: The stored fingerprint disagrees with
             the freshly computed one.
 
     """
-    path = publication_ops._published_winner_path_for(
-        experiment, published_generation_id, phase.name
-    )
-    if path is None:
+    if publication is None:
         raise FileNotFoundError(
             f"Winner file missing for phase {phase.name!r}: no generation has completed."
         )
-    try:
-        content = publication_validation_ops._read_unlinked_bytes(
-            path,
-            root=(
-                path_ops._generations_dir(experiment)
-                if published_generation_id is not None
-                else path_ops._experiment_dir(experiment)
-            ),
-        )
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}") from exc
-    except OSError as exc:
-        raise WinnerIntegrityError(
-            f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
-        ) from exc
-    try:
-        data = yaml.safe_load(content)
-    except yaml.YAMLError as exc:
-        raise WinnerIntegrityError(
-            f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
-        ) from exc
-    if not isinstance(data, dict):
-        raise WinnerIntegrityError(
-            f"Winner file {path} is invalid or incomplete for skipped phase "
-            f"{phase.name!r}: top level must be a mapping."
-        )
+    path = path_ops._generation_winner_path(experiment, publication.generation_id, phase.name)
+    validated = publication.winners.get(phase.name)
+    if validated is None:
+        raise FileNotFoundError(f"Winner file missing for phase {phase.name!r}: {path}")
+    data = validated.payload
 
     current_fp = fingerprint_ops._phase_fingerprint(experiment, phase, inherited_winners)
-    stored_fp = data.get("phase_fingerprint")
-
-    if stored_fp is None:
-        raise WinnerIntegrityError(
-            f"Winner file {path} has no phase_fingerprint. Refusing to use it "
-            f"for --from-phase because phasesweep cannot prove it matches the "
-            f"current config for skipped phase {phase.name!r}. Re-run the "
-            f"phase, or — if you know the config is unchanged — delete the "
-            f"file and re-run to regenerate it with a fingerprint."
-        )
-
-    if not isinstance(stored_fp, str):
-        raise WinnerIntegrityError(f"Winner file {path} has an invalid phase_fingerprint.")
-
+    stored_fp = data["phase_fingerprint"]
     if stored_fp != current_fp:
         raise StudyFingerprintMismatchError(
             f"Winner file {path} was produced by a different phase config "
@@ -384,12 +344,7 @@ def _load_winner(
             action=OperatorAction.FIX_CONFIG,
         )
 
-    completion = data.get("completion")
-    if not isinstance(completion, dict):
-        raise WinnerIntegrityError(
-            f"Winner file {path} is invalid or incomplete for skipped phase "
-            f"{phase.name!r}: missing mapping field 'completion'."
-        )
+    completion = data["completion"]
     if completion.get("incomplete") is True and not phase.allow_incomplete_on_timeout:
         raise WinnerIntegrityError(
             f"Winner file {path} records an incomplete phase result. Refusing to "
@@ -397,31 +352,12 @@ def _load_winner(
             "sets allow_incomplete_on_timeout: true.",
             action=OperatorAction.FIX_CONFIG,
         )
-    generation_id = data.get("generation_id")
-    attempt_id = data.get("attempt_id")
-    if not isinstance(generation_id, str) or not generation_id:
-        raise WinnerIntegrityError(
-            f"Winner file {path} has no valid generation_id; refusing unscoped evidence."
-        )
-    if not isinstance(attempt_id, str) or not attempt_id:
-        raise WinnerIntegrityError(
-            f"Winner file {path} has no valid attempt_id; refusing unscoped evidence."
-        )
-    source_data = data.get("winner_source")
-    if "promotion" in data:
-        raise WinnerIntegrityError(f"Winner file {path} contains removed promotion data.")
-
-    stored_env_digest = data.get("trainer_env_digest")
-    if not isinstance(stored_env_digest, str) or not stored_env_digest:
-        stored_env_digest = None
-    stored_inherit_env = data.get("trainer_inherit_env")
-    if not isinstance(stored_inherit_env, str | list):
-        stored_inherit_env = None
-    _warn_environment_drift(experiment, phase.name, stored_env_digest)
 
     try:
-        source = _parse_winner_source(source_data, expected_phase=phase.name)
-        return Winner(
+        source = _parse_winner_source(data["winner_source"], expected_phase=phase.name)
+        stored_env_digest = data["trainer_env_digest"]
+        stored_inherit_env = data["trainer_inherit_env"]
+        winner = Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),
             effective_overrides=dict(data["effective_overrides"]),
@@ -429,18 +365,12 @@ def _load_winner(
             constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
-            phase_fingerprint=str(stored_fp),
-            generation_id=generation_id,
-            attempt_id=attempt_id,
+            phase_fingerprint=stored_fp,
+            generation_id=data["generation_id"],
+            attempt_id=data["attempt_id"],
             source=source,
-            objective_provenance=(
-                dict(data["objective_provenance"])
-                if isinstance(data.get("objective_provenance"), dict)
-                else None
-            ),
-            trainer_input=(
-                dict(data["trainer_input"]) if isinstance(data.get("trainer_input"), dict) else None
-            ),
+            objective_provenance=dict(data["objective_provenance"]),
+            trainer_input=dict(data["trainer_input"]),
             trainer_env_digest=stored_env_digest,
             trainer_inherit_env=(
                 [str(name) for name in stored_inherit_env]
@@ -452,3 +382,5 @@ def _load_winner(
         raise WinnerIntegrityError(
             f"Winner file {path} is invalid or incomplete for skipped phase {phase.name!r}: {exc}"
         ) from exc
+    _warn_environment_drift(experiment, phase.name, stored_env_digest)
+    return winner

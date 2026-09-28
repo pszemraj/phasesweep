@@ -31,16 +31,15 @@ from phasesweep.engine import PublishedStudyMissingError, read_status, read_winn
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
+    _generation_record_path,
     _generation_summary_path,
     _generation_winner_path,
+    _last_successful_generation_path,
 )
-from phasesweep.engine.publication import (
-    _last_successful_generation_id,
-    _resolve_publication_pointer,
-)
+from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
 from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
-from tests.ledger_fixtures import ledger_file, materialize, tree_snapshot
+from tests.ledger_fixtures import ledger_file, materialize, published_generation_id, tree_snapshot
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -526,7 +525,7 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
         n_trials=3,
     )
     run_experiment(experiment)
-    published = _last_successful_generation_id(experiment)
+    published = published_generation_id(experiment)
     assert published is not None
     generation_before = _generation_path(experiment).read_bytes()
     generation_dirs_before = {
@@ -566,7 +565,7 @@ def test_published_phase_rejects_a_restored_partial_ledger(tmp_path: Path) -> No
     )
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
     assert _generation_path(experiment).read_bytes() == generation_before
-    assert _last_successful_generation_id(experiment) == published
+    assert published_generation_id(experiment) == published
     assert {
         path.name for path in (_experiment_dir(experiment) / "generations").iterdir()
     } == generation_dirs_before
@@ -821,14 +820,14 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
 def test_read_winner_rejects_a_winner_source_naming_another_phase(tmp_path: Path) -> None:
     """A winner_source citing another phase reads as absent, not as that phase's winner.
 
-    Reads by explicit ``generation_id`` go straight to
-    ``engine.read._read_winner_path`` without passing through
-    ``publication_validation``, so this proves the phase-agreement check now
-    lives in the permissive reader itself (``_parse_winner_source``), not
-    only in the stricter manifest validator.
+    Reads of a generation that is not the validated publication (here, one
+    whose winner was edited after publishing, so it no longer validates) go
+    through the permissive ``engine.read._read_winner_path``, so this proves
+    the phase-agreement check now lives in the permissive reader itself
+    (``_parse_winner_source``), not only in the stricter manifest validator.
     """
     experiment = _published(tmp_path)
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
 
     winner_path = _generation_winner_path(experiment, generation_id, "p")
@@ -838,6 +837,71 @@ def test_read_winner_rejects_a_winner_source_naming_another_phase(tmp_path: Path
     winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
 
     assert read_winner(experiment, "p", generation_id=generation_id) is None
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(b"\xff", id="invalid-utf8"),
+        pytest.param(b"completed_at: 2026-99-99\n", id="invalid-timestamp"),
+    ],
+)
+@pytest.mark.parametrize("reader", ["winner", "snapshot"])
+def test_pinned_reads_treat_malformed_winner_as_absent(
+    tmp_path: Path, contents: bytes, reader: str
+) -> None:
+    from phasesweep.mcp.snapshots import capture_result_snapshot
+
+    experiment = _published(tmp_path)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    _generation_winner_path(experiment, generation_id, "p").write_bytes(contents)
+
+    if reader == "winner":
+        assert read_winner(experiment, "p", generation_id=generation_id) is None
+    else:
+        snapshot = capture_result_snapshot(experiment, generation_id=generation_id)
+        assert snapshot["winners"] == []
+        assert snapshot["status"]["represented_generation_id"] == generation_id
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(b"\xff", id="invalid-utf8"),
+        pytest.param(b"updated_at: 2026-99-99\n", id="invalid-timestamp"),
+    ],
+)
+@pytest.mark.parametrize(
+    "artifact", ["current_pointer", "last_success_pointer", "summary", "lifecycle"]
+)
+def test_reads_tolerate_malformed_generation_metadata(
+    tmp_path: Path, contents: bytes, artifact: str
+) -> None:
+    from phasesweep.mcp.snapshots import capture_result_snapshot
+
+    experiment = _published(tmp_path)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    paths = {
+        "current_pointer": _generation_path(experiment),
+        "last_success_pointer": _last_successful_generation_path(experiment),
+        "summary": _generation_summary_path(experiment, generation_id),
+        "lifecycle": _generation_record_path(experiment, generation_id),
+    }
+    paths[artifact].write_bytes(contents)
+
+    status = read_status(experiment, generation_id=generation_id)
+    snapshot = capture_result_snapshot(experiment, generation_id=generation_id)
+
+    integrity = "failed" if artifact in {"last_success_pointer", "summary"} else "ok"
+    assert status["publication_integrity"] == integrity
+    assert snapshot["status"]["publication_integrity"] == integrity
+    assert snapshot["status"]["represented_generation_id"] == generation_id
+    assert len(snapshot["winners"]) == 1
+    assert snapshot["winners"][0]["phase"] == "p"
+    if artifact == "current_pointer":
+        assert status["current_generation_id"] is None
 
 
 def test_read_status_reuses_the_pointer_authenticated_summary(

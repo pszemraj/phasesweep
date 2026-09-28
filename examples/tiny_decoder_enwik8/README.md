@@ -55,8 +55,7 @@ The example sweeps only supported trainer controls. The upstream template does n
 ## MCP smoke
 
 For the same two-trial, 10-batch check through MCP, start from [`gpu_smoke.yaml`](gpu_smoke.yaml)
-instead of the full MCP experiment. Following the [runtime
-cutover](../../docs/runtime.md#fresh-state-cutover) and [fresh MCP state
+instead of the full MCP experiment. Following the [fresh MCP state
 requirement](../../docs/mcp.md#fresh-mcp-state), copy it into a new scratch
 directory from the repo root:
 
@@ -109,6 +108,5 @@ Configure your client with the absolute `phasesweep-mcp` executable and this cat
 
 The MCP variant uses scratch `workdir`, storage, and state paths under
 `/tmp/phasesweep-mcp-tiny-decoder-enwik8`; choose a fresh root before the first
-run with this release as described in the [runtime
-cutover](../../docs/runtime.md#fresh-state-cutover) and [fresh MCP
-state](../../docs/mcp.md#fresh-mcp-state) sections.
+run as described in the [fresh MCP state](../../docs/mcp.md#fresh-mcp-state)
+section.

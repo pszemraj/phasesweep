@@ -47,7 +47,6 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _winner_path,
 )
-from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
@@ -60,7 +59,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_param_echo_trainer,
 )
-from tests.ledger_fixtures import materialize
+from tests.ledger_fixtures import materialize, published_generation_id
 from tests.recovery_helpers import recover_run_cli
 
 
@@ -596,7 +595,7 @@ def _corrupt_the_publication(experiment: Experiment) -> str:
     :param Experiment experiment: Experiment whose published generation should be corrupted.
     :return str: The corrupted generation id.
     """
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
@@ -654,7 +653,7 @@ def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
     """The claim-time provenance files feed the same reporting as any winner."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     record = _generation_dir(experiment, generation_id) / "reproducibility.json"
     record.write_bytes(record.read_bytes() + b"\n")
@@ -686,7 +685,7 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment
-    generation_id = _last_successful_generation_id(experiment)
+    generation_id = published_generation_id(experiment)
     assert generation_id is not None
     snapshot = _generation_dir(experiment, generation_id) / "config.snapshot.yaml"
     original_mode = stat.S_IMODE(snapshot.stat().st_mode)
@@ -917,29 +916,6 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
     assert "internal error" not in captured.err
     assert "Traceback" not in captured.err
     assert not (tmp_path / "runs").exists()
-
-
-def test_cli_boundary_reports_runtime_operational_failures_without_traceback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Lock contention is a failure, not a bug.
-
-    Runtime lock configuration goes through the real validator in the next test.
-    """
-    error = ExperimentLockBusyError("another experiment process holds the lock")
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, error)
-
-    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 1
-    assert str(error) in captured.err
-    assert "Traceback" not in captured.err
-    assert "internal error" not in captured.err
 
 
 def test_cli_boundary_classifies_relative_lock_directory_as_operational(

@@ -126,7 +126,7 @@ def _validate_safe_name(kind: str, value: str) -> str:
 _OVERRIDE_KEY_SEGMENT = re.compile(r"^[A-Za-z0-9_\-]+$")
 
 
-def _validate_override_key(key: object, *, label: str) -> None:
+def _validate_override_key(key: str, *, label: str) -> None:
     """Reject override keys that would render to ambiguous shell arguments.
 
     Args:
@@ -136,15 +136,11 @@ def _validate_override_key(key: object, *, label: str) -> None:
             (e.g. ``"phase 'lr' search_space"``).
 
     Raises:
-        ValueError: ``key`` is not a string; empty; has leading/trailing or
-            embedded whitespace; or contains an empty dotted segment or a
-            segment with disallowed characters.
+        ValueError: ``key`` is empty; has leading/trailing or embedded
+            whitespace; or contains an empty dotted segment or a segment with
+            disallowed characters.
 
     """
-    if not isinstance(key, str):
-        raise ValueError(
-            f"{label}: override key must be a string, got {type(key).__name__}: {key!r}."
-        )
     if not key:
         raise ValueError(f"{label}: override key cannot be empty.")
     if key != key.strip():

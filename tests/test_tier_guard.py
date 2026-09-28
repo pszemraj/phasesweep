@@ -292,7 +292,7 @@ def test_slow_report_lists_unmarked_call_phases_at_or_over_the_threshold():
         _report("t.py::test_edge", duration=SLOW_CALL_SECONDS),
         _report("t.py::test_slow", duration=SLOW_CALL_SECONDS + 1.5),
         _report("t.py::test_marked", duration=9.0, markers=("integration",)),
-        _report("t.py::test_hardware", duration=9.0, markers=("hardware",)),
+        _report("t.py::test_live", duration=9.0, markers=("live",)),
         _report("t.py::test_slow_setup", duration=9.0, when="setup"),
     ]
 
@@ -305,11 +305,11 @@ def test_slow_report_lists_unmarked_call_phases_at_or_over_the_threshold():
 @pytest.mark.parametrize(
     ("markexpr", "excluded"),
     [
-        ("not hardware and not integration", True),
-        ("not (integration or hardware)", True),
+        ("not live and not integration", True),
+        ("not (integration or live)", True),
         ("unit", True),
-        ("not hardware", False),
-        ("integration and not hardware", False),
+        ("not live", False),
+        ("integration and not live", False),
         ("", False),
     ],
 )

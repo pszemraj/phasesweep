@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Any, Literal, NamedTuple, TypedDict
 
 import optuna
 
@@ -43,11 +43,9 @@ class _PhasePolicyState:
 
     max_sequence: int
     consecutive_failures: int
-    recovered_abort_sequence: int | None
-    fatal_trial_number: int | None
-    fatal_sequence: int | None
-    fatal_cause: str | None
-    fatal_policy: str | None
+    abort: dict[str, Any] | None
+    """The first abort recorded after the recovery boundary, if any. A later
+    outcome resets the streak but never this recorded decision."""
 
 
 def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
@@ -72,8 +70,10 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
 def _consecutive_failure_threshold_tripped(consecutive_failures: int, phase: Phase) -> bool:
     """Return whether a phase's consecutive-failure abort threshold is met.
 
-    Shared by the live per-outcome check and the startup replay check so
-    both compare the same count against the same threshold.
+    Shared by the live per-outcome check and the check before a resumed
+    phase launches new work, so both compare the same count against the same
+    threshold. Replay never applies it to recorded outcomes: the abort each
+    outcome tripped is recorded with that outcome.
 
     :param int consecutive_failures: Current consecutive-failure count.
     :param Phase phase: Phase config supplying ``max_consecutive_failures``.
@@ -182,6 +182,48 @@ def _phase_policy_schema_error(study: optuna.Study, detail: str) -> StudySchemaM
     )
 
 
+class _RecoveryRecord(NamedTuple):
+    """A validated ``PHASE_RECOVERY_ATTR`` record."""
+
+    start_after_sequence: int
+    trial_target: int
+
+
+def _load_recovery_record(study: optuna.Study) -> _RecoveryRecord | None:
+    """Validate the study's recovery record.
+
+    :param optuna.Study study: Study whose ``PHASE_RECOVERY_ATTR`` is read.
+    :raises StudySchemaMismatchError: The record is malformed.
+    :return _RecoveryRecord | None: The boundary and accepted target it
+        records, or ``None`` when no abort was ever recovered.
+    """
+    recovery = study.user_attrs.get(PHASE_RECOVERY_ATTR)
+    if recovery is None:
+        return None
+    if not isinstance(recovery, dict):
+        raise _phase_policy_schema_error(
+            study, f"{PHASE_RECOVERY_ATTR!r} must be an object, got {recovery!r}"
+        )
+    schema_version = recovery.get("schema_version")
+    start_after_sequence = recovery.get("start_after_sequence")
+    recovered_abort_sequence = recovery.get("recovered_abort_sequence")
+    trial_target = recovery.get("trial_target")
+    if (
+        schema_version != PHASE_RECOVERY_SCHEMA_VERSION
+        or type(start_after_sequence) is not int
+        or start_after_sequence < 1
+        or type(recovered_abort_sequence) is not int
+        or recovered_abort_sequence < 1
+        or recovered_abort_sequence > start_after_sequence
+        or type(trial_target) is not int
+        or trial_target < 1
+    ):
+        raise _phase_policy_schema_error(
+            study, f"{PHASE_RECOVERY_ATTR!r} has malformed fields: {recovery!r}"
+        )
+    return _RecoveryRecord(start_after_sequence, trial_target)
+
+
 def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
     """Validate and reconstruct the durable consecutive-failure state.
 
@@ -189,42 +231,16 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         per-trial outcome attrs are read and validated.
     :return _PhasePolicyState: Reconstructed state: the highest recorded
         outcome sequence, the consecutive-failure count since the last
-        recovery boundary, the recovered abort sequence (if any), and the
-        first fatal trial's number/sequence/cause (if any).
+        recovery boundary, and the first abort recorded after it (if any).
     :raises StudySchemaMismatchError: ``PHASE_RECOVERY_ATTR`` or a terminal
         trial's outcome attr is malformed, two trials share a completion
         sequence, or the recovery boundary exceeds the largest recorded
         sequence.
     """
-    recovery = study.user_attrs.get(PHASE_RECOVERY_ATTR)
-    recovery_boundary = 0
-    recovered_abort_sequence: int | None = None
-    if recovery is not None:
-        if not isinstance(recovery, dict):
-            raise _phase_policy_schema_error(
-                study, f"{PHASE_RECOVERY_ATTR!r} must be an object, got {recovery!r}"
-            )
-        schema_version = recovery.get("schema_version")
-        raw_recovery_boundary = recovery.get("start_after_sequence")
-        raw_recovered_abort_sequence = recovery.get("recovered_abort_sequence")
-        recovery_target = recovery.get("trial_target")
-        if (
-            schema_version != PHASE_RECOVERY_SCHEMA_VERSION
-            or type(raw_recovery_boundary) is not int
-            or raw_recovery_boundary < 1
-            or type(raw_recovered_abort_sequence) is not int
-            or raw_recovered_abort_sequence < 1
-            or raw_recovered_abort_sequence > raw_recovery_boundary
-            or type(recovery_target) is not int
-            or recovery_target < 1
-        ):
-            raise _phase_policy_schema_error(
-                study, f"{PHASE_RECOVERY_ATTR!r} has malformed fields: {recovery!r}"
-            )
-        recovery_boundary = raw_recovery_boundary
-        recovered_abort_sequence = raw_recovered_abort_sequence
+    recovery = _load_recovery_record(study)
+    recovery_boundary = 0 if recovery is None else recovery.start_after_sequence
 
-    events: list[tuple[int, int, str, str | None, str | None]] = []
+    events: list[tuple[int, str, dict[str, Any] | None]] = []
     seen_sequences: dict[int, int] = {}
     for trial in study.get_trials(deepcopy=False):
         raw = trial.user_attrs.get(TRIAL_OUTCOME_ATTR)
@@ -238,9 +254,6 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         if parsed is None:
             continue
         sequence = parsed.sequence
-        outcome = parsed.outcome
-        cause = parsed.cause
-        policy = parsed.policy
         other_trial = seen_sequences.get(sequence)
         if other_trial is not None:
             raise _phase_policy_schema_error(
@@ -248,9 +261,9 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
                 f"trials {other_trial} and {trial.number} both use completion sequence {sequence}",
             )
         seen_sequences[sequence] = trial.number
-        events.append((sequence, trial.number, outcome, cause, policy))
+        events.append((sequence, parsed.outcome, parsed.abort))
 
-    events.sort()
+    events.sort(key=lambda event: event[0])
     max_sequence = events[-1][0] if events else 0
     if recovery_boundary > max_sequence:
         raise _phase_policy_schema_error(
@@ -260,28 +273,52 @@ def _load_phase_policy_state(study: optuna.Study) -> _PhasePolicyState:
         )
 
     consecutive_failures = 0
-    fatal_trial_number: int | None = None
-    fatal_sequence: int | None = None
-    fatal_cause: str | None = None
-    fatal_policy: str | None = None
-    for sequence, trial_number, outcome, cause, policy in events:
+    abort: dict[str, Any] | None = None
+    for sequence, outcome, recorded_abort in events:
         if sequence <= recovery_boundary:
             continue
         consecutive_failures = _next_consecutive_failures(consecutive_failures, outcome)
-        if outcome == "fatal" and fatal_trial_number is None:
-            fatal_trial_number = trial_number
-            fatal_sequence = sequence
-            fatal_cause = cause
-            fatal_policy = policy
+        if abort is None:
+            abort = recorded_abort
 
     return _PhasePolicyState(
         max_sequence=max_sequence,
         consecutive_failures=consecutive_failures,
-        recovered_abort_sequence=recovered_abort_sequence,
-        fatal_trial_number=fatal_trial_number,
-        fatal_sequence=fatal_sequence,
-        fatal_cause=fatal_cause,
-        fatal_policy=fatal_policy,
+        abort=abort,
+    )
+
+
+def _record_recovery_boundary(
+    study: optuna.Study,
+    phase: Phase,
+    recovered_abort_sequence: int,
+) -> None:
+    """Durably acknowledge one phase abort as recovered.
+
+    Outcomes recorded up to the study's current largest sequence stop counting
+    toward the consecutive-failure streak that :func:`_load_phase_policy_state`
+    replays, and an abort recorded with any of them stops being the phase's
+    active abort. The record names the consumed abort for the audit trail.
+    It also accepts ``phase.n_trials`` as the trial target
+    (:func:`_accepted_trial_target`), so the raised target that authorizes a
+    recovery and the recovery itself become durable in this one write.
+
+    :param optuna.Study study: Study whose recovery boundary is written.
+    :param Phase phase: Phase whose ``n_trials`` the recovery runs toward.
+    :param int recovered_abort_sequence: Completion sequence of the abort
+        being acknowledged.
+    :raises StudySchemaMismatchError: The study's durable failure-policy state
+        is malformed.
+    """
+    current = _load_phase_policy_state(study)
+    study.set_user_attr(
+        PHASE_RECOVERY_ATTR,
+        {
+            "schema_version": PHASE_RECOVERY_SCHEMA_VERSION,
+            "recovered_abort_sequence": recovered_abort_sequence,
+            "start_after_sequence": current.max_sequence,
+            "trial_target": phase.n_trials,
+        },
     )
 
 
@@ -308,9 +345,7 @@ def _validate_study_schema(study: optuna.Study) -> None:
     raise StudySchemaMismatchError(
         f"Study {study.study_name!r} uses unsupported phasesweep storage schema {detail}; "
         f"current schema is {STUDY_SCHEMA_VERSION}. Affected trial numbers: {trial_numbers}. "
-        "Use a fresh artifact root and fresh local storage with this PhaseSweep release, "
-        "or use the preserved PhaseSweep 0.3.1 environment to operate existing state.",
-        action=OperatorAction.USE_PRIOR_RELEASE,
+        "Use a fresh artifact root and fresh local storage with this PhaseSweep release.",
     )
 
 
@@ -347,11 +382,19 @@ def _validate_study_direction(
 def _accepted_trial_target(study: optuna.Study) -> int:
     """Return the durable target for a current-format study.
 
+    A recovery record accepts its target in the same write that retires an
+    abort (:func:`_record_recovery_boundary`), and that write lands before
+    ``TRIAL_TARGET_ATTR`` catches up. Reading both keeps a crash between the
+    two from dropping the recovery's authorization or letting the old target
+    run the recovered phase.
+
     :param optuna.Study study: Study whose accepted trial target is read.
-    :return int: The stored ``phasesweep_trial_target`` user attr, or zero for
-        a newly initialized empty study.
+    :return int: The larger of the stored ``phasesweep_trial_target`` user
+        attr and the recovery record's target, or zero for a newly initialized
+        empty study.
     :raises StudySchemaMismatchError: The stored target is not a positive int,
-        or is lower than the number of already-finished trials.
+        is lower than the number of already-finished trials, or the recovery
+        record is malformed.
     """
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     stored = study.user_attrs.get(TRIAL_TARGET_ATTR)
@@ -360,9 +403,7 @@ def _accepted_trial_target(study: optuna.Study) -> int:
             return 0
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} has trial state but no {TRIAL_TARGET_ATTR!r}. "
-            "Use a fresh local ledger and artifact root, or use the preserved PhaseSweep "
-            "0.3.1 environment to operate the existing state.",
-            action=OperatorAction.USE_PRIOR_RELEASE,
+            "Use a fresh local ledger and artifact root.",
         )
     if type(stored) is not int or stored < 1 or finished > stored:
         raise StudySchemaMismatchError(
@@ -370,7 +411,8 @@ def _accepted_trial_target(study: optuna.Study) -> int:
             f"for {finished} terminal trial(s). Use a new experiment name, or archive/delete "
             "the inconsistent study before running again."
         )
-    return stored
+    recovery = _load_recovery_record(study)
+    return stored if recovery is None else max(stored, recovery.trial_target)
 
 
 def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
@@ -594,9 +636,7 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} contains populated trial(s) without a "
             f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
-            "which environment cohort owns those results. Use a new experiment name, or "
-            "use the preserved PhaseSweep 0.3.1 environment to operate the existing state.",
-            action=OperatorAction.USE_PRIOR_RELEASE,
+            "which environment cohort owns those results. Use a new experiment name.",
         )
     if recorded != {current_digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))

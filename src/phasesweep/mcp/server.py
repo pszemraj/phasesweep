@@ -151,8 +151,9 @@ ResultContext = Annotated[
             "recorded when it ran, so they describe the numbers as produced even if the "
             "config has since been edited. 'current_config': the represented result "
             "recorded no semantics of its own - nothing has published yet, or the "
-            "publication predates result manifests - so the currently loaded config "
-            "describes it. Under 'represented_generation', objective_evidence still "
+            "represented generation's summary is absent or records another summary "
+            "schema version - so the currently loaded config describes it. Under "
+            "'represented_generation', objective_evidence still "
             "falls back to the current extractor's assurance when the recorded summary "
             "carries none: treat evidence flags as unproven for such a result."
         )
@@ -348,7 +349,7 @@ class PhaseStatusPayload(_ToolPayload):
             "trial_data_available is false, inspection failed: a run can report "
             "cleanup_uncertain and require operator "
             "recovery before further MCP launches. Null means availability was not checked, "
-            "including older snapshots and pre-generation placeholders."
+            "including pre-generation placeholders."
         )
     )
     trial_data_available: bool = Field(

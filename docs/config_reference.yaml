@@ -222,9 +222,3 @@
 # type: "sha256"
 # path: str (trial-relative file; required)
 # sha256: str (required; 64 hexadecimal characters)
-
-# FORMAT CUTOVER
-# This breaking release accepts only fresh current-format artifact roots, local
-# ledgers, and MCP state directories. Do not attempt to migrate, adopt, move,
-# rebind, or repair an older namespace. Operate it with the preserved 0.3.1
-# release instead.

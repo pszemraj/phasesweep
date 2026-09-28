@@ -20,6 +20,7 @@ from phasesweep.config import (
     load_experiment,
 )
 from phasesweep.engine import (
+    PhaseWinnerView,
     read_winners,
     run_experiment,
 )
@@ -302,22 +303,22 @@ def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_rea
     # the snapshot that replaced that temporary live view.
     write_run_status(store, **{**unusable, "result_snapshot_state": "pending"})
     monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
-    original_live_status = app._live_status_payload
+    original_live_result = app._live_result
     finalized = False
 
     def finalize_during_live_read(
         experiment_id: str,
         experiment: Experiment,
         saved: RunHandle,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], list[PhaseWinnerView]]:
         nonlocal finalized
-        status = original_live_status(experiment_id, experiment, saved)
+        result = original_live_result(experiment_id, experiment, saved)
         assert not finalized
         finalized = True
         write_run_status(store, **unusable)
-        return status
+        return result
 
-    monkeypatch.setattr(app, "_live_status_payload", finalize_during_live_read)
+    monkeypatch.setattr(app, "_live_result", finalize_during_live_read)
     completed_during_read = app.winners(run_id=run_id)
 
     assert finalized
@@ -717,23 +718,23 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     monkeypatch.setattr(
         "phasesweep.mcp.runs.is_same_live_process", lambda _pid, _starttime: runner_live
     )
-    original_live = app._live_status_payload
+    original_live = app._live_result
     finalized = False
 
     def finish_during_live_read(
-        experiment_id: str, experiment: Experiment, saved: RunHandle | None
-    ) -> dict[str, Any]:
+        experiment_id: str, experiment: Experiment, saved: RunHandle
+    ) -> tuple[dict[str, Any], list[PhaseWinnerView]]:
         nonlocal finalized, runner_live
-        status = original_live(experiment_id, experiment, saved)
+        result = original_live(experiment_id, experiment, saved)
         if not finalized:
             finalized = True
             if transition == "complete":
                 write_run_status(store, **complete)
             else:
                 runner_live = False
-        return status
+        return result
 
-    monkeypatch.setattr(app, "_live_status_payload", finish_during_live_read)
+    monkeypatch.setattr(app, "_live_result", finish_during_live_read)
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     lock = (

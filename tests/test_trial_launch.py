@@ -466,13 +466,15 @@ def test_environment_identity_digest_ignores_mapping_order(
         make_experiment(
             env={"ALPHA": "1", "BETA": "2"},
             execution=ExecutionContext(inherit_env="none"),
-        )
+        ),
+        "p",
     )
     reversed_order = _environment_identity(
         make_experiment(
             env={"BETA": "2", "ALPHA": "1"},
             execution=ExecutionContext(inherit_env="none"),
-        )
+        ),
+        "p",
     )
 
     assert forward.digest == reversed_order.digest
@@ -487,7 +489,7 @@ def test_environment_identity_digest_tracks_values_and_name_boundaries(
 
     def identity_for(env: dict[str, str]) -> str:
         return _environment_identity(
-            make_experiment(env=env, execution=ExecutionContext(inherit_env="none"))
+            make_experiment(env=env, execution=ExecutionContext(inherit_env="none")), "p"
         ).digest
 
     assert identity_for({"TOKEN": "old"}) != identity_for({"TOKEN": "new"})
@@ -505,7 +507,8 @@ def test_environment_identity_names_are_sorted_and_hold_no_values(
         make_experiment(
             env={"ZULU": "z-secret", "ALPHA": "a-secret"},
             execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
-        )
+        ),
+        "p",
     )
 
     assert list(identity.names) == sorted(identity.names)
@@ -529,7 +532,7 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
     path = tmp_path / "trial_0" / "environment.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     identity = _environment_identity(
-        make_experiment(env={"CONFIGURED": "value"}, execution=execution)
+        make_experiment(env={"CONFIGURED": "value"}, execution=execution), "p"
     )
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -548,9 +551,9 @@ def test_passthrough_value_rotation_preserves_semantic_environment_digest(
     experiment = make_experiment(execution=execution)
 
     monkeypatch.setenv("WANDB_API_KEY", "first-secret")
-    first = _environment_identity(experiment)
+    first = _environment_identity(experiment, "p")
     monkeypatch.setenv("WANDB_API_KEY", "rotated-secret")
-    second = _environment_identity(experiment)
+    second = _environment_identity(experiment, "p")
 
     assert first.digest == second.digest
     assert first.values["WANDB_API_KEY"] == "first-secret"
@@ -603,10 +606,10 @@ def test_launch_trial_preserves_configured_and_passthrough_wandb_environment(
 def test_configured_env_value_cannot_be_exempted_as_passthrough() -> None:
     execution = ExecutionContext(inherit_env="none", passthrough_env=["WANDB_API_KEY"])
     first = _environment_identity(
-        make_experiment(execution=execution, env={"WANDB_API_KEY": "configured-a"})
+        make_experiment(execution=execution, env={"WANDB_API_KEY": "configured-a"}), "p"
     )
     second = _environment_identity(
-        make_experiment(execution=execution, env={"WANDB_API_KEY": "configured-b"})
+        make_experiment(execution=execution, env={"WANDB_API_KEY": "configured-b"}), "p"
     )
 
     assert first.digest != second.digest

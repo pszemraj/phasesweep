@@ -32,7 +32,6 @@ from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     canonical_storage_identity,
     file_url_path,
-    storage_is_in_memory,
 )
 from phasesweep.runtime.reaper import read_proc_starttime
 
@@ -278,7 +277,7 @@ def _require_mcp_stable_paths(
         or relative.
     """
     storage = experiment.resolved_storage
-    if storage is None or storage_is_in_memory(storage):
+    if storage is None:
         raise CatalogError(
             f"{experiment_id!r}: storage must be persistent; "
             "in-memory storage cannot be monitored or resumed across processes",

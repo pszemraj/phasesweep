@@ -23,15 +23,21 @@ the MCP layer.
    study, checks every study's root before any write, writes the tree
    binding, then claims empty studies. Only the ClaimedLedger it returns
    reaches open_phase_study.
-3. Pure read paths (read_status, read_winners, CLI status and show-winners,
-   the MCP result snapshot) never construct file-backed storage and never
-   write bytes. Recovery inspection validates binding and format before any
-   open and refuses a pre-cutover ledger with the bytes unchanged.
+3. Pure read paths (read_status, read_winners, read_result, CLI status and
+   show-winners, the MCP result snapshot) never construct file-backed storage
+   and never write bytes. Recovery inspection validates binding and format
+   before any open and refuses an unsupported ledger with the bytes unchanged.
 4. src/phasesweep/engine/ledger.py is the only module that constructs Optuna
    storage, and no other module imports its private names. No module
    constructs sqlite3, SQLAlchemy, or Optuna RDB storage at all.
    tests/test_ledger_contract.py enforces both, and its ratchets are empty,
    so a new site anywhere else fails.
+5. A published result is read once, by publication validation. Consumers
+   use PublicationPointer.validated and never reopen a published artifact
+   by path.
+6. A phase abort is written with the outcome that trips it. Replay honors
+   recorded aborts and never re-derives one from the current
+   max_consecutive_failures, which governs new work only.
 ```
 
 > [!IMPORTANT]
@@ -142,8 +148,7 @@ refused with `RESTORE_LEDGER` and the bytes unchanged.
 `claim_ledger`, `open_registry_study`, and confirmed recovery\
 **Tests:** `tests/test_format_cutover.py::test_validate_ledger_on_a_fresh_root_creates_nothing`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
-`tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`
-(its `release-0.3.1` cells pin the binding check before the format scan),
+`tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`,
 `tests/test_engine_read.py::test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_before_writes`,
 `tests/test_engine_read.py::test_journal_malformed_record_before_its_end_never_means_absent`,
 `tests/test_format_cutover.py::test_writers_repair_a_partial_final_journal_record`,
@@ -209,8 +214,9 @@ before its `_claim_study_artifact_root` loop\
 
 #### 6. Read paths construct and write nothing
 
-`read_status`, `read_winners`, CLI `status` and `show-winners`, and the MCP
-result snapshot build no file-backed storage, write no bytes, and report a
+`read_status`, `read_winners`, `read_result`, CLI `status` and
+`show-winners`, and the MCP result snapshot build no file-backed storage,
+write no bytes, and report a
 phase whose format scan did not complete as unavailable rather than counting
 its trials.
 
@@ -224,8 +230,8 @@ its trials.
 
 Recovery validates the binding and the format before it opens any study, never
 claims, refuses a study bound to another artifact root before it reaps
-anything, and refuses a pre-cutover ledger or an incomplete scan with the bytes
-unchanged. A confirmed recovery holds the experiment lock and is about to
+anything, and refuses an unsupported ledger or an incomplete scan with the
+bytes unchanged. A confirmed recovery holds the experiment lock and is about to
 write, so it repairs a journal whose last line is partial, as a run's claim
 does; inspection reads past that line as Optuna does and writes nothing.
 
@@ -236,7 +242,6 @@ does; inspection reads past that line as Optuna does and writes nothing.
 complete, with `engine.artifact_roots._check_study_artifact_root` on every
 opened study\
 **Tests:** `tests/test_ledger_read_paths.py::test_recovery_inspect_never_writes_to_a_golden_ledger`,
-`tests/test_ledger_read_paths.py::test_recovery_study_load_rewraps_the_engine_refusal`,
 `tests/test_format_cutover.py::test_unverified_handle_records_the_gap_and_opens_nothing_live`,
 `tests/test_stale_reaper.py::test_recovery_refuses_a_study_bound_to_another_artifact_root`,
 `tests/test_format_cutover.py::test_writers_repair_a_partial_final_journal_record`
@@ -278,12 +283,32 @@ the attempts, not either claim.
 No Optuna trial reaches a terminal state before its durable outcome record is
 written; a failed outcome write leaves the trial `RUNNING` for recovery.
 
-**Held by:** `engine.phase._run_phase`, which writes the outcome attribute
+**Held by:** `engine.phase._record_outcome`, which writes the outcome attribute
 before any terminal transition and raises
 `engine.phase._TrialOutcomeUnrecordedAbort` when it cannot\
 **Test:** `tests/test_runtime_behavior.py::test_persistent_outcome_write_failure_leaves_trial_running_until_recovery`
 
-#### 11. An unreadable ledger means cleanup is uncertain
+#### 11. An abort is recorded with the outcome that trips it
+
+A phase abort is written in the same record as the outcome that trips it, and
+replay honors the first abort recorded after the recovery boundary. A later
+success resets the failure streak but never a recorded abort, and a changed
+`max_consecutive_failures` governs new work only, never recorded outcomes.
+Recovering from an abort accepts the raised `n_trials` in the same record that
+retires the abort, so an interrupted recovery keeps its authorization and the
+old target never runs it.
+
+**Held by:** `engine.phase._record_outcome`, which writes the record
+`engine.phase._PhaseExecution.abort_decision` returns with the outcome;
+`engine.study_policy._load_phase_policy_state`, which replays it;
+`engine.phase._resume_phase`, which applies the current limit only before new
+work; `engine.study_policy._record_recovery_boundary`, whose record
+`engine.study_policy._accepted_trial_target` reads as an accepted target\
+**Tests:** `tests/test_runtime_behavior.py::test_parallel_failure_threshold_uses_completion_order`,
+`tests/test_abort_recovery.py::test_changing_the_failure_limit_never_reinterprets_recorded_outcomes`,
+`tests/test_abort_recovery.py::test_interrupted_recovery_keeps_the_raised_target_authorization`
+
+#### 12. An unreadable ledger means cleanup is uncertain
 
 A ledger that cannot be read makes cleanup uncertain, never confirmed, and the
 attempt stays registered for a later retry. A journal's partial final record
@@ -301,7 +326,7 @@ which marks the cleanup report uncertain\
 
 ### Publication
 
-#### 12. Publication is a transaction
+#### 13. Publication is a transaction
 
 The generation's own summary and winners are read back and validated before
 `last_successful_generation.yaml` commits, a failure before the commit leaves
@@ -314,20 +339,42 @@ commit lands.
 write\
 **Test:** `tests/test_publication_transaction.py::test_shutdown_signal_during_publication_is_absorbed_until_committed`
 
+#### 14. A published result is read once
+
+Validation reads every published artifact once, refusing symlinks and paths
+outside the generations root, and returns what it read. `show-winners`,
+`read_status`, `read_winners`, `read_result`, the MCP result snapshot and
+winner reads, and a `--from-phase` resume all show or build on those bytes;
+none reopens a published artifact by path. A generation that is not the
+validated publication, such as a pinned, unfinished, or failed one, is read
+from its files under the permissive read contract.
+
+**Held by:** `engine.publication_validation._validate_generation_manifest`,
+returning the `ValidatedPublication` that
+`engine.publication.PublicationPointer.validated` carries, consumed by
+`engine.read._represented_winners`, `cli._show_experiment_winners`, and
+`engine.artifacts._load_winner`\
+**Test:** `tests/test_publication_transaction.py::test_published_reads_consume_the_bytes_validation_read`
+
 ### MCP runs
 
-#### 13. A PID alone is never authority
+#### 15. A PID alone is never authority
 
 A process is identified by PID, start time, and boot id together, and a
-differing boot id settles a reboot without signalling anything.
+differing boot id settles a reboot without signalling anything. A stale
+attempt is signalled through one procedure, whichever source found it: the
+attempt registry, a stale `RUNNING` trial, or a terminal trial that recorded
+cleanup uncertainty.
 
 **Held by:** `runtime.reaper.identity_from_earlier_boot`,
 `mcp.runs.RunStore.from_earlier_boot`, `runtime.reaper.is_same_live_process`,
-`runtime.reaper.cleanup_stale_trial_process`\
+`runtime.reaper.cleanup_stale_trial_process`, whose only caller is
+`engine.attempts._resolve_attempt`\
 **Tests:** `tests/test_mcp_runs.py::test_state_cleanup_uncertain_on_pid_reuse_mismatch`,
-`tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`
+`tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`,
+`tests/test_attempt_resolution.py::test_only_resolve_attempt_signals_a_stale_process_group`
 
-#### 14. A dead runner stays live until recovery decides
+#### 16. A dead runner stays live until recovery decides
 
 A dead runner with no terminal status stays in the live set until `recover-run`
 decides; liveness alone never concludes a run.
@@ -338,7 +385,7 @@ decides; liveness alone never concludes a run.
 
 ### Errors and fixtures
 
-#### 15. Wraps keep the operator's remediation
+#### 17. Wraps keep the operator's remediation
 
 Every operator-facing error declares one remediation, and a wrap preserves it
 instead of replacing it with the wrapper's own advice. Alternatives route the
@@ -358,11 +405,11 @@ own; unconfirmed cleanup adds recover-run after the repair.
 `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`,
 `tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`
 
-#### 16. Refusals are tested against real ledgers
+#### 18. Refusals are tested against a real ledger
 
-Refusals are tested against ledgers produced by the public API and by the
-preserved `v0.3.1` tag, and read paths run under a patch that records and
-raises on any file-backed storage construction.
+Refusals are tested against a ledger produced by the public API, and read
+paths run under a patch that records and raises on any file-backed storage
+construction.
 
 **Held by:** `tests/fixtures/make_ledger_fixtures.py`,
 `tests/ledger_fixtures.py::forbid_file_backed_storage`\
@@ -391,7 +438,7 @@ test that spawns a real process without the `integration` marker (see
 
 When a detached runner is SIGKILLed or the host crashes, the run handle
 survives with no terminal status. `RunStore.state` deliberately keeps that run
-live (invariant 14), because a dead runner with no status is indistinguishable
+live (invariant 16), because a dead runner with no status is indistinguishable
 from one whose trials are still being reaped, so the run holds one of the
 experiment's capacity slots and no later launch can proceed. `recover-run` is
 the only path that reads the durable evidence and decides. It opens studies

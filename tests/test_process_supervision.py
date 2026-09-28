@@ -1950,19 +1950,11 @@ def test_reaper_raises_when_cleanup_uncertain(
         )
 
     monkeypatch.setattr(
-        "phasesweep.engine.attempts._read_trial_process_identity",
-        fake_identity,
-    )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup._read_trial_process_identity",
+        "phasesweep.engine.attempts.read_stale_process_identity",
         fake_identity,
     )
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: False,
-    )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: False,
     )
 
@@ -1976,7 +1968,7 @@ def test_reaper_raises_when_cleanup_uncertain(
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
 
     with pytest.raises(RuntimeError, match="cleanup could not prove"):
-        _reap_stale_trials(study, exp, exp.phases[0].name)
+        _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
 
 def test_run_supervised_reports_uncertain_cleanup_on_timeout(

@@ -332,6 +332,7 @@ def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path
         pgid=os.getpid(),
         pid_starttime=read_proc_starttime(os.getpid()),
         launch_state="spawned",
+        boot_id=read_boot_id(),
     )
     store.create(pending)
 
@@ -533,7 +534,7 @@ def test_run_store_refuses_unmarked_durable_state_before_initialization(
 
     monkeypatch.setattr(mcp_runs, "ensure_private_dir", fail_if_initialized)
 
-    with pytest.raises(ValueError, match="no format marker.*fresh MCP state directory.*0.3.1"):
+    with pytest.raises(ValueError, match="no format marker.*fresh MCP state directory"):
         RunStore(state_dir)
 
     assert initialized == []
@@ -823,17 +824,20 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
         ("pgid", "123"),
         ("pid_starttime", 0),
         ("pid_starttime", "123"),
+        ("pid_starttime", None),
         ("launch_state", "bogus"),
         ("started_at", "not-a-timestamp"),
         ("started_at", "2026-07-17T12:00:00"),
         ("boot_id", ""),
         ("boot_id", "malformed"),
         ("boot_id", 12345),
+        ("boot_id", None),
         ("visible_params_at_launch", "some"),
         ("visible_params_at_launch", [""]),
         ("visible_params_at_launch", ["lr", "lr"]),
         ("visible_params_at_launch", ["lr", 1]),
         ("visible_params_at_launch", {"lr": True}),
+        ("visible_params_at_launch", None),
     ],
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
@@ -1117,6 +1121,8 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
                 "run_id": "exp-1",
                 "config_sha256": handle.config_sha256,
                 "cleanup_confirmed": True,
+                "reaped_attempt_ids": [],
+                "reaped_attempt_locations": {},
             }
         ),
     )
@@ -1177,6 +1183,8 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
                             "run_id": handle.run_id,
                             "config_sha256": handle.config_sha256,
                             "cleanup_confirmed": True,
+                            "reaped_attempt_ids": [],
+                            "reaped_attempt_locations": {},
                         }
                     ),
                 )
@@ -1376,8 +1384,8 @@ def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) 
 
 
 def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path: Path) -> None:
-    # Same identity as the boot-mismatch case minus the boot id: an older
-    # persisted handle cannot rule out PID reuse, so it must still fail closed.
+    # Same identity as the boot-mismatch case minus the boot id: an unknown
+    # boot id cannot rule out PID reuse, so it must still fail closed.
     store = RunStore(tmp_path / "state")
     handle = replace(make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111), boot_id=None)
     assert handle.boot_id is None
@@ -1517,6 +1525,8 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
                 "run_id": "exp-1",
                 "config_sha256": "a" * 64,
                 "cleanup_confirmed": True,
+                "reaped_attempt_ids": [],
+                "reaped_attempt_locations": {},
             }
         ),
     )
@@ -1593,6 +1603,39 @@ def test_cleanup_recovery_rejects_malformed_reaped_attempt_ids(
     assert store.recovery_required(handle)
 
 
+def test_cleanup_recovery_rejects_missing_reaped_fields(tmp_path: Path) -> None:
+    """A recovery record missing either reaped field entirely is refused."""
+    store = RunStore(tmp_path / "state")
+    handle = make_run_handle(
+        run_id="exp-1",
+        config_sha256="a" * 64,
+        pid=reaped_pid(),
+        starttime=111,
+    )
+    store.create(handle)
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+    )
+    private_atomic_write_text(
+        store.cleanup_recovery_path(handle.run_id),
+        json.dumps(
+            {
+                "run_id": handle.run_id,
+                "config_sha256": handle.config_sha256,
+                "cleanup_confirmed": True,
+            }
+        ),
+    )
+
+    assert not store._cleanup_recovered(handle)
+    assert store.state(handle) == "running"
+    assert store.recovery_required(handle)
+
+
 def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -1639,8 +1682,8 @@ def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
     assert attempt_ids == {"runner-match", "operator-match"}
     assert locations == {"operator-match": ("p", 3, handle.run_id)}
 
-    # Optional runner evidence may be persisted as null by an older or partial
-    # writer; the operator record remains independently usable.
+    # Optional runner evidence may be persisted as null by a partial writer;
+    # the operator record remains independently usable.
     write_run_status(
         store,
         handle.run_id,

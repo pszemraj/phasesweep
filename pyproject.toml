@@ -127,9 +127,9 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -m 'not hardware' --strict-markers"
+addopts = "-q -m 'not live' --strict-markers"
 markers = [
-    "hardware: tests that query real host hardware and require explicit opt-in",
+    "live: tests that use real host hardware or a live external service; explicit opt-in with -m live",
     "signals_own_pid: tests that signal pytest's own PID on purpose; lifts that one target from the runner signal guard in tests/conftest.py",
     "integration: slow tests, excluded from the fast review tier. Collection fails when an unmarked test manages processes or waits on the clock directly; engine runs with quick trainers stay in the fast tier; any other slow test is marked by the classification rule in docs/development.md",
 ]

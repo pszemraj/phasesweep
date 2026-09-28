@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -20,6 +21,7 @@ import pytest
 import yaml
 
 import phasesweep.engine.ledger as engine_ledger
+import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
@@ -39,10 +41,13 @@ from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaM
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_record_path,
+    _phase_dir,
 )
+from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import (
     ARTIFACT_ROOT_ATTR,
 )
+from phasesweep.errors import OperatorAction
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
@@ -282,6 +287,59 @@ def test_resume_rejects_incompatible_winner_before_spawn(
     with pytest.raises(ResumeNotReadyError, match="compatible winner"):
         app.launch("srv", from_phase="q")
 
+    assert store.list_handles() == []
+
+
+@pytest.mark.integration
+def test_resume_gate_applies_the_run_preflight_acceptance_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate validates the manifest once and refuses a skipped winner whose evidence is gone."""
+    trainer = write_constant_trainer(tmp_path)
+    p = Phase(
+        name="p",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"lr": IntParam(type="int", low=1, high=2)},
+    )
+    q = Phase(
+        name="q",
+        inherits=["p"],
+        n_trials=1,
+        sampler=Sampler(type="random", seed=1),
+        search_space={"wd": FloatParam(type="float", low=0.0, high=0.1)},
+    )
+    published = _drift_experiment(tmp_path, trainer, phases=[p, q])
+    run_experiment(published)
+    # The operator appends phase r, which resumes from q's published winner,
+    # after q's source trial tree has been removed.
+    r = Phase(
+        name="r",
+        inherits=["q"],
+        n_trials=1,
+        sampler=Sampler(type="random", seed=2),
+        search_space={"bs": IntParam(type="int", low=1, high=2)},
+    )
+    config = tmp_path / "srv.yaml"
+    _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phases=[p, q, r]))
+    shutil.rmtree(_phase_dir(published, "q"))
+    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+
+    original_validate = validation_ops._validate_generation_manifest
+    calls = 0
+
+    def counting_validate(*args: Any, **kwargs: Any) -> ValidatedPublication:
+        nonlocal calls
+        calls += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(validation_ops, "_validate_generation_manifest", counting_validate)
+
+    with pytest.raises(ResumeNotReadyError, match="earlier phase 'q' has no compatible winner"):
+        app.launch("srv", from_phase="r")
+
+    assert calls == 1
     assert store.list_handles() == []
 
 
@@ -1251,9 +1309,16 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A spawned handle can never legitimately lack a boot id.
+
+    The fake runner here writes one anyway (bypassing the real runner's own
+    refusal), so the server's identity read must not trust it: the receipt
+    is unreadable rather than a legitimate live handle, and the launch still
+    ends in a recorded failure.
+    """
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    patch_popen_capture(monkeypatch)
+    captured = patch_popen_capture(monkeypatch)
     monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
     monkeypatch.setattr("tests.mcp_helpers.read_boot_id", lambda: None)
     monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *_args, **_kwargs: True)
@@ -1261,8 +1326,11 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     with pytest.raises(RuntimeError, match="boot id"):
         app.launch("srv")
 
-    (pending,) = store.list_handles()
-    assert store.state(pending) == "failed"
+    assert store.list_handles() == []
+    run_id = captured["cmd"][captured["cmd"].index("--run-id") + 1]
+    assert store.get(run_id) is None
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["returncode"] == 1
 
 
 def test_runner_does_not_persist_a_receipt_without_boot_identity(
@@ -1551,7 +1619,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
             storage=engine_ledger._resolve_storage(experiment.resolved_storage),
             direction="minimize",
         )
-        # Two populated, unmarked studies model a pre-cutover local ledger.
+        # Two populated, unmarked studies model an unsupported local ledger.
         study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
         study.add_trial(
             optuna.trial.create_trial(
@@ -1571,7 +1639,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
         started_at=started_at,
     )
 
-    with pytest.raises(StudySchemaMismatchError, match="pre-cutover or unsupported"):
+    with pytest.raises(StudySchemaMismatchError, match="unsupported PhaseSweep study state"):
         runner_main(
             runner_argv(
                 store,
@@ -1587,9 +1655,10 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
     assert terminal["result_snapshot_state"] == "complete"
     assert terminal["failure"]["code"] == "study_schema_mismatch"
     assert terminal["failure"]["retryable"] is False
-    # Pre-cutover state routes to the release that wrote it, which keeps the
-    # study, rather than to archiving it for a fresh one.
-    assert "preserved PhaseSweep release" in terminal["failure"]["remediation"]
+    # Unsupported state routes to starting fresh, rather than to archiving
+    # this study and continuing under the current one.
+    remediation = terminal["failure"]["remediation"]
+    assert mcp_runner._OPERATOR_STEPS[OperatorAction.FRESH_NAMESPACE] in remediation
 
 
 def test_launch_bookkeeping_failure_preserves_runner_status(

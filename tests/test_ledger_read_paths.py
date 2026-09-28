@@ -1,22 +1,19 @@
-"""Every read path, against every golden ledger, writes nothing and refuses honestly.
+"""Every read path, against the golden ledger, writes nothing and refuses honestly.
 
 Two durability invariants meet here. A read path never creates a study and
 never constructs file-backed storage (invariant 3); and it validates the
 artifact-root binding and then the ledger format *before* any bind, claim, or
 open, leaving the bytes untouched when it refuses (invariant 2). The golden
-fixtures under ``tests/fixtures/ledgers`` supply the pre-cutover shapes those
-refusals exist for, produced by real PhaseSweep runs -- including the
-preserved 0.3.1 release itself -- rather than by a test that guesses what old
-bytes look like.
+fixture under ``tests/fixtures/ledgers`` is real PhaseSweep output for these
+checks to run against, rather than bytes a test invented.
 
 ``mcp-recover-inspect`` is held to the weaker half on purpose: recovery
 preflight legitimately needs live ``Study`` objects, so it is not under the
-constructor ban. Its invariant is "validate before open, and refuse a
-pre-cutover ledger with the bytes unchanged", which it now satisfies by going
-through the ledger handle like every other read path. Because it reaps through
-those live studies, it also refuses any study bound to another artifact root.
-That makes its ``ledger-only`` verdict over a current ledger a refusal where
-every pure read says ``ok``.
+constructor ban. Its invariant is "validate before open, and leave the bytes
+unchanged", which it satisfies by going through the ledger handle like every
+other read path. Because it reaps through those live studies, it also refuses
+any study bound to another artifact root. That makes its ``ledger-only``
+verdict over the current ledger a refusal where every pure read says ``ok``.
 """
 
 from __future__ import annotations
@@ -29,23 +26,17 @@ from typing import Any
 import pytest
 import yaml
 
-from phasesweep.engine import ArtifactRootConflictError, StudySchemaMismatchError
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.read import read_status, read_winners
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
-from phasesweep.mcp.recovery import (
-    RunRecoveryError,
-    _load_recovery_studies,
-    recover_run,
-)
-from phasesweep.mcp.runs import RunStore, UnsupportedStateFormatError
+from phasesweep.mcp.recovery import RunRecoveryError, recover_run
+from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from tests.conftest import invoke_cli_boundary
 from tests.ledger_fixtures import (
     LEDGER_MODES,
     Materialized,
-    copy_fixture,
     discover_ledger_fixtures,
     fixture_by_name,
     forbid_file_backed_storage,
@@ -55,19 +46,10 @@ from tests.ledger_fixtures import (
     tree_snapshot,
 )
 from tests.mcp_helpers import stage_dead_run
-from tests.recovery_helpers import load_only_recovery_needs
 
 #: Every fixture this matrix requires. A missing entry means an incomplete
 #: regeneration, not a smaller matrix, so it is asserted by name.
-REQUIRED_FIXTURES = (
-    "current-journal",
-    "precutover-binding2-journal",
-    "precutover-mcp-state",
-    "precutover-schema2-journal",
-    "precutover-unmarked-tree-journal",
-    "precutover-unstamped-journal",
-    "release-0.3.1-journal",
-)
+REQUIRED_FIXTURES = ("current-journal",)
 
 #: Read paths that must not construct file-backed storage at all.
 PURE_READ_PATHS = (
@@ -82,9 +64,8 @@ PURE_READ_PATHS = (
 RECOVERY_READ_PATH = "mcp-recover-inspect"
 READ_PATHS = (*PURE_READ_PATHS, RECOVERY_READ_PATH)
 
-#: Operator-facing phrases that identify a refusal on a text-only surface.
-_SCHEMA_MISMATCH_PHRASE = "local storage ledger contains pre-cutover"
-_ROOT_CONFLICT_PHRASES = ("uses unsupported pre-cutover", "contains pre-cutover PhaseSweep state")
+#: Operator-facing phrase that identifies a study-owned-elsewhere refusal on a
+#: text-only surface.
 _STUDY_OWNED_ELSEWHERE_PHRASE = "publishes into artifact root"
 
 #: The verdict recovery owes a ``ledger-only`` cell that every pure read path
@@ -95,46 +76,24 @@ _STUDY_OWNED_ELSEWHERE_PHRASE = "publishes into artifact root"
 _RECOVERY_LEDGER_ONLY_VERDICTS = {"ok": "study-owned-elsewhere"}
 
 
-def _classify_exception(exc: BaseException) -> str:
-    """Map an engine refusal to its fixture verdict.
-
-    :param BaseException exc: Exception a read path raised.
-    :return str: ``"schema-mismatch"`` or ``"root-conflict"``.
-    :raises BaseException: ``exc`` itself, when it is not a format refusal.
-    """
-    if isinstance(exc, StudySchemaMismatchError):
-        return "schema-mismatch"
-    if isinstance(exc, ArtifactRootConflictError):
-        return "root-conflict"
-    raise exc
-
-
 def _classify_message(message: str) -> str:
     """Map an operator-facing diagnostic to its fixture verdict.
 
     :param str message: Rendered diagnostic from the CLI boundary or recovery.
-    :return str: ``"schema-mismatch"``, ``"root-conflict"``,
-        ``"study-owned-elsewhere"``, or ``"unclassified"``.
+    :return str: ``"study-owned-elsewhere"`` or ``"unclassified: <message>"``.
     """
-    if _SCHEMA_MISMATCH_PHRASE in message:
-        return "schema-mismatch"
-    if any(phrase in message for phrase in _ROOT_CONFLICT_PHRASES):
-        return "root-conflict"
     if _STUDY_OWNED_ELSEWHERE_PHRASE in message:
         return "study-owned-elsewhere"
     return f"unclassified: {message}"
 
 
 def _engine_verdict(call: Callable[[], object]) -> str:
-    """Run one in-process read path and report the verdict it reached.
+    """Run one in-process read path and report that it completed.
 
     :param Callable[[], object] call: Read path invocation.
-    :return str: ``"ok"`` when it returned, otherwise its refusal verdict.
+    :return str: ``"ok"``.
     """
-    try:
-        call()
-    except Exception as exc:
-        return _classify_exception(exc)
+    call()
     return "ok"
 
 
@@ -190,8 +149,6 @@ def _recover_inspect(materialized: Materialized, tmp_path: Path) -> tuple[str, d
         recover_run(state_dir, run_id, confirm=False, emit=messages.append)
     except RunRecoveryError as exc:
         verdict = _classify_message(str(exc))
-    except Exception as exc:
-        verdict = _classify_exception(exc)
     else:
         assert messages, "recovery preflight reported nothing"
         verdict = "ok"
@@ -291,53 +248,6 @@ def test_recovery_inspect_never_writes_to_a_golden_ledger(
         f"recovery preflight over {fixture_name} ({mode}) changed the MCP state "
         f"directory: {state_changes}"
     )
-
-
-@pytest.mark.parametrize(
-    "fixture_name", ["precutover-schema2-journal", "precutover-unstamped-journal"]
-)
-def test_recovery_study_load_rewraps_the_engine_refusal(fixture_name: str, tmp_path: Path) -> None:
-    """Recovery refuses a pre-cutover ledger in the engine's own words.
-
-    The wrapper's job is to say which command the operator is running, not to
-    re-explain the failure, so the original refusal text has to survive intact.
-    """
-    materialized = materialize(fixture_name, tmp_path, mode="tree")
-
-    with pytest.raises(RunRecoveryError) as excinfo:
-        _load_recovery_studies(materialized.experiment, load_only_recovery_needs())
-
-    assert _SCHEMA_MISMATCH_PHRASE in str(excinfo.value)
-    assert isinstance(excinfo.value.__cause__, StudySchemaMismatchError)
-    assert str(excinfo.value) == str(excinfo.value.__cause__)
-    assert materialized.unchanged(), materialized.changes()
-
-
-@pytest.mark.parametrize("entry_point", ["open_existing", "constructor"])
-def test_precutover_mcp_state_is_refused_without_writing(entry_point: str, tmp_path: Path) -> None:
-    """An unmarked durable MCP run store is refused from either entry point.
-
-    ``open_existing`` is the operator-recovery door and must stay purely
-    observational; the constructor is the server's door and must not adopt
-    0.3.1-era state by writing a current-format marker over it. Neither may
-    change a byte on the way to refusing.
-    """
-    fixture = fixture_by_name("precutover-mcp-state")
-    assert fixture.modes == (), "the MCP state fixture carries no ledger read modes"
-    root = copy_fixture("precutover-mcp-state", tmp_path / "fixture")
-    state_dir = root / "mcp_state"
-    before = tree_snapshot(root)
-
-    # The format refusal, not the missing-layout ValueError whose message also
-    # names an "MCP state directory": that one would mean the copy is broken.
-    with pytest.raises(UnsupportedStateFormatError) as excinfo:
-        if entry_point == "open_existing":
-            RunStore.open_existing(state_dir)
-        else:
-            RunStore(state_dir)
-
-    assert type(excinfo.value) is UnsupportedStateFormatError
-    assert tree_changes(before, tree_snapshot(root)) == {}
 
 
 def test_current_fixture_carries_this_release_format(tmp_path: Path) -> None:

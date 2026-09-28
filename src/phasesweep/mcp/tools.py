@@ -19,10 +19,10 @@ from pydantic import ValidationError
 from phasesweep.config import Experiment
 from phasesweep.engine import (
     ArtifactRootConflictError,
+    PhaseWinnerView,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
-    read_status,
-    read_winners,
+    read_result,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.mcp.errors import (
@@ -422,7 +422,7 @@ class PhaseSweepMCP(RunControl):
             )
         else:
             assert experiment is not None
-            status = self._live_status_payload(target_id, experiment, handle)
+            status, _winners = self._live_result(target_id, experiment, handle)
             # A runner can finish freezing its results during the live
             # storage read. Discard that view once its snapshot is durable.
             completed, completed_source = self._result_snapshot_view(experiment, handle, None)
@@ -453,27 +453,30 @@ class PhaseSweepMCP(RunControl):
         except UnknownExperimentError:
             return None
 
-    def _live_status_payload(
+    def _live_result(
         self,
         experiment_id: str,
         experiment: Experiment,
         handle: RunHandle,
-    ) -> dict[str, Any]:
-        """Read live status and leave catalog drift unknown after decataloging.
+    ) -> tuple[dict[str, Any], list[PhaseWinnerView]]:
+        """Read live status and winners, leaving catalog drift unknown after decataloging.
 
-        ``read_status`` normally compares against its read config when no
-        comparison config is supplied. A run snapshot remains the correct
-        artifact locator after its catalog entry is removed, but it is not a
-        current catalog config and therefore cannot support a drift verdict.
+        Both come from one pointer resolution, so the winners always belong to
+        the publication the status describes. ``read_result`` normally
+        compares against its read config when no comparison config is
+        supplied. A run snapshot remains the correct artifact locator after its
+        catalog entry is removed, but it is not a current catalog config and
+        therefore cannot support a drift verdict.
 
         :param str experiment_id: Catalog id associated with the read target.
         :param Experiment experiment: Live run snapshot config.
         :param RunHandle handle: Live run pinning the represented generation.
-        :return dict[str, Any]: Path-free live status payload.
+        :return tuple[dict[str, Any], list[PhaseWinnerView]]: Path-free live
+            status payload and the represented generation's winners.
         """
         comparison = self._catalog_comparison_experiment(experiment_id)
         try:
-            status = read_status(
+            status, winners = read_result(
                 experiment,
                 generation_id=handle.run_id,
                 comparison_experiment=comparison,
@@ -486,7 +489,7 @@ class PhaseSweepMCP(RunControl):
             self._raise_persistent_read_error(handle, exc)
         if comparison is None:
             status["published_config_matches_current"] = None
-        return status
+        return status, winners
 
     @staticmethod
     def _raise_persistent_read_error(
@@ -675,32 +678,11 @@ class PhaseSweepMCP(RunControl):
             )
         else:
             assert experiment is not None
-            # Resolve the represented generation once via read_status, then
-            # reuse that exact id for read_winners: two independent pointer
-            # resolutions here could otherwise mix identities from different
-            # moments. The represented generation id is the queried run's
-            # generation, never a later mutable pointer.
-            status = self._live_status_payload(
-                target_id,
-                experiment,
-                handle,
-            )
-            # Enumerate the plan that generation published under, not the one
-            # the config declares now: a phase renamed since publication used
-            # to drop its winner from this payload entirely while reporting
-            # the new name as missing (review v0.5.16 / blocker 4).
-            try:
-                winner_views = read_winners(
-                    experiment,
-                    generation_id=status["represented_generation_id"],
-                    phase_names=status["result_phase_plan"],
-                )
-            except (
-                ArtifactRootConflictError,
-                StudySchemaMismatchError,
-                StudyStorageUnavailableError,
-            ) as exc:
-                self._raise_persistent_read_error(handle, exc)
+            # One pointer resolution supplies the status and the winners of
+            # the queried run's generation, never a later mutable pointer,
+            # enumerated under the plan that generation published under
+            # (review v0.5.16 / blocker 4).
+            status, winner_views = self._live_result(target_id, experiment, handle)
             if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
                 winner_views = []
             # The live read may span the runner's final snapshot write.

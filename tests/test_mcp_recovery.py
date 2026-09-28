@@ -208,10 +208,6 @@ def _stage_stale_running_recovery_scaffold(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         cleanup_trial_stub,
     )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
-        cleanup_trial_stub,
-    )
     recover = partial(recover_run_cli, registry.state_dir, run_id, confirm=True)
     return app, store, handle, attempt_id, recover
 
@@ -239,7 +235,6 @@ def _stage_terminal_uncertain_run(
 
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
     recover = partial(recover_run_cli, registry.state_dir, run_id, confirm=True)
     return store, handle, trial_number, config, recover
 
@@ -653,12 +648,15 @@ def test_recovery_preserves_status_written_after_initial_read(
     assert terminal["result_snapshot_state"] == "complete"
 
 
-@pytest.mark.parametrize("unknown_side", ["saved", "current"])
 def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    unknown_side: str,
 ) -> None:
+    """A spawned handle always records its own boot id; only the current lookup can fail.
+
+    A recovery-time boot id read failure still must not signal, since it
+    cannot rule out PID reuse after a reboot.
+    """
     current_boot = read_boot_id()
     if current_boot is None:
         pytest.skip("boot id unavailable on this platform")
@@ -666,22 +664,18 @@ def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-recovery-unknown-boot"
-    handle = replace(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-            pid=reaped_pid(),
-            starttime=111,
-        ),
-        boot_id=None if unknown_side == "saved" else current_boot,
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        pid=reaped_pid(),
+        starttime=111,
     )
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     store.mark_cleanup_uncertain(handle)
-    if unknown_side == "current":
-        monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
-        monkeypatch.setattr(mcp_recovery, "read_boot_id", lambda: None, raising=False)
+    monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_recovery, "read_boot_id", lambda: None, raising=False)
     signalled: list[object] = []
 
     def record_signal(*args: object, **kwargs: object) -> bool:
@@ -948,7 +942,7 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
 
     # A real run binds the tree in preflight, long before it registers an
     # attempt into it. Fabricating the registry entry without the binding would
-    # leave a tree this release correctly reads as unmarked pre-cutover state.
+    # leave a tree this release correctly reads as unmarked PhaseSweep state.
     mark_current_format(experiment)
     attempt_id = "registry-only-attempt"
     trial_dir = _experiment_dir(experiment) / "p" / "trial_registry_only"
@@ -985,7 +979,6 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
         _counting_success_callback(runner_cleanup_calls),
     )
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", trial_cleanup)
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", trial_cleanup)
 
     dry = recover_run_cli(registry.state_dir, run_id)
 
@@ -1112,10 +1105,6 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *args, **kwargs: True)
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
-        lambda _identity: True,
-    )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
         lambda _identity: True,
     )
     recovery_path = store.cleanup_recovery_path(earlier_run_id)
@@ -1285,7 +1274,6 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process", fake_trial_cleanup
     )
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_trial_cleanup)
 
     with pytest.raises(ExperimentBusyError, match="already has a running sweep"):
         app.launch("srv")
@@ -1551,15 +1539,12 @@ def test_operator_recovery_uses_runner_reconciliation_evidence(
         "phasesweep.engine.attempts.cleanup_stale_trial_process",
         lambda _identity: True,
     )
-    monkeypatch.setattr(
-        "phasesweep.engine.cleanup.cleanup_stale_trial_process",
-        lambda _identity: True,
-    )
     assert (
         _reap_stale_trials(
             study,
             experiment,
             experiment.phases[0].name,
+            confirm=True,
             recovered_attempts=reconciled_attempts,
         )
         == 1
@@ -1673,7 +1658,6 @@ def test_operator_recovery_consumes_terminal_cleanup_evidence(
 
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_cleanup)
     monkeypatch.setattr("phasesweep.engine.attempts.cleanup_stale_trial_process", fake_cleanup)
-    monkeypatch.setattr("phasesweep.engine.cleanup.cleanup_stale_trial_process", fake_cleanup)
 
     stage_dead_run(store, first_run, config, reg.id, cleanup_uncertain=False)
     write_unsafe_cleanup_status(store, first_run)

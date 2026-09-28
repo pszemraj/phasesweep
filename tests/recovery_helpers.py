@@ -80,7 +80,7 @@ class StaleTrial(NamedTuple):
 def stamp_artifact_root(study: optuna.Study, experiment: Experiment) -> None:
     """Bind a hand-built study to the artifact root a prior run would have claimed."""
     # A study an earlier invocation left behind always carries this binding.
-    # Without it, preflight refuses the run as pre-cutover state, which
+    # Without it, preflight refuses the run as unmarked state, which
     # preempts the current-format recovery behavior under test.
     study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
 

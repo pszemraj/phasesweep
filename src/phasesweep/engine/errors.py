@@ -76,12 +76,14 @@ class PublicationCommitError(PhaseSweepError):
 
 
 class WinnerIntegrityError(PhaseSweepError):
-    """Raised when a saved winner cannot safely be used for a skipped phase.
+    """Raised when a saved phase result cannot safely be reused.
 
-    The winner may be unreadable, structurally incomplete, ambiguously scoped,
-    or incompatible with the current phase's partial-result policy. These are
-    operator-visible artifact/configuration refusals; fingerprint drift keeps
-    its more specific :class:`StudyFingerprintMismatchError` type.
+    A skipped phase's winner may be unreadable, structurally incomplete,
+    ambiguously scoped, or incompatible with the current phase's partial-result
+    policy, and a live phase's accepted partial-timeout decision replays only
+    under that policy too. These are operator-visible artifact/configuration
+    refusals; fingerprint drift keeps its more specific
+    :class:`StudyFingerprintMismatchError` type.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE

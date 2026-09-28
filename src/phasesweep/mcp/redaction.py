@@ -131,12 +131,11 @@ def winners_payload(
             "phase": source.phase,
             "trial_number": source.trial_number,
         }
-        source_generation_id = source.generation_id
         winner_generation = (
             "unknown"
-            if source_generation_id is None or represented_generation_id is None
+            if represented_generation_id is None
             else "current_generation"
-            if source_generation_id == represented_generation_id
+            if source.generation_id == represented_generation_id
             else "prior_generation"
         )
         phases.append(

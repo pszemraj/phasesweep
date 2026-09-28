@@ -51,7 +51,6 @@ from phasesweep.engine.paths import (
     _trial_dir_for,
     _winner_path,
 )
-from phasesweep.engine.publication import _last_successful_generation_id
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
@@ -70,6 +69,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
+from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
     claim_runner_handle,
     live_runs,
@@ -1194,6 +1194,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
             pgid=None,
             pid_starttime=None,
             started_at=started_at,
+            visible_params_at_launch="none",
             launch_state="launching",
         )
     )
@@ -1299,7 +1300,7 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     assert terminal["returncode"] == 0
     assert terminal["error_class"] is None
     assert terminal["failure"] is None
-    assert _last_successful_generation_id(load_experiment(config_path)) == run_id
+    assert published_generation_id(load_experiment(config_path)) == run_id
 
 
 @pytest.mark.parametrize("from_phase", [None, "b"])
@@ -1327,7 +1328,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
         persistent=tmp_path, trainer=write_constant_trainer(tmp_path), phases=phases
     )
     run_experiment(experiment)
-    first_generation = _last_successful_generation_id(experiment)
+    first_generation = published_generation_id(experiment)
     assert first_generation is not None
 
     # The convenience root projections must stay untouched by a failed resume;
@@ -1390,7 +1391,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     # Convenience root projections are untouched, and the published pointer
     # still resolves to the prior successful generation.
     assert {path: path.read_bytes() for path in protected_paths} == before
-    assert _last_successful_generation_id(experiment) == first_generation
+    assert published_generation_id(experiment) == first_generation
     failed_generations = set(_generations_dir(experiment).iterdir()) - generations_before
     assert len(failed_generations) == 1
     assert "state: failed" in (failed_generations.pop() / "generation.yaml").read_text()
@@ -1871,7 +1872,7 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
 
     assert not store.status_path(run_id).exists()
     assert any("no terminal MCP evidence" in record.getMessage() for record in caplog.records)
-    assert _last_successful_generation_id(load_experiment(config_path)) is None
+    assert published_generation_id(load_experiment(config_path)) is None
     # The consequence the exit code has to carry: this identity is exactly what
     # the runner persisted for itself (spawned, this live process), and with no
     # status.json the run stays ``running`` and holds its concurrency slot.
@@ -2005,7 +2006,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     assert prepared_phase["published_study_unavailable"] is False
     if damage_publication:
         _generation_summary_path(experiment, run_id).unlink()
-    assert _last_successful_generation_id(experiment) == (
+    assert published_generation_id(experiment) == (
         run_id if crash_boundary == "after_pointer" and not damage_publication else None
     )
 
@@ -2044,7 +2045,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         assert terminal["error_class"] == "PublicationNotCommitted"
         assert "result_publication_state" not in terminal
         assert snapshot["status"]["is_published"] is False
-        assert _last_successful_generation_id(experiment) is None
+        assert published_generation_id(experiment) is None
         failure = {
             "code": "publication_not_committed",
             "stage": "execution",

@@ -52,7 +52,7 @@ from phasesweep.engine.attempts import (
     _PreflightCleanupReport,
     _register_active_attempt,
 )
-from phasesweep.engine.cleanup import _inspect_cleanup_uncertain_trials, _reap_stale_trials
+from phasesweep.engine.cleanup import _reap_stale_trials, _recover_cleanup_uncertain_trials
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
     _artifact_root_binding_path,
@@ -60,16 +60,21 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
 )
 from phasesweep.engine.phase import _failure_policy_abort_record
-from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.resume import _published_for_resume
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
-    PHASE_ABORT_ATTR,
+    PHASE_DECISION_ATTR,
+    PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_DIR_ATTR,
+    TRIAL_OUTCOME_ABORT_KEY,
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
+    TRIAL_TARGET_ATTR,
 )
 from phasesweep.errors import OperatorAction, PhaseSweepError
 from phasesweep.evidence.wandb import require_wandb_sdk
@@ -97,6 +102,7 @@ from tests.ledger_fixtures import (
     Materialized,
     ledger_file,
     materialize,
+    published_generation_id,
     republish_as_incomplete,
 )
 from tests.mcp_helpers import make_run_handle, stage_dead_run, write_run_status
@@ -104,9 +110,7 @@ from tests.recovery_helpers import load_only_recovery_needs
 
 # Classes proving the module sweep reached past the error modules themselves.
 # If an import ever stops happening, these vanish from the walk and say so.
-_SWEEP_WITNESSES = frozenset(
-    {"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError", "_PolicyStateWriteError"}
-)
+_SWEEP_WITNESSES = frozenset({"UnsafeLockPathError", "NoFeasibleTrialError", "RunRecoveryError"})
 
 
 def _import_every_module() -> None:
@@ -189,6 +193,14 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
     assert foreign.action is RunRecoveryError.default_action
 
 
+_UNMARKED_STUDY_REMEDY_MARKERS = {
+    "study schema": "fresh artifact root",
+    "trial target": "fresh local ledger",
+    "environment cohort": "new experiment name",
+    "phase fingerprint": "fresh local ledger",
+}
+
+
 @pytest.mark.parametrize(
     ("label", "call"),
     [
@@ -211,12 +223,13 @@ def test_rewrap_preserves_inbound_action_and_explicit_action_replaces():
         ),
     ],
 )
-def test_pre_cutover_refusals_route_to_the_prior_release(label, call):
+def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
+    """A populated study with no PhaseSweep attrs is unsupported state, not just a config mismatch."""
     with pytest.raises(PhaseSweepError) as excinfo:
         call()
-    assert excinfo.value.action is OperatorAction.USE_PRIOR_RELEASE, label
+    assert excinfo.value.action is OperatorAction.FRESH_NAMESPACE, label
     # The routed action is additional to, not a replacement for, the remedy prose.
-    assert "0.3.1" in str(excinfo.value), label
+    assert _UNMARKED_STUDY_REMEDY_MARKERS[label] in str(excinfo.value), label
 
 
 def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
@@ -515,7 +528,7 @@ def _reap_unreadable_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> o
     """Reap stale trials from a study whose trial list cannot be read."""
     study = optuna.create_study(study_name="t::p")
     monkeypatch.setattr(optuna.Study, "get_trials", _raiser(_storage_gone()))
-    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p")
+    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p", confirm=True)
 
 
 def _recover_while_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -526,8 +539,8 @@ def _recover_while_locked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ob
         return recover_run(state_dir, run_id, confirm=True, emit=lambda _message: None)
 
 
-def _recover_over_pre_cutover_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Recover from a state directory the 0.3.1 runtime left: run handles, no format marker."""
+def _recover_over_unmarked_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover from a state directory holding run handles but no format marker."""
     state_dir = tmp_path / "mcp-state"
     RunStore(state_dir).create(make_run_handle(run_id="wrap-recover"))
     (state_dir / _STATE_FORMAT_MARKER_NAME).unlink()
@@ -635,7 +648,7 @@ def _scan_registry(
         trial_dir.mkdir()
         damage(_registered_entry(experiment, trial_dir))
         patch(monkeypatch)
-        return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+        return _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     return trigger
 
@@ -672,14 +685,12 @@ def _recover_through_retargeted_workdir(tmp_path: Path, monkeypatch: pytest.Monk
     return recover_run(state_dir, run_id, confirm=False, emit=lambda _message: None)
 
 
-def _refuse_as_prior_release(study: optuna.Study) -> None:
+def _refuse_mixed_types_same_remedy(study: optuna.Study) -> None:
     """Refuse each phase with a different type that names the same remedy."""
     error_type = (
         StudySchemaMismatchError if study.study_name == "t::a" else StudyFingerprintMismatchError
     )
-    raise error_type(
-        f"{study.study_name} predates this release.", action=OperatorAction.USE_PRIOR_RELEASE
-    )
+    raise error_type(f"{study.study_name} is unsupported.", action=OperatorAction.FRESH_NAMESPACE)
 
 
 def _preflight(
@@ -710,15 +721,15 @@ def _preflight(
     return trigger
 
 
-def _two_precutover_studies() -> dict[str, optuna.Study]:
-    """Return two populated studies that predate the schema stamp."""
+def _two_unmarked_studies() -> dict[str, optuna.Study]:
+    """Return two populated studies with no PhaseSweep schema stamp."""
     return {"a": _populated_study("t::a"), "b": _populated_study("t::b")}
 
 
 def _refuse_schema_differently(study: optuna.Study) -> None:
     """Refuse each phase with the same type but a different remedy."""
     action = (
-        OperatorAction.USE_PRIOR_RELEASE
+        OperatorAction.RESTORE_LEDGER
         if study.study_name == "t::a"
         else OperatorAction.FRESH_NAMESPACE
     )
@@ -828,11 +839,11 @@ WRAP_CASES = (
     RoutingCase(
         # Composed: the inbound refusal is a ValueError carrying no action, so the
         # site supplies the one its message names.
-        id="recover_run_pre_cutover_state",
-        trigger=_recover_over_pre_cutover_state,
+        id="recover_run_unmarked_state",
+        trigger=_recover_over_unmarked_state,
         raised=RunRecoveryError,
-        action=OperatorAction.USE_PRIOR_RELEASE,
-        message="use a fresh MCP state directory or the preserved PhaseSweep 0.3.1 runtime",
+        action=OperatorAction.FRESH_NAMESPACE,
+        message="use a fresh MCP state directory",
     ),
     RoutingCase(
         # Composed: a path with no run-store layout is a wrong argument, even
@@ -930,15 +941,15 @@ WRAP_CASES = (
     ),
     RoutingCase(
         id="preflight_same_type_aggregate",
-        trigger=_preflight(_two_precutover_studies),
+        trigger=_preflight(_two_unmarked_studies),
         raised=StudySchemaMismatchError,
-        action=OperatorAction.USE_PRIOR_RELEASE,
+        action=OperatorAction.FRESH_NAMESPACE,
         message=_PREFLIGHT_AGGREGATE,
     ),
     RoutingCase(
         # One type does not make one remedy: disagreeing refusals route to reading them.
         id="preflight_same_type_aggregate_disagreeing",
-        trigger=_preflight(_two_precutover_studies, schema_check=_refuse_schema_differently),
+        trigger=_preflight(_two_unmarked_studies, schema_check=_refuse_schema_differently),
         raised=StudySchemaMismatchError,
         action=OperatorAction.INSPECT_LOGS,
         message=_PREFLIGHT_AGGREGATE,
@@ -953,9 +964,9 @@ WRAP_CASES = (
     ),
     RoutingCase(
         id="preflight_mixed_aggregate_agreeing",
-        trigger=_preflight(_two_precutover_studies, schema_check=_refuse_as_prior_release),
+        trigger=_preflight(_two_unmarked_studies, schema_check=_refuse_mixed_types_same_remedy),
         raised=PhaseSweepError,
-        action=OperatorAction.USE_PRIOR_RELEASE,
+        action=OperatorAction.FRESH_NAMESPACE,
         message=_PREFLIGHT_AGGREGATE,
     ),
 )
@@ -980,7 +991,7 @@ def _reconcile_prepared_over_damaged_publication(
 ) -> object:
     """Reconcile a prepared publication after the last-success target lost its summary."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    published = _last_successful_generation_id(experiment)
+    published = published_generation_id(experiment)
     assert published is not None
     _generation_summary_path(experiment, published).unlink()
     needs = replace(
@@ -1013,7 +1024,7 @@ def _preflight_registered_trial_without_attempt(
     running.set_user_attr(TRIAL_DIR_ATTR, str(attempt_dir))
     running.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
     study.tell(running, state=optuna.trial.TrialState.FAIL)
-    return _preflight_active_attempts(experiment, _PreflightCleanupReport())
+    return _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
 
 def _inspect_uncertain(*kept: str) -> Trigger:
@@ -1033,7 +1044,8 @@ def _inspect_uncertain(*kept: str) -> Trigger:
             uncertain.set_user_attr(key, identity[key])
         uncertain.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
         study.tell(uncertain, state=optuna.trial.TrialState.FAIL)
-        return _inspect_cleanup_uncertain_trials(study, "p")
+        experiment = make_experiment(workdir=tmp_path / "runs")
+        return _recover_cleanup_uncertain_trials(study, experiment, "p", confirm=False)
 
     return trigger
 
@@ -1087,7 +1099,7 @@ def _reap_running_trial(tmp_path: Path, **attrs: object) -> object:
     running = study.ask()
     for key, value in attrs.items():
         running.set_user_attr(key, value)
-    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p")
+    return _reap_stale_trials(study, make_experiment(workdir=tmp_path / "runs"), "p", confirm=True)
 
 
 def _reap_trial_with_invalid_trial_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1193,20 +1205,101 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
     )
 
 
-def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-    """Re-run a phase whose study durably aborted at its current trial target."""
-    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
-    phase = experiment.phases[0]
-    study = optuna.load_study(
+def _append_failure_outcomes(
+    study: optuna.Study, count: int, *, abort_for: Phase | None = None
+) -> None:
+    """Append failed trials after the study's last outcome, the last carrying an abort.
+
+    :param optuna.Study study: The golden fixture's phase study.
+    :param int count: Failed trials to append.
+    :param Phase | None abort_for: Phase whose consecutive-failure abort the last
+        appended outcome records, or ``None`` to record no abort.
+    """
+    trials = study.get_trials(deepcopy=False)
+    digest = trials[0].user_attrs[TRAINER_ENV_DIGEST_ATTR]
+    last = max(trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials)
+    for sequence in range(last + 1, last + count + 1):
+        outcome: dict[str, object] = {
+            "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+            "sequence": sequence,
+            "outcome": "failure",
+        }
+        if abort_for is not None and sequence == last + count:
+            outcome[TRIAL_OUTCOME_ABORT_KEY] = _failure_policy_abort_record(
+                abort_for,
+                consecutive_failures=count,
+                completion_sequence=sequence,
+                trial_target=abort_for.n_trials,
+            )
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.FAIL,
+                user_attrs={TRAINER_ENV_DIGEST_ATTR: digest, TRIAL_OUTCOME_ATTR: outcome},
+            )
+        )
+
+
+def _fixture_study(experiment: Experiment) -> optuna.Study:
+    """Open the golden fixture's phase study for direct edits."""
+    return optuna.load_study(
         study_name="t::p", storage=engine_ledger._resolve_storage(experiment.resolved_storage)
     )
+
+
+def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Re-run a phase whose outcome ledger recorded an abort at its current trial target."""
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    study = _fixture_study(experiment)
+    phase = experiment.phases[0].model_copy(update={"n_trials": 4})
+    _append_failure_outcomes(study, 2, abort_for=phase)
+    study.set_user_attr(TRIAL_TARGET_ATTR, 4)
+    return run_experiment(experiment.model_copy(update={"phases": [phase]}))
+
+
+def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Resume, at its accepted target, a phase whose failure streak meets a lowered limit.
+
+    The fixture's trials carry the environment digest of the shell that generated
+    it, so preflight's cohort check (routed by ``environment_cohort_changed``) is
+    stubbed to keep this case independent of the ambient environment.
+    """
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    study = _fixture_study(experiment)
+    _append_failure_outcomes(study, 2)
+    study.set_user_attr(TRIAL_TARGET_ATTR, 5)
+    monkeypatch.setattr(guards, "_validate_environment_cohort", lambda study, digest: None)
+    phase = experiment.phases[0].model_copy(update={"n_trials": 5, "max_consecutive_failures": 2})
+    return run_experiment(experiment.model_copy(update={"phases": [phase]}))
+
+
+def _replay_partial_decision_without_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Re-run a phase whose accepted partial-timeout decision this config does not accept."""
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    study = _fixture_study(experiment)
+    trials = study.get_trials(deepcopy=False)
+    target = len(trials) + 1
+    study.set_user_attr(TRIAL_TARGET_ATTR, target)
     study.set_user_attr(
-        PHASE_ABORT_ATTR,
-        _failure_policy_abort_record(
-            phase, consecutive_failures=2, completion_sequence=2, trial_target=phase.n_trials
-        ),
+        PHASE_DECISION_ATTR,
+        {
+            "schema_version": PHASE_DECISION_SCHEMA_VERSION,
+            "decision": "accepted_partial_timeout",
+            "trial_target": target,
+            "outcome_sequence": max(
+                trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials
+            ),
+            "finished_trials": len(trials),
+            "completed_trials": sum(
+                trial.state is optuna.trial.TrialState.COMPLETE for trial in trials
+            ),
+            "timeout_scope": "phase",
+            "recovered_abort_sequence": None,
+        },
     )
-    return run_experiment(experiment)
+    phase = experiment.phases[0].model_copy(update={"n_trials": target})
+    return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 
 
 def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
@@ -1217,9 +1310,7 @@ def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         experiment,
         experiment.phases[0],
         {},
-        published_generation_id=_last_successful_generation_id(
-            experiment, raise_on_manifest_error=True
-        ),
+        publication=_published_for_resume(experiment),
     )
 
 
@@ -1233,9 +1324,7 @@ def _resume_after_phase_edit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         experiment.model_copy(update={"phases": [edited]}),
         edited,
         {},
-        published_generation_id=_last_successful_generation_id(
-            experiment, raise_on_manifest_error=True
-        ),
+        publication=_published_for_resume(experiment),
     )
 
 
@@ -1450,7 +1539,14 @@ ORIGIN_CASES = (
         trigger=_rerun_aborted_phase,
         raised=NoFeasibleTrialError,
         action=OperatorAction.FIX_CONFIG,
-        message="Increase n_trials above 2 to explicitly schedule new recovery attempts",
+        message="Increase n_trials above 4 to explicitly schedule new recovery attempts",
+    ),
+    RoutingCase(
+        id="failure_streak_at_limit",
+        trigger=_resume_with_streak_at_limit,
+        raised=NoFeasibleTrialError,
+        action=OperatorAction.FIX_CONFIG,
+        message="meets max_consecutive_failures=2, so it launches no more trials",
     ),
     RoutingCase(
         id="winner_incomplete_without_opt_in",
@@ -1458,6 +1554,13 @@ ORIGIN_CASES = (
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
         message="unless the current config sets allow_incomplete_on_timeout: true.",
+    ),
+    RoutingCase(
+        id="partial_decision_without_opt_in",
+        trigger=_replay_partial_decision_without_opt_in,
+        raised=WinnerIntegrityError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Refusing to replay it unless the current config sets",
     ),
     RoutingCase(
         id="winner_phase_config_changed",
@@ -1577,7 +1680,6 @@ def test_recover_run_lets_a_defect_keep_its_traceback(
 # did not route fails as surely as one that omits a step.
 _STEP_MARKERS: Mapping[OperatorAction, str] = MappingProxyType(
     {
-        OperatorAction.USE_PRIOR_RELEASE: "preserved PhaseSweep release",
         OperatorAction.FRESH_NAMESPACE: "new experiment name",
         OperatorAction.RESTORE_LEDGER: "storage ledger",
         OperatorAction.RESTORE_TREE: "repair the experiment tree",

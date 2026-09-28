@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 
 import optuna
 
@@ -11,9 +12,10 @@ import phasesweep.engine.evidence as evidence_ops
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.publication as publication_ops
 import phasesweep.engine.study_policy as study_policy_ops
-from phasesweep.config import Experiment
+from phasesweep.config import Experiment, Phase
 from phasesweep.engine.errors import StudyContextConflictError
 from phasesweep.engine.optuna import _finished_trial_count
+from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, Winner
 
 
@@ -37,6 +39,8 @@ def _preflight_skipped_winners(
         or incomplete.
     :raises StudyFingerprintMismatchError: A skipped phase's winner fingerprint
         disagrees with the current config.
+    :raises TrialEvidenceMissingError: A skipped winner's source trial evidence
+        is missing or changed.
     :raises PublicationAccessError: The published manifest cannot be read as
         the current user.
     :raises PublicationIntegrityError: The published manifest fails validation.
@@ -48,10 +52,7 @@ def _preflight_skipped_winners(
     # safe here, unlike in status reads: this preflight runs under
     # _experiment_lock, and this experiment's pointer only advances at this
     # run's final publish.
-    published_generation_id = publication_ops._last_successful_generation_id(
-        experiment,
-        raise_on_manifest_error=True,
-    )
+    publication = _published_for_resume(experiment)
 
     winners: dict[str, Winner] = {}
     for phase in experiment.phases:
@@ -61,17 +62,57 @@ def _preflight_skipped_winners(
             )
         if phase.name == from_phase:
             return winners
-        inherited = {parent: winners[parent] for parent in phase.inherits}
-        winner = artifact_io._load_winner(
-            experiment,
-            phase,
-            inherited,
-            published_generation_id=published_generation_id,
-        )
-        evidence_ops._verify_skipped_winner_evidence(experiment, phase, winner)
-        winners[phase.name] = winner
+        winners[phase.name] = _accept_skipped_winner(experiment, phase, winners, publication)
 
     raise ValueError(f"Unknown --from-phase value {from_phase!r}.")
+
+
+def _published_for_resume(experiment: Experiment) -> ValidatedPublication | None:
+    """Resolve the publication a resume builds on, refusing one that does not validate.
+
+    :param Experiment experiment: Experiment being resumed.
+    :raises PublicationAccessError: The published manifest cannot be read as
+        the current user.
+    :raises PublicationIntegrityError: The published manifest fails validation.
+    :return ValidatedPublication | None: Everything the validation read, or
+        ``None`` when no usable publication exists.
+    """
+    return publication_ops._resolve_publication_pointer(
+        experiment,
+        raise_on_manifest_error=True,
+    ).validated
+
+
+def _accept_skipped_winner(
+    experiment: Experiment,
+    phase: Phase,
+    winners: Mapping[str, Winner],
+    publication: ValidatedPublication | None,
+) -> Winner:
+    """Load one skipped phase's published winner and prove the resume may build on it.
+
+    This is the one rule for accepting a skipped winner. The run preflight and
+    the MCP launch gate both apply it, each reporting a refusal its own way.
+
+    :param Experiment experiment: Experiment being resumed.
+    :param Phase phase: Skipped phase whose winner is accepted.
+    :param Mapping[str, Winner] winners: Winners already accepted for earlier
+        phases, which supply ``phase``'s inherited context.
+    :param ValidatedPublication | None publication: The publication resolved
+        once for the whole resume.
+    :raises FileNotFoundError: The publication holds no winner for the phase.
+    :raises WinnerIntegrityError: The winner is incompatible with the current
+        partial-result policy.
+    :raises StudyFingerprintMismatchError: The winner was produced by a
+        different phase config.
+    :raises TrialEvidenceMissingError: The winner's source trial evidence is
+        missing or changed.
+    :return Winner: The accepted winner.
+    """
+    inherited = {parent: winners[parent] for parent in phase.inherits}
+    winner = artifact_io._load_winner(experiment, phase, inherited, publication=publication)
+    evidence_ops._verify_skipped_winner_evidence(experiment, phase, winner)
+    return winner
 
 
 def _reject_bound_descendant_topups(
@@ -92,8 +133,9 @@ def _reject_bound_descendant_topups(
     :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
         phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
     :raises StudyContextConflictError: An upstream phase still has unfinished
-        top-up trials remaining while an inheriting descendant already has a
-        study bound to a published winner fingerprint.
+        top-up trials remaining while an inheriting descendant's study is bound
+        to its published winner: it holds a stored fingerprint and at least
+        one trial.
     """
     for index, phase in experiment.phases_from(from_phase):
         study = existing_studies.get(phase.name)
@@ -113,11 +155,16 @@ def _reject_bound_descendant_topups(
         for candidate in experiment.phases[index + 1 :]:
             if any(parent in reached for parent in candidate.inherits):
                 reached.add(candidate.name)
+        # Only a populated descendant has consumed this winner. The fingerprint
+        # is stamped before resource preflight, so a child that failed
+        # preflight holds a fingerprint and no trials, and _verify_fingerprint
+        # rebinds such an empty study to the new inherited config.
         bound = [
             name
             for name in sorted(reached - {phase.name})
             if (dependent := existing_studies.get(name)) is not None
             and isinstance(dependent.user_attrs.get(PHASE_FINGERPRINT_ATTR), str)
+            and dependent.get_trials(deepcopy=False)
         ]
         if bound:
             raise StudyContextConflictError(

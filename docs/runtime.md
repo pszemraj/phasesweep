@@ -6,31 +6,6 @@ trainer subprocesses. GPUs are optional; the core CLI can run CPU-only work.
 The optional MCP server additionally requires Linux `/proc` process identity
 information for detached-run cancellation and recovery.
 
-## Fresh-state cutover
-
-This breaking release has one current on-disk format. Start it with all of the
-following:
-
-- a fresh artifact root (`<workdir>/<experiment>`), including for in-memory
-  storage;
-- a fresh local journal ledger, if the experiment is persistent; and
-- a fresh MCP `state_dir`, if the experiment is launched through MCP.
-
-The runtime checks an existing artifact root and local ledger before it creates
-or stamps state. It refuses missing, malformed, or unsupported PhaseSweep
-format records without modifying that namespace. An unmarked durable MCP state
-directory is likewise refused before it is initialized.
-
-> [!NOTE]
-> A new experiment name or workdir does not make an old populated local ledger
-> fresh: the format check covers every PhaseSweep study in the ledger, not only
-> the current experiment's.
-
-There is no migration, adoption, relocation, rebind, or repair path in this
-release. Operate an existing 0.3.1 output, ledger, or MCP state directory with
-the preserved 0.3.1 environment. Choose new paths for the consolidated
-release.
-
 ## Output layout
 
 For `workdir: ./runs` and `experiment: demo`, PhaseSweep writes under
@@ -231,12 +206,20 @@ detection.
 Trial, phase, and experiment timeouts are cooperative run controls. On a
 trial timeout PhaseSweep terminates the supervised process group and records a
 terminal failed attempt after cleanup. The `max_consecutive_failures` threshold
-also stops a broken phase. When both stop the same phase short of its target,
-the timeout decides the outcome: with `allow_incomplete_on_timeout` the phase
+also stops a broken phase. The abort is recorded with the outcome that trips
+it, so a trial that succeeds afterwards cannot turn the phase back into a
+result, and a rerun stays refused until `n_trials` is raised. Changing
+`max_consecutive_failures` governs new work only: it never aborts a completed
+phase retroactively, and a resumed phase whose failure streak already meets
+the new limit launches nothing until `n_trials` or the limit is raised. When a
+timeout and the threshold both stop the same phase short of its target, the
+timeout decides the outcome: with `allow_incomplete_on_timeout` the phase
 publishes the winner its completed trials earned, and without it the run stops
 as a timeout, so a retry with a larger budget does not replay the failure
-abort. `n_trials` counts terminal attempts, so failed and pruned attempts
-consume the configured target.
+abort. A rerun or `--from-phase` reuses an incomplete result only while the
+config still sets `allow_incomplete_on_timeout`; raising `n_trials` continues
+the phase instead. `n_trials` counts terminal attempts, so failed and pruned
+attempts consume the configured target.
 
 Before a supported continuation, PhaseSweep first checks the artifact-root and
 ledger binding, then reconciles stale active attempts, and only then verifies
@@ -256,9 +239,8 @@ ambiguous.
 Use `validate`, `run --dry-run`, `status`, and `show-winners` to review an
 experiment without launching work; an ordinary `run` invocation launches
 trials. `--from-phase` requires valid earlier winners. These reads inspect only
-the current-format local experiment; use the original 0.3.1 environment for
-existing 0.3.1 state. For per-trial tables and plots, point Optuna's own tools
-at the ledger as described in
+the current-format local experiment. For per-trial tables and plots, point
+Optuna's own tools at the ledger as described in
 [Inspect the ledger with Optuna](#inspect-the-ledger-with-optuna).
 
 > [!TIP]

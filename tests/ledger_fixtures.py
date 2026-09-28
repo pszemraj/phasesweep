@@ -35,7 +35,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _last_successful_generation_path,
 )
-from phasesweep.engine.publication import _last_successful_generation_id
+from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
 from tests.fixtures.make_ledger_fixtures import (
     LEDGER_FILENAME,
@@ -218,8 +218,7 @@ def _write_config(
     two paths substituted. Neither path is part of the experiment's semantic
     fingerprint, and the builder pins the trainer cwd, so a fixture the current
     generator produced reports ``published_config_matches_current`` from any
-    checkout path. The ``release-*`` fixtures carry their release's own
-    fingerprints; every read refuses them before comparing one.
+    checkout path.
 
     :param Path config_path: Where to write the YAML.
     :param str backend: Ledger backend recorded in the manifest.
@@ -344,6 +343,23 @@ def ledger_file(materialized: Materialized, backend: str) -> Path:
     return materialized.ledger_dir / LEDGER_FILENAME
 
 
+def published_generation_id(
+    experiment: Experiment, *, raise_on_manifest_error: bool = False
+) -> str | None:
+    """Return the last-success generation id when its publication validates.
+
+    :param Experiment experiment: Experiment whose pointer is resolved.
+    :param bool raise_on_manifest_error: Re-raise a manifest failure instead of
+        returning ``None``.
+    :return str | None: The validated generation id, or ``None`` when nothing
+        usable is published.
+    """
+    pointer = _resolve_publication_pointer(
+        experiment, raise_on_manifest_error=raise_on_manifest_error
+    )
+    return pointer.generation_id if pointer.state == "ok" else None
+
+
 def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
     """Point a publication pointer at ``summary_path``'s exact bytes."""
     pointer = yaml.safe_load(pointer_path.read_text())
@@ -355,7 +371,7 @@ def reanchor_summary_pointer(pointer_path: Path, summary_path: Path) -> None:
 
 def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
     """Reseal the last-success publication so ``phase``'s winner is a partial result that still validates."""
-    generation = _last_successful_generation_id(experiment)
+    generation = published_generation_id(experiment)
     assert generation is not None
     winner_path = _generation_winner_path(experiment, generation, phase)
     summary_path = _generation_summary_path(experiment, generation)

@@ -12,6 +12,10 @@ storage ledger: combining one database's trial counts with another database's
 publication is not a partial result. They do NOT re-verify phase fingerprints:
 that check belongs to the resume path in ``engine.artifacts._load_winner``, not to
 a status read.
+
+A published generation is read once, by publication validation, and its facts
+come from what that validation read. Only a generation that is not the
+validated publication (pinned, unfinished, or failed) is read from its files.
 """
 
 from __future__ import annotations
@@ -38,12 +42,8 @@ from phasesweep.engine.paths import (
     _generation_summary_path,
     _generation_winner_path,
 )
-from phasesweep.engine.publication import (
-    _last_successful_generation_id,
-    _published_winner_path,
-    _published_winner_path_for,
-    _resolve_publication_pointer,
-)
+from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
+from phasesweep.engine.publication_validation import _parse_phase_plan
 from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PublicationState,
@@ -98,8 +98,7 @@ def _phase_status_payloads(
     trial_data_available: Mapping[str, bool],
     running_attempts: Mapping[str, list[dict[str, Any]] | None],
     unavailable_published_phases: set[str],
-    winner_scope_generation_id: str | None = None,
-    pinned: bool = False,
+    winners_present: set[str],
 ) -> list[dict[str, Any]]:
     """Build the path-free per-phase status payloads ``read_status`` returns.
 
@@ -107,14 +106,12 @@ def _phase_status_payloads(
     path-bearing phase view from this function's output instead of asking it
     for paths, so no call here can ever put a filesystem path in its result.
 
-    ``winner_scope_generation_id`` must already be resolved by the caller
-    exactly once (e.g. a single :func:`phasesweep.engine.publication._resolve_publication_pointer`
-    call, or a caller-pinned id) and is reused for every phase in this one
-    call -- this function never re-resolves the last-success pointer itself,
-    so one status object spanning several phases can never mix identities
-    from two different pointer resolutions (review v0.5.15 / blocker 3).
+    ``winners_present`` must come from the caller's single resolution of the
+    represented generation, so one status object spanning several phases can
+    never mix identities from two different pointer resolutions (review
+    v0.5.15 / blocker 3).
 
-    :param Experiment experiment: Parsed experiment whose phase study counts and winner files should be inspected.
+    :param Experiment experiment: Parsed experiment whose phase study counts are reported.
     :param Mapping[str, dict[str, int]] trial_counts: Pre-read counts keyed by phase name.
     :param Mapping[str, dict[str, int]] generation_trial_counts: Counts for the represented generation, keyed by phase name.
     :param Mapping[str, bool] trial_data_available: Storage-read
@@ -129,28 +126,12 @@ def _phase_status_payloads(
         reviewer 2, blocker 6).
     :param set[str] unavailable_published_phases: Published phases whose local
         trial identity could not be matched in the storage snapshot.
-    :param str | None winner_scope_generation_id: Already-resolved generation id
-        whose winner files are represented. When ``pinned`` is ``False``
-        (default), this is an already-captured last-success id. When
-        ``pinned`` is ``True``, this is a caller-known generation id read
-        directly.
-    :param bool pinned: Whether ``winner_scope_generation_id`` names an exact,
-        caller-pinned generation rather than an already-captured last-success id.
+    :param set[str] winners_present: Phases whose winner the represented
+        generation holds.
     :return list[dict[str, Any]]: One status payload per phase in declaration order.
     """
     phases: list[dict[str, Any]] = []
     for phase in experiment.phases:
-        winner_path: Path | None
-        if pinned:
-            assert winner_scope_generation_id is not None
-            winner_path = _generation_winner_path(
-                experiment, winner_scope_generation_id, phase.name
-            )
-        else:
-            winner_path = _published_winner_path_for(
-                experiment, winner_scope_generation_id, phase.name
-            )
-        winner_present = winner_path is not None and winner_path.is_file()
         counts = trial_counts[phase.name]
         payload: dict[str, Any] = {
             "trials": counts,
@@ -161,30 +142,22 @@ def _phase_status_payloads(
             "trial_data_available": trial_data_available[phase.name],
             "published_study_unavailable": phase.name in unavailable_published_phases,
             "phase": phase.name,
-            "winner_present": winner_present,
+            "winner_present": phase.name in winners_present,
             "running_attempts": running_attempts[phase.name],
         }
         phases.append(payload)
     return phases
 
 
-def _read_winner_path(path: Path | None, phase_name: str) -> PhaseWinnerView | None:
-    """Parse one already-resolved winner path using the permissive read contract.
+def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | None:
+    """Reduce one decoded winner payload using the permissive read contract.
 
-    :param Path | None path: Winner path selected by the caller, or ``None``.
-    :param str phase_name: Phase name exposed by the selected winner.
-    :return PhaseWinnerView | None: Parsed winner, or ``None`` when absent or malformed.
+    :param Mapping[str, Any] data: Decoded winner payload.
+    :param str phase_name: Phase name exposed by the winner.
+    :return PhaseWinnerView | None: The winner view, or ``None`` when the
+        payload is malformed.
     """
-    if path is None or not path.is_file():
-        return None
     try:
-        loaded = yaml.safe_load(path.read_text())
-        if loaded is None:
-            data: Mapping[str, Any] = {}
-        elif isinstance(loaded, Mapping):
-            data = loaded
-        else:
-            return None
         # winner.yaml stores metric as {<metric_name>: value, "goal": ...}. The
         # winner is historical evidence: pull the value by the name the file
         # itself recorded, NOT the currently configured metric name — reading
@@ -207,8 +180,6 @@ def _read_winner_path(path: Path | None, phase_name: str) -> PhaseWinnerView | N
             return None
         effective_overrides = data.get("effective_overrides") or {}
         if not isinstance(effective_overrides, Mapping):
-            return None
-        if "promotion" in data:
             return None
         source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
         return PhaseWinnerView(
@@ -233,10 +204,71 @@ def _read_winner_path(path: Path | None, phase_name: str) -> PhaseWinnerView | N
             ),
             source=source,
         )
-    except (KeyError, ValueError, TypeError, OSError, yaml.YAMLError):
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def _read_winner_path(path: Path, phase_name: str) -> PhaseWinnerView | None:
+    """Read one unvalidated winner file using the permissive read contract.
+
+    Only a generation that is not the validated publication is read this way:
+    a pinned, unfinished, or failed one. A published winner is never reread;
+    it comes from the bytes publication validation read.
+
+    :param Path path: Winner path in the represented generation.
+    :param str phase_name: Phase name exposed by the winner.
+    :return PhaseWinnerView | None: Parsed winner, or ``None`` when absent or malformed.
+    """
+    if not path.is_file():
+        return None
+    try:
+        loaded = yaml.safe_load(path.read_text())
+    except (OSError, ValueError, yaml.YAMLError):
         # Partially-written or malformed file (or unlinked between the is_file
         # check and the read): report as no-winner-yet rather than raising.
         return None
+    if not isinstance(loaded, Mapping):
+        return None
+    return _winner_view(loaded, phase_name)
+
+
+def _represented_winners(
+    experiment: Experiment,
+    publication: PublicationPointer,
+    represented_generation_id: str | None,
+    phase_names: Sequence[str],
+) -> list[PhaseWinnerView]:
+    """Return the represented generation's winners, in ``phase_names`` order.
+
+    When the represented generation is the validated publication, every winner
+    comes from the bytes that validation read and nothing is reread. Any other
+    generation is read permissively from its files.
+
+    :param Experiment experiment: Experiment whose artifact tree is read.
+    :param PublicationPointer publication: This read's single pointer resolution.
+    :param str | None represented_generation_id: Generation whose winners are
+        represented, or ``None`` when there is none.
+    :param Sequence[str] phase_names: Safe phase names to enumerate.
+    :return list[PhaseWinnerView]: One view per named phase that has a usable winner.
+    """
+    if represented_generation_id is None:
+        return []
+    validated = publication.validated
+    views: list[PhaseWinnerView | None]
+    if validated is not None and validated.generation_id == represented_generation_id:
+        views = [
+            _winner_view(validated.winners[name].payload, name)
+            for name in phase_names
+            if name in validated.winners
+        ]
+    else:
+        views = [
+            _read_winner_path(
+                _generation_winner_path(experiment, represented_generation_id, name), name
+            )
+            for name in phase_names
+        ]
+    return [view for view in views if view is not None]
 
 
 def read_winner(
@@ -266,16 +298,13 @@ def read_winner(
         lives in ``engine.artifacts._load_winner`` and is intentionally not
         relaxed here.
 
+    Raises:
+        ValueError: If ``phase_name`` or ``generation_id`` is not a safe path
+            component.
+
     """
-    validate_ledger(experiment)
-    if generation_id is not None:
-        _validate_safe_name("generation", generation_id)
-    path = (
-        _published_winner_path(experiment, phase_name)
-        if generation_id is None
-        else _generation_winner_path(experiment, generation_id, phase_name)
-    )
-    return _read_winner_path(path, phase_name)
+    views = read_winners(experiment, generation_id=generation_id, phase_names=[phase_name])
+    return views[0] if views else None
 
 
 def read_winners(
@@ -305,32 +334,34 @@ def read_winners(
         One :class:`PhaseWinnerView` per named phase that has a winner on disk.
 
     Raises:
-        ValueError: If ``phase_names`` contains a name that is not a safe path
-            component. Plans parsed off disk are filtered before they reach
-            here, so this only fires on a programming error.
+        ValueError: If ``generation_id`` or a name in ``phase_names`` is not a
+            safe path component. Plans parsed off disk are filtered before
+            they reach here, so this only fires on a programming error.
 
     """
     validate_ledger(experiment)
-    published_generation_id: str | None = None
     if generation_id is not None:
         _validate_safe_name("generation", generation_id)
-    else:
-        published_generation_id = _last_successful_generation_id(experiment)
     names = (
         [phase.name for phase in experiment.phases]
         if phase_names is None
         else [_validate_safe_name("phase", name) for name in phase_names]
     )
-    paths = (
-        (
-            _generation_winner_path(experiment, generation_id, name)
-            if generation_id is not None
-            else _published_winner_path_for(experiment, published_generation_id, name)
-        )
-        for name in names
+    publication = _resolve_publication_pointer(experiment)
+    represented_generation_id = (
+        generation_id if generation_id is not None else _published_generation_id(publication)
     )
-    views = (_read_winner_path(path, name) for name, path in zip(names, paths, strict=True))
-    return [view for view in views if view is not None]
+    return _represented_winners(experiment, publication, represented_generation_id, names)
+
+
+def _published_generation_id(publication: PublicationPointer) -> str | None:
+    """Return the generation a pointer resolution may report as published.
+
+    :param PublicationPointer publication: One pointer resolution.
+    :return str | None: The validated generation id, or ``None`` when the
+        resolution is anything but ``ok``.
+    """
+    return publication.generation_id if publication.state == "ok" else None
 
 
 def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None:
@@ -344,29 +375,24 @@ def _read_summary_payload(summary_path: Path | None) -> Mapping[str, Any] | None
         return None
     try:
         payload = yaml.safe_load(summary_path.read_text())
-    except (OSError, yaml.YAMLError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
     if not isinstance(payload, Mapping):
         return None
     if payload.get("schema_version") != GENERATION_SUMMARY_SCHEMA_VERSION:
         return None
-    if "promotion_decisions" in payload:
-        return None
     return payload
 
 
 def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] | None:
-    """Return the phase names a represented generation published under.
+    """Return the phase names an unvalidated represented generation recorded.
 
-    Only the ``name`` of each ``phase_plan`` entry is read. The summary's other
-    phase records (``phases``) carry composed hyperparameters that agent-facing
-    payloads must never see; the plan is the design-time list the engine froze
-    beside the metric semantics for exactly this purpose (engine/run.py's
-    generation summary).
-
-    An entry that is not a mapping with a safe name invalidates the whole plan:
-    these names become path components, and a partially parsed plan would
-    under-report the publication just as badly as the current config does.
+    Only the plan's names are returned. The summary's other phase records
+    (``phases``) carry composed hyperparameters that agent-facing payloads
+    must never see; the plan is the design-time list the engine froze beside
+    the metric semantics for exactly this purpose (engine/run.py's generation
+    summary). The plan is parsed by the same rule publication validation
+    applies, which refuses what this permissive read reports as no plan.
 
     :param Mapping[str, Any] | None summary_payload: Parsed generation summary, or ``None``.
     :return list[str] | None: Recorded phase names in execution order, or
@@ -374,18 +400,8 @@ def _summary_phase_plan(summary_payload: Mapping[str, Any] | None) -> list[str] 
     """
     if summary_payload is None:
         return None
-    stored_plan = summary_payload.get("phase_plan")
-    if not isinstance(stored_plan, list) or not stored_plan:
-        return None
-    names: list[str] = []
-    for item in stored_plan:
-        if not isinstance(item, Mapping):
-            return None
-        name = item.get("name")
-        if not isinstance(name, str) or not SAFE_NAME_PATTERN.fullmatch(name):
-            return None
-        names.append(name)
-    return names
+    plan = _parse_phase_plan(summary_payload.get("phase_plan"))
+    return None if plan is None else [phase.name for phase in plan]
 
 
 _OBJECTIVE_EVIDENCE_KEYS = frozenset(_ObjectiveEvidenceFields.model_fields)
@@ -421,7 +437,7 @@ def _current_pointer_generation_id(experiment: Experiment) -> str | None:
     """
     try:
         generation = yaml.safe_load(_generation_path(experiment).read_text())
-    except (OSError, yaml.YAMLError):
+    except (OSError, ValueError, yaml.YAMLError):
         return None
     if not isinstance(generation, Mapping):
         return None
@@ -566,30 +582,99 @@ def read_status(
         config fingerprint against the current config's semantic fingerprint;
         ``None`` when the represented summary records no fingerprint.
     """
+    status, _publication = _read_status(
+        experiment,
+        generation_id=generation_id,
+        comparison_experiment=comparison_experiment,
+    )
+    return status
+
+
+def read_result(
+    experiment: Experiment,
+    *,
+    generation_id: str | None = None,
+    comparison_experiment: Experiment | None = None,
+) -> tuple[dict[str, Any], list[PhaseWinnerView]]:
+    """Read status and the represented generation's winners from one pointer resolution.
+
+    A caller that reports both must not pair :func:`read_status` with a
+    separate :func:`read_winners`: two pointer resolutions could describe two
+    different publications. Winners are enumerated under the status payload's
+    ``result_phase_plan``, so a phase renamed since publication neither hides
+    its published winner nor reports the new name as missing (review v0.5.16 /
+    blocker 4). A published generation's winners are the bytes publication
+    validation read; any other represented generation is read permissively.
+
+    :param Experiment experiment: Parsed experiment config whose phases are inspected.
+    :param str | None generation_id: Optional generation to represent, as for
+        :func:`read_status`.
+    :param Experiment | None comparison_experiment: Optional current config
+        for drift comparison, as for :func:`read_status`.
+    :raises ArtifactRootConflictError: If the artifact root cannot be read or
+        is bound to a different storage ledger or experiment.
+    :raises ValueError: If ``generation_id`` is not a safe generation name.
+    :return tuple[dict[str, Any], list[PhaseWinnerView]]: The path-free
+        :func:`read_status` payload and one winner view per recorded phase
+        that has a usable winner.
+    """
+    status, publication = _read_status(
+        experiment,
+        generation_id=generation_id,
+        comparison_experiment=comparison_experiment,
+    )
+    winners = _represented_winners(
+        experiment,
+        publication,
+        status["represented_generation_id"],
+        status["result_phase_plan"],
+    )
+    return status, winners
+
+
+def _read_status(
+    experiment: Experiment,
+    *,
+    generation_id: str | None,
+    comparison_experiment: Experiment | None,
+) -> tuple[dict[str, Any], PublicationPointer]:
+    """Build the :func:`read_status` payload and return the resolution behind it.
+
+    :param Experiment experiment: Parsed experiment config whose phases are inspected.
+    :param str | None generation_id: Optional generation to represent.
+    :param Experiment | None comparison_experiment: Optional current config for
+        drift comparison.
+    :raises ArtifactRootConflictError: If the artifact root cannot be read or
+        is bound to a different storage ledger or experiment.
+    :raises ValueError: If ``generation_id`` is not a safe generation name.
+    :return tuple[dict[str, Any], PublicationPointer]: The status payload and
+        the single pointer resolution every fact in it came from.
+    """
     ledger = validate_ledger(experiment)
     current_generation_id = _current_pointer_generation_id(experiment)
     publication = _resolve_publication_pointer(experiment)
-    published_generation_id = publication.generation_id if publication.state == "ok" else None
+    published_generation_id = _published_generation_id(publication)
 
     if generation_id is None:
         represented_generation_id = published_generation_id
         trial_scope_generation_id = current_generation_id
-        winner_scope_generation_id = published_generation_id
-        pinned = False
     else:
         _validate_safe_name("generation", generation_id)
         represented_generation_id = generation_id
         trial_scope_generation_id = generation_id
-        winner_scope_generation_id = generation_id
-        pinned = True
 
     is_published = (
         represented_generation_id is not None
         and represented_generation_id == published_generation_id
     )
+    # A published represented generation is exactly the validated one, so its
+    # facts come from what validation read and nothing below rereads it.
+    validated = publication.validated if is_published else None
 
     published_trials = (
-        _published_phase_trial_refs(publication.summary)
+        _published_phase_trial_refs(
+            None if publication.validated is None else publication.validated.summary
+        )
         if _artifact_root_binding_applies(experiment)
         else {}
     )
@@ -597,11 +682,6 @@ def read_status(
     # before it moves the pointer, so this capture holds every trial the
     # pointer's generation published.
     phase_stats = read_trial_stats(ledger, published_trials)
-    summary_path = (
-        _generation_summary_path(experiment, winner_scope_generation_id)
-        if winner_scope_generation_id is not None
-        else None
-    )
 
     # The represented generation's winner/summary facts are historical
     # evidence, so the metric they are reported under must be the one that
@@ -613,21 +693,41 @@ def read_status(
     metric_payload = _metric_semantics_payload(comparison.metric)
     result_phase_plan = [phase.name for phase in experiment.phases]
     result_context: ResultContext = "current_config"
-    published_config_matches_current: bool | None = None
     summary_payload: Mapping[str, Any] | None
-    if (
-        publication.state == "ok"
-        and represented_generation_id == publication.generation_id
-        and publication.summary is not None
-    ):
-        summary_payload = publication.summary
+    if validated is not None:
+        summary_payload = validated.summary
+        summary_present = True
+        winners_present = set(validated.winners)
+        result_phase_plan = [phase.name for phase in validated.phase_plan]
+        metric_payload = {
+            "name": validated.metric["name"],
+            "goal": validated.metric["goal"],
+            "objective_evidence": dict(validated.metric["objective_evidence"]),
+        }
+        result_context = "represented_generation"
     else:
+        summary_path = (
+            _generation_summary_path(experiment, represented_generation_id)
+            if represented_generation_id is not None
+            else None
+        )
         summary_payload = _read_summary_payload(summary_path)
-    if summary_payload is not None:
+        summary_present = summary_path is not None and summary_path.is_file()
+        winners_present = (
+            {
+                phase.name
+                for phase in experiment.phases
+                if _generation_winner_path(
+                    experiment, represented_generation_id, phase.name
+                ).is_file()
+            }
+            if represented_generation_id is not None
+            else set()
+        )
         stored_plan = _summary_phase_plan(summary_payload)
         if stored_plan is not None:
             result_phase_plan = stored_plan
-        stored_metric = summary_payload.get("metric")
+        stored_metric = None if summary_payload is None else summary_payload.get("metric")
         if (
             isinstance(stored_metric, Mapping)
             and isinstance(stored_metric.get("name"), str)
@@ -641,15 +741,18 @@ def read_status(
                     "objective_evidence": stored_evidence,
                 }
                 result_context = "represented_generation"
-        stored_fingerprint = summary_payload.get("config_fingerprint")
-        if isinstance(stored_fingerprint, str) and stored_fingerprint:
-            published_config_matches_current = (
-                stored_fingerprint == _experiment_semantic_fingerprint(comparison)
-            )
+    published_config_matches_current: bool | None = None
+    stored_fingerprint = (
+        None if summary_payload is None else summary_payload.get("config_fingerprint")
+    )
+    if isinstance(stored_fingerprint, str) and stored_fingerprint:
+        published_config_matches_current = stored_fingerprint == _experiment_semantic_fingerprint(
+            comparison
+        )
 
     publication_state: PublicationState = publication.state
 
-    return {
+    status = {
         "experiment": experiment.experiment,
         "current_generation_id": current_generation_id,
         "published_generation_id": published_generation_id,
@@ -698,8 +801,8 @@ def read_status(
                 )
                 for name, stats in phase_stats.items()
             },
-            winner_scope_generation_id=winner_scope_generation_id,
-            pinned=pinned,
+            winners_present=winners_present,
         ),
-        "summary_present": summary_path is not None and summary_path.is_file(),
+        "summary_present": summary_present,
     }
+    return status, publication

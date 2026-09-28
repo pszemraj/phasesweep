@@ -76,7 +76,7 @@ def pytest_collection_modifyitems(session, config, items) -> None:
     scanned: dict[Path, dict[str, str]] = {}
     offenders: dict[tuple[Path, str], str] = {}
     for item in items:
-        if item.get_closest_marker("integration") or item.get_closest_marker("hardware"):
+        if item.get_closest_marker("integration") or item.get_closest_marker("live"):
             continue
         module_path = getattr(item, "path", None)
         if module_path is None or module_path.suffix != ".py":
@@ -281,7 +281,7 @@ def mark_current_format(experiment: Experiment, *studies: optuna.Study) -> None:
     A test that constructs studies through Optuna directly skips the engine's
     own create path, so nothing stamps the study schema and nothing records the
     tree's ownership. Every read path then correctly refuses the state as
-    pre-cutover. This is the one place that repairs both halves, so the
+    unmarked. This is the one place that repairs both halves, so the
     equivalence between "the engine wrote it" and "the test built it" is
     asserted once instead of drifting across six copies.
 
@@ -321,11 +321,11 @@ def isolate_host_gpu_detection(
 ) -> None:
     """Keep ordinary tests independent of the host's NVIDIA driver state.
 
-    Hardware-marked tests opt out and may explicitly exercise the real host.
+    Live-marked tests opt out and may explicitly exercise the real host.
     GPU behavior tests replace these defaults with the inventory and driver
     state required by each case.
     """
-    if request.node.get_closest_marker("hardware") is not None:
+    if request.node.get_closest_marker("live") is not None:
         return
     # The empty CUDA sentinel also reaches runner/trainer subprocesses, where
     # this process's monkeypatches cannot. Individual GPU tests replace or

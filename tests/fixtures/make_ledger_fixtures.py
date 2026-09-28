@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the golden on-disk ledger fixtures committed under tests/fixtures/ledgers.
+"""Generate the golden on-disk ledger fixture committed under tests/fixtures/ledgers.
 
-Each fixture is one real PhaseSweep run (two trials of one phase, seeded random
-sampler, no GPU) captured verbatim, plus at most one recorded raw edit that
-turns the current-format bytes into the pre-cutover shape a read path has to
-refuse. The edits are raw JSON/JSONL rewrites -- never PhaseSweep code -- so
-the fixture keeps testing the reader rather than the writer that produced it.
+The fixture is one real PhaseSweep run -- two trials of one phase, seeded
+random sampler, no GPU -- captured verbatim on the journal backend.
+PhaseSweep keeps no backward compatibility, so this generator produces only
+the current-format shape.
 
 Run it from the repository root, in the environment under test::
 
@@ -14,17 +13,6 @@ Run it from the repository root, in the environment under test::
 The experiment pins ``execution.cwd`` to ``/``, so the phase fingerprints it
 stores name no directory of the generating checkout: a fixture read from any
 clone path recomputes the fingerprint it was published with.
-
-The ``release-0.3.1-journal`` fixture is produced from a detached worktree of
-the ``v0.3.1`` tag instead of the working tree::
-
-    git worktree add --detach "$W" v0.3.1
-    PYTHONPATH="$W/src" python -m tests.fixtures.make_ledger_fixtures \\
-        --only current --label release-0.3.1 --expect-source "$W/src"
-    git worktree remove --force "$W"
-
-This module uses only the public ``phasesweep`` API to *produce* ledgers, so it
-keeps working across the releases it has to generate bytes for.
 """
 
 from __future__ import annotations
@@ -70,10 +58,9 @@ OBJECTIVE_VALUE = "0.5"
 TRIAL_COMMAND = f"python -c 'print(\"{OBJECTIVE_TOKEN}={OBJECTIVE_VALUE}\")' {{overrides}}"
 
 #: PhaseSweep study schema this fixture set is asserted against. Mirrors
-#: ``phasesweep.engine.state.STUDY_SCHEMA_VERSION``; kept as a literal because
-#: the legacy-release run imports a *different* phasesweep whose constant
-#: describes that release, not the reader under test.
-TARGET_STUDY_SCHEMA_VERSION = 3
+#: ``phasesweep.engine.state.STUDY_SCHEMA_VERSION``; kept as a literal so this
+#: module names no PhaseSweep import before ``_isolate_environment`` runs.
+TARGET_STUDY_SCHEMA_VERSION = 4
 #: Artifact-root binding schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.artifact_roots.ARTIFACT_ROOT_BINDING_SCHEMA_VERSION``.
 TARGET_BINDING_SCHEMA_VERSION = 3
@@ -83,8 +70,6 @@ STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 JOURNAL_SET_STUDY_USER_ATTR = 2
 #: Artifact-root binding file, relative to ``<workdir>/<experiment>``.
 BINDING_FILENAME = "artifact_root_binding.json"
-#: MCP run-store format marker removed by the ``precutover-mcp-state`` fixture.
-MCP_FORMAT_MARKER = ".phasesweep-format.json"
 #: Replacement for the ``.gitignore`` PhaseSweep writes into every artifact
 #: root. Its ``*`` keeps ordinary run output out of a user's repository; here it
 #: would hide the fixture from git, and a deeper ignore file wins over the
@@ -178,7 +163,6 @@ class FixturePaths:
     root: Path
     ledger_dir: Path
     artifact_root: Path
-    mcp_state: Path
     backend: str
 
     @property
@@ -206,75 +190,6 @@ class FixturePaths:
         return self.experiment_dir / BINDING_FILENAME
 
 
-def _journal_records(paths: FixturePaths) -> list[dict[str, Any]]:
-    """Read a journal ledger as decoded JSONL records.
-
-    :param FixturePaths paths: Fixture under construction.
-    :return list[dict[str, Any]]: One decoded record per journal line.
-    """
-    text = paths.ledger.read_text(encoding="utf-8")
-    return [json.loads(line) for line in text.splitlines() if line]
-
-
-def _write_journal_records(paths: FixturePaths, records: list[dict[str, Any]]) -> None:
-    """Rewrite a journal ledger from decoded records, preserving Optuna's encoding.
-
-    Optuna writes one compact JSON object per line with a trailing newline and
-    refuses to replay a journal whose last record is incomplete, so the exact
-    line framing matters more than the field order.
-
-    :param FixturePaths paths: Fixture under construction.
-    :param list[dict[str, Any]] records: Records to serialize back, in order.
-    """
-    body = "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records)
-    paths.ledger.write_text(body, encoding="utf-8")
-
-
-def _downgrade_journal_schema_attr(paths: FixturePaths) -> None:
-    """Rewrite the journal's schema-version record so it reports schema 2."""
-    records = _journal_records(paths)
-    rewritten = 0
-    for record in records:
-        if record.get("op_code") == JOURNAL_SET_STUDY_USER_ATTR and STUDY_SCHEMA_ATTR in record.get(
-            "user_attr", {}
-        ):
-            record["user_attr"][STUDY_SCHEMA_ATTR] = TARGET_STUDY_SCHEMA_VERSION - 1
-            rewritten += 1
-    if rewritten != 1:
-        raise RuntimeError(f"expected exactly one schema record in {paths.ledger}, got {rewritten}")
-    _write_journal_records(paths, records)
-
-
-def _drop_journal_schema_attr(paths: FixturePaths) -> None:
-    """Drop the journal's schema-version record, leaving a populated unmarked study."""
-    records = _journal_records(paths)
-    kept = [
-        record
-        for record in records
-        if not (
-            record.get("op_code") == JOURNAL_SET_STUDY_USER_ATTR
-            and STUDY_SCHEMA_ATTR in record.get("user_attr", {})
-        )
-    ]
-    if len(kept) != len(records) - 1:
-        raise RuntimeError(f"expected exactly one schema record in {paths.ledger}")
-    _write_journal_records(paths, kept)
-
-
-def _downgrade_binding(paths: FixturePaths) -> None:
-    """Rewrite the artifact-root binding so it declares the pre-cutover schema."""
-    payload = json.loads(paths.binding.read_text(encoding="utf-8"))
-    payload["schema_version"] = TARGET_BINDING_SCHEMA_VERSION - 1
-    paths.binding.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def _remove_binding(paths: FixturePaths) -> None:
-    """Delete the artifact-root binding, leaving unmarked durable state behind."""
-    paths.binding.unlink()
-    if not (paths.experiment_dir / "generations").is_dir():
-        raise RuntimeError(f"{paths.experiment_dir} has no generations/ to leave unmarked")
-
-
 #: The committed fixture set. ``expect`` is the verdict a read path owes the
 #: fixture in each mode; the generator recomputes it from the produced bytes and
 #: refuses to write a manifest that disagrees.
@@ -287,65 +202,6 @@ FIXTURE_SPECS: tuple[FixtureSpec, ...] = (
         expect={"tree": "ok", "ledger-only": "ok"},
         derivation="",
         notes="Unedited output of this release on the journal backend.",
-    ),
-    FixtureSpec(
-        name="precutover-schema2-journal",
-        group="precutover",
-        backend="journal",
-        modes=("tree", "ledger-only"),
-        expect={"tree": "schema-mismatch", "ledger-only": "schema-mismatch"},
-        derived_from="current-journal",
-        derivation=(
-            "Rewrite the JSONL record with op_code == 2 (SET_STUDY_USER_ATTR) carrying "
-            "user_attr['phasesweep_study_schema_version'] so its value is 2."
-        ),
-        apply=_downgrade_journal_schema_attr,
-        notes="A populated study stamped with the pre-cutover schema version.",
-    ),
-    FixtureSpec(
-        name="precutover-unstamped-journal",
-        group="precutover",
-        backend="journal",
-        modes=("tree", "ledger-only"),
-        expect={"tree": "schema-mismatch", "ledger-only": "schema-mismatch"},
-        derived_from="current-journal",
-        derivation=(
-            "Drop the JSONL record with op_code == 2 (SET_STUDY_USER_ATTR) carrying "
-            "user_attr['phasesweep_study_schema_version']; the trial records remain."
-        ),
-        apply=_drop_journal_schema_attr,
-        notes="Populated but unmarked: the shape a 0.3.1 ledger has before stamping existed.",
-    ),
-    FixtureSpec(
-        name="precutover-binding2-journal",
-        group="precutover",
-        backend="journal",
-        modes=("tree",),
-        expect={"tree": "root-conflict"},
-        derived_from="current-journal",
-        derivation="Set artifact_root_binding.json 'schema_version' to 2.",
-        apply=_downgrade_binding,
-        notes="Current ledger, pre-cutover artifact tree: the binding is checked first.",
-    ),
-    FixtureSpec(
-        name="precutover-unmarked-tree-journal",
-        group="precutover",
-        backend="journal",
-        modes=("tree",),
-        expect={"tree": "root-conflict"},
-        derived_from="current-journal",
-        derivation="Delete artifact_root_binding.json; generations/ is left in place.",
-        apply=_remove_binding,
-        notes="Durable artifact state with no format marker at all.",
-    ),
-    FixtureSpec(
-        name="precutover-mcp-state",
-        group="mcp-state",
-        backend="journal",
-        modes=(),
-        expect={},
-        derivation=f"Delete mcp_state/{MCP_FORMAT_MARKER} from a populated run store.",
-        notes="Durable MCP run-store state with no format marker; RunStore refuses to open it.",
     ),
 )
 
@@ -482,7 +338,7 @@ def _computed_expectations(paths: FixturePaths, modes: tuple[str, ...]) -> dict[
     """Derive the verdict each mode owes this fixture, from the produced bytes.
 
     The artifact-root binding is validated before the ledger is scanned, so a
-    pre-cutover or missing binding decides the ``tree`` verdict on its own; the
+    missing or mismatched binding decides the ``tree`` verdict on its own; the
     ledger decides ``ledger-only`` and any ``tree`` read whose binding is
     current.
 
@@ -526,34 +382,6 @@ def _run_experiment_into(paths: FixturePaths, scratch: Path) -> None:
         tree_gitignore.write_text(FIXTURE_TREE_GITIGNORE, encoding="utf-8")
 
 
-def _make_mcp_state(paths: FixturePaths) -> None:
-    """Build a populated MCP run store, then strip its format marker.
-
-    :param FixturePaths paths: Fixture layout whose ``mcp_state`` is populated.
-    :raises RuntimeError: The store did not produce the expected marker.
-    """
-    from phasesweep.mcp.runs import RunHandle, RunStore
-
-    store = RunStore(paths.mcp_state)
-    handle = RunHandle(
-        run_id="golden-precutover-run",
-        experiment_id=EXPERIMENT,
-        config_sha256="0" * 64,
-        pid=999999,
-        pgid=999999,
-        pid_starttime=111,
-        started_at="2024-01-01T00:00:00Z",
-    )
-    store.create(handle)
-    store.config_snapshot_path(handle.run_id).write_text(
-        "# pre-cutover run config snapshot\n", encoding="utf-8"
-    )
-    marker = paths.mcp_state / MCP_FORMAT_MARKER
-    if not marker.is_file():
-        raise RuntimeError(f"RunStore did not create {marker}")
-    marker.unlink()
-
-
 def _produced_by(source_root: Path) -> dict[str, str]:
     """Record the toolchain that produced a fixture.
 
@@ -584,7 +412,7 @@ def _write_manifest(
 
     :param FixtureSpec spec: Spec the fixture was produced from.
     :param FixturePaths paths: Produced fixture layout.
-    :param str name: Fixture name, which a ``--label`` run overrides.
+    :param str name: Fixture name.
     :param dict[str, str] expect: Verdict per supported mode.
     :param dict[str, str] produced_by: Toolchain identifiers.
     :param str notes: Human-readable description of what this fixture holds.
@@ -616,20 +444,16 @@ def generate(
     name: str,
     scratch: Path,
     produced_by: dict[str, str],
-    verify_expectations: bool,
     notes: str | None = None,
 ) -> Path:
     """Produce one golden ledger fixture from scratch.
 
     :param FixtureSpec spec: Fixture to produce.
     :param Path out_dir: Directory that holds every fixture.
-    :param str name: Name for this fixture, which a ``--label`` run overrides.
+    :param str name: Name for this fixture.
     :param Path scratch: Throwaway directory for the generation-time config.
     :param dict[str, str] produced_by: Toolchain identifiers for the manifest.
     :param str | None notes: Manifest note replacing the spec's own.
-    :param bool verify_expectations: Compare the spec's declared verdicts with
-        the ones computed from the produced bytes. A legacy-release run skips
-        this, because the declared verdicts describe the current release.
     :return Path: The produced fixture directory.
     :raises RuntimeError: The computed verdicts contradict the declared ones.
     """
@@ -640,19 +464,14 @@ def generate(
         root=root,
         ledger_dir=root / "ledger",
         artifact_root=root / "artifact_root",
-        mcp_state=root / "mcp_state",
         backend=spec.backend,
     )
-    if spec.group == "mcp-state":
-        root.mkdir(parents=True)
-        _make_mcp_state(paths)
-    else:
-        paths.ledger_dir.mkdir(parents=True)
-        _run_experiment_into(paths, scratch)
-        if spec.apply is not None:
-            spec.apply(paths)
+    paths.ledger_dir.mkdir(parents=True)
+    _run_experiment_into(paths, scratch)
+    if spec.apply is not None:
+        spec.apply(paths)
     expect = _computed_expectations(paths, spec.modes)
-    if verify_expectations and spec.expect is not None and expect != spec.expect:
+    if spec.expect is not None and expect != spec.expect:
         raise RuntimeError(
             f"{name}: produced bytes imply {expect}, but the spec declares {spec.expect}"
         )
@@ -693,20 +512,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="comma-separated fixture names or groups to regenerate",
     )
     parser.add_argument(
-        "--label",
-        default=None,
-        help="rename the generated fixtures from <group>-<backend> to <label>-<backend>",
-    )
-    parser.add_argument(
         "--notes",
         default=None,
-        help="replace the selected fixtures' manifest notes, e.g. for a --label run",
-    )
-    parser.add_argument(
-        "--expect-source",
-        type=Path,
-        default=None,
-        help="require the imported phasesweep to come from this src directory",
+        help="replace the selected fixtures' manifest notes",
     )
     parser.add_argument(
         "-v",
@@ -735,9 +543,6 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if args.label and len({spec.group for spec in specs}) != 1:
-        print("error: --label requires --only to select a single fixture group", file=sys.stderr)
-        return 2
 
     out_dir: Path = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -747,25 +552,15 @@ def main(argv: list[str] | None = None) -> int:
         import phasesweep
 
         source_root = Path(phasesweep.__file__).resolve().parent.parent
-        if args.expect_source is not None:
-            expected = args.expect_source.resolve()
-            if source_root != expected:
-                print(
-                    f"error: imported phasesweep from {source_root}, expected {expected}",
-                    file=sys.stderr,
-                )
-                return 2
         produced_by = _produced_by(source_root)
         try:
             for spec in specs:
-                name = f"{args.label}-{spec.backend}" if args.label else spec.name
                 generate(
                     spec,
                     out_dir,
-                    name=name,
+                    name=spec.name,
                     scratch=sandbox,
                     produced_by=produced_by,
-                    verify_expectations=args.label is None,
                     notes=args.notes,
                 )
         except Exception as exc:  # noqa: BLE001
