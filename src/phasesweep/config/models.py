@@ -333,7 +333,8 @@ class Phase(_Frozen):
         description=(
             "By default, phase/run wallclock timeouts fail closed before winner "
             "selection if fewer than n_trials finished. Set true to allow a "
-            "partial phase winner and persist completion metadata."
+            "partial phase winner and persist completion metadata. Reusing a "
+            "stored partial result, by rerun or --from-phase, also requires it."
         ),
     )
     allow_partial_grid: bool = Field(

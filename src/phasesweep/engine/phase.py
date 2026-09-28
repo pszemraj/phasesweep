@@ -28,6 +28,7 @@ from phasesweep.engine.errors import (
     OperatorAction,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    WinnerIntegrityError,
 )
 from phasesweep.engine.evidence import _verify_winner_objective_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
@@ -384,9 +385,10 @@ def _resume_phase(
     Reaps stale trials, replays the failure policy from the durable outcomes,
     and verifies the phase fingerprint and trial target. An accepted
     partial-timeout decision at the current target replays as the phase's
-    winner. An abort recorded in the outcome ledger, or a replayed streak that
-    meets the current limit while work remains, is refused unless the raised
-    ``n_trials`` authorizes recovering from it.
+    winner while the current config still accepts incomplete results. An abort
+    recorded in the outcome ledger, or a replayed streak that meets the current
+    limit while work remains, is refused unless the raised ``n_trials``
+    authorizes recovering from it.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being resumed.
@@ -396,6 +398,9 @@ def _resume_phase(
     :raises NoFeasibleTrialError: The phase aborted, or its streak meets the
         current limit with work remaining, at an accepted target its current
         ``n_trials`` does not exceed.
+    :raises WinnerIntegrityError: An accepted partial-timeout decision would
+        replay while the current config disables
+        ``allow_incomplete_on_timeout``.
     :raises TimeoutError: An accepted partial-timeout decision replays with
         no feasible trial.
     :raises StudySchemaMismatchError: Durable phase state is malformed or
@@ -418,7 +423,20 @@ def _resume_phase(
         # This terminal decision is the authority even if a crash landed
         # before the timeout's recovery boundary consumed a recorded abort.
         # Replay deterministic selection; never reinterpret the timeout's
-        # unused slots as permission to launch more trainers.
+        # unused slots as permission to launch more trainers. The opt-in is a
+        # run control outside the fingerprint, so the current config must
+        # still accept an incomplete result, as it must for a skipped phase's
+        # incomplete winner.
+        if not phase.allow_incomplete_on_timeout:
+            raise WinnerIntegrityError(
+                f"Phase {phase.name!r} accepted an incomplete result when its "
+                f"{partial_decision.timeout_scope} deadline expired at "
+                f"{partial_decision.finished_trials}/{partial_decision.trial_target} "
+                "terminal trials. Refusing to replay it unless the current config sets "
+                "allow_incomplete_on_timeout: true; increase n_trials above "
+                f"{partial_decision.trial_target} to continue the phase instead.",
+                action=OperatorAction.FIX_CONFIG,
+            )
         completion = _partial_completion_for_replay(
             study,
             partial_decision,

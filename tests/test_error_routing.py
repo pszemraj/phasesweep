@@ -65,6 +65,8 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
+    PHASE_DECISION_ATTR,
+    PHASE_DECISION_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
@@ -1270,6 +1272,36 @@ def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 
 
+def _replay_partial_decision_without_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> object:
+    """Re-run a phase whose accepted partial-timeout decision this config does not accept."""
+    experiment = materialize("current-journal", tmp_path, mode="tree").experiment
+    study = _fixture_study(experiment)
+    trials = study.get_trials(deepcopy=False)
+    target = len(trials) + 1
+    study.set_user_attr(TRIAL_TARGET_ATTR, target)
+    study.set_user_attr(
+        PHASE_DECISION_ATTR,
+        {
+            "schema_version": PHASE_DECISION_SCHEMA_VERSION,
+            "decision": "accepted_partial_timeout",
+            "trial_target": target,
+            "outcome_sequence": max(
+                trial.user_attrs[TRIAL_OUTCOME_ATTR]["sequence"] for trial in trials
+            ),
+            "finished_trials": len(trials),
+            "completed_trials": sum(
+                trial.state is optuna.trial.TrialState.COMPLETE for trial in trials
+            ),
+            "timeout_scope": "phase",
+            "recovered_abort_sequence": None,
+        },
+    )
+    phase = experiment.phases[0].model_copy(update={"n_trials": target})
+    return run_experiment(experiment.model_copy(update={"phases": [phase]}))
+
+
 def _resume_over_incomplete_winner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Skip a phase whose published winner is a partial result this config does not accept."""
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
@@ -1522,6 +1554,13 @@ ORIGIN_CASES = (
         raised=WinnerIntegrityError,
         action=OperatorAction.FIX_CONFIG,
         message="unless the current config sets allow_incomplete_on_timeout: true.",
+    ),
+    RoutingCase(
+        id="partial_decision_without_opt_in",
+        trigger=_replay_partial_decision_without_opt_in,
+        raised=WinnerIntegrityError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Refusing to replay it unless the current config sets",
     ),
     RoutingCase(
         id="winner_phase_config_changed",

@@ -13,6 +13,7 @@ from phasesweep import run_experiment
 from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
 from phasesweep.engine import PhaseSweepError
 from phasesweep.engine.artifacts import _load_winner
+from phasesweep.engine.errors import OperatorAction, WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.resume import _published_for_resume
@@ -172,6 +173,44 @@ def test_incomplete_timeout_winner_is_accepted_only_under_current_opt_in(tmp_pat
             {},
             publication=_published_for_resume(current),
         )
+
+
+@pytest.mark.integration
+def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
+    tmp_path: Path,
+) -> None:
+    """A rerun without the opt-in refuses the accepted partial decision it would replay.
+
+    The opt-in is outside the phase fingerprint, so this is the only check
+    between it and a republished incomplete result. The refusal launches no
+    work and leaves the decision and the publication as they were.
+    """
+    trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
+    exp = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=5,
+        gpu_policy="none",
+        timeout_seconds_per_phase=4.0,
+        allow_incomplete_on_timeout=True,
+    )
+    assert run_experiment(exp)["p"].completion["incomplete"] is True
+
+    def load() -> optuna.Study:
+        return optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+
+    trials_before = len(load().trials)
+    decision_before = load().user_attrs[PHASE_DECISION_ATTR]
+    published_before = _last_successful_generation_path(exp).read_text()
+    strict = exp.model_copy(
+        update={"phases": [exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False})]}
+    )
+    with pytest.raises(WinnerIntegrityError, match="Refusing to replay it") as refused:
+        run_experiment(strict)
+    assert refused.value.action is OperatorAction.FIX_CONFIG
+    assert len(load().trials) == trials_before
+    assert load().user_attrs[PHASE_DECISION_ATTR] == decision_before
+    assert _last_successful_generation_path(exp).read_text() == published_before
 
 
 @pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
