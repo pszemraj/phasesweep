@@ -237,16 +237,18 @@ def _warn_environment_drift(
     phase_name: str,
     stored_digest: str,
 ) -> None:
-    """Warn once when an inherited winner was produced under another environment.
+    """Warn once when a reused winner was produced under another environment.
 
-    Persistent-study preflight separately refuses a top-up across semantic
-    environment cohorts. ``--from-phase`` deliberately skips this phase, so no
-    trial is allocated into that study; this warning tells the operator that a
-    later phase is building on a winner from another cohort.
+    Persistent-study preflight refuses to allocate a trial across semantic
+    environment cohorts, but two paths reuse a recorded result without
+    allocating: ``--from-phase`` loads a skipped phase's published winner, and
+    a replay re-selects from a study with no remaining trial slots. This
+    warning tells the operator that the result being built on came from
+    another cohort.
 
     :param Experiment experiment: Parsed experiment supplying the current contract.
-    :param str phase_name: Phase whose winner was loaded, used in the warn-once key.
-    :param str stored_digest: Digest recorded on the loaded winner.
+    :param str phase_name: Phase whose winner was reused, used in the warn-once key.
+    :param str stored_digest: Digest recorded on the reused winner or its trial.
     """
     # Deferred: ``engine.trial`` pulls in the evidence/W&B stack, which the
     # read-only paths that import this module never need.
@@ -264,8 +266,8 @@ def _warn_environment_drift(
         return
     _ENVIRONMENT_DRIFT_WARNED.add(key)
     log.warning(
-        "[%s] inherited winner ran under trainer environment %s..., but this process "
-        "composes %s... under execution.inherit_env=%r. The inherited result is being "
+        "[%s] reused winner ran under trainer environment %s..., but this process "
+        "composes %s... under execution.inherit_env=%r. The recorded result is being "
         "reused across an environment change; confirm the difference is irrelevant to "
         "the metric, or re-run the phase.",
         phase_name,

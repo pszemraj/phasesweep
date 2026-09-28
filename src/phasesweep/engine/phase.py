@@ -16,7 +16,7 @@ import optuna
 
 from phasesweep.config import Experiment, Phase
 from phasesweep.config.search import _placeholder_values_for
-from phasesweep.engine.artifacts import _write_trials_csv
+from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
     _register_active_attempt,
     _retire_active_attempt,
@@ -1553,6 +1553,10 @@ def _select_phase_winner(
     # reads only Optuna, so nothing before this point has looked at whether the
     # winning trial's directory still holds the bytes its metric came from.
     _verify_winner_objective_evidence(experiment, phase.name, selected)
+    # A replay allocates nothing, so the cohort check never runs and the
+    # winning trial may come from an environment this process no longer
+    # composes. After fresh allocation the digests match and this is silent.
+    _warn_environment_drift(experiment, phase.name, selected.trainer_env_digest)
     effective = _composed_overrides(phase, selected.params, inherited_winners)
     return Winner(
         trial_number=selected.trial_number,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.artifacts as artifacts_module
 from phasesweep import __version__, run_experiment
 from phasesweep.config import (
     CategoricalParam,
@@ -632,6 +634,27 @@ def test_changed_semantic_inherited_value_rejects_topup_before_allocation(
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(experiment.storage))
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
+
+
+@pytest.mark.integration
+def test_replay_under_changed_environment_warns_about_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A no-op replay allocates nothing, so only the drift warning names the change."""
+    monkeypatch.setattr(artifacts_module, "_ENVIRONMENT_DRIFT_WARNED", set())
+    caplog.set_level(logging.WARNING, logger="phasesweep")
+    trainer = write_constant_trainer(tmp_path)
+    experiment = _environment_cohort_experiment(
+        tmp_path, trainer, ExecutionContext(inherit_env=["PHASESWEEP_DATASET_REV"])
+    )
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-a")
+    run_experiment(experiment)
+    assert not [r for r in caplog.records if "reused winner" in r.getMessage()]
+
+    monkeypatch.setenv("PHASESWEEP_DATASET_REV", "revision-b")
+    run_experiment(experiment)
+
+    assert len([r for r in caplog.records if "reused winner" in r.getMessage()]) == 1
 
 
 @pytest.mark.integration
