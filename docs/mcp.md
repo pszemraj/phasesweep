@@ -130,13 +130,13 @@ inherit it.
 
 | Check | Verdict meaning |
 | --- | --- |
-| `evaluation_point` | `heterogeneous`: ranked objectives were measured at different checkpoints or steps (`distinct_checkpoints`, `distinct_steps`, `winner_step`). `n/a`: the extractor reports no evaluation metadata, or only one trial was ranked. |
+| `evaluation_point` | `heterogeneous`: ranked objectives were measured at `distinct_values` different positions on the configured evaluation axis; the winner's position was `winner_value`. `n/a`: the extractor reports no position, or only one trial was ranked. |
 | `survivorship` | `heterogeneous`: excluded trials (`infeasible` + `failed` + `pruned`) were at least as numerous as `ranked` ones. Always checked, never `n/a`. |
 | `tie` | `heterogeneous`: the winner tied exactly with `tied_trials` other ranked trials that used different params. `n/a`: only one trial was ranked. |
 
 `ok` means a check ran and found nothing; `n/a` means it could not run and
-must never be read as clean. Evidence strings (a checkpoint label may be a
-path) stay out of this payload; only enums and integers cross the MCP
+must never be read as clean. Evidence strings (an evaluation axis name is a
+config key) stay out of this payload; only enums and numbers cross the MCP
 boundary. The verdicts are advisory: they do not invalidate the result, and
 only the operator decides whether to re-run.
 
@@ -157,7 +157,9 @@ The operator may configure W&B, ordinary JSON, log, or envelope scoring.
 Frozen result reads preserve the producing reader's assurance fields and need
 no W&B SDK, credentials, or remote access. W&B binds its source to the managed
 attempt ID; it does not assert the envelope's evaluation metadata or input
-content guarantees. The trainer owns evaluation and aggregation; the metric
+content guarantees, and only records where in the run's history the
+objective's value was logged.
+The trainer owns evaluation and aggregation; the metric
 goal ranks the selected trial scalars. Log reduction defaults to `last` and is
 independent of the ranking goal.
 

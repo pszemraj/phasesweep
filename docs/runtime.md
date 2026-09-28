@@ -70,10 +70,12 @@ The block runs three checks, each `ok` (checked, nothing found),
 `heterogeneous` (checked, found a potential confound, with evidence), or
 `n/a` (could not be checked — never treat this as clean):
 
-- `evaluation_point`: whether the ranked trials' `json_envelope` objectives
-  were all measured at the same checkpoint and step. `n/a` for other
-  extractor kinds, which report no evaluation metadata, or when only one
-  trial was ranked.
+- `evaluation_point`: whether the ranked objectives were all measured at the
+  same position on the metric extractor's `evaluation_axis` -- the
+  training-progress axis the sweep holds fixed, such as optimizer step or
+  tokens. `n/a` for `json` and `log_regex` extractors, which report no
+  position; when any ranked `wandb` trial recorded no position in its run
+  history; or when only one trial was ranked.
 - `survivorship`: whether the winner was ranked among at most half of what
   ran, counting infeasible, failed, and pruned trials against the ranked
   ones. This check always runs.

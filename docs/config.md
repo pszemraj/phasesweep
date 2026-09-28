@@ -233,12 +233,24 @@ These scoring decisions are separate:
   `first`, `min`, or `max`).
 - W&B selects an exact finished-summary key; ordinary JSON selects a saved
   path and dotted key.
-- Envelope `policy` and `expected_step` validate reported metadata. They do
-  not cause evaluation or checkpoint loading. Leaving `checkpoint` and
-  `expected_step` unpinned lets ranked trials report different values for
-  either; selection's `evaluation_point` confound check flags that spread
-  (see [runtime behavior](runtime.md#confound-verdicts)). Pinning either
-  makes the check trivially `ok`.
+- Envelope `policy` and `expected_step` validate reported metadata; they do
+  not cause evaluation or checkpoint loading. The metric extractor's
+  `evaluation_axis` names the training-progress axis the sweep holds fixed;
+  selection's `evaluation_point` confound check compares ranked objectives
+  only on it (see [runtime behavior](runtime.md#confound-verdicts)). It is
+  part of the extractor config, so changing it starts a new study, like
+  `checkpoint`/`expected_step`; constraint extractors may not set it.
+  `json_envelope` defaults to `step`, the envelope's own evaluation step, and
+  any other name must be reported in `evaluation.progress` (via
+  `report_objective(..., progress={...})`); `wandb` defaults to `_step`,
+  W&B's own history step.
+
+For example, in a fixed-token batch-size sweep each trial's optimizer `step`
+count depends on its batch size, so trials differ by design in both `step`
+and any step-named checkpoint. Declaring `evaluation_axis: tokens` and reporting
+`progress={"tokens": total_tokens}` compares trials on tokens instead: the
+check stays `ok` when every trial trained to the same token count, and flags
+one that stopped short.
 
 The trainer owns evaluation cadence, early stopping, checkpoint selection,
 and custom aggregation. PhaseSweep has one experiment-level metric and does
@@ -256,6 +268,7 @@ metric:
     entity: YOUR_ENTITY
     project: YOUR_PROJECT
     metric_key: eval/loss
+    evaluation_axis: eval/step
     poll_seconds: 2
     timeout_seconds: 120
 ```
@@ -265,6 +278,13 @@ otherwise `eval/loss.min` reads the aggregate that
 `define_metric("eval/loss", summary="min")` stores under `eval/loss`. A bare
 `eval/loss` whose summary is such an aggregate is not a scalar and fails the
 trial.
+
+`evaluation_axis` names the history key that marks where `metric_key` was
+measured; it defaults to `_step`, W&B's own history step. Typically it names
+the `define_metric` step metric, e.g. `eval/step` under
+`define_metric("eval/*", step_metric="eval/step")`, or a token counter logged
+in the same `log()` call as the metric. It may not name the metric's own
+series.
 
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share
@@ -291,8 +311,9 @@ Polling runs after trainer cleanup and GPU release, under one deadline that
 includes startup, SDK calls, retries, and summary visibility, capped by phase
 and experiment budgets. Published evidence is frozen: selection, replay, CLI,
 and MCP reads need no SDK or remote reread, even after remote edits/deletion.
-W&B's source is keyed by attempt ID; it makes none of the envelope's evaluation
-metadata or trainer-input-content assurances.
+W&B's source is keyed by attempt ID; it makes none of the envelope's
+evaluation-metadata or trainer-input-content assurances. It only records
+where in the run's history the objective's value was logged.
 
 ## Trainer contract
 
