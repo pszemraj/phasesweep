@@ -148,6 +148,7 @@ def winners_payload(
                 "params_redacted": redacted,
                 "gates_passed": view.gates_passed,
                 "incomplete": view.incomplete,
+                "confound": view.confound,
             }
         )
     return {

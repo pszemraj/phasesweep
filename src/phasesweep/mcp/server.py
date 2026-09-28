@@ -32,7 +32,7 @@ from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import RunState, RunStore
-from phasesweep.mcp.snapshots import McpPublicationState
+from phasesweep.mcp.snapshots import ConfoundSummary, McpPublicationState
 from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
@@ -479,6 +479,13 @@ class WinnerPhasePayload(_ToolPayload):
         description="True/false when gates were declared; null when the phase has no gates."
     )
     incomplete: bool = Field(description="Whether a wallclock timeout produced a partial winner.")
+    confound: ConfoundSummary = Field(
+        description=(
+            "Advisory verdicts on the population this winner was selected from. Report every "
+            "flagged check with its counts before relying on the winner or on phases that "
+            "inherit it."
+        )
+    )
 
 
 class GetRunResultsResult(_ToolPayload):

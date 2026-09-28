@@ -66,6 +66,7 @@ from tests.conftest import (
     mark_current_format,
     reaped_pid,
     requires_nonroot,
+    single_trial_confound,
     write_constant_trainer,
     write_trainer,
 )
@@ -1135,6 +1136,7 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
             generation_id="engine-generation",
             attempt_id="engine-attempt",
         ),
+        confound=single_trial_confound(4),
     )
 
     snapshot = mcp_runner.capture_result_snapshot(

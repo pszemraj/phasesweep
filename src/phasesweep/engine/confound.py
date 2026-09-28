@@ -239,6 +239,8 @@ def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
     if not isinstance(check, Mapping) or check.get("verdict") not in CONFOUND_VERDICTS:
         raise ValueError(f"confound check {name!r} has no valid verdict")
     if check["verdict"] == "n/a":
+        if name == "survivorship":
+            raise ValueError("confound check 'survivorship' always runs and cannot be n/a")
         reason = check.get("reason")
         if set(check) != {"verdict", "reason"} or not isinstance(reason, str) or not reason:
             raise ValueError(f"confound check {name!r} is n/a without a reason")
@@ -373,6 +375,54 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
                 "params, and the lower trial number won"
             )
     return lines
+
+
+def _confound_summary(block: Mapping[str, Any], *, winner_trial: int) -> dict[str, Any]:
+    """Project a validated block onto the enums and counts agents may see.
+
+    Evidence can hold strings a trainer reported -- a checkpoint label may be
+    a path -- so the projection keeps only verdicts, check names, and
+    integers. The full evidence stays in ``winner.yaml`` for operators.
+
+    :param Mapping[str, Any] block: A validated confound block.
+    :param int winner_trial: Trial number of the winner the block belongs to.
+    :return dict[str, Any]: The path-free summary, one entry per check plus
+        the ``flagged`` check names.
+    """
+    checks = block["checks"]
+    evaluation = checks["evaluation_point"]
+    evaluation_detail = evaluation.get("detail")
+    tie = checks["tie"]
+    return {
+        "flagged": list(_flagged_checks(block)),
+        "evaluation_point": {
+            "verdict": evaluation["verdict"],
+            "distinct_checkpoints": (
+                len(evaluation_detail["checkpoint"]) if evaluation_detail else None
+            ),
+            "distinct_steps": len(evaluation_detail["step"]) if evaluation_detail else None,
+            "winner_step": (
+                next(
+                    (
+                        group["value"]
+                        for group in evaluation_detail["step"]
+                        if winner_trial in group["trials"]
+                    ),
+                    None,
+                )
+                if evaluation_detail
+                else None
+            ),
+        },
+        "survivorship": {
+            "verdict": checks["survivorship"]["verdict"],
+            **checks["survivorship"]["detail"],
+        },
+        "tie": {
+            "verdict": tie["verdict"],
+            "tied_trials": len(tie["detail"]["tied_trials"]) if "detail" in tie else None,
+        },
+    }
 
 
 def _logged_values(groups: Sequence[Mapping[str, Any]]) -> str:
