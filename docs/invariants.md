@@ -301,7 +301,7 @@ success resets the failure streak but never a recorded abort, and a changed
 `engine.phase._resume_phase`, which applies the current limit only before new
 work\
 **Tests:** `tests/test_runtime_behavior.py::test_parallel_failure_threshold_uses_completion_order`,
-`tests/test_runtime_behavior.py::test_changing_the_failure_limit_never_reinterprets_recorded_outcomes`
+`tests/test_abort_recovery.py::test_changing_the_failure_limit_never_reinterprets_recorded_outcomes`
 
 #### 12. An unreadable ledger means cleanup is uncertain
 
