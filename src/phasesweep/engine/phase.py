@@ -1574,10 +1574,10 @@ def _select_phase_winner(
         ),
         objective_provenance=selected.objective_provenance,
         trainer_input=dict(selected.trainer_input),
-        # The digest comes from the winning TRIAL — a top-up can select a
-        # trial an earlier invocation ran under another environment — while
-        # the environment contract is config, identical for every trial in the study
-        # because it is fingerprinted.
+        # The digest comes from the winning TRIAL — a no-op replay under a
+        # changed environment re-selects a trial an earlier invocation ran —
+        # while the environment contract is config, identical for every trial
+        # in the study because it is fingerprinted.
         trainer_env_digest=selected.trainer_env_digest,
         trainer_inherit_env=_inherit_env_contract(experiment),
     )
