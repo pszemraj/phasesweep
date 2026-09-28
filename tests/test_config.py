@@ -12,6 +12,7 @@ from phasesweep.config import (
     Constraint,
     ExecutionContext,
     Experiment,
+    JsonEnvelopeExtractor,
     JsonExtractor,
     LogRegexExtractor,
     Metric,
@@ -41,6 +42,38 @@ def test_wandb_consumers_must_agree_per_phase(field, value):
             metric=Metric(extractor=objective),
             constraints=[Constraint(name="memory", extractor=conflicting, max=5)],
         )
+
+
+def test_evaluation_axis_defaults_and_misplacements_are_rejected():
+    envelope = JsonEnvelopeExtractor(
+        type="json_envelope", objective_name="loss", split="validation", policy="final"
+    )
+    wandb = WandbExtractor(type="wandb", entity="e", project="p", metric_key="eval/loss.min")
+    assert (envelope.evaluation_axis, wandb.evaluation_axis) == ("step", "_step")
+    for axis in ("eval/loss.min", "eval/loss"):
+        with pytest.raises(ValueError, match="names the metric's own series"):
+            wandb.model_validate({**wandb.model_dump(), "evaluation_axis": axis})
+    for extractor in (
+        envelope.model_copy(update={"evaluation_axis": "tokens"}),
+        wandb.model_copy(update={"evaluation_axis": "eval/step"}),
+    ):
+        with pytest.raises(ValueError, match="only the metric extractor's evaluation_point"):
+            Constraint.model_validate(
+                {"name": "memory", "extractor": extractor.model_dump(), "max": 5}
+            )
+
+
+def test_evaluation_axis_is_part_of_study_identity():
+    from phasesweep.engine.fingerprints import _phase_fingerprint
+
+    def fingerprint(axis):
+        extractor = WandbExtractor(
+            type="wandb", entity="e", project="p", metric_key="eval/loss", evaluation_axis=axis
+        )
+        experiment = make_experiment(metric=Metric(extractor=extractor))
+        return _phase_fingerprint(experiment, experiment.phases[0], {})
+
+    assert fingerprint("_step") != fingerprint("eval/step")
 
 
 def test_wandb_query_normalizes_targets_and_collects_exact_keys():

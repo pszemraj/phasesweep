@@ -152,6 +152,16 @@ class JsonEnvelopeExtractor(_TrialFilePathModel):
     policy: str = Field(min_length=1)
     checkpoint: str | None = Field(default=None, min_length=1)
     expected_step: ConfigInt | None = Field(default=None, ge=0)
+    evaluation_axis: str = Field(
+        default="step",
+        min_length=1,
+        description=(
+            "Training-progress axis the sweep holds fixed, which selection's "
+            "evaluation_point check compares ranked objectives on. 'step' is the "
+            "envelope's evaluation step; any other name must appear in the "
+            "envelope's evaluation.progress, e.g. 'tokens' for a fixed-token sweep."
+        ),
+    )
 
 
 class LogRegexExtractor(_TrialFilePathModel):
@@ -232,6 +242,31 @@ class WandbExtractor(_WandbSummarySource):
 
     type: Literal["wandb"]
     metric_key: str = Field(min_length=1)
+    evaluation_axis: str = Field(
+        default="_step",
+        min_length=1,
+        description=(
+            "History key logged alongside metric_key that marks where it was "
+            "measured, e.g. 'eval/step' under define_metric('eval/*', "
+            "step_metric='eval/step'); selection's evaluation_point check compares "
+            "ranked objectives on it. '_step' is W&B's own history step."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_axis_is_not_the_metric(self) -> WandbExtractor:
+        """Reject an evaluation axis naming the metric's own history series.
+
+        :raises ValueError: ``evaluation_axis`` is ``metric_key`` or, for an
+            aggregate key such as ``eval/loss.min``, its ``eval/loss`` series.
+        :return WandbExtractor: Self, unchanged.
+        """
+        if self.evaluation_axis in {self.metric_key, self.metric_key.rpartition(".")[0]}:
+            raise ValueError(
+                f"evaluation_axis {self.evaluation_axis!r} names the metric's own series; "
+                "set it to the key that marks where the metric was measured, such as eval/step."
+            )
+        return self
 
 
 ObjectiveExtractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor

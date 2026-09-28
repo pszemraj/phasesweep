@@ -169,8 +169,12 @@
 # policy: str (required)
 # checkpoint: str | null = null
 # expected_step: int | null = null  # >= 0
+# evaluation_axis: str = "step"     # metric extractor only
 # Requires an attempt-bound complete result envelope. Python trainers can call
 # phasesweep.report_objective(), which writes the managed objective path.
+# evaluation_axis names the progress axis the sweep holds fixed; "step" is the
+# envelope's evaluation step, any other name (e.g. "tokens") must be reported in
+# evaluation.progress (report_objective(progress={...})).
 
 # type: "log_regex"
 # file: str = "stdout.log"          # trial-relative file
@@ -182,11 +186,14 @@
 # base_url: str = "https://api.wandb.ai"  # normalized HTTP(S) API endpoint
 # entity: str (required)
 # project: str (required)
-# metric_key: str (required; exact nonempty summary key, e.g. eval/loss)
+# metric_key: str (required; summary key, e.g. eval/loss or aggregate eval/loss.min)
+# evaluation_axis: str = "_step"       # metric extractor only; e.g. eval/step
 # poll_seconds: finite float = 2.0     # > 0
 # timeout_seconds: finite float = 120.0 # >= 1
 # Reads only the managed attempt's finished summary. Primary, constraints, and
 # phase gates must agree on the target and polling fields, and share one capture.
+# evaluation_axis is the history key logged with metric_key that marks where it
+# was measured; it may not name the metric's own series.
 # The trainer owns evaluation, checkpoint choice, aggregation, and early stopping.
 # Envelope policy/expected_step validate metadata; they do not schedule evaluation.
 

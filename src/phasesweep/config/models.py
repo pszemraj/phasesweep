@@ -31,6 +31,7 @@ from phasesweep.config.search import (
 from phasesweep.evidence.models import (
     Extractor,
     Gate,
+    JsonEnvelopeExtractor,
     ObjectiveExtractor,
     WandbExtractor,
     WandbQuery,
@@ -116,6 +117,26 @@ class Constraint(_Frozen):
             min_value=self.min,
             max_value=self.max,
         )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_evaluation_axis_unused(self) -> Constraint:
+        """Reject a non-default ``evaluation_axis`` that nothing would read.
+
+        Only the metric extractor's axis feeds selection's ``evaluation_point``
+        check, so a constraint that sets one is a misplaced setting.
+
+        :raises ValueError: The constraint extractor sets ``evaluation_axis``.
+        :return Constraint: Self, unchanged.
+        """
+        extractor = self.extractor
+        if not isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor):
+            return self
+        if extractor.evaluation_axis != type(extractor).model_fields["evaluation_axis"].default:
+            raise ValueError(
+                f"Constraint {self.name!r} sets evaluation_axis, which only the metric "
+                "extractor's evaluation_point check reads; remove it."
+            )
         return self
 
 
