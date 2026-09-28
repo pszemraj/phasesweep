@@ -146,10 +146,11 @@ at process or result state; [run state and recovery](#run-state-and-recovery)
 shows where each case comes from.
 
 Winner results describe selected values, not convergence curves, robustness,
-causality, or unreturned trial history. The `confound` payload is the one
-exception: it flags comparability issues in the population selection ranked,
-not robustness of the winner itself, and never blocks or qualifies the
-selected value. Treat `<redacted>` values as deliberate catalog policy, not
+causality, or unreturned trial history. The `confound` payload summarizes
+that history only as counts about the population selection ranked: it bounds
+how far the comparison behind the selected value can be trusted, but it says
+nothing about the winner's robustness and never changes or blocks the
+selection. Treat `<redacted>` values as deliberate catalog policy, not
 missing data.
 
 The operator may configure W&B, ordinary JSON, log, or envelope scoring.
