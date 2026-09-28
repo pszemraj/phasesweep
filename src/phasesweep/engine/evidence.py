@@ -215,6 +215,16 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
             _validate_trial_file_path(source["path"])
         except ValueError:
             fail("invalid file source path")
+    if kind == "json_envelope":
+        evaluation = source.get("evaluation")
+        if (
+            not isinstance(evaluation, Mapping)
+            or not isinstance(evaluation.get("checkpoint"), str)
+            or not evaluation["checkpoint"]
+            or type(evaluation.get("step")) is not int
+            or evaluation["step"] < 0
+        ):
+            fail("envelope objective has no evaluation checkpoint or step")
 
 
 def _verify_objective_source_evidence(

@@ -100,6 +100,8 @@ def _add_trial(
 class _TrialOrderStudy:
     """Small test double exposing trials in a deliberate non-Optuna order."""
 
+    study_name = "t::p"
+
     def __init__(self, trials):
         self._trials = trials
 

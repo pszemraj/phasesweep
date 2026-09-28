@@ -1584,6 +1584,7 @@ def _select_phase_winner(
         # in the study because it is fingerprinted.
         trainer_env_digest=selected.trainer_env_digest,
         trainer_inherit_env=_inherit_env_contract(experiment),
+        confound=selected.confound,
     )
 
 

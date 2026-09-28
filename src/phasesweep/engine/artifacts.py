@@ -16,6 +16,7 @@ import yaml
 import phasesweep.engine.fingerprints as fingerprint_ops
 import phasesweep.engine.paths as path_ops
 from phasesweep.config import Experiment, Phase
+from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import (
     OperatorAction,
     StudyFingerprintMismatchError,
@@ -162,7 +163,9 @@ def _save_winner(
 
     ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
     produced the winning trial (review v0.5.18 / finding F3). Neither ever
-    carries ambient variable values.
+    carries ambient variable values. ``confound`` records the advisory
+    verdicts on the population the source selection ranked; like the
+    provenance fields it is winner-only and never enters ``summary.yaml``.
 
     Args:
         experiment: Parsed experiment config; supplies the metric name used
@@ -182,6 +185,7 @@ def _save_winner(
         "objective_provenance": winner.objective_provenance,
         "trainer_env_digest": winner.trainer_env_digest,
         "trainer_inherit_env": winner.trainer_inherit_env,
+        "confound": winner.confound,
     }
     _write_yaml_atomic(path, payload)
 
@@ -379,6 +383,7 @@ def _load_winner(
                 if isinstance(stored_inherit_env, list)
                 else stored_inherit_env
             ),
+            confound=_validate_confound_block(data["confound"]),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise WinnerIntegrityError(

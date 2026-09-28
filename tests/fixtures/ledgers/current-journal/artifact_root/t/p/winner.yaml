@@ -16,14 +16,14 @@ completion:
   incomplete: false
   reason: null
   timeout_scope: null
-generation_id: 393077480017421d8bf4493c2bca638d
-attempt_id: 80498998b676468896e028540d2d8899
+generation_id: 012f5dde57f344c68846f2297e43093d
+attempt_id: 729354aeb9bd44548906e0d7954af31e
 winner_source:
   kind: phase_trial
   phase: p
   trial_number: 0
-  generation_id: 393077480017421d8bf4493c2bca638d
-  attempt_id: 80498998b676468896e028540d2d8899
+  generation_id: 012f5dde57f344c68846f2297e43093d
+  attempt_id: 729354aeb9bd44548906e0d7954af31e
 trainer_input:
   schema_version: 1
   format: argparse
@@ -35,7 +35,7 @@ objective_provenance:
   extractor:
     config_sha256: b7b4aa1d877c36c43b4c3c2c1ff207148492ab08e2b0e0a4096f8b4b43e6e1a2
     kind: log_regex
-  recorded_at: '2026-09-27T21:13:02+00:00'
+  recorded_at: '2026-09-28T09:38:40+00:00'
   schema_version: 1
   source:
     kind: file
@@ -46,3 +46,24 @@ objective_provenance:
     size_bytes: 11
 trainer_env_digest: c4dc5a1e2d3a991847397cc79ed5e3844e986d46ca71c788586aca6a7e37d436
 trainer_inherit_env: none
+confound:
+  schema_version: 1
+  ranked_trials:
+  - 0
+  - 1
+  checks:
+    evaluation_point:
+      verdict: n/a
+      reason: log_regex objectives report no evaluation checkpoint or step
+    survivorship:
+      verdict: ok
+      detail:
+        ranked: 2
+        infeasible: 0
+        failed: 0
+        pruned: 0
+    tie:
+      verdict: heterogeneous
+      detail:
+        tied_trials:
+        - 1

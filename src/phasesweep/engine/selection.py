@@ -11,6 +11,7 @@ import optuna
 
 from phasesweep.config import Experiment, check_bounds
 from phasesweep.engine.artifacts import _winner_common_payload
+from phasesweep.engine.confound import _assess_population, _describe_flagged
 from phasesweep.engine.errors import OperatorAction, PhaseSweepError, TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.state import (
@@ -46,6 +47,9 @@ class SelectedTrial:
     trainer_env_digest: str
     # Versioned identity of the exact generated input consumed by the trainer.
     trainer_input: dict[str, Any]
+    # Advisory verdicts on the population this selection ranked
+    # (:mod:`phasesweep.engine.confound`).
+    confound: dict[str, Any]
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
 
@@ -79,6 +83,11 @@ def select_winner(
     number rather than by value (review v0.5.17 / finding H). PhaseSweep has no
     way to know a config's meaningful resolution, so it does not guess one.
 
+    The ranked population is also classified for confounds
+    (:func:`phasesweep.engine.confound._assess_population`) and any flagged
+    check is logged once per selection. The verdicts are advisory: they never
+    change which trial wins or whether selection succeeds.
+
     Args:
         study: Optuna study for the phase whose winner we want.
         experiment: Parsed experiment config. Provides the optimization goal
@@ -89,7 +98,8 @@ def select_winner(
 
     Returns:
         The winning trial as :class:`SelectedTrial` (number, params, metric,
-        constraint readings, and persisted evidence-gate results).
+        constraint readings, persisted evidence-gate results, and the
+        population's confound block).
 
     Raises:
         NoFeasibleTrialError: If no trial in the study is both COMPLETE and
@@ -99,8 +109,9 @@ def select_winner(
     minimize = experiment.metric.goal == "minimize"
     constraints_by_name = {c.name: c for c in experiment.constraints}
 
+    trials = study.get_trials(deepcopy=False)
     survivors: list[optuna.trial.FrozenTrial] = []
-    for t in study.get_trials(deepcopy=False):
+    for t in trials:
         if _selection_candidate_identity(t) is None:
             continue
         # Re-verify constraints from user_attrs in case rules changed or stored
@@ -165,6 +176,18 @@ def select_winner(
             )
         gates = parsed_gates
 
+    provenance = {t.number: _trial_objective_provenance(t) for t in survivors}
+    confound = _assess_population(trials, survivors, best, provenance=provenance)
+    flagged = _describe_flagged(confound)
+    if flagged:
+        log.warning(
+            "[%s] potential confounds in the %d ranked trials (advisory; recorded in the "
+            "winner's confound block): %s.",
+            phase_name or study.study_name,
+            len(survivors),
+            "; ".join(flagged),
+        )
+
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
@@ -173,11 +196,12 @@ def select_winner(
         gates=gates,
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
-        objective_provenance=_trial_objective_provenance(best),
+        objective_provenance=provenance[best.number],
         # Allocation writes both before the trainer can run, so every
         # completed trial carries them.
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
+        confound=confound,
     )
 
 

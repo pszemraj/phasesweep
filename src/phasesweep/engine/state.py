@@ -137,6 +137,10 @@ class Winner:
     # compact identity.
     trainer_env_digest: str | None = None
     trainer_inherit_env: str | list[str] | None = None
+    # Advisory verdicts on the population the source selection ranked, frozen
+    # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
+    # keeps them verbatim; no fingerprint reads them.
+    confound: dict[str, Any] | None = None
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
