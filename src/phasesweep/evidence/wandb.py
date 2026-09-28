@@ -10,7 +10,7 @@ import os
 import shlex
 import sys
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -172,6 +172,7 @@ def poll_wandb_summary(
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
     presence_keys: Iterable[str] = (),
+    evaluation: tuple[str, str] | None = None,
     environment: Mapping[str, str] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
@@ -186,9 +187,12 @@ def poll_wandb_summary(
     :param float timeout_seconds: Visibility budget for the whole capture.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
+    :param tuple[str, str] | None evaluation: Objective ``(metric_key, axis)``
+        whose logged position the capture locates in the run's history.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float | None deadline: Absolute deadline including worker startup.
-    :return dict[str, Any]: Numeric values, present keys, and retrieval time.
+    :return dict[str, Any]: Numeric values, present keys, retrieval time, and
+        the objective's evaluation position when requested.
     :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
@@ -223,6 +227,7 @@ def poll_wandb_summary(
                     "timeout_seconds": timeout_seconds,
                     "required_keys": list(required_keys),
                     "presence_keys": list(presence_keys),
+                    "evaluation": list(evaluation) if evaluation is not None else None,
                     "deadline": deadline,
                 }
             ),
@@ -331,6 +336,58 @@ def _summary_lookup(summary: Mapping[str, Any], key: str) -> tuple[bool, Any]:
     return False, None
 
 
+def _history_position(
+    run: Any,
+    summary: Mapping[str, Any],
+    *,
+    metric_key: str,
+    axis: str,
+    value: float,
+) -> tuple[bool, int | float | None]:
+    """Locate where on ``axis`` a finished run logged its summary value.
+
+    The summary holds the last logged value, or a ``min``/``max`` aggregate,
+    of the metric's history series; either way it equals the value of the
+    latest history row that produced it, whose ``axis`` entry is where the
+    objective was measured. A value assigned straight to the summary, or a
+    ``mean`` aggregate, matches no row and has no position.
+
+    History is only conclusive once the server's last history step reaches
+    the summary's own ``_step``; until then the answer is unsettled. The
+    position is advisory evidence, so a failed history read never fails the
+    capture: a transient transport failure is unsettled (retried within the
+    deadline), and any other failure settles as "no position".
+
+    :param Any run: Finished public-API run.
+    :param Mapping[str, Any] summary: Its decoded summary.
+    :param str metric_key: Configured objective key (flat or ``head.tail``).
+    :param str axis: History key marking where the metric was measured.
+    :param float value: Captured objective value.
+    :return tuple[bool, int | float | None]: Whether the answer is settled,
+        and the position (``None`` when no row produced the value).
+    """
+    from phasesweep.evidence.evaluation import json_float, progress_position
+
+    last_step = progress_position(summary.get("_step"))
+    if last_step is None:
+        return True, None
+    series = metric_key if metric_key in summary else metric_key.rpartition(".")[0]
+    try:
+        if run.lastHistoryStep < last_step:
+            return False, None
+        position: int | float | None = None
+        for row in run.scan_history(keys=[series, axis], use_cache=False):
+            try:
+                logged = json_float(row.get(series), label=series)
+            except ValueError:
+                continue
+            if logged == value:
+                position = progress_position(row.get(axis))
+    except Exception as exc:
+        return not _is_retryable_setup_error(exc), None
+    return True, position
+
+
 def _poll_wandb_summary(
     *,
     base_url: str,
@@ -341,6 +398,7 @@ def _poll_wandb_summary(
     timeout_seconds: float,
     required_keys: Iterable[str] = (),
     presence_keys: Iterable[str] = (),
+    evaluation: Sequence[str] | None = None,
     deadline: float | None = None,
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
@@ -353,8 +411,12 @@ def _poll_wandb_summary(
     :param float timeout_seconds: Budget used when no ``deadline`` is given.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
+    :param Sequence[str] | None evaluation: Objective ``(metric_key, axis)``; its
+        history position is awaited while unsettled and time remains for
+        another poll, then recorded (``None`` when history never settled).
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
-    :return dict[str, Any]: Numeric values, present keys, and retrieval time.
+    :return dict[str, Any]: Numeric values, present keys, retrieval time, and
+        the objective's evaluation position when requested.
     :raises WandbPollTimeout: The run did not finish with the required keys in time.
     :raises WandbSetupError: Authentication or setup was denied.
     :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
@@ -408,16 +470,35 @@ def _poll_wandb_summary(
                             if not math.isfinite(value):
                                 raise ValueError(f"W&B metric {key!r} is non-finite.")
                             values[key] = value
-                        capture = {
+                        capture: dict[str, Any] = {
                             "values": values,
                             "present_keys": sorted(
                                 key for key in presence_keys if _summary_lookup(summary, key)[0]
                             ),
                             "retrieved_at": utc_now_iso(timespec="microseconds"),
                         }
+                        settled = True
+                        if evaluation is not None:
+                            metric_key, axis = evaluation
+                            settled, position = _history_position(
+                                run,
+                                summary,
+                                metric_key=metric_key,
+                                axis=axis,
+                                value=values[metric_key],
+                            )
+                            capture["evaluation"] = {
+                                "metric_key": metric_key,
+                                "axis": axis,
+                                "value": position,
+                            }
                         if time.monotonic() >= deadline:
                             break
-                        return capture
+                        if settled or time.monotonic() + poll_seconds >= deadline:
+                            return capture
+                        last_error = RuntimeError(
+                            "W&B history has not reached the finished summary's last step."
+                        )
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
     raise WandbPollTimeout(run_id, timeout_seconds, last_error)
 
@@ -438,6 +519,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("response", type=Path, help="Private polling response")
     args = parser.parse_args(argv)
     request = json.loads(args.request.read_text(encoding="utf-8"))
+    # History scans run through the SDK's service client, which reads the
+    # endpoint from settings rather than from Api overrides; this worker is
+    # its own process, so pin the setting before the SDK first loads it.
+    os.environ["WANDB_BASE_URL"] = request["base_url"]
     response: dict[str, Any]
     try:
         response = {"status": "summary", "capture": _poll_wandb_summary(**request)}

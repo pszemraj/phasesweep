@@ -162,7 +162,9 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
                 with Path({str(calls_path)!r}).open("a") as stream:
                     stream.write(path + "\\n")
                 return type("Run", (), {{"state": "finished", "summary_metrics":
-                    {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted"}}}})()
+                    {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted",
+                      "_step": 9}}, "lastHistoryStep": 9,
+                    "scan_history": lambda self, keys, use_cache=True: [{{"eval/loss": 0.25, "_step": 9}}]}})()
     """)
     trainer = write_trainer(
         tmp_path,
@@ -251,6 +253,10 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         assert capture["run_id"] == winner.attempt_id
         assert capture["run_state"] == "finished"
         assert "secret" not in json.dumps(capture)
+        if consumers in {"primary", "combined"}:
+            assert winner.objective_provenance["source"]["evaluation"] == {
+                "progress": {"axis": "_step", "value": 9}
+            }
         trial_dir = next(_phase_dir(experiment, phase.name).glob("trial_*"))
         receipt = json.loads((trial_dir / "receipt.json").read_text())
         assert receipt["x"] == 7

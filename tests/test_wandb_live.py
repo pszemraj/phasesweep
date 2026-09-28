@@ -76,7 +76,8 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
         base_url=os.environ.get("PHASESWEEP_WANDB_BASE_URL", "https://api.wandb.ai"),
         entity=entity,
         project=project,
-        metric_key="eval/loss",
+        metric_key="eval/loss.min",
+        evaluation_axis="eval/step",
         timeout_seconds=120,
         poll_seconds=2,
     )
@@ -128,10 +129,15 @@ def test_wandb_only_sweep_publishes_and_replays_without_remote_reads(tmp_path: P
         assert winner.metric == min(trial.value for trial in trials if trial.value is not None)
         attempts[phase.name] = [trial.user_attrs[ATTEMPT_ID_ATTR] for trial in trials]
         for trial in trials:
-            capture = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])["remote_capture"]
+            provenance = json.loads(trial.user_attrs[OBJECTIVE_PROVENANCE_ATTR])
+            capture = provenance["remote_capture"]
             assert capture["run_id"] == trial.user_attrs[ATTEMPT_ID_ATTR]
             assert capture["run_state"] == "finished"
-            assert capture["values"]["eval/loss"] == trial.value
+            assert capture["values"]["eval/loss.min"] == trial.value
+            # Loss falls monotonically, so the min is the last evaluation.
+            assert provenance["source"]["evaluation"] == {
+                "progress": {"axis": "eval/step", "value": 20}
+            }
             assert (capture["base_url"], capture["entity"], capture["project"]) == (
                 extractor.base_url,
                 entity,

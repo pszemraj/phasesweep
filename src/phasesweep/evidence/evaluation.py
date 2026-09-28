@@ -487,6 +487,9 @@ def _capture_wandb(
         cfg,
         (cfg.metric_key,) if isinstance(cfg, WandbExtractor) else (),
         tuple(cfg.keys) if isinstance(cfg, WandbSummaryRequiredGate) else (),
+        evaluation=(
+            (cfg.metric_key, cfg.evaluation_axis) if isinstance(cfg, WandbExtractor) else None
+        ),
     )
     source = query.source
     poll_deadline = time.monotonic() + source.timeout_seconds
@@ -505,6 +508,7 @@ def _capture_wandb(
             timeout_seconds=source.timeout_seconds,
             required_keys=query.numeric_keys,
             presence_keys=query.presence_keys,
+            evaluation=query.evaluation,
             environment=ctx.wandb_environment,
             deadline=poll_deadline,
         )
@@ -567,8 +571,10 @@ def _extract_wandb(
         ctx: Trial context whose shared W&B capture supplies the value.
         cfg: ``WandbExtractor`` config naming the remote target and the exact
             summary key.
-        provenance: Optional sink that receives the evidence ``source`` and
-            the shared ``remote_capture`` on success.
+        provenance: Optional sink that receives the evidence ``source`` --
+            including where on ``evaluation_axis`` the value was logged -- and
+            the shared ``remote_capture`` on success. Only the objective passes
+            one.
         deadline: Optional absolute ``time.monotonic()`` phase/run deadline
             for obtaining the capture.
 
@@ -576,8 +582,9 @@ def _extract_wandb(
         The finite numeric value of ``metric_key``.
 
     Raises:
-        ExtractorError: The capture failed or its deadline expired, or the key
-            has no valid finite numeric value.
+        ExtractorError: The capture failed or its deadline expired, the key
+            has no valid finite numeric value, or an objective capture did not
+            locate its evaluation position.
 
     """
     capture = _capture_wandb(ctx, cfg, deadline=deadline)
@@ -588,7 +595,16 @@ def _extract_wandb(
     if not math.isfinite(value):
         raise ExtractorError(f"W&B key {cfg.metric_key!r} is non-finite.")
     if provenance is not None:
-        provenance["source"] = {"kind": "wandb", "metric_key": cfg.metric_key}
+        located = capture.get("evaluation")
+        if not isinstance(located, dict) or located.get("metric_key") != cfg.metric_key:
+            raise ExtractorError(
+                f"W&B capture recorded no evaluation position for {cfg.metric_key!r}."
+            )
+        provenance["source"] = {
+            "kind": "wandb",
+            "metric_key": cfg.metric_key,
+            "evaluation": {"progress": {"axis": located["axis"], "value": located["value"]}},
+        }
         provenance["remote_capture"] = dict(capture)
     return value
 

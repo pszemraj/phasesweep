@@ -566,6 +566,9 @@ class WandbQuery:
     presence_keys: tuple[str, ...]
     constraint_keys: tuple[tuple[str, str], ...] = ()
     gate_keys: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # The W&B objective's (metric_key, evaluation_axis): the capture also
+    # locates where on that axis the objective's summary value was logged.
+    evaluation: tuple[str, str] | None = None
 
 
 def compose_wandb_environment(

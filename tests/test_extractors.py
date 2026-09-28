@@ -194,6 +194,79 @@ def test_wandb_reads_aggregated_summary_keys_as_the_runs_table_names_them(
     assert capture["present_keys"] == present
 
 
+class _HistoryRun:
+    """A finished run whose history rows and indexed last step a test controls."""
+
+    def __init__(self, summary, rows, indexed_steps=()):
+        self.state = "finished"
+        self.summary_metrics = summary
+        self.rows = rows
+        self.indexed_steps = iter(indexed_steps)
+        self.scans = []
+
+    @property
+    def lastHistoryStep(self):  # noqa: N802 - the SDK's attribute name
+        return next(self.indexed_steps, max((row["_step"] for row in self.rows), default=-1))
+
+    def scan_history(self, keys, use_cache=True):
+        self.scans.append((keys, use_cache))
+        return [row for row in self.rows if all(key in row for key in keys)]
+
+
+def _history_position(monkeypatch, run, metric_key="eval/loss", axis="_step", **kwargs):
+    public = pytest.importorskip("wandb.apis.public")
+    monkeypatch.setattr(public, "Api", lambda **_: SimpleNamespace(run=lambda path: run))
+    capture = _wandb_poll(required_keys=[metric_key], evaluation=[metric_key, axis], **kwargs)
+    assert capture["evaluation"]["metric_key"] == metric_key
+    assert capture["evaluation"]["axis"] == axis
+    return capture["evaluation"]["value"]
+
+
+_EVAL_ROWS = [
+    {"_step": 0, "train/loss": 2.0},
+    {"_step": 1, "eval/loss": 0.4, "eval/step": 100},
+    {"_step": 2, "train/loss": 1.0},
+    {"_step": 3, "eval/loss": 0.2, "eval/step": 200},
+    {"_step": 4, "eval/loss": 0.3, "eval/step": 300},
+    {"_step": 5, "eval/loss": 0.2, "eval/step": 400},
+]
+
+
+@pytest.mark.parametrize(
+    ("summary", "metric_key", "axis", "expected"),
+    [
+        ({"eval/loss": 0.2, "_step": 5}, "eval/loss", "_step", 5),
+        ({"eval/loss": 0.2, "_step": 5}, "eval/loss", "eval/step", 400),
+        ({"eval/loss": {"min": 0.2}, "_step": 5}, "eval/loss.min", "eval/step", 400),
+        ({"eval/loss": {"max": 0.4}, "_step": 5}, "eval/loss.max", "eval/step", 100),
+        ({"eval/loss": 0.1, "_step": 5}, "eval/loss", "eval/step", None),
+        ({"eval/loss": 0.2}, "eval/loss", "eval/step", None),
+    ],
+    ids=["last-on-_step", "last-on-eval-step", "min-latest-tie", "max", "assigned", "no-history"],
+)
+def test_wandb_locates_where_the_objective_summary_was_logged(
+    monkeypatch, summary, metric_key, axis, expected
+):
+    run = _HistoryRun(summary, _EVAL_ROWS)
+    assert _history_position(monkeypatch, run, metric_key, axis) == expected
+    assert all(use_cache is False for _, use_cache in run.scans)
+
+
+def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch):
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3, 4])
+    assert _history_position(monkeypatch, run, axis="eval/step") == 400
+    assert len(run.scans) == 1
+
+
+def test_wandb_history_that_never_settles_records_no_position(monkeypatch):
+    import time
+
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3] * 10**6)
+    position = _history_position(monkeypatch, run, deadline=time.monotonic() + 0.05)
+    assert position is None
+    assert run.scans == []
+
+
 def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
     from phasesweep.evidence.models import WandbQuery
 
@@ -204,7 +277,9 @@ def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
     gate = WandbSummaryRequiredGate(
         type="wandb_summary_required", entity="entity", project="project", keys=["done"]
     )
-    query = WandbQuery(objective, ("eval/loss", "memory"), ("done",))
+    query = WandbQuery(
+        objective, ("eval/loss", "memory"), ("done",), evaluation=("eval/loss", "_step")
+    )
     ctx = replace(make_trial_context(tmp_path), wandb_query=query)
     calls = []
 
@@ -214,16 +289,21 @@ def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
             "values": {"eval/loss": 0.2, "memory": 4.0},
             "present_keys": ["done"],
             "retrieved_at": "2026-09-20T00:00:00Z",
+            "evaluation": {"metric_key": "eval/loss", "axis": "_step", "value": 12},
         }
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    # Constraints and gates may trigger the shared capture first; the
+    # objective's position is requested regardless.
+    assert run_extractor(ctx, constraint) == 4
     provenance = {}
     assert run_extractor(ctx, objective, provenance=provenance) == 0.2
-    assert run_extractor(ctx, constraint) == 4
     assert all(result.passed for result in evaluate_gates(ctx, [gate]))
     assert len(calls) == 1
     assert calls[0]["required_keys"] == ("eval/loss", "memory")
+    assert calls[0]["evaluation"] == ("eval/loss", "_step")
     assert provenance["remote_capture"]["run_id"] == ctx.attempt_id
+    assert provenance["source"]["evaluation"] == {"progress": {"axis": "_step", "value": 12}}
 
 
 def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monkeypatch):
@@ -283,15 +363,22 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
     monkeypatch.setenv("WANDB_API_KEY", "excluded-parent-secret")
     wandb_worker_sdk("""
         import os
+        class Run:
+            state = "finished"
+            summary_metrics = {"loss": 0.25, "_step": 7, "done": object(), "unrelated": object()}
+            lastHistoryStep = 7
+            def scan_history(self, keys, use_cache=True):
+                return [{"loss": 0.25, "_step": 7}]
         class Api:
             def __init__(self, **kwargs):
                 assert "WANDB_API_KEY" not in os.environ
                 assert os.environ["HTTPS_PROXY"] == "https://transport.test"
                 assert "PYTHONHOME" not in os.environ
+                # The SDK's history service reads the endpoint from settings.
+                assert os.environ["WANDB_BASE_URL"] == "https://example.test"
             def run(self, path):
                 assert path == "entity/project/attempt"
-                return type("Run", (), {"state": "finished", "summary_metrics":
-                    {"loss": 0.25, "done": object(), "unrelated": object()}})()
+                return Run()
     """)
     capture = poll_wandb_summary(
         base_url="https://example.test",
@@ -303,10 +390,12 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
         timeout_seconds=5,
         required_keys=["loss"],
         presence_keys=["done", "missing"],
+        evaluation=("loss", "_step"),
         environment={"HTTPS_PROXY": "https://transport.test", "PYTHONHOME": "/trainer/python"},
     )
     assert capture["values"] == {"loss": 0.25}
     assert capture["present_keys"] == ["done"]
+    assert capture["evaluation"] == {"metric_key": "loss", "axis": "_step", "value": 7}
     assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
 
 

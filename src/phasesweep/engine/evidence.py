@@ -6,7 +6,7 @@ import json
 import math
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
 
 import optuna
 
@@ -201,6 +201,12 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         key = source.get("metric_key")
         if not isinstance(key, str) or not key or key not in capture["values"]:
             fail("W&B objective has no captured metric key")
+        evaluation = source.get("evaluation")
+        progress = evaluation.get("progress") if isinstance(evaluation, Mapping) else None
+        if not _valid_progress_record(progress, nullable=True):
+            fail("W&B objective has no evaluation-axis record")
+        if capture.get("evaluation") != {"metric_key": key, **progress}:
+            fail("W&B objective's evaluation-axis record disagrees with its capture")
         return
     if (
         source.get("kind") != "file"
@@ -230,13 +236,28 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
             fail("envelope objective has no evaluation-axis position")
 
 
-def _valid_progress_record(record: object, *, nullable: bool) -> bool:
+def _captured_evaluation_request(capture: Mapping[str, Any]) -> tuple[str, str] | None:
+    """Return the ``(metric_key, axis)`` a W&B capture located, if any.
+
+    :param Mapping[str, Any] capture: Frozen shared W&B capture.
+    :return tuple[str, str] | None: The objective key and axis the capture
+        recorded a position for, or ``None`` when it recorded none.
+    """
+    located = capture.get("evaluation")
+    if not isinstance(located, Mapping):
+        return None
+    key, axis = located.get("metric_key"), located.get("axis")
+    return (key, axis) if isinstance(key, str) and isinstance(axis, str) else None
+
+
+def _valid_progress_record(record: object, *, nullable: bool) -> TypeGuard[Mapping[str, Any]]:
     """Check a recorded evaluation-axis position: ``{axis, value}``.
 
     :param object record: Parsed ``source.evaluation.progress`` record.
     :param bool nullable: Whether ``value`` may be ``None``, meaning the
         source could not say where the objective was measured.
-    :return bool: Whether the record names an axis and a valid position.
+    :return TypeGuard[Mapping[str, Any]]: Whether the record names an axis
+        and a valid position.
     """
     if not isinstance(record, Mapping) or set(record) != {"axis", "value"}:
         return False
@@ -495,6 +516,7 @@ def _verify_trial_evidence_dir(
                 for name, key in wandb_query.constraint_keys
             )
             or not set(wandb_query.presence_keys).issubset(capture["present_keys"])
+            or _captured_evaluation_request(capture) != wandb_query.evaluation
         ):
             raise TrialEvidenceMissingError(
                 f"{subject} W&B capture disagrees with its shared constraint/gate evidence."
