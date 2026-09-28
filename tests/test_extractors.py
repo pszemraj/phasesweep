@@ -866,13 +866,14 @@ def test_provenance_envelope_freezes_validated_evaluation_metadata(tmp_path):
     source = provenance["source"]
     assert source["sha256"] == hashlib.sha256(raw).hexdigest()
     # The checkpoint and step are the envelope's own validated values even
-    # when the config did not pin them.
+    # when the config did not pin them; the default axis is that step.
     assert source["evaluation"] == {
         "objective_name": "val_loss",
         "split": "validation",
         "policy": "final_checkpoint",
         "checkpoint": "step_1000.pt",
         "step": 1000,
+        "progress": {"axis": "step", "value": 1000},
     }
 
 

@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from phasesweep import report_objective
 from phasesweep.cli import cli as cli_main
-from phasesweep.evidence import run_extractor
+from phasesweep.evidence import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonEnvelopeExtractor
 from tests.conftest import make_trial_context
 
@@ -88,6 +88,72 @@ def test_report_objective_creates_nested_parent_and_replaces_extractable_envelop
     )
     context = make_trial_context(tmp_path)
     assert run_extractor(context, extractor) == pytest.approx(0.125)
+
+
+def test_report_objective_progress_is_what_a_declared_evaluation_axis_reads(
+    reporting_environment: Path,
+    tmp_path: Path,
+) -> None:
+    """A fixed-token sweep compares tokens; the default axis stays the step."""
+    report_objective(
+        0.5,
+        name="loss",
+        split="validation",
+        policy="final_checkpoint",
+        checkpoint="checkpoint-40",
+        step=40,
+        progress={"tokens": 2_000_000},
+    )
+    assert json.loads(reporting_environment.read_text())["evaluation"]["progress"] == {
+        "tokens": 2_000_000
+    }
+
+    def recorded_position(axis: str) -> object:
+        extractor = JsonEnvelopeExtractor(
+            type="json_envelope",
+            path="reports/objective.json",
+            objective_name="loss",
+            split="validation",
+            policy="final_checkpoint",
+            evaluation_axis=axis,
+        )
+        provenance: dict = {}
+        run_extractor(make_trial_context(tmp_path), extractor, provenance=provenance)
+        return provenance["source"]["evaluation"]["progress"]
+
+    assert recorded_position("tokens") == {"axis": "tokens", "value": 2_000_000}
+    assert recorded_position("step") == {"axis": "step", "value": 40}
+    with pytest.raises(ExtractorError, match="no finite non-negative 'samples' position"):
+        recorded_position("samples")
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        {"step": 1},
+        {"": 1},
+        {"tokens": True},
+        {"tokens": -1},
+        {"tokens": float("nan")},
+        {"tokens": 10**400},
+        {"tokens": "5"},
+    ],
+)
+def test_report_objective_rejects_invalid_progress(
+    reporting_environment: Path, progress: dict
+) -> None:
+    with pytest.raises(ValueError, match="progress"):
+        report_objective(
+            0.5,
+            name="loss",
+            split="validation",
+            policy="final_checkpoint",
+            checkpoint="final.pt",
+            step=1,
+            progress=progress,
+        )
+
+    assert not reporting_environment.exists()
 
 
 @pytest.mark.parametrize("value", [True, float("nan"), float("inf"), "0.5"])

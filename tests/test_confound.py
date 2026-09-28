@@ -14,7 +14,7 @@ import yaml
 
 from phasesweep import run_experiment
 from phasesweep.config import IntParam, Phase, Sampler
-from phasesweep.engine import read_status
+from phasesweep.engine import TrialEvidenceMissingError, read_status
 from phasesweep.engine.confound import (
     CONFOUND_CHECKS,
     CONFOUND_VERDICTS,
@@ -24,6 +24,7 @@ from phasesweep.engine.confound import (
     _flagged_checks,
     _validate_confound_block,
 )
+from phasesweep.engine.evidence import _validate_objective_provenance
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
@@ -62,9 +63,29 @@ def _envelope(checkpoint: str = "final.pt", step: int = 1000) -> dict[str, Any]:
                 "policy": "final",
                 "checkpoint": checkpoint,
                 "step": step,
+                "progress": {"axis": "step", "value": step},
             },
         },
     }
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        None,
+        {"axis": "step"},
+        {"axis": "", "value": 1},
+        {"axis": "step", "value": None},
+        {"axis": "step", "value": -1},
+        {"axis": "step", "value": True},
+    ],
+    ids=["missing", "no-value", "no-axis", "null", "negative", "bool"],
+)
+def test_envelope_provenance_requires_an_evaluation_axis_position(progress):
+    record = _envelope()
+    record["source"]["evaluation"]["progress"] = progress
+    with pytest.raises(TrialEvidenceMissingError, match="no evaluation-axis position"):
+        _validate_objective_provenance(record, subject="Trial 0")
 
 
 def _log_regex() -> dict[str, Any]:

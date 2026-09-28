@@ -32,6 +32,7 @@ from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     extractor_config_fingerprint,
     json_float,
+    progress_position,
 )
 from phasesweep.evidence.models import (
     EXTRACTOR_KINDS,
@@ -225,6 +226,25 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
             or evaluation["step"] < 0
         ):
             fail("envelope objective has no evaluation checkpoint or step")
+        if not _valid_progress_record(evaluation.get("progress"), nullable=False):
+            fail("envelope objective has no evaluation-axis position")
+
+
+def _valid_progress_record(record: object, *, nullable: bool) -> bool:
+    """Check a recorded evaluation-axis position: ``{axis, value}``.
+
+    :param object record: Parsed ``source.evaluation.progress`` record.
+    :param bool nullable: Whether ``value`` may be ``None``, meaning the
+        source could not say where the objective was measured.
+    :return bool: Whether the record names an axis and a valid position.
+    """
+    if not isinstance(record, Mapping) or set(record) != {"axis", "value"}:
+        return False
+    if not isinstance(record["axis"], str) or not record["axis"]:
+        return False
+    if record["value"] is None:
+        return nullable
+    return progress_position(record["value"]) is not None
 
 
 def _verify_objective_source_evidence(

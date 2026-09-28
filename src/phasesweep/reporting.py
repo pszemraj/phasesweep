@@ -56,6 +56,39 @@ def _nonempty_string(value: str, *, label: str) -> str:
     return value
 
 
+def _progress_values(progress: Mapping[str, int | float]) -> dict[str, int | float]:
+    """Validate named training-progress counters reported beside the step.
+
+    :param Mapping[str, int | float] progress: Axis name to position, such as
+        ``{"tokens": 2_000_000}``.
+    :raises ValueError: If a name is empty or ``step`` (the envelope's own
+        axis), or a position is not a finite, non-negative JSON number.
+    :return dict[str, int | float]: The validated counters.
+    """
+    values: dict[str, int | float] = {}
+    for axis, position in progress.items():
+        if not isinstance(axis, str) or not axis or axis == "step":
+            raise ValueError(
+                f"progress names must be nonempty and not 'step' (the envelope's own "
+                f"step), got {axis!r}."
+            )
+        try:
+            valid = (
+                not isinstance(position, bool)
+                and isinstance(position, int | float)
+                and math.isfinite(position)
+                and position >= 0
+            )
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                f"progress[{axis!r}] must be a finite non-negative number, got {position!r}."
+            )
+        values[axis] = position
+    return values
+
+
 def report_objective(
     value: float,
     *,
@@ -64,6 +97,7 @@ def report_objective(
     policy: str,
     checkpoint: str,
     step: int,
+    progress: Mapping[str, int | float] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
     """Atomically publish this trial's objective as a PhaseSweep result envelope.
@@ -81,6 +115,10 @@ def report_objective(
         ``final_checkpoint``.
     :param str checkpoint: Nonempty checkpoint identity.
     :param int step: Non-negative evaluation step.
+    :param Mapping[str, int | float] | None progress: Optional positions on other
+        training-progress axes at this evaluation, such as ``{"tokens": n}``. An
+        extractor whose ``evaluation_axis`` names one of them compares trials on
+        it instead of ``step``.
     :param Mapping[str, Any] | None extra: Optional additional top-level JSON fields.
     :raises RuntimeError: If called outside a compatible PhaseSweep trial.
     :raises ValueError: If objective metadata is invalid or ``extra`` replaces a
@@ -96,6 +134,13 @@ def report_objective(
         raise ValueError(f"value must be finite, got {value!r}.")
     if isinstance(step, bool) or not isinstance(step, int) or step < 0:
         raise ValueError(f"step must be a non-negative integer, got {step!r}.")
+    evaluation: dict[str, Any] = {
+        "policy": _nonempty_string(policy, label="policy"),
+        "checkpoint": _nonempty_string(checkpoint, label="checkpoint"),
+        "step": step,
+    }
+    if progress is not None:
+        evaluation["progress"] = _progress_values(progress)
 
     destination = Path(_required_trial_environment("PHASESWEEP_OBJECTIVE_PATH"))
     identity = {key: _required_trial_environment(key) for key in _IDENTITY_ENV}
@@ -116,11 +161,7 @@ def report_objective(
             "split": _nonempty_string(split, label="split"),
             "value": numeric_value,
         },
-        "evaluation": {
-            "policy": _nonempty_string(policy, label="policy"),
-            "checkpoint": _nonempty_string(checkpoint, label="checkpoint"),
-            "step": step,
-        },
+        "evaluation": evaluation,
     }
     text = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
     atomic_write_text(destination, text)

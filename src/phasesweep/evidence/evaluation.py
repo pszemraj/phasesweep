@@ -131,6 +131,24 @@ def json_float(value: Any, *, label: str) -> float:
         raise ValueError(f"Value at {label!r} is outside the finite scalar range.") from exc
 
 
+def progress_position(value: Any) -> int | float | None:
+    """Return a valid training-progress position, or ``None``.
+
+    A position is where on an evaluation axis (step, tokens, a W&B step
+    metric) an objective was measured: a finite, non-negative JSON number.
+    Integers stay integers so step groups compare and render exactly.
+
+    :param Any value: Candidate position read from evidence.
+    :return int | float | None: ``value`` when valid, else ``None``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        return value if math.isfinite(value) and value >= 0 else None
+    except OverflowError:
+        return None
+
+
 class ExtractorError(RuntimeError):
     """Raised when an extractor cannot produce a value (file missing, key missing, etc).
 
@@ -295,6 +313,18 @@ def _extract_json_envelope(
         raise ExtractorError(f"JSON envelope at {target} has no non-negative evaluation step.")
     if cfg.expected_step is not None and step != cfg.expected_step:
         raise ExtractorError(f"JSON envelope at {target} does not report step {cfg.expected_step}.")
+    if cfg.evaluation_axis == "step":
+        position: int | float | None = step
+    else:
+        reported = evaluation.get("progress")
+        position = progress_position(
+            reported.get(cfg.evaluation_axis) if isinstance(reported, dict) else None
+        )
+        if position is None:
+            raise ExtractorError(
+                f"JSON envelope at {target} reports no finite non-negative "
+                f"{cfg.evaluation_axis!r} position in evaluation.progress."
+            )
 
     try:
         value = json_float(objective.get("value"), label="objective.value")
@@ -308,13 +338,15 @@ def _extract_json_envelope(
             "path": cfg.path,
             **_file_digest(raw),
             # Evaluation metadata as validated from the envelope body — the
-            # checkpoint and step are the envelope's own reported values.
+            # checkpoint, step, and progress position are the envelope's own
+            # reported values; progress is what evaluation_point compares.
             "evaluation": {
                 "objective_name": cfg.objective_name,
                 "split": cfg.split,
                 "policy": cfg.policy,
                 "checkpoint": checkpoint,
                 "step": step,
+                "progress": {"axis": cfg.evaluation_axis, "value": position},
             },
         }
     return value
