@@ -230,25 +230,27 @@ def test_report_objective_requires_injected_destination(monkeypatch: pytest.Monk
         )
 
 
+_CLI_OBJECTIVE = [
+    "report-objective",
+    "0.25",
+    "--name",
+    "accuracy",
+    "--split",
+    "validation",
+    "--policy",
+    "final_checkpoint",
+    "--checkpoint",
+    "final.pt",
+    "--step",
+    "80",
+]
+
+
 def test_report_objective_cli_uses_the_same_envelope_writer(
     reporting_environment: Path,
 ) -> None:
     result = CliRunner().invoke(
-        cli_main,
-        [
-            "report-objective",
-            "0.25",
-            "--name",
-            "accuracy",
-            "--split",
-            "validation",
-            "--policy",
-            "final_checkpoint",
-            "--checkpoint",
-            "final.pt",
-            "--step",
-            "80",
-        ],
+        cli_main, [*_CLI_OBJECTIVE, "--progress", "tokens=2048000", "--progress", "epochs=1.5"]
     )
 
     assert result.exit_code == 0, result.output
@@ -263,4 +265,23 @@ def test_report_objective_cli_uses_the_same_envelope_writer(
         "checkpoint": "final.pt",
         "policy": "final_checkpoint",
         "step": 80,
+        "progress": {"tokens": 2_048_000, "epochs": 1.5},
     }
+    assert type(payload["evaluation"]["progress"]["tokens"]) is int
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [["tokens"], ["tokens=many"], ["tokens=1", "tokens=2"], ["step=1"], ["tokens=-1"]],
+    ids=["no-value", "not-a-number", "repeated", "step", "negative"],
+)
+def test_report_objective_cli_rejects_invalid_progress(
+    reporting_environment: Path, progress: list[str]
+) -> None:
+    arguments = [*_CLI_OBJECTIVE]
+    for item in progress:
+        arguments += ["--progress", item]
+    result = CliRunner().invoke(cli_main, arguments)
+
+    assert result.exit_code == 2, result.output
+    assert not reporting_environment.exists()

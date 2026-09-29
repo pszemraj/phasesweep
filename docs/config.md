@@ -353,3 +353,6 @@ from the managed trial environment:
 phasesweep report-objective 0.123 --name validation_loss --split validation \
   --policy final --checkpoint final.pt --step 1000
 ```
+
+A repeatable `--progress tokens=2048000` reports what `progress=` does from
+Python.
