@@ -323,10 +323,13 @@ def test_assessed_block_survives_yaml_and_validation_unchanged() -> None:
     assert _validate_confound_block(yaml.safe_load(yaml.safe_dump(block))) == block
 
 
-def _mutated(path: tuple[Any, ...], value: Any) -> dict[str, Any]:
+def _mutated(
+    path: tuple[Any, ...], value: Any, block: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Return a valid block with the value at ``path`` replaced, or deleted for ``...``."""
-    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
-    block = _assess(trials, trials)
+    if block is None:
+        trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
+        block = _assess(trials, trials)
     target = block
     for key in path[:-1]:
         target = target[key]
@@ -377,6 +380,70 @@ def _mutated(path: tuple[Any, ...], value: Any) -> dict[str, Any]:
 def test_validator_rejects_malformed_blocks(path: tuple[Any, ...], value: Any) -> None:
     with pytest.raises(ValueError, match="confound"):
         _validate_confound_block(_mutated(path, value))
+
+
+def _all_checked() -> dict[str, Any]:
+    """Assess two ranked trials that tie on distinct params beside one failure."""
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 2), (_FAIL, None, 3))
+    return _assess(trials, trials[:2], provenance={0: _envelope(), 1: _envelope()})
+
+
+def _evaluation(verdict: str, *groups: tuple[int, list[int]]) -> dict[str, Any]:
+    values = [{"value": value, "trials": trials} for value, trials in groups]
+    return {"verdict": verdict, "detail": {"axis": "step", "values": values}}
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "error"),
+    [
+        pytest.param(
+            ("checks", "evaluation_point", "verdict"), "heterogeneous", "contradicts", id="eval"
+        ),
+        pytest.param(
+            ("checks", "survivorship", "verdict"), "heterogeneous", "contradicts", id="survivorship"
+        ),
+        pytest.param(("checks", "tie", "verdict"), "ok", "contradicts", id="tie"),
+        pytest.param(
+            ("checks", "evaluation_point"),
+            _evaluation("ok", (1000, [0])),
+            "cover each ranked trial once",
+            id="eval-missing-trial",
+        ),
+        pytest.param(
+            ("checks", "evaluation_point"),
+            _evaluation("heterogeneous", (400, [0, 1]), (1000, [1])),
+            "cover each ranked trial once",
+            id="eval-trial-twice",
+        ),
+        pytest.param(
+            ("checks", "evaluation_point"),
+            _evaluation("heterogeneous", (1000, [0]), (400, [1])),
+            "ascending and distinct",
+            id="eval-descending",
+        ),
+        pytest.param(("checks", "survivorship", "detail", "ranked"), 3, "ranked count", id="count"),
+        pytest.param(
+            ("checks", "tie", "detail", "tied_trials"), [7], "not ranked", id="tie-unranked"
+        ),
+        pytest.param(
+            ("checks", "tie"), {"verdict": "n/a", "reason": "skipped"}, "several", id="tie-n/a"
+        ),
+        pytest.param(("ranked_trials",), [0], "only one was ranked", id="single-ranked"),
+    ],
+)
+def test_validator_rejects_verdicts_that_contradict_their_evidence(
+    path: tuple[Any, ...], value: Any, error: str
+) -> None:
+    """An unpublished winner.yaml has no manifest hash, so its block must hold together."""
+    block = _all_checked()
+    assert _validate_confound_block(block) == block
+    assert [block["checks"][name]["verdict"] for name in CONFOUND_CHECKS] == [
+        "ok",
+        "ok",
+        "heterogeneous",
+    ]
+    with pytest.raises(ValueError, match=error):
+        _validate_confound_block(_mutated(path, value, _all_checked()))
 
 
 def test_summary_keeps_only_verdicts_and_numbers() -> None:

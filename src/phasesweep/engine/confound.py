@@ -118,7 +118,7 @@ def _evaluation_point(
             f"trial(s) {', '.join(unknown)} recorded no {axes[0]} position for their objective"
         )
     groups = _groups((number, progress["value"]) for number, progress in positions)
-    return _checked(len(groups) > 1, {"axis": axes[0], "values": groups})
+    return _checked("evaluation_point", {"axis": axes[0], "values": groups})
 
 
 def _survivorship(
@@ -143,8 +143,7 @@ def _survivorship(
         bucket = _EXCLUDED_BY_STATE.get(trial.state)
         if bucket is not None and trial.number not in ranked_numbers:
             counts[bucket] += 1
-    excluded = counts["infeasible"] + counts["failed"] + counts["pruned"]
-    return _checked(excluded >= max(1, counts["ranked"]), counts)
+    return _checked("survivorship", counts)
 
 
 def _tie(
@@ -170,7 +169,7 @@ def _tie(
         and trial.value == winner.value
         and trial.params != winner.params
     ]
-    return _checked(bool(tied), {"tied_trials": tied})
+    return _checked("tie", {"tied_trials": tied})
 
 
 def _groups(pairs: Iterable[tuple[int, Any]]) -> list[dict[str, Any]]:
@@ -186,14 +185,34 @@ def _groups(pairs: Iterable[tuple[int, Any]]) -> list[dict[str, Any]]:
     return [{"value": value, "trials": by_value[value]} for value in sorted(by_value)]
 
 
-def _checked(flagged: bool, detail: dict[str, Any]) -> dict[str, Any]:
-    """Return the record of a check that ran.
+def _checked(name: ConfoundCheck, detail: dict[str, Any]) -> dict[str, Any]:
+    """Return the record of a check that ran, its verdict derived from its evidence.
 
-    :param bool flagged: Whether the check found a confound.
+    Assessment and validation share this derivation, so a persisted verdict
+    can never disagree with the evidence recorded beside it.
+
+    :param ConfoundCheck name: The check.
     :param dict[str, Any] detail: Evidence recorded whatever the verdict.
     :return dict[str, Any]: The check record.
     """
-    return {"verdict": "heterogeneous" if flagged else "ok", "detail": detail}
+    return {"verdict": "heterogeneous" if _FLAGGED[name](detail) else "ok", "detail": detail}
+
+
+def _survivorship_flagged(counts: Mapping[str, int]) -> bool:
+    """Whether exclusions were at least as numerous as ranked trials.
+
+    :param Mapping[str, int] counts: Survivorship counts.
+    :return bool: Whether the winner was ranked among at most half of what ran.
+    """
+    excluded = counts["infeasible"] + counts["failed"] + counts["pruned"]
+    return excluded >= max(1, counts["ranked"])
+
+
+_FLAGGED: dict[ConfoundCheck, Callable[[Mapping[str, Any]], bool]] = {
+    "evaluation_point": lambda detail: len(detail["values"]) > 1,
+    "survivorship": _survivorship_flagged,
+    "tie": lambda detail: bool(detail["tied_trials"]),
+}
 
 
 def _not_checked(reason: str) -> dict[str, Any]:
@@ -213,8 +232,9 @@ def _validate_confound_block(data: object) -> dict[str, Any]:
     path, which differ only in how they wrap the ``ValueError``.
 
     :param object data: Parsed ``confound`` value from a ``winner.yaml``.
-    :raises ValueError: The block is absent, has another schema version, or
-        any check record is malformed.
+    :raises ValueError: The block is absent, has another schema version, any
+        check record is malformed or contradicts its evidence, or the evidence
+        disagrees with the ranked trials.
     :return dict[str, Any]: The validated block, rebuilt from plain values.
     """
     if not isinstance(data, Mapping) or set(data) != {"schema_version", "ranked_trials", "checks"}:
@@ -227,11 +247,37 @@ def _validate_confound_block(data: object) -> dict[str, Any]:
     checks = data["checks"]
     if not isinstance(checks, Mapping) or set(checks) != set(CONFOUND_CHECKS):
         raise ValueError(f"confound checks must be exactly {', '.join(CONFOUND_CHECKS)}")
-    return {
-        "schema_version": CONFOUND_SCHEMA_VERSION,
-        "ranked_trials": ranked,
-        "checks": {name: _validate_check(name, checks[name]) for name in CONFOUND_CHECKS},
-    }
+    validated = {name: _validate_check(name, checks[name]) for name in CONFOUND_CHECKS}
+    _validate_against_ranked(validated, ranked)
+    return {"schema_version": CONFOUND_SCHEMA_VERSION, "ranked_trials": ranked, "checks": validated}
+
+
+def _validate_against_ranked(
+    checks: Mapping[ConfoundCheck, Mapping[str, Any]], ranked: list[int]
+) -> None:
+    """Validate that each check's evidence describes the block's ranked trials.
+
+    :param Mapping[ConfoundCheck, Mapping[str, Any]] checks: Individually validated records.
+    :param list[int] ranked: The block's ranked trial numbers.
+    :raises ValueError: A single ranked trial was compared, several were not,
+        the evaluation groups do not cover each ranked trial once, the
+        survivorship count differs, or a tied trial was not ranked.
+    """
+    evaluation, survivorship, tie = (checks[name] for name in CONFOUND_CHECKS)
+    if len(ranked) < 2 and (evaluation["verdict"] != "n/a" or tie["verdict"] != "n/a"):
+        raise ValueError("confound compared trials though only one was ranked")
+    if len(ranked) >= 2 and tie["verdict"] == "n/a":
+        raise ValueError("confound tie is n/a though several trials were ranked")
+    if "detail" in evaluation:
+        grouped = sorted(
+            number for group in evaluation["detail"]["values"] for number in group["trials"]
+        )
+        if grouped != ranked:
+            raise ValueError("confound evaluation_point groups do not cover each ranked trial once")
+    if survivorship["detail"]["ranked"] != len(ranked):
+        raise ValueError("confound survivorship ranked count differs from ranked_trials")
+    if "detail" in tie and not set(tie["detail"]["tied_trials"]) <= set(ranked):
+        raise ValueError("confound tie lists a trial that was not ranked")
 
 
 def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
@@ -240,7 +286,8 @@ def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
     :param ConfoundCheck name: Check the record belongs to.
     :param object check: Parsed record.
     :raises ValueError: The verdict is unknown, an ``n/a`` record has no
-        reason, or a checked record's evidence is malformed.
+        reason, or a checked record's evidence is malformed or yields another
+        verdict.
     :return dict[str, Any]: The validated record.
     """
     if not isinstance(check, Mapping) or check.get("verdict") not in CONFOUND_VERDICTS:
@@ -254,7 +301,10 @@ def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
         return {"verdict": "n/a", "reason": reason}
     if set(check) != {"verdict", "detail"}:
         raise ValueError(f"confound check {name!r} has no evidence")
-    return {"verdict": check["verdict"], "detail": _DETAIL_VALIDATORS[name](check["detail"])}
+    record = _checked(name, _DETAIL_VALIDATORS[name](check["detail"]))
+    if record["verdict"] != check["verdict"]:
+        raise ValueError(f"confound check {name!r} verdict contradicts its evidence")
+    return record
 
 
 def _validate_evaluation_detail(detail: object) -> dict[str, Any]:
@@ -271,13 +321,15 @@ def _validate_evaluation_detail(detail: object) -> dict[str, Any]:
         raise ValueError("confound evaluation_point axis is not a nonempty string")
     if not isinstance(groups, list) or not groups:
         raise ValueError("confound evaluation_point has no value groups")
-    parsed = []
+    parsed: list[dict[str, Any]] = []
     for group in groups:
         if not isinstance(group, Mapping) or set(group) != {"value", "trials"}:
             raise ValueError("confound evaluation_point value group is malformed")
         trials = _trial_numbers(group["trials"], label="evaluation_point trials")
         if not _is_position(group["value"]) or not trials:
             raise ValueError("confound evaluation_point value group is malformed")
+        if parsed and not parsed[-1]["value"] < group["value"]:
+            raise ValueError("confound evaluation_point values are not ascending and distinct")
         parsed.append({"value": group["value"], "trials": trials})
     return {"axis": axis, "values": parsed}
 
