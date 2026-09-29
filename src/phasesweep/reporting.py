@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import numbers
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -56,36 +57,55 @@ def _nonempty_string(value: str, *, label: str) -> str:
     return value
 
 
-def _progress_values(progress: Mapping[str, int | float]) -> dict[str, int | float]:
+def _json_number(value: Any) -> int | float | None:
+    """Convert a Python or NumPy real scalar to the JSON number it reports.
+
+    NumPy scalars register as :class:`numbers.Integral` or :class:`numbers.Real`,
+    so an ``np.int64`` token count or ``np.float32`` loss reports like a Python
+    number. Bools and tensors are not numbers here.
+
+    :param Any value: Candidate number.
+    :return int | float | None: The ``int`` or ``float``, or ``None`` if
+        ``value`` is not a real number or a float overflows.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return None
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    try:
+        return float(value)
+    except OverflowError:
+        return None
+
+
+def _progress_values(progress: Mapping[str, Any]) -> dict[str, int | float]:
     """Validate named training-progress counters reported beside the step.
 
-    :param Mapping[str, int | float] progress: Axis name to position, such as
+    :param Mapping[str, Any] progress: Axis name to position, such as
         ``{"tokens": 2_000_000}``.
-    :raises ValueError: If a name is empty or ``step`` (the envelope's own
-        axis), or a position is not a finite, non-negative JSON number.
-    :return dict[str, int | float]: The validated counters.
+    :raises ValueError: If a name is not a string, is empty or ``step`` (the
+        envelope's own axis), or a position is not a finite, non-negative number.
+    :return dict[str, int | float]: The validated counters as JSON numbers.
     """
     values: dict[str, int | float] = {}
     for axis, position in progress.items():
-        if not isinstance(axis, str) or not axis or axis == "step":
+        if not isinstance(axis, str):
+            raise ValueError(f"progress names must be strings, got {axis!r}.")
+        if not axis or axis == "step":
             raise ValueError(
                 f"progress names must be nonempty and not 'step' (the envelope's own "
                 f"step), got {axis!r}."
             )
+        number = _json_number(position)
         try:
-            valid = (
-                not isinstance(position, bool)
-                and isinstance(position, int | float)
-                and math.isfinite(position)
-                and position >= 0
-            )
+            valid = number is not None and math.isfinite(number) and number >= 0
         except OverflowError:
             valid = False
-        if not valid:
+        if number is None or not valid:
             raise ValueError(
                 f"progress[{axis!r}] must be a finite non-negative number, got {position!r}."
             )
-        values[axis] = position
+        values[axis] = number
     return values
 
 
@@ -108,7 +128,9 @@ def report_objective(
     envelope fields managed by this helper. Missing parent directories in a
     nested configured destination are created by the atomic artifact writer.
 
-    :param float value: Finite objective value produced by the evaluation.
+    :param float value: Finite objective value produced by the evaluation. Here
+        and in ``step`` and ``progress``, NumPy scalars count as numbers;
+        call ``.item()`` on a tensor.
     :param str name: Objective name declared by the metric extractor.
     :param str split: Evaluated data split.
     :param str policy: Evaluation policy, such as ``best_checkpoint`` or
@@ -127,17 +149,22 @@ def report_objective(
     :raises OSError: If the completed envelope cannot be written atomically.
     :return Path: Configured objective path replaced by the completed envelope.
     """
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise ValueError(f"value must be a JSON number, got {value!r}.")
-    numeric_value = float(value)
+    number = _json_number(value)
+    if number is None:
+        raise ValueError(f"value must be a real number, got {value!r}.")
+    try:
+        numeric_value = float(number)
+    except OverflowError:
+        numeric_value = math.inf
     if not math.isfinite(numeric_value):
         raise ValueError(f"value must be finite, got {value!r}.")
-    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+    step_number = _json_number(step)
+    if not isinstance(step_number, int) or step_number < 0:
         raise ValueError(f"step must be a non-negative integer, got {step!r}.")
     evaluation: dict[str, Any] = {
         "policy": _nonempty_string(policy, label="policy"),
         "checkpoint": _nonempty_string(checkpoint, label="checkpoint"),
-        "step": step,
+        "step": step_number,
     }
     if progress is not None:
         evaluation["progress"] = _progress_values(progress)

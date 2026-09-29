@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -127,11 +128,35 @@ def test_report_objective_progress_is_what_a_declared_evaluation_axis_reads(
         recorded_position("samples")
 
 
+def test_report_objective_writes_numpy_scalars_as_json_numbers(
+    reporting_environment: Path,
+) -> None:
+    """Values computed with NumPy in a training loop report like Python numbers."""
+    np = pytest.importorskip("numpy")
+    report_objective(
+        np.float32(0.5),
+        name="loss",
+        split="validation",
+        policy="final_checkpoint",
+        checkpoint="checkpoint-40",
+        step=np.int64(40),
+        progress={"tokens": np.int64(40) * 4096, "epochs": np.float32(1.5)},
+    )
+    payload = json.loads(reporting_environment.read_text())
+    assert payload["objective"]["value"] == 0.5
+    step = payload["evaluation"]["step"]
+    progress = payload["evaluation"]["progress"]
+    assert (step, type(step)) == (40, int)
+    assert progress == {"tokens": 163_840, "epochs": 1.5}
+    assert type(progress["tokens"]) is int
+
+
 @pytest.mark.parametrize(
     "progress",
     [
         {"step": 1},
         {"": 1},
+        {0: 1},
         {"tokens": True},
         {"tokens": -1},
         {"tokens": float("nan")},
@@ -156,7 +181,9 @@ def test_report_objective_rejects_invalid_progress(
     assert not reporting_environment.exists()
 
 
-@pytest.mark.parametrize("value", [True, float("nan"), float("inf"), "0.5"])
+@pytest.mark.parametrize(
+    "value", [True, float("nan"), float("inf"), 10**400, "0.5", Decimal("0.5")]
+)
 def test_report_objective_rejects_non_json_or_nonfinite_values(
     reporting_environment: Path,
     value: object,
