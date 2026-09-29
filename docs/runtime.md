@@ -81,9 +81,10 @@ The block runs three checks, each `ok` (checked, nothing found),
   only one trial was ranked.
 - `survivorship`: whether failed and pruned trials were at least as numerous
   as the ranked ones, so that whatever made configurations fail could have
-  decided which ones were ranked. Infeasible trials are counted too but never
-  flag: the experiment's own constraints and gates define what may win. This
-  check always runs.
+  decided which ones were ranked. Failed trials include evidence-gate and
+  extraction failures. Infeasible trials, which violated a constraint, are
+  counted too but never flag: the experiment's own constraints define what
+  may win. This check always runs.
 - `tie`: whether the trial-number tiebreak chose between trials with
   different params tied on the exact metric value, rather than between
   repeats of one configuration. `n/a` with one ranked trial.

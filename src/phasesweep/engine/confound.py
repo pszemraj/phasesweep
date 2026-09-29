@@ -43,7 +43,8 @@ CONFOUND_SCHEMA_VERSION = 1
 _POSITIONED_KINDS = frozenset({"json_envelope", "wandb"})
 _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "failed", "pruned")
 # Where a terminal trial that selection did not rank is counted. A COMPLETE
-# trial outside the ranked set failed feasibility, a gate, or a constraint.
+# trial outside the ranked set violated a constraint; a trial that failed an
+# evidence gate or extraction is FAIL.
 _EXCLUDED_BY_STATE = {
     optuna.trial.TrialState.COMPLETE: "infeasible",
     optuna.trial.TrialState.FAIL: "failed",
@@ -136,10 +137,10 @@ def _survivorship(
 
     When they do, "best" is a claim about the survivors: anything that made a
     configuration fail, diverge, or run out of time is now correlated with
-    which configurations could win. An infeasible trial is excluded by the
-    operator's own constraints and gates, which define what may win, so it is
-    counted but never flags. The counts are recorded whatever the verdict, and
-    the check always runs.
+    which configurations could win. Failed trials include evidence-gate and
+    extraction failures. An infeasible trial violated one of the operator's
+    constraints, which define what may win, so it is counted but never flags.
+    The counts are recorded whatever the verdict, and the check always runs.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials.

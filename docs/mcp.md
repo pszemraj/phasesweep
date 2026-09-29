@@ -131,7 +131,7 @@ inherit it.
 | Check | Verdict meaning |
 | --- | --- |
 | `evaluation_point` | `heterogeneous`: ranked objectives were measured at `distinct_values` different positions on the configured evaluation axis; the winner's position was `winner_value`. `n/a`: only one trial was ranked, the extractor reports no position, or a ranked trial has no readable position on the axis. |
-| `survivorship` | `heterogeneous`: `failed` + `pruned` trials were at least as numerous as `ranked` ones. `infeasible` trials, excluded by the experiment's own constraints and gates, are counted but never flag. Always checked, never `n/a`. |
+| `survivorship` | `heterogeneous`: `failed` + `pruned` trials were at least as numerous as `ranked` ones; `failed` includes evidence-gate and extraction failures. `infeasible` trials, which violated one of the experiment's own constraints, are counted but never flag. Always checked, never `n/a`. |
 | `tie` | `heterogeneous`: the winner tied exactly with `tied_trials` other ranked trials that used different params. `n/a`: only one trial was ranked. |
 
 `ok` means a check ran and found nothing; `n/a` means it could not run and

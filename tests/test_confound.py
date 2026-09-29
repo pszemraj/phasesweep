@@ -278,7 +278,7 @@ def test_evaluation_point_is_not_checked_without_every_position(
         pytest.param(1, 0, 1, 0, "heterogeneous", id="last-standing"),
         pytest.param(2, 0, 1, 1, "heterogeneous", id="half-failed-or-pruned"),
         pytest.param(3, 0, 1, 1, "ok", id="majority-ranked"),
-        # Constraints and gates define what may win; excluding by them is no bias.
+        # Constraints define what may win; excluding by them is no bias.
         pytest.param(2, 5, 1, 0, "ok", id="minority-feasible"),
         pytest.param(1, 0, 0, 0, "ok", id="single-trial"),
     ],
