@@ -108,7 +108,7 @@
 # lists and needs allow_no_gpu_isolation for parallel work.
 
 #   max_consecutive_failures: int = 5 (>= 1)
-#   timeout_seconds_per_trial: float | null = 86400.0
+#   timeout_seconds_per_trial: float | null = 259200.0
 #   allow_unbounded_trials: bool = false
 #   timeout_seconds_per_phase: float | null = null
 #   allow_incomplete_on_timeout: bool = false

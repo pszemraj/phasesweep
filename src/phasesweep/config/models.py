@@ -340,7 +340,7 @@ class Phase(_Frozen):
         ),
     )
     sampler: Sampler = Field(default_factory=Sampler)
-    timeout_seconds_per_trial: ConfigFloat | None = Field(default=86400.0, ge=0)
+    timeout_seconds_per_trial: ConfigFloat | None = Field(default=259200.0, ge=0)
     allow_unbounded_trials: bool = Field(
         default=False,
         description=(

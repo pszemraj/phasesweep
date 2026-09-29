@@ -169,10 +169,9 @@ Grid and seeded random phases support ordinary local continuation.
 `allow_incomplete_on_timeout` control how failures and partial work are
 handled. They do not create an alternate winner.
 
-`timeout_seconds_per_trial` defaults to 86400 (24 hours) and stops any trial
-still running then. Set it above the longest trial you expect, such as
-`172800` for 48-hour training runs. `null`, no limit, also needs
-`allow_unbounded_trials: true`.
+`timeout_seconds_per_trial` defaults to 259200 (72 hours) and stops any trial
+still running then. Set it above the longest trial you expect. `null`, no
+limit, also needs `allow_unbounded_trials: true`.
 
 ## Trainer inputs
 

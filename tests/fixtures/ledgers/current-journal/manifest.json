@@ -22,7 +22,7 @@
   "produced_by": {
     "cwd": "/home/pszemraj/workspace/projects/productivity/phasesweep",
     "optuna": "4.9.0",
-    "phasesweep_git": "v0.3.4-2-g796896a-dirty",
+    "phasesweep_git": "v0.3.4-28-gb3beb2d-dirty",
     "python": "3.13.15",
     "sqlite": "3.53.4"
   }
