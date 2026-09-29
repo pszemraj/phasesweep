@@ -10,7 +10,7 @@ import os
 import shlex
 import sys
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,13 +27,11 @@ _WORKER_STDERR_LOG = "wandb-worker.stderr.log"
 # must not hold every trial for the whole capture timeout. Reading history
 # that has caught up may use the rest of the capture deadline.
 _HISTORY_SETTLE_SECONDS = 30.0
-# The server's silent cap on one sampled-history request: a series of fewer
-# rows comes back whole, and one of this many may be a sample.
+# The server's silent cap on the rows of one history request, both a sampled
+# request and, until the run's history is exported, a scan page: a longer
+# answer comes back as a sample. A scan page of this many steps holds at most
+# this many rows, so it is never sampled.
 _HISTORY_SAMPLES = 10_000
-# Steps per history scan request. A scan pays per request, not per row: a
-# 500,000-step run took 88 s in the SDK's default 1,000-step pages and 4.6 s
-# in one page.
-_SCAN_PAGE_STEPS = 100_000
 
 
 # Not frozen: unwinding sets an exception's __traceback__ (contextlib does so
@@ -353,17 +351,21 @@ def _history_position(
     objective was measured. A value assigned straight to the summary, or a
     ``mean`` aggregate, matches no row and has no position. The server names
     an aggregate by its series and aggregation (``eval/loss.min`` summarizes
-    the ``eval/loss`` series), so a key with no history rows of its own is
+    the ``eval/loss`` series), so a key the history index does not list is
     looked up as its ``head`` series.
 
-    History is only conclusive once the server's last history step reaches
-    the summary's own ``_step``; until then it is ``lagging``. The position
-    is advisory evidence, so a failed history read never fails the capture: a
+    The run's history index says how far history reaches and how many rows
+    logged each key, but for a while after a run finishes a read can return
+    part of a series without error: only its newest rows, or a sample. History
+    is ``lagging`` until the index reaches the summary's own ``_step`` and a
+    read returns every row the index counts for the series. The position is
+    advisory evidence, so a failed history read never fails the capture: a
     transient transport failure or a read still running at ``deadline`` is
     worth a ``retry``, and any other failure is ``settled`` as "no position".
     A ``define_metric`` step metric the trainer logs in a separate ``log()``
-    call is filled from its previous value, so the axis must be logged with
-    the metric.
+    call is filled from its previous value, and an axis missing from some of
+    the series' rows keeps the read short of the count, so the axis must be
+    logged with the metric.
 
     :param Any run: Finished public-API run.
     :param Mapping[str, Any] summary: Its decoded summary.
@@ -382,45 +384,44 @@ def _history_position(
     head, dot, _ = metric_key.rpartition(".")
     position: int | float | None = None
     try:
-        if run.lastHistoryStep < last_step:
+        run.load(force=True)
+        index = run.history_keys
+        if index["lastStep"] < last_step:
             return "lagging", None
-        for series in (metric_key, head) if dot else (metric_key,):
-            logged_series = False
-            for row in _series_rows(run, series, axis):
-                if time.monotonic() >= deadline:
-                    return "retry", None
-                logged_series = True
-                try:
-                    logged = json_float(row.get(series), label=series)
-                except ValueError:
-                    continue
-                if logged == value:
-                    position = progress_position(row.get(axis))
-            if logged_series:
-                break
+        logged_keys = index["keys"]
+        if metric_key in logged_keys:
+            series = metric_key
+        elif dot and head in logged_keys:
+            series = head
+        else:
+            return "settled", None
+        count = sum(entry["count"] for entry in logged_keys[series]["typeCounts"])
+        # A series under the cap, such as any evaluation series, comes back from
+        # one sampled request however long the run; a longer one is scanned in
+        # pages the server never samples.
+        keys = [series, axis]
+        if count < _HISTORY_SAMPLES:
+            rows = run.history(keys=keys, samples=_HISTORY_SAMPLES, pandas=False)
+        else:
+            rows = run.scan_history(keys=keys, page_size=_HISTORY_SAMPLES, use_cache=False)
+        read = 0
+        for row in rows:
+            if time.monotonic() >= deadline:
+                return "retry", None
+            if series not in row:
+                continue
+            read += 1
+            try:
+                logged = json_float(row[series], label=series)
+            except ValueError:
+                continue
+            if logged == value:
+                position = progress_position(row.get(axis))
+        if read < count:
+            return "lagging", None
     except Exception as exc:
         return ("retry" if _is_retryable_setup_error(exc) else "settled"), None
     return "settled", position
-
-
-def _series_rows(run: Any, series: str, axis: str) -> Iterator[Mapping[str, Any]]:
-    """Yield, in step order, every history row that logged ``series`` with ``axis``.
-
-    One sampled-history request returns every such row while there are fewer
-    than ``_HISTORY_SAMPLES``, which covers an evaluation series in well under
-    a second however long the run. Only a longer series is scanned, in pages
-    of ``_SCAN_PAGE_STEPS`` steps.
-
-    :param Any run: Finished public-API run.
-    :param str series: History key of the metric.
-    :param str axis: History key marking where it was measured.
-    :return Iterator[Mapping[str, Any]]: The rows.
-    """
-    rows = run.history(keys=[series, axis], samples=_HISTORY_SAMPLES, pandas=False)
-    if len(rows) < _HISTORY_SAMPLES:
-        yield from rows
-        return
-    yield from run.scan_history(keys=[series, axis], page_size=_SCAN_PAGE_STEPS, use_cache=False)
 
 
 def _poll_wandb_summary(

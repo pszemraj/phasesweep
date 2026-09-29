@@ -163,7 +163,10 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
                     stream.write(path + "\\n")
                 return type("Run", (), {{"state": "finished", "summary_metrics":
                     {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted",
-                      "_step": 9}}, "lastHistoryStep": 9,
+                      "_step": 9}},
+                    "history_keys": {{"lastStep": 9,
+                        "keys": {{"eval/loss": {{"typeCounts": [{{"count": 1}}]}}}}}},
+                    "load": lambda self, force=False: None,
                     "history": lambda self, keys, samples=500, pandas=True:
                         [{{"eval/loss": 0.25, "_step": 9}}]}})()
     """)

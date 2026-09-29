@@ -190,22 +190,41 @@ def test_wandb_errors_unwind_through_context_managers(name, arguments):
 
 
 class _HistoryRun:
-    """A finished run whose history rows and indexed last step a test controls."""
+    """A finished run whose history, and the index describing it, a test controls.
 
-    def __init__(self, summary, rows, indexed_steps=()):
+    ``indexed_steps`` are the index's last steps on successive loads before it
+    reaches the last row; ``visible`` slices the rows successive reads return
+    before all of them are visible, as reads just after a run finishes do.
+    """
+
+    def __init__(self, summary, rows, indexed_steps=(), visible=()):
         self.state = "finished"
         self.summary_metrics = summary
         self.rows = rows
         self.indexed_steps = iter(indexed_steps)
+        self.visible = iter(visible)
+        self.history_keys = None
         self.reads = []
 
-    @property
-    def lastHistoryStep(self):  # noqa: N802 - the SDK's attribute name
-        return next(self.indexed_steps, max((row["_step"] for row in self.rows), default=-1))
+    def load(self, force=False):
+        assert force is True
+        counts: dict[str, int] = {}
+        for row in self.rows:
+            for key in row.keys() - {"_step"}:
+                counts[key] = counts.get(key, 0) + 1
+        last_step = max((row["_step"] for row in self.rows), default=-1)
+        self.history_keys = {
+            "lastStep": next(self.indexed_steps, last_step),
+            "keys": {
+                key: {"typeCounts": [{"type": "number", "count": count}]}
+                for key, count in counts.items()
+            },
+        }
 
     def _logged(self, keys):
         # Like the server, only rows that logged every requested key.
-        return [row for row in self.rows if all(key in row for key in keys)]
+        rows = [row for row in self.rows if all(key in row for key in keys)]
+        return rows[next(self.visible, slice(None))]
 
     def history(self, keys, samples=500, pandas=True):
         assert pandas is False
@@ -261,14 +280,38 @@ def test_wandb_locates_where_the_objective_summary_was_logged(
     assert {kind for kind, _ in run.reads} <= {"history"}
 
 
-def test_wandb_series_the_server_may_have_sampled_is_scanned_whole(monkeypatch):
+def test_wandb_series_at_the_sample_cap_is_scanned_in_pages_never_sampled(monkeypatch):
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 2)
     run = _HistoryRun({"eval/loss.min": 0.2, "_step": 5}, _EVAL_ROWS)
-    # The sample drops the latest tied minimum at eval/step 400.
     assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
-    assert [kind for kind, _ in run.reads] == ["history", "history", "scan"]
-    # A scan pays per request, so it reads long pages rather than the SDK's 1,000 steps.
-    assert run.page_size == 100_000
+    assert [kind for kind, _ in run.reads] == ["scan"]
+    # A page of as many steps as the cap holds at most that many rows.
+    assert run.page_size == 2
+
+
+@pytest.mark.parametrize(
+    ("visible", "metric_key", "expected"),
+    [
+        # Just after a run finishes, reads can return only the newest rows ...
+        pytest.param(slice(-2, None), "eval/loss.max", 100, id="newest-only"),
+        # ... or miss the newest ones, which would locate an earlier tie.
+        pytest.param(slice(0, 2), "eval/loss.min", 400, id="oldest-only"),
+    ],
+)
+def test_wandb_read_short_of_the_indexed_row_count_is_retried(
+    monkeypatch, visible, metric_key, expected
+):
+    run = _HistoryRun(
+        {metric_key: 0.4 if "max" in metric_key else 0.2, "_step": 5}, _EVAL_ROWS, visible=[visible]
+    )
+    assert _history_position(monkeypatch, run, metric_key, "eval/step") == expected
+    assert [kind for kind, _ in run.reads] == ["history", "history"]
+
+
+def test_wandb_summary_key_absent_from_history_settles_without_a_read(monkeypatch):
+    run = _HistoryRun({"best/loss": 0.1, "_step": 5}, _EVAL_ROWS)
+    assert _history_position(monkeypatch, run, "best/loss", "eval/step") is None
+    assert run.reads == []
 
 
 def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
@@ -453,7 +496,9 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
         class Run:
             state = "finished"
             summary_metrics = {"loss": 0.25, "_step": 7, "done": object(), "unrelated": object()}
-            lastHistoryStep = 7
+            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 1}]}}}
+            def load(self, force=False):
+                pass
             def history(self, keys, samples=500, pandas=True):
                 return [{"loss": 0.25, "_step": 7}]
         class Api:
@@ -597,7 +642,9 @@ def test_wandb_worker_stopped_during_history_read_keeps_the_objective(wandb_work
         class Run:
             state = "finished"
             summary_metrics = {"loss": 0.25, "_step": 7}
-            lastHistoryStep = 7
+            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 1}]}}}
+            def load(self, force=False):
+                pass
             def history(self, keys, samples=500, pandas=True):
                 time.sleep(60)
                 return []
