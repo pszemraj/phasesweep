@@ -309,6 +309,17 @@ def test_wandb_read_short_of_the_indexed_row_count_is_retried(
     assert [kind for kind, _ in run.reads] == ["history", "history"]
 
 
+def test_wandb_slow_summary_polling_still_retries_history(monkeypatch):
+    """A summary poll interval past the settle window must not leave one history read."""
+    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_RETRY_SECONDS", 0.001)
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, visible=[slice(-2, None)])
+    position = _history_position(
+        monkeypatch, run, "eval/loss", "eval/step", poll_seconds=60, timeout_seconds=60
+    )
+    assert position == 400
+    assert len(run.reads) == 2
+
+
 def test_wandb_summary_key_absent_from_history_settles_without_a_read(monkeypatch):
     run = _HistoryRun({"best/loss": 0.1, "_step": 5}, _EVAL_ROWS)
     assert _history_position(monkeypatch, run, "best/loss", "eval/step") is None

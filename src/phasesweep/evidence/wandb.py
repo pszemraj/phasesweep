@@ -27,6 +27,9 @@ _WORKER_STDERR_LOG = "wandb-worker.stderr.log"
 # must not hold every trial for the whole capture timeout. Reading history
 # that has caught up may use the rest of the capture deadline.
 _HISTORY_SETTLE_SECONDS = 30.0
+# Longest wait between history reads, however slowly the summary is polled:
+# the partial reads just after a run finishes cleared within about a second.
+_HISTORY_RETRY_SECONDS = 2.0
 # The server's silent cap on the rows of one history request, both a sampled
 # request and, until the run's history is exported, a scan page: a longer
 # answer comes back as a sample. A scan page of this many steps holds at most
@@ -401,7 +404,8 @@ def _history_position(
         count = sum(entry["count"] for entry in logged_keys[series]["typeCounts"])
         # A series under the cap, such as any evaluation series, comes back from
         # one sampled request however long the run; a longer one is scanned in
-        # pages the server never samples.
+        # pages of the cap's size in steps, too few rows for the server to
+        # sample even before export.
         keys = [series, axis]
         if count < _HISTORY_SAMPLES:
             rows = run.history(keys=keys, samples=_HISTORY_SAMPLES, pandas=False)
@@ -558,7 +562,8 @@ def _locate_evaluation(
     :param Mapping[str, Any] summary: Its decoded summary.
     :param dict[str, Any] capture: Complete summary capture, extended in place.
     :param Sequence[str] evaluation: Objective ``(metric_key, axis)``.
-    :param float poll_seconds: Delay between history checks.
+    :param float poll_seconds: Summary poll interval, the delay between
+        history reads up to ``_HISTORY_RETRY_SECONDS``.
     :param float deadline: Absolute ``time.monotonic()`` capture deadline.
     :param Callable[[dict[str, Any]], None] | None commit: Durably records the
         capture before the history read starts.
@@ -571,6 +576,7 @@ def _locate_evaluation(
     if commit is not None:
         commit(capture)
     settle_by = min(deadline, time.monotonic() + _HISTORY_SETTLE_SECONDS)
+    interval = min(poll_seconds, _HISTORY_RETRY_SECONDS)
     while True:
         read, position = _history_position(
             run,
@@ -584,9 +590,9 @@ def _locate_evaluation(
             located["value"] = position
             return capture
         retry_by = settle_by if read == "lagging" else deadline
-        if time.monotonic() + poll_seconds >= retry_by:
+        if time.monotonic() + interval >= retry_by:
             return capture
-        time.sleep(poll_seconds)
+        time.sleep(interval)
 
 
 def main(argv: list[str] | None = None) -> int:
