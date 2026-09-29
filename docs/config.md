@@ -273,18 +273,18 @@ metric:
     timeout_seconds: 120
 ```
 
-Summary keys are named as the W&B runs table shows them. An exact key wins;
-otherwise `eval/loss.min` reads the aggregate that
-`define_metric("eval/loss", summary="min")` stores under `eval/loss`. A bare
-`eval/loss` whose summary is such an aggregate is not a scalar and fails the
-trial.
+`metric_key` is a summary key as the W&B runs table names it. W&B reports the
+aggregate from `define_metric("eval/loss", summary="min")` as `eval/loss.min`,
+and that run has no `eval/loss` summary key, so a bare `eval/loss` waits out
+the timeout.
 
 `evaluation_axis` names the history key that marks where `metric_key` was
 measured; it defaults to `_step`, W&B's own history step. Typically it names
 the `define_metric` step metric, e.g. `eval/step` under
 `define_metric("eval/*", step_metric="eval/step")`, or a token counter logged
 in the same `log()` call as the metric. It may not name the metric's own
-series.
+series. An aggregate key such as `eval/loss.min` is located in its `eval/loss`
+history series.
 
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share

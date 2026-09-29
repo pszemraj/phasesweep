@@ -316,26 +316,6 @@ def poll_wandb_summary(
     return capture
 
 
-def _summary_lookup(summary: Mapping[str, Any], key: str) -> tuple[bool, Any]:
-    """Find a key in a finished summary the way W&B's runs table names it.
-
-    An exact key wins. Otherwise ``head.tail`` names the aggregate that
-    ``define_metric(head, summary=tail)`` stores as ``{tail: value}`` under
-    ``head``, so ``eval/loss.min`` reads ``summary["eval/loss"]["min"]``.
-
-    :param Mapping[str, Any] summary: Decoded finished-run summary.
-    :param str key: Configured summary key.
-    :return tuple[bool, Any]: Whether the key is present, and its raw value.
-    """
-    if key in summary:
-        return True, summary[key]
-    head, dot, tail = key.rpartition(".")
-    aggregate = summary.get(head) if dot else None
-    if isinstance(aggregate, Mapping) and tail in aggregate:
-        return True, aggregate[tail]
-    return False, None
-
-
 def _history_position(
     run: Any,
     summary: Mapping[str, Any],
@@ -350,7 +330,10 @@ def _history_position(
     of the metric's history series; either way it equals the value of the
     latest history row that produced it, whose ``axis`` entry is where the
     objective was measured. A value assigned straight to the summary, or a
-    ``mean`` aggregate, matches no row and has no position.
+    ``mean`` aggregate, matches no row and has no position. The server names
+    an aggregate by its series and aggregation (``eval/loss.min`` summarizes
+    the ``eval/loss`` series), so a key with no history rows of its own is
+    looked up as its ``head`` series.
 
     History is only conclusive once the server's last history step reaches
     the summary's own ``_step``; until then the answer is unsettled. The
@@ -360,7 +343,7 @@ def _history_position(
 
     :param Any run: Finished public-API run.
     :param Mapping[str, Any] summary: Its decoded summary.
-    :param str metric_key: Configured objective key (flat or ``head.tail``).
+    :param str metric_key: Configured objective summary key.
     :param str axis: History key marking where the metric was measured.
     :param float value: Captured objective value.
     :return tuple[bool, int | float | None]: Whether the answer is settled,
@@ -371,18 +354,25 @@ def _history_position(
     last_step = progress_position(summary.get("_step"))
     if last_step is None:
         return True, None
-    series = metric_key if metric_key in summary else metric_key.rpartition(".")[0]
+    head, dot, _ = metric_key.rpartition(".")
+    position: int | float | None = None
     try:
         if run.lastHistoryStep < last_step:
             return False, None
-        position: int | float | None = None
-        for row in run.scan_history(keys=[series, axis], use_cache=False):
-            try:
-                logged = json_float(row.get(series), label=series)
-            except ValueError:
-                continue
-            if logged == value:
-                position = progress_position(row.get(axis))
+        for series in (metric_key, head) if dot else (metric_key,):
+            logged_series = False
+            for row in run.scan_history(keys=[series, axis], use_cache=False):
+                if series not in row:
+                    continue
+                logged_series = True
+                try:
+                    logged = json_float(row[series], label=series)
+                except ValueError:
+                    continue
+                if logged == value:
+                    position = progress_position(row.get(axis))
+            if logged_series:
+                break
     except Exception as exc:
         return not _is_retryable_setup_error(exc), None
     return True, position
@@ -462,19 +452,16 @@ def _poll_wandb_summary(
                     raise WandbRunTerminalError(run_id, run.state)
                 if run.state == "finished":
                     summary = run.summary_metrics
-                    found = {key: _summary_lookup(summary, key) for key in required}
-                    if all(present for present, _ in found.values()):
+                    if all(key in summary for key in required):
                         values = {}
-                        for key, (_, raw) in found.items():
-                            value = json_float(raw, label=key)
+                        for key in required:
+                            value = json_float(summary[key], label=key)
                             if not math.isfinite(value):
                                 raise ValueError(f"W&B metric {key!r} is non-finite.")
                             values[key] = value
                         capture: dict[str, Any] = {
                             "values": values,
-                            "present_keys": sorted(
-                                key for key in presence_keys if _summary_lookup(summary, key)[0]
-                            ),
+                            "present_keys": sorted(key for key in presence_keys if key in summary),
                             "retrieved_at": utc_now_iso(timespec="microseconds"),
                         }
                         settled = True

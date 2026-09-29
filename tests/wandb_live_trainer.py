@@ -31,8 +31,8 @@ def main(argv: list[str] | None = None) -> int:
     """Train with full-batch SGD for 20 steps, logging held-out loss every 5.
 
     Eval metrics use their own ``eval/step`` x-axis and a ``min`` summary, so
-    the finished summary holds ``{"eval/loss": {"min": ...}}`` and history
-    records the step each evaluation ran at.
+    the finished summary reports ``eval/loss.min`` and history records the step
+    each evaluation ran at.
 
     :param list[str] | None argv: Command-line arguments.
     :return int: Process exit code.

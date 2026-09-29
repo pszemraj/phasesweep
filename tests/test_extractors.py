@@ -150,48 +150,18 @@ def test_wandb_terminal_runs_cannot_win(monkeypatch, state):
     assert caught.value.state == state
 
 
-@pytest.mark.parametrize("aggregated", [False, True], ids=["flat", "aggregated"])
-@pytest.mark.parametrize("value", [True, "0.2", None, float("inf"), 10**400, {"min": 0.2}])
-def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value, aggregated):
+@pytest.mark.parametrize("value", [True, "0.2", None, float("inf"), 10**400])
+def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
     public = pytest.importorskip("wandb.apis.public")
-    summary = {"loss": {"min": value}} if aggregated else {"loss": value}
     monkeypatch.setattr(
         public,
         "Api",
         lambda **kwargs: SimpleNamespace(
-            run=lambda path: SimpleNamespace(state="finished", summary_metrics=summary)
+            run=lambda path: SimpleNamespace(state="finished", summary_metrics={"loss": value})
         ),
     )
     with pytest.raises(ValueError):
-        _wandb_poll(required_keys=["loss.min" if aggregated else "loss"])
-
-
-@pytest.mark.parametrize(
-    ("summary", "expected", "present"),
-    [
-        ({"eval/loss": {"min": 0.2, "last": 0.3}}, 0.2, ["eval/loss.last"]),
-        ({"eval/loss.min": 0.1, "eval/loss": {"min": 0.2}}, 0.1, []),
-    ],
-    ids=["aggregated", "exact-key-wins"],
-)
-def test_wandb_reads_aggregated_summary_keys_as_the_runs_table_names_them(
-    monkeypatch, summary, expected, present
-):
-    # define_metric("eval/loss", summary="min") stores {"eval/loss": {"min": v}},
-    # which the runs table shows as eval/loss.min.
-    public = pytest.importorskip("wandb.apis.public")
-    monkeypatch.setattr(
-        public,
-        "Api",
-        lambda **kwargs: SimpleNamespace(
-            run=lambda path: SimpleNamespace(state="finished", summary_metrics=summary)
-        ),
-    )
-    capture = _wandb_poll(
-        required_keys=["eval/loss.min"], presence_keys=["eval/loss.last", "eval/loss.max"]
-    )
-    assert capture["values"] == {"eval/loss.min": expected}
-    assert capture["present_keys"] == present
+        _wandb_poll(required_keys=["loss"])
 
 
 class _HistoryRun:
@@ -237,8 +207,9 @@ _EVAL_ROWS = [
     [
         ({"eval/loss": 0.2, "_step": 5}, "eval/loss", "_step", 5),
         ({"eval/loss": 0.2, "_step": 5}, "eval/loss", "eval/step", 400),
-        ({"eval/loss": {"min": 0.2}, "_step": 5}, "eval/loss.min", "eval/step", 400),
-        ({"eval/loss": {"max": 0.4}, "_step": 5}, "eval/loss.max", "eval/step", 100),
+        # The server returns define_metric aggregates as flat series.aggregation keys.
+        ({"eval/loss.min": 0.2, "_step": 5}, "eval/loss.min", "eval/step", 400),
+        ({"eval/loss.max": 0.4, "_step": 5}, "eval/loss.max", "eval/step", 100),
         ({"eval/loss": 0.1, "_step": 5}, "eval/loss", "eval/step", None),
         ({"eval/loss": 0.2}, "eval/loss", "eval/step", None),
     ],
@@ -250,6 +221,16 @@ def test_wandb_locates_where_the_objective_summary_was_logged(
     run = _HistoryRun(summary, _EVAL_ROWS)
     assert _history_position(monkeypatch, run, metric_key, axis) == expected
     assert all(use_cache is False for _, use_cache in run.scans)
+
+
+def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
+    rows = [
+        {"_step": 0, "eval/loss": 0.2, "eval/loss.ema": 0.3, "eval/step": 10},
+        {"_step": 1, "eval/loss": 0.3, "eval/loss.ema": 0.2, "eval/step": 20},
+    ]
+    run = _HistoryRun({"eval/loss.ema": 0.2, "_step": 1}, rows)
+    assert _history_position(monkeypatch, run, "eval/loss.ema", "eval/step") == 20
+    assert [keys for keys, _ in run.scans] == [["eval/loss.ema", "eval/step"]]
 
 
 def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch):
