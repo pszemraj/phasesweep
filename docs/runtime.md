@@ -62,9 +62,12 @@ frozen at selection time. It never blocks selection or publication, and it
 never joins a fingerprint, so an observation on a winner can never invalidate
 a study or block a top-up; a top-up that reselects the same trial for a
 larger population publishes a fresh block, and `--from-phase` carries the
-parent winner's block verbatim. Because it lives in `winner.yaml`, it is
-manifest-covered: editing a verdict after publication fails
-`publication_integrity`.
+parent winner's block verbatim. The authoritative copy is the generation's
+`generations/<generation-id>/phases/<phase>/winner.yaml`, which the
+generation manifest covers: editing a verdict there after publication fails
+`publication_integrity`. The per-phase `<phase>/winner.yaml` projection is
+never read back, so editing it changes nothing, and the next publication
+rewrites it.
 
 The block runs three checks, each `ok` (checked, nothing found),
 `heterogeneous` (checked, found a potential confound, with evidence), or
