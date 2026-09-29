@@ -38,7 +38,7 @@ from phasesweep.mcp.registry import (
     require_linux_mcp_host,
 )
 from phasesweep.mcp.scaffold import scaffold_catalog_text
-from phasesweep.reporting import report_objective
+from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -271,6 +271,10 @@ def report_objective_cmd(
                 raise click.BadParameter(
                     f"{item!r} does not end in a number.", param_hint="'--progress'"
                 ) from None
+    try:
+        _progress_values(progress)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="'--progress'") from exc
     try:
         destination = report_objective(
             value,

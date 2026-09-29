@@ -353,7 +353,9 @@ report_objective(
 ```
 
 `report_objective` obtains the attempt identity and output path from the
-managed environment. Do not construct those values yourself.
+managed environment. Do not construct those values yourself. `value`, `step`,
+and any `progress={"tokens": total_tokens}` positions, which a declared
+`evaluation_axis` reads, may be Python or NumPy numbers.
 
 Trainers that cannot import the Python helper can publish the same envelope
 from the managed trial environment:

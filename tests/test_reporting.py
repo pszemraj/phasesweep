@@ -284,4 +284,5 @@ def test_report_objective_cli_rejects_invalid_progress(
     result = CliRunner().invoke(cli_main, arguments)
 
     assert result.exit_code == 2, result.output
+    assert "'--progress'" in result.output
     assert not reporting_environment.exists()
