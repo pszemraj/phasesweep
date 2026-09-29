@@ -20,7 +20,10 @@ _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _WORKER_STDERR_LOG = "wandb-worker.stderr.log"
 
 
-@dataclass(frozen=True)
+# Not frozen: unwinding sets an exception's __traceback__ (contextlib does so
+# explicitly), which a frozen dataclass refuses with FrozenInstanceError.
+# eq=False keeps the identity equality and hashing every exception has.
+@dataclass(eq=False)
 class WandbPollTimeout(TimeoutError):
     """The complete worker exhausted its summary visibility budget."""
 
@@ -29,7 +32,7 @@ class WandbPollTimeout(TimeoutError):
     last_error: Exception | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class WandbRunTerminalError(RuntimeError):
     """The expected run terminated unsuccessfully."""
 
@@ -37,7 +40,7 @@ class WandbRunTerminalError(RuntimeError):
     state: str
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class WandbSetupError(RuntimeError):
     """W&B rejected authentication or client configuration permanently."""
 

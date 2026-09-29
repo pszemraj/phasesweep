@@ -164,6 +164,29 @@ def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
         _wandb_poll(required_keys=["loss"])
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("WandbPollTimeout", ("attempt", 1.0)),
+        ("WandbRunTerminalError", ("attempt", "crashed")),
+        ("WandbSetupError", ("attempt", "denied")),
+    ],
+)
+def test_wandb_errors_unwind_through_context_managers(name, arguments):
+    import contextlib
+
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    @contextlib.contextmanager
+    def span():
+        yield
+
+    error = getattr(wandb_evidence, name)(*arguments)
+    with pytest.raises(type(error)) as caught, span():
+        raise error
+    assert caught.value is error
+
+
 class _HistoryRun:
     """A finished run whose history rows and indexed last step a test controls."""
 
