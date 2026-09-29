@@ -276,13 +276,14 @@ def test_evaluation_point_is_not_checked_without_every_position(
     ("ranked", "infeasible", "failed", "pruned", "verdict"),
     [
         pytest.param(1, 0, 1, 0, "heterogeneous", id="last-standing"),
-        pytest.param(2, 3, 0, 0, "heterogeneous", id="minority-feasible"),
-        pytest.param(2, 1, 1, 0, "heterogeneous", id="half-excluded"),
+        pytest.param(2, 0, 1, 1, "heterogeneous", id="half-failed-or-pruned"),
         pytest.param(3, 0, 1, 1, "ok", id="majority-ranked"),
+        # Constraints and gates define what may win; excluding by them is no bias.
+        pytest.param(2, 5, 1, 0, "ok", id="minority-feasible"),
         pytest.param(1, 0, 0, 0, "ok", id="single-trial"),
     ],
 )
-def test_survivorship_flags_a_winner_ranked_among_at_most_half(
+def test_survivorship_flags_failures_at_least_matching_the_ranked(
     ranked: int, infeasible: int, failed: int, pruned: int, verdict: str
 ) -> None:
     specs = (
@@ -574,7 +575,35 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert len(warnings) == 1
     assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
     assert "2 distinct step values (400, 1000)" in warnings[0]
-    assert "ranked among 2 of 4 terminal trials" in warnings[0]
+    assert "2 failed and 0 pruned trials against 2 ranked" in warnings[0]
+
+
+def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:
+    """Confound verdicts are advisory: a losing trial's bad record cannot fail selection."""
+    experiment = make_experiment(phases=[Phase(name="p", n_trials=2)])
+    study = optuna.create_study(direction="minimize")
+    for number, value in enumerate([0.2, 0.9]):
+        attrs = _candidate_attrs(number, _envelope())
+        if number == 1:
+            attrs[OBJECTIVE_PROVENANCE_ATTR] = "{not json"
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=_COMPLETE,
+                value=value,
+                params={"x": number},
+                distributions={"x": optuna.distributions.IntDistribution(0, 10)},
+                user_attrs=attrs,
+            )
+        )
+
+    selected = select_winner(study, experiment, phase_name="p")
+
+    assert selected.trial_number == 0
+    assert selected.confound["checks"]["evaluation_point"] == {
+        "verdict": "n/a",
+        "reason": "trial(s) 1 have unreadable objective provenance",
+    }
+    _validate_confound_block(selected.confound)
 
 
 def _published_winner(experiment: Any) -> tuple[Path, dict[str, Any]]:

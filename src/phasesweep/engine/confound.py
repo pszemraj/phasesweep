@@ -68,7 +68,8 @@ def _assess_population(
         candidates that satisfy every constraint.
     :param optuna.trial.FrozenTrial winner: The selected trial, one of ``ranked``.
     :param Mapping[int, Mapping[str, Any]] provenance: Validated objective
-        provenance for every ranked trial, keyed by trial number.
+        provenance keyed by trial number, for every ranked trial whose record
+        could be read.
     :return dict[str, Any]: The ``confound`` block persisted on the winner.
     """
     ordered = sorted(ranked, key=lambda trial: trial.number)
@@ -99,11 +100,17 @@ def _evaluation_point(
     ranked trial declares the same one.
 
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number.
-    :param Mapping[int, Mapping[str, Any]] provenance: Their objective provenance.
+    :param Mapping[int, Mapping[str, Any]] provenance: Their readable objective
+        provenance.
     :return dict[str, Any]: The check record.
     """
     if len(ranked) < 2:
         return _not_checked("only one trial was ranked")
+    unreadable = [str(trial.number) for trial in ranked if trial.number not in provenance]
+    if unreadable:
+        return _not_checked(
+            f"trial(s) {', '.join(unreadable)} have unreadable objective provenance"
+        )
     records = [(trial.number, provenance[trial.number]) for trial in ranked]
     kinds = sorted({record["extractor"]["kind"] for _, record in records})
     if len(kinds) != 1 or kinds[0] not in _POSITIONED_KINDS:
@@ -125,12 +132,14 @@ def _survivorship(
     trials: Sequence[optuna.trial.FrozenTrial],
     ranked: Sequence[optuna.trial.FrozenTrial],
 ) -> dict[str, Any]:
-    """Check whether the winner was ranked among at most half of what ran.
+    """Check whether failed and pruned trials at least match the ranked ones.
 
-    When failures or exclusions are at least as numerous as the ranked trials,
-    "best" is a claim about the survivors: anything that made a configuration
-    fail is now correlated with which configurations could win. The counts are
-    recorded whatever the verdict, and the check always runs.
+    When they do, "best" is a claim about the survivors: anything that made a
+    configuration fail, diverge, or run out of time is now correlated with
+    which configurations could win. An infeasible trial is excluded by the
+    operator's own constraints and gates, which define what may win, so it is
+    counted but never flags. The counts are recorded whatever the verdict, and
+    the check always runs.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials.
@@ -199,13 +208,12 @@ def _checked(name: ConfoundCheck, detail: dict[str, Any]) -> dict[str, Any]:
 
 
 def _survivorship_flagged(counts: Mapping[str, int]) -> bool:
-    """Whether exclusions were at least as numerous as ranked trials.
+    """Whether failed and pruned trials were at least as numerous as ranked ones.
 
     :param Mapping[str, int] counts: Survivorship counts.
-    :return bool: Whether the winner was ranked among at most half of what ran.
+    :return bool: Whether the failures could have decided what was ranked.
     """
-    excluded = counts["infeasible"] + counts["failed"] + counts["pruned"]
-    return excluded >= max(1, counts["ranked"])
+    return counts["failed"] + counts["pruned"] >= max(1, counts["ranked"])
 
 
 _FLAGGED: dict[ConfoundCheck, Callable[[Mapping[str, Any]], bool]] = {
@@ -426,11 +434,9 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
                 f"{detail['axis']} values ({_logged_values(groups)})"
             )
         elif name == "survivorship":
-            total = sum(detail[key] for key in _SURVIVORSHIP_COUNTS)
             lines.append(
-                f"survivorship: the winner was ranked among {detail['ranked']} of {total} "
-                f"terminal trials ({detail['infeasible']} infeasible, {detail['failed']} "
-                f"failed, {detail['pruned']} pruned)"
+                f"survivorship: {detail['failed']} failed and {detail['pruned']} pruned "
+                f"trials against {detail['ranked']} ranked"
             )
         else:
             tied = ", ".join(str(number) for number in detail["tied_trials"])

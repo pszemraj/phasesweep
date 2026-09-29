@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -176,7 +177,15 @@ def select_winner(
             )
         gates = parsed_gates
 
-    provenance = {t.number: _trial_objective_provenance(t) for t in survivors}
+    objective_provenance = _trial_objective_provenance(best)
+    provenance = {best.number: objective_provenance}
+    # Only the winner's record backs the published result. The others feed the
+    # advisory evaluation_point check, which reports one it cannot read
+    # instead of failing selection over a trial that lost.
+    for t in survivors:
+        if t is not best:
+            with contextlib.suppress(TrialEvidenceMissingError):
+                provenance[t.number] = _trial_objective_provenance(t)
     confound = _assess_population(trials, survivors, best, provenance=provenance)
     flagged = _describe_flagged(confound)
     if flagged:
@@ -196,7 +205,7 @@ def select_winner(
         gates=gates,
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
-        objective_provenance=provenance[best.number],
+        objective_provenance=objective_provenance,
         # Allocation writes both before the trainer can run, so every
         # completed trial carries them.
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
