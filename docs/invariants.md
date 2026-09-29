@@ -427,9 +427,10 @@ The confound block is computed once per selection and frozen onto the winner;
 observation can never invalidate a study or block a top-up, and a top-up that
 reselects the same trial for a larger ranked population publishes a fresh
 block rather than reusing the old one. A `--from-phase` resume carries the
-parent winner's block verbatim. Because the block lives in `winner.yaml`, it
-is manifest-covered: an edited verdict fails `publication_integrity` like any
-other tampered artifact.
+parent winner's block verbatim. The block's authoritative copy is the
+generation's `phases/<phase>/winner.yaml`, which the generation manifest
+covers: an edited verdict there fails `publication_integrity` like any other
+tampered artifact. The per-phase `winner.yaml` projection is never read back.
 
 **Held by:** `engine.confound._assess_population`, `engine.confound._validate_check`
 refusing an `n/a` record without a `reason`, `engine.fingerprints._phase_fingerprint`,
