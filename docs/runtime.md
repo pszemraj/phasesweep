@@ -73,7 +73,8 @@ The block runs three checks, each `ok` (checked, nothing found),
 - `evaluation_point`: whether the ranked objectives were all measured at the
   same position on the metric extractor's `evaluation_axis` -- the
   training-progress axis the sweep holds fixed, such as optimizer step or
-  tokens. A W&B aggregate such as `eval/loss.min` is positioned where its
+  tokens. Positions within 1% of the highest count as the same point, and the
+  exact positions are recorded either way. A W&B aggregate such as `eval/loss.min` is positioned where its
   history series ends, since where each trial's best value fell differs by
   nature. `n/a` for `json` and `log_regex` extractors, which report no
   position; when any ranked `wandb` trial recorded no position in its run

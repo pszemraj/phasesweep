@@ -50,6 +50,10 @@ _EXCLUDED_BY_STATE = {
     optuna.trial.TrialState.FAIL: "failed",
     optuna.trial.TrialState.PRUNED: "pruned",
 }
+# Evaluation positions within this fraction of the furthest one count as one
+# point: a fixed-token batch-size sweep stops each trial within a batch of its
+# budget, while a truncated trial falls short by far more.
+_POSITION_TOLERANCE = 0.01
 # Distinct values a log line spells out before eliding the rest.
 _LOGGED_VALUES = 5
 
@@ -98,7 +102,9 @@ def _evaluation_point(
     other axis would flag designed differences: a fixed-token batch-size sweep
     ends trials at different steps, and checkpoint labels usually embed the
     step. The axis is part of the fingerprinted extractor config, so every
-    ranked trial declares the same one.
+    ranked trial declares the same one. The exact positions are recorded, and
+    the check flags only positions more than ``_POSITION_TOLERANCE`` short of
+    the furthest.
 
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number.
     :param Mapping[int, Mapping[str, Any]] provenance: Their readable objective
@@ -217,8 +223,20 @@ def _survivorship_flagged(counts: Mapping[str, int]) -> bool:
     return counts["failed"] + counts["pruned"] >= max(1, counts["ranked"])
 
 
+def _evaluation_point_flagged(detail: Mapping[str, Any]) -> bool:
+    """Whether a ranked position fell more than the tolerance short of the furthest.
+
+    :param Mapping[str, Any] detail: Evaluation-point evidence, groups ascending.
+    :return bool: Whether the positions span more than ``_POSITION_TOLERANCE``.
+    """
+    groups = detail["values"]
+    lowest: float = groups[0]["value"]
+    highest: float = groups[-1]["value"]
+    return lowest < (1 - _POSITION_TOLERANCE) * highest
+
+
 _FLAGGED: dict[ConfoundCheck, Callable[[Mapping[str, Any]], bool]] = {
-    "evaluation_point": lambda detail: len(detail["values"]) > 1,
+    "evaluation_point": _evaluation_point_flagged,
     "survivorship": _survivorship_flagged,
     "tie": lambda detail: bool(detail["tied_trials"]),
 }
@@ -432,7 +450,8 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
             groups = detail["values"]
             lines.append(
                 f"evaluation_point: ranked objectives were measured at {len(groups)} distinct "
-                f"{detail['axis']} values ({_logged_values(groups)})"
+                f"{detail['axis']} values ({_logged_values(groups)}), the lowest more than "
+                f"{_POSITION_TOLERANCE:.0%} short of the highest"
             )
         elif name == "survivorship":
             lines.append(

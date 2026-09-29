@@ -253,10 +253,11 @@ For example, in a fixed-token batch-size sweep each trial's optimizer `step`
 count depends on its batch size, so trials differ by design in both `step`
 and any step-named checkpoint. Declaring `evaluation_axis: tokens` and reporting
 `progress={"tokens": total_tokens}` compares trials on tokens instead: the
-check stays `ok` when every trial trained to the same token count, and flags
-one that stopped short. Likewise, a trainer that reports its best checkpoint
-reports a step that differs between trials by nature; report how far it
-trained on a declared axis instead, such as
+check stays `ok` when every trial reached the token budget, and flags one
+that stopped short. Positions within 1% of the highest count as one point,
+since each batch size stops within a batch of the budget. Likewise, a trainer
+that reports its best checkpoint reports a step that differs between trials by
+nature; report how far it trained on a declared axis instead, such as
 `progress={"trained_steps": total_steps}` with
 `evaluation_axis: trained_steps`.
 

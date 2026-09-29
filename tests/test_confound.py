@@ -214,6 +214,19 @@ def test_fixed_token_sweep_compares_tokens_not_steps_or_checkpoints() -> None:
     }
 
 
+def test_fixed_token_budget_reached_within_a_batch_is_one_point() -> None:
+    """Each batch size stops within a batch of the budget; that is no confound."""
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2), (_COMPLETE, 0.3, 3))
+    tokens = [1_990_656, 1_996_800, 1_992_704]
+    records = {number: _envelope(tokens=count) for number, count in enumerate(tokens)}
+    block = _assess(trials, trials, provenance=records)
+
+    check = block["checks"]["evaluation_point"]
+    assert check["verdict"] == "ok"
+    assert [group["value"] for group in check["detail"]["values"]] == sorted(tokens)
+    assert _validate_confound_block(block) == block
+
+
 @pytest.mark.parametrize(
     ("records", "axis", "groups"),
     [
