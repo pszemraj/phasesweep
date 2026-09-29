@@ -428,8 +428,7 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
                 assert "WANDB_API_KEY" not in os.environ
                 assert os.environ["HTTPS_PROXY"] == "https://transport.test"
                 assert "PYTHONHOME" not in os.environ
-                # The SDK's history service reads the endpoint from settings.
-                assert os.environ["WANDB_BASE_URL"] == "https://example.test"
+                assert kwargs["overrides"] == {"base_url": "https://example.test"}
             def run(self, path):
                 assert path == "entity/project/attempt"
                 return Run()

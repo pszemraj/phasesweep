@@ -595,10 +595,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("response", type=Path, help="Private polling response")
     args = parser.parse_args(argv)
     request = json.loads(args.request.read_text(encoding="utf-8"))
-    # History scans run through the SDK's service client, which reads the
-    # endpoint from settings rather than from Api overrides; this worker is
-    # its own process, so pin the setting before the SDK first loads it.
-    os.environ["WANDB_BASE_URL"] = request["base_url"]
 
     def commit(capture: dict[str, Any]) -> None:
         """Record a complete capture the parent keeps even if it must stop this worker.
