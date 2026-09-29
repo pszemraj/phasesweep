@@ -437,6 +437,32 @@ def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
     assert provenance["source"]["evaluation"] == {"progress": {"axis": "_step", "value": 12}}
 
 
+def test_wandb_history_read_past_the_deadline_keeps_the_objective(tmp_path, monkeypatch):
+    """The worker accepts a summary only before its deadline; the advisory
+    history read after it may return late without costing the trial."""
+    objective = WandbExtractor(
+        type="wandb", entity="entity", project="project", metric_key="eval/loss"
+    )
+
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+
+    def capture(*, deadline, **kwargs):
+        clock[0] = deadline + 1.0  # the history read ran past the deadline
+        return {
+            "values": {"eval/loss": 0.2},
+            "present_keys": [],
+            "retrieved_at": "2026-09-20T00:00:00Z",
+            "evaluation": {"metric_key": "eval/loss", "axis": "_step", "value": None},
+        }
+
+    monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    provenance = {}
+    ctx = make_trial_context(tmp_path)
+    assert run_extractor(ctx, objective, provenance=provenance, deadline=150.0) == 0.2
+    assert provenance["source"]["evaluation"] == {"progress": {"axis": "_step", "value": None}}
+
+
 def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monkeypatch):
     from phasesweep.evidence.wandb import _poll_wandb_summary
 

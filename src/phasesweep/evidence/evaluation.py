@@ -539,9 +539,8 @@ def _capture_wandb(
         raise
     except RuntimeError as exc:
         raise ExtractorError(f"W&B evidence worker failed for {target}.") from exc
-    if time.monotonic() >= poll_deadline:
-        error = DeadlineExceededError if capped else ExtractorError
-        raise error(f"W&B evidence arrived after its deadline for {target}.")
+    # The worker accepts a summary only before poll_deadline; only its advisory
+    # history read may return after it.
     ctx.wandb_capture.update(
         {
             "kind": "wandb",
