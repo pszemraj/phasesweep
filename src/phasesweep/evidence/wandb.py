@@ -14,7 +14,11 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import Any, Literal
+
+_HistoryRead = Literal["settled", "lagging", "retry"]
+"""How one history read ended: an answer, history behind the summary, or a
+transient failure worth another read."""
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _WORKER_STDERR_LOG = "wandb-worker.stderr.log"
@@ -340,7 +344,7 @@ def _history_position(
     axis: str,
     value: float,
     deadline: float,
-) -> tuple[bool, int | float | None]:
+) -> tuple[_HistoryRead, int | float | None]:
     """Locate where on ``axis`` a finished run logged its summary value.
 
     The summary holds the last logged value, or a ``min``/``max`` aggregate,
@@ -353,10 +357,10 @@ def _history_position(
     looked up as its ``head`` series.
 
     History is only conclusive once the server's last history step reaches
-    the summary's own ``_step``; until then the answer is unsettled. The
-    position is advisory evidence, so a failed history read never fails the
-    capture: a transient transport failure or a scan still running at
-    ``deadline`` is unsettled, and any other failure settles as "no position".
+    the summary's own ``_step``; until then it is ``lagging``. The position
+    is advisory evidence, so a failed history read never fails the capture: a
+    transient transport failure or a read still running at ``deadline`` is
+    worth a ``retry``, and any other failure is ``settled`` as "no position".
     A ``define_metric`` step metric the trainer logs in a separate ``log()``
     call is filled from its previous value, so the axis must be logged with
     the metric.
@@ -367,24 +371,24 @@ def _history_position(
     :param str axis: History key marking where the metric was measured.
     :param float value: Captured objective value.
     :param float deadline: ``time.monotonic()`` time at which a read gives up.
-    :return tuple[bool, int | float | None]: Whether the answer is settled,
-        and the position (``None`` when no row produced the value).
+    :return tuple[_HistoryRead, int | float | None]: How the read ended, and
+        the position once ``settled`` (``None`` when no row produced the value).
     """
     from phasesweep.evidence.evaluation import json_float, progress_position
 
     last_step = progress_position(summary.get("_step"))
     if last_step is None:
-        return True, None
+        return "settled", None
     head, dot, _ = metric_key.rpartition(".")
     position: int | float | None = None
     try:
         if run.lastHistoryStep < last_step:
-            return False, None
+            return "lagging", None
         for series in (metric_key, head) if dot else (metric_key,):
             logged_series = False
             for row in _series_rows(run, series, axis):
                 if time.monotonic() >= deadline:
-                    return False, None
+                    return "retry", None
                 logged_series = True
                 try:
                     logged = json_float(row.get(series), label=series)
@@ -395,8 +399,8 @@ def _history_position(
             if logged_series:
                 break
     except Exception as exc:
-        return not _is_retryable_setup_error(exc), None
-    return True, position
+        return ("retry" if _is_retryable_setup_error(exc) else "settled"), None
+    return "settled", position
 
 
 def _series_rows(run: Any, series: str, axis: str) -> Iterator[Mapping[str, Any]]:
@@ -540,8 +544,8 @@ def _locate_evaluation(
     The capture is committed without a position before history is read, so a
     history read that outlives the deadline, and the worker with it, still
     leaves the objective. History then gets at most
-    ``_HISTORY_SETTLE_SECONDS`` to reach the summary's last step, and reading
-    it may use the rest of the deadline.
+    ``_HISTORY_SETTLE_SECONDS`` to reach the summary's last step; reading it,
+    and retrying a transient read failure, may use the rest of the deadline.
 
     :param Any run: Finished public-API run.
     :param Mapping[str, Any] summary: Its decoded summary.
@@ -561,7 +565,7 @@ def _locate_evaluation(
         commit(capture)
     settle_by = min(deadline, time.monotonic() + _HISTORY_SETTLE_SECONDS)
     while True:
-        settled, position = _history_position(
+        read, position = _history_position(
             run,
             summary,
             metric_key=metric_key,
@@ -569,10 +573,11 @@ def _locate_evaluation(
             value=capture["values"][metric_key],
             deadline=deadline,
         )
-        if settled:
+        if read == "settled":
             located["value"] = position
             return capture
-        if time.monotonic() + poll_seconds >= settle_by:
+        retry_by = settle_by if read == "lagging" else deadline
+        if time.monotonic() + poll_seconds >= retry_by:
             return capture
         time.sleep(poll_seconds)
 

@@ -296,6 +296,29 @@ def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch
     assert run.reads == []
 
 
+def test_wandb_transient_history_failure_retries_past_the_settle_window(monkeypatch):
+    """Only waiting for history to catch up is bounded by the settle window."""
+    clock = [0.0]
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.time.sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+
+    class FlakyRun(_HistoryRun):
+        failures = 1
+
+        def history(self, keys, samples=500, pandas=True):
+            if self.failures:
+                self.failures -= 1
+                clock[0] += 40.0  # a long read, then a dropped connection
+                raise ConnectionError("connection reset by peer")
+            return super().history(keys, samples, pandas)
+
+    run = FlakyRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS)
+    assert _history_position(monkeypatch, run, axis="eval/step", timeout_seconds=120) == 400
+
+
 @pytest.mark.parametrize(("timeout", "expected"), [(120, 400), (70, None)])
 def test_wandb_history_read_may_outlast_the_settle_window_but_not_the_deadline(
     monkeypatch, timeout, expected
