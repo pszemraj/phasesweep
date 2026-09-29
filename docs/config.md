@@ -286,9 +286,9 @@ in the same `log()` call as the metric: W&B fills a step metric missing from a
 call with its previous value, so an axis logged separately lags one
 evaluation behind. It may not name the metric's own series. An aggregate key such as `eval/loss.min` is located in its `eval/loss`
 history series. The position is advisory: once the summary is captured,
-history gets up to 30 seconds, within `timeout_seconds`, to catch up, and a
-history read that fails or runs out of time records no position instead of
-failing the trial.
+history gets up to 30 seconds to catch up with it, and reading it may use the
+rest of `timeout_seconds`. A history read that fails or runs out of time
+records no position instead of failing the trial.
 
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share

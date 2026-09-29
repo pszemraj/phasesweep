@@ -214,9 +214,10 @@ class _HistoryRun:
         # The server returns a series of at least ``samples`` rows as a sample.
         return rows if len(rows) < samples else rows[::2][:samples]
 
-    def scan_history(self, keys, use_cache=True):
+    def scan_history(self, keys, page_size=1000, use_cache=True):
         assert use_cache is False
         self.reads.append(("scan", keys))
+        self.page_size = page_size
         return self._logged(keys)
 
 
@@ -266,6 +267,8 @@ def test_wandb_series_the_server_may_have_sampled_is_scanned_whole(monkeypatch):
     # The sample drops the latest tied minimum at eval/step 400.
     assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
     assert [kind for kind, _ in run.reads] == ["history", "history", "scan"]
+    # A scan pays per request, so it reads long pages rather than the SDK's 1,000 steps.
+    assert run.page_size == 100_000
 
 
 def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
@@ -293,16 +296,20 @@ def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch
     assert run.reads == []
 
 
-def test_wandb_history_scan_outlasting_the_settle_window_keeps_the_objective(monkeypatch):
-    """The objective is committed before history is read, then the scan is bounded."""
+@pytest.mark.parametrize(("timeout", "expected"), [(120, 400), (70, None)])
+def test_wandb_history_read_may_outlast_the_settle_window_but_not_the_deadline(
+    monkeypatch, timeout, expected
+):
+    """The objective is committed before history is read; the read is bounded by the deadline."""
     public = pytest.importorskip("wandb.apis.public")
     clock = [0.0]
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 1)
 
     class SlowScanRun(_HistoryRun):
-        def scan_history(self, keys, use_cache=True):
-            for row in super().scan_history(keys, use_cache):
+        def scan_history(self, keys, page_size=1000, use_cache=True):
+            # Four evaluation rows, 20 s apart: the scan ends 80 s in.
+            for row in super().scan_history(keys, page_size, use_cache):
                 clock[0] += 20.0
                 yield row
 
@@ -312,13 +319,16 @@ def test_wandb_history_scan_outlasting_the_settle_window_keeps_the_objective(mon
     capture = _wandb_poll(
         required_keys=["eval/loss"],
         evaluation=["eval/loss", "eval/step"],
-        timeout_seconds=120,
+        timeout_seconds=timeout,
         commit=lambda committed: commits.append((committed["evaluation"]["value"], len(run.reads))),
     )
     assert capture["values"] == {"eval/loss": 0.2}
-    assert capture["evaluation"] == {"metric_key": "eval/loss", "axis": "eval/step", "value": None}
+    assert capture["evaluation"] == {
+        "metric_key": "eval/loss",
+        "axis": "eval/step",
+        "value": expected,
+    }
     assert commits == [(None, 0)]
-    assert clock[0] < 120
 
 
 def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):

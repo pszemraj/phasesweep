@@ -10,7 +10,7 @@ import os
 import shlex
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,13 +18,18 @@ from typing import Any
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _WORKER_STDERR_LOG = "wandb-worker.stderr.log"
-# How long a captured objective waits for run history to reach its summary
-# before recording no position; the position is advisory, so it must not
-# hold every trial for the whole capture timeout.
+# How long a captured objective waits for run history to catch up with its
+# summary before recording no position; the position is advisory, so waiting
+# must not hold every trial for the whole capture timeout. Reading history
+# that has caught up may use the rest of the capture deadline.
 _HISTORY_SETTLE_SECONDS = 30.0
-# Rows one sampled-history request asks for; fewer back means none were
-# sampled away. Well under the server's silent 10,000-row cap.
-_HISTORY_SAMPLES = 1000
+# The server's silent cap on one sampled-history request: a series of fewer
+# rows comes back whole, and one of this many may be a sample.
+_HISTORY_SAMPLES = 10_000
+# Steps per history scan request. A scan pays per request, not per row: a
+# 500,000-step run took 88 s in the SDK's default 1,000-step pages and 4.6 s
+# in one page.
+_SCAN_PAGE_STEPS = 100_000
 
 
 # Not frozen: unwinding sets an exception's __traceback__ (contextlib does so
@@ -361,7 +366,7 @@ def _history_position(
     :param str metric_key: Configured objective summary key.
     :param str axis: History key marking where the metric was measured.
     :param float value: Captured objective value.
-    :param float deadline: ``time.monotonic()`` time at which a scan gives up.
+    :param float deadline: ``time.monotonic()`` time at which a read gives up.
     :return tuple[bool, int | float | None]: Whether the answer is settled,
         and the position (``None`` when no row produced the value).
     """
@@ -376,50 +381,42 @@ def _history_position(
         if run.lastHistoryStep < last_step:
             return False, None
         for series in (metric_key, head) if dot else (metric_key,):
-            rows = _series_rows(run, series, axis, deadline=deadline)
-            if rows is None:
-                return False, None
-            for row in rows:
+            logged_series = False
+            for row in _series_rows(run, series, axis):
+                if time.monotonic() >= deadline:
+                    return False, None
+                logged_series = True
                 try:
                     logged = json_float(row.get(series), label=series)
                 except ValueError:
                     continue
                 if logged == value:
                     position = progress_position(row.get(axis))
-            if rows:
+            if logged_series:
                 break
     except Exception as exc:
         return not _is_retryable_setup_error(exc), None
     return True, position
 
 
-def _series_rows(
-    run: Any, series: str, axis: str, *, deadline: float
-) -> list[Mapping[str, Any]] | None:
-    """Return, in step order, every history row that logged ``series`` with ``axis``.
+def _series_rows(run: Any, series: str, axis: str) -> Iterator[Mapping[str, Any]]:
+    """Yield, in step order, every history row that logged ``series`` with ``axis``.
 
     One sampled-history request returns every such row while there are fewer
-    than ``_HISTORY_SAMPLES``; the server samples only a longer series. That
-    covers typical evaluation series in one request, where a paged scan
-    reads the run's whole history (seconds per 10,000 steps). Only a longer
-    series falls back to the scan, which gives up at ``deadline``.
+    than ``_HISTORY_SAMPLES``, which covers an evaluation series in well under
+    a second however long the run. Only a longer series is scanned, in pages
+    of ``_SCAN_PAGE_STEPS`` steps.
 
     :param Any run: Finished public-API run.
     :param str series: History key of the metric.
     :param str axis: History key marking where it was measured.
-    :param float deadline: ``time.monotonic()`` time at which a scan gives up.
-    :return list[Mapping[str, Any]] | None: The rows, or ``None`` when the
-        scan reached ``deadline``.
+    :return Iterator[Mapping[str, Any]]: The rows.
     """
     rows = run.history(keys=[series, axis], samples=_HISTORY_SAMPLES, pandas=False)
     if len(rows) < _HISTORY_SAMPLES:
-        return list(rows)
-    scanned = []
-    for row in run.scan_history(keys=[series, axis], use_cache=False):
-        if time.monotonic() >= deadline:
-            return None
-        scanned.append(row)
-    return scanned
+        yield from rows
+        return
+    yield from run.scan_history(keys=[series, axis], page_size=_SCAN_PAGE_STEPS, use_cache=False)
 
 
 def _poll_wandb_summary(
@@ -543,7 +540,8 @@ def _locate_evaluation(
     The capture is committed without a position before history is read, so a
     history read that outlives the deadline, and the worker with it, still
     leaves the objective. History then gets at most
-    ``_HISTORY_SETTLE_SECONDS`` to reach the summary's last step.
+    ``_HISTORY_SETTLE_SECONDS`` to reach the summary's last step, and reading
+    it may use the rest of the deadline.
 
     :param Any run: Finished public-API run.
     :param Mapping[str, Any] summary: Its decoded summary.
@@ -569,7 +567,7 @@ def _locate_evaluation(
             metric_key=metric_key,
             axis=axis,
             value=capture["values"][metric_key],
-            deadline=settle_by,
+            deadline=deadline,
         )
         if settled:
             located["value"] = position
