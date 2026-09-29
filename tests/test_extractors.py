@@ -197,15 +197,27 @@ class _HistoryRun:
         self.summary_metrics = summary
         self.rows = rows
         self.indexed_steps = iter(indexed_steps)
-        self.scans = []
+        self.reads = []
 
     @property
     def lastHistoryStep(self):  # noqa: N802 - the SDK's attribute name
         return next(self.indexed_steps, max((row["_step"] for row in self.rows), default=-1))
 
-    def scan_history(self, keys, use_cache=True):
-        self.scans.append((keys, use_cache))
+    def _logged(self, keys):
+        # Like the server, only rows that logged every requested key.
         return [row for row in self.rows if all(key in row for key in keys)]
+
+    def history(self, keys, samples=500, pandas=True):
+        assert pandas is False
+        self.reads.append(("history", keys))
+        rows = self._logged(keys)
+        # The server returns a series of at least ``samples`` rows as a sample.
+        return rows if len(rows) < samples else rows[::2][:samples]
+
+    def scan_history(self, keys, use_cache=True):
+        assert use_cache is False
+        self.reads.append(("scan", keys))
+        return self._logged(keys)
 
 
 def _history_position(monkeypatch, run, metric_key="eval/loss", axis="_step", **kwargs):
@@ -245,7 +257,15 @@ def test_wandb_locates_where_the_objective_summary_was_logged(
 ):
     run = _HistoryRun(summary, _EVAL_ROWS)
     assert _history_position(monkeypatch, run, metric_key, axis) == expected
-    assert all(use_cache is False for _, use_cache in run.scans)
+    assert {kind for kind, _ in run.reads} <= {"history"}
+
+
+def test_wandb_series_the_server_may_have_sampled_is_scanned_whole(monkeypatch):
+    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 2)
+    run = _HistoryRun({"eval/loss.min": 0.2, "_step": 5}, _EVAL_ROWS)
+    # The sample drops the latest tied minimum at eval/step 400.
+    assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
+    assert [kind for kind, _ in run.reads] == ["history", "history", "scan"]
 
 
 def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
@@ -255,13 +275,13 @@ def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
     ]
     run = _HistoryRun({"eval/loss.ema": 0.2, "_step": 1}, rows)
     assert _history_position(monkeypatch, run, "eval/loss.ema", "eval/step") == 20
-    assert [keys for keys, _ in run.scans] == [["eval/loss.ema", "eval/step"]]
+    assert run.reads == [("history", ["eval/loss.ema", "eval/step"])]
 
 
 def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch):
     run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3, 4])
     assert _history_position(monkeypatch, run, axis="eval/step") == 400
-    assert len(run.scans) == 1
+    assert len(run.reads) == 1
 
 
 def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch):
@@ -270,7 +290,7 @@ def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch
     start = time.monotonic()
     assert _history_position(monkeypatch, run, timeout_seconds=60) is None
     assert time.monotonic() - start < 30
-    assert run.scans == []
+    assert run.reads == []
 
 
 def test_wandb_history_scan_outlasting_the_settle_window_keeps_the_objective(monkeypatch):
@@ -278,6 +298,7 @@ def test_wandb_history_scan_outlasting_the_settle_window_keeps_the_objective(mon
     public = pytest.importorskip("wandb.apis.public")
     clock = [0.0]
     monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 1)
 
     class SlowScanRun(_HistoryRun):
         def scan_history(self, keys, use_cache=True):
@@ -292,7 +313,7 @@ def test_wandb_history_scan_outlasting_the_settle_window_keeps_the_objective(mon
         required_keys=["eval/loss"],
         evaluation=["eval/loss", "eval/step"],
         timeout_seconds=120,
-        commit=lambda committed: commits.append((committed["evaluation"]["value"], len(run.scans))),
+        commit=lambda committed: commits.append((committed["evaluation"]["value"], len(run.reads))),
     )
     assert capture["values"] == {"eval/loss": 0.2}
     assert capture["evaluation"] == {"metric_key": "eval/loss", "axis": "eval/step", "value": None}
@@ -400,7 +421,7 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
             state = "finished"
             summary_metrics = {"loss": 0.25, "_step": 7, "done": object(), "unrelated": object()}
             lastHistoryStep = 7
-            def scan_history(self, keys, use_cache=True):
+            def history(self, keys, samples=500, pandas=True):
                 return [{"loss": 0.25, "_step": 7}]
         class Api:
             def __init__(self, **kwargs):
@@ -545,7 +566,7 @@ def test_wandb_worker_stopped_during_history_read_keeps_the_objective(wandb_work
             state = "finished"
             summary_metrics = {"loss": 0.25, "_step": 7}
             lastHistoryStep = 7
-            def scan_history(self, keys, use_cache=True):
+            def history(self, keys, samples=500, pandas=True):
                 time.sleep(60)
                 return []
         class Api:

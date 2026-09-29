@@ -164,7 +164,8 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
                 return type("Run", (), {{"state": "finished", "summary_metrics":
                     {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted",
                       "_step": 9}}, "lastHistoryStep": 9,
-                    "scan_history": lambda self, keys, use_cache=True: [{{"eval/loss": 0.25, "_step": 9}}]}})()
+                    "history": lambda self, keys, samples=500, pandas=True:
+                        [{{"eval/loss": 0.25, "_step": 9}}]}})()
     """)
     trainer = write_trainer(
         tmp_path,

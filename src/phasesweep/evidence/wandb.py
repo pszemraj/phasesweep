@@ -22,6 +22,9 @@ _WORKER_STDERR_LOG = "wandb-worker.stderr.log"
 # before recording no position; the position is advisory, so it must not
 # hold every trial for the whole capture timeout.
 _HISTORY_SETTLE_SECONDS = 30.0
+# Rows one sampled-history request asks for; fewer back means none were
+# sampled away. Well under the server's silent 10,000-row cap.
+_HISTORY_SAMPLES = 1000
 
 
 # Not frozen: unwinding sets an exception's __traceback__ (contextlib does so
@@ -349,6 +352,9 @@ def _history_position(
     position is advisory evidence, so a failed history read never fails the
     capture: a transient transport failure or a scan still running at
     ``deadline`` is unsettled, and any other failure settles as "no position".
+    A ``define_metric`` step metric the trainer logs in a separate ``log()``
+    call is filled from its previous value, so the axis must be logged with
+    the metric.
 
     :param Any run: Finished public-API run.
     :param Mapping[str, Any] summary: Its decoded summary.
@@ -370,24 +376,50 @@ def _history_position(
         if run.lastHistoryStep < last_step:
             return False, None
         for series in (metric_key, head) if dot else (metric_key,):
-            logged_series = False
-            for row in run.scan_history(keys=[series, axis], use_cache=False):
-                if time.monotonic() >= deadline:
-                    return False, None
-                if series not in row:
-                    continue
-                logged_series = True
+            rows = _series_rows(run, series, axis, deadline=deadline)
+            if rows is None:
+                return False, None
+            for row in rows:
                 try:
-                    logged = json_float(row[series], label=series)
+                    logged = json_float(row.get(series), label=series)
                 except ValueError:
                     continue
                 if logged == value:
                     position = progress_position(row.get(axis))
-            if logged_series:
+            if rows:
                 break
     except Exception as exc:
         return not _is_retryable_setup_error(exc), None
     return True, position
+
+
+def _series_rows(
+    run: Any, series: str, axis: str, *, deadline: float
+) -> list[Mapping[str, Any]] | None:
+    """Return, in step order, every history row that logged ``series`` with ``axis``.
+
+    One sampled-history request returns every such row while there are fewer
+    than ``_HISTORY_SAMPLES``; the server samples only a longer series. That
+    covers typical evaluation series in one request, where a paged scan
+    reads the run's whole history (seconds per 10,000 steps). Only a longer
+    series falls back to the scan, which gives up at ``deadline``.
+
+    :param Any run: Finished public-API run.
+    :param str series: History key of the metric.
+    :param str axis: History key marking where it was measured.
+    :param float deadline: ``time.monotonic()`` time at which a scan gives up.
+    :return list[Mapping[str, Any]] | None: The rows, or ``None`` when the
+        scan reached ``deadline``.
+    """
+    rows = run.history(keys=[series, axis], samples=_HISTORY_SAMPLES, pandas=False)
+    if len(rows) < _HISTORY_SAMPLES:
+        return list(rows)
+    scanned = []
+    for row in run.scan_history(keys=[series, axis], use_cache=False):
+        if time.monotonic() >= deadline:
+            return None
+        scanned.append(row)
+    return scanned
 
 
 def _poll_wandb_summary(
