@@ -73,9 +73,12 @@ The block runs three checks, each `ok` (checked, nothing found),
 - `evaluation_point`: whether the ranked objectives were all measured at the
   same position on the metric extractor's `evaluation_axis` -- the
   training-progress axis the sweep holds fixed, such as optimizer step or
-  tokens. `n/a` for `json` and `log_regex` extractors, which report no
+  tokens. A W&B aggregate such as `eval/loss.min` is positioned where its
+  history series ends, since where each trial's best value fell differs by
+  nature. `n/a` for `json` and `log_regex` extractors, which report no
   position; when any ranked `wandb` trial recorded no position in its run
-  history; or when only one trial was ranked.
+  history, or a ranked trial's objective provenance is unreadable; or when
+  only one trial was ranked.
 - `survivorship`: whether failed and pruned trials were at least as numerous
   as the ranked ones, so that whatever made configurations fail could have
   decided which ones were ranked. Infeasible trials are counted too but never

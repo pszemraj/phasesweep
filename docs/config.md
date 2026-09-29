@@ -254,7 +254,11 @@ count depends on its batch size, so trials differ by design in both `step`
 and any step-named checkpoint. Declaring `evaluation_axis: tokens` and reporting
 `progress={"tokens": total_tokens}` compares trials on tokens instead: the
 check stays `ok` when every trial trained to the same token count, and flags
-one that stopped short.
+one that stopped short. Likewise, a trainer that reports its best checkpoint
+reports a step that differs between trials by nature; report how far it
+trained on a declared axis instead, such as
+`progress={"trained_steps": total_steps}` with
+`evaluation_axis: trained_steps`.
 
 The trainer owns evaluation cadence, early stopping, checkpoint selection,
 and custom aggregation. PhaseSweep has one experiment-level metric and does
@@ -288,12 +292,15 @@ the `define_metric` step metric, e.g. `eval/step` under
 `define_metric("eval/*", step_metric="eval/step")`, or a token counter. Log it
 in the same `log()` call as the metric: W&B fills a step metric missing from a
 call with its previous value, so an axis logged separately lags one
-evaluation behind. It may not name the metric's own series. An aggregate key
-such as `eval/loss.min` is located in its `eval/loss` history series. The
-position is advisory: once the summary is captured,
-history gets up to 30 seconds to catch up with it, and reading it may use the
-rest of `timeout_seconds`. A history read that fails or runs out of time
-records no position instead of failing the trial.
+evaluation behind. It may not name the metric's own series. A plain key is
+positioned at the last row that logged its value. An aggregate key such as
+`eval/loss.min` covers its whole `eval/loss` history series, so it is
+positioned where that series ends: how far the trial trained, not where its
+best value fell, which differs between comparable trials by nature. The
+position is advisory: once the summary is captured, history gets up to 30
+seconds to catch up with it, and reading it may use the rest of
+`timeout_seconds`. A history read that fails or runs out of time records no
+position instead of failing the trial.
 
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share

@@ -125,8 +125,9 @@ def _is_nonretryable_authorization_error(exc: Exception) -> bool:
 def _is_retryable_setup_error(exc: Exception) -> bool:
     """Recognize temporary transport failures using public SDK/request errors.
 
-    :param Exception exc: Error raised while creating the client or reading the run.
-    :return bool: Whether the failure is transient and polling should continue.
+    :param Exception exc: Error raised while creating the client, reading the
+        run, or reading its history.
+    :return bool: Whether the failure is transient and worth another attempt.
     """
     import requests.exceptions as request_errors
 
@@ -343,16 +344,17 @@ def _history_position(
     value: float,
     deadline: float,
 ) -> tuple[_HistoryRead, int | float | None]:
-    """Locate where on ``axis`` a finished run logged its summary value.
+    """Locate how far along ``axis`` a finished run's objective was measured.
 
-    The summary holds the last logged value, or a ``min``/``max`` aggregate,
-    of the metric's history series; either way it equals the value of the
-    latest history row that produced it, whose ``axis`` entry is where the
-    objective was measured. A value assigned straight to the summary, or a
-    ``mean`` aggregate, matches no row and has no position. The server names
-    an aggregate by its series and aggregation (``eval/loss.min`` summarizes
-    the ``eval/loss`` series), so a key the history index does not list is
-    looked up as its ``head`` series.
+    A plain summary key holds its series' last logged value: the latest
+    history row with that value is where the objective was measured, and a
+    value assigned straight to the summary matches no row and has no position.
+    The server names an aggregate by its series and aggregation
+    (``eval/loss.min`` summarizes the ``eval/loss`` series), so a key the
+    history index does not list is looked up as its ``head`` series. An
+    aggregate is measured over the whole series, so its position is where the
+    series ends: how far the trial trained, not where its best value fell,
+    which differs between comparable trials by nature.
 
     The run's history index says how far history reaches and how many rows
     logged each key, but for a while after a run finishes a read can return
@@ -374,7 +376,8 @@ def _history_position(
     :param float value: Captured objective value.
     :param float deadline: ``time.monotonic()`` time at which a read gives up.
     :return tuple[_HistoryRead, int | float | None]: How the read ended, and
-        the position once ``settled`` (``None`` when no row produced the value).
+        the position once ``settled`` (``None`` when no row produced a plain
+        key's value).
     """
     from phasesweep.evidence.evaluation import json_float, progress_position
 
@@ -411,6 +414,9 @@ def _history_position(
             if series not in row:
                 continue
             read += 1
+            if series != metric_key:
+                position = progress_position(row.get(axis))
+                continue
             try:
                 logged = json_float(row[series], label=series)
             except ValueError:

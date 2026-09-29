@@ -264,13 +264,16 @@ _EVAL_ROWS = [
     [
         ({"eval/loss": 0.2, "_step": 5}, "eval/loss", "_step", 5),
         ({"eval/loss": 0.2, "_step": 5}, "eval/loss", "eval/step", 400),
-        # The server returns define_metric aggregates as flat series.aggregation keys.
+        # The server returns define_metric aggregates as flat series.aggregation
+        # keys. An aggregate covers its whole series, so it is positioned where
+        # the series ends, not where its best value fell (eval/step 100 here).
+        ({"eval/loss.max": 0.4, "_step": 5}, "eval/loss.max", "eval/step", 400),
         ({"eval/loss.min": 0.2, "_step": 5}, "eval/loss.min", "eval/step", 400),
-        ({"eval/loss.max": 0.4, "_step": 5}, "eval/loss.max", "eval/step", 100),
+        ({"eval/loss.mean": 0.275, "_step": 5}, "eval/loss.mean", "eval/step", 400),
         ({"eval/loss": 0.1, "_step": 5}, "eval/loss", "eval/step", None),
         ({"eval/loss": 0.2}, "eval/loss", "eval/step", None),
     ],
-    ids=["last-on-_step", "last-on-eval-step", "min-latest-tie", "max", "assigned", "no-history"],
+    ids=["last-on-_step", "last-on-eval-step", "max", "min", "mean", "assigned", "no-history"],
 )
 def test_wandb_locates_where_the_objective_summary_was_logged(
     monkeypatch, summary, metric_key, axis, expected
@@ -293,17 +296,15 @@ def test_wandb_series_at_the_sample_cap_is_scanned_in_pages_never_sampled(monkey
     ("visible", "metric_key", "expected"),
     [
         # Just after a run finishes, reads can return only the newest rows ...
-        pytest.param(slice(-2, None), "eval/loss.max", 100, id="newest-only"),
-        # ... or miss the newest ones, which would locate an earlier tie.
+        pytest.param(slice(-2, None), "eval/loss", 400, id="newest-only"),
+        # ... or miss the newest ones, which would end the series early.
         pytest.param(slice(0, 2), "eval/loss.min", 400, id="oldest-only"),
     ],
 )
 def test_wandb_read_short_of_the_indexed_row_count_is_retried(
     monkeypatch, visible, metric_key, expected
 ):
-    run = _HistoryRun(
-        {metric_key: 0.4 if "max" in metric_key else 0.2, "_step": 5}, _EVAL_ROWS, visible=[visible]
-    )
+    run = _HistoryRun({metric_key: 0.2, "_step": 5}, _EVAL_ROWS, visible=[visible])
     assert _history_position(monkeypatch, run, metric_key, "eval/step") == expected
     assert [kind for kind, _ in run.reads] == ["history", "history"]
 
