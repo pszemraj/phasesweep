@@ -284,7 +284,10 @@ the `define_metric` step metric, e.g. `eval/step` under
 `define_metric("eval/*", step_metric="eval/step")`, or a token counter logged
 in the same `log()` call as the metric. It may not name the metric's own
 series. An aggregate key such as `eval/loss.min` is located in its `eval/loss`
-history series.
+history series. The position is advisory: once the summary is captured,
+history gets up to 30 seconds, within `timeout_seconds`, to catch up, and a
+history read that fails or runs out of time records no position instead of
+failing the trial.
 
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share

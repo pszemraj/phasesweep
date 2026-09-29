@@ -30,13 +30,15 @@ def _wandb_poll(**kwargs):
     from phasesweep.evidence.wandb import _poll_wandb_summary
 
     return _poll_wandb_summary(
-        base_url="https://example.test",
-        entity="entity",
-        project="project",
-        run_id="attempt",
-        poll_seconds=0.001,
-        timeout_seconds=1,
-        **kwargs,
+        **{
+            "base_url": "https://example.test",
+            "entity": "entity",
+            "project": "project",
+            "run_id": "attempt",
+            "poll_seconds": 0.001,
+            "timeout_seconds": 1,
+            **kwargs,
+        }
     )
 
 
@@ -262,13 +264,40 @@ def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch):
     assert len(run.scans) == 1
 
 
-def test_wandb_history_that_never_settles_records_no_position(monkeypatch):
-    import time
-
+def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch):
+    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SETTLE_SECONDS", 0.05)
     run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3] * 10**6)
-    position = _history_position(monkeypatch, run, deadline=time.monotonic() + 0.05)
-    assert position is None
+    start = time.monotonic()
+    assert _history_position(monkeypatch, run, timeout_seconds=60) is None
+    assert time.monotonic() - start < 30
     assert run.scans == []
+
+
+def test_wandb_history_scan_outlasting_the_settle_window_keeps_the_objective(monkeypatch):
+    """The objective is committed before history is read, then the scan is bounded."""
+    public = pytest.importorskip("wandb.apis.public")
+    clock = [0.0]
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+
+    class SlowScanRun(_HistoryRun):
+        def scan_history(self, keys, use_cache=True):
+            for row in super().scan_history(keys, use_cache):
+                clock[0] += 20.0
+                yield row
+
+    run = SlowScanRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS)
+    monkeypatch.setattr(public, "Api", lambda **_: SimpleNamespace(run=lambda path: run))
+    commits = []
+    capture = _wandb_poll(
+        required_keys=["eval/loss"],
+        evaluation=["eval/loss", "eval/step"],
+        timeout_seconds=120,
+        commit=lambda committed: commits.append((committed["evaluation"]["value"], len(run.scans))),
+    )
+    assert capture["values"] == {"eval/loss": 0.2}
+    assert capture["evaluation"] == {"metric_key": "eval/loss", "axis": "eval/step", "value": None}
+    assert commits == [(None, 0)]
+    assert clock[0] < 120
 
 
 def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
@@ -503,6 +532,44 @@ def test_wandb_supervision_bounds_blocked_sdk_and_descendants(wandb_worker_sdk, 
     assert time.monotonic() - start < 12
     pid = int(pid_file.read_text())
     assert not is_pid_alive(pid) or is_pid_zombie(pid)
+
+
+@pytest.mark.integration
+def test_wandb_worker_stopped_during_history_read_keeps_the_objective(wandb_worker_sdk, tmp_path):
+    from phasesweep.evidence.wandb import poll_wandb_summary
+    from phasesweep.runtime.process import read_attempt_lifecycle
+
+    wandb_worker_sdk("""
+        import time
+        class Run:
+            state = "finished"
+            summary_metrics = {"loss": 0.25, "_step": 7}
+            lastHistoryStep = 7
+            def scan_history(self, keys, use_cache=True):
+                time.sleep(60)
+                return []
+        class Api:
+            def __init__(self, **kwargs):
+                pass
+            def run(self, path):
+                return Run()
+    """)
+    start = time.monotonic()
+    capture = poll_wandb_summary(
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        run_id="attempt",
+        trial_dir=tmp_path,
+        poll_seconds=0.01,
+        timeout_seconds=2,
+        required_keys=["loss"],
+        evaluation=("loss", "_step"),
+    )
+    assert time.monotonic() - start < 12
+    assert capture["values"] == {"loss": 0.25}
+    assert capture["evaluation"] == {"metric_key": "loss", "axis": "_step", "value": None}
+    assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
 
 
 def _assert_log_regex_provenance(

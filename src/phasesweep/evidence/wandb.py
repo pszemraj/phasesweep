@@ -10,7 +10,7 @@ import os
 import shlex
 import sys
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,6 +18,10 @@ from typing import Any
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _WORKER_STDERR_LOG = "wandb-worker.stderr.log"
+# How long a captured objective waits for run history to reach its summary
+# before recording no position; the position is advisory, so it must not
+# hold every trial for the whole capture timeout.
+_HISTORY_SETTLE_SECONDS = 30.0
 
 
 # Not frozen: unwinding sets an exception's __traceback__ (contextlib does so
@@ -298,14 +302,15 @@ def poll_wandb_summary(
         raise ImportError(
             "W&B SDK is unavailable in the supervised worker; install phasesweep[wandb]."
         )
-    if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
-        detail = response.get("cause")
-        raise WandbPollTimeout(run_id, timeout_seconds, RuntimeError(detail) if detail else None)
-    if (
-        result.return_code != 0
-        or result.failure_reason is not None
-        or response.get("status") != "summary"
-    ):
+    # A summary response is written whole, and the worker commits one before
+    # its advisory history read, so a worker stopped during that read still
+    # delivered the objective.
+    if response.get("status") != "summary":
+        if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
+            detail = response.get("cause")
+            raise WandbPollTimeout(
+                run_id, timeout_seconds, RuntimeError(detail) if detail else None
+            )
         diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
         raise RuntimeError(
             f"W&B evidence worker failed for attempt {run_id!r} (exit {result.return_code})."
@@ -326,6 +331,7 @@ def _history_position(
     metric_key: str,
     axis: str,
     value: float,
+    deadline: float,
 ) -> tuple[bool, int | float | None]:
     """Locate where on ``axis`` a finished run logged its summary value.
 
@@ -341,14 +347,15 @@ def _history_position(
     History is only conclusive once the server's last history step reaches
     the summary's own ``_step``; until then the answer is unsettled. The
     position is advisory evidence, so a failed history read never fails the
-    capture: a transient transport failure is unsettled (retried within the
-    deadline), and any other failure settles as "no position".
+    capture: a transient transport failure or a scan still running at
+    ``deadline`` is unsettled, and any other failure settles as "no position".
 
     :param Any run: Finished public-API run.
     :param Mapping[str, Any] summary: Its decoded summary.
     :param str metric_key: Configured objective summary key.
     :param str axis: History key marking where the metric was measured.
     :param float value: Captured objective value.
+    :param float deadline: ``time.monotonic()`` time at which a scan gives up.
     :return tuple[bool, int | float | None]: Whether the answer is settled,
         and the position (``None`` when no row produced the value).
     """
@@ -365,6 +372,8 @@ def _history_position(
         for series in (metric_key, head) if dot else (metric_key,):
             logged_series = False
             for row in run.scan_history(keys=[series, axis], use_cache=False):
+                if time.monotonic() >= deadline:
+                    return False, None
                 if series not in row:
                     continue
                 logged_series = True
@@ -393,6 +402,7 @@ def _poll_wandb_summary(
     presence_keys: Iterable[str] = (),
     evaluation: Sequence[str] | None = None,
     deadline: float | None = None,
+    commit: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Poll an exact run using refreshed SDK clients within the parent's deadline.
 
@@ -404,10 +414,12 @@ def _poll_wandb_summary(
     :param float timeout_seconds: Budget used when no ``deadline`` is given.
     :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
     :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
-    :param Sequence[str] | None evaluation: Objective ``(metric_key, axis)``; its
-        history position is awaited while unsettled and time remains for
-        another poll, then recorded (``None`` when history never settled).
+    :param Sequence[str] | None evaluation: Objective ``(metric_key, axis)``
+        whose history position :func:`_locate_evaluation` adds once the
+        summary values are captured.
     :param float | None deadline: Absolute ``time.monotonic()`` deadline from the parent.
+    :param Callable[[dict[str, Any]], None] | None commit: Durably records the
+        capture before its advisory history read starts.
     :return dict[str, Any]: Numeric values, present keys, retrieval time, and
         the objective's evaluation position when requested.
     :raises WandbPollTimeout: The run did not finish with the required keys in time.
@@ -467,30 +479,72 @@ def _poll_wandb_summary(
                             "present_keys": sorted(key for key in presence_keys if key in summary),
                             "retrieved_at": utc_now_iso(timespec="microseconds"),
                         }
-                        settled = True
-                        if evaluation is not None:
-                            metric_key, axis = evaluation
-                            settled, position = _history_position(
-                                run,
-                                summary,
-                                metric_key=metric_key,
-                                axis=axis,
-                                value=values[metric_key],
-                            )
-                            capture["evaluation"] = {
-                                "metric_key": metric_key,
-                                "axis": axis,
-                                "value": position,
-                            }
                         if time.monotonic() >= deadline:
                             break
-                        if settled or time.monotonic() + poll_seconds >= deadline:
+                        if evaluation is None:
                             return capture
-                        last_error = RuntimeError(
-                            "W&B history has not reached the finished summary's last step."
+                        return _locate_evaluation(
+                            run,
+                            summary,
+                            capture,
+                            evaluation=evaluation,
+                            poll_seconds=poll_seconds,
+                            deadline=deadline,
+                            commit=commit,
                         )
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
     raise WandbPollTimeout(run_id, timeout_seconds, last_error)
+
+
+def _locate_evaluation(
+    run: Any,
+    summary: Mapping[str, Any],
+    capture: dict[str, Any],
+    *,
+    evaluation: Sequence[str],
+    poll_seconds: float,
+    deadline: float,
+    commit: Callable[[dict[str, Any]], None] | None,
+) -> dict[str, Any]:
+    """Add where the objective was logged to a capture, never at its expense.
+
+    The capture is committed without a position before history is read, so a
+    history read that outlives the deadline, and the worker with it, still
+    leaves the objective. History then gets at most
+    ``_HISTORY_SETTLE_SECONDS`` to reach the summary's last step.
+
+    :param Any run: Finished public-API run.
+    :param Mapping[str, Any] summary: Its decoded summary.
+    :param dict[str, Any] capture: Complete summary capture, extended in place.
+    :param Sequence[str] evaluation: Objective ``(metric_key, axis)``.
+    :param float poll_seconds: Delay between history checks.
+    :param float deadline: Absolute ``time.monotonic()`` capture deadline.
+    :param Callable[[dict[str, Any]], None] | None commit: Durably records the
+        capture before the history read starts.
+    :return dict[str, Any]: The capture, its position ``None`` when history
+        never settled or no row produced the value.
+    """
+    metric_key, axis = evaluation
+    located: dict[str, Any] = {"metric_key": metric_key, "axis": axis, "value": None}
+    capture["evaluation"] = located
+    if commit is not None:
+        commit(capture)
+    settle_by = min(deadline, time.monotonic() + _HISTORY_SETTLE_SECONDS)
+    while True:
+        settled, position = _history_position(
+            run,
+            summary,
+            metric_key=metric_key,
+            axis=axis,
+            value=capture["values"][metric_key],
+            deadline=settle_by,
+        )
+        if settled:
+            located["value"] = position
+            return capture
+        if time.monotonic() + poll_seconds >= settle_by:
+            return capture
+        time.sleep(poll_seconds)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -513,9 +567,18 @@ def main(argv: list[str] | None = None) -> int:
     # endpoint from settings rather than from Api overrides; this worker is
     # its own process, so pin the setting before the SDK first loads it.
     os.environ["WANDB_BASE_URL"] = request["base_url"]
+
+    def commit(capture: dict[str, Any]) -> None:
+        """Record a complete capture the parent keeps even if it must stop this worker.
+
+        :param dict[str, Any] capture: Summary capture.
+        """
+        summary = {"status": "summary", "capture": capture}
+        private_atomic_write_text(args.response, json.dumps(summary, allow_nan=False))
+
     response: dict[str, Any]
     try:
-        response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
+        response = {"status": "summary", "capture": _poll_wandb_summary(**request, commit=commit)}
     except ImportError:
         response = {"status": "import_error"}
     except WandbSetupError as exc:
