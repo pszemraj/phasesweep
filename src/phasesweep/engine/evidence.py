@@ -205,8 +205,6 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         progress = evaluation.get("progress") if isinstance(evaluation, Mapping) else None
         if not _valid_progress_record(progress, nullable=True):
             fail("W&B objective has no evaluation-axis record")
-        if capture.get("evaluation") != {"metric_key": key, **progress}:
-            fail("W&B objective's evaluation-axis record disagrees with its capture")
         return
     if (
         source.get("kind") != "file"
@@ -234,20 +232,6 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
             fail("envelope objective has no evaluation checkpoint or step")
         if not _valid_progress_record(evaluation.get("progress"), nullable=False):
             fail("envelope objective has no evaluation-axis position")
-
-
-def _captured_evaluation_request(capture: Mapping[str, Any]) -> tuple[str, str] | None:
-    """Return the ``(metric_key, axis)`` a W&B capture located, if any.
-
-    :param Mapping[str, Any] capture: Frozen shared W&B capture.
-    :return tuple[str, str] | None: The objective key and axis the capture
-        recorded a position for, or ``None`` when it recorded none.
-    """
-    located = capture.get("evaluation")
-    if not isinstance(located, Mapping):
-        return None
-    key, axis = located.get("metric_key"), located.get("axis")
-    return (key, axis) if isinstance(key, str) and isinstance(axis, str) else None
 
 
 def _valid_progress_record(record: object, *, nullable: bool) -> TypeGuard[Mapping[str, Any]]:
@@ -516,7 +500,6 @@ def _verify_trial_evidence_dir(
                 for name, key in wandb_query.constraint_keys
             )
             or not set(wandb_query.presence_keys).issubset(capture["present_keys"])
-            or _captured_evaluation_request(capture) != wandb_query.evaluation
         ):
             raise TrialEvidenceMissingError(
                 f"{subject} W&B capture disagrees with its shared constraint/gate evidence."
@@ -532,6 +515,7 @@ def _verify_trial_evidence_dir(
                 for field in ("base_url", "entity", "project")
             )
             or source.get("metric_key") != extractor.metric_key
+            or source["evaluation"]["progress"]["axis"] != extractor.evaluation_axis
             or capture["values"].get(extractor.metric_key) != metric_value
         ):
             raise TrialEvidenceMissingError(

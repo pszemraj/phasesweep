@@ -298,10 +298,11 @@ positioned at the last row that logged its value. An aggregate key such as
 `eval/loss.min` covers its whole `eval/loss` history series, so it is
 positioned where that series ends: how far the trial trained, not where its
 best value fell, which differs between comparable trials by nature. The
-position is advisory: once the summary is captured, history gets up to 30
-seconds to catch up with it, and reading it may use the rest of
-`timeout_seconds`. A history read that fails or runs out of time records no
-position instead of failing the trial.
+position is advisory, so it is read only after the trial's result is
+accepted, within a fresh `timeout_seconds` and whatever phase or run budget
+remains: history gets up to 30 seconds to catch up with the summary, and
+reading it may use the rest. A history read that fails or runs out of time
+records no position; the trial keeps its objective.
 
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share

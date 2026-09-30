@@ -33,6 +33,7 @@ from phasesweep.evidence.wandb import (
     WandbPollTimeout,
     WandbRunTerminalError,
     WandbSetupError,
+    locate_wandb_position,
     poll_wandb_summary,
 )
 from phasesweep.runtime.files import file_sha256
@@ -487,9 +488,6 @@ def _capture_wandb(
         cfg,
         (cfg.metric_key,) if isinstance(cfg, WandbExtractor) else (),
         tuple(cfg.keys) if isinstance(cfg, WandbSummaryRequiredGate) else (),
-        evaluation=(
-            (cfg.metric_key, cfg.evaluation_axis) if isinstance(cfg, WandbExtractor) else None
-        ),
     )
     source = query.source
     poll_deadline = time.monotonic() + source.timeout_seconds
@@ -508,7 +506,6 @@ def _capture_wandb(
             timeout_seconds=source.timeout_seconds,
             required_keys=query.numeric_keys,
             presence_keys=query.presence_keys,
-            evaluation=query.evaluation,
             environment=ctx.wandb_environment,
             deadline=poll_deadline,
         )
@@ -539,8 +536,6 @@ def _capture_wandb(
         raise
     except RuntimeError as exc:
         raise ExtractorError(f"W&B evidence worker failed for {target}.") from exc
-    # The worker accepts a summary only before poll_deadline; only its advisory
-    # history read may return after it.
     ctx.wandb_capture.update(
         {
             "kind": "wandb",
@@ -570,10 +565,10 @@ def _extract_wandb(
         ctx: Trial context whose shared W&B capture supplies the value.
         cfg: ``WandbExtractor`` config naming the remote target and the exact
             summary key.
-        provenance: Optional sink that receives the evidence ``source`` --
-            including where on ``evaluation_axis`` the value was logged -- and
-            the shared ``remote_capture`` on success. Only the objective passes
-            one.
+        provenance: Optional sink that receives the evidence ``source`` and the
+            shared ``remote_capture`` on success. Only the objective passes
+            one. Its position on ``evaluation_axis`` stays ``None`` until
+            :func:`locate_objective_position` reads it.
         deadline: Optional absolute ``time.monotonic()`` phase/run deadline
             for obtaining the capture.
 
@@ -581,9 +576,8 @@ def _extract_wandb(
         The finite numeric value of ``metric_key``.
 
     Raises:
-        ExtractorError: The capture failed or its deadline expired, the key
-            has no valid finite numeric value, or an objective capture did not
-            locate its evaluation position.
+        ExtractorError: The capture failed or its deadline expired, or the key
+            has no valid finite numeric value.
 
     """
     capture = _capture_wandb(ctx, cfg, deadline=deadline)
@@ -594,18 +588,57 @@ def _extract_wandb(
     if not math.isfinite(value):
         raise ExtractorError(f"W&B key {cfg.metric_key!r} is non-finite.")
     if provenance is not None:
-        located = capture.get("evaluation")
-        if not isinstance(located, dict) or located.get("metric_key") != cfg.metric_key:
-            raise ExtractorError(
-                f"W&B capture recorded no evaluation position for {cfg.metric_key!r}."
-            )
         provenance["source"] = {
             "kind": "wandb",
             "metric_key": cfg.metric_key,
-            "evaluation": {"progress": {"axis": located["axis"], "value": located["value"]}},
+            "evaluation": {"progress": {"axis": cfg.evaluation_axis, "value": None}},
         }
         provenance["remote_capture"] = dict(capture)
     return value
+
+
+def locate_objective_position(
+    ctx: TrialContext,
+    cfg: Extractor,
+    provenance: dict[str, Any],
+    *,
+    deadline: float | None = None,
+) -> None:
+    """Record where an accepted W&B objective was logged on its evaluation axis.
+
+    Call only once the trial's result is accepted. The position is advisory,
+    so it gets whatever budget acceptance left: a read that fails or runs out
+    of time leaves the position ``None``, and the trial keeps its objective.
+    Other extractors record their position during extraction.
+
+    Args:
+        ctx: Trial context of the accepted attempt.
+        cfg: The objective's extractor config.
+        provenance: The objective provenance :func:`run_extractor` recorded,
+            updated in place.
+        deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
+
+    Raises:
+        UnsafeProcessCleanupError: Worker cleanup is uncertain.
+
+    """
+    if not isinstance(cfg, WandbExtractor):
+        return
+    progress = provenance["source"]["evaluation"]["progress"]
+    progress["value"] = locate_wandb_position(
+        base_url=cfg.base_url,
+        entity=cfg.entity,
+        project=cfg.project,
+        run_id=ctx.attempt_id,
+        trial_dir=ctx.trial_dir,
+        poll_seconds=cfg.poll_seconds,
+        timeout_seconds=cfg.timeout_seconds,
+        metric_key=cfg.metric_key,
+        axis=cfg.evaluation_axis,
+        value=provenance["remote_capture"]["values"][cfg.metric_key],
+        environment=ctx.wandb_environment,
+        deadline=deadline,
+    )
 
 
 _DISPATCH: dict[type, Callable[..., float]] = {

@@ -249,7 +249,9 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     monkeypatch.setenv("WANDB_PROJECT", "ambient-old-project")
     winners = run_experiment(experiment)
     assert winners["next"].effective_overrides == {"x": 7}
-    assert len(calls_path.read_text().splitlines()) == 2
+    # One shared capture per trial, and one position read per accepted W&B objective.
+    remote_reads = 4 if consumers in {"primary", "combined"} else 2
+    assert len(calls_path.read_text().splitlines()) == remote_reads
 
     for phase in experiment.phases:
         winner = winners[phase.name]
@@ -276,6 +278,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
 
             for fields, replacement in [
                 (("source", "metric_key"), "wrong"),
+                (("source", "evaluation", "progress", "axis"), "tokens"),
                 (("remote_capture", "run_id"), "another-attempt"),
                 (("remote_capture", "project"), "another-project"),
                 (("remote_capture", "values", "eval/loss"), 9.0),
@@ -299,7 +302,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     with monkeypatch.context() as replay_env:
         replay_env.setenv("WANDB_MODE", "offline")
         assert run_experiment(experiment)["next"].attempt_id == winners["next"].attempt_id
-    assert len(calls_path.read_text().splitlines()) == 2
+    assert len(calls_path.read_text().splitlines()) == remote_reads
     if consumers == "primary":
         from phasesweep.engine.state import TRIAL_TARGET_ATTR
         from phasesweep.errors import PhaseSweepError

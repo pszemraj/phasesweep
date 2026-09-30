@@ -115,22 +115,17 @@ def _wandb(value: float | None = 1000, axis: str = "eval/step") -> dict[str, Any
             "retrieved_at": "2026-01-01T00:00:00+00:00",
             "values": {"eval/loss": 0.5},
             "present_keys": [],
-            "evaluation": {"metric_key": "eval/loss", **located},
         },
     }
 
 
-def test_wandb_provenance_may_lack_a_position_but_must_match_its_capture():
+def test_wandb_provenance_may_lack_a_position_but_not_its_axis_record():
     # null: history could not say where the summary value was logged.
     _validate_objective_provenance(_wandb(None), subject="Trial 0")
     missing = _wandb()
     del missing["source"]["evaluation"]
     with pytest.raises(TrialEvidenceMissingError, match="no evaluation-axis record"):
         _validate_objective_provenance(missing, subject="Trial 0")
-    disagreeing = _wandb()
-    disagreeing["source"]["evaluation"]["progress"]["value"] = 5
-    with pytest.raises(TrialEvidenceMissingError, match="disagrees with its capture"):
-        _validate_objective_provenance(disagreeing, subject="Trial 0")
 
 
 def _log_regex() -> dict[str, Any]:

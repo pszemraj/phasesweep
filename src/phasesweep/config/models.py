@@ -1216,9 +1216,4 @@ def _wandb_query(
             for gate in gates
             if isinstance(gate, WandbSummaryRequiredGate)
         ),
-        (
-            (experiment.metric.extractor.metric_key, experiment.metric.extractor.evaluation_axis)
-            if isinstance(experiment.metric.extractor, WandbExtractor)
-            else None
-        ),
     )
