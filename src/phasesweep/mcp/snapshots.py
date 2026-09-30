@@ -188,8 +188,8 @@ class SurvivorshipSummary(_SnapshotModel):
 
     verdict: ConfoundVerdict = Field(
         description=(
-            f"{_VERDICT_DESCRIPTION} Heterogeneous when excluded trials are at least as "
-            "numerous as ranked ones."
+            f"{_VERDICT_DESCRIPTION} Heterogeneous when failed and pruned trials are at "
+            "least as numerous as ranked ones; infeasible trials never flag."
         )
     )
     ranked: NonNegativeInt
