@@ -456,9 +456,10 @@ def _history_position(
     history row with that value is where the objective was measured, and a
     value assigned straight to the summary matches no row and has no position.
     The server names an aggregate by its series and aggregation
-    (``eval/loss.min`` summarizes the ``eval/loss`` series), so a key the
-    history index does not list is looked up as its ``head`` series. An
-    aggregate is measured over the whole series, so its position is where the
+    (``eval/loss.min`` summarizes the ``eval/loss`` series), so a recognized
+    aggregation suffix absent from the history index is looked up as its
+    ``head`` series. Other summary-only keys have no position. An aggregate
+    is measured over the whole series, so its position is where the
     series ends: how far the trial trained, not where its best value fell,
     which differs between comparable trials by nature.
 
@@ -490,7 +491,7 @@ def _history_position(
     last_step = progress_position(summary.get("_step"))
     if last_step is None:
         return "settled", None
-    head, dot, _ = metric_key.rpartition(".")
+    head, dot, aggregation = metric_key.rpartition(".")
     position: int | float | None = None
     try:
         run.load(force=True)
@@ -500,7 +501,7 @@ def _history_position(
         logged_keys = index["keys"]
         if metric_key in logged_keys:
             series = metric_key
-        elif dot and head in logged_keys:
+        elif dot and aggregation in {"min", "max", "mean", "last", "first"} and head in logged_keys:
             series = head
         else:
             return "settled", None

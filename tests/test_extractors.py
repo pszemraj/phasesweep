@@ -281,10 +281,22 @@ _EVAL_ROWS = [
         ({"eval/loss.max": 0.4, "_step": 5}, "eval/loss.max", "eval/step", 400),
         ({"eval/loss.min": 0.2, "_step": 5}, "eval/loss.min", "eval/step", 400),
         ({"eval/loss.mean": 0.275, "_step": 5}, "eval/loss.mean", "eval/step", 400),
+        ({"eval/loss.last": 0.2, "_step": 5}, "eval/loss.last", "eval/step", 400),
+        ({"eval/loss.first": 0.4, "_step": 5}, "eval/loss.first", "eval/step", 400),
         ({"eval/loss": 0.1, "_step": 5}, "eval/loss", "eval/step", None),
         ({"eval/loss": 0.2}, "eval/loss", "eval/step", None),
     ],
-    ids=["last-on-_step", "last-on-eval-step", "max", "min", "mean", "assigned", "no-history"],
+    ids=[
+        "last-on-_step",
+        "last-on-eval-step",
+        "max",
+        "min",
+        "mean",
+        "last",
+        "first",
+        "assigned",
+        "no-history",
+    ],
 )
 def test_wandb_locates_where_the_objective_summary_was_logged(
     monkeypatch, summary, metric_key, axis, expected
@@ -331,9 +343,16 @@ def test_wandb_slow_summary_polling_still_retries_history(monkeypatch):
     assert len(run.reads) == 2
 
 
-def test_wandb_summary_key_absent_from_history_settles_without_a_read(monkeypatch):
-    run = _HistoryRun({"best/loss": 0.1, "_step": 5}, _EVAL_ROWS)
-    assert _history_position(monkeypatch, run, "best/loss", "eval/step") is None
+@pytest.mark.parametrize(
+    ("metric_key", "value"),
+    [("best/loss", 0.1), ("eval/loss.selected", 0.123456), ("eval/loss.selected", 0.4)],
+    ids=["absent-series", "custom-suffix-unlogged-value", "custom-suffix-matching-value"],
+)
+def test_wandb_summary_key_absent_from_history_settles_without_a_read(
+    monkeypatch, metric_key, value
+):
+    run = _HistoryRun({metric_key: value, "_step": 5}, _EVAL_ROWS)
+    assert _history_position(monkeypatch, run, metric_key, "eval/step") is None
     assert run.reads == []
 
 
