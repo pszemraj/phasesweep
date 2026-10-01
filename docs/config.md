@@ -302,7 +302,10 @@ position is advisory, so it is read only after the trial's result is
 accepted, within a fresh `timeout_seconds` and whatever phase or run budget
 remains: history gets up to 30 seconds to catch up with the summary, and
 reading it may use the rest. A history read that fails or runs out of time
-records no position; the trial keeps its objective.
+records no position; the trial keeps its objective. The read runs in a
+supervised reader like the summary capture, so if its cleanup is uncertain the
+phase stops instead (see
+[trial execution and evidence](runtime.md#trial-execution-and-evidence)).
 
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share

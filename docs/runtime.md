@@ -219,7 +219,9 @@ It uses the same durable attempt slot and process supervisor, so recovery can
 find the reader after abrupt parent exit, even if its phase was removed.
 Uncertain cleanup blocks further work. One absolute polling deadline covers
 worker startup, SDK construction, requests, retries, and summary visibility;
-phase/run deadlines can shorten it, while cleanup grace stays separate.
+phase/run deadlines can shorten it, while cleanup grace stays separate. Once
+the trial is accepted, a second reader in the same slot locates the objective
+in run history under its own deadline.
 Trainer return code and duration remain trainer measurements.
 
 Finished W&B captures freeze only the requested numeric values and gate-presence
