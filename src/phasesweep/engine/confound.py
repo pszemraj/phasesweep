@@ -251,17 +251,18 @@ def _not_checked(reason: str) -> dict[str, Any]:
     return {"verdict": "n/a", "reason": reason}
 
 
-def _validate_confound_block(data: object) -> dict[str, Any]:
+def _validate_confound_block(data: object, *, winner_trial: int) -> dict[str, Any]:
     """Validate a persisted ``confound`` block and return a plain copy.
 
     Shared by :func:`phasesweep.engine.publication_validation._validate_generation_manifest`,
     :func:`phasesweep.engine.artifacts._load_winner`, and the winner read
-    path, which differ only in how they wrap the ``ValueError``.
+    paths, which differ only in how they wrap the ``ValueError``.
 
     :param object data: Parsed ``confound`` value from a ``winner.yaml``.
+    :param int winner_trial: Trial number of the winner the block sits on.
     :raises ValueError: The block is absent, has another schema version, any
-        check record is malformed or contradicts its evidence, or the evidence
-        disagrees with the ranked trials.
+        check record is malformed or contradicts its evidence, the evidence
+        disagrees with the ranked trials, or the winner is not one of them.
     :return dict[str, Any]: The validated block, rebuilt from plain values.
     """
     if not isinstance(data, Mapping) or set(data) != {"schema_version", "ranked_trials", "checks"}:
@@ -269,13 +270,18 @@ def _validate_confound_block(data: object) -> dict[str, Any]:
     if type(data["schema_version"]) is not int or data["schema_version"] != CONFOUND_SCHEMA_VERSION:
         raise ValueError(f"confound schema_version is not {CONFOUND_SCHEMA_VERSION}")
     ranked = _trial_numbers(data["ranked_trials"], label="ranked_trials")
-    if not ranked:
-        raise ValueError("confound ranked_trials is empty")
+    if winner_trial not in ranked:
+        raise ValueError(
+            f"confound ranked_trials does not include the winner, trial {winner_trial}"
+        )
     checks = data["checks"]
     if not isinstance(checks, Mapping) or set(checks) != set(CONFOUND_CHECKS):
         raise ValueError(f"confound checks must be exactly {', '.join(CONFOUND_CHECKS)}")
     validated = {name: _validate_check(name, checks[name]) for name in CONFOUND_CHECKS}
     _validate_against_ranked(validated, ranked)
+    tie = validated["tie"]
+    if "detail" in tie and winner_trial in tie["detail"]["tied_trials"]:
+        raise ValueError("confound tie lists the winner as tying with itself")
     return {"schema_version": CONFOUND_SCHEMA_VERSION, "ranked_trials": ranked, "checks": validated}
 
 

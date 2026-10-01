@@ -431,7 +431,7 @@ def _validate_generation_manifest(
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
             try:
-                _validate_confound_block(payload.get("confound"))
+                _validate_confound_block(payload.get("confound"), winner_trial=source_trial)
             except ValueError as exc:
                 raise _fail(
                     f"winner for phase {name!r} has no valid confound block ({exc})"

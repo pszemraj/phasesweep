@@ -188,7 +188,8 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
         source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
         trial_number = int(data["trial_number"])
         confound = _confound_summary(
-            _validate_confound_block(data.get("confound")), winner_trial=trial_number
+            _validate_confound_block(data.get("confound"), winner_trial=trial_number),
+            winner_trial=trial_number,
         )
         return PhaseWinnerView(
             phase=phase_name,

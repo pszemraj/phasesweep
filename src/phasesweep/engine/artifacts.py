@@ -383,7 +383,9 @@ def _load_winner(
                 if isinstance(stored_inherit_env, list)
                 else stored_inherit_env
             ),
-            confound=_validate_confound_block(data["confound"]),
+            confound=_validate_confound_block(
+                data["confound"], winner_trial=int(data["trial_number"])
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise WinnerIntegrityError(

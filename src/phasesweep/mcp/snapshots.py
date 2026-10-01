@@ -274,7 +274,8 @@ def _winner_snapshot(
         )
         incomplete = bool(winner.completion.get("incomplete", False))
         confound = _confound_summary(
-            _validate_confound_block(winner.confound), winner_trial=winner.trial_number
+            _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
+            winner_trial=winner.trial_number,
         )
     else:
         gates_passed = winner.gates_passed

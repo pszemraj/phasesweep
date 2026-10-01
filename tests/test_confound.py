@@ -177,11 +177,11 @@ def test_verdicts_are_three_distinct_values_and_not_checked_is_never_ok() -> Non
     assert block["checks"]["evaluation_point"]["verdict"] == "n/a"
     assert block["checks"]["tie"]["verdict"] == "n/a"
     assert _flagged_checks(block) == []
-    assert _validate_confound_block(block)["checks"]["tie"]["verdict"] == "n/a"
+    assert _validate_confound_block(block, winner_trial=0)["checks"]["tie"]["verdict"] == "n/a"
     masquerading = copy.deepcopy(block)
     masquerading["checks"]["tie"]["detail"] = {"tied_trials": []}
     with pytest.raises(ValueError, match="n/a without a reason"):
-        _validate_confound_block(masquerading)
+        _validate_confound_block(masquerading, winner_trial=0)
 
 
 def test_evaluation_point_agreement_is_ok_with_grouped_evidence() -> None:
@@ -220,7 +220,7 @@ def test_fixed_token_budget_reached_within_a_batch_is_one_point() -> None:
     check = block["checks"]["evaluation_point"]
     assert check["verdict"] == "ok"
     assert [group["value"] for group in check["detail"]["values"]] == sorted(tokens)
-    assert _validate_confound_block(block) == block
+    assert _validate_confound_block(block, winner_trial=2) == block
 
 
 @pytest.mark.parametrize(
@@ -330,7 +330,7 @@ def test_assessed_block_survives_yaml_and_validation_unchanged() -> None:
     trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.5, 2), (_FAIL, None, 3))
     block = _assess(trials, trials[:2], provenance={0: _envelope(), 1: _envelope(step=5)})
 
-    assert _validate_confound_block(yaml.safe_load(yaml.safe_dump(block))) == block
+    assert _validate_confound_block(yaml.safe_load(yaml.safe_dump(block)), winner_trial=0) == block
 
 
 def _mutated(
@@ -389,7 +389,8 @@ def _mutated(
 )
 def test_validator_rejects_malformed_blocks(path: tuple[Any, ...], value: Any) -> None:
     with pytest.raises(ValueError, match="confound"):
-        _validate_confound_block(_mutated(path, value))
+        # Trial 1, at 0.4, won the default block.
+        _validate_confound_block(_mutated(path, value), winner_trial=1)
 
 
 def _all_checked() -> dict[str, Any]:
@@ -446,14 +447,23 @@ def test_validator_rejects_verdicts_that_contradict_their_evidence(
 ) -> None:
     """An unpublished winner.yaml has no manifest hash, so its block must hold together."""
     block = _all_checked()
-    assert _validate_confound_block(block) == block
+    assert _validate_confound_block(block, winner_trial=0) == block
     assert [block["checks"][name]["verdict"] for name in CONFOUND_CHECKS] == [
         "ok",
         "ok",
         "heterogeneous",
     ]
     with pytest.raises(ValueError, match=error):
-        _validate_confound_block(_mutated(path, value, _all_checked()))
+        _validate_confound_block(_mutated(path, value, _all_checked()), winner_trial=0)
+
+
+def test_validator_anchors_the_block_to_its_own_winner() -> None:
+    """A block that does not describe the winner beside it cannot report its position."""
+    block = _all_checked()  # trial 0 won, tying with trial 1
+    with pytest.raises(ValueError, match="does not include the winner, trial 5"):
+        _validate_confound_block(block, winner_trial=5)
+    with pytest.raises(ValueError, match="tying with itself"):
+        _validate_confound_block(block, winner_trial=1)
 
 
 def test_summary_keeps_only_verdicts_and_numbers() -> None:
@@ -505,7 +515,7 @@ def test_summary_reports_unchecked_counts_as_null() -> None:
 
 def test_validator_rejects_an_absent_block() -> None:
     with pytest.raises(ValueError, match="confound block is missing"):
-        _validate_confound_block(None)
+        _validate_confound_block(None, winner_trial=0)
 
 
 def test_confound_block_never_moves_a_downstream_fingerprint() -> None:
@@ -612,7 +622,7 @@ def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:
         "verdict": "n/a",
         "reason": "trial(s) 1 have unreadable objective provenance",
     }
-    _validate_confound_block(selected.confound)
+    _validate_confound_block(selected.confound, winner_trial=selected.trial_number)
 
 
 def _published_winner(experiment: Any) -> tuple[Path, dict[str, Any]]:
@@ -631,7 +641,8 @@ def test_published_block_is_manifest_covered(tmp_path: Path) -> None:
     run_experiment(experiment)
     path, payload = _published_winner(experiment)
     # The constant trainer ties both trials with different params.
-    assert _flagged_checks(_validate_confound_block(payload["confound"])) == ["tie"]
+    block = _validate_confound_block(payload["confound"], winner_trial=payload["trial_number"])
+    assert _flagged_checks(block) == ["tie"]
 
     payload["confound"]["checks"]["tie"] = {"verdict": "ok", "detail": {"tied_trials": []}}
     path.write_text(yaml.safe_dump(payload, sort_keys=False))
