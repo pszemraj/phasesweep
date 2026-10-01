@@ -60,10 +60,10 @@ TRIAL_COMMAND = f"python -c 'print(\"{OBJECTIVE_TOKEN}={OBJECTIVE_VALUE}\")' {{o
 #: PhaseSweep study schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.state.STUDY_SCHEMA_VERSION``; kept as a literal so this
 #: module names no PhaseSweep import before ``_isolate_environment`` runs.
-TARGET_STUDY_SCHEMA_VERSION = 4
+TARGET_STUDY_SCHEMA_VERSION = 5
 #: Artifact-root binding schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.artifact_roots.ARTIFACT_ROOT_BINDING_SCHEMA_VERSION``.
-TARGET_BINDING_SCHEMA_VERSION = 3
+TARGET_BINDING_SCHEMA_VERSION = 4
 #: Study user attribute holding the PhaseSweep study schema version.
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 #: Optuna journal op code for ``SET_STUDY_USER_ATTR``.

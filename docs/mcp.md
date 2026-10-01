@@ -122,22 +122,45 @@ still validates:
 For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and
 report the condition.
 
+Every winner also carries a `confound` payload: advisory verdicts on the
+population selection ranked to choose it, frozen at selection time. `flagged`
+lists the checks below whose verdict is `heterogeneous`; report each one with
+its counts before relying on the winner or proposing a run whose phases
+inherit it.
+
+| Check | Verdict meaning |
+| --- | --- |
+| `evaluation_point` | `heterogeneous`: ranked objectives were measured at `distinct_values` different positions on the configured evaluation axis, the lowest more than 1% short of the highest; the winner's position was `winner_value`. `ok` may still report several `distinct_values` within 1% of each other, such as a fixed-token sweep's batch sizes each stopping within a batch of the budget. `n/a`: only one trial was ranked, the extractor reports no position, or a ranked trial has no readable position on the axis. |
+| `survivorship` | `heterogeneous`: `failed` + `pruned` trials were at least as numerous as `ranked` ones; `failed` includes evidence-gate and extraction failures. `infeasible` trials, which violated one of the experiment's own constraints, are counted but never flag. Always checked, never `n/a`. |
+| `tie` | `heterogeneous`: the winner tied exactly with `tied_trials` other ranked trials that used different params. `n/a`: only one trial was ranked. |
+
+`ok` means a check ran and found nothing; `n/a` means it could not run and
+must never be read as clean. Evidence strings (an evaluation axis name is a
+config key) stay out of this payload; only enums and numbers cross the MCP
+boundary. The verdicts are advisory: they do not invalidate the result, and
+only the operator decides whether to re-run.
+
 `recovery_required: true` means cleanup, launch handoff, or snapshot
 finalization needs operator recovery. Agents should stop rather than guessing
 at process or result state; [run state and recovery](#run-state-and-recovery)
 shows where each case comes from.
 
 Winner results describe selected values, not convergence curves, robustness,
-causality, or unreturned trial history. Treat `<redacted>` values as deliberate
-catalog policy, not missing data.
+causality, or unreturned trial history. The `confound` payload summarizes
+that history only as counts about the population selection ranked: it bounds
+how far the comparison behind the selected value can be trusted, but it says
+nothing about the winner's robustness and never changes or blocks the
+selection. Treat `<redacted>` values as deliberate catalog policy, not
+missing data.
 
 The operator may configure W&B, ordinary JSON, log, or envelope scoring.
 Frozen result reads preserve the producing reader's assurance fields and need
 no W&B SDK, credentials, or remote access. W&B binds its source to the managed
 attempt ID; it does not assert the envelope's evaluation metadata or input
-content guarantees. The trainer owns evaluation and aggregation; the metric
-goal ranks the selected trial scalars. Log reduction defaults to `last` and is
-independent of the ranking goal.
+content guarantees, and only records where in the run's history the
+objective's value was logged. The trainer owns evaluation and aggregation; the
+metric goal ranks the selected trial scalars. Log reduction defaults to `last`
+and is independent of the ranking goal.
 
 ## Run state and recovery
 

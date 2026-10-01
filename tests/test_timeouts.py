@@ -662,6 +662,88 @@ def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     assert result.deadline_exhausted is True
 
 
+@pytest.mark.parametrize(("read_seconds", "position"), [(1.0, 400), (60.0, None)])
+def test_slow_wandb_position_read_never_costs_an_accepted_trial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read_seconds: float, position: int | None
+) -> None:
+    """A W&B objective captured in time is accepted however long its history read runs.
+
+    The summary lands at 100 against a deadline of 150. The advisory history
+    read runs only after acceptance, so one that outlives the deadline records
+    no position instead of spending the budget acceptance needed.
+    """
+    from types import SimpleNamespace
+
+    public = pytest.importorskip("wandb.apis.public")
+    from phasesweep.config import WandbExtractor
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+
+    class Run:
+        state = "finished"
+        summary_metrics = {"eval/loss": 0.2, "_step": 1}
+        history_keys: dict = {}
+
+        def load(self, force: bool = False) -> None:
+            self.history_keys = {
+                "lastStep": 1,
+                "keys": {"eval/loss": {"typeCounts": [{"count": 1}]}},
+            }
+
+        def history(self, keys: list[str], samples: int, pandas: bool) -> list[dict]:
+            clock[0] += read_seconds
+            return [{"_step": 1, "eval/loss": 0.2, "eval/step": 400}]
+
+    monkeypatch.setattr(public, "Api", lambda **_: SimpleNamespace(run=lambda path: Run()))
+
+    def in_process_worker(request, *, deadline, **_):
+        # The supervised worker, run in-process; the parent stops it at its deadline.
+        request = dict(request)
+        if request.pop("task") == "summary":
+            response = {
+                "status": "summary",
+                "capture": wandb_evidence._poll_wandb_summary(**request),
+            }
+        else:
+            response = {
+                "status": "position",
+                "value": wandb_evidence._locate_wandb_position(**request),
+            }
+        return SimpleNamespace(timed_out=clock[0] >= deadline), response, None
+
+    monkeypatch.setattr(wandb_evidence, "_run_worker", in_process_worker)
+    objective = WandbExtractor(
+        type="wandb", entity="e", project="p", metric_key="eval/loss", evaluation_axis="eval/step"
+    )
+    experiment = make_experiment(workdir=tmp_path, metric=Metric(extractor=objective))
+    executed = ExecutedTrial(
+        ctx=TrialContext(
+            experiment="t",
+            phase="p",
+            trial_id=0,
+            generation_id="generation-test",
+            attempt_id="attempt-test",
+            overrides_sha256="0" * 64,
+            trial_dir=tmp_path,
+            run_name="t-p-0-attempt-test",
+            return_code=0,
+            duration_seconds=0.1,
+        ),
+        process=ProcessResult(return_code=0, timed_out=False, pid=123, duration_seconds=0.1),
+    )
+
+    result = extract_trial_result(experiment=experiment, executed=executed, deadline=150.0)
+
+    assert (result.metric, result.failure_reason, result.deadline_exhausted) == (0.2, None, False)
+    assert result.objective_provenance is not None
+    assert result.objective_provenance["source"]["evaluation"] == {
+        "progress": {"axis": "eval/step", "value": position}
+    }
+
+
 def test_process_failure_after_deadline_is_not_relabelled(tmp_path: Path) -> None:
     """An elapsed clock is not causal when the trainer already failed."""
     experiment = make_experiment(workdir=tmp_path)

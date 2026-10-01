@@ -35,6 +35,7 @@ from phasesweep.evidence.evaluation import (
     GateResult,
     TrialContext,
     evaluate_gates,
+    locate_objective_position,
     run_extractor,
 )
 from phasesweep.evidence.models import JsonEnvelopeExtractor, compose_wandb_environment
@@ -726,7 +727,8 @@ def extract_trial_result(
             the metric, each constraint, the gates, and the final result), so
             a single blocking local stage can overrun by at most its own
             duration; W&B polling additionally caps its request budget to the
-            remainder.
+            remainder. An accepted W&B objective's evaluation position is read
+            last, within what remains, and never changes the result.
 
     Returns:
         :class:`TrialResult` with either a finite metric and feasibility flag,
@@ -915,6 +917,11 @@ def extract_trial_result(
         expired.gate_results = gate_results
         return expired
 
+    # Accepted. Where the objective was logged is advisory, so it is read
+    # only now and can never spend the budget acceptance needed.
+    locate_objective_position(
+        executed.ctx, experiment.metric.extractor, objective_provenance, deadline=deadline
+    )
     return TrialResult(
         metric=metric_value,
         constraints=constraint_values,

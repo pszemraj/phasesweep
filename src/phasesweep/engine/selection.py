@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ import optuna
 
 from phasesweep.config import Experiment, check_bounds
 from phasesweep.engine.artifacts import _winner_common_payload
+from phasesweep.engine.confound import _assess_population, _describe_flagged
 from phasesweep.engine.errors import OperatorAction, PhaseSweepError, TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
 from phasesweep.engine.state import (
@@ -46,6 +48,9 @@ class SelectedTrial:
     trainer_env_digest: str
     # Versioned identity of the exact generated input consumed by the trainer.
     trainer_input: dict[str, Any]
+    # Advisory verdicts on the population this selection ranked
+    # (:mod:`phasesweep.engine.confound`).
+    confound: dict[str, Any]
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
 
@@ -79,23 +84,23 @@ def select_winner(
     number rather than by value (review v0.5.17 / finding H). PhaseSweep has no
     way to know a config's meaningful resolution, so it does not guess one.
 
-    Comparability is checked but never enforced: if the compared trials span
-    more than one trainer-environment digest — a top-up ran under a different
-    environment — the ranking mixes environments, and that is reported once
-    per selection (review v0.5.18 / finding F3). It is not an error, because
-    the environment is deliberately outside the semantic fingerprint.
+    The ranked population is also classified for confounds
+    (:func:`phasesweep.engine.confound._assess_population`) and any flagged
+    check is logged once per selection. The verdicts are advisory: they never
+    change which trial wins or whether selection succeeds.
 
     Args:
         study: Optuna study for the phase whose winner we want.
         experiment: Parsed experiment config. Provides the optimization goal
             (minimize/maximize) and the constraint definitions used to filter
             trials.
-        phase_name: Phase label used in the environment-divergence warning;
-            defaults to the study name when the caller has no phase context.
+        phase_name: Phase label used in log messages; defaults to the study
+            name when the caller has no phase context.
 
     Returns:
         The winning trial as :class:`SelectedTrial` (number, params, metric,
-        constraint readings, and persisted evidence-gate results).
+        constraint readings, persisted evidence-gate results, and the
+        population's confound block).
 
     Raises:
         NoFeasibleTrialError: If no trial in the study is both COMPLETE and
@@ -105,8 +110,9 @@ def select_winner(
     minimize = experiment.metric.goal == "minimize"
     constraints_by_name = {c.name: c for c in experiment.constraints}
 
+    trials = study.get_trials(deepcopy=False)
     survivors: list[optuna.trial.FrozenTrial] = []
-    for t in study.get_trials(deepcopy=False):
+    for t in trials:
         if _selection_candidate_identity(t) is None:
             continue
         # Re-verify constraints from user_attrs in case rules changed or stored
@@ -134,8 +140,6 @@ def select_winner(
             "No feasible completed trials in phase. "
             "Check stdout/stderr logs in the phase's trial_* directories."
         )
-
-    _warn_mixed_environments(survivors, phase_name=phase_name, study=study)
 
     best_value = (
         min(_trial_value(t) for t in survivors)
@@ -173,6 +177,26 @@ def select_winner(
             )
         gates = parsed_gates
 
+    objective_provenance = _trial_objective_provenance(best)
+    provenance = {best.number: objective_provenance}
+    # Only the winner's record backs the published result. The others feed the
+    # advisory evaluation_point check, which reports one it cannot read
+    # instead of failing selection over a trial that lost.
+    for t in survivors:
+        if t is not best:
+            with contextlib.suppress(TrialEvidenceMissingError):
+                provenance[t.number] = _trial_objective_provenance(t)
+    confound = _assess_population(trials, survivors, best, provenance=provenance)
+    flagged = _describe_flagged(confound)
+    if flagged:
+        log.warning(
+            "[%s] potential confounds in the %d ranked trials (advisory; recorded in the "
+            "winner's confound block): %s.",
+            phase_name or study.study_name,
+            len(survivors),
+            "; ".join(flagged),
+        )
+
     return SelectedTrial(
         trial_number=best.number,
         params=dict(best.params),
@@ -181,42 +205,12 @@ def select_winner(
         gates=gates,
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
         attempt_id=str(best.user_attrs[ATTEMPT_ID_ATTR]),
-        objective_provenance=_trial_objective_provenance(best),
+        objective_provenance=objective_provenance,
         # Allocation writes both before the trainer can run, so every
         # completed trial carries them.
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
-    )
-
-
-def _warn_mixed_environments(
-    survivors: list[optuna.trial.FrozenTrial],
-    *,
-    phase_name: str | None,
-    study: optuna.Study,
-) -> None:
-    """Warn once when the compared trials did not all run under one environment.
-
-    :param list[optuna.trial.FrozenTrial] survivors: Feasible completed trials
-        that form the comparison set for this selection.
-    :param str | None phase_name: Phase label supplied by the caller; the study
-        name is used when it is ``None``.
-    :param optuna.Study study: Study the survivors came from, read only for its
-        name and only when a divergence is being reported.
-    """
-    digests = {trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] for trial in survivors}
-    if len(digests) < 2:
-        return
-    log.warning(
-        "[%s] comparing %d candidate trials that ran under %d distinct trainer "
-        "environments (digests %s). A top-up ran under a different environment, so this "
-        "ranking mixes environments; the environment is outside the study fingerprint by "
-        "design. Re-run the phase under one environment if the difference can move the "
-        "metric.",
-        phase_name or study.study_name,
-        len(survivors),
-        len(digests),
-        ", ".join(sorted(digest[:12] for digest in digests)),
+        confound=confound,
     )
 
 

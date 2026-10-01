@@ -31,6 +31,7 @@ from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
+from phasesweep.engine.confound import _confound_summary, _validate_confound_block
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import read_trial_stats, validate_ledger
 from phasesweep.engine.optuna import (
@@ -88,6 +89,9 @@ class PhaseWinnerView:
     # by whatever metric the current config declares.
     metric_name: str | None = None
     metric_goal: str | None = None
+    # Path-free projection of the winner's confound block: verdicts, check
+    # names, and counts only (:func:`phasesweep.engine.confound._confound_summary`).
+    confound: dict[str, Any] | None = None
 
 
 def _phase_status_payloads(
@@ -182,9 +186,14 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
         if not isinstance(effective_overrides, Mapping):
             return None
         source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
+        trial_number = int(data["trial_number"])
+        confound = _confound_summary(
+            _validate_confound_block(data.get("confound"), winner_trial=trial_number),
+            winner_trial=trial_number,
+        )
         return PhaseWinnerView(
             phase=phase_name,
-            trial_number=int(data["trial_number"]),
+            trial_number=trial_number,
             metric=float(metric_block[stored_metric_name]),
             metric_name=stored_metric_name,
             metric_goal=str(stored_goal) if isinstance(stored_goal, str) else None,
@@ -203,6 +212,7 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
                 else None
             ),
             source=source,
+            confound=confound,
         )
     except (KeyError, ValueError, TypeError):
         return None

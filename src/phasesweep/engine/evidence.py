@@ -6,7 +6,7 @@ import json
 import math
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn, TypeGuard
 
 import optuna
 
@@ -46,6 +46,7 @@ from phasesweep.runtime.commands import TRAINER_INPUT_FILENAMES
 from phasesweep.runtime.files import (
     file_sha256,
 )
+from phasesweep.runtime.json import progress_position
 from phasesweep.runtime.process import (
     read_attempt_lifecycle,
 )
@@ -200,6 +201,10 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
         key = source.get("metric_key")
         if not isinstance(key, str) or not key or key not in capture["values"]:
             fail("W&B objective has no captured metric key")
+        evaluation = source.get("evaluation")
+        progress = evaluation.get("progress") if isinstance(evaluation, Mapping) else None
+        if not _valid_progress_record(progress, nullable=True):
+            fail("W&B objective has no evaluation-axis record")
         return
     if (
         source.get("kind") != "file"
@@ -215,6 +220,36 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
             _validate_trial_file_path(source["path"])
         except ValueError:
             fail("invalid file source path")
+    if kind == "json_envelope":
+        evaluation = source.get("evaluation")
+        if (
+            not isinstance(evaluation, Mapping)
+            or not isinstance(evaluation.get("checkpoint"), str)
+            or not evaluation["checkpoint"]
+            or type(evaluation.get("step")) is not int
+            or evaluation["step"] < 0
+        ):
+            fail("envelope objective has no evaluation checkpoint or step")
+        if not _valid_progress_record(evaluation.get("progress"), nullable=False):
+            fail("envelope objective has no evaluation-axis position")
+
+
+def _valid_progress_record(record: object, *, nullable: bool) -> TypeGuard[Mapping[str, Any]]:
+    """Check a recorded evaluation-axis position: ``{axis, value}``.
+
+    :param object record: Parsed ``source.evaluation.progress`` record.
+    :param bool nullable: Whether ``value`` may be ``None``, meaning the
+        source could not say where the objective was measured.
+    :return TypeGuard[Mapping[str, Any]]: Whether the record names an axis
+        and a valid position.
+    """
+    if not isinstance(record, Mapping) or set(record) != {"axis", "value"}:
+        return False
+    if not isinstance(record["axis"], str) or not record["axis"]:
+        return False
+    if record["value"] is None:
+        return nullable
+    return progress_position(record["value"]) is not None
 
 
 def _verify_objective_source_evidence(
@@ -480,6 +515,7 @@ def _verify_trial_evidence_dir(
                 for field in ("base_url", "entity", "project")
             )
             or source.get("metric_key") != extractor.metric_key
+            or source["evaluation"]["progress"]["axis"] != extractor.evaluation_axis
             or capture["values"].get(extractor.metric_key) != metric_value
         ):
             raise TrialEvidenceMissingError(

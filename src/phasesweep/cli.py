@@ -38,7 +38,7 @@ from phasesweep.mcp.registry import (
     require_linux_mcp_host,
 )
 from phasesweep.mcp.scaffold import scaffold_catalog_text
-from phasesweep.reporting import report_objective
+from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
@@ -227,6 +227,13 @@ def init(output: Path) -> None:
 @click.option("--policy", required=True, help="Evaluation policy, such as final_checkpoint.")
 @click.option("--checkpoint", required=True, help="Checkpoint identity for this evaluation.")
 @click.option("--step", required=True, type=click.IntRange(min=0), help="Evaluation step.")
+@click.option(
+    "--progress",
+    "progress_items",
+    multiple=True,
+    metavar="NAME=VALUE",
+    help="Position on another progress axis at this evaluation, such as tokens=1048576. Repeatable.",
+)
 def report_objective_cmd(
     value: float,
     name: str,
@@ -234,6 +241,7 @@ def report_objective_cmd(
     policy: str,
     checkpoint: str,
     step: int,
+    progress_items: tuple[str, ...],
 ) -> None:
     """Publish one objective through the trainer-side reporting API.
 
@@ -243,9 +251,30 @@ def report_objective_cmd(
     :param str policy: Evaluation policy.
     :param str checkpoint: Checkpoint identity.
     :param int step: Non-negative evaluation step.
+    :param tuple[str, ...] progress_items: ``NAME=VALUE`` progress positions.
     :raises click.BadParameter: If the objective metadata is invalid.
     :raises click.ClickException: If the PhaseSweep trial environment is absent.
     """
+    progress: dict[str, int | float] = {}
+    for item in progress_items:
+        axis, separator, raw = item.partition("=")
+        if not separator or axis in progress:
+            raise click.BadParameter(
+                f"expected unique NAME=VALUE pairs, got {item!r}.", param_hint="'--progress'"
+            )
+        try:
+            progress[axis] = int(raw)
+        except ValueError:
+            try:
+                progress[axis] = float(raw)
+            except ValueError:
+                raise click.BadParameter(
+                    f"{item!r} does not end in a number.", param_hint="'--progress'"
+                ) from None
+    try:
+        _progress_values(progress)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="'--progress'") from exc
     try:
         destination = report_objective(
             value,
@@ -254,6 +283,7 @@ def report_objective_cmd(
             policy=policy,
             checkpoint=checkpoint,
             step=step,
+            progress=progress or None,
         )
     except ValueError as exc:
         raise click.BadParameter(str(exc), param_hint="objective") from exc

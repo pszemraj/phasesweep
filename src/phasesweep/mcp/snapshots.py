@@ -12,6 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from phasesweep.config import Experiment
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine import PhaseWinnerView, read_result, read_status
+from phasesweep.engine.confound import (
+    ConfoundCheck,
+    ConfoundVerdict,
+    _confound_summary,
+    _validate_confound_block,
+)
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
@@ -28,6 +34,7 @@ from phasesweep.evidence.models import _ObjectiveEvidenceFields
 log = logging.getLogger("phasesweep.mcp.snapshots")
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
+NonNegativeFloat = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 McpPublicationState = PublicationState | Literal["unknown"]
 """Engine publication verdict plus the MCP snapshot-unavailable state."""
 
@@ -147,6 +154,75 @@ class WinnerSourceSnapshot(_SnapshotModel):
     attempt_id: str
 
 
+_VERDICT_DESCRIPTION = (
+    "ok: checked, nothing found. heterogeneous: a potential confound in the population "
+    "this winner was chosen from; report it before relying on the winner. n/a: not "
+    "checked; never read it as clean."
+)
+
+
+class EvaluationPointSummary(_SnapshotModel):
+    """Whether every ranked objective was measured at one training position.
+
+    Positions are on the experiment's configured evaluation axis -- the
+    progress axis its sweep holds fixed, such as optimizer step or tokens.
+    """
+
+    verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
+    distinct_values: NonNegativeInt | None = Field(
+        description=(
+            "Distinct positions on the configured evaluation axis the ranked objectives "
+            "were measured at; null when not checked."
+        )
+    )
+    winner_value: NonNegativeInt | NonNegativeFloat | None = Field(
+        description=(
+            "Position on the configured evaluation axis the winning objective was "
+            "measured at; null when not checked."
+        )
+    )
+
+
+class SurvivorshipSummary(_SnapshotModel):
+    """How many terminal trials were ranked versus excluded from ranking."""
+
+    verdict: ConfoundVerdict = Field(
+        description=(
+            f"{_VERDICT_DESCRIPTION} Heterogeneous when failed and pruned trials are at "
+            "least as numerous as ranked ones; infeasible trials never flag."
+        )
+    )
+    ranked: NonNegativeInt
+    infeasible: NonNegativeInt
+    failed: NonNegativeInt
+    pruned: NonNegativeInt
+
+
+class TieSummary(_SnapshotModel):
+    """Whether the winner tied exactly with trials that used other params."""
+
+    verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
+    tied_trials: NonNegativeInt | None = Field(
+        description="Trials tying the winner with other params; null when not checked."
+    )
+
+
+class ConfoundSummary(_SnapshotModel):
+    """Advisory verdicts on the population the winner was selected from.
+
+    Frozen when the winner was selected. The evidence behind each verdict
+    stays in the operator-facing winner file; this summary carries only
+    verdicts and counts.
+    """
+
+    flagged: list[ConfoundCheck] = Field(
+        description="Checks whose verdict is heterogeneous, in report order."
+    )
+    evaluation_point: EvaluationPointSummary
+    survivorship: SurvivorshipSummary
+    tie: TieSummary
+
+
 class WinnerSnapshot(_SnapshotModel):
     """One sampled phase winner captured without effective overrides."""
 
@@ -159,6 +235,7 @@ class WinnerSnapshot(_SnapshotModel):
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSourceSnapshot
+    confound: ConfoundSummary
 
 
 def _winner_source_snapshot(
@@ -196,9 +273,16 @@ def _winner_snapshot(
             all(bool(gate.get("passed")) for gate in winner.gates) if winner.gates else None
         )
         incomplete = bool(winner.completion.get("incomplete", False))
+        confound = _confound_summary(
+            _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
+            winner_trial=winner.trial_number,
+        )
     else:
         gates_passed = winner.gates_passed
         incomplete = winner.incomplete
+        if winner.confound is None:
+            raise RuntimeError("Current-format winner is missing confound verdicts.")
+        confound = winner.confound
     return WinnerSnapshot(
         phase=phase,
         trial_number=winner.trial_number,
@@ -209,6 +293,7 @@ def _winner_snapshot(
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
         source=_winner_source_snapshot(winner),
+        confound=ConfoundSummary.model_validate(confound),
     )
 
 
@@ -260,6 +345,7 @@ class RunResultSnapshot(_SnapshotModel):
                     generation_id=winner.source.generation_id,
                     attempt_id=winner.source.attempt_id,
                 ),
+                confound=winner.confound.model_dump(mode="json"),
             )
             for winner in self.winners
         ]

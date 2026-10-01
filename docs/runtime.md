@@ -54,6 +54,50 @@ shareable generation identity record. Trial directories retain local evidence
 and attempt lifecycle information used for supported continuation and winner
 validation.
 
+### Confound verdicts
+
+Each phase's `winner.yaml` carries a `confound` block: advisory verdicts on
+the population that selection ranked to pick the winner, computed once and
+frozen at selection time. It never blocks selection or publication, and it
+never joins a fingerprint, so an observation on a winner can never invalidate
+a study or block a top-up; a top-up that reselects the same trial for a
+larger population publishes a fresh block, and `--from-phase` carries the
+parent winner's block verbatim. The authoritative copy is the generation's
+`generations/<generation-id>/phases/<phase>/winner.yaml`, which the
+generation manifest covers: editing a verdict there after publication fails
+`publication_integrity`. The per-phase `<phase>/winner.yaml` projection is
+never read back, so editing it changes nothing, and the next publication
+rewrites it.
+
+The block runs three checks, each `ok` (checked, nothing found),
+`heterogeneous` (checked, found a potential confound, with evidence), or
+`n/a` (could not be checked — never treat this as clean):
+
+- `evaluation_point`: whether the ranked objectives were all measured at the
+  same position on the metric extractor's `evaluation_axis` -- the
+  training-progress axis the sweep holds fixed, such as optimizer step or
+  tokens. Positions within 1% of the highest count as the same point, and the
+  exact positions are recorded either way. A W&B aggregate such as `eval/loss.min` is positioned where its
+  history series ends, since where each trial's best value fell differs by
+  nature. `n/a` for `json` and `log_regex` extractors, which report no
+  position; when any ranked `wandb` trial recorded no position in its run
+  history, or a ranked trial's objective provenance is unreadable; or when
+  only one trial was ranked.
+- `survivorship`: whether failed and pruned trials were at least as numerous
+  as the ranked ones, so that whatever made configurations fail could have
+  decided which ones were ranked. Failed trials include evidence-gate and
+  extraction failures. Infeasible trials, which violated a constraint, are
+  counted too but never flag: the experiment's own constraints define what
+  may win. This check always runs.
+- `tie`: whether the trial-number tiebreak chose between trials with
+  different params tied on the exact metric value, rather than between
+  repeats of one configuration. `n/a` with one ranked trial.
+
+Selection logs one `WARNING` naming every flagged check and its numbers, and
+a phase that is about to build on a flagged parent winner logs its own
+`WARNING` before it runs. `phasesweep show-winners` prints the raw
+`winner.yaml`, including the full evidence behind each check.
+
 > [!WARNING]
 > `config.snapshot.yaml` is private because it can contain command and
 > environment values. PhaseSweep writes a `.gitignore` containing `*` whenever
@@ -175,7 +219,9 @@ It uses the same durable attempt slot and process supervisor, so recovery can
 find the reader after abrupt parent exit, even if its phase was removed.
 Uncertain cleanup blocks further work. One absolute polling deadline covers
 worker startup, SDK construction, requests, retries, and summary visibility;
-phase/run deadlines can shorten it, while cleanup grace stays separate.
+phase/run deadlines can shorten it, while cleanup grace stays separate. Once
+the trial is accepted, a second reader in the same slot locates the objective
+in run history under its own deadline.
 Trainer return code and duration remain trainer measurements.
 
 Finished W&B captures freeze only the requested numeric values and gate-presence

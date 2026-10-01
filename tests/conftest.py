@@ -609,6 +609,22 @@ def invoke_cli_boundary(
     return 0 if code is None else int(code)
 
 
+def single_trial_confound(trial_number: int) -> dict[str, Any]:
+    """Return the confound block selection records for a one-trial population."""
+    return {
+        "schema_version": 1,
+        "ranked_trials": [trial_number],
+        "checks": {
+            "evaluation_point": {"verdict": "n/a", "reason": "only one trial was ranked"},
+            "survivorship": {
+                "verdict": "ok",
+                "detail": {"ranked": 1, "infeasible": 0, "failed": 0, "pruned": 0},
+            },
+            "tie": {"verdict": "n/a", "reason": "only one trial was ranked"},
+        },
+    }
+
+
 def write_trainer(path: Path, body: str) -> Path:
     """Write an executable Python trainer script to ``path``.
 

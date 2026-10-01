@@ -88,7 +88,7 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".launch.lock",
     ".transition.lock",
 )
-MCP_STATE_FORMAT_VERSION = 1
+MCP_STATE_FORMAT_VERSION = 2
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 

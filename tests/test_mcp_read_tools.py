@@ -100,6 +100,28 @@ def _record_published_run_snapshot(
     return run_id, trainer, config, catalog
 
 
+@pytest.mark.integration
+def test_run_results_carry_path_free_confound_verdicts(tmp_path: Path) -> None:
+    """Agents get every verdict and its counts; operator evidence stays in winner.yaml."""
+    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
+    app, _registry, _store = make_mcp_app(catalog)
+
+    payload = app.winners(run_id=run_id)
+    confound = GetRunResultsResult.model_validate(payload).phases[0].confound
+
+    assert confound.evaluation_point.verdict == "n/a"
+    assert confound.evaluation_point.distinct_values is None
+    assert confound.survivorship.ranked >= 1
+    assert confound.flagged == [
+        name
+        for name in ("evaluation_point", "survivorship", "tie")
+        if getattr(confound, name).verdict == "heterogeneous"
+    ]
+    rendered = json.dumps(payload["phases"][0]["confound"])
+    assert "reason" not in rendered
+    assert "detail" not in rendered
+
+
 @pytest.mark.parametrize(
     "method_name",
     # Only the winners read needs a published run, and a real run is slow.

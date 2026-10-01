@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 
 import optuna
 import pytest
@@ -27,6 +26,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
     constraint_attr,
 )
+from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from tests.conftest import make_experiment
 
 # Allocation writes both attrs on every trial before its trainer runs.
@@ -37,7 +37,7 @@ def _objective_provenance_json() -> str:
     """Return a structurally valid current-format local objective record."""
     return json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
             "extractor": {"kind": "log_regex", "config_sha256": "0" * 64},
             "recorded_at": "2026-01-01T00:00:00+00:00",
             "source": {
@@ -71,7 +71,6 @@ def _add_trial(
     feasible=True,
     constraint_vals=None,
     params=None,
-    env_digest="a" * 64,
     extra_user_attrs=None,
 ):
     distributions: dict = {}
@@ -85,7 +84,6 @@ def _add_trial(
         ATTEMPT_ID_ATTR: f"attempt-{len(study.trials)}",
         OBJECTIVE_PROVENANCE_ATTR: _objective_provenance_json(),
         **_ALLOCATION_ATTRS,
-        TRAINER_ENV_DIGEST_ATTR: env_digest,
     }
     user_attrs.update(extra_user_attrs or {})
     for cn, cv in (constraint_vals or {}).items():
@@ -102,6 +100,8 @@ def _add_trial(
 
 class _TrialOrderStudy:
     """Small test double exposing trials in a deliberate non-Optuna order."""
+
+    study_name = "t::p"
 
     def __init__(self, trials):
         self._trials = trials
@@ -225,36 +225,6 @@ def test_exact_tie_is_anchored_to_optimum_not_iteration_order():
 
     assert w.trial_number == 1
     assert w.params == {"x": 1}
-
-
-def test_selection_warns_when_candidates_span_environments(caplog):
-    """A top-up run under a different environment mixes environments in one ranking."""
-    exp = _make_exp()
-    study = _make_study()
-    _add_trial(study, 1.0, params={"x": 0}, env_digest="a" * 64)
-    _add_trial(study, 0.5, params={"x": 1}, env_digest="b" * 64)
-
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
-        winner = select_winner(study, exp, phase_name="p")
-
-    assert winner.trial_number == 1
-    warnings = [r for r in caplog.records if "environment" in r.getMessage()]
-    assert len(warnings) == 1
-    assert warnings[0].getMessage().startswith("[p] ")
-    assert "2 distinct" in warnings[0].getMessage()
-
-
-def test_selection_is_quiet_when_candidates_share_one_environment(caplog):
-    """One environment across the compared trials is the normal case; stay silent."""
-    exp = _make_exp()
-    study = _make_study()
-    _add_trial(study, 1.0, params={"x": 0}, env_digest="a" * 64)
-    _add_trial(study, 0.5, params={"x": 1}, env_digest="a" * 64)
-
-    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.selection"):
-        select_winner(study, exp, phase_name="p")
-
-    assert not [r for r in caplog.records if "environment" in r.getMessage()]
 
 
 def test_rejects_nan_constraint_values_defensively():

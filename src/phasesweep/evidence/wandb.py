@@ -1,4 +1,8 @@
-"""Capture one finished W&B summary in the existing supervised attempt slot."""
+"""Read finished W&B evidence in the existing supervised attempt slot.
+
+A trial's summary capture is mandatory evidence; locating its accepted
+objective in run history is advisory and runs as a separate request.
+"""
 
 from __future__ import annotations
 
@@ -14,13 +18,38 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
+
+from phasesweep.runtime.json import progress_position
+
+if TYPE_CHECKING:
+    from phasesweep.runtime.process import ProcessResult
+
+_HistoryRead = Literal["settled", "lagging", "retry"]
+"""How one history read ended: an answer, history behind the summary, or a
+transient failure worth another read."""
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 _WORKER_STDERR_LOG = "wandb-worker.stderr.log"
+# How long an accepted objective waits for run history to catch up with its
+# summary before recording no position; the position is advisory, so waiting
+# must not hold every trial for the whole timeout. Reading history that has
+# caught up may use the rest of the read's deadline.
+_HISTORY_SETTLE_SECONDS = 30.0
+# Longest wait between history reads, however slowly the summary is polled:
+# the partial reads just after a run finishes cleared within about a second.
+_HISTORY_RETRY_SECONDS = 2.0
+# The server's silent cap on the rows of one history request, both a sampled
+# request and, until the run's history is exported, a scan page: a longer
+# answer comes back as a sample. A scan page of this many steps holds at most
+# this many rows, so it is never sampled.
+_HISTORY_SAMPLES = 10_000
 
 
-@dataclass(frozen=True)
+# Not frozen: unwinding sets an exception's __traceback__ (contextlib does so
+# explicitly), which a frozen dataclass refuses with FrozenInstanceError.
+# eq=False keeps the identity equality and hashing every exception has.
+@dataclass(eq=False)
 class WandbPollTimeout(TimeoutError):
     """The complete worker exhausted its summary visibility budget."""
 
@@ -29,7 +58,7 @@ class WandbPollTimeout(TimeoutError):
     last_error: Exception | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class WandbRunTerminalError(RuntimeError):
     """The expected run terminated unsuccessfully."""
 
@@ -37,7 +66,7 @@ class WandbRunTerminalError(RuntimeError):
     state: str
 
 
-@dataclass(frozen=True)
+@dataclass(eq=False)
 class WandbSetupError(RuntimeError):
     """W&B rejected authentication or client configuration permanently."""
 
@@ -108,8 +137,9 @@ def _is_nonretryable_authorization_error(exc: Exception) -> bool:
 def _is_retryable_setup_error(exc: Exception) -> bool:
     """Recognize temporary transport failures using public SDK/request errors.
 
-    :param Exception exc: Error raised while creating the client or reading the run.
-    :return bool: Whether the failure is transient and polling should continue.
+    :param Exception exc: Error raised while creating the client, reading the
+        run, or reading its history.
+    :return bool: Whether the failure is transient and worth another attempt.
     """
     import requests.exceptions as request_errors
 
@@ -161,38 +191,27 @@ def _poll_worker_environment(environment: Mapping[str, str] | None) -> dict[str,
     return worker_environment
 
 
-def poll_wandb_summary(
+def _run_worker(
+    request: Mapping[str, Any],
     *,
-    base_url: str,
-    entity: str,
-    project: str,
+    statuses: frozenset[str],
     run_id: str,
     trial_dir: Path,
-    poll_seconds: float,
-    timeout_seconds: float,
-    required_keys: Iterable[str] = (),
-    presence_keys: Iterable[str] = (),
-    environment: Mapping[str, str] | None = None,
-    deadline: float | None = None,
-) -> dict[str, Any]:
-    """Capture requested evidence after confirmed trainer cleanup.
+    environment: Mapping[str, str] | None,
+    deadline: float,
+) -> tuple[ProcessResult, dict[str, Any], Path | None]:
+    """Run one supervised worker request in the attempt's process slot.
 
-    :param str base_url: Normalized W&B API endpoint.
-    :param str entity: W&B entity that owns the project.
-    :param str project: W&B project containing the run.
+    :param Mapping[str, Any] request: Worker request, including its ``task``.
+    :param frozenset[str] statuses: Response statuses the task can report; any
+        other outcome preserves the worker's stderr for diagnosis.
     :param str run_id: Immutable attempt ID, also used by process recovery.
     :param Path trial_dir: Existing attempt directory and durable process slot.
-    :param float poll_seconds: Delay between summary polls.
-    :param float timeout_seconds: Visibility budget for the whole capture.
-    :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
-    :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
-    :param float | None deadline: Absolute deadline including worker startup.
-    :return dict[str, Any]: Numeric values, present keys, and retrieval time.
-    :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget.
-    :raises WandbSetupError: Authentication or setup was denied.
-    :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
-    :raises ValueError: A requested scalar is invalid.
+    :param float deadline: Absolute ``time.monotonic()`` time the worker is stopped at.
+    :return tuple[ProcessResult, dict[str, Any], Path | None]: The worker's
+        process result, its response (empty when it wrote none), and the
+        preserved stderr path, if any.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
     from phasesweep.errors import UnsafeProcessCleanupError
@@ -200,33 +219,13 @@ def poll_wandb_summary(
     from phasesweep.runtime.process import run_supervised
     from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 
-    deadline = min(
-        time.monotonic() + timeout_seconds, deadline if deadline is not None else math.inf
-    )
-    if time.monotonic() >= deadline:
-        raise WandbPollTimeout(run_id, timeout_seconds)
     diagnostic_path: Path | None = None
     with TemporaryDirectory(prefix="phasesweep-wandb-") as directory:
         worker_dir = Path(directory)
         request_path = worker_dir / "request.json"
         response_path = worker_dir / "response.json"
         stderr_path = worker_dir / "stderr.log"
-        private_atomic_write_text(
-            request_path,
-            json.dumps(
-                {
-                    "base_url": base_url,
-                    "entity": entity,
-                    "project": project,
-                    "run_id": run_id,
-                    "poll_seconds": poll_seconds,
-                    "timeout_seconds": timeout_seconds,
-                    "required_keys": list(required_keys),
-                    "presence_keys": list(presence_keys),
-                    "deadline": deadline,
-                }
-            ),
-        )
+        private_atomic_write_text(request_path, json.dumps(dict(request)))
         with (
             (worker_dir / "stdout.log").open("w", encoding="utf-8") as stdout,
             stderr_path.open("w", encoding="utf-8") as stderr,
@@ -261,15 +260,7 @@ def poll_wandb_summary(
         if not result.timed_out and (
             result.return_code != 0
             or result.failure_reason is not None
-            or response.get("status")
-            not in {
-                "summary",
-                "setup_error",
-                "terminal_error",
-                "invalid_evidence",
-                "import_error",
-                "timeout",
-            }
+            or response.get("status") not in statuses
         ):
             diagnostic = stderr_path.read_text(encoding="utf-8", errors="replace")
             if diagnostic:
@@ -279,6 +270,76 @@ def poll_wandb_summary(
                     diagnostic,
                     require_private_dir=False,
                 )
+    return result, response, diagnostic_path
+
+
+def poll_wandb_summary(
+    *,
+    base_url: str,
+    entity: str,
+    project: str,
+    run_id: str,
+    trial_dir: Path,
+    poll_seconds: float,
+    timeout_seconds: float,
+    required_keys: Iterable[str] = (),
+    presence_keys: Iterable[str] = (),
+    environment: Mapping[str, str] | None = None,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    """Capture requested evidence after confirmed trainer cleanup.
+
+    :param str base_url: Normalized W&B API endpoint.
+    :param str entity: W&B entity that owns the project.
+    :param str project: W&B project containing the run.
+    :param str run_id: Immutable attempt ID, also used by process recovery.
+    :param Path trial_dir: Existing attempt directory and durable process slot.
+    :param float poll_seconds: Delay between summary polls.
+    :param float timeout_seconds: Visibility budget for the whole capture.
+    :param Iterable[str] required_keys: Numeric keys required before accepting a capture.
+    :param Iterable[str] presence_keys: Keys whose presence is recorded without their values.
+    :param Mapping[str, str] | None environment: Actual composed trainer environment.
+    :param float | None deadline: Absolute deadline including worker startup.
+    :return dict[str, Any]: Numeric values, present keys, and retrieval time.
+    :raises WandbPollTimeout: Startup, SDK work, or visibility exceeded the budget.
+    :raises WandbSetupError: Authentication or setup was denied.
+    :raises WandbRunTerminalError: The expected run terminated unsuccessfully.
+    :raises ValueError: A requested scalar is invalid.
+    :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
+    """
+    deadline = min(
+        time.monotonic() + timeout_seconds, deadline if deadline is not None else math.inf
+    )
+    if time.monotonic() >= deadline:
+        raise WandbPollTimeout(run_id, timeout_seconds)
+    result, response, diagnostic_path = _run_worker(
+        {
+            "task": "summary",
+            "base_url": base_url,
+            "entity": entity,
+            "project": project,
+            "run_id": run_id,
+            "poll_seconds": poll_seconds,
+            "timeout_seconds": timeout_seconds,
+            "required_keys": list(required_keys),
+            "presence_keys": list(presence_keys),
+            "deadline": deadline,
+        },
+        statuses=frozenset(
+            {
+                "summary",
+                "setup_error",
+                "terminal_error",
+                "invalid_evidence",
+                "import_error",
+                "timeout",
+            }
+        ),
+        run_id=run_id,
+        trial_dir=trial_dir,
+        environment=environment,
+        deadline=deadline,
+    )
     # Definite operational causes remain definite even if cleanup crossed a deadline.
     if response.get("status") == "setup_error":
         raise WandbSetupError(run_id, response["cause"])
@@ -290,14 +351,15 @@ def poll_wandb_summary(
         raise ImportError(
             "W&B SDK is unavailable in the supervised worker; install phasesweep[wandb]."
         )
-    if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
-        detail = response.get("cause")
-        raise WandbPollTimeout(run_id, timeout_seconds, RuntimeError(detail) if detail else None)
-    if (
-        result.return_code != 0
-        or result.failure_reason is not None
-        or response.get("status") != "summary"
-    ):
+    # The worker writes a summary response whole, and only before the
+    # deadline, so one that exists was captured in time even if the worker
+    # was stopped while exiting.
+    if response.get("status") != "summary":
+        if result.timed_out or response.get("status") == "timeout" or time.monotonic() >= deadline:
+            detail = response.get("cause")
+            raise WandbPollTimeout(
+                run_id, timeout_seconds, RuntimeError(detail) if detail else None
+            )
         diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
         raise RuntimeError(
             f"W&B evidence worker failed for attempt {run_id!r} (exit {result.return_code})."
@@ -309,6 +371,171 @@ def poll_wandb_summary(
             f"W&B evidence worker returned a malformed capture for attempt {run_id!r}."
         )
     return capture
+
+
+def locate_wandb_position(
+    *,
+    base_url: str,
+    entity: str,
+    project: str,
+    run_id: str,
+    trial_dir: Path,
+    poll_seconds: float,
+    timeout_seconds: float,
+    metric_key: str,
+    axis: str,
+    value: float,
+    environment: Mapping[str, str] | None = None,
+    deadline: float | None = None,
+) -> int | float | None:
+    """Locate where on ``axis`` an accepted objective was logged in run history.
+
+    Callers run this only once the trial's result is accepted: the position
+    is advisory, so reading it must never cost the trial its objective or
+    the budget its acceptance needs. Every failure, and a worker stopped at
+    the deadline, means "no position".
+
+    :param str base_url: Normalized W&B API endpoint.
+    :param str entity: W&B entity that owns the project.
+    :param str project: W&B project containing the run.
+    :param str run_id: Immutable attempt ID, also used by process recovery.
+    :param Path trial_dir: Existing attempt directory and durable process slot.
+    :param float poll_seconds: Summary poll interval, the delay between
+        history reads up to ``_HISTORY_RETRY_SECONDS``.
+    :param float timeout_seconds: Budget for the whole read.
+    :param str metric_key: Objective summary key.
+    :param str axis: History key marking where the metric was measured.
+    :param float value: Captured objective value.
+    :param Mapping[str, str] | None environment: Actual composed trainer environment.
+    :param float | None deadline: Absolute phase/run deadline, if any.
+    :return int | float | None: The position, or ``None`` when history never
+        settled, no row produced the value, or the read failed.
+    :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
+    """
+    deadline = min(
+        time.monotonic() + timeout_seconds, deadline if deadline is not None else math.inf
+    )
+    if time.monotonic() >= deadline:
+        return None
+    result, response, _ = _run_worker(
+        {
+            "task": "position",
+            "base_url": base_url,
+            "entity": entity,
+            "project": project,
+            "run_id": run_id,
+            "poll_seconds": poll_seconds,
+            "metric_key": metric_key,
+            "axis": axis,
+            "value": value,
+            "deadline": deadline,
+        },
+        statuses=frozenset({"position", "import_error"}),
+        run_id=run_id,
+        trial_dir=trial_dir,
+        environment=environment,
+        deadline=deadline,
+    )
+    if result.timed_out or response.get("status") != "position":
+        return None
+    return progress_position(response.get("value"))
+
+
+def _history_position(
+    run: Any,
+    summary: Mapping[str, Any],
+    *,
+    metric_key: str,
+    axis: str,
+    value: float,
+    deadline: float,
+) -> tuple[_HistoryRead, int | float | None]:
+    """Locate how far along ``axis`` a finished run's objective was measured.
+
+    A plain summary key holds its series' last logged value: the latest
+    history row with that value is where the objective was measured, and a
+    value assigned straight to the summary matches no row and has no position.
+    The server names an aggregate by its series and aggregation
+    (``eval/loss.min`` summarizes the ``eval/loss`` series), so a recognized
+    aggregation suffix absent from the history index is looked up as its
+    ``head`` series. Other summary-only keys have no position. An aggregate
+    is measured over the whole series, so its position is where the
+    series ends: how far the trial trained, not where its best value fell,
+    which differs between comparable trials by nature.
+
+    The run's history index says how far history reaches and how many rows
+    logged each key, but for a while after a run finishes a read can return
+    part of a series without error: only its newest rows, or a sample. History
+    is ``lagging`` until the index reaches the summary's own ``_step`` and a
+    read returns every row the index counts for the series. The position is
+    advisory evidence, so a failed history read never fails anything: a
+    transient transport failure or a read still running at ``deadline`` is
+    worth a ``retry``, and any other failure is ``settled`` as "no position".
+    A ``define_metric`` step metric the trainer logs in a separate ``log()``
+    call is filled from its previous value, and an axis missing from some of
+    the series' rows keeps the read short of the count, so the axis must be
+    logged with the metric.
+
+    :param Any run: Finished public-API run.
+    :param Mapping[str, Any] summary: Its decoded summary.
+    :param str metric_key: Configured objective summary key.
+    :param str axis: History key marking where the metric was measured.
+    :param float value: Captured objective value.
+    :param float deadline: ``time.monotonic()`` time at which a read gives up.
+    :return tuple[_HistoryRead, int | float | None]: How the read ended, and
+        the position once ``settled`` (``None`` when no row produced a plain
+        key's value).
+    """
+    from phasesweep.evidence.evaluation import json_float
+
+    last_step = progress_position(summary.get("_step"))
+    if last_step is None:
+        return "settled", None
+    head, dot, aggregation = metric_key.rpartition(".")
+    position: int | float | None = None
+    try:
+        run.load(force=True)
+        index = run.history_keys
+        if index["lastStep"] < last_step:
+            return "lagging", None
+        logged_keys = index["keys"]
+        if metric_key in logged_keys:
+            series = metric_key
+        elif dot and aggregation in {"min", "max", "mean", "last", "first"} and head in logged_keys:
+            series = head
+        else:
+            return "settled", None
+        count = sum(entry["count"] for entry in logged_keys[series]["typeCounts"])
+        # A series under the cap, such as any evaluation series, comes back from
+        # one sampled request however long the run; a longer one is scanned in
+        # pages of the cap's size in steps, too few rows for the server to
+        # sample even before export.
+        keys = [series, axis]
+        if count < _HISTORY_SAMPLES:
+            rows = run.history(keys=keys, samples=_HISTORY_SAMPLES, pandas=False)
+        else:
+            rows = run.scan_history(keys=keys, page_size=_HISTORY_SAMPLES, use_cache=False)
+        read = 0
+        for row in rows:
+            if time.monotonic() >= deadline:
+                return "retry", None
+            if series not in row:
+                continue
+            read += 1
+            if series != metric_key:
+                position = progress_position(row.get(axis))
+                continue
+            try:
+                logged = json_float(row[series], label=series)
+            except ValueError:
+                continue
+            if logged == value:
+                position = progress_position(row.get(axis))
+        if read < count:
+            return "lagging", None
+    except Exception as exc:
+        return ("retry" if _is_retryable_setup_error(exc) else "settled"), None
+    return "settled", position
 
 
 def _poll_wandb_summary(
@@ -387,7 +614,7 @@ def _poll_wandb_summary(
                             if not math.isfinite(value):
                                 raise ValueError(f"W&B metric {key!r} is non-finite.")
                             values[key] = value
-                        capture = {
+                        capture: dict[str, Any] = {
                             "values": values,
                             "present_keys": sorted(key for key in presence_keys if key in summary),
                             "retrieved_at": utc_now_iso(timespec="microseconds"),
@@ -397,6 +624,71 @@ def _poll_wandb_summary(
                         return capture
         time.sleep(min(poll_seconds, max(0.0, deadline - time.monotonic())))
     raise WandbPollTimeout(run_id, timeout_seconds, last_error)
+
+
+def _locate_wandb_position(
+    *,
+    base_url: str,
+    entity: str,
+    project: str,
+    run_id: str,
+    poll_seconds: float,
+    metric_key: str,
+    axis: str,
+    value: float,
+    deadline: float,
+) -> int | float | None:
+    """Read where a finished run's objective was logged, within the parent's deadline.
+
+    History gets at most ``_HISTORY_SETTLE_SECONDS`` to reach the summary's
+    last step; reading it, and retrying a transient failure, may use the rest
+    of the deadline. Any other failure means "no position".
+
+    :param str base_url: Normalized W&B API endpoint.
+    :param str entity: W&B entity that owns the project.
+    :param str project: W&B project containing the run.
+    :param str run_id: Exact W&B run ID to read.
+    :param float poll_seconds: Summary poll interval, the delay between
+        history reads up to ``_HISTORY_RETRY_SECONDS``.
+    :param str metric_key: Objective summary key.
+    :param str axis: History key marking where the metric was measured.
+    :param float value: Captured objective value.
+    :param float deadline: Absolute ``time.monotonic()`` deadline from the parent.
+    :return int | float | None: The position, or ``None`` when history never
+        settled, no row produced the value, or the read failed.
+    """
+    from wandb.apis.public import Api
+
+    settle_by = min(deadline, time.monotonic() + _HISTORY_SETTLE_SECONDS)
+    interval = min(poll_seconds, _HISTORY_RETRY_SECONDS)
+    run: Any = None
+    while True:
+        read: _HistoryRead = "retry"
+        try:
+            if run is None:
+                api = Api(
+                    overrides={"base_url": base_url},
+                    timeout=max(1, math.ceil(deadline - time.monotonic())),
+                )
+                run = api.run(f"{entity}/{project}/{run_id}")
+        except Exception as exc:
+            if not _is_retryable_setup_error(exc):
+                return None
+        else:
+            read, position = _history_position(
+                run,
+                run.summary_metrics,
+                metric_key=metric_key,
+                axis=axis,
+                value=value,
+                deadline=deadline,
+            )
+            if read == "settled":
+                return position
+        retry_by = settle_by if read == "lagging" else deadline
+        if time.monotonic() + interval >= retry_by:
+            return None
+        time.sleep(interval)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -415,9 +707,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("response", type=Path, help="Private polling response")
     args = parser.parse_args(argv)
     request = json.loads(args.request.read_text(encoding="utf-8"))
+    task = request.pop("task")
+
     response: dict[str, Any]
     try:
-        response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
+        if task == "position":
+            response = {"status": "position", "value": _locate_wandb_position(**request)}
+        else:
+            response = {"status": "summary", "capture": _poll_wandb_summary(**request)}
     except ImportError:
         response = {"status": "import_error"}
     except WandbSetupError as exc:

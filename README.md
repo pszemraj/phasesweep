@@ -92,7 +92,8 @@ params:
 effective_overrides:
   model.n_layers: 8
   optimizer.lr: 0.0003
-# ... completion state, fingerprints, and objective provenance follow
+# ... completion state, fingerprints, objective provenance, and confound
+# verdicts on the ranked population follow
 ```
 
 The starter uses `storage: auto`, so its ledger and outputs live together under

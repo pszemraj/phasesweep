@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from click.testing import CliRunner
 
 from phasesweep import report_objective
 from phasesweep.cli import cli as cli_main
-from phasesweep.evidence import run_extractor
+from phasesweep.evidence import ExtractorError, run_extractor
 from phasesweep.evidence.models import JsonEnvelopeExtractor
 from tests.conftest import make_trial_context
 
@@ -90,7 +91,99 @@ def test_report_objective_creates_nested_parent_and_replaces_extractable_envelop
     assert run_extractor(context, extractor) == pytest.approx(0.125)
 
 
-@pytest.mark.parametrize("value", [True, float("nan"), float("inf"), "0.5"])
+def test_report_objective_progress_is_what_a_declared_evaluation_axis_reads(
+    reporting_environment: Path,
+    tmp_path: Path,
+) -> None:
+    """A fixed-token sweep compares tokens; the default axis stays the step."""
+    report_objective(
+        0.5,
+        name="loss",
+        split="validation",
+        policy="final_checkpoint",
+        checkpoint="checkpoint-40",
+        step=40,
+        progress={"tokens": 2_000_000},
+    )
+    assert json.loads(reporting_environment.read_text())["evaluation"]["progress"] == {
+        "tokens": 2_000_000
+    }
+
+    def recorded_position(axis: str) -> object:
+        extractor = JsonEnvelopeExtractor(
+            type="json_envelope",
+            path="reports/objective.json",
+            objective_name="loss",
+            split="validation",
+            policy="final_checkpoint",
+            evaluation_axis=axis,
+        )
+        provenance: dict = {}
+        run_extractor(make_trial_context(tmp_path), extractor, provenance=provenance)
+        return provenance["source"]["evaluation"]["progress"]
+
+    assert recorded_position("tokens") == {"axis": "tokens", "value": 2_000_000}
+    assert recorded_position("step") == {"axis": "step", "value": 40}
+    with pytest.raises(ExtractorError, match="no finite non-negative 'samples' position"):
+        recorded_position("samples")
+
+
+def test_report_objective_writes_numpy_scalars_as_json_numbers(
+    reporting_environment: Path,
+) -> None:
+    """Values computed with NumPy in a training loop report like Python numbers."""
+    np = pytest.importorskip("numpy")
+    report_objective(
+        np.float32(0.5),
+        name="loss",
+        split="validation",
+        policy="final_checkpoint",
+        checkpoint="checkpoint-40",
+        step=np.int64(40),
+        progress={"tokens": np.int64(40) * 4096, "epochs": np.float32(1.5)},
+    )
+    payload = json.loads(reporting_environment.read_text())
+    assert payload["objective"]["value"] == 0.5
+    step = payload["evaluation"]["step"]
+    progress = payload["evaluation"]["progress"]
+    assert (step, type(step)) == (40, int)
+    assert progress == {"tokens": 163_840, "epochs": 1.5}
+    assert type(progress["tokens"]) is int
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        {"step": 1},
+        {"": 1},
+        {0: 1},
+        {"tokens": True},
+        {"tokens": -1},
+        {"tokens": float("nan")},
+        {"tokens": 10**400},
+        {"tokens": "5"},
+    ],
+)
+def test_report_objective_rejects_invalid_progress(
+    reporting_environment: Path, progress: dict
+) -> None:
+    with pytest.raises(ValueError, match="progress"):
+        report_objective(
+            0.5,
+            name="loss",
+            split="validation",
+            policy="final_checkpoint",
+            checkpoint="final.pt",
+            step=1,
+            progress=progress,
+        )
+
+    assert not reporting_environment.exists()
+
+
+@pytest.mark.parametrize(
+    "value", [True, float("nan"), float("inf"), 10**400, "0.5", Decimal("0.5")]
+)
 def test_report_objective_rejects_non_json_or_nonfinite_values(
     reporting_environment: Path,
     value: object,
@@ -137,25 +230,27 @@ def test_report_objective_requires_injected_destination(monkeypatch: pytest.Monk
         )
 
 
+_CLI_OBJECTIVE = [
+    "report-objective",
+    "0.25",
+    "--name",
+    "accuracy",
+    "--split",
+    "validation",
+    "--policy",
+    "final_checkpoint",
+    "--checkpoint",
+    "final.pt",
+    "--step",
+    "80",
+]
+
+
 def test_report_objective_cli_uses_the_same_envelope_writer(
     reporting_environment: Path,
 ) -> None:
     result = CliRunner().invoke(
-        cli_main,
-        [
-            "report-objective",
-            "0.25",
-            "--name",
-            "accuracy",
-            "--split",
-            "validation",
-            "--policy",
-            "final_checkpoint",
-            "--checkpoint",
-            "final.pt",
-            "--step",
-            "80",
-        ],
+        cli_main, [*_CLI_OBJECTIVE, "--progress", "tokens=2048000", "--progress", "epochs=1.5"]
     )
 
     assert result.exit_code == 0, result.output
@@ -170,4 +265,24 @@ def test_report_objective_cli_uses_the_same_envelope_writer(
         "checkpoint": "final.pt",
         "policy": "final_checkpoint",
         "step": 80,
+        "progress": {"tokens": 2_048_000, "epochs": 1.5},
     }
+    assert type(payload["evaluation"]["progress"]["tokens"]) is int
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [["tokens"], ["tokens=many"], ["tokens=1", "tokens=2"], ["step=1"], ["tokens=-1"]],
+    ids=["no-value", "not-a-number", "repeated", "step", "negative"],
+)
+def test_report_objective_cli_rejects_invalid_progress(
+    reporting_environment: Path, progress: list[str]
+) -> None:
+    arguments = [*_CLI_OBJECTIVE]
+    for item in progress:
+        arguments += ["--progress", item]
+    result = CliRunner().invoke(cli_main, arguments)
+
+    assert result.exit_code == 2, result.output
+    assert "'--progress'" in result.output
+    assert not reporting_environment.exists()

@@ -33,15 +33,16 @@ from phasesweep.evidence.wandb import (
     WandbPollTimeout,
     WandbRunTerminalError,
     WandbSetupError,
+    locate_wandb_position,
     poll_wandb_summary,
 )
 from phasesweep.runtime.files import file_sha256
-from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.json import progress_position, strict_json_loads
 from phasesweep.runtime.time import utc_now_iso
 
 # Version of the objective evidence provenance payload frozen alongside a
 # metric at extraction time (review v0.5.17 / finding F).
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 1
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 2
 # Bump when log-regex selection semantics change. The revision is frozen into
 # each trial's extractor contract, so selection and replay reject readings
 # made under an older interpretation even when the package version is absent.
@@ -295,6 +296,18 @@ def _extract_json_envelope(
         raise ExtractorError(f"JSON envelope at {target} has no non-negative evaluation step.")
     if cfg.expected_step is not None and step != cfg.expected_step:
         raise ExtractorError(f"JSON envelope at {target} does not report step {cfg.expected_step}.")
+    if cfg.evaluation_axis == "step":
+        position: int | float | None = step
+    else:
+        reported = evaluation.get("progress")
+        position = progress_position(
+            reported.get(cfg.evaluation_axis) if isinstance(reported, dict) else None
+        )
+        if position is None:
+            raise ExtractorError(
+                f"JSON envelope at {target} reports no finite non-negative "
+                f"{cfg.evaluation_axis!r} position in evaluation.progress."
+            )
 
     try:
         value = json_float(objective.get("value"), label="objective.value")
@@ -308,13 +321,15 @@ def _extract_json_envelope(
             "path": cfg.path,
             **_file_digest(raw),
             # Evaluation metadata as validated from the envelope body — the
-            # checkpoint and step are the envelope's own reported values.
+            # checkpoint, step, and progress position are the envelope's own
+            # reported values; progress is what evaluation_point compares.
             "evaluation": {
                 "objective_name": cfg.objective_name,
                 "split": cfg.split,
                 "policy": cfg.policy,
                 "checkpoint": checkpoint,
                 "step": step,
+                "progress": {"axis": cfg.evaluation_axis, "value": position},
             },
         }
     return value
@@ -503,9 +518,6 @@ def _capture_wandb(
         raise
     except RuntimeError as exc:
         raise ExtractorError(f"W&B evidence worker failed for {target}.") from exc
-    if time.monotonic() >= poll_deadline:
-        error = DeadlineExceededError if capped else ExtractorError
-        raise error(f"W&B evidence arrived after its deadline for {target}.")
     ctx.wandb_capture.update(
         {
             "kind": "wandb",
@@ -535,8 +547,10 @@ def _extract_wandb(
         ctx: Trial context whose shared W&B capture supplies the value.
         cfg: ``WandbExtractor`` config naming the remote target and the exact
             summary key.
-        provenance: Optional sink that receives the evidence ``source`` and
-            the shared ``remote_capture`` on success.
+        provenance: Optional sink that receives the evidence ``source`` and the
+            shared ``remote_capture`` on success. Only the objective passes
+            one. Its position on ``evaluation_axis`` stays ``None`` until
+            :func:`locate_objective_position` reads it.
         deadline: Optional absolute ``time.monotonic()`` phase/run deadline
             for obtaining the capture.
 
@@ -556,9 +570,57 @@ def _extract_wandb(
     if not math.isfinite(value):
         raise ExtractorError(f"W&B key {cfg.metric_key!r} is non-finite.")
     if provenance is not None:
-        provenance["source"] = {"kind": "wandb", "metric_key": cfg.metric_key}
+        provenance["source"] = {
+            "kind": "wandb",
+            "metric_key": cfg.metric_key,
+            "evaluation": {"progress": {"axis": cfg.evaluation_axis, "value": None}},
+        }
         provenance["remote_capture"] = dict(capture)
     return value
+
+
+def locate_objective_position(
+    ctx: TrialContext,
+    cfg: Extractor,
+    provenance: dict[str, Any],
+    *,
+    deadline: float | None = None,
+) -> None:
+    """Record where an accepted W&B objective was logged on its evaluation axis.
+
+    Call only once the trial's result is accepted. The position is advisory,
+    so it gets whatever budget acceptance left: a read that fails or runs out
+    of time leaves the position ``None``, and the trial keeps its objective.
+    Other extractors record their position during extraction.
+
+    Args:
+        ctx: Trial context of the accepted attempt.
+        cfg: The objective's extractor config.
+        provenance: The objective provenance :func:`run_extractor` recorded,
+            updated in place.
+        deadline: Optional absolute ``time.monotonic()`` phase/run deadline.
+
+    Raises:
+        UnsafeProcessCleanupError: Worker cleanup is uncertain.
+
+    """
+    if not isinstance(cfg, WandbExtractor):
+        return
+    progress = provenance["source"]["evaluation"]["progress"]
+    progress["value"] = locate_wandb_position(
+        base_url=cfg.base_url,
+        entity=cfg.entity,
+        project=cfg.project,
+        run_id=ctx.attempt_id,
+        trial_dir=ctx.trial_dir,
+        poll_seconds=cfg.poll_seconds,
+        timeout_seconds=cfg.timeout_seconds,
+        metric_key=cfg.metric_key,
+        axis=cfg.evaluation_axis,
+        value=provenance["remote_capture"]["values"][cfg.metric_key],
+        environment=ctx.wandb_environment,
+        deadline=deadline,
+    )
 
 
 _DISPATCH: dict[type, Callable[..., float]] = {

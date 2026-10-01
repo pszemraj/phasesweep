@@ -30,13 +30,15 @@ def _wandb_poll(**kwargs):
     from phasesweep.evidence.wandb import _poll_wandb_summary
 
     return _poll_wandb_summary(
-        base_url="https://example.test",
-        entity="entity",
-        project="project",
-        run_id="attempt",
-        poll_seconds=0.001,
-        timeout_seconds=1,
-        **kwargs,
+        **{
+            "base_url": "https://example.test",
+            "entity": "entity",
+            "project": "project",
+            "run_id": "attempt",
+            "poll_seconds": 0.001,
+            "timeout_seconds": 1,
+            **kwargs,
+        }
     )
 
 
@@ -164,6 +166,265 @@ def test_wandb_invalid_scalar_is_not_retryable(monkeypatch, value):
         _wandb_poll(required_keys=["loss"])
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("WandbPollTimeout", ("attempt", 1.0)),
+        ("WandbRunTerminalError", ("attempt", "crashed")),
+        ("WandbSetupError", ("attempt", "denied")),
+    ],
+)
+def test_wandb_errors_unwind_through_context_managers(name, arguments):
+    import contextlib
+
+    from phasesweep.evidence import wandb as wandb_evidence
+
+    @contextlib.contextmanager
+    def span():
+        yield
+
+    error = getattr(wandb_evidence, name)(*arguments)
+    with pytest.raises(type(error)) as caught, span():
+        raise error
+    assert caught.value is error
+
+
+class _HistoryRun:
+    """A finished run whose history, and the index describing it, a test controls.
+
+    ``indexed_steps`` are the index's last steps on successive loads before it
+    reaches the last row; ``visible`` slices the rows successive reads return
+    before all of them are visible, as reads just after a run finishes do.
+    """
+
+    def __init__(self, summary, rows, indexed_steps=(), visible=()):
+        self.state = "finished"
+        self.summary_metrics = summary
+        self.rows = rows
+        self.indexed_steps = iter(indexed_steps)
+        self.visible = iter(visible)
+        self.history_keys = None
+        self.reads = []
+
+    def load(self, force=False):
+        assert force is True
+        counts: dict[str, int] = {}
+        for row in self.rows:
+            for key in row.keys() - {"_step"}:
+                counts[key] = counts.get(key, 0) + 1
+        last_step = max((row["_step"] for row in self.rows), default=-1)
+        self.history_keys = {
+            "lastStep": next(self.indexed_steps, last_step),
+            "keys": {
+                key: {"typeCounts": [{"type": "number", "count": count}]}
+                for key, count in counts.items()
+            },
+        }
+
+    def _logged(self, keys):
+        # Like the server, only rows that logged every requested key.
+        rows = [row for row in self.rows if all(key in row for key in keys)]
+        return rows[next(self.visible, slice(None))]
+
+    def history(self, keys, samples=500, pandas=True):
+        assert pandas is False
+        self.reads.append(("history", keys))
+        rows = self._logged(keys)
+        # The server returns a series of at least ``samples`` rows as a sample.
+        return rows if len(rows) < samples else rows[::2][:samples]
+
+    def scan_history(self, keys, page_size=1000, use_cache=True):
+        assert use_cache is False
+        self.reads.append(("scan", keys))
+        self.page_size = page_size
+        return self._logged(keys)
+
+
+def _history_position(
+    monkeypatch, run, metric_key="eval/loss", axis="_step", poll_seconds=0.001, timeout_seconds=1
+):
+    from phasesweep.evidence.wandb import _locate_wandb_position
+
+    public = pytest.importorskip("wandb.apis.public")
+    monkeypatch.setattr(public, "Api", lambda **_: SimpleNamespace(run=lambda path: run))
+    return _locate_wandb_position(
+        base_url="https://example.test",
+        entity="entity",
+        project="project",
+        run_id="attempt",
+        poll_seconds=poll_seconds,
+        metric_key=metric_key,
+        axis=axis,
+        value=run.summary_metrics[metric_key],
+        deadline=time.monotonic() + timeout_seconds,
+    )
+
+
+_EVAL_ROWS = [
+    {"_step": 0, "train/loss": 2.0},
+    {"_step": 1, "eval/loss": 0.4, "eval/step": 100},
+    {"_step": 2, "train/loss": 1.0},
+    {"_step": 3, "eval/loss": 0.2, "eval/step": 200},
+    {"_step": 4, "eval/loss": 0.3, "eval/step": 300},
+    {"_step": 5, "eval/loss": 0.2, "eval/step": 400},
+]
+
+
+@pytest.mark.parametrize(
+    ("summary", "metric_key", "axis", "expected"),
+    [
+        ({"eval/loss": 0.2, "_step": 5}, "eval/loss", "_step", 5),
+        ({"eval/loss": 0.2, "_step": 5}, "eval/loss", "eval/step", 400),
+        # The server returns define_metric aggregates as flat series.aggregation
+        # keys. An aggregate covers its whole series, so it is positioned where
+        # the series ends, not where its best value fell (eval/step 100 here).
+        ({"eval/loss.max": 0.4, "_step": 5}, "eval/loss.max", "eval/step", 400),
+        ({"eval/loss.min": 0.2, "_step": 5}, "eval/loss.min", "eval/step", 400),
+        ({"eval/loss.mean": 0.275, "_step": 5}, "eval/loss.mean", "eval/step", 400),
+        ({"eval/loss.last": 0.2, "_step": 5}, "eval/loss.last", "eval/step", 400),
+        ({"eval/loss.first": 0.4, "_step": 5}, "eval/loss.first", "eval/step", 400),
+        ({"eval/loss": 0.1, "_step": 5}, "eval/loss", "eval/step", None),
+        ({"eval/loss": 0.2}, "eval/loss", "eval/step", None),
+    ],
+    ids=[
+        "last-on-_step",
+        "last-on-eval-step",
+        "max",
+        "min",
+        "mean",
+        "last",
+        "first",
+        "assigned",
+        "no-history",
+    ],
+)
+def test_wandb_locates_where_the_objective_summary_was_logged(
+    monkeypatch, summary, metric_key, axis, expected
+):
+    run = _HistoryRun(summary, _EVAL_ROWS)
+    assert _history_position(monkeypatch, run, metric_key, axis) == expected
+    assert {kind for kind, _ in run.reads} <= {"history"}
+
+
+def test_wandb_series_at_the_sample_cap_is_scanned_in_pages_never_sampled(monkeypatch):
+    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 2)
+    run = _HistoryRun({"eval/loss.min": 0.2, "_step": 5}, _EVAL_ROWS)
+    assert _history_position(monkeypatch, run, "eval/loss.min", "eval/step") == 400
+    assert [kind for kind, _ in run.reads] == ["scan"]
+    # A page of as many steps as the cap holds at most that many rows.
+    assert run.page_size == 2
+
+
+@pytest.mark.parametrize(
+    ("visible", "metric_key", "expected"),
+    [
+        # Just after a run finishes, reads can return only the newest rows ...
+        pytest.param(slice(-2, None), "eval/loss", 400, id="newest-only"),
+        # ... or miss the newest ones, which would end the series early.
+        pytest.param(slice(0, 2), "eval/loss.min", 400, id="oldest-only"),
+    ],
+)
+def test_wandb_read_short_of_the_indexed_row_count_is_retried(
+    monkeypatch, visible, metric_key, expected
+):
+    run = _HistoryRun({metric_key: 0.2, "_step": 5}, _EVAL_ROWS, visible=[visible])
+    assert _history_position(monkeypatch, run, metric_key, "eval/step") == expected
+    assert [kind for kind, _ in run.reads] == ["history", "history"]
+
+
+def test_wandb_slow_summary_polling_still_retries_history(monkeypatch):
+    """A summary poll interval past the settle window must not leave one history read."""
+    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_RETRY_SECONDS", 0.001)
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, visible=[slice(-2, None)])
+    position = _history_position(
+        monkeypatch, run, "eval/loss", "eval/step", poll_seconds=60, timeout_seconds=60
+    )
+    assert position == 400
+    assert len(run.reads) == 2
+
+
+@pytest.mark.parametrize(
+    ("metric_key", "value"),
+    [("best/loss", 0.1), ("eval/loss.selected", 0.123456), ("eval/loss.selected", 0.4)],
+    ids=["absent-series", "custom-suffix-unlogged-value", "custom-suffix-matching-value"],
+)
+def test_wandb_summary_key_absent_from_history_settles_without_a_read(
+    monkeypatch, metric_key, value
+):
+    run = _HistoryRun({metric_key: value, "_step": 5}, _EVAL_ROWS)
+    assert _history_position(monkeypatch, run, metric_key, "eval/step") is None
+    assert run.reads == []
+
+
+def test_wandb_dotted_history_series_is_read_before_its_head(monkeypatch):
+    rows = [
+        {"_step": 0, "eval/loss": 0.2, "eval/loss.ema": 0.3, "eval/step": 10},
+        {"_step": 1, "eval/loss": 0.3, "eval/loss.ema": 0.2, "eval/step": 20},
+    ]
+    run = _HistoryRun({"eval/loss.ema": 0.2, "_step": 1}, rows)
+    assert _history_position(monkeypatch, run, "eval/loss.ema", "eval/step") == 20
+    assert run.reads == [("history", ["eval/loss.ema", "eval/step"])]
+
+
+def test_wandb_waits_for_history_to_reach_the_summary_step(monkeypatch):
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3, 4])
+    assert _history_position(monkeypatch, run, axis="eval/step") == 400
+    assert len(run.reads) == 1
+
+
+def test_wandb_history_that_never_settles_stops_at_the_settle_window(monkeypatch):
+    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SETTLE_SECONDS", 0.05)
+    run = _HistoryRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS, indexed_steps=[3] * 10**6)
+    start = time.monotonic()
+    assert _history_position(monkeypatch, run, timeout_seconds=60) is None
+    assert time.monotonic() - start < 30
+    assert run.reads == []
+
+
+def test_wandb_transient_history_failure_retries_past_the_settle_window(monkeypatch):
+    """Only waiting for history to catch up is bounded by the settle window."""
+    clock = [0.0]
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        "phasesweep.evidence.wandb.time.sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+    )
+
+    class FlakyRun(_HistoryRun):
+        failures = 1
+
+        def history(self, keys, samples=500, pandas=True):
+            if self.failures:
+                self.failures -= 1
+                clock[0] += 40.0  # a long read, then a dropped connection
+                raise ConnectionError("connection reset by peer")
+            return super().history(keys, samples, pandas)
+
+    run = FlakyRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS)
+    assert _history_position(monkeypatch, run, axis="eval/step", timeout_seconds=120) == 400
+
+
+@pytest.mark.parametrize(("timeout", "expected"), [(120, 400), (70, None)])
+def test_wandb_history_read_may_outlast_the_settle_window_but_not_the_deadline(
+    monkeypatch, timeout, expected
+):
+    """A history read may outlast the settle window, bounded by the deadline."""
+    clock = [0.0]
+    monkeypatch.setattr("phasesweep.evidence.wandb.time.monotonic", lambda: clock[0])
+    monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 1)
+
+    class SlowScanRun(_HistoryRun):
+        def scan_history(self, keys, page_size=1000, use_cache=True):
+            # Four evaluation rows, 20 s apart: the scan ends 80 s in.
+            for row in super().scan_history(keys, page_size, use_cache):
+                clock[0] += 20.0
+                yield row
+
+    run = SlowScanRun({"eval/loss": 0.2, "_step": 5}, _EVAL_ROWS)
+    position = _history_position(monkeypatch, run, axis="eval/step", timeout_seconds=timeout)
+    assert position == expected
+
+
 def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
     from phasesweep.evidence.models import WandbQuery
 
@@ -187,13 +448,16 @@ def test_wandb_consumers_share_one_capture(tmp_path, monkeypatch):
         }
 
     monkeypatch.setattr("phasesweep.evidence.evaluation.poll_wandb_summary", capture)
+    # Constraints and gates may trigger the shared capture first.
+    assert run_extractor(ctx, constraint) == 4
     provenance = {}
     assert run_extractor(ctx, objective, provenance=provenance) == 0.2
-    assert run_extractor(ctx, constraint) == 4
     assert all(result.passed for result in evaluate_gates(ctx, [gate]))
     assert len(calls) == 1
     assert calls[0]["required_keys"] == ("eval/loss", "memory")
     assert provenance["remote_capture"]["run_id"] == ctx.attempt_id
+    # The position is read only once the trial is accepted.
+    assert provenance["source"]["evaluation"] == {"progress": {"axis": "_step", "value": None}}
 
 
 def test_wandb_gate_only_missing_key_fails_first_finished_capture(tmp_path, monkeypatch):
@@ -247,36 +511,51 @@ def test_wandb_late_sdk_success_is_rejected(monkeypatch, stage):
 
 
 def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_path, monkeypatch):
-    from phasesweep.evidence.wandb import poll_wandb_summary
+    from phasesweep.evidence.wandb import locate_wandb_position, poll_wandb_summary
     from phasesweep.runtime.process import read_attempt_lifecycle
 
     monkeypatch.setenv("WANDB_API_KEY", "excluded-parent-secret")
     wandb_worker_sdk("""
         import os
+        class Run:
+            state = "finished"
+            summary_metrics = {"loss": 0.25, "_step": 7, "done": object(), "unrelated": object()}
+            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 1}]}}}
+            def load(self, force=False):
+                pass
+            def history(self, keys, samples=500, pandas=True):
+                return [{"loss": 0.25, "_step": 7}]
         class Api:
             def __init__(self, **kwargs):
                 assert "WANDB_API_KEY" not in os.environ
                 assert os.environ["HTTPS_PROXY"] == "https://transport.test"
                 assert "PYTHONHOME" not in os.environ
+                assert kwargs["overrides"] == {"base_url": "https://example.test"}
             def run(self, path):
                 assert path == "entity/project/attempt"
-                return type("Run", (), {"state": "finished", "summary_metrics":
-                    {"loss": 0.25, "done": object(), "unrelated": object()}})()
+                return Run()
     """)
+    target = {
+        "base_url": "https://example.test",
+        "entity": "entity",
+        "project": "project",
+        "run_id": "attempt",
+        "trial_dir": tmp_path,
+        "poll_seconds": 0.01,
+        "timeout_seconds": 5,
+        "environment": {"HTTPS_PROXY": "https://transport.test", "PYTHONHOME": "/trainer/python"},
+    }
     capture = poll_wandb_summary(
-        base_url="https://example.test",
-        entity="entity",
-        project="project",
-        run_id="attempt",
-        trial_dir=tmp_path,
-        poll_seconds=0.01,
-        timeout_seconds=5,
-        required_keys=["loss"],
-        presence_keys=["done", "missing"],
-        environment={"HTTPS_PROXY": "https://transport.test", "PYTHONHOME": "/trainer/python"},
+        **target, required_keys=["loss"], presence_keys=["done", "missing"]
     )
-    assert capture["values"] == {"loss": 0.25}
-    assert capture["present_keys"] == ["done"]
+    assert capture == {
+        "values": {"loss": 0.25},
+        "present_keys": ["done"],
+        "retrieved_at": capture["retrieved_at"],
+    }
+    assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
+    # The advisory position is a separate request in the same attempt slot.
+    assert locate_wandb_position(**target, metric_key="loss", axis="_step", value=0.25) == 7
     assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
 
 
@@ -302,9 +581,11 @@ def test_wandb_worker_crash_preserves_private_stderr(wandb_worker_sdk, tmp_path)
     assert "worker-diagnostic-marker" not in str(exc_info.value)
 
 
-def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch):
+@pytest.mark.parametrize("request_kind", ["summary", "position"])
+def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch, request_kind):
+    """Uncertain worker cleanup is never downgraded, even for the advisory position read."""
     from phasesweep.errors import UnsafeProcessCleanupError
-    from phasesweep.evidence.wandb import poll_wandb_summary
+    from phasesweep.evidence.wandb import locate_wandb_position, poll_wandb_summary
     from phasesweep.runtime import process
 
     with (tmp_path / "trainer.log").open("w") as output:
@@ -330,16 +611,20 @@ def test_wandb_launch_failure_cannot_use_trainer_identity(tmp_path, monkeypatch)
 
     monkeypatch.setattr(process, "_write_process_identity", fail_identity)
     monkeypatch.setattr(process, "_abort_launch", uncertain_abort)
+    target = {
+        "base_url": "https://example.test",
+        "entity": "e",
+        "project": "p",
+        "run_id": "attempt",
+        "trial_dir": tmp_path,
+        "poll_seconds": 0.01,
+        "timeout_seconds": 5,
+    }
     with pytest.raises(UnsafeProcessCleanupError, match="cleanup is uncertain"):
-        poll_wandb_summary(
-            base_url="https://example.test",
-            entity="e",
-            project="p",
-            run_id="attempt",
-            trial_dir=tmp_path,
-            poll_seconds=0.01,
-            timeout_seconds=5,
-        )
+        if request_kind == "summary":
+            poll_wandb_summary(**target)
+        else:
+            locate_wandb_position(**target, metric_key="loss", axis="_step", value=0.25)
     lifecycle = process.read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt")
     assert lifecycle.state == "launching"
     assert lifecycle.cleanup_confirmed is None
@@ -380,6 +665,48 @@ def test_wandb_supervision_bounds_blocked_sdk_and_descendants(wandb_worker_sdk, 
     assert time.monotonic() - start < 12
     pid = int(pid_file.read_text())
     assert not is_pid_alive(pid) or is_pid_zombie(pid)
+
+
+@pytest.mark.integration
+def test_wandb_position_worker_stopped_at_its_deadline_records_no_position(
+    wandb_worker_sdk, tmp_path
+):
+    from phasesweep.evidence.wandb import locate_wandb_position
+    from phasesweep.runtime.process import read_attempt_lifecycle
+
+    wandb_worker_sdk("""
+        import time
+        class Run:
+            state = "finished"
+            summary_metrics = {"loss": 0.25, "_step": 7}
+            history_keys = {"lastStep": 7, "keys": {"loss": {"typeCounts": [{"count": 1}]}}}
+            def load(self, force=False):
+                pass
+            def history(self, keys, samples=500, pandas=True):
+                time.sleep(60)
+                return []
+        class Api:
+            def __init__(self, **kwargs):
+                pass
+            def run(self, path):
+                return Run()
+    """)
+    start = time.monotonic()
+    position = locate_wandb_position(
+        base_url="https://example.test",
+        entity="e",
+        project="p",
+        run_id="attempt",
+        trial_dir=tmp_path,
+        poll_seconds=0.01,
+        timeout_seconds=2,
+        metric_key="loss",
+        axis="_step",
+        value=0.25,
+    )
+    assert time.monotonic() - start < 12
+    assert position is None
+    assert read_attempt_lifecycle(tmp_path, expected_attempt_id="attempt").cleanup_confirmed
 
 
 def _assert_log_regex_provenance(
@@ -774,7 +1101,7 @@ def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
 
     assert value == pytest.approx(0.42)
-    assert provenance["schema_version"] == 1
+    assert provenance["schema_version"] == 2
     assert provenance["extractor"]["kind"] == "json"
     assert provenance["extractor"]["config_sha256"] == extractor_config_fingerprint(cfg)
     assert provenance["source"] == {
@@ -836,13 +1163,14 @@ def test_provenance_envelope_freezes_validated_evaluation_metadata(tmp_path):
     source = provenance["source"]
     assert source["sha256"] == hashlib.sha256(raw).hexdigest()
     # The checkpoint and step are the envelope's own validated values even
-    # when the config did not pin them.
+    # when the config did not pin them; the default axis is that step.
     assert source["evaluation"] == {
         "objective_name": "val_loss",
         "split": "validation",
         "policy": "final_checkpoint",
         "checkpoint": "step_1000.pt",
         "step": 1000,
+        "progress": {"axis": "step", "value": 1000},
     }
 
 

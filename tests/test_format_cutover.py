@@ -117,7 +117,8 @@ def test_unsupported_artifact_binding_version_is_refused_before_mutation(
 
     with pytest.raises(
         ArtifactRootConflictError,
-        match=r"unsupported PhaseSweep format 2.*fresh artifact root",
+        match=rf"unsupported PhaseSweep format {ARTIFACT_ROOT_BINDING_SCHEMA_VERSION - 1}"
+        r".*fresh artifact root",
     ):
         run_experiment(experiment)
 

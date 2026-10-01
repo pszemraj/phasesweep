@@ -162,7 +162,13 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
                 with Path({str(calls_path)!r}).open("a") as stream:
                     stream.write(path + "\\n")
                 return type("Run", (), {{"state": "finished", "summary_metrics":
-                    {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted"}}}})()
+                    {{"eval/loss": 0.25, "memory": 3.0, "complete": True, "secret": "never persisted",
+                      "_step": 9}},
+                    "history_keys": {{"lastStep": 9,
+                        "keys": {{"eval/loss": {{"typeCounts": [{{"count": 1}}]}}}}}},
+                    "load": lambda self, force=False: None,
+                    "history": lambda self, keys, samples=500, pandas=True:
+                        [{{"eval/loss": 0.25, "_step": 9}}]}})()
     """)
     trainer = write_trainer(
         tmp_path,
@@ -243,7 +249,9 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     monkeypatch.setenv("WANDB_PROJECT", "ambient-old-project")
     winners = run_experiment(experiment)
     assert winners["next"].effective_overrides == {"x": 7}
-    assert len(calls_path.read_text().splitlines()) == 2
+    # One shared capture per trial, and one position read per accepted W&B objective.
+    remote_reads = 4 if consumers in {"primary", "combined"} else 2
+    assert len(calls_path.read_text().splitlines()) == remote_reads
 
     for phase in experiment.phases:
         winner = winners[phase.name]
@@ -251,6 +259,10 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         assert capture["run_id"] == winner.attempt_id
         assert capture["run_state"] == "finished"
         assert "secret" not in json.dumps(capture)
+        if consumers in {"primary", "combined"}:
+            assert winner.objective_provenance["source"]["evaluation"] == {
+                "progress": {"axis": "_step", "value": 9}
+            }
         trial_dir = next(_phase_dir(experiment, phase.name).glob("trial_*"))
         receipt = json.loads((trial_dir / "receipt.json").read_text())
         assert receipt["x"] == 7
@@ -266,6 +278,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
 
             for fields, replacement in [
                 (("source", "metric_key"), "wrong"),
+                (("source", "evaluation", "progress", "axis"), "tokens"),
                 (("remote_capture", "run_id"), "another-attempt"),
                 (("remote_capture", "project"), "another-project"),
                 (("remote_capture", "values", "eval/loss"), 9.0),
@@ -289,7 +302,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     with monkeypatch.context() as replay_env:
         replay_env.setenv("WANDB_MODE", "offline")
         assert run_experiment(experiment)["next"].attempt_id == winners["next"].attempt_id
-    assert len(calls_path.read_text().splitlines()) == 2
+    assert len(calls_path.read_text().splitlines()) == remote_reads
     if consumers == "primary":
         from phasesweep.engine.state import TRIAL_TARGET_ATTR
         from phasesweep.errors import PhaseSweepError

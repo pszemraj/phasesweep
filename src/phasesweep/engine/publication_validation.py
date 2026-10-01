@@ -17,6 +17,7 @@ import phasesweep.engine.paths as path_ops
 from phasesweep.config import Experiment, Metric
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.config.models import _metric_semantics_payload
+from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.paths import GENERATION_SUMMARY_FILENAME
 from phasesweep.engine.state import (
@@ -429,6 +430,12 @@ def _validate_generation_manifest(
             )
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
+            try:
+                _validate_confound_block(payload.get("confound"), winner_trial=source_trial)
+            except ValueError as exc:
+                raise _fail(
+                    f"winner for phase {name!r} has no valid confound block ({exc})"
+                ) from exc
             winners[name] = ValidatedWinner(content=content, payload=payload)
     phases_dir = generation_dir / "phases"
     if phases_dir.is_dir():
@@ -630,8 +637,9 @@ def _validate_winner_source_generation(
                 f"winner for phase {phase_name!r} disagrees with the winner recorded by its "
                 f"source generation {source_generation!r} on {field_name}"
             )
-    # Completion and phase fingerprint belong to the exposing phase; the
-    # fields below come from the cited source trial.
+    # Completion, phase fingerprint, and confound verdicts belong to the
+    # exposing selection -- a top-up re-selecting this trial ranks a larger
+    # population -- while the fields below come from the cited source trial.
     for field_name in (
         "metric",
         "params",

@@ -28,7 +28,11 @@ def _mse(weight: float, xs: list[float]) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Train with full-batch SGD for 20 steps, then log the held-out loss.
+    """Train with full-batch SGD for 20 steps, logging held-out loss every 5.
+
+    Eval metrics use their own ``eval/step`` x-axis and a ``min`` summary, so
+    the finished summary reports ``eval/loss.min`` and history records the step
+    each evaluation ran at.
 
     :param list[str] | None argv: Command-line arguments.
     :return int: Process exit code.
@@ -42,15 +46,17 @@ def main(argv: list[str] | None = None) -> int:
     args.receipt.write_text(json.dumps(parameters) + "\n", encoding="utf-8")
     mean_square = sum(x * x for x in TRAIN_X) / len(TRAIN_X)
     weight = 0.0
-    for _ in range(20):
-        gradient = 2.0 * (weight - 2.0) * mean_square + args.weight_decay * weight
-        weight -= args.learning_rate * gradient
     with wandb.init(
         config=parameters, dir=str(args.receipt.parent), settings=wandb.Settings(silent=True)
     ) as run:
-        loss = _mse(weight, EVAL_X)
-        run.log({"eval/loss": loss})
-        run.summary["eval/loss"] = loss
+        run.define_metric("eval/step", hidden=True)
+        run.define_metric("eval/*", step_metric="eval/step")
+        run.define_metric("eval/loss", summary="min")
+        for step in range(1, 21):
+            gradient = 2.0 * (weight - 2.0) * mean_square + args.weight_decay * weight
+            weight -= args.learning_rate * gradient
+            if step % 5 == 0:
+                run.log({"eval/loss": _mse(weight, EVAL_X), "eval/step": step})
     return 0
 
 

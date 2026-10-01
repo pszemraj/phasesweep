@@ -27,7 +27,7 @@ from phasesweep.mcp.tools import (
     _run_elapsed_seconds,
 )
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import mark_current_format, reaped_pid
+from tests.conftest import mark_current_format, reaped_pid, single_trial_confound
 from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
@@ -183,6 +183,7 @@ def test_terminal_run_reads_do_not_drift_with_shared_study_state(tmp_path: Path)
             generation_id="prior-generation",
             attempt_id="attempt-1",
         ),
+        confound=single_trial_confound(1),
     )
     write_run_status(
         store,

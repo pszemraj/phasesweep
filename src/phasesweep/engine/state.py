@@ -137,6 +137,10 @@ class Winner:
     # compact identity.
     trainer_env_digest: str | None = None
     trainer_inherit_env: str | list[str] | None = None
+    # Advisory verdicts on the population the source selection ranked, frozen
+    # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
+    # keeps them verbatim; no fingerprint reads them.
+    confound: dict[str, Any] | None = None
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
@@ -144,7 +148,7 @@ GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 4
+STUDY_SCHEMA_VERSION = 5
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The

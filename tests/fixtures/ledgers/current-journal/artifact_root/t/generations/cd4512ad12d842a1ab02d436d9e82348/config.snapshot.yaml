@@ -39,7 +39,7 @@ phases:
     seed: 0
     n_startup_trials: 10
     acknowledge_nonresumable: false
-  timeout_seconds_per_trial: 86400.0
+  timeout_seconds_per_trial: 259200.0
   allow_unbounded_trials: false
   timeout_seconds_per_phase: null
   allow_incomplete_on_timeout: false
