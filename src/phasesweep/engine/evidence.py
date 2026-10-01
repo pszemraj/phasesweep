@@ -32,7 +32,6 @@ from phasesweep.evidence.evaluation import (
     EVIDENCE_PROVENANCE_SCHEMA_VERSION,
     extractor_config_fingerprint,
     json_float,
-    progress_position,
 )
 from phasesweep.evidence.models import (
     EXTRACTOR_KINDS,
@@ -47,6 +46,7 @@ from phasesweep.runtime.commands import TRAINER_INPUT_FILENAMES
 from phasesweep.runtime.files import (
     file_sha256,
 )
+from phasesweep.runtime.json import progress_position
 from phasesweep.runtime.process import (
     read_attempt_lifecycle,
 )

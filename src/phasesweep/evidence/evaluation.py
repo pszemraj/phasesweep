@@ -37,7 +37,7 @@ from phasesweep.evidence.wandb import (
     poll_wandb_summary,
 )
 from phasesweep.runtime.files import file_sha256
-from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.json import progress_position, strict_json_loads
 from phasesweep.runtime.time import utc_now_iso
 
 # Version of the objective evidence provenance payload frozen alongside a
@@ -130,24 +130,6 @@ def json_float(value: Any, *, label: str) -> float:
         return float(value)
     except OverflowError as exc:
         raise ValueError(f"Value at {label!r} is outside the finite scalar range.") from exc
-
-
-def progress_position(value: Any) -> int | float | None:
-    """Return a valid training-progress position, or ``None``.
-
-    A position is where on an evaluation axis (step, tokens, a W&B step
-    metric) an objective was measured: a finite, non-negative JSON number.
-    Integers stay integers so step groups compare and render exactly.
-
-    :param Any value: Candidate position read from evidence.
-    :return int | float | None: ``value`` when valid, else ``None``.
-    """
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return None
-    try:
-        return value if math.isfinite(value) and value >= 0 else None
-    except OverflowError:
-        return None
 
 
 class ExtractorError(RuntimeError):

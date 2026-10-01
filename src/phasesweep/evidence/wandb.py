@@ -20,6 +20,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Literal
 
+from phasesweep.runtime.json import progress_position
+
 if TYPE_CHECKING:
     from phasesweep.runtime.process import ProcessResult
 
@@ -410,8 +412,6 @@ def locate_wandb_position(
         settled, no row produced the value, or the read failed.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
     """
-    from phasesweep.evidence.evaluation import progress_position
-
     deadline = min(
         time.monotonic() + timeout_seconds, deadline if deadline is not None else math.inf
     )
@@ -486,7 +486,7 @@ def _history_position(
         the position once ``settled`` (``None`` when no row produced a plain
         key's value).
     """
-    from phasesweep.evidence.evaluation import json_float, progress_position
+    from phasesweep.evidence.evaluation import json_float
 
     last_step = progress_position(summary.get("_step"))
     if last_step is None:

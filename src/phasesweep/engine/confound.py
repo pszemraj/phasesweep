@@ -19,11 +19,12 @@ objective provenance and passes the records in.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal, get_args
 
 import optuna
+
+from phasesweep.runtime.json import progress_position
 
 ConfoundVerdict = Literal["ok", "heterogeneous", "n/a"]
 """Outcome of one check. ``ok``: the check ran and found nothing.
@@ -359,26 +360,12 @@ def _validate_evaluation_detail(detail: object) -> dict[str, Any]:
         if not isinstance(group, Mapping) or set(group) != {"value", "trials"}:
             raise ValueError("confound evaluation_point value group is malformed")
         trials = _trial_numbers(group["trials"], label="evaluation_point trials")
-        if not _is_position(group["value"]) or not trials:
+        if progress_position(group["value"]) is None or not trials:
             raise ValueError("confound evaluation_point value group is malformed")
         if parsed and not parsed[-1]["value"] < group["value"]:
             raise ValueError("confound evaluation_point values are not ascending and distinct")
         parsed.append({"value": group["value"], "trials": trials})
     return {"axis": axis, "values": parsed}
-
-
-def _is_position(value: object) -> bool:
-    """Whether ``value`` is a finite, non-negative JSON number (not a bool).
-
-    :param object value: Parsed group value.
-    :return bool: Whether it is a valid evaluation-axis position.
-    """
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return False
-    try:
-        return math.isfinite(value) and value >= 0
-    except OverflowError:
-        return False
 
 
 def _validate_survivorship_detail(detail: object) -> dict[str, Any]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, NoReturn
 
 
@@ -45,3 +46,21 @@ def strict_json_loads(text: str) -> Any:
         object_pairs_hook=_unique_object,
         parse_constant=_reject_constant,
     )
+
+
+def progress_position(value: Any) -> int | float | None:
+    """Return a valid training-progress position, or ``None``.
+
+    A position is where on an evaluation axis (step, tokens, a W&B step
+    metric) an objective was measured: a finite, non-negative JSON number.
+    Integers stay integers so step groups compare and render exactly.
+
+    :param Any value: Candidate position read from evidence.
+    :return int | float | None: ``value`` when valid, else ``None``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        return value if math.isfinite(value) and value >= 0 else None
+    except OverflowError:
+        return None
