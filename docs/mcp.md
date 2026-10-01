@@ -158,10 +158,9 @@ Frozen result reads preserve the producing reader's assurance fields and need
 no W&B SDK, credentials, or remote access. W&B binds its source to the managed
 attempt ID; it does not assert the envelope's evaluation metadata or input
 content guarantees, and only records where in the run's history the
-objective's value was logged.
-The trainer owns evaluation and aggregation; the metric
-goal ranks the selected trial scalars. Log reduction defaults to `last` and is
-independent of the ranking goal.
+objective's value was logged. The trainer owns evaluation and aggregation; the
+metric goal ranks the selected trial scalars. Log reduction defaults to `last`
+and is independent of the ranking goal.
 
 ## Run state and recovery
 
