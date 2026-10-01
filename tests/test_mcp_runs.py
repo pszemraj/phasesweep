@@ -485,7 +485,10 @@ def test_run_store_marks_fresh_scaffolded_state(tmp_path: Path) -> None:
     [
         ("not json\n", "malformed or unsupported"),
         ('{"schema_version": 0}\n', "malformed or unsupported"),
-        ('{"schema_version": 1, "unexpected": true}\n', "malformed or unsupported"),
+        (
+            json.dumps({"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION, "unexpected": True}),
+            "malformed or unsupported",
+        ),
     ],
 )
 def test_run_store_rejects_invalid_format_marker_without_mutation(
@@ -621,7 +624,14 @@ def _under_unsearchable_dir(tmp_path: Path) -> Path:
         pytest.param(_marker_mode(0o000), "cannot be read", marks=requires_nonroot),
         (_marker_mode(0o644), "with mode 0600; found"),
         (_marker_text("not json\n"), "is malformed"),
-        (_marker_text('{"schema_version": 1, "unexpected": true}\n'), "is malformed"),
+        (
+            _marker_text(
+                json.dumps(
+                    {"schema_version": mcp_runs.MCP_STATE_FORMAT_VERSION, "unexpected": True}
+                )
+            ),
+            "is malformed",
+        ),
         # The CLI resolves a symlinked state_dir first; through the API the
         # marker is reached, so the link standing in for the directory is damage.
         (_symlink_to_state_dir, "is not a real directory"),

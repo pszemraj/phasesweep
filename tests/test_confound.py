@@ -38,6 +38,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
     Winner,
 )
+from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from tests.conftest import make_experiment, write_constant_trainer
 
 _COMPLETE = optuna.trial.TrialState.COMPLETE
@@ -58,7 +59,7 @@ def _envelope(
         {"axis": "step", "value": step} if tokens is None else {"axis": "tokens", "value": tokens}
     )
     return {
-        "schema_version": 1,
+        "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
         "extractor": {"kind": "json_envelope", "config_sha256": "0" * 64},
         "recorded_at": "2026-01-01T00:00:00+00:00",
         "source": {
@@ -101,7 +102,7 @@ def _wandb(value: float | None = 1000, axis: str = "eval/step") -> dict[str, Any
     """Return a current-format ``wandb`` objective provenance record."""
     located = {"axis": axis, "value": value}
     return {
-        "schema_version": 1,
+        "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
         "extractor": {"kind": "wandb", "config_sha256": "0" * 64},
         "recorded_at": "2026-01-01T00:00:00+00:00",
         "source": {"kind": "wandb", "metric_key": "eval/loss", "evaluation": {"progress": located}},
@@ -131,7 +132,7 @@ def test_wandb_provenance_may_lack_a_position_but_not_its_axis_record():
 def _log_regex() -> dict[str, Any]:
     """Return a current-format ``log_regex`` objective provenance record."""
     return {
-        "schema_version": 1,
+        "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
         "extractor": {"kind": "log_regex", "config_sha256": "0" * 64},
         "recorded_at": "2026-01-01T00:00:00+00:00",
         "source": {"kind": "file", "path": "stdout.log", "size_bytes": 0, "sha256": "0" * 64},

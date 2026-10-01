@@ -26,6 +26,7 @@ from phasesweep.engine.state import (
     TRAINER_INPUT_ATTR,
     constraint_attr,
 )
+from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
 from tests.conftest import make_experiment
 
 # Allocation writes both attrs on every trial before its trainer runs.
@@ -36,7 +37,7 @@ def _objective_provenance_json() -> str:
     """Return a structurally valid current-format local objective record."""
     return json.dumps(
         {
-            "schema_version": 1,
+            "schema_version": EVIDENCE_PROVENANCE_SCHEMA_VERSION,
             "extractor": {"kind": "log_regex", "config_sha256": "0" * 64},
             "recorded_at": "2026-01-01T00:00:00+00:00",
             "source": {
