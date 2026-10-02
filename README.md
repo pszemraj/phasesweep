@@ -154,6 +154,8 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 - [Durability invariants](https://github.com/pszemraj/phasesweep/blob/main/docs/invariants.md): the ordering rules the ledger, publication, and recovery paths must hold, and the test that owns each one.
 - [Development](https://github.com/pszemraj/phasesweep/blob/main/docs/development.md): source checkout, contributor setup, and quality gates.
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pszemraj/phasesweep)
+
 ## License
 
 MIT. See [LICENSE](https://github.com/pszemraj/phasesweep/blob/main/LICENSE).
