@@ -2,9 +2,9 @@
 
 PhaseSweep runs phase-chained hyperparameter sweeps from one ordinary YAML file. That file contains your trainer configuration, the metric, and the search plan. PhaseSweep materializes the configured trainer input for every trial, decides what to try next, persists each phase winner, and carries selected values forward as fixed inputs to later phases.
 
-This is useful when a full joint sweep is too expensive or hard to interpret. For example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](docs/config.md#phase-composition) explains the inheritance model and its tradeoffs.
+This is useful when a full joint sweep is too expensive or hard to interpret. For example, choose architecture depth, then tune learning rate, then regularization. The [configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#phase-composition) explains the inheritance model and its tradeoffs.
 
-![PhaseSweep phase DAG](docs/images/diagramA_dag.png)
+![PhaseSweep phase DAG](https://raw.githubusercontent.com/pszemraj/phasesweep/main/docs/images/diagramA_dag.png)
 
 ## How it works
 
@@ -52,7 +52,7 @@ importing PhaseSweep.
 Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
 
 ```bash
-pip install git+https://github.com/pszemraj/phasesweep.git
+python -m pip install phasesweep
 phasesweep --version
 
 mkdir phasesweep-demo && cd phasesweep-demo
@@ -99,8 +99,8 @@ effective_overrides:
 The starter uses `storage: auto`, so its ledger and outputs live together under
 `<workdir>/<experiment>/`. The ledger is an Optuna journal: `phasesweep status`
 prints its path, and Optuna's own CLI and dashboard can
-[read it](docs/runtime.md#inspect-the-ledger-with-optuna). See
-[runtime behavior](docs/runtime.md) for state layout, current-format
+[read it](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspect-the-ledger-with-optuna). See
+[runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md) for state layout, current-format
 requirements, locks, cleanup, GPU isolation, and resume.
 
 ## Use your own trainer
@@ -125,7 +125,7 @@ For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJEC
 have the trainer honor the supplied W&B identity, and install the extra:
 
 ```bash
-python -m pip install "phasesweep[wandb] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[wandb]"
 ```
 
 `metric.goal` ranks each trial's selected scalar. Log matching selects the
@@ -133,27 +133,27 @@ last observation by default; W&B selects an exact finished-summary key.
 The trainer owns evaluation, early stopping, checkpoint selection, and
 aggregation. Inheritance transfers parameters, not model weights.
 
-See the [configuration guide](docs/config.md) for input types, reporting,
+See the [configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md) for input types, reporting,
 credentials, and selection details. The [Tiny Decoder Enwik8
-example](examples/tiny_decoder_enwik8/README.md) is a complete real-trainer
+example](https://github.com/pszemraj/phasesweep/blob/main/examples/tiny_decoder_enwik8/README.md) is a complete real-trainer
 integration.
 
 ## Connect an agent
 
-The optional MCP server connects an AI agent to experiments you have approved without exposing config or storage paths, trainer commands, environment values, or raw logs. Sampled winner values follow the catalog's `visible_params` policy. Follow the [MCP setup](docs/mcp_setup.md) to install the extra, review the catalog authority boundary, configure a client-owned connection, and verify the result.
+The optional MCP server connects an AI agent to experiments you have approved without exposing config or storage paths, trainer commands, environment values, or raw logs. Sampled winner values follow the catalog's `visible_params` policy. Follow the [MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md) to install the extra, review the catalog authority boundary, configure a client-owned connection, and verify the result.
 
 ## Reference
 
-- [Configuration guide](docs/config.md): Experiment YAML, search spaces, inheritance, gates, and objective extractors.
-- [Configuration reference](docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
-- [Runtime behavior](docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
-- [MCP setup](docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.
-- [MCP operator reference](docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.
-- [Toy experiment and MCP catalog](examples/experiment.yaml): a checkout-local CLI example backed by the packaged fake trainer, plus an [MCP catalog](examples/catalog.yaml) whose detached-run state and experiment outputs use absolute scratch paths under `/tmp`.
-- [Tiny Decoder Enwik8 example](examples/tiny_decoder_enwik8/README.md): real-trainer integration.
-- [Durability invariants](docs/invariants.md): the ordering rules the ledger, publication, and recovery paths must hold, and the test that owns each one.
-- [Development](docs/development.md): source checkout, contributor setup, and quality gates.
+- [Configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md): Experiment YAML, search spaces, inheritance, gates, and objective extractors.
+- [Configuration reference](https://github.com/pszemraj/phasesweep/blob/main/docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
+- [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
+- [MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.
+- [MCP operator reference](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.
+- [Toy experiment and MCP catalog](https://github.com/pszemraj/phasesweep/blob/main/examples/experiment.yaml): a checkout-local CLI example backed by the packaged fake trainer, plus an [MCP catalog](https://github.com/pszemraj/phasesweep/blob/main/examples/catalog.yaml) whose detached-run state and experiment outputs use absolute scratch paths under `/tmp`.
+- [Tiny Decoder Enwik8 example](https://github.com/pszemraj/phasesweep/blob/main/examples/tiny_decoder_enwik8/README.md): real-trainer integration.
+- [Durability invariants](https://github.com/pszemraj/phasesweep/blob/main/docs/invariants.md): the ordering rules the ledger, publication, and recovery paths must hold, and the test that owns each one.
+- [Development](https://github.com/pszemraj/phasesweep/blob/main/docs/development.md): source checkout, contributor setup, and quality gates.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/pszemraj/phasesweep/blob/main/LICENSE).

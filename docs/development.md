@@ -12,6 +12,12 @@ The development extra includes MCP and Hydra for integration checks; the
 optional W&B extra exercises the installed SDK. Run Python-dependent commands
 in the environment where you installed the project.
 
+To install unreleased `main` without an editable checkout:
+
+```bash
+python -m pip install git+https://github.com/pszemraj/phasesweep.git
+```
+
 ## Quality gates
 
 Run the repository checks sequentially:
@@ -142,6 +148,46 @@ summary decoding and error behavior with controlled responses, plus supervised
 worker fixtures for deadlines, cleanup faults, and recovery; only the live W&B
 round trip reaches the service. Input tests use the real Hydra 1.3 parser and
 entrypoint; rendering itself has no Hydra runtime dependency.
+
+## PyPI releases
+
+Versions come from Git tags through setuptools-scm. The
+[`publish.yml` workflow](../.github/workflows/publish.yml) builds one wheel and
+one source distribution from the commit recorded by a published GitHub Release.
+It requires a stable `v`-prefixed PEP 440 tag whose commit is contained in `main`,
+then checks that both distributions contain the tag's normalized version and
+the project name `phasesweep`. GitHub prereleases are skipped.
+
+Before the first upload, configure the pending publisher in
+[PyPI account publishing](https://pypi.org/manage/account/publishing/):
+
+| Field | Value |
+| --- | --- |
+| PyPI project name | `phasesweep` |
+| GitHub owner | `pszemraj` |
+| GitHub repository | `phasesweep` |
+| Workflow filename | `publish.yml` |
+| Environment name | `pypi` |
+
+The publishing job uses the GitHub environment `pypi` with no required reviewer.
+GitHub creates it on first use if it does not exist. Only this job has
+`id-token: write`; it uploads the validated distributions with short-lived OIDC
+credentials and attestations. No PyPI API-token secret is needed.
+
+For each release:
+
+1. Complete the local quality gates above and merge the changes into `main`.
+2. Publish a normal GitHub Release with a new stable version tag, pointing to a
+   commit that includes the publishing workflow. Keep release notes in GitHub
+   Releases. Publishing starts the workflow; draft creation and tag pushes do
+   not.
+3. Check the workflow result and the [PyPI project](https://pypi.org/p/phasesweep):
+   version, wheel, source distribution, README rendering, and attestations.
+
+The first successful upload converts the pending publisher into the project's
+trusted publisher. Versions already uploaded to PyPI cannot be replaced;
+duplicate uploads fail visibly. Prerelease testing should use a distinct tag
+such as `v0.4.0rc1`, followed by a separate stable release such as `v0.4.0`.
 
 ## Package map
 

@@ -1,0 +1,149 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+# Scope concurrency by release tag so distinct releases cannot replace an older pending run.
+concurrency:
+  group: pypi-publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-distributions:
+    if: github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+      - name: Install packaging tools
+        run: python -m pip install build packaging twine
+      - name: Validate the release tag and commit
+        id: release
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "Release tag ${RELEASE_TAG} is not contained in main." >&2
+            exit 1
+          fi
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          from packaging.version import InvalidVersion, Version
+
+          tag = os.environ["RELEASE_TAG"]
+          if not tag.startswith("v"):
+              raise SystemExit(f"release tag must start with 'v': {tag!r}")
+          try:
+              version = Version(tag[1:])
+          except InvalidVersion as error:
+              raise SystemExit(f"release tag is not a PEP 440 version: {tag!r}") from error
+          # Post releases and epochs remain valid stable public PEP 440 versions.
+          if version.is_prerelease or version.is_devrelease or version.local is not None:
+              raise SystemExit(f"release tag must be a stable public version: {tag!r}")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(f"version={version}", file=output)
+          PY
+      - name: Build distributions
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
+      - name: Verify distribution versions
+        env:
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          import tarfile
+          from email.parser import BytesParser
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          from packaging.utils import canonicalize_name
+          from packaging.version import Version
+
+          expected_version = Version(os.environ["EXPECTED_VERSION"])
+          wheels = list(Path("dist").glob("*.whl"))
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit(f"expected one wheel and one sdist, found {wheels!r} and {sdists!r}")
+          with ZipFile(wheels[0]) as archive:
+              metadata_paths = [
+                  name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+              ]
+              if len(metadata_paths) != 1:
+                  raise SystemExit(
+                      f"expected one .dist-info/METADATA in {wheels[0]}, found {metadata_paths!r}"
+                  )
+              metadata_path = metadata_paths[0]
+              wheel_metadata = BytesParser().parsebytes(archive.read(metadata_path))
+          with tarfile.open(sdists[0]) as archive:
+              metadata_members = [
+                  member
+                  for member in archive.getmembers()
+                  if member.name.endswith("/PKG-INFO") and len(Path(member.name).parts) == 2
+              ]
+              if len(metadata_members) != 1:
+                  names = [member.name for member in metadata_members]
+                  raise SystemExit(
+                      f"expected one top-level PKG-INFO in {sdists[0]}, found {names!r}"
+                  )
+              metadata_member = metadata_members[0]
+              metadata_file = archive.extractfile(metadata_member)
+              if metadata_file is None:
+                  raise SystemExit(f"could not read {metadata_member.name} from {sdists[0]}")
+              sdist_metadata = BytesParser().parse(metadata_file)
+          for artifact, metadata in (
+              (wheels[0], wheel_metadata),
+              (sdists[0], sdist_metadata),
+          ):
+              if canonicalize_name(metadata["Name"]) != "phasesweep":
+                  raise SystemExit(f"unexpected project name in {artifact}: {metadata['Name']!r}")
+              actual_version = Version(metadata["Version"])
+              if actual_version != expected_version:
+                  raise SystemExit(
+                      f"release tag expects {expected_version}, but {artifact} contains {actual_version}"
+                  )
+          PY
+      - name: Store distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-to-pypi:
+    if: github.event.release.prerelease == false
+    needs: build-distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/phasesweep
+    permissions:
+      id-token: write
+    steps:
+      - name: Retrieve distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-distributions
+          path: dist/
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          attestations: true
