@@ -156,7 +156,8 @@ Versions come from Git tags through setuptools-scm. The
 one source distribution from the commit recorded by a published GitHub Release.
 It requires a stable `v`-prefixed PEP 440 tag whose commit is contained in `main`,
 then checks that both distributions contain the tag's normalized version and
-the project name `phasesweep`. GitHub prereleases are skipped.
+the project name `phasesweep`. GitHub prereleases are skipped, and prerelease
+version tags are rejected even for normal GitHub Releases.
 
 Before the first upload, configure the pending publisher in
 [PyPI account publishing](https://pypi.org/manage/account/publishing/):
@@ -186,8 +187,7 @@ For each release:
 
 The first successful upload converts the pending publisher into the project's
 trusted publisher. Versions already uploaded to PyPI cannot be replaced;
-duplicate uploads fail visibly. Prerelease testing should use a distinct tag
-such as `v0.4.0rc1`, followed by a separate stable release such as `v0.4.0`.
+duplicate uploads fail visibly.
 
 ## Package map
 
