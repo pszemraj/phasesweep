@@ -8,9 +8,10 @@ cd phasesweep
 python -m pip install -e ".[dev,wandb]"
 ```
 
-The development extra includes MCP and Hydra for integration checks; the
-optional W&B extra exercises the installed SDK. Run Python-dependent commands
-in the environment where you installed the project.
+The development extra includes MCP and Hydra for integration checks and
+setuptools-scm for the release-version regression; the optional W&B extra
+exercises the installed SDK. Run Python-dependent commands in the environment
+where you installed the project.
 
 To install unreleased `main` without an editable checkout:
 
@@ -154,6 +155,8 @@ entrypoint; rendering itself has no Hydra runtime dependency.
 Versions come from Git tags through setuptools-scm. The
 [`publish.yml` workflow](../.github/workflows/publish.yml) builds one wheel and
 one source distribution from the commit recorded by a published GitHub Release.
+The build restricts setuptools-scm's Git tag selection to that release's tag,
+so other tags on the same commit cannot determine the package version.
 It requires a stable `v`-prefixed PEP 440 tag whose commit is contained in `main`,
 then checks that both distributions contain the tag's normalized version and
 the project name `phasesweep`. GitHub prereleases are skipped, and prerelease

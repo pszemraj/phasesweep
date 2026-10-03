@@ -59,6 +59,12 @@ jobs:
               print(f"version={version}", file=output)
           PY
       - name: Build distributions
+        env:
+          # An annotated RC tag on the same commit must not override the release tag.
+          SETUPTOOLS_SCM_OVERRIDES_FOR_PHASESWEEP: >-
+            {scm.git.describe_command = ["git", "describe", "--dirty", "--tags",
+            "--long", "--abbrev=40", "--exact-match", "--match",
+            "${{ github.event.release.tag_name }}"]}
         run: python -m build
       - name: Check distribution metadata
         run: python -m twine check --strict dist/*
