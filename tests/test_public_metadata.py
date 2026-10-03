@@ -16,6 +16,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 
 import phasesweep.engine as engine
 import phasesweep.evidence as evidence
@@ -48,6 +49,63 @@ def test_console_scripts_declare_importable_targets() -> None:
         module_name, _, attribute = target.partition(":")
         module = importlib.import_module(module_name)
         assert callable(getattr(module, attribute)), f"{target} is not callable"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("release_tag", "expected_version"),
+    [("v0.4.0", "0.4.0"), ("v0.4.0.post1", "0.4.0.post1"), ("v1!0.4.0", "1!0.4.0")],
+)
+def test_release_version_uses_event_tag_with_competing_annotated_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release_tag: str, expected_version: str
+) -> None:
+    """The publishing build must select its release tag over an annotated RC."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "pyproject.toml").write_bytes(PYPROJECT_PATH.read_bytes())
+
+    def run(*command: str) -> str:
+        result = subprocess.run(
+            command,
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        return result.stdout.strip()
+
+    git = (
+        "git",
+        "-c",
+        "user.name=Release test",
+        "-c",
+        "user.email=release@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "tag.gpgsign=false",
+    )
+    run(*git, "init", "-q")
+    run(*git, "add", "pyproject.toml")
+    run(*git, "commit", "-qm", "Release fixture")
+    run(*git, "tag", "-a", "v0.4.0rc1", "-m", "Release candidate")
+    run(*git, "tag", release_tag)
+
+    monkeypatch.delenv("SETUPTOOLS_SCM_OVERRIDES_FOR_PHASESWEEP", raising=False)
+    assert run(sys.executable, "-m", "setuptools_scm") == "0.4.0rc1"
+
+    workflow_path = PYPROJECT_PATH.parent / ".github" / "workflows" / "publish.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    build_step = next(
+        step
+        for step in workflow["jobs"]["build-distributions"]["steps"]
+        if step["name"] == "Build distributions"
+    )
+    for name, value in build_step.get("env", {}).items():
+        monkeypatch.setenv(name, value.replace("${{ github.event.release.tag_name }}", release_tag))
+
+    assert run(sys.executable, "-m", "setuptools_scm") == expected_version
 
 
 @pytest.mark.integration

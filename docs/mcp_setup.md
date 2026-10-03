@@ -19,7 +19,7 @@ Install PhaseSweep and its optional MCP dependency in the Python environment
 that provides the server executable:
 
 ```bash
-python -m pip install "phasesweep[mcp] @ git+https://github.com/pszemraj/phasesweep.git"
+python -m pip install "phasesweep[mcp]"
 ```
 
 Contributor and editable-install setup is in [development](development.md).
