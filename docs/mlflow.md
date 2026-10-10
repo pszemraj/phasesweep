@@ -150,7 +150,7 @@ path followed by its normal arguments and `{overrides}`; set
 launcher is for managed ownership only. It preserves native logging through
 `report_to: [mlflow]`, and an exception exits the context as a failed run.
 Verify that the example imports its matching Transformers package using the
-[trainer environment preflight](mcp_setup.md#2-create-and-review-the-catalog).
+[trainer environment preflight](config.md#source-checkout-preflight).
 
 Native metrics retain their Trainer names, such as `eval_loss` and
 `eval_rouge1`; choose the exact final optimizer step when comparing fixed
@@ -281,10 +281,8 @@ missing terminal record.
 Bindings, creation intents, and mutable delivery records stay under the
 experiment artifact root. Delivery records live in
 `tracking/<generation-id>/delivery/`, separately from committed generation
-manifests. Disposable worker scratch lives in
-`~/.cache/phasesweep/mlflow/workers/` and is removed after each operation.
-`XDG_CACHE_HOME` can relocate that cache; the default uses `Path.home()`.
-Host lock placement retains its existing OS-account-home contract.
+manifests. See [runtime layout](runtime.md#output-layout) for worker scratch and
+cache placement.
 
 ## Databricks status
 

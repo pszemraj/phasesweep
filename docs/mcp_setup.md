@@ -1,12 +1,5 @@
 # MCP agent setup
 
-PhaseSweep owns the MCP server and its operator-reviewed catalog. Your MCP
-client owns its configuration and any client-specific instructions.
-
-> [!NOTE]
-> PhaseSweep does not create, edit, inspect, or remove client files. You add
-> the server entry to your client yourself in step 3.
-
 Requirements: Python 3.11+, the [MCP runtime requirements](mcp.md), a
 PhaseSweep experiment that passes validation, and a client with local stdio
 MCP support.
@@ -37,37 +30,10 @@ installed-package starter named `experiment.yaml` without overwriting files.
 The [configuration reference](config_reference.yaml) describes the accepted
 experiment fields, including backend selection and environment composition.
 
-Before cataloging a source-checkout trainer, verify the package actually
-imported by the configured Python executable. Running a checkout's example
-script does not make Python import that checkout's library. Match the example
-to its installed library, or explicitly select the checkout's source directory:
-
-```yaml
-execution:
-  cwd: /absolute/path/to/transformers
-  inherit_env: none
-env:
-  PYTHONPATH: /absolute/path/to/transformers/src
-```
-
-Run a CPU-only preflight with that same executable and explicit environment;
-for this example:
-
-```bash
-CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
-  /absolute/path/to/python -c 'import transformers; print(transformers.__version__); print(transformers.__file__)'
-CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
-  /absolute/path/to/python /absolute/path/to/transformers/examples/pytorch/token-classification/run_ner.py --help
-```
-
-Carry all required settings into the experiment's composed environment:
-`inherit_env: none` drops ambient `PYTHONPATH` and other shell settings.
-Use the actual example's `--help` to choose supported arguments; configuration
-validation does not execute the trainer or establish library compatibility.
-For Transformers with managed MLflow, also apply the
-[full-script run context](mlflow.md#transformers-trainer) before launch so final
-evaluation remains in the bound run. The W&B integration uses its own native
-callback and managed attempt identity.
+Before cataloging a source-checkout trainer, follow the
+[trainer environment preflight](config.md#source-checkout-preflight) to verify
+its imported library and supported arguments under the configured environment.
+Then create the catalog:
 
 ```bash
 phasesweep mcp init-catalog --from ./experiment.yaml
@@ -95,8 +61,9 @@ state layout without launching a sweep.
 
 ### 3. Configure your client
 
-Follow your MCP client's official documentation for its configuration file,
-scope, and restart behavior. Configure a stdio server with the absolute
+You manage the client files; PhaseSweep does not create, edit, inspect, or
+remove them. Follow your client's official documentation for its configuration
+file, scope, and restart behavior. Configure a stdio server with the absolute
 `phasesweep-mcp` executable and the absolute reviewed catalog path:
 
 ```text

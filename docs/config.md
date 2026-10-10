@@ -61,20 +61,10 @@ phases:
       optimizer.lr: {type: float, low: 0.00001, high: 0.001, log: true}
 ```
 
-Use an explicit `journal:///...` URL for persistent local storage, on one
-host, at any `n_jobs`. `storage: auto` always resolves to `study.journal` in
-`<workdir>/<experiment>/`, regardless of `n_jobs`. Persistent storage requires
-a nonempty `provenance` mapping. Any other value, including a `sqlite:///...`
-URL, `:memory:`, or an external database URL, is refused at config load; the
-message names `storage: auto`, `journal:///path/to/study.journal`, and
-`storage: null` as the supported forms.
-
-> [!NOTE]
-> `storage: null`, or omitting `storage` entirely, runs an in-memory disposable
-> study. It cannot be resumed or topped up by a later invocation.
-
-See [runtime behavior](runtime.md) for artifact-root binding, current-format
-state, and execution behavior.
+Choose `storage: auto` or a `journal:///...` URL for persistent local work,
+with a nonempty `provenance` mapping. `storage: null` is disposable. See
+[storage and locks](runtime.md#storage-and-locks) for path resolution,
+artifact-root binding, and continuation behavior.
 
 ## Phase composition
 
@@ -145,11 +135,8 @@ fixes that key; its `adamw` then becomes the origin that descendants inherit.
 ## Search spaces and samplers
 
 `search_space` maps dotted trainer-config paths to `float`, `int`, or
-`categorical` parameter objects. Float and integer steps must land exactly on
-their upper bound. Numeric integer bounds are limited to Optuna's exactly
-representable range. Categorical choices must be distinct under Python
-equality; seed keys are rejected by default unless `allow_seed_search: true`
-makes a variance audit explicit.
+`categorical` parameter objects. To audit seed variance deliberately, set
+`allow_seed_search: true`; ordinary sweeps reject seed keys.
 
 > [!IMPORTANT]
 > YAML decides scalar types before PhaseSweep reads fixed overrides or categorical
@@ -158,50 +145,17 @@ makes a variance audit explicit.
 > usable. Write a decimal value (or an exponent with a decimal mantissa) for a
 > numeric override, and quote a value when you intend a string category.
 
-Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid has
-at most 4,096 concrete combinations, counted before trials are materialized.
-Its trial target must equal that cardinality unless `allow_partial_grid: true`
-is set. CMA-ES accepts numeric spaces only.
-
-`sampler.n_startup_trials` applies only to `tpe`; the other sampler types
-must leave it at its default (10) or config load fails, since they never
-read it.
+Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's
+trial target covers its concrete combinations unless `allow_partial_grid: true`
+is set; CMA-ES accepts numeric spaces only. Sampler-specific limits and fields
+are listed in the [reference](config_reference.yaml).
 
 For persistent storage, `random`, `tpe`, and `cmaes` need a seed. TPE and
 CMA-ES also require `acknowledge_nonresumable: true`: their target must finish
 in one invocation rather than being resumed or enlarged across processes.
-Grid and seeded random phases support ordinary local continuation.
-
-`n_trials` counts terminal Optuna attempts, not only successful objectives.
-`max_consecutive_failures`, trial/phase/run timeouts, and
-`allow_incomplete_on_timeout` control how failures and partial work are
-handled. They do not create an alternate winner.
-
-Winner ties use the lowest trial number. Built-in confound verdicts are
-advisory: `evaluation_point` flags a ranked objective more than 1% short of the
-furthest reported progress, `survivorship` flags when failed plus pruned
-trials are at least as numerous as ranked trials (infeasible trials are only
-counted), and `tie` flags exact ties between different sampled configurations.
-`n/a` means not checked, for example when objectives have no usable progress
-position or only one trial was ranked. These verdicts never block publication
-and have no YAML switches or threshold settings.
-
-Persistent trial targets cannot decrease. For resumable samplers, a larger
-`n_trials` explicitly schedules additional attempts after a durable abort or
-accepted partial timeout. Raising only `max_consecutive_failures` does not
-undo a recorded abort. Repeating an accepted partial target replays that
-decision without filling unused slots, and still requires
-`allow_incomplete_on_timeout: true`.
-
-`timeout_seconds_per_trial` defaults to 259200 (72 hours) and stops any trial
-still running then. Set it above the longest trial you expect. `null`, no
-limit, also needs `allow_unbounded_trials: true`.
-This timeout covers supervised launch and execution after GPU acquisition,
-including supervisor startup, rather than the queue for a GPU or post-trainer
-evidence. Phase/run budgets cover those stages too. Cleanup can extend beyond
-a deadline. Unlike phase/run budgets,
-the per-trial timeout participates in semantic study identity; changing it
-cannot reuse a populated phase.
+See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation)
+for trial accounting, partial results, and sampler continuation, and
+[confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
 
 ## Trainer inputs
 
@@ -333,15 +287,9 @@ evaluation behind. It may not name the metric's own series. A plain key is
 positioned at the last row that logged its value. An aggregate key such as
 `eval/loss.min` covers its whole `eval/loss` history series, so it is
 positioned where that series ends: how far the trial trained, not where its
-best value fell, which differs between comparable trials by nature. The
-position is advisory, so it is read only after the trial's result is
-accepted, within a fresh `timeout_seconds` and whatever phase or run budget
-remains: history gets up to 30 seconds to catch up with the summary, and
-reading it may use the rest. A history read that fails or runs out of time
-records no position; the trial keeps its objective. The read runs in a
-supervised reader like the summary capture, so if its cleanup is uncertain the
-phase stops instead (see
-[trial execution and evidence](runtime.md#trial-execution-and-evidence)).
+best value fell, which differs between comparable trials by nature. See
+[trial execution and evidence](runtime.md#trial-execution-and-evidence) for
+the advisory read's deadline and cleanup behavior.
 
 For plain keys, exact history matches take priority. With no exact match, the
 reader can use the final finite metric row when it differs from the summary by
@@ -354,8 +302,7 @@ Within a phase, the primary objective, W&B constraints, and that phase's W&B
 gates must agree on normalized endpoint, entity, project, poll interval, and
 timeout. They share one finished-summary capture. When the objective and
 constraints are local, separate gate-only phases may use different W&B
-targets. Only requested numeric values and gate-presence
-evidence are saved. A gate-only configuration accepts the first finished
+targets. A gate-only configuration accepts the first finished
 summary and fails if required keys are missing. Failed, crashed, killed, or
 preempted remote runs cannot win.
 
@@ -373,10 +320,6 @@ are not reacquired. Supported SDK account authentication also works; an
 API-key environment variable is not mandatory. Credentials are never serialized
 in worker requests. Syntax validation and dry runs do not authenticate.
 
-Polling runs after trainer cleanup and GPU release, under one deadline that
-includes startup, SDK calls, retries, and summary visibility, capped by phase
-and experiment budgets. Published evidence is frozen: selection, replay, CLI,
-and MCP reads need no SDK or remote reread, even after remote edits/deletion.
 W&B's source is keyed by attempt ID; it makes none of the envelope's
 evaluation-metadata or trainer-input-content assurances. It only records
 where in the run's history the objective's value was logged.
@@ -390,14 +333,8 @@ attempt identity, evidence-path, trainer-input, and GPU variables. Use
 `execution.passthrough_env` for rotating credentials or transport settings.
 Top-level `env` values remain semantic configuration.
 
-GPU pool discovery uses explicit phase `gpu_ids`/`gpu_devices`, then top-level
-`env.CUDA_VISIBLE_DEVICES`, then the controller's ambient value, then local
-inventory. Discovery reads ambient visibility even when `inherit_env` excludes
-it. The default `single_per_trial` policy rebinds a leased device token, or
-preserves an empty/`-1` CUDA-disable sentinel, in each trainer. `gpu_policy:
-none` assigns no binding; include ambient visibility in the trainer inheritance
-contract or set it in `env` if it must be retained. See the reference for
-parallel opt-ins and whole-node requirements.
+See [GPU isolation](runtime.md#gpu-isolation) for discovery precedence and
+how device visibility interacts with environment inheritance.
 
 When no W&B evidence consumer is configured, trainer-owned `WANDB_*` settings
 are preserved except for an ambient/inherited `WANDB_RUN_ID`, which is removed.
@@ -435,3 +372,37 @@ phasesweep report-objective 0.123 --name validation_loss --split validation \
 
 A repeatable `--progress tokens=2048000` reports what `progress=` does from
 Python.
+
+### Source-checkout preflight
+
+Before launching a source-checkout trainer, verify the package actually
+imported by the configured Python executable. Running a checkout's example
+script does not make Python import that checkout's library. Match the example
+to its installed library, or explicitly select the checkout's source directory:
+
+```yaml
+execution:
+  cwd: /absolute/path/to/transformers
+  inherit_env: none
+env:
+  PYTHONPATH: /absolute/path/to/transformers/src
+```
+
+Run a CPU-only preflight with that same executable and explicit environment;
+for this example:
+
+```bash
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
+  /absolute/path/to/python -c 'import transformers; print(transformers.__version__); print(transformers.__file__)'
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
+  /absolute/path/to/python /absolute/path/to/transformers/examples/pytorch/token-classification/run_ner.py --help
+```
+
+Carry all required settings into the experiment's composed environment:
+`inherit_env: none` drops ambient `PYTHONPATH` and other shell settings.
+Use the actual example's `--help` to choose supported arguments; configuration
+validation does not execute the trainer or establish library compatibility.
+For Transformers with managed MLflow, also apply the
+[full-script run context](mlflow.md#transformers-trainer) before launch so final
+evaluation remains in the bound run. The W&B integration uses its own native
+callback and managed attempt identity.

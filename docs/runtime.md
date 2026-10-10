@@ -60,23 +60,18 @@ These records support upload retries and are separate from the committed
 scientific manifests. Disposable supervised-worker scratch uses
 `~/.cache/phasesweep/<backend>/workers/`, or the corresponding
 `XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`.
-Each operation removes its temporary directory. See [MLflow tracking](mlflow.md)
-for ownership and offline replay.
+Each operation removes its temporary directory. Host lock placement retains
+its separate OS-account-home contract. See [MLflow tracking](mlflow.md) for
+ownership and offline replay.
 
 ### Confound verdicts
 
 Each phase's `winner.yaml` carries a `confound` block: advisory verdicts on
 the population that selection ranked to pick the winner, computed once and
-frozen at selection time. It never blocks selection or publication, and it
-never joins a fingerprint, so an observation on a winner can never invalidate
-a study or block a top-up; a top-up that reselects the same trial for a
-larger population publishes a fresh block, and `--from-phase` carries the
-parent winner's block verbatim. The authoritative copy is the generation's
-`generations/<generation-id>/phases/<phase>/winner.yaml`, which the
-generation manifest covers: editing a verdict there after publication fails
-`publication_integrity`. The per-phase `<phase>/winner.yaml` projection is
-never read back, so editing it changes nothing, and the next publication
-rewrites it.
+frozen at selection time. It never blocks selection or publication and has no
+YAML switches or threshold settings. The authoritative copy belongs to the
+published generation; [invariant 19](invariants.md#19-a-confound-verdict-never-joins-a-fingerprint-or-gets-read-as-clean)
+describes its integrity, fingerprints, top-ups, and inheritance.
 
 The block runs three checks, each `ok` (checked, nothing found),
 `heterogeneous` (checked, found a potential confound, with evidence), or
@@ -100,7 +95,8 @@ The block runs three checks, each `ok` (checked, nothing found),
   may win. This check always runs.
 - `tie`: whether the trial-number tiebreak chose between trials with
   different params tied on the exact metric value, rather than between
-  repeats of one configuration. `n/a` with one ranked trial.
+  repeats of one configuration. The lowest trial number wins a tie.
+  `n/a` with one ranked trial.
 
 Selection logs one `WARNING` naming every flagged check and its numbers, and
 a phase that is about to build on a flagged parent winner logs its own
@@ -139,10 +135,13 @@ lock namespace and the MCP `state_dir`.
 
 ## Storage and locks
 
-`storage: null` is in-memory and ends with the process. Persistent local
+`storage: null`, or omitting `storage`, is in-memory and ends with the process;
+it cannot be resumed or topped up by a later invocation. Persistent local
 storage is an explicit `journal:///...` URL, or `auto`, which always resolves
-to a sibling `study.journal`. The journal backend supports parallel trials
-(`n_jobs > 1`) on one host.
+to `<workdir>/<experiment>/study.journal`, regardless of `n_jobs`. The journal
+backend supports parallel trials (`n_jobs > 1`) on one host. Any other storage
+value, including `sqlite:///...`, `:memory:`, and external database URLs, is
+refused at config load; the error names the supported forms.
 
 The selected artifact root and ledger are bound to each other in both
 directions:
@@ -230,24 +229,31 @@ Uncertain cleanup blocks further work. One absolute polling deadline covers
 worker startup, SDK construction, requests, retries, and summary visibility;
 phase/run deadlines can shorten it, while cleanup grace stays separate. Once
 the trial is accepted, a second reader in the same slot locates the objective
-in run history under its own deadline.
+in run history within a fresh `timeout_seconds` and the remaining phase/run
+budget. History gets up to 30 seconds to catch up with the summary; reading it
+may use the rest. A failed or timed-out history read records no position and
+keeps the objective, while uncertain reader cleanup stops the phase.
 Trainer return code and duration remain trainer measurements.
 
 Finished W&B captures freeze only the requested numeric values and gate-presence
 evidence, with target, attempt, retrieval time, selected key, and consumer
-bindings. Published results and no-op replay need no SDK, credentials, or
-network reads. New remote work checks SDK availability after recognized-state
-recovery and before accepting a larger target. Missing/invalid evidence fails a
+bindings. Published results, selection, and no-op replay need no SDK,
+credentials, or network reads, even after remote edits or deletion. New remote
+work checks SDK availability after recognized-state recovery and before
+accepting a larger target. Missing/invalid evidence fails a
 trial; a measured constraint violation remains complete but infeasible.
 See the [configuration guide](config.md) for scoring and environment details.
 
 ## GPU isolation
 
 By default, `gpu_policy: single_per_trial` leases one visible CUDA device per
-parallel trial. Explicit `gpu_ids` or `gpu_devices` define the available
-tokens; otherwise the runtime uses numeric, GPU UUID, or MIG tokens from
-`CUDA_VISIBLE_DEVICES`, or falls back to host discovery. The lease controls
-visibility and same-host locking, not GPU memory allocation.
+parallel trial. Discovery uses explicit phase `gpu_ids`/`gpu_devices`, then
+top-level `env.CUDA_VISIBLE_DEVICES`, then the controller's ambient value,
+then local inventory. Visibility tokens may be numeric, GPU UUIDs, or MIG
+tokens. Discovery reads ambient visibility even when `inherit_env` excludes
+it. The policy rebinds a leased device token, or preserves an empty/`-1`
+CUDA-disable sentinel, in each trainer. The lease controls visibility and
+same-host locking, not GPU memory allocation.
 
 `gpu_policy: whole_node` requires `n_jobs: 1` and a unique explicit device
 list. `gpu_policy: none` disables PhaseSweep's GPU isolation and cannot be
@@ -256,11 +262,22 @@ combined with an explicit device list; parallel use requires the explicit
 make that acknowledgement deliberately rather than relying on failed device
 detection.
 
+`gpu_policy: none` assigns no binding. Include ambient visibility in the
+trainer inheritance contract or set it in `env` if it must be retained.
+
 ## Timeouts, cleanup, and continuation
 
-Trial, phase, and experiment timeouts are cooperative run controls. On a
-trial timeout PhaseSweep terminates the supervised process group and records a
-terminal failed attempt after cleanup. The `max_consecutive_failures` threshold
+Trial, phase, and experiment timeouts are cooperative run controls. Set the
+per-trial timeout above the longest trial you expect; an unbounded trial needs
+`allow_unbounded_trials: true`. Its clock covers supervised launch and execution
+after GPU acquisition, including supervisor startup, but excludes the GPU
+queue and post-trainer evidence. Phase/run budgets cover those stages too.
+Cleanup can extend beyond a deadline. Unlike phase/run budgets, the per-trial
+timeout participates in semantic study identity; changing it cannot reuse a
+populated phase.
+
+On a trial timeout PhaseSweep terminates the supervised process group and
+records a terminal failed attempt after cleanup. The `max_consecutive_failures` threshold
 also stops a broken phase. The abort is recorded with the outcome that trips
 it, so a trial that succeeds afterwards cannot turn the phase back into a
 result, and a rerun stays refused until `n_trials` is raised. Changing
@@ -275,6 +292,12 @@ abort. A rerun or `--from-phase` reuses an incomplete result only while the
 config still sets `allow_incomplete_on_timeout`; raising `n_trials` continues
 the phase instead. `n_trials` counts terminal attempts, so failed and pruned
 attempts consume the configured target.
+
+Persistent trial targets cannot decrease. Raising a resumable sampler's
+`n_trials` schedules additional attempts after a durable abort or accepted
+partial timeout. Repeating an accepted partial target replays that decision
+without filling unused slots. Failure and timeout controls never create an
+alternate winner.
 
 Before a supported continuation, PhaseSweep first checks the artifact-root and
 ledger binding, then reconciles stale active attempts, and only then verifies

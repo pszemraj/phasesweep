@@ -6,40 +6,6 @@ on this page names the code that holds it and the test that fails when it stops
 holding, so breaking one fails a test instead of waiting for a reviewer to
 notice.
 
-## Agent handoff
-
-Paste this block into the instructions of any agent that changes the engine or
-the MCP layer.
-
-```text
-1. Mutating paths (a run, and recover-run when confirmed) take the experiment
-   lock before they touch the artifact tree or the ledger. Read paths and
-   recovery inspection take no lock, so they must write nothing.
-2. Validate, then claim, then open. validate_ledger checks the artifact-root
-   binding, then scans the ledger format, and writes nothing; on a bound tree
-   an unreadable scan is tolerated and recorded on the handle. claim_ledger
-   rescans strictly if the scan did not complete, cuts a partial final
-   journal record under Optuna's journal lock, loads every existing phase
-   study, checks every study's root before any write, writes the tree
-   binding, then claims empty studies. Only the ClaimedLedger it returns
-   reaches open_phase_study.
-3. Pure read paths (read_status, read_winners, read_result, CLI status and
-   show-winners, the MCP result snapshot) never construct file-backed storage
-   and never write bytes. Recovery inspection validates binding and format
-   before any open and refuses an unsupported ledger with the bytes unchanged.
-4. src/phasesweep/engine/ledger.py is the only module that constructs Optuna
-   storage, and no other module imports its private names. No module
-   constructs sqlite3, SQLAlchemy, or Optuna RDB storage at all.
-   tests/test_ledger_contract.py enforces both, and its ratchets are empty,
-   so a new site anywhere else fails.
-5. A published result is read once, by publication validation. Consumers
-   use PublicationPointer.validated and never reopen a published artifact
-   by path.
-6. A phase abort is written with the outcome that trips it. Replay honors
-   recorded aborts and never re-derives one from the current
-   max_consecutive_failures, which governs new work only.
-```
-
 > [!IMPORTANT]
 > Error text is authoritative, and a wrap preserves the operator's remediation.
 > Never fix a failing test by weakening a message match or an ordering
@@ -55,6 +21,14 @@ the repository root.
 Every path into the ledger passes through `engine.ledger`, and the handle each
 step returns is the proof the earlier steps ran. The diagram shows where each
 caller enters and where it must stop.
+
+`engine.ledger` is the only module that constructs Optuna storage; no other
+module imports its private names. No module constructs sqlite3, SQLAlchemy,
+or Optuna RDB storage. `tests/test_ledger_contract.py` parses every package
+module and compares banned references against two ratchets for equality.
+Both `_LEGACY_SITES` and `_LEGACY_PRIVATE_IMPORTS` are empty, so any new site
+outside the ledger module fails. [Development](development.md#quality-gates)
+describes the contract-test hooks and CI.
 
 ```mermaid
 flowchart TD
@@ -443,55 +417,15 @@ which never reads `Winner.confound`, and
 `tests/test_confound.py::test_top_up_reselection_publishes_a_fresh_block_for_its_larger_population`,
 `tests/test_confound.py::test_inheriting_phases_are_warned_and_from_phase_carries_the_block`
 
-## Decision record: recovery machinery
+## Detached-run recovery rationale
 
-Three pieces of machinery exist only to survive a hard exit. Each is cheap to
-delete and expensive to be wrong about, so the cost is written down here
-rather than rediscovered by the next reviewer.
+A dead runner without terminal status may still have trials being reaped, so
+invariant 16 keeps its capacity slot occupied until `recover-run` decides from
+durable evidence. Invariant 7 governs that recovery's ledger access. Process
+identity includes the boot id because PID and `/proc` start time can both be
+reused after reboot; an unknown boot id on either side refuses to signal.
 
-| Machinery | Failure it prevents | Cost |
-| --- | --- | --- |
-| `recover-run` | A leaked capacity slot after a hard exit | About 980 lines |
-| Runner boot identity | Signalling an unrelated process after a reboot | About 160 lines |
-| Persisted spawned handle | A duplicate sweep after a server restart | About 270 lines |
-
-Their tests stay in the fast tier except the ones that spawn a real runner,
-and that split is enforced rather than chosen: the collection guard fails any
-test that spawns a real process without the `integration` marker (see
-[test tiers](development.md#test-tiers)).
-
-### `recover-run`
-
-When a detached runner is SIGKILLed or the host crashes, the run handle
-survives with no terminal status. `RunStore.state` deliberately keeps that run
-live (invariant 16), because a dead runner with no status is indistinguishable
-from one whose trials are still being reaped, so the run holds one of the
-experiment's capacity slots and no later launch can proceed. `recover-run` is
-the only path that reads the durable evidence and decides. It opens studies
-only through `validate_ledger` and `open_existing_study`, so it validates the
-binding and the format before it opens anything (invariant 7).
-
-The cost is all of `src/phasesweep/mcp/recovery.py` plus the `mcp_recover_run`
-command in `src/phasesweep/cli.py`.
-
-### Runner boot identity
-
-PID plus `/proc` start time is unique only within one boot: the kernel restarts
-both counters, so a saved pair can name a process the host started after
-rebooting, and a cancel or a cleanup would signal it. A recorded boot id
-settles the question in the safe direction. A differing boot id proves nothing
-from that boot survives, so cleanup is complete without sending a signal; an
-unknown boot id on either side refuses to signal at all.
-
-The cost is five definitions in `src/phasesweep/mcp/runs.py`
-(`ProcessIdentity`, `cleanup_identity`, `RunStore.from_earlier_boot`,
-`_read_cleanup_identity`, `_valid_optional_boot_id`), plus
-`runtime.reaper.identity_from_earlier_boot`, plus the lines in
-`_persist_spawned_handle` in `src/phasesweep/mcp/runner.py` that read the boot
-id, refuse to persist a handle without one, and record it. `mcp.runs` never
-constructs storage, so the ledger chokepoint does not touch it.
-
-### MCP restart recovery and the persisted spawned handle
+### Persisted spawned handle
 
 A detached runner outlives its parent by design. If the server restarts with
 no handle on disk, it has no record of that runner, and a second `launch_run`
@@ -500,29 +434,6 @@ spawns a duplicate sweep against the same ledger. The handle is created before
 identity, and confirmed through a ready/ack handshake, so no child ever exists
 without a durable handle naming it.
 
-The cost is three methods in `src/phasesweep/mcp/run_control.py`:
-`RunControl._spawn`, `_terminate_failed_spawn`, and `_pending_handle`.
-
-### Rejected: removing any of the three
-
-Removing `recover-run` leaves the leaked capacity slot with no owner, because
-the state machine is deliberately unable to conclude a dead runner on its own.
-Removing boot identity means signalling a PID a reboot may have reassigned,
-which is killing an unrelated process on the operator's host. Removing the
-persisted spawned handle means two sweeps writing into one ledger. Each removal
-converts a bounded amount of code into an unbounded class of silent
-corruption, so all three stay.
-
-## Test tiers and gates
-
-The fast tier, the `integration` marker, and the quality gates are described in
-[test tiers](development.md#test-tiers).
-
-`tests/test_ledger_contract.py` is the static contract behind invariant 3. It
-parses every module under `src/phasesweep` and compares the banned storage
-references it finds against two ratchets for equality, not containment.
-Both ratchets, `_LEGACY_SITES` and `_LEGACY_PRIVATE_IMPORTS`, are empty, so
-any storage constructor or private ledger import outside `engine/ledger.py`
-fails the test. The pre-commit hook and CI run it with
-`tests/test_error_routing.py` and `tests/test_tier_guard.py`, the three
-contract test files.
+**Held by:** `mcp.run_control.RunControl._spawn`, `_terminate_failed_spawn`,
+and `_pending_handle`; `mcp.runner._persist_spawned_handle` refuses to persist
+a runner receipt without a boot id.

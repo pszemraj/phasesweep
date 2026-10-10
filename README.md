@@ -95,13 +95,6 @@ effective_overrides:
 # verdicts on the ranked population follow
 ```
 
-The starter uses `storage: auto`, so its ledger and outputs live together under
-`<workdir>/<experiment>/`. The ledger is an Optuna journal: `phasesweep status`
-prints its path, and Optuna's own CLI and dashboard can
-[read it](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspect-the-ledger-with-optuna). See
-[runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md) for state layout, current-format
-requirements, locks, cleanup, GPU isolation, and resume.
-
 ## Use your own trainer
 
 Choose the input interface your trainer already accepts:
@@ -132,16 +125,6 @@ experiment in the `mlflow` block, and use
 `extractor: {type: mlflow, metric_key: eval/loss, select: last}`. See the
 [MLflow guide](docs/mlflow.md) for both run ownership modes, a complete CPU
 example, Databricks setup, and retrying result uploads.
-
-`metric.goal` ranks each trial's selected scalar. Log matching selects the
-last observation by default; W&B selects an exact finished-summary key.
-The trainer owns evaluation, early stopping, checkpoint selection, and
-aggregation. Inheritance transfers parameters, not model weights.
-
-See the [configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md) for input types, reporting,
-credentials, and selection details. The [Tiny Decoder Enwik8
-example](https://github.com/pszemraj/phasesweep/blob/main/examples/tiny_decoder_enwik8/README.md) is a complete real-trainer
-integration.
 
 ## Connect an agent
 

@@ -125,11 +125,10 @@ If it returns `found: false`, `run` is null and there is no run to resume.
 rather than tight status polling. Never cancel a run or launch a replacement
 automatically.
 
-`get_run_results` is run-specific; terminal reads use that run's frozen result
-snapshot. A plain `phasesweep run` can publish winners, but it does not create
-an MCP run record. Its results remain inspectable through `phasesweep status`
-and `phasesweep show-winners`; the server does not create handles for an
-arbitrary existing output tree.
+`get_run_results` is run-specific. A plain `phasesweep run` can publish winners,
+but it does not create an MCP run record. Its results remain inspectable through
+`phasesweep status` and `phasesweep show-winners`; the server does not create
+handles for an arbitrary existing output tree.
 
 ## Reading status responses
 
@@ -159,23 +158,15 @@ still validates:
 For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and
 report the condition.
 
-Every winner also carries a `confound` payload: advisory verdicts on the
-population selection ranked to choose it, frozen at selection time. `flagged`
-lists the checks below whose verdict is `heterogeneous`; report each one with
-its counts before relying on the winner or proposing a run whose phases
-inherit it.
-
-| Check | Verdict meaning |
-| --- | --- |
-| `evaluation_point` | `heterogeneous`: ranked objectives were measured at `distinct_values` different positions on the configured evaluation axis, the lowest more than 1% short of the highest; the winner's position was `winner_value`. `ok` may still report several `distinct_values` within 1% of each other, such as a fixed-token sweep's batch sizes each stopping within a batch of the budget. `n/a`: only one trial was ranked, the extractor reports no position, or a ranked trial has no readable position on the axis. |
-| `survivorship` | `heterogeneous`: `failed` + `pruned` trials were at least as numerous as `ranked` ones; `failed` includes evidence-gate and extraction failures. `infeasible` trials, which violated one of the experiment's own constraints, are counted but never flag. Always checked, never `n/a`. |
-| `tie` | `heterogeneous`: the winner tied exactly with `tied_trials` other ranked trials that used different params. `n/a`: only one trial was ranked. |
-
-`ok` means a check ran and found nothing; `n/a` means it could not run and
-must never be read as clean. Evidence strings (an evaluation axis name is a
-config key) stay out of this payload; only enums and numbers cross the MCP
-boundary. The verdicts are advisory: they do not invalidate the result, and
-only the operator decides whether to re-run.
+Every winner carries frozen, advisory
+[confound verdicts](runtime.md#confound-verdicts). `flagged` lists checks whose
+verdict is `heterogeneous`; report each with its counts before relying on the
+winner or proposing a run whose phases inherit it. `evaluation_point` exposes
+`distinct_values` and `winner_value`; `tie` exposes `tied_trials`.
+`n/a` means a check could not run and must never be read as clean.
+MCP exposes only enums and numbers from these checks; evidence strings such as
+the evaluation-axis config key stay private. The verdicts do not invalidate
+the result, and only the operator decides whether to re-run.
 
 `recovery_required: true` means cleanup, launch handoff, or snapshot
 finalization needs operator recovery. Agents should stop rather than guessing
@@ -183,12 +174,9 @@ at process or result state; [run state and recovery](#run-state-and-recovery)
 shows where each case comes from.
 
 Winner results describe selected values, not convergence curves, robustness,
-causality, or unreturned trial history. The `confound` payload summarizes
-that history only as counts about the population selection ranked: it bounds
-how far the comparison behind the selected value can be trusted, but it says
-nothing about the winner's robustness and never changes or blocks the
-selection. Treat `<redacted>` values as deliberate catalog policy, not
-missing data.
+causality, or unreturned trial history. Confound counts describe the population
+selection ranked, not the winner's robustness. Treat `<redacted>` values as
+deliberate catalog policy, not missing data.
 
 The operator may configure MLflow, W&B, ordinary JSON, log, or envelope scoring.
 Frozen scientific result reads preserve the producing reader's assurance
@@ -202,7 +190,7 @@ and aggregation; `metric.goal` ranks the selected trial scalars. Log reduction
 defaults to `last` and is independent of the ranking goal. Operators preparing
 native logging should follow [MLflow run ownership and Transformers
 integration](mlflow.md#choose-run-ownership) and the
-[trainer environment preflight](mcp_setup.md#2-create-and-review-the-catalog).
+[trainer environment preflight](config.md#source-checkout-preflight).
 
 The assurance flags `expected_step_declared` and `expected_step_value_bound`
 describe JSON-envelope metadata checks only. They remain false for MLflow even
@@ -214,10 +202,9 @@ For MLflow, `tracking_delivery` reports current local upload counts, separately
 from the frozen scientific outcome. Pending delivery does not invalidate an
 accepted score or winner, and a later retry can change those counts without
 changing the run snapshot. The operator can retry saved projections with
-`phasesweep sync-tracking CONFIG --generation GENERATION_ID`, using the original
-target configuration. This CLI operation does not retrain or select metrics
-again. It is not an MCP agent recovery or replacement-run action. Missing or
-null delivery information does not establish successful delivery.
+the [MLflow delivery command](mlflow.md#result-delivery-and-recovery).
+This is an operator action, not agent recovery or a replacement run. Missing
+or null delivery information does not establish successful delivery.
 
 ## Run state and recovery
 
