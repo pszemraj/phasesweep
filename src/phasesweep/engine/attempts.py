@@ -205,10 +205,11 @@ def _require_trial_attempt(
     return record
 
 
-ATTEMPT_REGISTRY_SCHEMA_VERSION = 3
+ATTEMPT_REGISTRY_SCHEMA_VERSION = 4
 _ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
     {
         "schema_version",
+        "kind",
         "attempt_id",
         "experiment",
         "phase",
@@ -220,6 +221,30 @@ _ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
         "generation_id",
     }
 )
+
+
+def _register_tracking_operation(
+    experiment: Experiment, *, operation_id: str, generation_id: str, directory: Path
+) -> None:
+    """Register a supervised publisher with no study or Optuna trial.
+
+    :param Experiment experiment: Local experiment namespace.
+    :param str operation_id: Process identity.
+    :param str generation_id: Producing generation.
+    :param Path directory: Process lifecycle directory.
+    """
+    entry = {
+        "schema_version": ATTEMPT_REGISTRY_SCHEMA_VERSION,
+        "kind": "tracking",
+        "attempt_id": operation_id,
+        "experiment": experiment.experiment,
+        "phase": "tracking",
+        "trial_dir": str(directory),
+        "generation_id": generation_id,
+    }
+    private_atomic_write_text(
+        _attempts_dir(experiment) / f"{operation_id}.json", json.dumps(entry, sort_keys=True) + "\n"
+    )
 
 
 def _register_active_attempt(
@@ -263,6 +288,7 @@ def _register_active_attempt(
     try:
         entry = {
             "schema_version": ATTEMPT_REGISTRY_SCHEMA_VERSION,
+            "kind": "trial",
             "attempt_id": attempt_id,
             "experiment": experiment.experiment,
             "phase": phase_name,
@@ -373,6 +399,27 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             "entry file if you are certain nothing is running.",
             action=OperatorAction.RESTORE_TREE,
         ) from exc
+    if isinstance(payload, dict) and payload.get("kind") == "tracking":
+        required = {
+            "schema_version",
+            "kind",
+            "attempt_id",
+            "experiment",
+            "phase",
+            "trial_dir",
+            "generation_id",
+        }
+        if (
+            payload.get("schema_version") == ATTEMPT_REGISTRY_SCHEMA_VERSION
+            and set(payload) == required
+            and all(
+                isinstance(payload[k], str) and payload[k] for k in required - {"schema_version"}
+            )
+        ):
+            return payload
+        raise ProcessCleanupUncertainError(
+            "Malformed tracking operation registry entry.", action=OperatorAction.RESTORE_TREE
+        )
     locator_identity: str | None = None
     if isinstance(payload, dict) and isinstance(payload.get("storage_locator"), str):
         try:
@@ -387,6 +434,7 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
     if (
         not isinstance(payload, dict)
         or not _ATTEMPT_ENTRY_REQUIRED_FIELDS.issubset(payload)
+        or payload.get("kind") != "trial"
         or payload.get("schema_version") != ATTEMPT_REGISTRY_SCHEMA_VERSION
         or not isinstance(payload.get("attempt_id"), str)
         or not isinstance(payload.get("trial_dir"), str)
@@ -464,7 +512,7 @@ def _registry_attempt_record(entry: Mapping[str, Any], entry_path: Path) -> _Att
         trial_dir=trial_dir,
         generation_id=entry["generation_id"],
         phase_name=entry["phase"],
-        trial_number=entry["trial_number"],
+        trial_number=entry.get("trial_number"),
     )
 
 
@@ -660,6 +708,8 @@ def _registry_attempt_fail_stale_trial(
         marked FAIL, or its durable recovery state could not be recorded; the
         study is left inconsistent rather than silently dropping the failure.
     """
+    if entry["kind"] == "tracking":
+        return "terminal"
     current_identity = canonical_storage_identity(current_storage)
     storage_url = (
         storage_recovery_locator(current_storage)
@@ -763,6 +813,7 @@ def _preflight_active_attempts(
     *,
     confirm: bool,
     retain_recovery_evidence: bool = False,
+    tracking_only: bool = False,
 ) -> dict[str, str]:
     """Resolve every registered nonterminal attempt before any launch.
 
@@ -783,6 +834,7 @@ def _preflight_active_attempts(
     :param bool retain_recovery_evidence: Keep entries backed by uncommitted
         cleanup evidence so interrupted operator recovery can retry even when
         the attempt's recorded storage differs from the current config.
+    :param bool tracking_only: Resolve only controller operations without Optuna trials.
     :return dict[str, str]: Registered attempt ids mapped to their producing
         generation ids.
     :raises ProcessCleanupUncertainError: A registered attempt could not be
@@ -794,6 +846,8 @@ def _preflight_active_attempts(
             return inspected
         for entry_path in entry_paths:
             entry = _load_attempt_entry(entry_path, directory_fd=directory_fd)
+            if tracking_only and entry["kind"] != "tracking":
+                continue
             attempt_id = entry["attempt_id"]
             inspected[attempt_id] = entry["generation_id"]
             try:
@@ -841,7 +895,7 @@ class _AttemptRecord:
     trial_dir: Path
     generation_id: str | None
     phase_name: str
-    trial_number: int
+    trial_number: int | None
 
 
 class _Discovery(ABC):

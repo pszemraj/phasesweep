@@ -33,6 +33,7 @@ from phasesweep.evidence.evaluation import (
     extractor_config_fingerprint,
     json_float,
 )
+from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
 from phasesweep.evidence.models import (
     EXTRACTOR_KINDS,
     JsonExtractor,
@@ -162,7 +163,14 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     if not isinstance(source, Mapping):
         fail("missing source")
     capture = provenance.get("remote_capture")
-    if capture is not None:
+    if isinstance(capture, Mapping) and capture.get("kind") == "mlflow":
+        from phasesweep.evidence.mlflow import validate_capture
+
+        try:
+            validate_capture(capture)
+        except (ValueError, KeyError, TypeError) as exc:
+            fail(f"invalid MLflow capture: {exc}")
+    elif capture is not None:
         if not isinstance(capture, Mapping) or capture.get("kind") != "wandb":
             fail("invalid remote capture")
         for field in ("base_url", "entity", "project", "run_id", "retrieved_at"):
@@ -195,6 +203,23 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
                 valid = False
             if not valid:
                 fail("invalid remote numeric evidence")
+    if kind == "mlflow":
+        if (
+            source.get("kind") != "mlflow"
+            or not isinstance(capture, Mapping)
+            or capture.get("kind") != "mlflow"
+        ):
+            fail("MLflow objective has no native capture")
+        point = capture["observations"].get(source.get("selection"))
+        evaluation = source.get("evaluation")
+        if (
+            not isinstance(point, Mapping)
+            or not isinstance(evaluation, Mapping)
+            or evaluation.get("progress") != {"axis": "step", "value": point["step"]}
+            or evaluation.get("timestamp") != point["timestamp"]
+        ):
+            fail("MLflow objective has no matching native position")
+        return
     if kind == "wandb":
         if source.get("kind") != "wandb" or not isinstance(capture, Mapping):
             fail("W&B objective has no remote capture")
@@ -280,7 +305,7 @@ def _verify_objective_source_evidence(
     _validate_objective_provenance(provenance, subject=subject)
     source = provenance["source"]
     assert isinstance(source, Mapping)  # required by _validate_objective_provenance
-    if source["kind"] == "wandb":
+    if source["kind"] in {"wandb", "mlflow"}:
         return
     raw_path = str(source["path"])
     candidate = Path(raw_path)
@@ -414,6 +439,8 @@ def _verify_trial_evidence_dir(
     metric_value: float,
     wandb_query: WandbQuery | None,
     constraints: Mapping[str, Any],
+    mlflow_query: dict[str, Any] | None = None,
+    mlflow_target: dict[str, Any] | None = None,
 ) -> None:
     """Require one trial's evidence directory and audit artifacts to still exist.
 
@@ -438,6 +465,8 @@ def _verify_trial_evidence_dir(
     :param float metric_value: Selected scalar recorded by the study or winner.
     :param WandbQuery | None wandb_query: Shared remote evidence binding for this phase.
     :param Mapping[str, Any] constraints: Saved constraint measurements.
+    :param dict[str, Any] | None mlflow_query: Shared native metric selections and gates.
+    :param dict[str, Any] | None mlflow_target: Configured native target and ownership mode.
     :raises TrialEvidenceMissingError: The directory, an audit artifact, the
         generated trainer input, or recorded objective source is missing,
         foreign, or altered.
@@ -482,7 +511,7 @@ def _verify_trial_evidence_dir(
             f"{_TRIAL_EVIDENCE_REMEDY}"
         )
     capture = provenance.get("remote_capture")
-    if capture is not None and capture["run_id"] != attempt_id:
+    if capture is not None and capture.get("kind") == "wandb" and capture["run_id"] != attempt_id:
         raise TrialEvidenceMissingError(f"{subject} W&B capture belongs to another attempt.")
     if wandb_query is not None:
         if (
@@ -504,8 +533,51 @@ def _verify_trial_evidence_dir(
             raise TrialEvidenceMissingError(
                 f"{subject} W&B capture disagrees with its shared constraint/gate evidence."
             )
+    elif mlflow_query is not None:
+        from phasesweep.evidence.mlflow import observation_id
+        from phasesweep.evidence.models import MlflowExtractor
+        from phasesweep.tracking.session import read_binding, read_record
+
+        try:
+            binding = read_binding(trial_dir)
+            expected = read_record(trial_dir / "mlflow-expected.json")
+            if (
+                capture is None
+                or capture.get("kind") != "mlflow"
+                or capture["binding"] != binding
+                or capture["query"] != mlflow_query
+                or binding["attempt_id"] != attempt_id
+                or binding["overrides_sha256"] != trainer_input["sha256"]
+                or any(binding.get(k) != v for k, v in expected.items())
+                or mlflow_target is None
+                or binding["tracking_uri"] != mlflow_target["tracking_uri"]
+                or binding["run_mode"] != mlflow_target["run_mode"]
+                or (
+                    mlflow_target["experiment_id"] is not None
+                    and binding["experiment_id"] != mlflow_target["experiment_id"]
+                )
+            ):
+                raise ValueError("binding, target, or shared query differs")
+            for name, specification in mlflow_query["constraints"].items():
+                point = capture["observations"][
+                    observation_id(MlflowExtractor.model_validate(specification))
+                ]
+                if point["value"] != constraints.get(name):
+                    raise ValueError("constraint selection differs")
+            spec = MlflowExtractor.model_validate(mlflow_query["objective"])
+            identity = observation_id(spec)
+            if (
+                capture["observations"][identity]["value"] != metric_value
+                or provenance["source"].get("selection") != identity
+                or provenance["source"].get("metric_key") != spec.metric_key
+            ):
+                raise ValueError("objective selection differs")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise TrialEvidenceMissingError(
+                f"{subject} MLflow evidence disagrees with its bound attempt: {exc}."
+            ) from exc
     elif capture is not None:
-        raise TrialEvidenceMissingError(f"{subject} has undeclared W&B evidence.")
+        raise TrialEvidenceMissingError(f"{subject} has undeclared remote evidence.")
     if isinstance(extractor, WandbExtractor):
         source = provenance["source"]
         if (
@@ -609,6 +681,13 @@ def _validate_selection_evidence(
                     experiment,
                     next(phase.gates for phase in experiment.phases if phase.name == phase_name),
                 ),
+                mlflow_query=compile_mlflow_query(
+                    experiment,
+                    next(phase.gates for phase in experiment.phases if phase.name == phase_name),
+                ),
+                mlflow_target=None
+                if experiment.mlflow is None
+                else experiment.mlflow.evidence_identity(),
                 constraints={
                     c.name: trial.user_attrs.get(constraint_attr(c.name))
                     for c in experiment.constraints
@@ -665,6 +744,10 @@ def _verify_winner_objective_evidence(
         wandb_query=_wandb_query(
             experiment, next(phase.gates for phase in experiment.phases if phase.name == phase_name)
         ),
+        mlflow_query=compile_mlflow_query(
+            experiment, next(phase.gates for phase in experiment.phases if phase.name == phase_name)
+        ),
+        mlflow_target=None if experiment.mlflow is None else experiment.mlflow.evidence_identity(),
         constraints=selected.constraints,
     )
 
@@ -712,5 +795,7 @@ def _verify_skipped_winner_evidence(
         extractor=experiment.metric.extractor,
         metric_value=winner.metric,
         wandb_query=_wandb_query(experiment, phase.gates),
+        mlflow_query=compile_mlflow_query(experiment, phase.gates),
+        mlflow_target=None if experiment.mlflow is None else experiment.mlflow.evidence_identity(),
         constraints=winner.constraints,
     )

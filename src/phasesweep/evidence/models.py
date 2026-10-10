@@ -269,10 +269,52 @@ class WandbExtractor(_WandbSummarySource):
         return self
 
 
-ObjectiveExtractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
+class MlflowExtractor(_Frozen):
+    """Select a native metric-history observation from the attempt's MLflow run."""
+
+    type: Literal["mlflow"]
+    metric_key: str = Field(min_length=1)
+    select: Literal["last", "min", "max", "step"]
+    step: ConfigInt | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _exact_step(self) -> MlflowExtractor:
+        """Require step exclusively for exact-step selection.
+
+        :raises ValueError: Selector and step disagree.
+        :return MlflowExtractor: Validated extractor.
+        """
+        if (self.select == "step") != (self.step is not None):
+            raise ValueError("MLflow step is required exactly when select=step.")
+        return self
+
+
+class MlflowRequiredGate(_Frozen):
+    """Require finite metrics and named metadata on the bound MLflow run."""
+
+    type: Literal["mlflow_required"]
+    metrics: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
+    params: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
+    tags: list[Annotated[str, Field(min_length=1)]] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _requirements(self) -> MlflowRequiredGate:
+        """Require at least one presence declaration.
+
+        :raises ValueError: The gate declares no requirements.
+        :return MlflowRequiredGate: Validated gate.
+        """
+        if not (self.metrics or self.params or self.tags):
+            raise ValueError("mlflow_required needs metrics, params, or tags.")
+        return self
+
+
+ObjectiveExtractor = (
+    JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor | MlflowExtractor
+)
 Extractor = ObjectiveExtractor
 
-ExtractorKind = Literal["json", "json_envelope", "log_regex", "wandb"]
+ExtractorKind = Literal["json", "json_envelope", "log_regex", "wandb", "mlflow"]
 """The ``type`` of every objective extractor, as recorded evidence names it."""
 
 EXTRACTOR_KINDS: frozenset[ExtractorKind] = frozenset(get_args(ExtractorKind))
@@ -316,8 +358,8 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         against the runtime's own identity before accepting the result.
         Other readers have no reported identity fields to check, so it is
         ``False``.
-      - ``source_identity_keyed`` is ``True`` for W&B: the normalized target
-        and exact attempt ID identify its finished summary. Local readers use
+      - ``source_identity_keyed`` is ``True`` for W&B and MLflow: the target
+        and bound run ID identify their finished evidence. Local readers use
         location-addressed files. W&B makes no envelope metadata assurances.
 
     :param ObjectiveExtractor extractor: Configured objective extractor to describe.
@@ -347,9 +389,9 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
         }
     return {
         "kind": extractor.type,
-        "attempt_location_scoped": not isinstance(extractor, WandbExtractor),
+        "attempt_location_scoped": not isinstance(extractor, WandbExtractor | MlflowExtractor),
         "attempt_identity_bound": False,
-        "source_identity_keyed": isinstance(extractor, WandbExtractor),
+        "source_identity_keyed": isinstance(extractor, WandbExtractor | MlflowExtractor),
         "objective_name_bound": False,
         "split_bound": False,
         "evaluation_policy_bound": False,
@@ -621,6 +663,7 @@ Gate = Annotated[
     | JsonScalarBoundGate
     | ArtifactSizeGate
     | Sha256Gate
-    | WandbSummaryRequiredGate,
+    | WandbSummaryRequiredGate
+    | MlflowRequiredGate,
     Field(discriminator="type"),
 ]

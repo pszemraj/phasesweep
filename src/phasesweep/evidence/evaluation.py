@@ -22,6 +22,8 @@ from phasesweep.evidence.models import (
     JsonExtractor,
     JsonScalarBoundGate,
     LogRegexExtractor,
+    MlflowExtractor,
+    MlflowRequiredGate,
     RequiredFileGate,
     Sha256Gate,
     WandbExtractor,
@@ -42,7 +44,7 @@ from phasesweep.runtime.time import utc_now_iso
 
 # Version of the objective evidence provenance payload frozen alongside a
 # metric at extraction time (review v0.5.17 / finding F).
-EVIDENCE_PROVENANCE_SCHEMA_VERSION = 2
+EVIDENCE_PROVENANCE_SCHEMA_VERSION = 3
 # Bump when log-regex selection semantics change. The revision is frozen into
 # each trial's extractor contract, so selection and replay reject readings
 # made under an older interpretation even when the package version is absent.
@@ -160,6 +162,10 @@ class TrialContext:
     wandb_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
     wandb_query: WandbQuery | None = None
     wandb_capture: dict[str, Any] = field(default_factory=dict, compare=False)
+    mlflow_settings: dict[str, Any] | None = None
+    mlflow_query: dict[str, Any] | None = None
+    mlflow_environment: Mapping[str, str] | None = field(default=None, repr=False, compare=False)
+    mlflow_capture: dict[str, Any] = field(default_factory=dict, compare=False)
 
 
 def _extract_json(
@@ -623,11 +629,99 @@ def locate_objective_position(
     )
 
 
+def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> dict[str, Any]:
+    """Read each native history once, after verifying the exact bound run.
+
+    :param TrialContext ctx: Attempt and configured capture contract.
+    :param float | None deadline: Existing execution deadline.
+    :return dict[str, Any]: Shared frozen evidence.
+    :raises ExtractorError: Binding or remote evidence cannot be accepted.
+    """
+    import time
+
+    from phasesweep.evidence.mlflow import validate_capture
+    from phasesweep.tracking.mlflow import request_operation
+    from phasesweep.tracking.session import read_binding, read_record
+
+    if ctx.mlflow_capture:
+        return ctx.mlflow_capture
+    if ctx.mlflow_settings is None or ctx.mlflow_query is None:
+        raise ExtractorError("MLflow capture requires a configured target and query.")
+    try:
+        binding = read_binding(ctx.trial_dir)
+        expected = read_record(ctx.trial_dir / "mlflow-expected.json")
+        if (
+            any(binding.get(k) != v for k, v in expected.items())
+            or binding["attempt_id"] != ctx.attempt_id
+            or binding["generation_id"] != ctx.generation_id
+            or binding["overrides_sha256"] != ctx.overrides_sha256
+        ):
+            raise ValueError("MLflow binding belongs to a different attempt or target.")
+        stop = time.monotonic() + ctx.mlflow_settings["timeout_seconds"]
+        capture = request_operation(
+            {
+                "action": "capture",
+                "settings": ctx.mlflow_settings,
+                "binding": binding,
+                "query": ctx.mlflow_query,
+            },
+            operation_id=ctx.attempt_id,
+            directory=ctx.trial_dir,
+            environment=ctx.mlflow_environment or {},
+            deadline=min(stop, deadline) if deadline is not None else stop,
+        )
+        validate_capture(capture)
+    except TimeoutError as exc:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise DeadlineExceededError(str(exc)) from exc
+        raise ExtractorError(str(exc)) from exc
+    except (OSError, ValueError, RuntimeError) as exc:
+        if isinstance(exc, UnsafeProcessCleanupError):
+            raise
+        raise ExtractorError(str(exc)) from exc
+    ctx.mlflow_capture.update(capture)
+    return ctx.mlflow_capture
+
+
+def _extract_mlflow(
+    ctx: TrialContext,
+    cfg: MlflowExtractor,
+    provenance: dict[str, Any] | None,
+    *,
+    deadline: float | None = None,
+) -> float:
+    """Return a selected native metric and retain its native position.
+
+    :param TrialContext ctx: Bound attempt.
+    :param MlflowExtractor cfg: Metric selector.
+    :param dict[str, Any] | None provenance: Objective evidence sink.
+    :param float | None deadline: Existing execution deadline.
+    :return float: Selected metric value.
+    """
+    from phasesweep.evidence.mlflow import observation_id
+
+    capture = _capture_mlflow(ctx, deadline=deadline)
+    point = capture["observations"][observation_id(cfg)]
+    if provenance is not None:
+        provenance["source"] = {
+            "kind": "mlflow",
+            "metric_key": cfg.metric_key,
+            "selection": observation_id(cfg),
+            "evaluation": {
+                "progress": {"axis": "step", "value": point["step"]},
+                "timestamp": point["timestamp"],
+            },
+        }
+        provenance["remote_capture"] = dict(capture)
+    return float(point["value"])
+
+
 _DISPATCH: dict[type, Callable[..., float]] = {
     JsonExtractor: _extract_json,
     JsonEnvelopeExtractor: _extract_json_envelope,
     LogRegexExtractor: _extract_log_regex,
     WandbExtractor: _extract_wandb,
+    MlflowExtractor: _extract_mlflow,
 }
 
 
@@ -855,6 +949,23 @@ def _sha256(ctx: TrialContext, gate: Sha256Gate) -> GateResult:
     return GateResult(gate.type, False, f"{gate.path} sha256 {digest} != {gate.sha256}")
 
 
+def _mlflow_required(
+    ctx: TrialContext, gate: MlflowRequiredGate, *, deadline: float | None = None
+) -> GateResult:
+    """Check presence from the same verified native metric capture.
+
+    :param TrialContext ctx: Bound attempt.
+    :param MlflowRequiredGate gate: Required namespaces.
+    :param float | None deadline: Existing execution deadline.
+    :return GateResult: Presence result.
+    """
+    try:
+        _capture_mlflow(ctx, deadline=deadline)
+    except ExtractorError as exc:
+        return GateResult(gate.type, False, str(exc), isinstance(exc, DeadlineExceededError))
+    return GateResult(gate.type, True, "MLflow metrics, parameters, and tags are present")
+
+
 def _wandb_summary_required(
     ctx: TrialContext, gate: WandbSummaryRequiredGate, *, deadline: float | None = None
 ) -> GateResult:
@@ -888,6 +999,7 @@ _GATE_DISPATCH: dict[type, Callable[[TrialContext, Any], GateResult]] = {
     ArtifactSizeGate: _artifact_size,
     Sha256Gate: _sha256,
     WandbSummaryRequiredGate: _wandb_summary_required,
+    MlflowRequiredGate: _mlflow_required,
 }
 
 
@@ -931,6 +1043,8 @@ def evaluate_gates(
         results.append(
             _wandb_summary_required(ctx, gate, deadline=deadline)
             if isinstance(gate, WandbSummaryRequiredGate)
+            else _mlflow_required(ctx, gate, deadline=deadline)
+            if isinstance(gate, MlflowRequiredGate)
             else fn(ctx, gate)
         )
     return results

@@ -2,7 +2,7 @@
   "config_fingerprint": "028e0ae227e984f3e0ba40afad2921234a2387a221b33f6d7dc54a1b2fb839cf",
   "config_snapshot": {
     "path": "config.snapshot.yaml",
-    "sha256": "be4f46e2a798e0e8e802da204fda6a6cded4be67fc6825e885b4af59c249b1cf"
+    "sha256": "921d922f37b3ff463560ba92feec55305d0fd65aa43f0b6d6123675c4ce177ad"
   },
   "experiment": "t",
   "generation_id": "cd4512ad12d842a1ab02d436d9e82348",
@@ -13,7 +13,7 @@
       "sha256": "62efce7e3c5c0b67956a99a3845b28713beaa382d959821ba510af5e5afac392"
     }
   ],
-  "phasesweep_version": "0.3.4",
+  "phasesweep_version": "0.3.6",
   "provenance": {
     "revision": "golden-fixture-v1"
   },

@@ -10,14 +10,10 @@ import argparse
 import importlib
 import json
 import math
-import os
-import shlex
-import sys
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Literal
 
 from phasesweep.runtime.json import progress_position
@@ -173,24 +169,6 @@ def _error_detail(exc: Exception) -> str:
     return f"{type(exc).__name__}{suffix}"
 
 
-def _poll_worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
-    """Retain composed credentials and the orchestrator's Python bootstrap.
-
-    :param Mapping[str, str] | None environment: Composed trainer environment, or
-        ``None`` for the orchestrator's own environment.
-    :return dict[str, str]: Worker environment whose ``PYTHON*`` variables match
-        the orchestrator's exactly.
-    """
-    worker_environment = dict(os.environ if environment is None else environment)
-    for name in set(worker_environment) | set(os.environ):
-        if name.startswith("PYTHON"):
-            if name in os.environ:
-                worker_environment[name] = os.environ[name]
-            else:
-                worker_environment.pop(name, None)
-    return worker_environment
-
-
 def _run_worker(
     request: Mapping[str, Any],
     *,
@@ -200,77 +178,28 @@ def _run_worker(
     environment: Mapping[str, str] | None,
     deadline: float,
 ) -> tuple[ProcessResult, dict[str, Any], Path | None]:
-    """Run one supervised worker request in the attempt's process slot.
+    """Run a W&B request in the registered attempt's process slot.
 
-    :param Mapping[str, Any] request: Worker request, including its ``task``.
-    :param frozenset[str] statuses: Response statuses the task can report; any
-        other outcome preserves the worker's stderr for diagnosis.
-    :param str run_id: Immutable attempt ID, also used by process recovery.
-    :param Path trial_dir: Existing attempt directory and durable process slot.
-    :param Mapping[str, str] | None environment: Actual composed trainer environment.
-    :param float deadline: Absolute ``time.monotonic()`` time the worker is stopped at.
-    :return tuple[ProcessResult, dict[str, Any], Path | None]: The worker's
-        process result, its response (empty when it wrote none), and the
-        preserved stderr path, if any.
-    :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
+    :param Mapping[str, Any] request: Backend request payload.
+    :param frozenset[str] statuses: Accepted worker response statuses.
+    :param str run_id: PhaseSweep attempt identity, not a remote run ID.
+    :param Path trial_dir: Registered process slot.
+    :param Mapping[str, str] | None environment: Composed trainer environment.
+    :param float deadline: Absolute monotonic operation deadline.
+    :return tuple[ProcessResult, dict[str, Any], Path | None]: Process, response, diagnostic.
     """
-    from phasesweep.errors import UnsafeProcessCleanupError
-    from phasesweep.runtime.files import private_atomic_write_text
-    from phasesweep.runtime.process import run_supervised
-    from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
+    from phasesweep.runtime.remote_worker import run_worker
 
-    diagnostic_path: Path | None = None
-    with TemporaryDirectory(prefix="phasesweep-wandb-") as directory:
-        worker_dir = Path(directory)
-        request_path = worker_dir / "request.json"
-        response_path = worker_dir / "response.json"
-        stderr_path = worker_dir / "stderr.log"
-        private_atomic_write_text(request_path, json.dumps(dict(request)))
-        with (
-            (worker_dir / "stdout.log").open("w", encoding="utf-8") as stdout,
-            stderr_path.open("w", encoding="utf-8") as stderr,
-        ):
-            # Never let a previous safe trainer identity hide a failed worker launch.
-            (trial_dir / PROCESS_IDENTITY_FILE).unlink(missing_ok=True)
-            result = run_supervised(
-                shlex.join(
-                    [
-                        sys.executable,
-                        "-P",
-                        str(Path(__file__).resolve()),
-                        str(request_path),
-                        str(response_path),
-                    ]
-                ),
-                env=_poll_worker_environment(environment),
-                stdout=stdout,
-                stderr=stderr,
-                timeout=max(0.0, deadline - time.monotonic()),
-                wallclock_deadline=deadline,
-                trial_dir=trial_dir,
-                attempt_id=run_id,
-            )
-        if not result.cleanup_confirmed:
-            raise UnsafeProcessCleanupError(
-                f"W&B worker cleanup is uncertain for attempt {run_id!r}; recover {trial_dir}."
-            )
-        response = (
-            json.loads(response_path.read_text(encoding="utf-8")) if response_path.is_file() else {}
-        )
-        if not result.timed_out and (
-            result.return_code != 0
-            or result.failure_reason is not None
-            or response.get("status") not in statuses
-        ):
-            diagnostic = stderr_path.read_text(encoding="utf-8", errors="replace")
-            if diagnostic:
-                diagnostic_path = trial_dir / _WORKER_STDERR_LOG
-                private_atomic_write_text(
-                    diagnostic_path,
-                    diagnostic,
-                    require_private_dir=False,
-                )
-    return result, response, diagnostic_path
+    return run_worker(
+        request,
+        Path(__file__).resolve(),
+        "wandb",
+        statuses=statuses,
+        run_id=run_id,
+        trial_dir=trial_dir,
+        environment=environment,
+        deadline=deadline,
+    )
 
 
 def poll_wandb_summary(

@@ -110,6 +110,11 @@ def _semantic_core(experiment: Experiment) -> dict[str, Any]:
         "provenance": dict(sorted(experiment.provenance.items())),
         "metric": experiment.metric.model_dump(mode="json"),
         "constraints": [c.model_dump(mode="json") for c in experiment.constraints],
+        **(
+            {"mlflow": experiment.mlflow.evidence_identity()}
+            if experiment.mlflow is not None
+            else {}
+        ),
     }
 
 

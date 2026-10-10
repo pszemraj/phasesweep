@@ -1,0 +1,40 @@
+experiment: native_mlflow
+storage: journal:///./runs/native_mlflow.journal
+workdir: ./runs
+provenance:
+  trainer: phasesweep-deterministic-mlflow-v1
+trial_command: "python -m phasesweep.examples.mlflow_train --config {config_path}"
+trainer_config:
+  model: {depth: 1}
+  optimizer: {rate: 0}
+execution:
+  inherit_env: [PATH]
+mlflow:
+  tracking_uri: http://127.0.0.1:5000
+  experiment_name: phasesweep-native
+  run_mode: managed
+metric:
+  name: eval_loss
+  goal: minimize
+  extractor: {type: mlflow, metric_key: eval/loss, select: last}
+constraints:
+  - name: cost
+    extractor: {type: mlflow, metric_key: cost, select: last}
+    max: 5
+phases:
+  - name: depth
+    n_trials: 2
+    sampler: {type: grid}
+    search_space:
+      model.depth: {type: categorical, choices: [1, 2]}
+    gates:
+      - type: mlflow_required
+        metrics: [eval/loss, cost]
+        params: [depth, rate]
+        tags: [trainer]
+  - name: rate
+    inherits: [depth]
+    n_trials: 2
+    sampler: {type: grid}
+    search_space:
+      optimizer.rate: {type: categorical, choices: [1, 3]}

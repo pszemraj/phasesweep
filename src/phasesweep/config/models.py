@@ -46,6 +46,7 @@ from phasesweep.runtime.files import (
     local_storage_url,
     storage_backend,
 )
+from phasesweep.tracking.models import MlflowSettings
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
 
@@ -579,6 +580,7 @@ class Experiment(_Frozen):
         ),
     )
     override_format: OverrideFormat = "yaml_file"
+    mlflow: MlflowSettings | None = None
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
     phases: list[Phase] = Field(min_length=1)
@@ -793,6 +795,9 @@ class Experiment(_Frozen):
             _validate_sampler_resumability(self.resolved_storage, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
+            from phasesweep.evidence.mlflow import compile_query
+
+            compile_query(self, phase.gates)
             query = _wandb_query(self, phase.gates, gate_location=f"phases[{len(seen)}].gates")
             if query is not None:
                 compose_wandb_environment(query, self.env, self.env)

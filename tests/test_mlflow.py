@@ -1,0 +1,490 @@
+"""Native MLflow configuration, history, binding, and retry contracts."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+from pydantic import ValidationError
+
+from phasesweep.config import Experiment, MlflowSettings
+from phasesweep.evidence.mlflow import compile_query, observation_id, select_observation
+from phasesweep.evidence.models import MlflowExtractor
+from phasesweep.tracking.mlflow import _capture, _create
+
+
+def spec(selection="last", **kwargs):
+    """Build an explicit native history selector."""
+    return MlflowExtractor(type="mlflow", metric_key="loss", select=selection, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "selection,kwargs,expected",
+    [("last", {}, 7), ("min", {}, 2), ("max", {}, 9), ("step", {"step": 1}, 2)],
+)
+def test_ordering(selection, kwargs, expected):
+    history = [
+        {"value": 7, "step": 3, "timestamp": 2},
+        {"value": 2, "step": 1, "timestamp": 4},
+        {"value": 9, "step": 0, "timestamp": 5},
+        {"value": 3, "step": 1, "timestamp": 2},
+    ]
+    assert select_observation(history, spec(selection, **kwargs))["value"] == expected
+
+
+@pytest.mark.parametrize("selection", ["min", "max"])
+def test_tie_earliest_position(selection):
+    history = [
+        {"value": 2, "step": 4, "timestamp": 1},
+        {"value": 2, "step": 1, "timestamp": 3},
+        {"value": 2, "step": 1, "timestamp": 2},
+    ]
+    assert select_observation(history, spec(selection)) == {"value": 2.0, "step": 1, "timestamp": 2}
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        [],
+        [{"value": True, "step": 0, "timestamp": 1}],
+        [{"value": float("nan"), "step": 0, "timestamp": 1}],
+        [{"value": 1, "step": 0, "timestamp": 1}, {"value": 2, "step": 0, "timestamp": 1}],
+        [{"value": 1, "step": -1, "timestamp": 1}],
+    ],
+)
+def test_invalid_history(history):
+    with pytest.raises(ValueError):
+        select_observation(history, spec())
+
+
+@pytest.mark.parametrize("uri", ["databricks", "databricks://WorkProfile", "http://localhost:5000"])
+def test_native_target_spelling(uri):
+    assert MlflowSettings(tracking_uri=uri, experiment_name="existing").tracking_uri == uri
+
+
+@pytest.mark.parametrize("extra", [{}, {"experiment_id": "1", "experiment_name": "x"}])
+def test_exactly_one_experiment(extra):
+    with pytest.raises(ValidationError):
+        MlflowSettings(tracking_uri="databricks", **extra)
+
+
+def test_selector_requires_explicit_step():
+    with pytest.raises(ValidationError):
+        spec("step")
+    with pytest.raises(ValidationError):
+        spec("last", step=2)
+
+
+def _binding():
+    return {
+        "schema_version": 1,
+        "tracking_uri": "http://localhost:5000",
+        "experiment_id": "1",
+        "run_id": "native-id",
+        "experiment": "test",
+        "phase": "p",
+        "generation_id": "a" * 32,
+        "attempt_id": "b" * 32,
+        "overrides_sha256": "c" * 64,
+        "run_mode": "managed",
+    }
+
+
+def _run(binding, *, status="FINISHED", metrics=None):
+    from phasesweep.tracking.mlflow import identity_tags
+
+    return SimpleNamespace(
+        info=SimpleNamespace(
+            run_id=binding["run_id"],
+            experiment_id=binding["experiment_id"],
+            lifecycle_stage="active",
+            status=status,
+        ),
+        data=SimpleNamespace(
+            tags=identity_tags(binding), params={}, metrics=metrics or {"loss": 2.0}
+        ),
+    )
+
+
+def test_shared_history_once():
+    binding = _binding()
+    selectors = [spec("last"), spec("min"), spec("step", step=1)]
+    query = {
+        "revision": 1,
+        "selections": {observation_id(s): s.model_dump() for s in selectors},
+        "gates": [],
+    }
+    calls = []
+
+    def history(run_id, key):
+        calls.append((run_id, key))
+        return [
+            SimpleNamespace(value=2.0, step=1, timestamp=2),
+            SimpleNamespace(value=3.0, step=2, timestamp=1),
+        ]
+
+    client = SimpleNamespace(get_run=lambda _: _run(binding), get_metric_history=history)
+    capture = _capture(
+        client,
+        {
+            "binding": binding,
+            "query": query,
+            "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
+        },
+    )
+    assert calls == [(binding["run_id"], "loss")]
+    assert [capture["observations"][observation_id(s)]["value"] for s in selectors] == [3, 2, 2]
+
+
+@pytest.mark.parametrize("status", ["FAILED", "KILLED"])
+def test_unsuccessful_remote_cannot_be_finished(status):
+    binding = _binding()
+    client = SimpleNamespace(get_run=lambda _: _run(binding, status=status))
+    with pytest.raises(ValueError, match="unsuccessfully"):
+        _capture(client, {"binding": binding, "query": {}, "settings": {"timeout_seconds": 1}})
+
+
+def test_uncertain_creation_reconciles_without_creating():
+    binding = _binding()
+    run = _run(binding)
+
+    class Page(list):
+        token = None
+
+    client = SimpleNamespace(
+        get_experiment=lambda _: SimpleNamespace(experiment_id="1", lifecycle_stage="active"),
+        search_runs=lambda *a, **k: Page([run]),
+    )
+    result = _create(
+        client, {"binding": binding, "settings": {"experiment_id": "1"}, "allow_create": False}
+    )
+    assert result == binding
+    client.search_runs = lambda *a, **k: Page()
+    with pytest.raises(ValueError, match="Refusing a duplicate"):
+        _create(
+            client, {"binding": binding, "settings": {"experiment_id": "1"}, "allow_create": False}
+        )
+
+
+def test_no_cross_backend_publishing(tmp_path):
+    config = {
+        "experiment": "test",
+        "workdir": str(tmp_path),
+        "trial_command": "true {overrides}",
+        "mlflow": {"tracking_uri": "databricks", "experiment_id": "1"},
+        "phases": [
+            {
+                "name": "p",
+                "n_trials": 1,
+                "search_space": {"x": {"type": "categorical", "choices": [1]}},
+            }
+        ],
+    }
+    config["override_format"] = "hydra"
+    config["metric"] = {
+        "name": "loss",
+        "goal": "minimize",
+        "extractor": {"type": "json", "path": "result.json", "key": "loss"},
+    }
+    with pytest.raises(ValidationError, match="MLflow objective"):
+        Experiment.model_validate(config)
+
+
+def native_experiment(tmp_path):
+    """Build the complete native example in an isolated artifact namespace."""
+    from pathlib import Path
+
+    import yaml
+
+    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config.update(workdir=str(tmp_path), storage=None)
+    return Experiment.model_validate(config)
+
+
+def test_lost_acknowledgment_reconciles_exact_intent(tmp_path, monkeypatch):
+    """A successful remote create with a lost response never causes a second create."""
+    from phasesweep.tracking import session
+
+    binding = _binding()
+    identity = {k: v for k, v in binding.items() if k != "run_id"}
+    path = tmp_path / "mlflow-binding.json"
+    calls = []
+
+    def operation(request, **kwargs):
+        assert session.read_record(path.with_suffix(".intent.json")) == identity
+        calls.append(request["allow_create"])
+        if len(calls) == 1:
+            raise RuntimeError("Remote create succeeded but response was lost")
+        return binding
+
+    monkeypatch.setattr(session, "request_operation", operation)
+    actual = session._create_bound(
+        native_experiment(tmp_path), identity, path, {}, deadline=None, attempt_directory=tmp_path
+    )
+    assert actual == binding
+    assert calls == [True, False]
+    assert session.read_binding(tmp_path) == binding
+
+
+@pytest.mark.parametrize("field", ["run_id", "experiment_id", "attempt_id"])
+def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, field):
+    from phasesweep.evidence.evaluation import ExtractorError, TrialContext, _capture_mlflow
+    from phasesweep.tracking import session
+
+    binding = _binding()
+    expected = {k: v for k, v in binding.items() if k != "run_id"}
+    if field == "run_id":
+        expected["run_id"] = "another-run"
+    else:
+        binding[field] = "another-identity"
+    session.write_record(tmp_path / "mlflow-expected.json", expected)
+    session.write_record(tmp_path / "mlflow-binding.json", binding)
+    experiment = native_experiment(tmp_path)
+    ctx = TrialContext(
+        experiment="test",
+        phase="p",
+        trial_id=0,
+        generation_id="a" * 32,
+        attempt_id="b" * 32,
+        overrides_sha256="c" * 64,
+        trial_dir=tmp_path,
+        run_name="test",
+        return_code=0,
+        duration_seconds=1,
+        mlflow_settings=experiment.mlflow.model_dump(),
+        mlflow_query=compile_query(experiment, []),
+    )
+
+    def remote(*args, **kwargs):
+        pytest.fail("A foreign binding must not contact MLflow")
+
+    monkeypatch.setattr("phasesweep.tracking.mlflow.request_operation", remote)
+    with pytest.raises(ExtractorError, match="different attempt"):
+        _capture_mlflow(ctx, deadline=None)
+
+
+def test_trainer_run_is_never_finished_by_controller():
+    binding = {**_binding(), "run_mode": "trainer"}
+    client = SimpleNamespace(get_run=lambda _: _run(binding, status="RUNNING"))
+    with pytest.raises(TimeoutError, match="missing or delayed"):
+        _capture(client, {"binding": binding, "query": {}, "settings": {"timeout_seconds": 0}})
+
+
+def test_missing_metric_is_not_replaced_by_result_metric():
+    binding = _binding()
+    query = {"selections": {observation_id(spec()): spec().model_dump()}, "gates": []}
+    client = SimpleNamespace(get_run=lambda _: _run(binding, metrics={"phasesweep.objective": 1}))
+    with pytest.raises(TimeoutError, match="missing or delayed"):
+        _capture(client, {"binding": binding, "query": query, "settings": {"timeout_seconds": 0}})
+
+
+def test_failed_trainer_never_reads_remote_metrics(tmp_path, monkeypatch):
+    from phasesweep.engine.trial import ExecutedTrial, extract_trial_result
+    from phasesweep.evidence.evaluation import TrialContext
+    from phasesweep.runtime.process import ProcessResult
+
+    experiment = native_experiment(tmp_path)
+    ctx = TrialContext(
+        experiment="test",
+        phase="p",
+        trial_id=0,
+        generation_id="a" * 32,
+        attempt_id="b" * 32,
+        overrides_sha256="c" * 64,
+        trial_dir=tmp_path,
+        run_name="test",
+        return_code=1,
+        duration_seconds=1,
+    )
+
+    def remote(*args, **kwargs):
+        pytest.fail("Failed trainer evidence is never read")
+
+    monkeypatch.setattr("phasesweep.engine.trial.run_extractor", remote)
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=ExecutedTrial(
+            ctx, ProcessResult(return_code=1, timed_out=False, pid=0, duration_seconds=1)
+        ),
+    )
+    assert result.metric is None and result.failure_reason
+
+
+def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
+    from phasesweep.tracking import publication
+    from phasesweep.tracking.session import read_record, tracking_root
+
+    experiment = native_experiment(tmp_path)
+    binding = _binding()
+    projection = publication._projection(
+        metrics={"phasesweep.objective": 2.0}, params={}, tags={}, summary={"metric": 2.0}
+    )
+    from phasesweep.engine.attempts import _register_active_attempt
+    from phasesweep.engine.paths import _attempts_dir
+    from phasesweep.runtime.process import write_attempt_lifecycle
+
+    trial_dir = tmp_path / "unfinished-training"
+    trial_dir.mkdir()
+    write_attempt_lifecycle(trial_dir, attempt_id="d" * 32, state="allocated")
+    _register_active_attempt(
+        experiment,
+        attempt_id="d" * 32,
+        phase_name="depth",
+        study_name="training",
+        trial_number=0,
+        trial_dir=trial_dir,
+        generation_id=binding["generation_id"],
+    )
+
+    def outage(*args, **kwargs):
+        raise RuntimeError("Disconnected")
+
+    monkeypatch.setattr(publication, "call_tracking", outage)
+    publication._enqueue(experiment, binding["generation_id"], "test", binding, projection, {})
+    assert publication.delivery_status(experiment) == {"pending": 1, "delivered": 0}
+    requests = []
+
+    def deliver(experiment, generation_id, request, environment):
+        requests.append(request)
+        return {}
+
+    monkeypatch.setattr(publication, "call_tracking", deliver)
+    assert publication.sync_tracking(experiment, binding["generation_id"]) == {
+        "pending": 0,
+        "delivered": 1,
+    }
+    assert requests[0]["action"] == "publish"
+    assert requests[0]["projection"] == projection
+    record = read_record(
+        tracking_root(experiment) / binding["generation_id"] / "delivery/test.json"
+    )
+    assert record["projection"] == projection
+    assert publication.sync_tracking(experiment, binding["generation_id"])["pending"] == 0
+    assert len(requests) == 1
+    assert (_attempts_dir(experiment) / f"{'d' * 32}.json").exists()
+
+
+def test_mcp_status_projects_only_mutable_delivery_counts(tmp_path, monkeypatch):
+    from phasesweep.engine.read import read_status
+    from phasesweep.mcp.redaction import status_payload
+    from phasesweep.tracking import publication
+
+    experiment = native_experiment(tmp_path)
+    scientific = read_status(experiment)
+
+    def outage(*args, **kwargs):
+        raise RuntimeError("Disconnected")
+
+    monkeypatch.setattr(publication, "call_tracking", outage)
+    binding = _binding()
+    publication._enqueue(
+        experiment,
+        binding["generation_id"],
+        "test",
+        binding,
+        publication._projection(metrics={}, params={}, tags={}, summary={}),
+        {},
+    )
+    current = read_status(experiment)
+    assert current["tracking_delivery"] == {"pending": 1, "delivered": 0}
+    assert {k: v for k, v in current.items() if k != "tracking_delivery"} == {
+        k: v for k, v in scientific.items() if k != "tracking_delivery"
+    }
+    result = status_payload(
+        "catalog-id", current, {}, result_source="current_shared_study", elapsed_seconds=None
+    )
+    assert result["tracking_delivery"] == current["tracking_delivery"]
+    assert "localhost" not in str(result) and str(tmp_path) not in str(result)
+
+
+def test_tracking_registry_recovery_cannot_fail_optuna_trial(tmp_path):
+    import optuna
+
+    from phasesweep.engine.attempts import (
+        _preflight_active_attempts,
+        _PreflightCleanupReport,
+        _register_tracking_operation,
+    )
+    from phasesweep.engine.paths import _attempts_dir
+    from phasesweep.runtime.process import write_attempt_lifecycle
+
+    experiment = native_experiment(tmp_path)
+    study = optuna.create_study()
+    study.ask()
+    directory = tmp_path / "operation"
+    directory.mkdir()
+    write_attempt_lifecycle(directory, attempt_id="a" * 32, state="allocated")
+    _register_tracking_operation(
+        experiment, operation_id="a" * 32, generation_id="b" * 32, directory=directory
+    )
+    _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
+    assert study.trials[0].state == optuna.trial.TrialState.RUNNING
+    assert not list(_attempts_dir(experiment).glob("*.json"))
+
+
+def test_cache_uses_home_and_xdg(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from phasesweep.runtime.files import cache_dir
+
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    assert cache_dir() == Path.home() / ".cache/phasesweep"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    assert cache_dir() == tmp_path / "phasesweep"
+
+
+def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch):
+    from phasesweep.engine import NoFeasibleTrialError, run_experiment
+    from phasesweep.runtime.gpu import GpuPool
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("MLflow unavailable")
+
+    def no_lease(*args, **kwargs):
+        pytest.fail("Run binding must precede GPU acquisition")
+
+    monkeypatch.setattr("phasesweep.tracking.session.prepare_attempt", unavailable)
+    monkeypatch.setattr(GpuPool, "acquire", no_lease)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(native_experiment(tmp_path))
+
+
+@pytest.mark.parametrize("problem", [None, "experiment", "attempt"])
+def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch, problem):
+    import sys
+
+    from phasesweep.tracking import bind_mlflow_run
+    from phasesweep.tracking.session import read_binding, write_record
+
+    binding = {**_binding(), "run_mode": "trainer"}
+    write_record(
+        tmp_path / "mlflow-expected.json", {k: v for k, v in binding.items() if k != "run_id"}
+    )
+    for key in ("attempt_id", "generation_id", "overrides_sha256"):
+        monkeypatch.setenv("PHASESWEEP_" + key.upper(), binding[key])
+    monkeypatch.setenv("PHASESWEEP_TRIAL_DIR", str(tmp_path))
+    run = _run(binding)
+    run.data.tags = {"mlflow.parentRunId": "trainer-parent"}
+    if problem == "experiment":
+        run.info.experiment_id = "foreign"
+    elif problem == "attempt":
+        run.data.tags["phasesweep.attempt_id"] = "foreign"
+    updates = []
+
+    def set_tag(run_id, key, value):
+        updates.append(key)
+        run.data.tags[key] = value
+
+    client = SimpleNamespace(get_run=lambda _: run, set_tag=set_tag)
+    monkeypatch.setitem(
+        sys.modules, "mlflow", SimpleNamespace(MlflowClient=lambda **kwargs: client)
+    )
+    if problem is not None:
+        with pytest.raises(ValueError, match="different experiment|another attempt"):
+            bind_mlflow_run(binding["run_id"])
+        assert not updates
+        assert not (tmp_path / "mlflow-binding.json").exists()
+    else:
+        bind_mlflow_run(binding["run_id"])
+        assert read_binding(tmp_path) == binding
+        assert run.data.tags["mlflow.parentRunId"] == "trainer-parent"

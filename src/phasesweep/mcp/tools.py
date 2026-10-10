@@ -539,6 +539,12 @@ class PhaseSweepMCP(RunControl):
             and result_source != "terminal_snapshot_unavailable"
             else None
         )
+        if comparison is not None and comparison.mlflow is not None:
+            from phasesweep.tracking.publication import delivery_status
+
+            status["tracking_delivery"] = delivery_status(
+                comparison, snapshot.status.represented_generation_id
+            )
         return status
 
     def _status_result(

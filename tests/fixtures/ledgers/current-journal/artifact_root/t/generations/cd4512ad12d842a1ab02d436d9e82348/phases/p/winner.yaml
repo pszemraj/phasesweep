@@ -35,8 +35,8 @@ objective_provenance:
   extractor:
     config_sha256: b7b4aa1d877c36c43b4c3c2c1ff207148492ab08e2b0e0a4096f8b4b43e6e1a2
     kind: log_regex
-  recorded_at: '2026-10-01T10:47:32+00:00'
-  schema_version: 2
+  recorded_at: '2026-10-10T07:45:32+00:00'
+  schema_version: 3
   source:
     kind: file
     match_count: 1
@@ -44,7 +44,7 @@ objective_provenance:
     path: stdout.log
     sha256: 4aefd9d9b7f57cbfc31e8739fd45762b4eef95203a53299f58a0584920ef8087
     size_bytes: 11
-trainer_env_digest: 85d56c77940a2ffbf67c0c5cef4ce0d5df47cec7bea8ec68cbf80abe912b60b9
+trainer_env_digest: 1cdfd4e11f5b9acf3f930aa1d379e91a15b955b547328c716e5aa226a73def05
 trainer_inherit_env: none
 confound:
   schema_version: 1

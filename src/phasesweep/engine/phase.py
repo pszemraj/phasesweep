@@ -911,6 +911,36 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     # GPU lease covers only subprocess lifetime, not extraction (#2).
     try:
+        _refuse_launch_after_deadline(run)
+        prepared_input = prepare_trainer_input(
+            experiment=experiment,
+            phase_name=phase.name,
+            trial_id=trial.number,
+            attempt_id=attempt_id,
+            trial_dir=trial_dir,
+            overrides=overrides,
+        )
+        trial.set_user_attr(TRAINER_INPUT_ATTR, prepared_input.record())
+        if experiment.mlflow is not None:
+            from phasesweep.tracking.session import prepare_attempt
+
+            try:
+                prepare_attempt(
+                    experiment,
+                    phase=phase.name,
+                    generation_id=run.generation_id,
+                    attempt_id=attempt_id,
+                    overrides_sha256=prepared_input.sha256,
+                    directory=trial_dir,
+                    environment=run.environment_identity.values,
+                    deadline=run.optimize_deadline,
+                )
+            except UnsafeProcessCleanupError:
+                raise
+            except (OSError, ValueError, RuntimeError) as exc:
+                if run.optimize_deadline is not None and time.monotonic() >= run.optimize_deadline:
+                    raise _DeadlineTrialExecutionError(f"MLflow run preparation: {exc}") from exc
+                raise TrialExecutionError(f"MLflow run preparation: {exc}") from exc
         with run.gpu_pool.acquire(deadline=run.optimize_deadline) as gpu_assignment:
             # Re-check abort flags inside the lease (review v0.5.2 / blocker 8,
             # extended to fatal objective errors). Without this, queued
@@ -923,19 +953,6 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             if run.aborted:
                 raise optuna.TrialPruned("phase aborted")
 
-            _refuse_launch_after_deadline(run)
-            prepared_input = prepare_trainer_input(
-                experiment=experiment,
-                phase_name=phase.name,
-                trial_id=trial.number,
-                attempt_id=attempt_id,
-                trial_dir=trial_dir,
-                overrides=overrides,
-            )
-            # Persist the historical input identity before the trainer is
-            # started. If this ledger write fails, no subprocess consumes
-            # evidence that the study cannot later verify.
-            trial.set_user_attr(TRAINER_INPUT_ATTR, prepared_input.record())
             _refuse_launch_after_deadline(run)
             executed = launch_trial(
                 experiment=experiment,
@@ -1148,12 +1165,12 @@ def _after_trial(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
 ) -> None:
-    """Post-trial callback: re-assert a tripped abort and snapshot ``trials.csv``.
+    """Retire cleaned attempts, mirror accepted MLflow results, and snapshot CSV.
 
     The threshold decision itself lives in ``_record_outcome``, inside the
     objective's completion-order critical section — a callback observing a
     mutable aggregate counter is race-prone under ``n_jobs > 1`` (review
-    v0.5.17 / blocker 7). This callback only repeats ``study.stop()`` in
+    v0.5.17 / blocker 7). This callback repeats ``study.stop()`` in
     case the tripping thread's stop call failed transiently.
 
     Args:
@@ -1178,6 +1195,16 @@ def _after_trial(
         and not _trial_requires_cleanup_recovery(trial)
     ):
         _retire_active_attempt(run.experiment, finished_attempt)
+    if run.experiment.mlflow is not None and trial.state == optuna.trial.TrialState.COMPLETE:
+        from phasesweep.tracking.publication import publish_trial
+
+        publish_trial(
+            run.experiment,
+            run.generation_id,
+            trial,
+            run.environment_identity.values,
+            run.inherited_winners,
+        )
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     now = time.monotonic()
     if run.csv_throttle.should_write(finished, now):

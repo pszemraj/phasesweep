@@ -362,6 +362,13 @@ class PhaseStatusPayload(_ToolPayload):
     )
 
 
+class TrackingDeliveryPayload(_ToolPayload):
+    """Mutable path-free upload counts, separate from accepted scientific facts."""
+
+    pending: int
+    delivered: int
+
+
 class GetRunStatusResult(_ToolPayload):
     """Structured output for get_run_status."""
 
@@ -416,6 +423,7 @@ class GetRunStatusResult(_ToolPayload):
     phases: list[PhaseStatusPayload]
     summary_present: bool
     run: RunPayload
+    tracking_delivery: TrackingDeliveryPayload | None = None
     elapsed_seconds: int | None = Field(
         description=(
             "Seconds since launch while running; total run duration once terminal; "

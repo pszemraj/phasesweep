@@ -723,6 +723,10 @@ def _run_experiment_inner(
         winners=winners,
         publication_hook=publication_hook,
     )
+    if experiment.mlflow is not None:
+        from phasesweep.tracking.publication import publish_generation
+
+        publish_generation(experiment, generation_id, winners)
     log.info("Wrote %s", summary_path)
 
     return winners
@@ -850,6 +854,11 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     integrity = status["publication_integrity"]
     ledger_path = ledger_ops.resolved_ledger_path(experiment)
     return {
+        **(
+            {"tracking_delivery": status["tracking_delivery"]}
+            if "tracking_delivery" in status
+            else {}
+        ),
         "kind": "experiment",
         "experiment": status["experiment"],
         "workdir": str(path_ops._experiment_dir(experiment)),

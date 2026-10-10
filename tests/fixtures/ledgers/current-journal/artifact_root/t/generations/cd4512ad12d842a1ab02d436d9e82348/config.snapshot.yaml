@@ -1,11 +1,12 @@
 experiment: t
-storage: journal:////home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/ledger/study.journal
-workdir: /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root
+storage: journal:////tmp/phasesweep-current-fixture/current-journal/ledger/study.journal
+workdir: /tmp/phasesweep-current-fixture/current-journal/artifact_root
 trial_command: python -c 'print("PSWOBJ=0.5")' {overrides}
 trainer_config: {}
 provenance:
   revision: golden-fixture-v1
 override_format: argparse
+mlflow: null
 metric:
   name: objective
   goal: minimize

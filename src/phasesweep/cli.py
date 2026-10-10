@@ -574,6 +574,37 @@ def status(config_path: Path) -> None:
     _raise_on_failed_publication(payload)
 
 
+@cli.command(
+    "sync-tracking",
+    context_settings=CONTEXT_SETTINGS,
+    help="Retry pending MLflow uploads without training or metric selection.",
+)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
+@click.option(
+    "--generation",
+    "generation_id",
+    required=True,
+    help="Generation ID reported by phasesweep status.",
+)
+def sync_tracking(config_path: Path, generation_id: str) -> None:
+    """Retry the generation's retained native MLflow result projections.
+
+    :param Path config_path: Matching experiment configuration.
+    :param str generation_id: Generation to synchronize.
+    :raises ClickException: Target mismatch or incomplete delivery.
+    """
+    from phasesweep.tracking.publication import sync_tracking as sync
+
+    config = _load_cli_config(config_path)
+    try:
+        counts = sync(config, generation_id)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(yaml.safe_dump(counts, sort_keys=False).rstrip())
+    if counts["pending"]:
+        raise click.ClickException("MLflow uploads remain pending.")
+
+
 @cli.group(
     context_settings=CONTEXT_SETTINGS,
     help="Manage the optional MCP server, catalog, and operator recovery.",

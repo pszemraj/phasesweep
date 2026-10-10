@@ -1,7 +1,7 @@
 schema_version: 3
 experiment: t
 generation_id: cd4512ad12d842a1ab02d436d9e82348
-phasesweep_version: 0.3.4
+phasesweep_version: 0.3.6
 config_fingerprint: 028e0ae227e984f3e0ba40afad2921234a2387a221b33f6d7dc54a1b2fb839cf
 metric:
   name: objective
@@ -55,10 +55,10 @@ phases:
 artifacts:
 - kind: config_snapshot
   path: config.snapshot.yaml
-  sha256: be4f46e2a798e0e8e802da204fda6a6cded4be67fc6825e885b4af59c249b1cf
+  sha256: 921d922f37b3ff463560ba92feec55305d0fd65aa43f0b6d6123675c4ce177ad
 - kind: reproducibility
   path: reproducibility.json
-  sha256: 9152452e4c009935720effb855ebb280dea2bfa813bc956b9cf6c281f970d58a
+  sha256: 65d90d9f69c32dc4052e87c09cfc1f4f0a63e94dc4e0ec488e0435109d2ecdae
 - kind: winner
   phase: p
-  sha256: 0cc2c826638af8f9499a5abbb55b7dd94b25e3396d0a2ed92bef9730afa4d531
+  sha256: 04e35c63e8cd94a61d97b9432c99eafa99b3cf44b1ce04364d39dedd4ca93c42

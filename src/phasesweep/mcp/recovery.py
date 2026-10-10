@@ -721,7 +721,7 @@ def _recover_trial_evidence(
         for attempt_id, record in inspected_attempts.items():
             if record.generation_id == run_id or attempt_id in causal_attempt_ids:
                 evidence.reaped_attempt_ids.add(attempt_id)
-                if record.generation_id is not None:
+                if record.generation_id is not None and record.trial_number is not None:
                     evidence.reaped_attempt_locations[attempt_id] = (
                         record.phase_name,
                         record.trial_number,

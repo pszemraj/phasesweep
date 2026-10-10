@@ -41,7 +41,7 @@ CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 CONFOUND_SCHEMA_VERSION = 1
 
 # Objective kinds whose provenance records a position on the evaluation axis.
-_POSITIONED_KINDS = frozenset({"json_envelope", "wandb"})
+_POSITIONED_KINDS = frozenset({"json_envelope", "wandb", "mlflow"})
 _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "failed", "pruned")
 # Where a terminal trial that selection did not rank is counted. A COMPLETE
 # trial outside the ranked set violated a constraint; a trial that failed an

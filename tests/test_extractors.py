@@ -1101,7 +1101,7 @@ def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
 
     assert value == pytest.approx(0.42)
-    assert provenance["schema_version"] == 2
+    assert provenance["schema_version"] == 3
     assert provenance["extractor"]["kind"] == "json"
     assert provenance["extractor"]["config_sha256"] == extractor_config_fingerprint(cfg)
     assert provenance["source"] == {
