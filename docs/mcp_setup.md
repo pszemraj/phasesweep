@@ -23,15 +23,51 @@ python -m pip install "phasesweep[mcp]"
 ```
 
 Contributor and editable-install setup is in [development](development.md).
-If cataloged experiments read W&B evidence, install the `mcp,wandb` extras
-together in that environment. Config validation and frozen result reads do not
-authenticate; new W&B work requires the SDK and the trainer's composed account
-access.
+Install the tracking extra needed by the cataloged experiment in that same
+environment: `phasesweep[mcp,wandb]` for W&B or `phasesweep[mcp,mlflow]` for
+MLflow. Config validation and frozen scientific result reads do not authenticate.
+New work needs the selected SDK and access to its configured account or server.
+MLflow additionally requires an existing experiment; the client extra does not
+start a tracking server. See [native MLflow setup and run ownership](mlflow.md).
 
 ### 2. Create and review the catalog
 
 If you do not have an experiment yet, `phasesweep init` creates an
 installed-package starter named `experiment.yaml` without overwriting files.
+The [configuration reference](config_reference.yaml) describes the accepted
+experiment fields, including backend selection and environment composition.
+
+Before cataloging a source-checkout trainer, verify the package actually
+imported by the configured Python executable. Running a checkout's example
+script does not make Python import that checkout's library. Match the example
+to its installed library, or explicitly select the checkout's source directory:
+
+```yaml
+execution:
+  cwd: /absolute/path/to/transformers
+  inherit_env: none
+env:
+  PYTHONPATH: /absolute/path/to/transformers/src
+```
+
+Run a CPU-only preflight with that same executable and explicit environment;
+for this example:
+
+```bash
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
+  /absolute/path/to/python -c 'import transformers; print(transformers.__version__); print(transformers.__file__)'
+CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
+  /absolute/path/to/python /absolute/path/to/transformers/examples/pytorch/token-classification/run_ner.py --help
+```
+
+Carry all required settings into the experiment's composed environment:
+`inherit_env: none` drops ambient `PYTHONPATH` and other shell settings.
+Use the actual example's `--help` to choose supported arguments; configuration
+validation does not execute the trainer or establish library compatibility.
+For Transformers with managed MLflow, also apply the
+[full-script run context](mlflow.md#transformers-trainer) before launch so final
+evaluation remains in the bound run. The W&B integration uses its own native
+callback and managed attempt identity.
 
 ```bash
 phasesweep mcp init-catalog --from ./experiment.yaml

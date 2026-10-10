@@ -127,7 +127,31 @@ Here `trainer` is your configured Transformers Trainer. Removing `MLFLOW_RUN_ID`
 before its MLflow callback starts lets the callback use the active run without
 taking ownership of closing it. Otherwise, the callback can close the run when
 training ends, and a later evaluation can log to a different run. When wrapping
-an official example script, keep its entire execution inside this context.
+an official example script, keep its entire execution inside this context. For
+example, save this small launcher next to your experiment configuration:
+
+```python
+import os
+import runpy
+import sys
+
+import mlflow
+
+script = sys.argv[1]
+sys.argv = sys.argv[1:]  # Preserve the example's own argument parsing.
+run_id = os.environ.pop("MLFLOW_RUN_ID")
+with mlflow.start_run(run_id=run_id):
+    runpy.run_path(script, run_name="__main__")
+```
+
+Configure `trial_command` to invoke this launcher with the absolute example
+path followed by its normal arguments and `{overrides}`; set
+`override_format: argparse` for command-line Transformers arguments. This
+launcher is for managed ownership only. It preserves native logging through
+`report_to: [mlflow]`, and an exception exits the context as a failed run.
+Verify that the example imports its matching Transformers package using the
+[trainer environment preflight](mcp_setup.md#2-create-and-review-the-catalog).
+
 Native metrics retain their Trainer names, such as `eval_loss` and
 `eval_rouge1`; choose the exact final optimizer step when comparing fixed
 training budgets.
@@ -240,11 +264,19 @@ metrics again, or rewrite scientific evidence. Already delivered projections
 are skipped. The command exits nonzero if uploads remain pending. Tracking-only
 worker recovery uses the active-work registry without changing Optuna trials.
 
-A failed controller invocation can currently leave its generation-summary run
-marked RUNNING after the attempt runs have failed. This was observed during
-local framework qualification. After confirming that trainer cleanup completed,
-close that abandoned summary explicitly through MLflow; `sync-tracking` retries
-saved result projections and does not repair this missing terminal projection.
+After confirmed cleanup of a failed invocation, PhaseSweep queues a terminal
+projection for its own generation-summary run: FAILED for ordinary failure,
+or KILLED for shutdown or keyboard interruption. Upload failures leave this
+projection pending for `sync-tracking`; the remote summary can remain RUNNING
+until delivery succeeds. This does not change attempt-run status, accepted
+scores, or committed winners. A conflicting remote terminal status is never
+overwritten.
+
+Abrupt controller death, uncertain cleanup, or an unresolved generation binding
+can still leave no terminal projection. These require operator inspection and,
+where indicated, [MCP recovery](mcp.md#run-state-and-recovery) before further
+action. `sync-tracking` retries saved projections; it does not manufacture a
+missing terminal record.
 
 Bindings, creation intents, and mutable delivery records stay under the
 experiment artifact root. Delivery records live in

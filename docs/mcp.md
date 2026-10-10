@@ -83,8 +83,25 @@ cancel_run(run_id)
 
 Save the `run_id` returned by launch. To reconnect from another chat or after a
 client restart, call `get_latest_run(experiment_id)`, then use that returned
-`run_id` for status and results. If it returns `found: false`, there is no run
-to resume. `await_run` is bounded server-side waiting; use it for monitoring
+`run.run_id` for status and results. Launch returns a top-level `run_id`, while
+reconnection nests it under `run`:
+
+```json
+{
+  "experiment_id": "tiny_lm",
+  "found": true,
+  "run": {
+    "run_id": "tiny_lm-0123456789abcdef0123456789abcdef",
+    "state": "running",
+    "started_at": "2026-01-01T00:00:00Z",
+    "recovery_required": false,
+    "failure": null
+  }
+}
+```
+
+If it returns `found: false`, `run` is null and there is no run to resume.
+`await_run` is bounded server-side waiting; use it for monitoring
 rather than tight status polling. Never cancel a run or launch a replacement
 automatically.
 
@@ -153,14 +170,34 @@ nothing about the winner's robustness and never changes or blocks the
 selection. Treat `<redacted>` values as deliberate catalog policy, not
 missing data.
 
-The operator may configure W&B, ordinary JSON, log, or envelope scoring.
-Frozen result reads preserve the producing reader's assurance fields and need
-no W&B SDK, credentials, or remote access. W&B binds its source to the managed
-attempt ID; it does not assert the envelope's evaluation metadata or input
-content guarantees, and only records where in the run's history the
-objective's value was logged. The trainer owns evaluation and aggregation; the
-metric goal ranks the selected trial scalars. Log reduction defaults to `last`
-and is independent of the ranking goal.
+The operator may configure MLflow, W&B, ordinary JSON, log, or envelope scoring.
+Frozen scientific result reads preserve the producing reader's assurance
+fields and need no tracking SDK, credentials, or remote access. W&B reads an
+exact finished-summary key from its managed attempt ID. MLflow reads native
+metric history from the verified bound run in its configured experiment;
+`last`, `min`, `max`, or exact `step` selects the within-trial observation.
+Both record the selected history position, without asserting the envelope's
+evaluation metadata or input-content guarantees. The trainer owns evaluation
+and aggregation; `metric.goal` ranks the selected trial scalars. Log reduction
+defaults to `last` and is independent of the ranking goal. Operators preparing
+native logging should follow [MLflow run ownership and Transformers
+integration](mlflow.md#choose-run-ownership) and the
+[trainer environment preflight](mcp_setup.md#2-create-and-review-the-catalog).
+
+The assurance flags `expected_step_declared` and `expected_step_value_bound`
+describe JSON-envelope metadata checks only. They remain false for MLflow even
+when `select: step` requires an exact native metric-history step. That selector
+does not establish the envelope's split, checkpoint, or evaluation-policy
+guarantees.
+
+For MLflow, `tracking_delivery` reports current local upload counts, separately
+from the frozen scientific outcome. Pending delivery does not invalidate an
+accepted score or winner, and a later retry can change those counts without
+changing the run snapshot. The operator can retry saved projections with
+`phasesweep sync-tracking CONFIG --generation GENERATION_ID`, using the original
+target configuration. This CLI operation does not retrain or select metrics
+again. It is not an MCP agent recovery or replacement-run action. Missing or
+null delivery information does not establish successful delivery.
 
 ## Run state and recovery
 
