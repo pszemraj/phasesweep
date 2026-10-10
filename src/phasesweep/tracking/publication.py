@@ -333,6 +333,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         retried, or ``None`` for every generation's retained deliveries.
     :raises ValueError: No deliveries exist, or the target or generation does
         not match the saved records.
+    :raises PhaseSweepError: The MLflow SDK is not installed.
     :return dict[str, int]: Remaining pending and delivered counts in that scope.
     """
     from phasesweep.config.common import _validate_safe_name
@@ -340,11 +341,13 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
     from phasesweep.engine.locking import _experiment_lock
     from phasesweep.engine.trial import _trainer_environment
     from phasesweep.runtime.shutdown import signal_handler_scope
+    from phasesweep.tracking.mlflow import require_mlflow_sdk
 
     if generation_id is not None:
         _validate_safe_name("generation", generation_id)
     if experiment.mlflow is None:
         raise ValueError("sync-tracking requires MLflow settings.")
+    require_mlflow_sdk()
     with signal_handler_scope(), _experiment_lock(experiment):
         _preflight_active_attempts(
             experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True

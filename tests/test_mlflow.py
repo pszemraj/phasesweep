@@ -520,6 +520,41 @@ def test_cache_uses_home_and_xdg(tmp_path, monkeypatch):
         assert cache_dir() == Path.home() / ".cache/phasesweep"
 
 
+def test_missing_sdk_is_refused_before_any_trial(tmp_path, monkeypatch):
+    from phasesweep.engine import run_experiment
+    from phasesweep.errors import PhaseSweepError
+    from phasesweep.tracking.publication import sync_tracking
+
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    monkeypatch.setattr(
+        "phasesweep.tracking.session.prepare_attempt",
+        lambda *a, **k: pytest.fail("No trial may be allocated without the SDK"),
+    )
+    experiment = native_experiment(tmp_path)
+    for operation in (run_experiment, sync_tracking):
+        with pytest.raises(PhaseSweepError, match=r"phasesweep\[mlflow\]"):
+            operation(experiment)
+
+
+@pytest.mark.parametrize(
+    "missing,expected",
+    [("mlflow", "requires phasesweep[mlflow]"), ("boto3", "needs Python module 'boto3'")],
+)
+def test_worker_names_the_missing_module(tmp_path, monkeypatch, missing, expected):
+    import json
+
+    from phasesweep.tracking import mlflow as worker
+
+    def dispatch(request):
+        raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+
+    monkeypatch.setattr(worker, "_dispatch", dispatch)
+    request, response = tmp_path / "request.json", tmp_path / "response.json"
+    request.write_text(json.dumps({"action": "publish"}))
+    assert worker.main([str(request), str(response)]) == 0
+    assert expected in json.loads(response.read_text())["message"]
+
+
 def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch):
     from phasesweep.engine import NoFeasibleTrialError, run_experiment
     from phasesweep.runtime.gpu import GpuPool

@@ -97,6 +97,7 @@ from phasesweep.runtime.files import (
     phasesweep_home,
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.tracking.mlflow import require_mlflow_sdk
 from tests.conftest import make_experiment, requires_nonroot
 from tests.ledger_fixtures import (
     Materialized,
@@ -1069,6 +1070,12 @@ def _wandb_sdk_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     return require_wandb_sdk()
 
 
+def _mlflow_sdk_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Check for the MLflow SDK in an environment that cannot import it."""
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    return require_mlflow_sdk()
+
+
 def _field_dropped(entry: Path) -> None:
     """Drop a field every current registry entry carries, keeping its owner-only file."""
     payload = json.loads(entry.read_text())
@@ -1421,6 +1428,13 @@ ORIGIN_CASES = (
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
         message='python -m pip install "phasesweep[wandb]"',
+    ),
+    RoutingCase(
+        id="mlflow_sdk_missing",
+        trigger=_mlflow_sdk_not_installed,
+        raised=PhaseSweepError,
+        action=OperatorAction.FIX_CONFIG,
+        message='python -m pip install "phasesweep[mlflow]"',
     ),
     RoutingCase(
         id="registry_entry_partial_schema",

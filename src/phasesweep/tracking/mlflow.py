@@ -19,6 +19,26 @@ from phasesweep.runtime.time import utc_now_iso
 _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
 
 
+def require_mlflow_sdk() -> None:
+    """Check that the optional SDK is installed before allocating tracked work.
+
+    The check locates the package without importing it: importing MLflow
+    starts its client telemetry, which belongs in the supervised workers.
+
+    :raises PhaseSweepError: The MLflow client package is not installed.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("mlflow") is None:
+        from phasesweep.errors import OperatorAction, PhaseSweepError
+
+        raise PhaseSweepError(
+            "MLflow tracking requires the optional SDK in the PhaseSweep environment. "
+            'Install this distribution with its mlflow extra: python -m pip install "phasesweep[mlflow]".',
+            action=OperatorAction.FIX_CONFIG,
+        )
+
+
 def request_operation(
     request: dict[str, Any],
     *,
@@ -320,10 +340,13 @@ def main(argv: list[str] | None = None) -> int:
     request = json.loads(args.request.read_text(encoding="utf-8"))
     try:
         response = {"status": "ok", "result": _dispatch(request)}
-    except ImportError:
+    except ImportError as exc:
+        missing = exc.name or "an optional dependency"
         response = {
             "status": "error",
-            "message": "MLflow requires phasesweep[mlflow] in the controller environment.",
+            "message": "MLflow requires phasesweep[mlflow] in the controller environment."
+            if missing.partition(".")[0] == "mlflow"
+            else f"MLflow {request['action']} needs Python module {missing!r}, which is not installed in the controller environment.",
         }
     except (ValueError, TimeoutError) as exc:
         response = {"status": "error", "message": str(exc)}

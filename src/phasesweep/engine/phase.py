@@ -1460,9 +1460,12 @@ def _run_phase(
 
     from phasesweep.config.models import _wandb_query
     from phasesweep.evidence.wandb import require_wandb_sdk
+    from phasesweep.tracking.mlflow import require_mlflow_sdk
 
     if _wandb_query(experiment, phase.gates) is not None:
         require_wandb_sdk()
+    if experiment.mlflow is not None:
+        require_mlflow_sdk()
 
     gpu_pool = GpuPool.create(
         n_jobs=phase.n_jobs,
