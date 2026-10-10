@@ -337,6 +337,9 @@ def bind_trainer_run(run_id: str) -> None:
     run = client.get_run(run_id)
     if run.info.experiment_id != expected["experiment_id"] or run.info.lifecycle_stage != "active":
         raise ValueError("Trainer MLflow run belongs to a different experiment.")
+    # An ended run predates this attempt, so its metrics cannot be its evidence.
+    if run.info.status != "RUNNING":
+        raise ValueError("Bind the trainer's MLflow run while it is still RUNNING.")
     tags = identity_tags(binding)
     if any(key in run.data.tags and run.data.tags[key] != value for key, value in tags.items()):
         raise ValueError("Trainer MLflow run already belongs to another attempt.")

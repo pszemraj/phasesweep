@@ -73,7 +73,7 @@ with mlflow.start_run() as run:
     mlflow.log_metric("eval/loss", 0.42, step=100)
 ```
 
-The helper verifies the configured experiment, attaches PhaseSweep identity tags, and writes the local binding. It does not log or replace metrics. PhaseSweep never discovers runs by name or recency, finishes trainer-owned runs, or changes their existing parent relationships. The trainer must close its run successfully before evidence can be accepted. Existing framework loggers must expose their actual run ID and honor this ownership contract; other logger integrations require their own qualification.
+The helper verifies the configured experiment and that the run is still RUNNING, attaches PhaseSweep identity tags, and writes the local binding. It does not log or replace metrics. PhaseSweep never discovers runs by name or recency, finishes trainer-owned runs, or changes their existing parent relationships. The trainer must close its run successfully before evidence can be accepted. Existing framework loggers must expose their actual run ID and honor this ownership contract; other logger integrations require their own qualification.
 
 ### Transformers Trainer
 

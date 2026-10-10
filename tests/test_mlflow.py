@@ -571,7 +571,7 @@ def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch):
         run_experiment(native_experiment(tmp_path))
 
 
-@pytest.mark.parametrize("problem", [None, "experiment", "attempt"])
+@pytest.mark.parametrize("problem", [None, "experiment", "attempt", "finished"])
 def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch, problem):
     import sys
 
@@ -585,7 +585,7 @@ def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch
     for key in ("attempt_id", "generation_id", "overrides_sha256"):
         monkeypatch.setenv("PHASESWEEP_" + key.upper(), binding[key])
     monkeypatch.setenv("PHASESWEEP_TRIAL_DIR", str(tmp_path))
-    run = _run(binding)
+    run = _run(binding, status="FINISHED" if problem == "finished" else "RUNNING")
     run.data.tags = {"mlflow.parentRunId": "trainer-parent"}
     if problem == "experiment":
         run.info.experiment_id = "foreign"
@@ -602,7 +602,7 @@ def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch
         sys.modules, "mlflow", SimpleNamespace(MlflowClient=lambda **kwargs: client)
     )
     if problem is not None:
-        with pytest.raises(ValueError, match="different experiment|another attempt"):
+        with pytest.raises(ValueError, match="different experiment|another attempt|RUNNING"):
             bind_mlflow_run(binding["run_id"])
         assert not updates
         assert not (tmp_path / "mlflow-binding.json").exists()
