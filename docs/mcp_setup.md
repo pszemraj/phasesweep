@@ -15,25 +15,13 @@ that provides the server executable:
 python -m pip install "phasesweep[mcp]"
 ```
 
-Contributor and editable-install setup is in [development](development.md).
-Install the tracking extra needed by the cataloged experiment in that same
-environment: `phasesweep[mcp,wandb]` for W&B or `phasesweep[mcp,mlflow]` for
-MLflow. Config validation and frozen scientific result reads do not authenticate.
-New work needs the selected SDK and access to its configured account or server.
-MLflow additionally requires an existing experiment; the client extra does not
-start a tracking server. See [native MLflow setup and run ownership](mlflow.md).
+Contributor and editable-install setup is in [development](development.md). Install the tracking extra needed by the cataloged experiment in that same environment: `phasesweep[mcp,wandb]` for W&B or `phasesweep[mcp,mlflow]` for MLflow. Config validation and frozen scientific result reads do not authenticate. New work needs the selected SDK and access to its configured account or server. MLflow additionally requires an existing experiment; the client extra does not start a tracking server. See [native MLflow setup and run ownership](mlflow.md).
 
 ### 2. Create and review the catalog
 
-If you do not have an experiment yet, `phasesweep init` creates an
-installed-package starter named `experiment.yaml` without overwriting files.
-The [configuration reference](config_reference.yaml) describes the accepted
-experiment fields, including backend selection and environment composition.
+If you do not have an experiment yet, `phasesweep init` creates an installed-package starter named `experiment.yaml` without overwriting files. The [configuration reference](config_reference.yaml) describes the accepted experiment fields, including backend selection and environment composition.
 
-Before cataloging a source-checkout trainer, follow the
-[trainer environment preflight](config.md#source-checkout-preflight) to verify
-its imported library and supported arguments under the configured environment.
-Then create the catalog:
+Before cataloging a source-checkout trainer, follow the [trainer environment preflight](config.md#source-checkout-preflight) to verify its imported library and supported arguments under the configured environment. Then create the catalog:
 
 ```bash
 phasesweep mcp init-catalog --from ./experiment.yaml
@@ -61,10 +49,7 @@ state layout without launching a sweep.
 
 ### 3. Configure your client
 
-You manage the client files; PhaseSweep does not create, edit, inspect, or
-remove them. Follow your client's official documentation for its configuration
-file, scope, and restart behavior. Configure a stdio server with the absolute
-`phasesweep-mcp` executable and the absolute reviewed catalog path:
+You manage the client files; PhaseSweep does not create, edit, inspect, or remove them. Follow your client's official documentation for its configuration file, scope, and restart behavior. Configure a stdio server with the absolute `phasesweep-mcp` executable and the absolute reviewed catalog path:
 
 ```text
 /absolute/path/to/phasesweep-mcp --catalog /absolute/path/to/catalog.yaml

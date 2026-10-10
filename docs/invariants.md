@@ -1,9 +1,6 @@
 # Durability invariants
 
-The experiment lock serializes local ledger mutations. Artifact-root and
-format checks precede claims, durable outcome records precede terminal trial
-states, and generation validation precedes the publication-pointer commit.
-Operator recovery identifies processes from durable attempt and run records.
+The experiment lock serializes local ledger mutations. Artifact-root and format checks precede claims, durable outcome records precede terminal trial states, and generation validation precedes the publication-pointer commit. Operator recovery identifies processes from durable attempt and run records.
 
 > [!IMPORTANT]
 > Error text is authoritative, and a wrap preserves the operator's remediation.
@@ -21,13 +18,7 @@ Every path into the ledger passes through `engine.ledger`, and the handle each
 step returns is the proof the earlier steps ran. The diagram shows where each
 caller enters and where it must stop.
 
-`engine.ledger` is the only module that constructs Optuna storage; no other
-module imports its private names. No module constructs sqlite3, SQLAlchemy,
-or Optuna RDB storage. `tests/test_ledger_contract.py` parses every package
-module and compares banned references against two ratchets for equality.
-Both `_LEGACY_SITES` and `_LEGACY_PRIVATE_IMPORTS` are empty, so any new site
-outside the ledger module fails. [Development](development.md#quality-gates)
-describes the contract-test hooks and CI.
+`engine.ledger` is the only module that constructs Optuna storage; no other module imports its private names. No module constructs sqlite3, SQLAlchemy, or Optuna RDB storage. `tests/test_ledger_contract.py` parses every package module and compares banned references against two ratchets for equality. Both `_LEGACY_SITES` and `_LEGACY_PRIVATE_IMPORTS` are empty, so any new site outside the ledger module fails. [Development](development.md#quality-gates) describes the contract-test hooks and CI.
 
 ```mermaid
 flowchart TD
@@ -418,11 +409,7 @@ which never reads `Winner.confound`, and
 
 ## Detached-run recovery rationale
 
-A dead runner without terminal status may still have trials being reaped, so
-invariant 16 keeps its capacity slot occupied until `recover-run` decides from
-durable evidence. Invariant 7 governs that recovery's ledger access. Process
-identity includes the boot id because PID and `/proc` start time can both be
-reused after reboot; an unknown boot id on either side refuses to signal.
+A dead runner without terminal status may still have trials being reaped, so invariant 16 keeps its capacity slot occupied until `recover-run` decides from durable evidence. Invariant 7 governs that recovery's ledger access. Process identity includes the boot id because PID and `/proc` start time can both be reused after reboot; an unknown boot id on either side refuses to signal.
 
 ### Persisted spawned handle
 
@@ -433,6 +420,4 @@ spawns a duplicate sweep against the same ledger. The handle is created before
 identity, and confirmed through a ready/ack handshake, so no child ever exists
 without a durable handle naming it.
 
-**Held by:** `mcp.run_control.RunControl._spawn`, `_terminate_failed_spawn`,
-and `_pending_handle`; `mcp.runner._persist_spawned_handle` refuses to persist
-a runner receipt without a boot id.
+**Held by:** `mcp.run_control.RunControl._spawn`, `_terminate_failed_spawn`, and `_pending_handle`; `mcp.runner._persist_spawned_handle` refuses to persist a runner receipt without a boot id.

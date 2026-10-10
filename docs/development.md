@@ -199,18 +199,14 @@ duplicate uploads fail visibly.
   immutable generation publication, and read-only status.
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
-- `phasesweep.tracking`: MLflow run bindings, supervised controller operations,
-  result delivery, and upload retries.
+- `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
 - `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local
   storage URLs, and override rendering.
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable
   run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
-Common package-root calls are `load_experiment`, `run_experiment`, and
-`experiment_status`. Schema types are exported from `phasesweep.config`. Tests
-that need internals import direct modules under `engine`, `evidence`,
-`tracking`, `runtime`, or `mcp`.
+Common package-root calls are `load_experiment`, `run_experiment`, and `experiment_status`. Schema types are exported from `phasesweep.config`. Tests that need internals import direct modules under `engine`, `evidence`, `tracking`, `runtime`, or `mcp`.
 
 Within `phasesweep.engine`, module ownership is intentionally direct:
 
@@ -258,10 +254,8 @@ flowchart TD
 - `tests/test_extractors.py`, `tests/test_trial_evidence.py`, and
   `tests/test_trial_launch.py`: scalar evidence, shared W&B captures, gates,
   supervised trials, and durable input verification.
-- `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native
-  history selection, run bindings, shared captures, and terminal delivery retries.
-- `tests/test_mlflow_integration.py`: both ownership modes against a temporary
-  HTTP server, stopped-server replay, worker cleanup, and delivery retries.
+- `tests/test_mlflow.py` and `tests/test_mlflow_terminal_delivery.py`: native history selection, run bindings, shared captures, and terminal delivery retries.
+- `tests/test_mlflow_integration.py`: both ownership modes against a temporary HTTP server, stopped-server replay, worker cleanup, and delivery retries.
 - `tests/test_fingerprint.py`, `tests/test_runtime_behavior.py`,
   `tests/test_publication_transaction.py`, and `tests/test_engine_read.py`:
   continuation, current-format publication, and read-only views.

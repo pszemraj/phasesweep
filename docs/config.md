@@ -11,16 +11,7 @@ duplicate YAML mapping keys and unsupported fields before it creates run
 artifacts. A top-level `suite` is rejected: write each component as its own
 complete experiment YAML file and review its defaults explicitly.
 
-Field types, defaults, and validation constraints are in
-[config_reference.yaml](config_reference.yaml). It is a signature reference,
-not runnable YAML; start with [example.yaml](../examples/example.yaml) for
-one local CPU toy-trainer attempt. Both CLI commands take an explicit config
-path. YAML values override built-in defaults; CLI execution flags and ambient
-environment do not form a general config-key overlay. Config is read once per
-invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal
-and `execution.cwd` paths resolve against the invocation directory, rather
-than the YAML file. MCP's separate catalog and detached-launch path rules are
-documented in the [operator reference](mcp.md#the-catalog).
+Field types, defaults, and validation constraints are in [config_reference.yaml](config_reference.yaml). It is a signature reference, not runnable YAML; start with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Both CLI commands take an explicit config path. YAML values override built-in defaults; CLI execution flags and ambient environment do not form a general config-key overlay. Config is read once per invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal and `execution.cwd` paths resolve against the invocation directory, rather than the YAML file. MCP's separate catalog and detached-launch path rules are documented in the [operator reference](mcp.md#the-catalog).
 
 ## Experiment YAML
 
@@ -61,10 +52,7 @@ phases:
       optimizer.lr: {type: float, low: 0.00001, high: 0.001, log: true}
 ```
 
-Choose `storage: auto` or a `journal:///...` URL for persistent local work,
-with a nonempty `provenance` mapping. `storage: null` is disposable. See
-[storage and locks](runtime.md#storage-and-locks) for path resolution,
-artifact-root binding, and continuation behavior.
+Choose `storage: auto` or a `journal:///...` URL for persistent local work, with a nonempty `provenance` mapping. `storage: null` is disposable. See [storage and locks](runtime.md#storage-and-locks) for path resolution, artifact-root binding, and continuation behavior.
 
 ## Phase composition
 
@@ -134,9 +122,7 @@ fixes that key; its `adamw` then becomes the origin that descendants inherit.
 
 ## Search spaces and samplers
 
-`search_space` maps dotted trainer-config paths to `float`, `int`, or
-`categorical` parameter objects. To audit seed variance deliberately, set
-`allow_seed_search: true`; ordinary sweeps reject seed keys.
+`search_space` maps dotted trainer-config paths to `float`, `int`, or `categorical` parameter objects. To audit seed variance deliberately, set `allow_seed_search: true`; ordinary sweeps reject seed keys.
 
 > [!IMPORTANT]
 > YAML decides scalar types before PhaseSweep reads fixed overrides or categorical
@@ -145,17 +131,9 @@ fixes that key; its `adamw` then becomes the origin that descendants inherit.
 > usable. Write a decimal value (or an exponent with a decimal mantissa) for a
 > numeric override, and quote a value when you intend a string category.
 
-Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's
-trial target covers its concrete combinations unless `allow_partial_grid: true`
-is set; CMA-ES accepts numeric spaces only. Sampler-specific limits and fields
-are listed in the [reference](config_reference.yaml).
+Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's trial target covers its concrete combinations unless `allow_partial_grid: true` is set; CMA-ES accepts numeric spaces only. Sampler-specific limits and fields are listed in the [reference](config_reference.yaml).
 
-For persistent storage, `random`, `tpe`, and `cmaes` need a seed. TPE and
-CMA-ES also require `acknowledge_nonresumable: true`: their target must finish
-in one invocation rather than being resumed or enlarged across processes.
-See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation)
-for trial accounting, partial results, and sampler continuation, and
-[confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
+For persistent storage, `random`, `tpe`, and `cmaes` need a seed. TPE and CMA-ES also require `acknowledge_nonresumable: true`: their target must finish in one invocation rather than being resumed or enlarged across processes. See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation) for trial accounting, partial results, and sampler continuation, and [confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
 
 ## Trainer inputs
 
@@ -196,23 +174,14 @@ Use the reader that matches the trainer's existing reporting:
 - `wandb` reads an exact scalar key such as `eval/loss` from the finished run
   whose ID is the immutable trial attempt ID. It requires the optional
   `wandb` extra and an authorized entity/project.
-- `mlflow` reads native metric history from the bound finished run. It requires
-  the optional `mlflow` extra, an existing experiment in the top-level `mlflow`
-  block, and an explicit `select: last | min | max | step`. See the
-  [MLflow guide](mlflow.md) for ownership, selection, and result delivery.
+- `mlflow` reads native metric history from the bound finished run. It requires the optional `mlflow` extra, an existing experiment in the top-level `mlflow` block, and an explicit `select: last | min | max | step`. See the [MLflow guide](mlflow.md) for ownership, selection, and result delivery.
 - `json_envelope` reads an attempt-bound versioned envelope from a
   trial-relative path. Python trainers can call `phasesweep.report_objective`
   to write it to the managed `PHASESWEEP_OBJECTIVE_PATH`.
 - `log_regex` reads a trial-relative log file and selects a numeric named
   `(?P<value>...)` match; `select: last` remains the default.
 
-`constraints` use the same scalar readers. A valid measured constraint violation
-is a completed but infeasible trial; missing or invalid evidence fails the trial.
-Phase `gates` include `required_file`, `json_equals`, `json_scalar_bound`,
-`artifact_size`, `sha256`, `wandb_summary_required`, and `mlflow_required`.
-`mlflow_required` separately names `metrics`, `params`, and `tags` from the
-same bound run. A failed gate fails the trial. There is no
-advisory gate mode or baseline substitution.
+`constraints` use the same scalar readers. A valid measured constraint violation is a completed but infeasible trial; missing or invalid evidence fails the trial. Phase `gates` include `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, `wandb_summary_required`, and `mlflow_required`. `mlflow_required` separately names `metrics`, `params`, and `tags` from the same bound run. A failed gate fails the trial. There is no advisory gate mode or baseline substitution.
 
 All local evidence paths are relative to the fresh attempt directory; there is
 no latest-file discovery or fallback to a shared result. Objective extraction,
@@ -228,17 +197,7 @@ These scoring decisions are separate:
 - W&B selects an exact finished-summary key; ordinary JSON selects a saved
   path and dotted key.
 - MLflow uses an explicit [native history selector](mlflow.md#select-metrics-and-require-evidence).
-- Envelope `policy` and `expected_step` validate reported metadata; they do
-  not cause evaluation or checkpoint loading. For envelope and W&B objectives,
-  `evaluation_axis` names the training-progress axis the sweep holds fixed;
-  selection's `evaluation_point` confound check compares ranked objectives
-  only on it (see [runtime behavior](runtime.md#confound-verdicts)). It is
-  part of the extractor config, so changing it starts a new study, like
-  `checkpoint`/`expected_step`; constraint extractors may not set it.
-  `json_envelope` defaults to `step`, the envelope's own evaluation step, and
-  any other name must be reported in `evaluation.progress` (via
-  `report_objective(..., progress={...})`); `wandb` defaults to `_step`,
-  W&B's own history step.
+- Envelope `policy` and `expected_step` validate reported metadata; they do not cause evaluation or checkpoint loading. For envelope and W&B objectives, `evaluation_axis` names the training-progress axis the sweep holds fixed; selection's `evaluation_point` confound check compares ranked objectives only on it (see [runtime behavior](runtime.md#confound-verdicts)). It is part of the extractor config, so changing it starts a new study, like `checkpoint`/`expected_step`; constraint extractors may not set it. `json_envelope` defaults to `step`, the envelope's own evaluation step, and any other name must be reported in `evaluation.progress` (via `report_objective(..., progress={...})`); `wandb` defaults to `_step`, W&B's own history step.
 
 For example, in a fixed-token batch-size sweep each trial's optimizer `step`
 count depends on its batch size, so trials differ by design in both `step`
@@ -278,34 +237,11 @@ aggregate from `define_metric("eval/loss", summary="min")` as `eval/loss.min`,
 and that run has no `eval/loss` summary key, so a bare `eval/loss` waits out
 the timeout.
 
-`evaluation_axis` names the history key that marks where `metric_key` was
-measured; it defaults to `_step`, W&B's own history step. Typically it names
-the `define_metric` step metric, e.g. `eval/step` under
-`define_metric("eval/*", step_metric="eval/step")`, or a token counter. Log it
-in the same `log()` call as the metric: W&B fills a step metric missing from a
-call with its previous value, so an axis logged separately lags one
-evaluation behind. It may not name the metric's own series. A plain key is
-positioned at the last row that logged its value. An aggregate key such as
-`eval/loss.min` covers its whole `eval/loss` history series, so it is
-positioned where that series ends: how far the trial trained, not where its
-best value fell, which differs between comparable trials by nature. See
-[trial execution and evidence](runtime.md#trial-execution-and-evidence) for
-the advisory read's deadline and cleanup behavior.
+`evaluation_axis` names the history key that marks where `metric_key` was measured; it defaults to `_step`, W&B's own history step. Typically it names the `define_metric` step metric, e.g. `eval/step` under `define_metric("eval/*", step_metric="eval/step")`, or a token counter. Log it in the same `log()` call as the metric: W&B fills a step metric missing from a call with its previous value, so an axis logged separately lags one evaluation behind. It may not name the metric's own series. A plain key is positioned at the last row that logged its value. An aggregate key such as `eval/loss.min` covers its whole `eval/loss` history series, so it is positioned where that series ends: how far the trial trained, not where its best value fell, which differs between comparable trials by nature. See [trial execution and evidence](runtime.md#trial-execution-and-evidence) for the advisory read's deadline and cleanup behavior.
 
-For plain keys, exact history matches take priority. With no exact match, the
-reader can use the final finite metric row when it differs from the summary by
-one binary64 step and no other neighboring value occurs. Larger or ambiguous
-differences leave the position unavailable. This accommodates observed API
-numeric differences; it cannot establish whether a summary was assigned
-independently, and never changes the accepted scalar.
+For plain keys, exact history matches take priority. With no exact match, the reader can use the final finite metric row when it differs from the summary by one binary64 step and no other neighboring value occurs. Larger or ambiguous differences leave the position unavailable. This accommodates observed API numeric differences; it cannot establish whether a summary was assigned independently, and never changes the accepted scalar.
 
-Within a phase, the primary objective, W&B constraints, and that phase's W&B
-gates must agree on normalized endpoint, entity, project, poll interval, and
-timeout. They share one finished-summary capture. When the objective and
-constraints are local, separate gate-only phases may use different W&B
-targets. A gate-only configuration accepts the first finished
-summary and fails if required keys are missing. Failed, crashed, killed, or
-preempted remote runs cannot win.
+Within a phase, the primary objective, W&B constraints, and that phase's W&B gates must agree on normalized endpoint, entity, project, poll interval, and timeout. They share one finished-summary capture. When the objective and constraints are local, separate gate-only phases may use different W&B targets. A gate-only configuration accepts the first finished summary and fails if required keys are missing. Failed, crashed, killed, or preempted remote runs cannot win.
 
 PhaseSweep supplies `WANDB_BASE_URL`, `WANDB_ENTITY`, `WANDB_PROJECT`,
 `WANDB_RUN_ID`, and `WANDB_RESUME=never`. Trainers must honor those values and
@@ -334,13 +270,9 @@ attempt identity, evidence-path, trainer-input, and GPU variables. Use
 `execution.passthrough_env` for rotating credentials or transport settings.
 Top-level `env` values remain semantic configuration.
 
-See [GPU isolation](runtime.md#gpu-isolation) for discovery precedence and
-how device visibility interacts with environment inheritance.
+See [GPU isolation](runtime.md#gpu-isolation) for discovery precedence and how device visibility interacts with environment inheritance.
 
-When no W&B evidence consumer is configured, trainer-owned `WANDB_*` settings
-are preserved except for an ambient/inherited `WANDB_RUN_ID`, which is removed.
-An ID explicitly configured in top-level `env.WANDB_RUN_ID` remains
-trainer-owned in this case.
+When no W&B evidence consumer is configured, trainer-owned `WANDB_*` settings are preserved except for an ambient/inherited `WANDB_RUN_ID`, which is removed. An ID explicitly configured in top-level `env.WANDB_RUN_ID` remains trainer-owned in this case.
 
 For a trainer that chooses the optional envelope contract:
 
@@ -376,10 +308,7 @@ Python.
 
 ### Source-checkout preflight
 
-Before launching a source-checkout trainer, verify the package actually
-imported by the configured Python executable. Running a checkout's example
-script does not make Python import that checkout's library. Match the example
-to its installed library, or explicitly select the checkout's source directory:
+Before launching a source-checkout trainer, verify the package actually imported by the configured Python executable. Running a checkout's example script does not make Python import that checkout's library. Match the example to its installed library, or explicitly select the checkout's source directory:
 
 ```yaml
 execution:
@@ -389,8 +318,7 @@ env:
   PYTHONPATH: /absolute/path/to/transformers/src
 ```
 
-Run a CPU-only preflight with that same executable and explicit environment;
-for this example:
+Run a CPU-only preflight with that same executable and explicit environment; for this example:
 
 ```bash
 CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
@@ -399,11 +327,4 @@ CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
   /absolute/path/to/python /absolute/path/to/transformers/examples/pytorch/token-classification/run_ner.py --help
 ```
 
-Carry all required settings into the experiment's composed environment:
-`inherit_env: none` drops ambient `PYTHONPATH` and other shell settings.
-Use the actual example's `--help` to choose supported arguments; configuration
-validation does not execute the trainer or establish library compatibility.
-For Transformers with managed MLflow, also apply the
-[full-script run context](mlflow.md#transformers-trainer) before launch so final
-evaluation remains in the bound run. The W&B integration uses its own native
-callback and managed attempt identity.
+Carry all required settings into the experiment's composed environment: `inherit_env: none` drops ambient `PYTHONPATH` and other shell settings. Use the actual example's `--help` to choose supported arguments; configuration validation does not execute the trainer or establish library compatibility. For Transformers with managed MLflow, also apply the [full-script run context](mlflow.md#transformers-trainer) before launch so final evaluation remains in the bound run. The W&B integration uses its own native callback and managed attempt identity.

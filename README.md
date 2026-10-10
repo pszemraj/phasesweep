@@ -43,8 +43,7 @@ phases:
       optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-The packaged fake trainer uses the optional `report_objective(...)` envelope
-helper. Your own trainer can report through W&B, MLflow, ordinary JSON, or logs.
+The packaged fake trainer uses the optional `report_objective(...)` envelope helper. Your own trainer can report through W&B, MLflow, ordinary JSON, or logs.
 
 ## Install and try it
 
@@ -120,11 +119,7 @@ have the trainer honor the supplied W&B identity, and install the extra:
 python -m pip install "phasesweep[wandb]"
 ```
 
-For native MLflow metrics, install `phasesweep[mlflow]`, configure an existing
-experiment in the `mlflow` block, and use
-`extractor: {type: mlflow, metric_key: eval/loss, select: last}`. See the
-[MLflow guide](docs/mlflow.md) for both run ownership modes, a complete CPU
-example, Databricks setup, and retrying result uploads.
+For native MLflow metrics, install `phasesweep[mlflow]`, configure an existing experiment in the `mlflow` block, and use `extractor: {type: mlflow, metric_key: eval/loss, select: last}`. See the [MLflow guide](docs/mlflow.md) for both run ownership modes, a complete CPU example, Databricks setup, and retrying result uploads.
 
 ## Connect an agent
 

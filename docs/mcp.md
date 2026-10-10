@@ -32,16 +32,9 @@ experiments:
     visible_params: none
 ```
 
-The catalog is a separate YAML configuration from the experiment. Both reject
-unknown fields and duplicate YAML keys. The server validates and freezes the
-catalog and referenced experiment configurations at startup. Restart the server
-after editing either; a changed experiment file is refused by launch until it
-is reloaded. An already detached run keeps its submitted configuration snapshot.
+The catalog is a separate YAML configuration from the experiment. Both reject unknown fields and duplicate YAML keys. The server validates and freezes the catalog and referenced experiment configurations at startup. Restart the server after editing either; a changed experiment file is refused by launch until it is reloaded. An already detached run keeps its submitted configuration snapshot.
 
-These are all accepted catalog fields. Entry paths expand `~`; relative
-`state_dir`, `experiments[].config` and `experiments[].cwd` paths resolve against
-the directory containing the catalog, independently of the server's launch
-directory.
+These are all accepted catalog fields. Entry paths expand `~`; relative `state_dir`, `experiments[].config` and `experiments[].cwd` paths resolve against the directory containing the catalog, independently of the server's launch directory.
 
 | Key | Type and default | Behavior |
 |---|---|---|
@@ -72,12 +65,7 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 
 ## Fresh MCP state
 
-`state_dir` is private, owner-only state for handles, logs, audit entries, and
-frozen terminal snapshots. A new path or an empty private directory can be
-initialized with the current format marker. The server refuses existing durable
-run data without that marker, or a malformed or unsupported marker, before
-changing the directory. There is no migration, adoption, or repair path for a
-refused directory: point `state_dir` at a fresh path instead.
+`state_dir` is private, owner-only state for handles, logs, audit entries, and frozen terminal snapshots. A new path or an empty private directory can be initialized with the current format marker. The server refuses existing durable run data without that marker, or a malformed or unsupported marker, before changing the directory. There is no migration, adoption, or repair path for a refused directory: point `state_dir` at a fresh path instead.
 
 ## Tool workflow
 
@@ -102,10 +90,7 @@ get_run_results(run_id)
 cancel_run(run_id)
 ```
 
-Save the `run_id` returned by launch. To reconnect from another chat or after a
-client restart, call `get_latest_run(experiment_id)`, then use that returned
-`run.run_id` for status and results. Launch returns a top-level `run_id`, while
-reconnection nests it under `run`:
+Save the `run_id` returned by launch. To reconnect from another chat or after a client restart, call `get_latest_run(experiment_id)`, then use that returned `run.run_id` for status and results. Launch returns a top-level `run_id`, while reconnection nests it under `run`:
 
 ```json
 {
@@ -121,15 +106,9 @@ reconnection nests it under `run`:
 }
 ```
 
-If it returns `found: false`, `run` is null and there is no run to resume.
-`await_run` is bounded server-side waiting; use it for monitoring
-rather than tight status polling. Never cancel a run or launch a replacement
-automatically.
+If it returns `found: false`, `run` is null and there is no run to resume. `await_run` is bounded server-side waiting; use it for monitoring rather than tight status polling. Never cancel a run or launch a replacement automatically.
 
-`get_run_results` is run-specific. A plain `phasesweep run` can publish winners,
-but it does not create an MCP run record. Its results remain inspectable through
-`phasesweep status` and `phasesweep show-winners`; the server does not create
-handles for an arbitrary existing output tree.
+`get_run_results` is run-specific. A plain `phasesweep run` can publish winners, but it does not create an MCP run record. Its results remain inspectable through `phasesweep status` and `phasesweep show-winners`; the server does not create handles for an arbitrary existing output tree.
 
 ## Reading status responses
 
@@ -154,14 +133,9 @@ Read provenance and labels together:
 | `result_context` | `represented_generation` uses that generation's recorded metric name, goal, and phase plan; `current_config` uses the loaded configuration when no recorded semantics are available. |
 | `published_config_matches_current` | Whether the producing configuration matches the current catalog configuration. `false` means the historical labels may differ from the next run's; null does not establish a match. |
 
-`get_run_results` measures `missing_phases` and `all_phases_have_winners` against
-the represented generation's plan. Report that context with the winners rather
-than relabeling historical results using an edited catalog. The config-match
-comparison is refreshed on terminal reads; the scientific facts stay frozen.
+`get_run_results` measures `missing_phases` and `all_phases_have_winners` against the represented generation's plan. Report that context with the winners rather than relabeling historical results using an edited catalog. The config-match comparison is refreshed on terminal reads; the scientific facts stay frozen.
 
-`publication_integrity` reports the publication validation recorded in the
-response. Terminal responses preserve snapshot-time validation and do not
-revalidate the current publication tree:
+`publication_integrity` reports the publication validation recorded in the response. Terminal responses preserve snapshot-time validation and do not revalidate the current publication tree:
 
 | Value | Meaning |
 | --- | --- |
@@ -174,57 +148,22 @@ revalidate the current publication tree:
 For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and
 report the condition.
 
-Every winner carries frozen, advisory
-[confound verdicts](runtime.md#confound-verdicts). `flagged` lists checks whose
-verdict is `heterogeneous`; report each with its counts before relying on the
-winner or proposing a run whose phases inherit it. `evaluation_point` exposes
-`distinct_values` and `winner_value`; `tie` exposes `tied_trials`.
-`n/a` means a check could not run and must never be read as clean.
-MCP exposes only enums and numbers from these checks; evidence strings such as
-the evaluation-axis config key stay private. The verdicts do not invalidate
-the result, and only the operator decides whether to re-run.
+Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-verdicts). `flagged` lists checks whose verdict is `heterogeneous`; report each with its counts before relying on the winner or proposing a run whose phases inherit it. `evaluation_point` exposes `distinct_values` and `winner_value`; `tie` exposes `tied_trials`. `n/a` means a check could not run and must never be read as clean. MCP exposes only enums and numbers from these checks; evidence strings such as the evaluation-axis config key stay private. The verdicts do not invalidate the result, and only the operator decides whether to re-run.
 
-Also report a winner's `incomplete: true`: a wallclock timeout cut its phase
-short, so selection used a partial population. The confound checks do not cover
-this limitation.
+Also report a winner's `incomplete: true`: a wallclock timeout cut its phase short, so selection used a partial population. The confound checks do not cover this limitation.
 
 `recovery_required: true` means cleanup, launch handoff, or snapshot
 finalization needs operator recovery. Agents should stop rather than guessing
 at process or result state; [run state and recovery](#run-state-and-recovery)
 shows where each case comes from.
 
-Winner results describe selected values, not convergence curves, robustness,
-causality, or unreturned trial history. Confound counts describe the population
-selection ranked, not the winner's robustness. Treat `<redacted>` values as
-deliberate catalog policy, not missing data.
+Winner results describe selected values, not convergence curves, robustness, causality, or unreturned trial history. Confound counts describe the population selection ranked, not the winner's robustness. Treat `<redacted>` values as deliberate catalog policy, not missing data.
 
-The operator may configure MLflow, W&B, ordinary JSON, log, or envelope scoring.
-Frozen scientific result reads preserve the producing reader's assurance
-fields and need no tracking SDK, credentials, or remote access. W&B reads an
-exact finished-summary key from its managed attempt ID. MLflow reads native
-metric history from the verified bound run in its configured experiment;
-`last`, `min`, `max`, or exact `step` selects the within-trial observation.
-Both record the selected history position, without asserting the envelope's
-evaluation metadata or input-content guarantees. The trainer owns evaluation
-and aggregation; `metric.goal` ranks the selected trial scalars. Log reduction
-defaults to `last` and is independent of the ranking goal. Operators preparing
-native logging should follow [MLflow run ownership and Transformers
-integration](mlflow.md#choose-run-ownership) and the
-[trainer environment preflight](config.md#source-checkout-preflight).
+The operator may configure MLflow, W&B, ordinary JSON, log, or envelope scoring. Frozen scientific result reads preserve the producing reader's assurance fields and need no tracking SDK, credentials, or remote access. W&B reads an exact finished-summary key from its managed attempt ID. MLflow reads native metric history from the verified bound run in its configured experiment; `last`, `min`, `max`, or exact `step` selects the within-trial observation. Both record the selected history position, without asserting the envelope's evaluation metadata or input-content guarantees. The trainer owns evaluation and aggregation; `metric.goal` ranks the selected trial scalars. Log reduction defaults to `last` and is independent of the ranking goal. Operators preparing native logging should follow [MLflow run ownership and Transformers integration](mlflow.md#choose-run-ownership) and the [trainer environment preflight](config.md#source-checkout-preflight).
 
-The assurance flags `expected_step_declared` and `expected_step_value_bound`
-describe JSON-envelope metadata checks only. They remain false for MLflow even
-when `select: step` requires an exact native metric-history step. That selector
-does not establish the envelope's split, checkpoint, or evaluation-policy
-guarantees.
+The assurance flags `expected_step_declared` and `expected_step_value_bound` describe JSON-envelope metadata checks only. They remain false for MLflow even when `select: step` requires an exact native metric-history step. That selector does not establish the envelope's split, checkpoint, or evaluation-policy guarantees.
 
-For MLflow, `tracking_delivery` reports current local upload counts, separately
-from the frozen scientific outcome. Pending delivery does not invalidate an
-accepted score or winner, and a later retry can change those counts without
-changing the run snapshot. The operator can retry saved projections with
-the [MLflow delivery command](mlflow.md#result-delivery-and-recovery).
-This is an operator action, not agent recovery or a replacement run. Missing
-or null delivery information does not establish successful delivery.
+For MLflow, `tracking_delivery` reports current local upload counts, separately from the frozen scientific outcome. Pending delivery does not invalidate an accepted score or winner, and a later retry can change those counts without changing the run snapshot. The operator can retry saved projections with the [MLflow delivery command](mlflow.md#result-delivery-and-recovery). This is an operator action, not agent recovery or a replacement run. Missing or null delivery information does not establish successful delivery.
 
 ## Run state and recovery
 

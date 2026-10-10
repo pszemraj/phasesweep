@@ -54,47 +54,22 @@ shareable generation identity record. Trial directories retain local evidence
 and attempt lifecycle information used for supported continuation and winner
 validation.
 
-MLflow-backed experiments additionally retain native run bindings in each trial
-directory and mutable delivery state under `tracking/<generation-id>/`.
-These records support upload retries and are separate from the committed
-scientific manifests. Disposable supervised-worker scratch uses
-`~/.cache/phasesweep/<backend>/workers/`, or the corresponding
-`XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`.
-Each operation removes its temporary directory. Host lock placement retains
-its separate OS-account-home contract. See [MLflow tracking](mlflow.md) for
-ownership and offline replay.
+MLflow-backed experiments additionally retain native run bindings in each trial directory and mutable delivery state under `tracking/<generation-id>/`. These records support upload retries and are separate from the committed scientific manifests. Disposable supervised-worker scratch uses `~/.cache/phasesweep/<backend>/workers/`, or the corresponding `XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`. Each operation removes its temporary directory. Host lock placement retains its separate OS-account-home contract. See [MLflow tracking](mlflow.md) for ownership and offline replay.
 
 ### Confound verdicts
 
-Each phase's `winner.yaml` carries a `confound` block: advisory verdicts on
-the population that selection ranked to pick the winner, computed once and
-frozen at selection time. It never blocks selection or publication and has no
-YAML switches or threshold settings. The authoritative copy belongs to the
-published generation; [invariant 19](invariants.md#19-a-confound-verdict-never-joins-a-fingerprint-or-gets-read-as-clean)
-describes its integrity, fingerprints, top-ups, and inheritance.
+Each phase's `winner.yaml` carries a `confound` block: advisory verdicts on the population that selection ranked to pick the winner, computed once and frozen at selection time. It never blocks selection or publication and has no YAML switches or threshold settings. The authoritative copy belongs to the published generation; [invariant 19](invariants.md#19-a-confound-verdict-never-joins-a-fingerprint-or-gets-read-as-clean) describes its integrity, fingerprints, top-ups, and inheritance.
 
-The block runs three checks, each `ok` (checked, nothing found),
-`heterogeneous` (checked, found a potential confound, with evidence), or
-`n/a` (could not be checked - never treat this as clean):
+The block runs three checks, each `ok` (checked, nothing found), `heterogeneous` (checked, found a potential confound, with evidence), or `n/a` (could not be checked - never treat this as clean):
 
-- `evaluation_point`: whether the ranked objectives share a training-progress
-  position. Envelope and W&B objectives use the configured `evaluation_axis`,
-  such as optimizer step or tokens; MLflow objectives use the selected native
-  observation's step. Positions within 1% of the highest count as the same
-  point, and the exact positions are recorded either way. See
-  [W&B evidence](config.md#wb-evidence) for aggregate positions. `n/a` for `json` and
-  `log_regex` extractors, which report no position; when a ranked objective has
-  no recorded position or unreadable provenance; or when only one trial was ranked.
+- `evaluation_point`: whether the ranked objectives share a training-progress position. Envelope and W&B objectives use the configured `evaluation_axis`, such as optimizer step or tokens; MLflow objectives use the selected native observation's step. Positions within 1% of the highest count as the same point, and the exact positions are recorded either way. See [W&B evidence](config.md#wb-evidence) for aggregate positions. `n/a` for `json` and `log_regex` extractors, which report no position; when a ranked objective has no recorded position or unreadable provenance; or when only one trial was ranked.
 - `survivorship`: whether failed and pruned trials were at least as numerous
   as the ranked ones, so that whatever made configurations fail could have
   decided which ones were ranked. Failed trials include evidence-gate and
   extraction failures. Infeasible trials, which violated a constraint, are
   counted too but never flag: the experiment's own constraints define what
   may win. This check always runs.
-- `tie`: whether the trial-number tiebreak chose between trials with
-  different params tied on the exact metric value, rather than between
-  repeats of one configuration. The lowest trial number wins a tie.
-  `n/a` with one ranked trial.
+- `tie`: whether the trial-number tiebreak chose between trials with different params tied on the exact metric value, rather than between repeats of one configuration. The lowest trial number wins a tie. `n/a` with one ranked trial.
 
 Selection logs one `WARNING` naming every flagged check and its numbers, and
 a phase that is about to build on a flagged parent winner logs its own
@@ -133,13 +108,7 @@ lock namespace and the MCP `state_dir`.
 
 ## Storage and locks
 
-`storage: null`, or omitting `storage`, is in-memory and ends with the process;
-it cannot be resumed or topped up by a later invocation. Persistent local
-storage is an explicit `journal:///...` URL, or `auto`, which always resolves
-to `<workdir>/<experiment>/study.journal`, regardless of `n_jobs`. The journal
-backend supports parallel trials (`n_jobs > 1`) on one host. Any other storage
-value, including `sqlite:///...`, `:memory:`, and external database URLs, is
-refused at config load; the error names the supported forms.
+`storage: null`, or omitting `storage`, is in-memory and ends with the process; it cannot be resumed or topped up by a later invocation. Persistent local storage is an explicit `journal:///...` URL, or `auto`, which always resolves to `<workdir>/<experiment>/study.journal`, regardless of `n_jobs`. The journal backend supports parallel trials (`n_jobs > 1`) on one host. Any other storage value, including `sqlite:///...`, `:memory:`, and external database URLs, is refused at config load; the error names the supported forms.
 
 The selected artifact root and ledger are bound to each other in both
 directions:
@@ -158,26 +127,9 @@ A reused root therefore cannot combine a second ledger's trial counts with the
 first ledger's publication, and a reused ledger cannot publish into a second
 tree. Both refusals happen before any trial runs and write nothing.
 
-Runs and confirmed MCP recovery check the tree's binding and then the ledger's
-format before mutating the ledger. When either check fails, the command stops
-and leaves both byte-for-byte as they were. Read-only commands,
-including `status`, `show-winners`, and `run --dry-run`, never create a missing
-ledger or its directory. A process killed while it appended to the journal
-can leave a partial final record, which every reader skips. The next
-`phasesweep run` or confirmed `phasesweep mcp recover-run` cuts it under
-Optuna's own journal lock, after saving the journal as
-`<ledger>.<UTC stamp>.bak` beside it, with permissions no broader than the
-ledger's. The killed process can also leave that
-lock behind, as `<ledger>.lock`. If the lock is still held after 30 seconds,
-the command refuses and names it: once no process is writing the ledger,
-remove the lock and run the command again. A record damaged anywhere before
-the last is refused as corruption. Contributors will find the ordering rules
-behind these guarantees, and the tests that hold them, in
-[durability invariants](invariants.md).
+Runs and confirmed MCP recovery check the tree's binding and then the ledger's format before mutating the ledger. When either check fails, the command stops and leaves both byte-for-byte as they were. Read-only commands, including `status`, `show-winners`, and `run --dry-run`, never create a missing ledger or its directory. A process killed while it appended to the journal can leave a partial final record, which every reader skips. The next `phasesweep run` or confirmed `phasesweep mcp recover-run` cuts it under Optuna's own journal lock, after saving the journal as `<ledger>.<UTC stamp>.bak` beside it, with permissions no broader than the ledger's. The killed process can also leave that lock behind, as `<ledger>.lock`. If the lock is still held after 30 seconds, the command refuses and names it: once no process is writing the ledger, remove the lock and run the command again. A record damaged anywhere before the last is refused as corruption. Contributors will find the ordering rules behind these guarantees, and the tests that hold them, in [durability invariants](invariants.md).
 
-MLflow delivery retries use the experiment lock and validate their saved target
-and generation, but do not open or mutate the ledger. See
-[result delivery and recovery](mlflow.md#result-delivery-and-recovery).
+MLflow delivery retries use the experiment lock and validate their saved target and generation, but do not open or mutate the ledger. See [result delivery and recovery](mlflow.md#result-delivery-and-recovery).
 
 Persistent phases use same-host locks. A concurrent CLI or MCP launch for the
 same experiment waits or fails safely according to the operation; it never
@@ -224,44 +176,15 @@ JSON identifies the nested overrides file. Argparse and Hydra retain the
 resolved-overrides identity together with the command. Historical inputs are
 verified using their saved format.
 
-W&B polling starts only after successful trainer cleanup and GPU-lease release.
-It uses the same durable attempt slot and process supervisor, so recovery can
-find the reader after abrupt parent exit, even if its phase was removed.
-Uncertain cleanup blocks further work. One absolute polling deadline covers
-worker startup, SDK construction, requests, retries, and summary visibility;
-phase/run deadlines can shorten it, while cleanup grace stays separate. Once
-the trial is accepted, a second reader in the same slot locates the objective
-in run history within a fresh `timeout_seconds` and the remaining phase/run
-budget. History gets up to 30 seconds to catch up with the summary; reading it
-may use the rest. A failed or timed-out history read records no position and
-keeps the objective, while uncertain reader cleanup stops the phase.
-Trainer return code and duration remain trainer measurements.
+W&B polling starts only after successful trainer cleanup and GPU-lease release. It uses the same durable attempt slot and process supervisor, so recovery can find the reader after abrupt parent exit, even if its phase was removed. Uncertain cleanup blocks further work. One absolute polling deadline covers worker startup, SDK construction, requests, retries, and summary visibility; phase/run deadlines can shorten it, while cleanup grace stays separate. Once the trial is accepted, a second reader in the same slot locates the objective in run history within a fresh `timeout_seconds` and the remaining phase/run budget. History gets up to 30 seconds to catch up with the summary; reading it may use the rest. A failed or timed-out history read records no position and keeps the objective, while uncertain reader cleanup stops the phase. Trainer return code and duration remain trainer measurements.
 
-Finished W&B captures freeze only the requested numeric values and gate-presence
-evidence, with target, attempt, retrieval time, selected key, and consumer
-bindings. Published results, selection, and no-op replay need no SDK,
-credentials, or network reads, even after remote edits or deletion. New remote
-work checks SDK availability after recognized-state recovery and before
-accepting a larger target. Missing/invalid evidence fails a trial; a measured
-constraint violation remains complete but infeasible.
-See the [configuration guide](config.md) for scoring and environment details.
+Finished W&B captures freeze only the requested numeric values and gate-presence evidence, with target, attempt, retrieval time, selected key, and consumer bindings. Published results, selection, and no-op replay need no SDK, credentials, or network reads, even after remote edits or deletion. New remote work checks SDK availability after recognized-state recovery and before accepting a larger target. Missing/invalid evidence fails a trial; a measured constraint violation remains complete but infeasible. See the [configuration guide](config.md) for scoring and environment details.
 
-MLflow captures the selected native observation and its step together after
-trainer cleanup and GPU release, without a second advisory history lookup.
-Managed run creation happens before GPU acquisition. See
-[native MLflow tracking](mlflow.md#choose-run-ownership) for ownership and
-supervised controller operations.
+MLflow captures the selected native observation and its step together after trainer cleanup and GPU release, without a second advisory history lookup. Managed run creation happens before GPU acquisition. See [native MLflow tracking](mlflow.md#choose-run-ownership) for ownership and supervised controller operations.
 
 ## GPU isolation
 
-By default, `gpu_policy: single_per_trial` leases one visible CUDA device per
-parallel trial. Discovery uses explicit phase `gpu_ids`/`gpu_devices`, then
-top-level `env.CUDA_VISIBLE_DEVICES`, then the controller's ambient value,
-then local inventory. Visibility tokens may be numeric, GPU UUIDs, or MIG
-tokens. Discovery reads ambient visibility even when `inherit_env` excludes
-it. The policy rebinds a leased device token, or preserves an empty/`-1`
-CUDA-disable sentinel, in each trainer. The lease controls visibility and
-same-host locking, not GPU memory allocation.
+By default, `gpu_policy: single_per_trial` leases one visible CUDA device per parallel trial. Discovery uses explicit phase `gpu_ids`/`gpu_devices`, then top-level `env.CUDA_VISIBLE_DEVICES`, then the controller's ambient value, then local inventory. Visibility tokens may be numeric, GPU UUIDs, or MIG tokens. Discovery reads ambient visibility even when `inherit_env` excludes it. The policy rebinds a leased device token, or preserves an empty/`-1` CUDA-disable sentinel, in each trainer. The lease controls visibility and same-host locking, not GPU memory allocation.
 
 `gpu_policy: whole_node` requires `n_jobs: 1` and a unique explicit device
 list. `gpu_policy: none` disables PhaseSweep's GPU isolation and cannot be
@@ -270,40 +193,15 @@ combined with an explicit device list; parallel use requires the explicit
 make that acknowledgement deliberately rather than relying on failed device
 detection.
 
-`gpu_policy: none` assigns no binding. Include ambient visibility in the
-trainer inheritance contract or set it in `env` if it must be retained.
+`gpu_policy: none` assigns no binding. Include ambient visibility in the trainer inheritance contract or set it in `env` if it must be retained.
 
 ## Timeouts, cleanup, and continuation
 
-Trial, phase, and experiment timeouts are cooperative run controls. Set the
-per-trial timeout above the longest trial you expect; an unbounded trial needs
-`allow_unbounded_trials: true`. Its clock covers supervised launch and execution
-after GPU acquisition, including supervisor startup, but excludes the GPU
-queue and post-trainer evidence. Phase/run budgets cover those stages too.
-Cleanup can extend beyond a deadline. Unlike phase/run budgets, the per-trial
-timeout participates in semantic study identity; changing it cannot reuse a
-populated phase.
+Trial, phase, and experiment timeouts are cooperative run controls. Set the per-trial timeout above the longest trial you expect; an unbounded trial needs `allow_unbounded_trials: true`. Its clock covers supervised launch and execution after GPU acquisition, including supervisor startup, but excludes the GPU queue and post-trainer evidence. Phase/run budgets cover those stages too. Cleanup can extend beyond a deadline. Unlike phase/run budgets, the per-trial timeout participates in semantic study identity; changing it cannot reuse a populated phase.
 
-On a trial timeout PhaseSweep terminates the supervised process group and
-records a terminal failed attempt after cleanup. The `max_consecutive_failures`
-threshold also stops a broken phase. The abort is recorded with the outcome that trips
-it, so a trial that succeeds afterwards cannot turn the phase back into a
-result, and a rerun stays refused until `n_trials` is raised. Changing
-`max_consecutive_failures` governs new work only: it never aborts a completed
-phase retroactively, and a resumed phase whose failure streak already meets
-the new limit launches nothing until `n_trials` or the limit is raised. When a
-timeout and the threshold both stop the same phase short of its target, the
-timeout decides the outcome: with `allow_incomplete_on_timeout` the phase
-publishes the winner its completed trials earned, and without it the run stops
-as a timeout, so a retry with a larger budget does not replay the failure
-abort. A rerun or `--from-phase` replays an accepted partial target without
-filling unused slots, only while the config still sets
-`allow_incomplete_on_timeout`. `n_trials` counts terminal attempts, so failed
-and pruned attempts consume the configured target.
+On a trial timeout PhaseSweep terminates the supervised process group and records a terminal failed attempt after cleanup. The `max_consecutive_failures` threshold also stops a broken phase. The abort is recorded with the outcome that trips it, so a trial that succeeds afterwards cannot turn the phase back into a result, and a rerun stays refused until `n_trials` is raised. Changing `max_consecutive_failures` governs new work only: it never aborts a completed phase retroactively, and a resumed phase whose failure streak already meets the new limit launches nothing until `n_trials` or the limit is raised. When a timeout and the threshold both stop the same phase short of its target, the timeout decides the outcome: with `allow_incomplete_on_timeout` the phase publishes the winner its completed trials earned, and without it the run stops as a timeout, so a retry with a larger budget does not replay the failure abort. A rerun or `--from-phase` replays an accepted partial target without filling unused slots, only while the config still sets `allow_incomplete_on_timeout`. `n_trials` counts terminal attempts, so failed and pruned attempts consume the configured target.
 
-Persistent trial targets cannot decrease. Raising a resumable sampler's
-`n_trials` schedules additional attempts after a durable abort or accepted
-partial timeout. Failure and timeout controls never create an alternate winner.
+Persistent trial targets cannot decrease. Raising a resumable sampler's `n_trials` schedules additional attempts after a durable abort or accepted partial timeout. Failure and timeout controls never create an alternate winner.
 
 Before a supported continuation, PhaseSweep first checks the artifact-root and
 ledger binding, then reconciles stale active attempts, and only then verifies
