@@ -26,7 +26,6 @@ _HistoryRead = Literal["settled", "lagging", "retry"]
 transient failure worth another read."""
 
 _RETRYABLE_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
-_WORKER_STDERR_LOG = "wandb-worker.stderr.log"
 # How long an accepted objective waits for run history to catch up with its
 # summary before recording no position; the position is advisory, so waiting
 # must not hold every trial for the whole timeout. Reading history that has
