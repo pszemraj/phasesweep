@@ -434,6 +434,9 @@ class PhaseSweepMCP(RunControl):
             # The final probe can also reserve cleanup or discover an
             # orphaned pending snapshot without producing a result view.
             run = self._run_payload(handle)
+        delivery = self._tracking_delivery(handle, experiment)
+        if delivery is not None:
+            status["tracking_delivery"] = delivery
         if result_source == "terminal_snapshot_unavailable":
             run["failure"] = self._run_failure_payload(
                 handle,
@@ -441,6 +444,31 @@ class PhaseSweepMCP(RunControl):
                 force_snapshot_unavailable=True,
             )
         return target_id, status, run, handle, result_source
+
+    def _tracking_delivery(
+        self, handle: RunHandle, experiment: Experiment | None
+    ) -> dict[str, int] | None:
+        """Count this run's own MLflow result uploads from its launch config.
+
+        Delivery records are mutable, so only status reads them; frozen result
+        reads never depend on them. A terminal read loads the run's config
+        snapshot just for this and reports no counts when it is unavailable.
+
+        :param RunHandle handle: Run whose generation owns the uploads.
+        :param Experiment | None experiment: Launch config, when already loaded.
+        :return dict[str, int] | None: Pending and delivered counts, or ``None``
+            when the run does not use MLflow or its config is unavailable.
+        """
+        if experiment is None:
+            try:
+                experiment = self._load_run_experiment(handle)
+            except RunSnapshotUnavailableError:
+                return None
+        if experiment.mlflow is None:
+            return None
+        from phasesweep.tracking.publication import delivery_status
+
+        return delivery_status(experiment, handle.run_id)
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
         """Return the config a future catalog launch would execute, if available.
@@ -513,21 +541,21 @@ class PhaseSweepMCP(RunControl):
         *,
         result_source: ResultSource,
     ) -> dict[str, Any]:
-        """Return frozen run facts with current config drift and delivery counts.
+        """Return frozen run facts with a config-only live drift comparison.
 
         A terminal run snapshot is the historical read authority for that run.
         Publication pointers and integrity stay as captured: consulting the
         live artifact tree here would make an intact snapshot unreadable, and
         a later generation's damage could erase this run's
-        already-validated winners. Config drift compares the frozen
-        represented-config fingerprint with the current catalog; MLflow
-        delivery counts also refresh from the separate mutable records.
+        already-validated winners. Config drift is the sole live field and
+        compares the frozen represented-config fingerprint with the current
+        catalog.
 
         :param str experiment_id: Catalog id associated with the run.
         :param RunResultSnapshot snapshot: Validated frozen result snapshot.
         :param ResultSource result_source: Snapshot provenance, including the
             unavailable placeholder case.
-        :return dict[str, Any]: Frozen status with current drift and delivery observations.
+        :return dict[str, Any]: Frozen status with a current config-drift verdict.
         """
         status = snapshot.status_payload()
         comparison = self._catalog_comparison_experiment(experiment_id)
@@ -539,12 +567,6 @@ class PhaseSweepMCP(RunControl):
             and result_source != "terminal_snapshot_unavailable"
             else None
         )
-        if comparison is not None and comparison.mlflow is not None:
-            from phasesweep.tracking.publication import delivery_status
-
-            status["tracking_delivery"] = delivery_status(
-                comparison, snapshot.status.represented_generation_id
-            )
         return status
 
     def _status_result(

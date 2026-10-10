@@ -597,10 +597,6 @@ def read_status(
         generation_id=generation_id,
         comparison_experiment=comparison_experiment,
     )
-    if experiment.mlflow is not None:
-        from phasesweep.tracking.publication import delivery_status
-
-        status["tracking_delivery"] = delivery_status(experiment, generation_id)
     return status
 
 

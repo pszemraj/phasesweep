@@ -583,14 +583,14 @@ def status(config_path: Path) -> None:
 @click.option(
     "--generation",
     "generation_id",
-    required=True,
-    help="Generation ID reported by phasesweep status.",
+    default=None,
+    help="Retry only this generation's uploads instead of every pending one.",
 )
-def sync_tracking(config_path: Path, generation_id: str) -> None:
-    """Retry the generation's retained native MLflow result projections.
+def sync_tracking(config_path: Path, generation_id: str | None) -> None:
+    """Retry retained native MLflow result projections.
 
     :param Path config_path: Matching experiment configuration.
-    :param str generation_id: Generation to synchronize.
+    :param str | None generation_id: Generation to synchronize, or ``None`` for all.
     :raises ClickException: Target mismatch or incomplete delivery.
     """
     from phasesweep.tracking.publication import sync_tracking as sync

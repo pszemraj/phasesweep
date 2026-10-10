@@ -839,8 +839,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       projections never establish publication authority.
     * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"``, and ``publication_error`` beside either failure
-      verdict -- the one
-      conditional key in this payload (review v0.5.18 / finding F4). Published
+      verdict -- conditional on that verdict (review v0.5.18 / finding F4). Published
       results that no longer validate are reported as corrupt rather than as
       an experiment that never published. After printing this payload, the CLI
       turns ``"failed"`` into
@@ -854,6 +853,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       (a published phase's local trial identity could not be matched), and
       ``trial_data_available`` (true for known counts, including confirmed
       absence; false when inspection failed).
+    * ``tracking_delivery``: MLflow configs only, last; pending and delivered
+      result-upload counts across every generation, the scope
+      ``phasesweep sync-tracking`` retries by default.
 
     ``read_status``'s summary-derived fields (``metric``, ``result_context``,
     ``published_config_matches_current``, ``summary_present``) are deliberately
@@ -870,12 +872,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     status = read_status(experiment)
     integrity = status["publication_integrity"]
     ledger_path = ledger_ops.resolved_ledger_path(experiment)
-    return {
-        **(
-            {"tracking_delivery": status["tracking_delivery"]}
-            if "tracking_delivery" in status
-            else {}
-        ),
+    payload: dict[str, Any] = {
         "kind": "experiment",
         "experiment": status["experiment"],
         "workdir": str(path_ops._experiment_dir(experiment)),
@@ -894,3 +891,8 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
             experiment, status["phases"], status["published_generation_id"]
         ),
     }
+    if experiment.mlflow is not None:
+        from phasesweep.tracking.publication import delivery_status
+
+        payload["tracking_delivery"] = delivery_status(experiment)
+    return payload

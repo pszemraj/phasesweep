@@ -394,42 +394,67 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
         tracking_root(experiment) / binding["generation_id"] / "delivery/test.json"
     )
     assert record["projection"] == projection
-    assert publication.sync_tracking(experiment, binding["generation_id"])["pending"] == 0
+    assert publication.sync_tracking(experiment)["pending"] == 0
     assert len(requests) == 1
     assert (_attempts_dir(experiment) / f"{'d' * 32}.json").exists()
 
 
-def test_mcp_status_projects_only_mutable_delivery_counts(tmp_path, monkeypatch):
+@pytest.mark.parametrize("terminal", [True, False])
+def test_delivery_counts_are_scoped_to_their_reader(tmp_path, terminal):
+    """CLI status counts what sync retries; MCP status counts its run; results ignore both."""
+    import yaml
+
     from phasesweep.engine.read import read_status
-    from phasesweep.mcp.redaction import status_payload
-    from phasesweep.tracking import publication
+    from phasesweep.engine.run import experiment_status
+    from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
+    from phasesweep.tracking.session import tracking_root, write_record
+    from tests.conftest import mark_current_format
+    from tests.mcp_helpers import make_mcp_app, make_run_handle, stage_dead_run, write_run_status
 
-    experiment = native_experiment(tmp_path)
-    scientific = read_status(experiment)
-
-    def outage(*args, **kwargs):
-        raise RuntimeError("Disconnected")
-
-    monkeypatch.setattr(publication, "call_tracking", outage)
-    binding = _binding()
-    publication._enqueue(
-        experiment,
-        binding["generation_id"],
-        "test",
-        binding,
-        publication._projection(metrics={}, params={}, tags={}, summary={}),
-        {},
+    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config.update(workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'j.journal'}")
+    config_path = tmp_path / "exp.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    catalog = tmp_path / "catalog.yaml"
+    catalog.write_text(
+        yaml.safe_dump(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "experiments": [{"id": "mlf", "config": str(config_path)}],
+            }
+        )
     )
-    current = read_status(experiment)
-    assert current["tracking_delivery"] == {"pending": 1, "delivered": 0}
-    assert {k: v for k, v in current.items() if k != "tracking_delivery"} == {
-        k: v for k, v in scientific.items() if k != "tracking_delivery"
-    }
-    result = status_payload(
-        "catalog-id", current, {}, result_source="current_shared_study", elapsed_seconds=None
-    )
-    assert result["tracking_delivery"] == current["tracking_delivery"]
-    assert "localhost" not in str(result) and str(tmp_path) not in str(result)
+    app, registry, store = make_mcp_app(catalog)
+    experiment = registry.get("mlf").experiment
+    mark_current_format(experiment)
+    run_id = "mlf-" + "a" * 32
+    if terminal:
+        stage_dead_run(store, run_id, config_path, "mlf", cleanup_uncertain=False)
+        write_run_status(
+            store,
+            run_id,
+            returncode=1,
+            result_snapshot_state="complete",
+            result_snapshot=capture_pre_generation_result_snapshot(experiment),
+        )
+    else:
+        store.create(
+            make_run_handle(
+                run_id=run_id, experiment_id="mlf", config_sha256=registry.get("mlf").config_sha256
+            )
+        )
+        store.config_snapshot_path(run_id).write_bytes(config_path.read_bytes())
+    for generation, name in [(run_id, "own"), ("other", "a"), ("other", "b")]:
+        write_record(
+            tracking_root(experiment) / generation / "delivery" / f"{name}.json",
+            {"schema_version": 1, "generation_id": generation, "state": "pending"},
+        )
+
+    assert app.status(run_id)["tracking_delivery"] == {"pending": 1, "delivered": 0}
+    assert experiment_status(experiment)["tracking_delivery"] == {"pending": 3, "delivered": 0}
+    assert "tracking_delivery" not in read_status(experiment)
+    (tracking_root(experiment) / run_id / "delivery" / "own.json").write_text("{")
+    assert app.winners(run_id)["run_id"] == run_id
 
 
 def test_tracking_registry_recovery_cannot_fail_optuna_trial(tmp_path):

@@ -163,7 +163,7 @@ The operator may configure MLflow, W&B, ordinary JSON, log, or envelope scoring.
 
 The assurance flags `expected_step_declared` and `expected_step_value_bound` describe JSON-envelope metadata checks only. They remain false for MLflow even when `select: step` requires an exact native metric-history step. That selector does not establish the envelope's split, checkpoint, or evaluation-policy guarantees.
 
-For MLflow, `tracking_delivery` reports current local upload counts, separately from the frozen scientific outcome. Pending delivery does not invalidate an accepted score or winner, and a later retry can change those counts without changing the run snapshot. The operator can retry saved projections with the [MLflow delivery command](mlflow.md#result-delivery-and-recovery). This is an operator action, not agent recovery or a replacement run. Missing or null delivery information does not establish successful delivery.
+For MLflow, `get_run_status` and `await_run` report the run's own current local upload counts in `tracking_delivery`, separately from the frozen scientific outcome; `get_run_results` never reads them. Pending delivery does not invalidate an accepted score or winner, and a later retry can change those counts without changing the run snapshot. The operator can retry saved projections with the [MLflow delivery command](mlflow.md#result-delivery-and-recovery). This is an operator action, not agent recovery or a replacement run. Missing or null delivery information does not establish successful delivery.
 
 ## Run state and recovery
 

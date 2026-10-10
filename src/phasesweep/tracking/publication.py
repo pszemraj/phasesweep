@@ -311,20 +311,29 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
     :return dict[str, int]: Path-free pending and delivered counts.
     """
     counts = {"pending": 0, "delivered": 0}
-    root = tracking_root(experiment)
-    pattern = "*/delivery/*.json" if generation_id is None else f"{generation_id}/delivery/*.json"
-    for path in root.glob(pattern):
+    for path in tracking_root(experiment).glob(_delivery_pattern(generation_id)):
         counts[read_record(path)["state"]] += 1
     return counts
 
 
-def sync_tracking(experiment: Experiment, generation_id: str) -> dict[str, int]:
+def _delivery_pattern(generation_id: str | None) -> str:
+    """Select one generation's delivery records, or every generation's.
+
+    :param str | None generation_id: Generation filter, or ``None`` for all.
+    :return str: Glob relative to the tracking root.
+    """
+    return f"{generation_id or '*'}/delivery/*.json"
+
+
+def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
     """Retry only retained result projections, without selecting or training.
 
     :param Experiment experiment: Matching source experiment configuration.
-    :param str generation_id: Generation whose deliveries should be retried.
-    :raises ValueError: Generation or target does not match the saved records.
-    :return dict[str, int]: Remaining pending and delivered counts.
+    :param str | None generation_id: Generation whose deliveries should be
+        retried, or ``None`` for every generation's retained deliveries.
+    :raises ValueError: No deliveries exist, or the target or generation does
+        not match the saved records.
+    :return dict[str, int]: Remaining pending and delivered counts in that scope.
     """
     from phasesweep.config.common import _validate_safe_name
     from phasesweep.engine.attempts import _preflight_active_attempts, _PreflightCleanupReport
@@ -332,21 +341,22 @@ def sync_tracking(experiment: Experiment, generation_id: str) -> dict[str, int]:
     from phasesweep.engine.trial import _trainer_environment
     from phasesweep.runtime.shutdown import signal_handler_scope
 
-    _validate_safe_name("generation", generation_id)
+    if generation_id is not None:
+        _validate_safe_name("generation", generation_id)
     if experiment.mlflow is None:
-        raise ValueError("sync-tracking requires MLflow settings and a generation ID.")
+        raise ValueError("sync-tracking requires MLflow settings.")
     with signal_handler_scope(), _experiment_lock(experiment):
         _preflight_active_attempts(
             experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
         )
-        paths = sorted((tracking_root(experiment) / generation_id / "delivery").glob("*.json"))
+        paths = sorted(tracking_root(experiment).glob(_delivery_pattern(generation_id)))
         if not paths:
-            raise ValueError("No tracking deliveries exist for this generation.")
+            raise ValueError("No tracking deliveries exist for this scope.")
         for path in paths:
             record = read_record(path)
             if (
                 record["source"] != experiment.mlflow.evidence_identity()
-                or record["generation_id"] != generation_id
+                or record["generation_id"] != path.parent.parent.name
             ):
                 raise ValueError("Tracking delivery belongs to a different target or generation.")
         environment = _trainer_environment(experiment, experiment.phases[0].name)

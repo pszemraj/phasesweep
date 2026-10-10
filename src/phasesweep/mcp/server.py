@@ -424,7 +424,15 @@ class GetRunStatusResult(_ToolPayload):
     phases: list[PhaseStatusPayload]
     summary_present: bool
     run: RunPayload
-    tracking_delivery: TrackingDeliveryPayload | None = None
+    tracking_delivery: TrackingDeliveryPayload | None = Field(
+        default=None,
+        description=(
+            "This run's own MLflow result-upload counts, read live even for a terminal run. "
+            "Null when the run does not use MLflow or its launch config is unavailable. "
+            "Pending uploads never change accepted scores or winners; report them to the "
+            "operator instead of launching another run."
+        ),
+    )
     elapsed_seconds: int | None = Field(
         description=(
             "Seconds since launch while running; total run duration once terminal; "

@@ -150,13 +150,13 @@ At least one namespace must be nonempty. Missing evidence fails the trial; value
 
 Accepted trials receive reserved `phasesweep.*` metrics, parameters, and tags: objective, measured constraints, feasibility, trainer duration, effective fixed/inherited/sampled overrides, and phase/inheritance references. Trainers should leave this namespace to PhaseSweep. A generation-summary run in the same experiment groups managed attempts and holds `phasesweep/summary.json` plus winner references. Trainer-owned attempts retain their own parents.
 
-An upload failure after acceptance warns and leaves a pending delivery record. It does not change the accepted score, complete trial, or committed winner. `phasesweep status` and current MCP status expose path-free `tracking_delivery` counts; scientific terminal snapshots remain frozen. Retry the saved projections:
+An upload failure after acceptance warns and leaves a pending delivery record. It does not change the accepted score, complete trial, or committed winner. `phasesweep status` exposes path-free `tracking_delivery` counts across every generation, and MCP status counts the queried run's own uploads; scientific terminal snapshots remain frozen. Retry the saved projections:
 
 ```bash
-phasesweep sync-tracking examples/mlflow.yaml --generation GENERATION_ID
+phasesweep sync-tracking examples/mlflow.yaml
 ```
 
-This requires the original target configuration. It does not train, select metrics again, or rewrite scientific evidence. Already delivered projections are skipped. The command exits nonzero if uploads remain pending. Tracking-only worker recovery uses the active-work registry without changing Optuna trials.
+This requires the original target configuration and retries every generation's pending projections; `--generation GENERATION_ID` limits it to one generation, which for an MCP run is its run ID. It does not train, select metrics again, or rewrite scientific evidence. Already delivered projections are skipped. The command exits nonzero if uploads remain pending. Tracking-only worker recovery uses the active-work registry without changing Optuna trials.
 
 After confirmed cleanup of a failed invocation, PhaseSweep queues a terminal projection for its own generation-summary run: FAILED for ordinary failure, or KILLED for shutdown or keyboard interruption. Upload failures leave this projection pending for `sync-tracking`; the remote summary can remain RUNNING until delivery succeeds. This does not change attempt-run status, accepted scores, or committed winners. A conflicting remote terminal status is never overwritten.
 
