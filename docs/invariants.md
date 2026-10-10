@@ -1,10 +1,9 @@
 # Durability invariants
 
-PhaseSweep's local ledger, artifact-root binding, publication transaction, and
-operator recovery are where a wrong ordering silently destroys work. Every rule
-on this page names the code that holds it and the test that fails when it stops
-holding, so breaking one fails a test instead of waiting for a reviewer to
-notice.
+The experiment lock serializes local ledger mutations. Artifact-root and
+format checks precede claims, durable outcome records precede terminal trial
+states, and generation validation precedes the publication-pointer commit.
+Operator recovery identifies processes from durable attempt and run records.
 
 > [!IMPORTANT]
 > Error text is authoritative, and a wrap preserves the operator's remediation.

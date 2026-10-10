@@ -227,8 +227,9 @@ These scoring decisions are separate:
   `first`, `min`, or `max`).
 - W&B selects an exact finished-summary key; ordinary JSON selects a saved
   path and dotted key.
+- MLflow uses an explicit [native history selector](mlflow.md#select-metrics-and-require-evidence).
 - Envelope `policy` and `expected_step` validate reported metadata; they do
-  not cause evaluation or checkpoint loading. The metric extractor's
+  not cause evaluation or checkpoint loading. For envelope and W&B objectives,
   `evaluation_axis` names the training-progress axis the sweep holds fixed;
   selection's `evaluation_point` confound check compares ranked objectives
   only on it (see [runtime behavior](runtime.md#confound-verdicts)). It is

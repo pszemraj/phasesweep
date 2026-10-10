@@ -1,7 +1,5 @@
 # PhaseSweep config_reference.yaml: exhaustive primary Experiment YAML, signature form.
 # Values are signatures (key: type = default), not runnable YAML; start from examples/example.yaml.
-# Hand-maintained: tests/test_config_reference.py guards schema paths, variants, required/default signatures and the real-loader example. Comments and runtime interactions require source review.
-# This preserves one narrative reference for cross-field behavior; schema metadata does not contain these interactions.
 # CLI: phasesweep validate CONFIG and phasesweep run CONFIG require an explicit path; no default file or environment-to-config overlay.
 # Read once per invocation; detached MCP launch freezes the submitted config. Editing the original does not reload active work.
 # Unknown model fields and duplicate YAML keys are rejected. Arbitrary map keys in trainer_config/fixed_overrides/provenance/env are intentional.
@@ -15,7 +13,7 @@
 # Operational environment outside YAML: XDG_CACHE_HOME places worker/cache files; PHASESWEEP_HOME selects an existing private absolute 0700 root.
 # PHASESWEEP_LOCK_DIR selects an existing safe absolute host-lock directory; by default locks use the OS account home, independent of HOME/XDG.
 # Trainer cache paths, model/data downloads, training cadence and hardware usage remain the external trainer's responsibility.
-# This reference covers the sweep schema. The separate MCP catalog's complete field table is in docs/mcp.md; examples/catalog.yaml is its starting example.
+# MCP catalog fields: docs/mcp.md; starting catalog: examples/catalog.yaml.
 # Publication and cleanup/recovery are engine behavior, not extra YAML blocks. Current-format state is required; no migration or legacy aliases are accepted.
 
 # ---------- Required experiment fields ----------

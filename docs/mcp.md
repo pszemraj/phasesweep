@@ -73,10 +73,11 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 ## Fresh MCP state
 
 `state_dir` is private, owner-only state for handles, logs, audit entries, and
-frozen terminal snapshots. Its root carries a format marker, and the server
-refuses an unmarked, malformed, or unsupported durable state directory before
-creating or repairing it. There is no migration, adoption, or repair path for
-a refused directory: point `state_dir` at a fresh path instead.
+frozen terminal snapshots. A new path or an empty private directory can be
+initialized with the current format marker. The server refuses existing durable
+run data without that marker, or a malformed or unsupported marker, before
+changing the directory. There is no migration, adoption, or repair path for a
+refused directory: point `state_dir` at a fresh path instead.
 
 ## Tool workflow
 
@@ -144,15 +145,30 @@ that is absent or unreadable remains unavailable; it is not reconstructed from
 the current ledger. Availability fields may be unknown when an observation was
 not possible and must not be treated as available.
 
-`publication_integrity` reports whether the experiment's recorded publication
-still validates:
+Read provenance and labels together:
+
+| Field | Interpretation |
+| --- | --- |
+| `represented_generation_id` | Generation whose winners and completeness the response describes; null when no generation can be represented. |
+| `winner_generation` | Per-winner enum: `current_generation` was selected in the represented generation; `prior_generation` was carried from an earlier one; `unknown` means no represented generation is available for comparison. It is not a generation ID. |
+| `result_context` | `represented_generation` uses that generation's recorded metric name, goal, and phase plan; `current_config` uses the loaded configuration when no recorded semantics are available. |
+| `published_config_matches_current` | Whether the producing configuration matches the current catalog configuration. `false` means the historical labels may differ from the next run's; null does not establish a match. |
+
+`get_run_results` measures `missing_phases` and `all_phases_have_winners` against
+the represented generation's plan. Report that context with the winners rather
+than relabeling historical results using an edited catalog. The config-match
+comparison is refreshed on terminal reads; the scientific facts stay frozen.
+
+`publication_integrity` reports the publication validation recorded in the
+response. Terminal responses preserve snapshot-time validation and do not
+revalidate the current publication tree:
 
 | Value | Meaning |
 | --- | --- |
-| `ok` | The recorded publication validates. |
-| `absent` | No result has published yet. |
-| `failed` | A publication was recorded but no longer validates; it needs operator inspection. |
-| `permission_denied` | The server process cannot read the publishing tree. |
+| `ok` | The publication passed validation for this view. |
+| `absent` | No publication was recorded in this view. |
+| `failed` | A recorded publication failed validation; it needs operator inspection. |
+| `permission_denied` | The server process could not read the publishing tree for validation. |
 | `unknown` | The run's terminal snapshot cannot establish an answer. |
 
 For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and
@@ -167,6 +183,10 @@ winner or proposing a run whose phases inherit it. `evaluation_point` exposes
 MCP exposes only enums and numbers from these checks; evidence strings such as
 the evaluation-axis config key stay private. The verdicts do not invalidate
 the result, and only the operator decides whether to re-run.
+
+Also report a winner's `incomplete: true`: a wallclock timeout cut its phase
+short, so selection used a partial population. The confound checks do not cover
+this limitation.
 
 `recovery_required: true` means cleanup, launch handoff, or snapshot
 finalization needs operator recovery. Agents should stop rather than guessing

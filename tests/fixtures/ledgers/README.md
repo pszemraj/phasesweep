@@ -1,8 +1,7 @@
 # Golden ledger fixture
 
-Real on-disk PhaseSweep output, committed so the read paths can be tested
-against bytes a reader actually has to survive instead of bytes a test
-invented. One fixture is committed:
+The `current-journal` fixture contains on-disk output produced through
+PhaseSweep's public API:
 
 ```
 current-journal/manifest.json          inventory record: backend, modes, expected verdicts, provenance
@@ -27,9 +26,8 @@ validated first. `ledger-only` points the same ledger at a workdir that has
 never existed, which is the case no binding can answer and the ledger format
 scan must.
 
-PhaseSweep keeps no backward compatibility: `current-journal` is the only
-fixture this project carries, and it is unedited output of this release's
-journal backend. Its `manifest.json` records `derivation: ""` for that reason.
+`current-journal` uses the current journal format. Its `manifest.json`
+records `derivation: ""` because the generator does not transform that format.
 Its `produced_by` carries the phasesweep `git describe --tags --always
 --dirty`, Optuna, the interpreter's stdlib `sqlite3` module version (unrelated
 to the fixture's ledger backend -- the journal is the only backend this
@@ -48,8 +46,7 @@ The generator refuses to write a manifest whose declared verdicts disagree
 with the ones it computes from the bytes it just produced, so a regeneration
 that silently changes meaning fails instead of landing.
 
-Three things the generator changes about a raw run, all for packaging rather
-than for the format boundary:
+The generator keeps the fixture tracked and independent of the generating host:
 
 - `artifact_root/t/.gitignore` is rewritten from PhaseSweep's `*` to `!*`. A
   deeper ignore file wins over the repository root's negation, so the original
@@ -78,11 +75,10 @@ every time, in the ledger and in the artifact tree:
 - absolute paths, which name the checkout the fixture was generated in, and with
   them `artifact_root_binding.json`'s `artifact_root` and its `storage_key`
   digest (`tests/ledger_fixtures.py` rewrites both for the copy it reads);
-- `phasesweep_trainer_env_digest`, which hashes the host's `PATH`, `HOME`, and
-  `TMPDIR` values.
+- `phasesweep_trainer_env_digest`, which includes the inherited base environment
+  described by the [trainer contract](../../../docs/config.md#trainer-contract).
 
-None of that is what the fixture tests. What must stay stable is the format-
-bearing state: the study schema stamp, the artifact-root binding's
-`schema_version`, and Optuna's own `version_info` / `alembic_version` rows.
-Regenerate only when the release changes one of those on purpose, and expect
-a large, noisy diff when you do.
+The read-path tests check format-bearing state, including the study schema
+stamp and the artifact-root binding's `schema_version`. Regenerate when the
+stored format changes. Timestamps, identities, and paths make the resulting
+diff larger than the format change itself.

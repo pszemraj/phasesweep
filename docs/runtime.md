@@ -75,18 +75,16 @@ describes its integrity, fingerprints, top-ups, and inheritance.
 
 The block runs three checks, each `ok` (checked, nothing found),
 `heterogeneous` (checked, found a potential confound, with evidence), or
-`n/a` (could not be checked — never treat this as clean):
+`n/a` (could not be checked - never treat this as clean):
 
-- `evaluation_point`: whether the ranked objectives were all measured at the
-  same position on the metric extractor's `evaluation_axis` -- the
-  training-progress axis the sweep holds fixed, such as optimizer step or
-  tokens. Positions within 1% of the highest count as the same point, and the
-  exact positions are recorded either way. A W&B aggregate such as `eval/loss.min` is positioned where its
-  history series ends, since where each trial's best value fell differs by
-  nature. `n/a` for `json` and `log_regex` extractors, which report no
-  position; when any ranked `wandb` trial recorded no position in its run
-  history, or a ranked trial's objective provenance is unreadable; or when
-  only one trial was ranked.
+- `evaluation_point`: whether the ranked objectives share a training-progress
+  position. Envelope and W&B objectives use the configured `evaluation_axis`,
+  such as optimizer step or tokens; MLflow objectives use the selected native
+  observation's step. Positions within 1% of the highest count as the same
+  point, and the exact positions are recorded either way. See
+  [W&B evidence](config.md#wb-evidence) for aggregate positions. `n/a` for `json` and
+  `log_regex` extractors, which report no position; when a ranked objective has
+  no recorded position or unreadable provenance; or when only one trial was ranked.
 - `survivorship`: whether failed and pruned trials were at least as numerous
   as the ranked ones, so that whatever made configurations fail could have
   decided which ones were ranked. Failed trials include evidence-gate and
@@ -160,9 +158,9 @@ A reused root therefore cannot combine a second ledger's trial counts with the
 first ledger's publication, and a reused ledger cannot publish into a second
 tree. Both refusals happen before any trial runs and write nothing.
 
-No command writes to the artifact root or its ledger until it has checked the
-tree's binding and then the ledger's format. When a check fails, the command
-stops and leaves both byte-for-byte as they were. Read-only commands,
+Runs and confirmed MCP recovery check the tree's binding and then the ledger's
+format before mutating the ledger. When either check fails, the command stops
+and leaves both byte-for-byte as they were. Read-only commands,
 including `status`, `show-winners`, and `run --dry-run`, never create a missing
 ledger or its directory. A process killed while it appended to the journal
 can leave a partial final record, which every reader skips. The next
@@ -176,6 +174,10 @@ remove the lock and run the command again. A record damaged anywhere before
 the last is refused as corruption. Contributors will find the ordering rules
 behind these guarantees, and the tests that hold them, in
 [durability invariants](invariants.md).
+
+MLflow delivery retries use the experiment lock and validate their saved target
+and generation, but do not open or mutate the ledger. See
+[result delivery and recovery](mlflow.md#result-delivery-and-recovery).
 
 Persistent phases use same-host locks. A concurrent CLI or MCP launch for the
 same experiment waits or fails safely according to the operation; it never
@@ -240,9 +242,15 @@ evidence, with target, attempt, retrieval time, selected key, and consumer
 bindings. Published results, selection, and no-op replay need no SDK,
 credentials, or network reads, even after remote edits or deletion. New remote
 work checks SDK availability after recognized-state recovery and before
-accepting a larger target. Missing/invalid evidence fails a
-trial; a measured constraint violation remains complete but infeasible.
+accepting a larger target. Missing/invalid evidence fails a trial; a measured
+constraint violation remains complete but infeasible.
 See the [configuration guide](config.md) for scoring and environment details.
+
+MLflow captures the selected native observation and its step together after
+trainer cleanup and GPU release, without a second advisory history lookup.
+Managed run creation happens before GPU acquisition. See
+[native MLflow tracking](mlflow.md#choose-run-ownership) for ownership and
+supervised controller operations.
 
 ## GPU isolation
 
@@ -277,8 +285,8 @@ timeout participates in semantic study identity; changing it cannot reuse a
 populated phase.
 
 On a trial timeout PhaseSweep terminates the supervised process group and
-records a terminal failed attempt after cleanup. The `max_consecutive_failures` threshold
-also stops a broken phase. The abort is recorded with the outcome that trips
+records a terminal failed attempt after cleanup. The `max_consecutive_failures`
+threshold also stops a broken phase. The abort is recorded with the outcome that trips
 it, so a trial that succeeds afterwards cannot turn the phase back into a
 result, and a rerun stays refused until `n_trials` is raised. Changing
 `max_consecutive_failures` governs new work only: it never aborts a completed
@@ -288,16 +296,14 @@ timeout and the threshold both stop the same phase short of its target, the
 timeout decides the outcome: with `allow_incomplete_on_timeout` the phase
 publishes the winner its completed trials earned, and without it the run stops
 as a timeout, so a retry with a larger budget does not replay the failure
-abort. A rerun or `--from-phase` reuses an incomplete result only while the
-config still sets `allow_incomplete_on_timeout`; raising `n_trials` continues
-the phase instead. `n_trials` counts terminal attempts, so failed and pruned
-attempts consume the configured target.
+abort. A rerun or `--from-phase` replays an accepted partial target without
+filling unused slots, only while the config still sets
+`allow_incomplete_on_timeout`. `n_trials` counts terminal attempts, so failed
+and pruned attempts consume the configured target.
 
 Persistent trial targets cannot decrease. Raising a resumable sampler's
 `n_trials` schedules additional attempts after a durable abort or accepted
-partial timeout. Repeating an accepted partial target replays that decision
-without filling unused slots. Failure and timeout controls never create an
-alternate winner.
+partial timeout. Failure and timeout controls never create an alternate winner.
 
 Before a supported continuation, PhaseSweep first checks the artifact-root and
 ledger binding, then reconciles stale active attempts, and only then verifies

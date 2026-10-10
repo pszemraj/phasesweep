@@ -513,21 +513,21 @@ class PhaseSweepMCP(RunControl):
         *,
         result_source: ResultSource,
     ) -> dict[str, Any]:
-        """Return frozen run facts with a config-only live drift comparison.
+        """Return frozen run facts with current config drift and delivery counts.
 
         A terminal run snapshot is the historical read authority for that run.
         Publication pointers and integrity stay as captured: consulting the
         live artifact tree here would make an intact snapshot unreadable, and
         a later generation's damage could erase this run's
-        already-validated winners. Config drift is the sole live field and
-        compares the frozen represented-config fingerprint with the current
-        catalog.
+        already-validated winners. Config drift compares the frozen
+        represented-config fingerprint with the current catalog; MLflow
+        delivery counts also refresh from the separate mutable records.
 
         :param str experiment_id: Catalog id associated with the run.
         :param RunResultSnapshot snapshot: Validated frozen result snapshot.
         :param ResultSource result_source: Snapshot provenance, including the
             unavailable placeholder case.
-        :return dict[str, Any]: Frozen status with a current config-drift verdict.
+        :return dict[str, Any]: Frozen status with current drift and delivery observations.
         """
         status = snapshot.status_payload()
         comparison = self._catalog_comparison_experiment(experiment_id)

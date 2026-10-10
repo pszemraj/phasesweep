@@ -157,9 +157,9 @@ Native metrics retain their Trainer names, such as `eval_loss` and
 training budgets.
 
 Set model storage precision explicitly when preparing mixed-precision training.
-In the qualified Transformers checkout, BART's checkpoint loaded FP16 weights
-when the example omitted `dtype`, and both tested learning rates produced NaN
-metrics. BF16 autocast did not change that parameter storage. Loading with
+In the tested Transformers checkout, BART's checkpoint loaded FP16 weights
+when the example omitted `dtype`, producing NaN metrics. BF16 autocast did not
+change that parameter storage. Loading with
 `from_pretrained(..., dtype=torch.float32)` supplies FP32 parameters for training
 while `bf16: true` controls autocast separately.
 
@@ -185,21 +185,14 @@ input filenames ending in `.json`, rather than `.jsonl`. Materialize bounded
 samples from large Hub datasets with streaming before launching the sweep, and
 use distinct training and validation splits.
 
-This managed pattern was exercised with MLflow 3.17.0, Transformers
-5.19.0.dev0 (`536ecc0`), and BART-large: six RTX 5090 trials of 100 optimizer
-steps each across three inherited phases, using the explicit FP32 model load
-above. Native evidence and same-experiment delivery were verified locally.
-No-work replay preserved the selected values and provenance with tracking SDK
-imports, network connections, and child launches blocked.
-
-The official NER example was also qualified with Ettin 68M, Liquid
-LFM2.5 Encoder 230M, and text-only NeoMME 260M: nine 500-update trials per
-model across three inherited phases, at batch 32 with FP32 parameters and
-optimizer states plus BF16 autocast. Ettin used its native task head; Liquid
-and NeoMME required local token-classification heads, with NeoMME's document
-prefix removed before predicting word labels. Native histories, same-experiment
-delivery, and stopped-server replay were verified for all three. Repeated
-validation selection and sentence overlap limit model-quality conclusions.
+Managed native logging, same-experiment delivery, and no-work replay were
+tested with MLflow 3.17.0 and Transformers 5.19.0.dev0 (`536ecc0`), using
+BART-large and the official NER example with Ettin 68M, Liquid LFM2.5 Encoder
+230M, and text-only NeoMME 260M. NER used FP32 parameters and optimizer states
+with BF16 autocast. Ettin used its native task head; Liquid and NeoMME required
+local token-classification heads, with NeoMME's document prefix removed before
+predicting word labels. Repeated validation selection and sentence overlap
+limit model-quality conclusions.
 
 Trainer-owned Transformers logging and other framework/version combinations
 remain unverified.
@@ -238,8 +231,8 @@ At least one namespace must be nonempty. Missing evidence fails the trial;
 values from another run or a PhaseSweep result metric cannot substitute for it.
 Accepted evidence freezes the selected value, step, timestamp, verified native
 run identity, and required metadata. Local reads and no-work replay require
-neither an MLflow import nor server access. Confound reporting uses the selected
-native step as its evaluation position.
+neither an MLflow import nor server access. See
+[confound verdicts](runtime.md#confound-verdicts) for evaluation-position checks.
 
 ## Result delivery and recovery
 
@@ -293,7 +286,5 @@ inheritance, explicitly list rotating authentication/transport variables in
 The SDK can also use its normal profile configuration. See
 [Databricks authentication](https://docs.databricks.com/en/dev-tools/auth/index.html).
 
-Local HTTP behavior is qualified by the integration tests. Live Databricks
-access remains **unverified** until workplace testing; no workplace credentials
-or endpoints are required locally. A local framework qualification does not
-establish that framework's Databricks behavior.
+Local HTTP behavior is covered by integration tests. Live Databricks access
+and framework integrations on Databricks remain **unverified**.
