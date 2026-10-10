@@ -567,6 +567,7 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
     from phasesweep.runtime.process import read_attempt_lifecycle
 
     monkeypatch.setenv("WANDB_API_KEY", "excluded-parent-secret")
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
     wandb_worker_sdk("""
         import os
         class Run:
@@ -582,6 +583,7 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
                 assert "WANDB_API_KEY" not in os.environ
                 assert os.environ["HTTPS_PROXY"] == "https://transport.test"
                 assert "PYTHONHOME" not in os.environ
+                assert os.environ["DO_NOT_TRACK"] == "1"
                 assert kwargs["overrides"] == {"base_url": "https://example.test"}
             def run(self, path):
                 assert path == "entity/project/attempt"

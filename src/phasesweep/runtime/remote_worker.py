@@ -15,14 +15,19 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from phasesweep.runtime.process import ProcessResult
 
+# Workers run SDK clients on the orchestrator's behalf, so its usage-telemetry
+# opt-outs apply even when the composed trainer environment omits them.
+_TELEMETRY_OPT_OUTS = ("DO_NOT_TRACK", "MLFLOW_DISABLE_TELEMETRY")
+
 
 def worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
-    """Retain composed credentials and the orchestrator's Python bootstrap.
+    """Retain composed credentials plus the orchestrator's Python bootstrap and opt-outs.
 
     :param Mapping[str, str] | None environment: Composed trainer environment, or
         ``None`` for the orchestrator's own environment.
     :return dict[str, str]: Worker environment whose ``PYTHON*`` variables match
-        the orchestrator's exactly.
+        the orchestrator's exactly, carrying any telemetry opt-out the
+        orchestrator sets.
     """
     worker_environment = dict(os.environ if environment is None else environment)
     for name in set(worker_environment) | set(os.environ):
@@ -31,6 +36,9 @@ def worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
                 worker_environment[name] = os.environ[name]
             else:
                 worker_environment.pop(name, None)
+    for name in _TELEMETRY_OPT_OUTS:
+        if name in os.environ:
+            worker_environment[name] = os.environ[name]
     return worker_environment
 
 
