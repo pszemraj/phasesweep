@@ -50,8 +50,21 @@
 # metric: Metric (required)
 #   name: str = "objective"       # `goal` is reserved and cannot be the name.
 #   goal: Literal["minimize", "maximize"] = "minimize"
-#   extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor
+#   extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor | MlflowExtractor
 # All readers must yield a finite scalar. Goal ranks trials, not observations.
+
+# mlflow: MlflowSettings | null = null
+#   tracking_uri: str (HTTP(S), databricks, or databricks://profile)
+#   experiment_id: str | null = null
+#   experiment_name: str | null = null
+# Exactly one existing experiment selector is required. No implicit creation.
+#   run_mode: "managed" | "trainer" = "managed"
+#   poll_seconds: finite float = 2.0      # > 0
+#   timeout_seconds: finite float = 120.0 # >= 1, per controller operation
+# Requires an MLflow objective; W&B remote consumers cannot be mixed in.
+# Trainer-owned runs require phasesweep.tracking.bind_mlflow_run(actual_run_id).
+# Managed runs receive their real ID through MLFLOW_RUN_ID before trainer launch.
+# Results publish to the same experiment. See mlflow.md for delivery/recovery.
 
 # constraints: list[Constraint] = []
 # Each constraint has name, a scalar extractor, and at least one finite min/max
@@ -132,7 +145,7 @@
 
 #   gates: list[Gate] = []
 # Every gate is a post-trial hard check. File and JSON gates inspect local
-# attempt artifacts; wandb_summary_required uses the phase's shared remote capture.
+# attempt artifacts; wandb_summary_required and mlflow_required use shared remote captures.
 # Gate failure fails the trial.
 
 # SEARCH PARAMETER OBJECTS
@@ -197,7 +210,20 @@
 # The trainer owns evaluation, checkpoint choice, aggregation, and early stopping.
 # Envelope policy/expected_step validate metadata; they do not schedule evaluation.
 
+# type: "mlflow"
+# metric_key: str (required; exact native metric name)
+# select: "last" | "min" | "max" | "step" (required)
+# step: nonnegative int | null = null (required only for select: step)
+# last: greatest step/latest timestamp. min/max ties: earliest step/timestamp.
+# step: latest timestamp at that exact step. Shared capture freezes positions.
+
 # GATE OBJECTS
+
+# type: "mlflow_required"
+# metrics: list[str] = []
+# params: list[str] = []
+# tags: list[str] = []
+# At least one namespace must be nonempty. Uses the same verified bound run.
 
 # type: "wandb_summary_required"
 # base_url/entity/project/poll_seconds/timeout_seconds: same as wandb above

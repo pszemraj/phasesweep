@@ -54,6 +54,15 @@ shareable generation identity record. Trial directories retain local evidence
 and attempt lifecycle information used for supported continuation and winner
 validation.
 
+MLflow-backed experiments additionally retain native run bindings in each trial
+directory and mutable delivery state under `tracking/<generation-id>/`.
+These records support upload retries and are separate from the committed
+scientific manifests. Disposable supervised-worker scratch uses
+`~/.cache/phasesweep/<backend>/workers/`, or the corresponding
+`XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`.
+Each operation removes its temporary directory. See [MLflow tracking](mlflow.md)
+for ownership and offline replay.
+
 ### Confound verdicts
 
 Each phase's `winner.yaml` carries a `confound` block: advisory verdicts on

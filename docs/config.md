@@ -212,6 +212,10 @@ Use the reader that matches the trainer's existing reporting:
 - `wandb` reads an exact scalar key such as `eval/loss` from the finished run
   whose ID is the immutable trial attempt ID. It requires the optional
   `wandb` extra and an authorized entity/project.
+- `mlflow` reads native metric history from the bound finished run. It requires
+  the optional `mlflow` extra, an existing experiment in the top-level `mlflow`
+  block, and an explicit `select: last | min | max | step`. See the
+  [MLflow guide](mlflow.md) for ownership, selection, and result delivery.
 - `json_envelope` reads an attempt-bound versioned envelope from a
   trial-relative path. Python trainers can call `phasesweep.report_objective`
   to write it to the managed `PHASESWEEP_OBJECTIVE_PATH`.
@@ -221,7 +225,9 @@ Use the reader that matches the trainer's existing reporting:
 `constraints` use the same scalar readers. A valid measured constraint violation
 is a completed but infeasible trial; missing or invalid evidence fails the trial.
 Phase `gates` include `required_file`, `json_equals`, `json_scalar_bound`,
-`artifact_size`, `sha256`, and `wandb_summary_required`. A failed gate fails the trial. There is no
+`artifact_size`, `sha256`, `wandb_summary_required`, and `mlflow_required`.
+`mlflow_required` separately names `metrics`, `params`, and `tags` from the
+same bound run. A failed gate fails the trial. There is no
 advisory gate mode or baseline substitution.
 
 All local evidence paths are relative to the fresh attempt directory; there is
