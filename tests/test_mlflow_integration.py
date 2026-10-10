@@ -138,6 +138,9 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
             summary[0].info.run_id if mode == "managed" else parent.info.run_id
         )
     assert summary[0].info.status == "FINISHED"
+    publication.publish_failed_generation(experiment, generation_id, RuntimeError("late error"))
+    assert client.get_run(summary[0].info.run_id).info.status == "FINISHED"
+    assert delivery_status(experiment, generation_id) == {"pending": 0, "delivered": 7}
     assert (
         client.list_artifacts(summary[0].info.run_id, "phasesweep")[0].path
         == "phasesweep/summary.json"
@@ -193,3 +196,72 @@ def test_blocked_tracking_worker_is_cleaned(tmp_path, monkeypatch):
     lifecycle = read_attempt_lifecycle(directories[0], expected_attempt_id=directories[0].name)
     assert lifecycle.state == "exited" and lifecycle.cleanup_confirmed
     assert not list(_attempts_dir(experiment).glob("*.json"))
+
+
+@pytest.mark.parametrize("outage", ["none", "before_upload", "lost_ack"])
+def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, monkeypatch, outage):
+    """A real failed trainer leaves no score and a retryable failed summary projection."""
+    from phasesweep.engine import NoFeasibleTrialError
+    from phasesweep.engine.paths import _attempts_dir
+    from phasesweep.tracking import publication
+    from phasesweep.tracking.session import read_record, tracking_root
+
+    uri, client, experiment_id, _process = local_server
+    trainer = tmp_path / "failed_trainer.py"
+    trainer.write_text(
+        "import os\nimport mlflow\n"
+        "with mlflow.start_run(run_id=os.environ['MLFLOW_RUN_ID']):\n"
+        "    mlflow.log_metric('eval/loss', 0.01, step=500)\n"
+        "    raise RuntimeError('failure after logging a tempting score')\n"
+    )
+    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config.update(
+        workdir=str(tmp_path / "work"), storage=f"journal:///{tmp_path / 'study.journal'}"
+    )
+    config["trial_command"] = f"{sys.executable} {trainer} --config {{config_path}}"
+    config["mlflow"].update(tracking_uri=uri, timeout_seconds=15, poll_seconds=0.05)
+    config["phases"][0].update(max_consecutive_failures=1)
+    experiment = Experiment.model_validate(config)
+    actual_call = publication.call_tracking
+
+    def disconnected(*args, **kwargs):
+        if outage == "lost_ack":
+            actual_call(*args, **kwargs)
+        raise RuntimeError("Simulated summary-upload outage")
+
+    if outage != "none":
+        monkeypatch.setattr(publication, "call_tracking", disconnected)
+    reports = []
+    with pytest.raises(NoFeasibleTrialError) as caught:
+        run_experiment(experiment, terminal_callback=reports.append)
+    assert reports[0].primary_error is caught.value
+    assert reports[0].cleanup_confirmed
+    generation = reports[0].generation_id
+    status = read_status(experiment)
+    assert status["published_generation_id"] is None
+    assert status["phases"][0]["trials"]["FAIL"] == 1
+    assert status["phases"][0]["trials"].get("COMPLETE", 0) == 0
+    assert not list(_attempts_dir(experiment).glob("*.json"))
+    summaries = client.search_runs(
+        [experiment_id], filter_string="tags.`phasesweep.phase` = 'generation'"
+    )
+    attempts = client.search_runs(
+        [experiment_id], filter_string="tags.`phasesweep.phase` != 'generation'"
+    )
+    assert len(summaries) == len(attempts) == 1
+    assert attempts[0].info.status == "FAILED"
+    assert attempts[0].data.metrics["eval/loss"] == 0.01
+    assert "phasesweep.objective" not in attempts[0].data.metrics
+    assert summaries[0].info.status == ("RUNNING" if outage == "before_upload" else "FAILED")
+    record_path = tracking_root(experiment) / generation / "delivery/generation.json"
+    before = read_record(record_path)
+    assert before["finish"] == "FAILED"
+    assert before["state"] == ("delivered" if outage == "none" else "pending")
+    monkeypatch.setattr(publication, "call_tracking", actual_call)
+    assert sync_tracking(experiment, generation) == {"pending": 0, "delivered": 1}
+    assert read_record(record_path)["projection"] == before["projection"]
+    assert client.get_run(summaries[0].info.run_id).info.status == "FAILED"
+    assert "phasesweep/summary.json" in [
+        a.path for a in client.list_artifacts(summaries[0].info.run_id, "phasesweep")
+    ]
+    assert read_status(experiment)["phases"] == status["phases"]

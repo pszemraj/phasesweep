@@ -258,6 +258,51 @@ def publish_generation(
     )
 
 
+def publish_failed_generation(
+    experiment: Experiment, generation_id: str, error: BaseException
+) -> None:
+    """Mirror a failed invocation only after the engine confirms process cleanup.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Failed invocation identity.
+    :param BaseException error: Authoritative engine failure, without its private message.
+    """
+    from phasesweep.engine.paths import _last_successful_generation_path
+    from phasesweep.engine.publication_validation import _read_pointer_target
+    from phasesweep.engine.trial import _trainer_environment
+    from phasesweep.runtime.shutdown import PhaseSweepShutdown
+
+    parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
+    if not parent_path.exists():
+        return
+    # The pointer commits before the optional lifecycle record. A secondary
+    # error after that boundary must never turn committed success into failure.
+    target = _read_pointer_target(
+        _last_successful_generation_path(experiment), experiment_name=experiment.experiment
+    )
+    if target is not None and target.generation_id == generation_id:
+        return
+    status = "KILLED" if isinstance(error, (PhaseSweepShutdown, KeyboardInterrupt)) else "FAILED"
+    _enqueue(
+        experiment,
+        generation_id,
+        "generation",
+        read_record(parent_path),
+        _projection(
+            metrics={},
+            params={},
+            tags={"phasesweep.outcome": status},
+            summary={
+                "generation_id": generation_id,
+                "status": status,
+                "error_class": type(error).__name__,
+            },
+        ),
+        _trainer_environment(experiment, experiment.phases[0].name),
+        finish=status,
+    )
+
+
 def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
     """Read mutable delivery counts without importing the tracking SDK.
 

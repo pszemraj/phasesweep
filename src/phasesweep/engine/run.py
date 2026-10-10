@@ -499,6 +499,23 @@ def _run_experiment_outcome(
                     error_class=failed_error_class,
                 ),
             )
+            if experiment.mlflow is not None and cleanup.cleanup_confirmed:
+                from phasesweep.tracking.publication import publish_failed_generation
+
+                try:
+                    publish_failed_generation(experiment, generation_id, primary_error)
+                except ProcessCleanupUncertainError as tracking_exc:
+                    cleanup.mark_uncertain(tracking_exc)
+                    log.exception("MLflow failure delivery cleanup could not be confirmed")
+                except BaseException as tracking_exc:  # noqa: BLE001 - primary error must survive
+                    if (
+                        isinstance(tracking_exc, PhaseSweepShutdown)
+                        and not tracking_exc.report.cleanup_confirmed
+                    ):
+                        cleanup.mark_uncertain(tracking_exc)
+                    log.exception(
+                        "MLflow failure delivery did not complete; preserving the original error"
+                    )
             terminal_report = _terminal_report_from_cleanup(
                 generation_id,
                 cleanup,

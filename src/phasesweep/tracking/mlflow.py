@@ -230,10 +230,14 @@ def _publish(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     binding, projection = request["binding"], request["projection"]
     run = client.get_run(binding["run_id"])
     verify_remote(run, binding)
-    if request.get("finish") and run.info.status in {"FAILED", "KILLED"}:
-        raise ValueError(
-            "MLflow generation run ended unsuccessfully; refusing to overwrite its status."
-        )
+    finish = request.get("finish")
+    if finish:
+        if binding["phase"] != "generation" or binding["run_mode"] != "managed":
+            raise ValueError("Only PhaseSweep-owned generation summaries may be terminated.")
+        if run.info.status in {"FINISHED", "FAILED", "KILLED"} and run.info.status != finish:
+            raise ValueError(
+                "MLflow generation run has a different terminal status; refusing to overwrite it."
+            )
     client.log_batch(
         binding["run_id"],
         metrics=[
@@ -249,8 +253,8 @@ def _publish(client: Any, request: dict[str, Any]) -> dict[str, Any]:
             json.dumps(projection["summary"], sort_keys=True, allow_nan=False), encoding="utf-8"
         )
         client.log_artifact(binding["run_id"], str(path), artifact_path="phasesweep")
-    if request.get("finish") and run.info.status != "FINISHED":
-        client.set_terminated(binding["run_id"], status=request["finish"])
+    if finish and run.info.status != finish:
+        client.set_terminated(binding["run_id"], status=finish)
     return {}
 
 
