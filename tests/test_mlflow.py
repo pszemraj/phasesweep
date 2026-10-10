@@ -555,6 +555,19 @@ def test_worker_names_the_missing_module(tmp_path, monkeypatch, missing, expecte
     assert expected in json.loads(response.read_text())["message"]
 
 
+def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
+    from phasesweep.runtime.process import ProcessResult
+    from phasesweep.tracking import mlflow as worker
+
+    diagnostic = tmp_path / "mlflow-worker.stderr.log"
+    crashed = ProcessResult(return_code=1, timed_out=False, pid=0, duration_seconds=0)
+    monkeypatch.setattr(worker, "run_worker", lambda *args, **kwargs: (crashed, {}, diagnostic))
+    with pytest.raises(RuntimeError, match=f"exit 1.*{diagnostic}"):
+        worker.request_operation(
+            {}, operation_id="op", directory=tmp_path, environment={}, deadline=0.0
+        )
+
+
 def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch):
     from phasesweep.engine import NoFeasibleTrialError, run_experiment
     from phasesweep.runtime.gpu import GpuPool

@@ -57,7 +57,7 @@ def request_operation(
     :raises RuntimeError: The worker failed, timed out, or rejected the request.
     :return dict[str, Any]: Successful public-client response.
     """
-    result, response, _diagnostic = run_worker(
+    result, response, diagnostic_path = run_worker(
         request,
         Path(__file__).resolve(),
         "mlflow",
@@ -70,7 +70,8 @@ def request_operation(
     if result.timed_out:
         raise TimeoutError("MLflow operation exceeded its deadline.")
     if result.return_code != 0 or response.get("status") not in {"ok", "error"}:
-        raise RuntimeError("MLflow worker failed; inspect its private diagnostic.")
+        diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
+        raise RuntimeError(f"MLflow worker failed (exit {result.return_code}).{diagnostic}")
     if response["status"] == "error":
         raise RuntimeError(response["message"])
     return dict(response["result"])
