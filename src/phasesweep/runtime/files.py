@@ -34,9 +34,9 @@ SHARED_FILE_MODE = 0o660
 def cache_dir() -> Path:
     """Return the disposable PhaseSweep cache namespace.
 
-    :return Path: XDG cache root plus phasesweep, defaulting below Path.home().
+    :return Path: Absolute XDG cache root plus phasesweep, defaulting below Path.home().
     """
-    return Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "phasesweep"
+    return xdg_home("XDG_CACHE_HOME", Path.home() / ".cache") / "phasesweep"
 
 
 def ensure_artifact_dir(path: Path) -> None:

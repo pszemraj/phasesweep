@@ -466,6 +466,9 @@ def test_cache_uses_home_and_xdg(tmp_path, monkeypatch):
     assert cache_dir() == Path.home() / ".cache/phasesweep"
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     assert cache_dir() == tmp_path / "phasesweep"
+    for ignored in ("", "relative/cache"):
+        monkeypatch.setenv("XDG_CACHE_HOME", ignored)
+        assert cache_dir() == Path.home() / ".cache/phasesweep"
 
 
 def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch):
