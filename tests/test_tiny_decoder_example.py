@@ -5,6 +5,9 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -25,6 +28,7 @@ def _load_wrapper() -> ModuleType:
 
 def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monkeypatch):
     wrapper = _load_wrapper()
+    monkeypatch.setitem(sys.modules, "mlflow", None)
     template_root = tmp_path / "upstream"
     template_root.mkdir()
     trial_dir = tmp_path / "trial"
@@ -94,6 +98,96 @@ def test_wrapper_publishes_attempt_scoped_final_checkpoint_result(tmp_path, monk
         "status": "complete",
     }
     assert list(trial_dir.glob(".result.json.*.tmp")) == []
+
+
+@pytest.mark.parametrize("managed", [True, False])
+@pytest.mark.parametrize("device_type", ["cuda", "cpu"])
+@pytest.mark.parametrize("trainer_fails", [False, True])
+def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
+    tmp_path, monkeypatch, managed, device_type, trainer_fails
+) -> None:
+    """The native run covers training and closes on failure without logging a score."""
+    wrapper = _load_wrapper()
+    config_path = tmp_path / "trainer.yaml"
+    config = {"run_dir": str(tmp_path / "trainer"), "learning_rate": 0.001, "num_batches": 10}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    observed: dict[str, object] = {}
+
+    @contextmanager
+    def start_run(*, run_id: str | None) -> Iterator[SimpleNamespace]:
+        observed["resumed"] = run_id
+        observed["active"] = True
+        try:
+            yield SimpleNamespace(info=SimpleNamespace(run_id="native-run"))
+        except RuntimeError:
+            observed["status"] = "FAILED"
+            raise
+        else:
+            observed["status"] = "FINISHED"
+        finally:
+            observed["active"] = False
+
+    def train(_root: Path, _config: Path) -> None:
+        assert observed["active"] is True
+        assert observed["params"] == config
+        if trainer_fails:
+            raise RuntimeError("trainer failed")
+
+    def log_metrics(values: dict[str, float], *, step: int) -> None:
+        observed["metrics"] = values
+        observed["step"] = step
+
+    sdk = SimpleNamespace(
+        start_run=start_run,
+        log_params=lambda params: observed.update(params=params),
+        log_metrics=log_metrics,
+        set_tags=lambda tags: observed.update(tags=tags),
+    )
+    monkeypatch.setitem(sys.modules, "mlflow", sdk)
+    monkeypatch.setattr(
+        "phasesweep.tracking.bind_mlflow_run", lambda run_id: observed.update(bound=run_id)
+    )
+    if managed:
+        monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
+    else:
+        monkeypatch.delenv("MLFLOW_RUN_ID", raising=False)
+    monkeypatch.setattr(wrapper, "_run_template", train)
+    monkeypatch.setattr(
+        wrapper,
+        "_evaluate_final_checkpoint",
+        lambda *_args: {
+            "val_loss": 0.25,
+            "step": 10,
+            "device_type": device_type,
+            "policy": "final_checkpoint",
+            "checkpoint": "final.pt",
+        },
+    )
+    # Native mode has no JSON-envelope destination supplied by the controller.
+    monkeypatch.delenv("PHASESWEEP_OBJECTIVE_PATH", raising=False)
+    args = ["--config", str(config_path), "--mlflow"]
+    if trainer_fails:
+        with pytest.raises(RuntimeError, match="trainer failed"):
+            wrapper.main(args)
+        assert observed["status"] == "FAILED"
+        assert "metrics" not in observed
+    else:
+        assert wrapper.main(args) == 0
+        assert observed["status"] == "FINISHED"
+        assert observed["metrics"] == {
+            "val_loss": 0.25,
+            "runtime/cuda": float(device_type == "cuda"),
+        }
+        assert observed["step"] == 10
+        assert observed["tags"] == {
+            "runtime.device_type": device_type,
+            "evaluation.policy": "final_checkpoint",
+            "evaluation.checkpoint": "final.pt",
+            "evaluation.split": "validation",
+        }
+    assert observed["resumed"] == ("managed-run" if managed else None)
+    assert observed.get("bound") == (None if managed else "native-run")
+    assert observed["active"] is False
 
 
 def test_wrapper_rejects_a_config_from_another_attempt(tmp_path, monkeypatch) -> None:

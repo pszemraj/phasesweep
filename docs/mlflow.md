@@ -35,6 +35,11 @@ with loss 9; the rate phase inherits that depth and selects `optimizer.rate=3`
 with loss 0. The [trainer](../src/phasesweep/examples/mlflow_train.py) uses
 `mlflow.log_metric`, `log_params`, and `set_tag` directly.
 
+For real training on a GPU, the [Tiny Decoder MLflow smoke
+guide](../examples/tiny_decoder_enwik8/README.md#native-mlflow-gpu-smoke)
+provides a complete two-trial, ten-batch configuration using native
+final-checkpoint metrics, with both run ownership modes supported.
+
 ## Configure the source experiment
 
 ```yaml
