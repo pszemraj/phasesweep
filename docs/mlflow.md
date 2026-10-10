@@ -105,7 +105,53 @@ PhaseSweep never discovers runs by name or recency, finishes trainer-owned
 runs, or changes their existing parent relationships. The trainer must close
 its run successfully before evidence can be accepted. Existing framework
 loggers must expose their actual run ID and honor this ownership contract;
-framework-specific qualification remains follow-up work.
+other logger integrations require their own qualification.
+
+### Transformers Trainer
+
+For native Transformers logging, set `report_to: [mlflow]` in the trainer's
+arguments. Keep the managed run active across both training and any subsequent
+evaluation:
+
+```python
+import os
+import mlflow
+
+run_id = os.environ.pop("MLFLOW_RUN_ID")
+with mlflow.start_run(run_id=run_id):
+    trainer.train()
+    trainer.evaluate()
+```
+
+Here `trainer` is your configured Transformers Trainer. Removing `MLFLOW_RUN_ID`
+before its MLflow callback starts lets the callback use the active run without
+taking ownership of closing it. Otherwise, the callback can close the run when
+training ends, and a later evaluation can log to a different run. When wrapping
+an official example script, keep its entire execution inside this context.
+Native metrics retain their Trainer names, such as `eval_loss` and
+`eval_rouge1`; choose the exact final optimizer step when comparing fixed
+training budgets.
+
+Set model storage precision explicitly when preparing mixed-precision training.
+In the qualified Transformers checkout, BART's checkpoint loaded FP16 weights
+when the example omitted `dtype`, and both tested learning rates produced NaN
+metrics. BF16 autocast did not change that parameter storage. Loading with
+`from_pretrained(..., dtype=torch.float32)` supplies FP32 parameters for training
+while `bf16: true` controls autocast separately.
+
+The official summarization example accepts JSON-lines data but requires local
+input filenames ending in `.json`, rather than `.jsonl`. Materialize bounded
+samples from large Hub datasets with streaming before launching the sweep, and
+use distinct training and validation splits.
+
+This managed pattern was exercised with MLflow 3.17.0, Transformers
+5.19.0.dev0 (`536ecc0`), and BART-large: six RTX 5090 trials of 100 optimizer
+steps each across three inherited phases, using the explicit FP32 model load
+above. Native evidence and same-experiment delivery were verified locally.
+No-work replay preserved the selected values and provenance with tracking SDK
+imports, network connections, and child launches blocked.
+Trainer-owned Transformers logging and other framework/version combinations
+remain unverified.
 
 ## Select metrics and require evidence
 
@@ -167,6 +213,12 @@ metrics again, or rewrite scientific evidence. Already delivered projections
 are skipped. The command exits nonzero if uploads remain pending. Tracking-only
 worker recovery uses the active-work registry without changing Optuna trials.
 
+A failed controller invocation can currently leave its generation-summary run
+marked RUNNING after the attempt runs have failed. This was observed during
+local framework qualification. After confirming that trainer cleanup completed,
+close that abandoned summary explicitly through MLflow; `sync-tracking` retries
+saved result projections and does not repair this missing terminal projection.
+
 Bindings, creation intents, and mutable delivery records stay under the
 experiment artifact root. Delivery records live in
 `tracking/<generation-id>/delivery/`, separately from committed generation
@@ -185,5 +237,6 @@ The SDK can also use its normal profile configuration. See
 [Databricks authentication](https://docs.databricks.com/en/dev-tools/auth/index.html).
 
 Local HTTP behavior is qualified by the integration tests. Live Databricks
-access and framework-specific logger behavior remain **unverified** until
-workplace testing; no workplace credentials or endpoints are required locally.
+access remains **unverified** until workplace testing; no workplace credentials
+or endpoints are required locally. A local framework qualification does not
+establish that framework's Databricks behavior.
