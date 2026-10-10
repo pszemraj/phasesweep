@@ -648,9 +648,9 @@ mlflow: object | null = null
   # Recommended: use a finite interval; current validation also accepts positive infinity, which is not a practical polling interval.
   poll_seconds: float = 2.0
 
-  # Per controller tracking-operation budget in seconds; must be >= 1. Remaining phase/run deadlines cap it; this does not limit training time.
+  # Per controller tracking-operation budget in seconds; must be >= 1. Remaining phase/run deadlines also cap experiment resolution, run creation and evidence capture; result uploads are publication and are bounded only by this value. This does not limit training time.
   # Recommended: use a finite value long enough for server/SDK startup; current validation also accepts positive infinity.
-  # Warning: positive infinity removes this configured operation bound, subject to any remaining phase/run deadlines.
+  # Warning: positive infinity removes this bound; a result upload to an unresponsive server then blocks the sweep until the server responds.
   timeout_seconds: float = 120.0
 
 # ---------- Execution environment ----------
@@ -690,7 +690,7 @@ execution: object = {}
   record_env: bool = false
 
 # Whole run wallclock budget in seconds, finite and nonnegative; null adds no run deadline, zero expires immediately.
-# Combined with phases[].timeout_seconds_per_phase and phases[].timeout_seconds_per_trial, the earliest active deadline limits work. MLflow/W&B operations are also capped by the remaining phase/run budget.
+# Combined with phases[].timeout_seconds_per_phase and phases[].timeout_seconds_per_trial, the earliest active deadline limits work. W&B evidence reads and MLflow resolution, run creation and evidence capture are also capped by the remaining phase/run budget; MLflow result uploads are publication.
 # An incomplete phase fails closed unless phases[].allow_incomplete_on_timeout permits a feasible partial winner.
 # Starts after the generation is claimed, before execution preflight and phase work; initial locking/ledger setup is outside this clock. Cleanup/publication may extend beyond the deadline, which never waives process-cleanup requirements.
 timeout_seconds_per_run: float | null = null
