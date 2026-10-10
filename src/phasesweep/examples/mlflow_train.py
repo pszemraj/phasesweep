@@ -6,7 +6,6 @@ import argparse
 import os
 from pathlib import Path
 
-import mlflow
 import yaml
 
 from phasesweep.tracking import bind_mlflow_run
@@ -21,6 +20,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args(argv)
+    import mlflow
+
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     depth, rate = config["model"]["depth"], config["optimizer"]["rate"]
     loss = float((depth - 2) ** 2 + (rate - 3) ** 2)

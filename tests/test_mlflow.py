@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import runpy
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +14,16 @@ from phasesweep.config import Experiment, MlflowSettings
 from phasesweep.evidence.mlflow import compile_query, observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor
 from phasesweep.tracking.mlflow import _capture, _create
+
+
+def test_cpu_example_import_and_help_without_sdk(monkeypatch, capsys):
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    path = Path(__file__).parents[1] / "src/phasesweep/examples/mlflow_train.py"
+    namespace = runpy.run_path(str(path))
+    with pytest.raises(SystemExit) as stopped:
+        namespace["main"](["--help"])
+    assert stopped.value.code == 0
+    assert "--config" in capsys.readouterr().out
 
 
 def spec(selection="last", **kwargs):
