@@ -682,7 +682,7 @@ execution: object = {}
   # Additional ambient variable names for rotating credentials or transport, e.g. MLFLOW_TRACKING_TOKEN, HTTPS_PROXY. Names/classification are semantic, values are excluded from the persistent environment cohort digest. Missing ambient variables are not invented.
   # Conflicts with: execution.inherit_env explicit lists must not overlap; duplicate, empty or padded names fail config load.
   # Overridden by: env for matching names, whose configured values remain semantic.
-  # Warning: this selects trainer/reader credentials; the controller MLflow client also needs its own ambient authentication. Model/data/cache settings that change trial meaning belong in env or execution.inherit_env instead.
+  # Warning: this selects credentials for the trainer and for PhaseSweep's own evidence and tracking workers, which run with the same composed environment, so listed values must exist in the controller's ambient environment, including for sync-tracking. Model/data/cache settings that change trial meaning belong in env or execution.inherit_env instead.
   passthrough_env: list[string] = []
 
   # Write the composed base environment before per-trial PHASESWEEP_* and GPU bindings into trial environment.json, owner-only mode 0600. Names and the semantic digest are recorded regardless of this flag.
