@@ -313,6 +313,13 @@ supervised reader like the summary capture, so if its cleanup is uncertain the
 phase stops instead (see
 [trial execution and evidence](runtime.md#trial-execution-and-evidence)).
 
+For plain keys, exact history matches take priority. With no exact match, the
+reader can use the final finite metric row when it differs from the summary by
+one binary64 step and no other neighboring value occurs. Larger or ambiguous
+differences leave the position unavailable. This accommodates observed API
+numeric differences; it cannot establish whether a summary was assigned
+independently, and never changes the accepted scalar.
+
 The primary objective, W&B constraints, and each phase's W&B gates must agree
 on normalized endpoint, entity, project, poll interval, and timeout. They share
 one finished-summary capture. Only requested numeric values and gate-presence

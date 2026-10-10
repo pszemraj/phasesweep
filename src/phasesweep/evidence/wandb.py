@@ -383,7 +383,12 @@ def _history_position(
 
     A plain summary key holds its series' last logged value: the latest
     history row with that value is where the objective was measured, and a
-    value assigned straight to the summary matches no row and has no position.
+    value assigned straight to the summary normally has no matching position.
+    When no exact match exists, a single finite neighboring binary64 value
+    may identify the final metric row. This accommodates observed API rounding
+    but cannot distinguish it from a separately assigned neighboring summary.
+    Ambiguous neighbors, older-only neighbors, and malformed final rows do
+    not supply this advisory position; the captured scalar stays unchanged.
     The server names an aggregate by its series and aggregation
     (``eval/loss.min`` summarizes the ``eval/loss`` series), so a recognized
     aggregation suffix absent from the history index is looked up as its
@@ -412,8 +417,8 @@ def _history_position(
     :param float value: Captured objective value.
     :param float deadline: ``time.monotonic()`` time at which a read gives up.
     :return tuple[_HistoryRead, int | float | None]: How the read ended, and
-        the position once ``settled`` (``None`` when no row produced a plain
-        key's value).
+        the position once ``settled`` (``None`` when a plain key has neither
+        an exact match nor an unambiguous neighboring final observation).
     """
     from phasesweep.evidence.evaluation import json_float
 
@@ -445,6 +450,10 @@ def _history_position(
         else:
             rows = run.scan_history(keys=keys, page_size=_HISTORY_SAMPLES, use_cache=False)
         read = 0
+        exact_match = False
+        neighbors: set[float] = set()
+        final_value: float | None = None
+        final_position: int | float | None = None
         for row in rows:
             if time.monotonic() >= deadline:
                 return "retry", None
@@ -454,14 +463,24 @@ def _history_position(
             if series != metric_key:
                 position = progress_position(row.get(axis))
                 continue
+            final_value = None
+            final_position = progress_position(row.get(axis))
             try:
                 logged = json_float(row[series], label=series)
             except ValueError:
                 continue
+            if not math.isfinite(logged):
+                continue
+            final_value = logged
             if logged == value:
-                position = progress_position(row.get(axis))
+                exact_match = True
+                position = final_position
+            elif math.nextafter(value, logged) == logged:
+                neighbors.add(logged)
         if read < count:
             return "lagging", None
+        if not exact_match and len(neighbors) == 1 and final_value in neighbors:
+            position = final_position
     except Exception as exc:
         return ("retry" if _is_retryable_setup_error(exc) else "settled"), None
     return "settled", position

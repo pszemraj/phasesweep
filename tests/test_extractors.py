@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 import tracemalloc
@@ -304,6 +305,57 @@ def test_wandb_locates_where_the_objective_summary_was_logged(
     run = _HistoryRun(summary, _EVAL_ROWS)
     assert _history_position(monkeypatch, run, metric_key, axis) == expected
     assert {kind for kind, _ in run.reads} <= {"history"}
+
+
+@pytest.mark.parametrize("direction", [-math.inf, math.inf])
+def test_wandb_final_history_neighbor_supplies_only_advisory_position(monkeypatch, direction):
+    """The two API representations may differ by one binary64 value."""
+    value = 0.0965803563594818
+    logged = math.nextafter(value, direction)
+    rows = [
+        {"_step": 0, "eval/loss": 3.9606740474700928, "eval/step": 0},
+        {"_step": 25, "eval/loss": logged, "eval/step": 500},
+        {"_step": 27, "eval/loss": logged, "eval/step": 500},
+    ]
+    summary = {"eval/loss": value, "_step": 28}
+    run = _HistoryRun(summary, rows + [{"_step": 28, "train/loss": 0.04}])
+    assert _history_position(monkeypatch, run, axis="eval/step") == 500
+    assert run.summary_metrics == {"eval/loss": value, "_step": 28}
+    assert run.rows[1]["eval/loss"] == logged
+
+
+@pytest.mark.parametrize("exact_axis", [100, None])
+def test_wandb_exact_history_match_precedes_later_neighbor(monkeypatch, exact_axis):
+    """An exact observation stays authoritative even without a usable axis."""
+    value = 0.2
+    rows = [
+        {"_step": 0, "eval/loss": value, "eval/step": exact_axis},
+        {"_step": 1, "eval/loss": math.nextafter(value, math.inf), "eval/step": 500},
+    ]
+    run = _HistoryRun({"eval/loss": value, "_step": 1}, rows)
+    assert _history_position(monkeypatch, run, axis="eval/step") == exact_axis
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [math.nextafter(0.2, -math.inf), math.nextafter(0.2, math.inf)],
+        [math.nextafter(math.nextafter(0.2, math.inf), math.inf)],
+        [math.nextafter(0.2, math.inf), 0.3],
+        [math.nextafter(0.2, math.inf), "not-a-number"],
+        [math.nextafter(0.2, math.inf), True],
+        [math.nextafter(0.2, math.inf), math.nan],
+        [math.nextafter(0.2, math.inf), math.inf],
+    ],
+    ids=["ambiguous", "two-ulps", "older-only", "malformed", "boolean", "nan", "infinite"],
+)
+def test_wandb_history_neighbor_cannot_guess_a_position(monkeypatch, values):
+    rows = [
+        {"_step": step, "eval/loss": logged, "eval/step": (step + 1) * 100}
+        for step, logged in enumerate(values)
+    ]
+    run = _HistoryRun({"eval/loss": 0.2, "_step": len(rows) - 1}, rows)
+    assert _history_position(monkeypatch, run, axis="eval/step") is None
 
 
 def test_wandb_series_at_the_sample_cap_is_scanned_in_pages_never_sampled(monkeypatch):
