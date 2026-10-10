@@ -139,6 +139,23 @@ metrics. BF16 autocast did not change that parameter storage. Loading with
 `from_pretrained(..., dtype=torch.float32)` supplies FP32 parameters for training
 while `bf16: true` controls autocast separately.
 
+Check the model head's loss normalization when using gradient accumulation.
+In this checkout, the BART summarization and ModernBERT token-classification
+heads compute mean cross-entropy but accept `**kwargs` without using
+`num_items_in_batch`. Trainer consequently assumes the loss is already
+normalized across accumulated microbatches. For these heads, set
+`model.accepts_loss_kwargs = False` before constructing Trainer so it averages
+the microbatch losses. This is microbatch averaging, rather than a global mean
+over all nonignored tokens. The earlier BART qualification omitted this setting;
+its measured evaluation scores and tracking checks stand, but its accumulated
+training gradients were summed rather than averaged.
+
+For token classification, select native `eval_f1` at the final optimizer step
+with `metric.goal: maximize`. Keep the validation rows and word-label alignment
+fixed across candidates. When sweeping `label_smoothing_factor`, compare F1:
+Trainer applies smoothing to evaluation loss too, so losses from different
+smoothing settings have different definitions.
+
 The official summarization example accepts JSON-lines data but requires local
 input filenames ending in `.json`, rather than `.jsonl`. Materialize bounded
 samples from large Hub datasets with streaming before launching the sweep, and
@@ -150,6 +167,16 @@ steps each across three inherited phases, using the explicit FP32 model load
 above. Native evidence and same-experiment delivery were verified locally.
 No-work replay preserved the selected values and provenance with tracking SDK
 imports, network connections, and child launches blocked.
+
+The official NER example was also qualified with Ettin 68M, Liquid
+LFM2.5 Encoder 230M, and text-only NeoMME 260M: nine 500-update trials per
+model across three inherited phases, at batch 32 with FP32 parameters and
+optimizer states plus BF16 autocast. Ettin used its native task head; Liquid
+and NeoMME required local token-classification heads, with NeoMME's document
+prefix removed before predicting word labels. Native histories, same-experiment
+delivery, and stopped-server replay were verified for all three. Repeated
+validation selection and sentence overlap limit model-quality conclusions.
+
 Trainer-owned Transformers logging and other framework/version combinations
 remain unverified.
 
