@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import runpy
 import sys
 from pathlib import Path
@@ -157,7 +158,27 @@ def test_unsuccessful_remote_cannot_be_finished(status):
         _capture(client, {"binding": binding, "query": {}, "settings": {"timeout_seconds": 1}})
 
 
-def test_creation_binds_an_existing_identity_and_creates_only_when_absent():
+def test_worker_keeps_sdk_retries_for_idempotent_operations(tmp_path, monkeypatch):
+    """Reads such as evidence capture ride out transient HTTP failures."""
+    import json
+
+    from phasesweep.tracking import mlflow as worker
+
+    monkeypatch.delenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", raising=False)
+    seen = []
+    monkeypatch.setattr(
+        worker,
+        "_dispatch",
+        lambda request: seen.append(os.environ.get("MLFLOW_HTTP_REQUEST_MAX_RETRIES")) or {},
+    )
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"action": "capture"}))
+    assert worker.main([str(request), str(tmp_path / "response.json")]) == 0
+    assert seen == [None]
+
+
+def test_creation_binds_an_existing_identity_and_creates_only_when_absent(monkeypatch):
+    monkeypatch.delenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", raising=False)
     binding = _binding()
     identity = {k: v for k, v in binding.items() if k != "run_id"}
     created = []
@@ -166,6 +187,8 @@ def test_creation_binds_an_existing_identity_and_creates_only_when_absent():
         token = None
 
     def create_run(*args, **kwargs):
+        # Only the non-idempotent create is never replayed by the SDK.
+        assert os.environ["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] == "0"
         created.append(kwargs["tags"])
         return _run(binding)
 
@@ -180,6 +203,7 @@ def test_creation_binds_an_existing_identity_and_creates_only_when_absent():
     client.search_runs = lambda *a, **k: Page()
     assert _create(client, request) == binding
     assert len(created) == 1
+    assert "MLFLOW_HTTP_REQUEST_MAX_RETRIES" not in os.environ
     client.search_runs = lambda *a, **k: Page([_run(binding), _run(binding)])
     with pytest.raises(ValueError, match="ambiguous"):
         _create(client, request)

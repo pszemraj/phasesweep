@@ -46,7 +46,7 @@ metric:
 
 The experiment must already exist and be active. PhaseSweep never creates it implicitly. `tracking_uri` accepts HTTP(S), `databricks`, and `databricks://profile`. HTTP credentials belong in the SDK's authentication configuration or environment rather than the URI. The top-level `mlflow` block requires an MLflow objective. Local constraint extractors and local gates can still accompany it, but every remote consumer uses the bound MLflow run.
 
-All controller network operations run in supervised workers outside GPU leases. The timeout bounds each operation; a phase or whole-run deadline can shorten it. Trainer cleanup is confirmed before releasing its GPU lease, and launch checks cancellation and deadlines again after acquiring that lease.
+All controller network operations run in supervised workers outside GPU leases. The timeout bounds each operation; a phase or whole-run deadline can shorten it. Within that bound the MLflow client retries transient HTTP failures, except run creation, which reconciles by identity instead of being replayed. Trainer cleanup is confirmed before releasing its GPU lease, and launch checks cancellation and deadlines again after acquiring that lease.
 
 ## Choose run ownership
 

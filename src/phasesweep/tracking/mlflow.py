@@ -6,7 +6,8 @@ import argparse
 import json
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -14,6 +15,8 @@ from typing import Any
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.remote_worker import run_worker
 from phasesweep.runtime.time import utc_now_iso
+
+_SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
 
 
 def request_operation(
@@ -101,6 +104,26 @@ def _resolve(client: Any, settings: dict[str, Any]) -> str:
     return str(experiment.experiment_id)
 
 
+@contextmanager
+def _without_sdk_replay() -> Iterator[None]:
+    """Disable the SDK's HTTP retries for one non-idempotent request.
+
+    A timed-out POST can have succeeded, so the caller's next try reconciles
+    by identity instead of replaying it. Idempotent reads keep SDK retries.
+
+    :return Iterator[None]: Scope in which the SDK sends each request once.
+    """
+    previous = os.environ.get(_SDK_RETRIES)
+    os.environ[_SDK_RETRIES] = "0"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(_SDK_RETRIES, None)
+        else:
+            os.environ[_SDK_RETRIES] = previous
+
+
 def _create(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     """Bind the run carrying this exact identity, creating it only when none exists.
 
@@ -134,7 +157,10 @@ def _create(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     else:
         if binding.get("parent_run_id"):
             tags["mlflow.parentRunId"] = binding["parent_run_id"]
-        run = client.create_run(binding["experiment_id"], tags=tags, run_name=request["run_name"])
+        with _without_sdk_replay():
+            run = client.create_run(
+                binding["experiment_id"], tags=tags, run_name=request["run_name"]
+            )
     binding["run_id"] = run.info.run_id
     verify_remote(run, binding)
     return binding
@@ -292,9 +318,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("response", type=Path)
     args = parser.parse_args(argv)
     request = json.loads(args.request.read_text(encoding="utf-8"))
-    # A timed-out POST can have succeeded. Reconciliation, not HTTP replay,
-    # decides what to do with run creation.
-    os.environ["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] = "0"
     try:
         response = {"status": "ok", "result": _dispatch(request)}
     except ImportError:
