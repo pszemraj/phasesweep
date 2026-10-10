@@ -69,6 +69,7 @@ def _deliver(experiment: Experiment, path: Path, environment: Mapping[str, str])
             record["generation_id"],
             {
                 "action": "publish",
+                "name": path.stem,
                 "binding": record["binding"],
                 "projection": record["projection"],
                 "finish": record["finish"],

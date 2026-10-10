@@ -148,7 +148,7 @@ At least one namespace must be nonempty. Missing evidence fails the trial; value
 
 ## Result delivery and recovery
 
-Accepted trials receive reserved `phasesweep.*` metrics, parameters, and tags: objective, measured constraints, feasibility, trainer duration, effective fixed/inherited/sampled overrides, and phase/inheritance references. Trainers should leave this namespace to PhaseSweep. A generation-summary run in the same experiment groups managed attempts and holds `phasesweep/summary.json` plus winner references. Trainer-owned attempts retain their own parents.
+Accepted trials receive reserved `phasesweep.*` metrics, parameters, and tags: objective, measured constraints, feasibility, trainer duration, effective fixed/inherited/sampled overrides, and phase/inheritance references. Trainers should leave this namespace to PhaseSweep. A generation-summary run in the same experiment groups managed attempts and holds `phasesweep/generation.json` plus winner references. Each attempt run holds `phasesweep/attempt-<attempt-id>.json`, and a winning run also holds `phasesweep/winner-<phase>.json`. Trainer-owned attempts retain their own parents.
 
 An upload failure after acceptance warns and leaves a pending delivery record. It does not change the accepted score, complete trial, or committed winner. `phasesweep status` exposes path-free `tracking_delivery` counts across every generation, and MCP status counts the queried run's own uploads; scientific terminal snapshots remain frozen. Retry the saved projections:
 

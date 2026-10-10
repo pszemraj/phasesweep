@@ -141,10 +141,14 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
     publication.publish_failed_generation(experiment, generation_id, RuntimeError("late error"))
     assert client.get_run(summary[0].info.run_id).info.status == "FINISHED"
     assert delivery_status(experiment, generation_id) == {"pending": 0, "delivered": 7}
-    assert (
-        client.list_artifacts(summary[0].info.run_id, "phasesweep")[0].path
-        == "phasesweep/summary.json"
-    )
+    assert [a.path for a in client.list_artifacts(summary[0].info.run_id, "phasesweep")] == [
+        "phasesweep/generation.json"
+    ]
+    rate_run = winners["rate"].objective_provenance["remote_capture"]["binding"]["run_id"]
+    assert {a.path for a in client.list_artifacts(rate_run, "phasesweep")} == {
+        f"phasesweep/attempt-{winners['rate'].attempt_id}.json",
+        "phasesweep/winner-rate.json",
+    }
     rate_capture = winners["rate"].objective_provenance["remote_capture"]
     assert rate_capture["binding"]["run_id"] != winners["rate"].attempt_id
     assert all(point["step"] == 1 for point in rate_capture["observations"].values())
@@ -263,7 +267,7 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
     assert client.get_run(summaries[0].info.run_id).info.status == "FAILED"
     attempt = client.get_run(attempts[0].info.run_id)
     assert (attempt.info.status, attempt.data.tags["phasesweep.outcome"]) == ("FAILED", "FAILED")
-    assert "phasesweep/summary.json" in [
+    assert "phasesweep/generation.json" in [
         a.path for a in client.list_artifacts(summaries[0].info.run_id, "phasesweep")
     ]
     assert read_status(experiment)["phases"] == status["phases"]

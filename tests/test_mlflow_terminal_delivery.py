@@ -35,6 +35,7 @@ def test_publish_finishes_only_a_running_owned_run(actual, requested):
     _publish(
         client,
         {
+            "name": "generation",
             "binding": binding,
             "projection": publication._projection(metrics={}, params={}, tags={}, summary={}),
             "finish": requested,

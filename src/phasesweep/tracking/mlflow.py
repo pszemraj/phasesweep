@@ -268,7 +268,9 @@ def _publish(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     """Mirror one retained projection, then finish a still-running owned run.
 
     A run that is already terminal keeps its status, so a remote outcome is
-    never overwritten; the projection still records PhaseSweep's result.
+    never overwritten; the projection still records PhaseSweep's result. The
+    summary artifact is named after the projection, so a winner projection
+    never replaces its run's trial summary.
 
     :param Any client: Public MLflow client in the supervised worker.
     :param dict[str, Any] request: Trusted target or operation payload.
@@ -293,7 +295,7 @@ def _publish(client: Any, request: dict[str, Any]) -> dict[str, Any]:
         synchronous=True,
     )
     with TemporaryDirectory(prefix="phasesweep-mlflow-summary-") as directory:
-        path = Path(directory) / "summary.json"
+        path = Path(directory) / f"{request['name']}.json"
         path.write_text(
             json.dumps(projection["summary"], sort_keys=True, allow_nan=False), encoding="utf-8"
         )
