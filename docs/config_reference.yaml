@@ -156,7 +156,7 @@ metric: object (required)
 # Ordered nonempty list of phase objects; each phase must produce a feasible winner before dependent work can proceed. Values below describe one item.
 # Warning: inherits transfers override values, never model weights or checkpoints; the trainer must load a checkpoint explicitly if that is intended.
 phases: list[object] (required)
-  # Safe nonempty [A-Za-z0-9_-]+ phase identity, e.g. learning_rate. Names must be unique case-insensitively; attempts and generations are reserved.
+  # Safe nonempty [A-Za-z0-9_-]+ phase identity, e.g. learning_rate. Names must be unique case-insensitively; attempts, generations and tracking are reserved.
   # Requires: phases[].inherits can name this phase only from later declared phases.
   - name: string (required)
 

@@ -395,6 +395,8 @@ class Phase(_Frozen):
             raise ValueError(
                 "Phase name 'generations' is reserved for immutable generation records."
             )
+        if v.casefold() == "tracking":
+            raise ValueError("Phase name 'tracking' is reserved for MLflow tracking records.")
         return v
 
     @model_validator(mode="after")

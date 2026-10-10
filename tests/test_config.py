@@ -477,6 +477,7 @@ def test_config_rejects_invalid_metric_regex_before_creating_workdir(tmp_path, p
         ("Attempts", "reserved for the runtime recovery registry"),
         ("generations", "reserved for immutable generation records"),
         ("Generations", "reserved for immutable generation records"),
+        ("tracking", "reserved for MLflow tracking records"),
     ],
 )
 def test_config_rejects_reserved_phase_name_before_creating_workdir(
