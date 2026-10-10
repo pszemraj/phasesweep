@@ -1,257 +1,674 @@
-# PhaseSweep configuration reference
-#
-# This is a hand-written, fully commented key reference, not a runnable config.
-# A configuration is one UTF-8 YAML mapping for one Experiment. Duplicate mapping
-# keys are rejected. A top-level suite mapping is unsupported.
+# PhaseSweep config_reference.yaml: exhaustive primary Experiment YAML, signature form.
+# Values are signatures (key: type = default), not runnable YAML; start from examples/example.yaml.
+# Hand-maintained: tests/test_config_reference.py guards schema paths, variants, required/default signatures and the real-loader example.
+# This preserves one narrative reference for cross-field behavior; schema metadata does not contain these interactions.
+# CLI: phasesweep validate CONFIG and phasesweep run CONFIG require an explicit path; no default file or environment-to-config overlay.
+# Read once per invocation; detached MCP launch freezes the submitted config. Editing the original does not reload active work.
+# Unknown model fields and duplicate YAML keys are rejected. Arbitrary map keys in trainer_config/fixed_overrides/provenance/env are intentional.
+# One UTF-8 mapping describes one Experiment; suite documents are unsupported. Built-in defaults are overlaid by YAML values.
+# Run flags (--from-phase, --dry-run, --verbose) control execution/display; they do not override YAML keys.
+# Relative workdir, journal and execution.cwd paths resolve against invocation cwd; local evidence is trial-relative.
+# There is no general ${VAR} interpolation. Shell expansion in trial_command follows the subprocess environment.
+# YAML scalars keep loader types: 1e-3 is a string; 1.0e-3 or 0.001 is numeric. Numeric fields reject booleans.
+# Each list/object variant below is an alternative, selected by its type; repeated type entries are documentation, not one combined object.
+# <key> in prose means any valid dotted override name, illustrated by optimizer.lr under search_space.
+# Operational environment outside YAML: XDG_CACHE_HOME places worker/cache files; PHASESWEEP_HOME selects an existing private absolute 0700 root.
+# PHASESWEEP_LOCK_DIR selects an existing safe absolute host-lock directory; by default locks use the OS account home, independent of HOME/XDG.
+# Trainer cache paths, model/data downloads, training cadence and hardware usage remain the external trainer's responsibility.
 
-# EXPERIMENT ROOT
+# ---------- Required experiment fields ----------
 
-# experiment: str (required)
-# Safe `[A-Za-z0-9_-]+` identity used in paths, study names, and locks.
+# Safe experiment identity used in paths, study names and locks: nonempty [A-Za-z0-9_-]+, e.g. bart_search.
+experiment: string (required)
 
-# storage: str | null = null
-# null (or omitted) is in-memory and disposable. The only durable local form is
-# journal:///absolute-or-relative/path.journal, which supports parallel trials
-# (n_jobs > 1) on one host. `auto` always selects
-# <workdir>/<experiment>/study.journal, regardless of n_jobs. Persistent
-# storage requires nonempty provenance. Any other value, including a
-# sqlite:///... URL, :memory:, or an external database URL, is rejected before
-# connection or artifact creation.
+# Shell command for one trainer invocation, e.g. python train.py --config {config_path}.
+# Requires: override_format determines the input placeholder: yaml_file always needs {config_path}; argparse/hydra need {overrides}, json_file needs {overrides_path}, unless composed overrides are empty in those three formats; incompatible placeholders fail config load.
+# Supported placeholders: {config_path}, {overrides}, {overrides_path}, {trial_dir}, {trial_id}, {phase}, {run_name}; unknown fields and malformed braces fail config load; {{ and }} escape literal braces.
+# Paths are shell-quoted by PhaseSweep; do not surround path placeholders with your own quotes. Trial ID is the phase-local Optuna number; run_name includes experiment, phase, trial ID and immutable attempt ID.
+# Recommended: use an absolute interpreter/script path and execution.cwd for a real trainer so the controller shell does not choose the wrong executable.
+trial_command: string (required)
 
-# workdir: str = "./runs"
-# Root containing this experiment's generations, phase directories, trial logs,
-# and winners. A current-format root is bound to its supported local ledger.
+# Primary finite scalar objective; its extractor selects one observation and its goal ranks trials. No pruning, evaluation scheduling or checkpoint selection is performed by PhaseSweep.
+# Requires: metric.name and constraints[].name must all be distinct; duplicate names fail config load.
+metric: object (required)
+  # Name published for the objective, e.g. validation_loss; goal is reserved and rejected.
+  # Requires: constraints[].name values must all be distinct from metric.name.
+  name: string = "objective"
 
-# trial_command: str (required)
-# Shell template for one trial. Supported placeholders are {config_path},
-# {overrides}, {overrides_path}, {trial_dir}, {trial_id}, {phase}, and {run_name}.
-# yaml_file requires {config_path}; argparse/hydra require {overrides};
-# json_file requires {overrides_path}. Constant commands may omit the input
-# placeholder when every phase's composed overrides are genuinely empty.
+  # Rank the scalar chosen per trial: minimize selects the smallest, maximize the largest.
+  # metric.extractor.select for log_regex/mlflow only selects within a run; it does not inherit this ranking direction.
+  goal: "minimize" | "maximize" = "minimize"
 
-# trainer_config: dict[str, JSON/YAML-compatible value] = {}
-# Complete base configuration for override_format: yaml_file. Dotted inherited,
-# fixed, and sampled values are applied to a copied mapping per trial. A nonempty
-# mapping is invalid with any other input format because it does not consume it.
+  # Scalar source, selected by type. Each variant below replaces this one object; do not combine their keys. All accepted objectives are finite scalars.
+  # Requires: the mlflow variant needs the top-level mlflow block; W&B variants cannot coexist with that block.
+  extractor: json | json_envelope | log_regex | mlflow | wandb (required)
+    # Variant json; selected by type: json.
+    # Read a finite JSON number; bool/string/container/nonfinite or unrepresentable integer evidence fails extraction.
+    type: "json" (required)
 
-# provenance: dict[str, str] = {}
-# Meaningful external trainer/data/dependency identifiers. Required for durable
-# local storage and part of the experiment identity.
+    # Trial-relative descendant file path, e.g. result.json; nonempty, no absolute paths, NUL or .. segments, and not the trial root. The trainer must write it in this attempt directory.
+    path: string (required)
 
-# override_format: Literal["yaml_file", "argparse", "hydra", "json_file"] = "yaml_file"
-# yaml_file writes a complete trainer_config.yaml and uses {config_path}.
-# argparse emits shell-safe --key=value tokens through {overrides}; it accepts
-# null, booleans, integers, finite floats, strings, and nested lists of them.
-# hydra renders native key=value tokens through {overrides}, preserving those
-# types. Control characters and interpolation-like strings are unsupported.
-# json_file writes strictly encoded nested overrides.json via {overrides_path};
-# flat overrides_resolved.json remains the audit copy. Dotted collisions fail.
+    # Nonempty dotted JSON object-key path, e.g. eval.loss; empty segments are rejected. No list-index or literal-dot escaping syntax is provided.
+    key: string (required)
 
-# metric: Metric (required)
-#   name: str = "objective"       # `goal` is reserved and cannot be the name.
-#   goal: Literal["minimize", "maximize"] = "minimize"
-#   extractor: JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor | MlflowExtractor
-# All readers must yield a finite scalar. Goal ranks trials, not observations.
+    # Variant json_envelope; selected by type: json_envelope.
+    # Read an attempt-bound result envelope; the trainer can write it with phasesweep.report_objective(). Attempt identity and content fingerprint must match.
+    type: "json_envelope" (required)
 
-# mlflow: MlflowSettings | null = null
-#   tracking_uri: str (HTTP(S), databricks, or databricks://profile)
-#   experiment_id: str | null = null
-#   experiment_name: str | null = null
-# Exactly one existing experiment selector is required. No implicit creation.
-#   run_mode: "managed" | "trainer" = "managed"
-#   poll_seconds: finite float = 2.0      # > 0
-#   timeout_seconds: finite float = 120.0 # >= 1, per controller operation
-# Requires an MLflow objective; W&B remote consumers cannot be mixed in.
-# Trainer-owned runs require phasesweep.tracking.bind_mlflow_run(actual_run_id).
-# Managed runs receive their real ID through MLFLOW_RUN_ID before trainer launch.
-# Results publish to the same experiment. See mlflow.md for delivery/recovery.
+    # Trial-relative descendant file path, e.g. result.json; nonempty, no absolute paths, NUL or .. segments, and not the trial root. The trainer must write it in this attempt directory. The default managed objective path is result.json.
+    path: string = "result.json"
 
-# constraints: list[Constraint] = []
-# Each constraint has name, a scalar extractor, and at least one finite min/max
-# bound. A measured bound violation is COMPLETE but ineligible to win; missing
-# or invalid evidence fails the trial.
+    # Required nonempty exact objective.name in the envelope, e.g. eval_loss; mismatch fails extraction.
+    objective_name: string (required)
 
-# env: dict[str, str] = {}
-# Semantic environment values applied over execution inheritance. Generic
-# credential/telemetry variables can be passed to a trainer. When W&B evidence
-# is configured, PhaseSweep manages target, attempt ID, and never-resume policy;
-# explicit conflicts or offline/disabled mode fail before training.
+    # Required nonempty exact objective.split, e.g. validation; mismatch fails extraction.
+    split: string (required)
 
-# execution: ExecutionContext = {}
-#   cwd: str | null = null
-#   inherit_env: "all" | "none" | list[str] = "all"
-#   passthrough_env: list[str] = []
-#   record_env: bool = false
-# cwd and the environment-selection contract join durable experiment identity.
-# Pass-through values may rotate, but their names/classification remain semantic.
-# record_env writes the full composed trainer environment, including ambient
-# values, to owner-only (0600) environment.json in each trial directory. It can
-# contain secrets; leave it false unless retaining those values is intentional.
+    # Required nonempty exact evaluation.policy, e.g. final or best; mismatch fails extraction. This validates reported metadata and does not select a checkpoint.
+    policy: string (required)
 
-# timeout_seconds_per_run: float | null = null
-# Finite whole-invocation wallclock budget. It is a run control, not a new
-# result-selection policy.
+    # Optional exact nonempty checkpoint identity to validate; null accepts any structurally valid checkpoint reported by the trainer. It never loads weights.
+    checkpoint: string | null = null
 
-# PHASE OBJECTS
+    # Optional exact evaluation step, integer >= 0; null accepts any structurally valid nonnegative reported step. It does not schedule evaluation.
+    expected_step: int | null = null
 
-# phases: list[Phase] (required; at least one)
-# Each phase executes in declaration order. Its name is a safe, case-insensitively
-# unique identifier and `inherits` can name prior phases only.
+    # Nonempty progress key for objective comparability: step reads the envelope evaluation step; another name, e.g. tokens, reads evaluation.progress and must be reported through report_objective(progress={...}).
+    # Only used when: this is metric.extractor; constraints[].extractor must leave the default step or config load fails.
+    # Recommended: use tokens for a fixed-token comparison or trained_steps for best-checkpoint reporting, and log the full training budget on that axis.
+    evaluation_axis: string = "step"
 
-#   name: str (required)
-#   comment: str | null = null       # display-only design note
-#   inherits: list[str] = []
-#   fixed_overrides: dict[str, value] = {}
-#   search_space: dict[str, SearchParam] = {}
-#   n_trials: int (required; >= 1)
-# Dotted override keys use [A-Za-z0-9_-]+ segments. A key and its prefix cannot
-# coexist. A local key cannot be both fixed and sampled.
-#
-# Inherited keys remain fixed. A same-origin diamond is valid. Conflicting keys
-# from independent origins require this phase to fix that key explicitly; the
-# fixed child value becomes the new origin. An inherited key cannot be sampled.
+    # Variant log_regex; selected by type: log_regex.
+    # Extract numeric matches from an attempt log; missing/nonfinite evidence fails the trial.
+    type: "log_regex" (required)
 
-#   n_jobs: int = 1 (>= 1)
-#   gpu_policy: "single_per_trial" | "whole_node" | "none" = "single_per_trial"
-#   gpu_ids: list[int] | null = null
-#   gpu_devices: list[str] | null = null
-#   allow_no_gpu_isolation: bool = false
-# GPU policy controls CUDA visibility and same-host leases. whole_node requires
-# n_jobs: 1 plus one explicit, unique device list. none forbids explicit device
-# lists and needs allow_no_gpu_isolation for parallel work.
+    # Trial-relative descendant log path, e.g. stdout.log: nonempty, no absolute paths, NUL or .. segments, and not the trial root. stdout.log and stderr.log are written automatically.
+    file: string = "stdout.log"
 
-#   max_consecutive_failures: int = 5 (>= 1)
-#   timeout_seconds_per_trial: float | null = 259200.0
-#   allow_unbounded_trials: bool = false
-#   timeout_seconds_per_phase: float | null = null
-#   allow_incomplete_on_timeout: bool = false
-#   allow_partial_grid: bool = false
-#   allow_seed_search: bool = false
-# n_trials counts terminal Optuna attempts. Null per-trial timeout requires the
-# explicit allow_unbounded_trials opt-in. A partial timeout winner is allowed
-# only when allow_incomplete_on_timeout is true and a feasible result exists.
+    # Compilable Python regex with named (?P<value>...) capture, e.g. eval_loss=(?P<value>[0-9.eE+-]+); invalid regex or missing group fails config load.
+    pattern: string (required)
 
-#   sampler: Sampler = {}
-#     type: "tpe" | "random" | "grid" | "cmaes" = "tpe"
-#     seed: int | null = null       # 0 <= seed <= 2**32 - 1
-#     n_startup_trials: int = 10    # tpe only; other sampler types must leave
-#                                    # it at the default 10 or config load fails
-#     acknowledge_nonresumable: bool = false
-# A grid may have at most 4,096 combinations, counted before materialization;
-# n_trials must equal the cardinality unless allow_partial_grid is true. CMA-ES
-# accepts numeric parameters only. Durable random/TPE/CMA-ES phases require a
-# seed. Durable TPE/CMA-ES phases require acknowledge_nonresumable: true and
-# cannot resume a partially completed target across processes.
+    # Select an observation within this trial: last/first use match order, min/max use numeric values.
+    # metric.goal independently ranks the selected per-trial scalars; maximize does not change this selector.
+    select: "last" | "first" | "min" | "max" = "last"
 
-#   gates: list[Gate] = []
-# Every gate is a post-trial hard check. File and JSON gates inspect local
-# attempt artifacts; wandb_summary_required and mlflow_required use shared remote captures.
-# Gate failure fails the trial.
+    # Variant mlflow; selected by type: mlflow.
+    # Read native unscoped metric history from the verified finished run; no local objective mirror is required.
+    # Requires: top-level mlflow and an MLflow primary objective; model/dataset-scoped metric observations are unsupported.
+    type: "mlflow" (required)
 
-# SEARCH PARAMETER OBJECTS
+    # Exact nonempty native metric name, e.g. eval_loss or eval/loss; use what the trainer actually logs, including its slashes/underscores. Aliases, summary fallbacks and fuzzy discovery are not provided.
+    # Warning: a trainer logging eval_loss cannot satisfy eval/loss; verify the real metric key before launching a sweep.
+    metric_key: string (required)
 
-# type: "float"
-# low: finite float (required)
-# high: finite float (required; >= low)
-# log: bool = false                 # requires low > 0 and forbids step
-# step: finite float | null = null  # positive; exactly divides high - low
+    # Required explicit within-run selection: last chooses greatest step then latest timestamp; min/max choose the extreme value with earliest step then timestamp on ties; step chooses latest timestamp at the exact step.
+    # Requires: metric.extractor.step is nonnull exactly for select step; any other pairing fails config load. The same rule applies under constraints[].extractor.
+    # metric.goal only ranks trial scalars; it never supplies this selector.
+    # Warning: min/max reject any nonfinite history point; last/step require the selected point finite. Conflicting values at one step/timestamp fail, and shared capture freezes the native position.
+    select: "last" | "min" | "max" | "step" (required)
 
-# type: "int"
-# low: int (required; >= -2**53)
-# high: int (required; <= 2**53 and >= low)
-# log: bool = false                 # requires low > 0 and step: 1
-# step: int = 1                     # positive; exactly divides high - low
+    # Exact native history step, integer >= 0; null means no exact-step request. Units follow the trainer's logged step counter.
+    # Requires: metric.extractor.select step needs this value; setting it for last/min/max fails config load. The same rule applies under constraints[].extractor.
+    step: int | null = null
 
-# type: "categorical"
-# choices: list[null | bool | int | finite float | str] (required; nonempty)
-# Choices must remain distinct under Python equality. Grid rejects logarithmic
-# parameters and requires a concrete stepped or categorical domain.
+    # Variant wandb; selected by type: wandb.
+    # Read the managed attempt's finished scalar summary, never another run; requires the installed W&B extra. Failed/crashed/killed/preempted runs cannot win.
+    type: "wandb" (required)
 
-# EVIDENCE EXTRACTORS
+    # Normalized HTTP(S) API endpoint; no embedded credentials, query or fragment. Scheme/host are lowercased and trailing path slashes stripped.
+    # Requires: every W&B metric/constraint/gate agrees on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
+    base_url: string = "https://api.wandb.ai"
 
-# type: "json"
-# path: str (trial-relative file; required)
-# key: str (nonempty dotted JSON path; required)
-# Primary or constraint scalar reader. The selected value must be a finite
-# JSON number (no bool/string/container/nonfinite or unrepresentable integer).
+    # Nonempty account/team name without slash or whitespace, e.g. research-team.
+    # Requires: all W&B consumers agree on target and polling fields; credentials in the composed environment must authorize this target.
+    entity: string (required)
 
-# type: "json_envelope"
-# path: str = "result.json"         # trial-relative file
-# objective_name: str (required)
-# split: str (required)
-# policy: str (required)
-# checkpoint: str | null = null
-# expected_step: int | null = null  # >= 0
-# evaluation_axis: str = "step"     # metric extractor only
-# Requires an attempt-bound complete result envelope. Python trainers can call
-# phasesweep.report_objective(), which writes the managed objective path.
-# evaluation_axis names the progress axis the sweep holds fixed; "step" is the
-# envelope's evaluation step, any other name (e.g. "tokens") must be reported in
-# evaluation.progress (report_objective(progress={...})).
+    # Nonempty project name without slash or whitespace, e.g. bart-search.
+    # Requires: all W&B consumers agree on target and polling fields; the trainer must honor managed WANDB_ENTITY/PROJECT/BASE_URL/RUN_ID and WANDB_RESUME=never and finish its run.
+    project: string (required)
 
-# type: "log_regex"
-# file: str = "stdout.log"          # trial-relative file
-# pattern: str (required; named (?P<value>...) capture)
-# select: "last" | "first" | "min" | "max" = "last"
-# Select chooses an observation within a trial independently of metric.goal.
+    # Finite positive polling interval in seconds.
+    # Requires: every W&B consumer uses the same interval; disagreement fails config load.
+    poll_seconds: float = 2.0
 
-# type: "wandb"
-# base_url: str = "https://api.wandb.ai"  # normalized HTTP(S) API endpoint
-# entity: str (required)
-# project: str (required)
-# metric_key: str (required; summary key, e.g. eval/loss or aggregate eval/loss.min)
-# evaluation_axis: str = "_step"       # metric extractor only; e.g. eval/step
-# poll_seconds: finite float = 2.0     # > 0
-# timeout_seconds: finite float = 120.0 # >= 1
-# Reads only the managed attempt's finished summary. Primary, constraints, and
-# phase gates must agree on the target and polling fields, and share one capture.
-# evaluation_axis is the history key logged with metric_key that marks where it
-# was measured; it may not name the metric's own series.
-# The trainer owns evaluation, checkpoint choice, aggregation, and early stopping.
-# Envelope policy/expected_step validate metadata; they do not schedule evaluation.
+    # Finite operation timeout in seconds, >= 1, capped by remaining phase/run budget; includes remote startup, SDK calls and visibility polling.
+    # Requires: every W&B consumer uses the same timeout; disagreement fails config load.
+    timeout_seconds: float = 120.0
 
-# type: "mlflow"
-# metric_key: str (required; exact native metric name)
-# select: "last" | "min" | "max" | "step" (required)
-# step: nonnegative int | null = null (required only for select: step)
-# last: greatest step/latest timestamp. min/max ties: earliest step/timestamp.
-# step: latest timestamp at that exact step. Shared capture freezes positions.
+    # Exact nonempty finished-summary key, e.g. eval/loss or eval/loss.min for a define_metric summary=min aggregate. A bare key does not substitute for its aggregate suffix.
+    # Requires: evaluation_axis must not name this metric or its aggregate's underlying series.
+    metric_key: string (required)
 
-# GATE OBJECTS
+    # Nonempty history key marking objective progress, e.g. eval/step or tokens; _step is W&B's history step. Log the axis in the same log() call as the metric. Aggregate-summary keys are positioned at the history series end.
+    # Requires: different from metric_key and its aggregate's underlying series; otherwise config load fails.
+    # Only used when: this is metric.extractor; constraints[].extractor must retain default _step or config load fails.
+    # Warning: position lookup is advisory after objective acceptance; missing/delayed history can leave no position while preserving the scalar.
+    evaluation_axis: string = "_step"
 
-# type: "mlflow_required"
-# metrics: list[str] = []
-# params: list[str] = []
-# tags: list[str] = []
-# At least one namespace must be nonempty. Uses the same verified bound run.
+# Ordered nonempty list of phase objects; each phase must produce a feasible winner before dependent work can proceed. Values below describe one item.
+# Warning: inherits transfers override values, never model weights or checkpoints; the trainer must load a checkpoint explicitly if that is intended.
+phases: list[object] (required)
+  # Safe nonempty [A-Za-z0-9_-]+ phase identity, e.g. learning_rate. Names must be unique case-insensitively; attempts and generations are reserved.
+  # Requires: phases[].inherits can name this phase only from later declared phases.
+  - name: string (required)
 
-# type: "wandb_summary_required"
-# base_url/entity/project/poll_seconds/timeout_seconds: same as wandb above
-# keys: list[str] (nonempty exact summary keys)
-# Presence-only gate. Missing keys in the accepted finished capture fail it.
+    # Target count of terminal Optuna attempts, not successful objectives; integer >= 1. New invocation continuation depends on storage and sampler type.
+    # Requires: with phases[].sampler.type grid, the target equals grid cardinality unless phases[].allow_partial_grid is true, and it may never exceed cardinality; config load fails otherwise.
+    # Warning: failed/infeasible attempts consume the target; no feasible eligible result fails the phase.
+    n_trials: int (required)
 
-# type: "required_file"
-# path: str (trial-relative file; required)
+    # Free-text design note shown by validate and show-winners; null adds no note. This field is excluded from semantic study identity.
+    comment: string | null = null
 
-# type: "json_equals"
-# path: str (trial-relative file; required)
-# key: str (nonempty dotted JSON path; required)
-# value: bool | int | finite float | str | null (required; type-strict equality)
+    # Names of earlier phases whose complete winner overrides become fixed inputs; no automatic previous-phase inheritance. Transitively inherited values keep their original producer.
+    # Overrides: trainer_config at inherited dotted paths.
+    # Overridden by: phases[].fixed_overrides when the child explicitly fixes an inherited key; the child becomes that key's new origin.
+    # Conflicts with: phases[].search_space cannot sample any inherited key; config load fails.
+    # Requires: independent parent origins for one key must be resolved explicitly by phases[].fixed_overrides; same-origin diamonds are accepted. Key/prefix namespace collisions fail config load.
+    # Warning: weights/checkpoints are never inherited; configure checkpoint input in trainer_config/fixed_overrides explicitly.
+    inherits: list[string] = []
 
-# type: "json_scalar_bound"
-# path: str (trial-relative file; required)
-# key: str (nonempty dotted JSON path; required)
-# min: finite float | null = null
-# max: finite float | null = null
-# At least one bound is required and min must not exceed max.
+    # Fixed trainer-defined values applied to every trial; arbitrary JSON/YAML-compatible values are passed to the command chosen by trial_command. Keys use dotted nonempty [A-Za-z0-9_-]+ segments, e.g. optimizer.lr or training.max_steps.
+    # Overrides: trainer_config and phases[].inherits at the same key; independent inherited-origin conflicts must be resolved here or config load fails.
+    # Conflicts with: phases[].search_space cannot contain the same local key, and a key and its prefix cannot coexist across inherited/fixed/sampled overrides.
+    # Recommended: fix batch size, seed, data split and training/evaluation budgets here when comparing hyperparameters; PhaseSweep does not equalize training automatically. Override string values do not expand runtime placeholders.
+    fixed_overrides: map[string, any] = {}
 
-# type: "artifact_size"
-# source: "file" | "directory" | "json" (required)
-# path: str (trial-relative; `.` is allowed only for source: directory)
-# key: str | null = null             # required only for source: json
-# min_bytes: int | null = null
-# max_bytes: int | null = null
+    # Trainer-defined dotted override keys mapped to one parameter variant below. optimizer.lr is an example key; replace it with any valid dotted name. Keys and prefixes cannot coexist across composed overrides.
+    # Overrides: trainer_config at sampled dotted paths.
+    # Conflicts with: phases[].fixed_overrides for the same local key, or phases[].inherits for any inherited key; config load fails.
+    # Requires: phases[].allow_seed_search for a key exactly seed or ending .seed; otherwise config load fails.
+    # Requires: phases[].sampler.type cmaes permits numeric variants only; grid forbids log parameters and requires a step on floats, with at most 4096 combinations and distinct wire values.
+    search_space: map[string, categorical | float | int] = {}
+      # Example dotted trainer key; replace optimizer.lr with your parameter name.
+      optimizer.lr: categorical | float | int (required)
+        # Variant categorical; selected by type: categorical.
+        # Select an explicit discrete parameter domain.
+        type: "categorical" (required)
 
-# type: "sha256"
-# path: str (trial-relative file; required)
-# sha256: str (required; 64 hexadecimal characters)
+        # Nonempty list of null/bool/int/finite-float/string choices; containers are rejected. Values must be distinct under Python equality, so [1, 1.0] and [0, false] fail config load.
+        # Requires: phases[].sampler.type cannot be cmaes; grid enumerates these choices.
+        # Warning: preserve YAML scalar types: bare 1e-3 is a string in this loader; use 1.0e-3 or 0.001 for a float and quote intended strings.
+        choices: list[null | bool | int | float | string] (required)
+
+        # Variant float; selected by type: float.
+        # Select a float-valued search parameter.
+        type: "float" (required)
+
+        # Inclusive finite lower bound in trainer-defined units.
+        # Requires: phases[].search_space.<key>.high >= low; log true needs low > 0.
+        low: float (required)
+
+        # Inclusive finite upper bound in trainer-defined units.
+        # Requires: high >= phases[].search_space.<key>.low and any step must divide high - low exactly.
+        high: float (required)
+
+        # Sample logarithmically instead of linearly.
+        # Requires: phases[].search_space.<key>.low > 0; grid rejects logarithmic domains.
+        # Conflicts with: phases[].search_space.<key>.step must be null; otherwise config load fails.
+        log: bool = false
+
+        # Positive finite increment in trainer-defined units; null is continuous sampling.
+        # Requires: the increment divides high - low exactly; grid requires nonnull and rejects points that collapse under its 12-decimal rounding.
+        # Conflicts with: phases[].search_space.<key>.log true; config load fails.
+        step: float | null = null
+
+        # Variant int; selected by type: int.
+        # Select an integer-valued search parameter.
+        type: "int" (required)
+
+        # Inclusive integer lower bound in trainer-defined units; >= -9007199254740992.
+        # Requires: phases[].search_space.<key>.high >= low; log true needs low > 0.
+        low: int (required)
+
+        # Inclusive integer upper bound in trainer-defined units; <= 9007199254740992.
+        # Requires: high >= phases[].search_space.<key>.low and step divides high - low exactly.
+        high: int (required)
+
+        # Sample logarithmically instead of linearly.
+        # Requires: phases[].search_space.<key>.low > 0 and phases[].search_space.<key>.step 1; grid rejects logarithmic domains.
+        log: bool = false
+
+        # Positive integer increment in trainer-defined units.
+        # Requires: step divides high - low exactly; phases[].search_space.<key>.log true requires step 1, or config load fails.
+        step: int = 1
+
+    # Maximum parallel trainer attempts in this phase, integer >= 1; single_per_trial workers wait for exclusive device leases when the pool is smaller than this count.
+    # Requires: phases[].gpu_policy whole_node needs 1; none with > 1 needs phases[].allow_no_gpu_isolation true, or config load fails.
+    n_jobs: int = 1
+
+    # single_per_trial leases one CUDA-visible token and same-host lock per attempt, even with n_jobs 1; whole_node leases the full explicit configured set; none leaves CUDA isolation and GPU host locks off.
+    # Requires: whole_node needs phases[].n_jobs 1 and exactly one of phases[].gpu_ids/phases[].gpu_devices, containing distinct physical devices. Missing/duplicate lists fail config load; aliases and a multi-device world containing MIG tokens fail at runtime.
+    # Requires: none forbids explicit device lists and requires phases[].allow_no_gpu_isolation when phases[].n_jobs > 1; config load fails otherwise.
+    # Warning: the trainer sees a leased physical GPU as its local cuda:0; use local indexing. Whole-node world size is semantic, while single-device pool size controls throughput.
+    gpu_policy: "single_per_trial" | "whole_node" | "none" = "single_per_trial"
+
+    # Explicit nonempty list of nonnegative CUDA indices; each is resolved to physical host-lock identity.
+    # Explicit lists take priority over env.CUDA_VISIBLE_DEVICES and inherited visibility for pool discovery; the trainer receives its leased token.
+    # Unset: gpu_devices, then composed CUDA_VISIBLE_DEVICES, then nvidia-smi inventory determines the pool.
+    # Conflicts with: phases[].gpu_devices; setting both fails config load.
+    # Requires: phases[].gpu_policy must not be none; whole_node requires one explicit unique physical-device list.
+    # Recommended: use one explicit index for predictable single-GPU experiments; avoid choosing devices already occupied by another independent workload.
+    gpu_ids: list[int] | null = null
+
+    # Explicit nonempty list of CUDA tokens, e.g. ["GPU-..."] or ["MIG-..."]; whitespace is stripped, empty/comma-containing/-1 tokens fail config load.
+    # Explicit lists take priority over env.CUDA_VISIBLE_DEVICES and inherited visibility for pool discovery; the trainer receives its leased token.
+    # Unset: gpu_ids, then composed CUDA_VISIBLE_DEVICES, then nvidia-smi inventory determines the pool.
+    # Conflicts with: phases[].gpu_ids; setting both fails config load.
+    # Requires: phases[].gpu_policy must not be none; whole_node requires unique physical devices and rejects multi-device MIG worlds at runtime.
+    gpu_devices: list[string] | null = null
+
+    # Permit intentional parallel CPU/external-isolation work or unavailable host-lock isolation.
+    # Requires: phases[].gpu_policy none with phases[].n_jobs > 1 needs true; default false refuses that config. Under single_per_trial, unavailable GPUs with parallel jobs fail unless true.
+    # Warning: true can permit unrestricted GPU visibility without host locks; it does not turn a CUDA model into a CPU model. A single-job run on a host with no GPUs can proceed without this flag.
+    allow_no_gpu_isolation: bool = false
+
+    # Sampling strategy and its random seed; nested defaults apply when omitted.
+    # phases[].search_space, phases[].n_trials and storage; see each child for supported domains and durable continuation.
+    sampler: object = {}
+      # Optuna strategy: tpe fits a surrogate after startup trials, random samples independently, grid enumerates a concrete matrix, cmaes samples numeric spaces and requires the installed cmaes dependency.
+      # Requires: phases[].search_space must be numeric for cmaes; grid needs nonlog domains, a step for floats, at most 4096 distinct combinations and a compatible phases[].n_trials/phases[].allow_partial_grid target.
+      # Requires: persistent storage needs phases[].sampler.seed for random/tpe/cmaes and phases[].sampler.acknowledge_nonresumable for tpe/cmaes.
+      # Warning: TPE/CMA-ES targets must finish in one invocation; interrupted partial targets cannot resume or be enlarged across processes. Grid and seeded random support ordinary continuation; acknowledge_nonresumable true with random/grid fails config load.
+      type: "tpe" | "random" | "grid" | "cmaes" = "tpe"
+
+      # Sampler RNG seed, integer 0 through 4294967295; independent of the trainer seed in trainer_config or fixed_overrides.
+      # Unset: stochastic suggestions are not seeded; persistent storage rejects null for random/tpe/cmaes.
+      # Requires: storage auto/journal with phases[].sampler.type random/tpe/cmaes needs an explicit seed; grid is exempt.
+      seed: int | null = null
+
+      # Number of random TPE startup attempts before fitting, integer >= 0.
+      # Only used when: phases[].sampler.type is tpe; every other type must leave the value 10 or config load fails.
+      n_startup_trials: int = 10
+
+      # Accept the process-local-state restriction of TPE/CMA-ES.
+      # Requires: persistent storage and phases[].sampler.type tpe/cmaes need true.
+      # Only used when: phases[].sampler.type is tpe/cmaes; true with random/grid fails config load.
+      # Warning: acknowledgement permits the run, not continuation after interruption.
+      acknowledge_nonresumable: bool = false
+
+    # Abort after this many consecutive failed/infeasible trials, integer >= 1; a feasible success resets the streak. Failed attempts still count toward phases[].n_trials.
+    # Recommended: lower the threshold for an expensive trainer when configuration failure should stop promptly.
+    max_consecutive_failures: int = 5
+
+    # Trainer timeout in seconds, finite and >= 0 when nonnull; default 259200 is 72 hours. Zero expires immediately.
+    # Requires: null needs phases[].allow_unbounded_trials true; config load fails otherwise.
+    # Combined with phases[].timeout_seconds_per_phase and timeout_seconds_per_run, the earliest active deadline limits work.
+    timeout_seconds_per_trial: float | null = 259200.0
+
+    # Explicitly permit a trainer invocation with no per-trial deadline.
+    # Requires: phases[].timeout_seconds_per_trial null needs true; otherwise config load fails. Other phase/run deadlines still apply.
+    allow_unbounded_trials: bool = false
+
+    # Phase wallclock budget in seconds, finite and >= 0 when nonnull; null adds no phase deadline and zero expires immediately.
+    # Combined with phases[].timeout_seconds_per_trial and timeout_seconds_per_run, the earliest active deadline limits work.
+    # phases[].allow_incomplete_on_timeout controls whether a feasible partial winner may be accepted.
+    timeout_seconds_per_phase: float | null = null
+
+    # Allow a feasible winner from fewer than phases[].n_trials attempts after a phase/run wallclock timeout and persist that accepted partial decision; default false fails closed. Reusing a partial winner also requires true.
+    # Only used when: phases[].timeout_seconds_per_phase or timeout_seconds_per_run leaves an incomplete phase; this does not substitute a baseline or make missing/infeasible evidence win.
+    allow_incomplete_on_timeout: bool = false
+
+    # Allow a grid target smaller than its full cardinality; false requires the full matrix.
+    # Only used when: phases[].sampler.type is grid; true on other samplers has no effect.
+    # phases[].n_trials must still be <= grid cardinality, or config load fails.
+    allow_partial_grid: bool = false
+
+    # Permit search-space keys exactly seed or ending .seed for an explicit stochastic-variance audit.
+    # Requires: phases[].search_space containing those keys needs true; false rejects them at config load. Fixed seeds remain allowed.
+    # Warning: searching seeds selects stochastic variation rather than a model/config improvement.
+    allow_seed_search: bool = false
+
+    # Post-trial hard checks selected by type; each variant below describes one list item. Any failed gate fails the attempt. Local paths are inside the fresh attempt directory, and remote gates use its shared verified capture.
+    gates: list[artifact_size | json_equals | json_scalar_bound | mlflow_required | required_file | sha256 | wandb_summary_required] = []
+      # Variant artifact_size; selected by type: artifact_size.
+      # Require an artifact byte count inside inclusive bounds.
+      - type: "artifact_size" (required)
+
+        # file uses a file's size; directory recursively counts regular files/file-symlink targets without following directory symlinks; json reads a saved byte count.
+        # Requires: phases[].gates[].key exactly when source is json; invalid pairing fails config load.
+        source: "file" | "directory" | "json" (required)
+
+        # Trial-relative path, nonempty with no absolute/NUL/.. paths; . is allowed only with source directory. File/json requires a descendant file.
+        path: string (required)
+
+        # Nonempty dotted JSON key, e.g. artifact.bytes, with no empty segments; null when source is not json.
+        # Requires: phases[].gates[].source json needs key; a key with file/directory fails config load.
+        key: string | null = null
+
+        # Inclusive minimum bytes, integer >= 0; null adds no lower bound.
+        # Requires: phases[].gates[].min_bytes or phases[].gates[].max_bytes must be nonnull, and min_bytes <= max_bytes when both are set; otherwise config load fails.
+        min_bytes: int | null = null
+
+        # Inclusive maximum bytes, integer >= 0; null adds no upper bound.
+        # Requires: phases[].gates[].min_bytes or phases[].gates[].max_bytes must be nonnull, and min_bytes <= max_bytes when both are set; otherwise config load fails.
+        max_bytes: int | null = null
+
+      # Variant json_equals; selected by type: json_equals.
+      # Require type-strict equality to a JSON scalar: true, 1 and 1.0 are different values.
+      - type: "json_equals" (required)
+
+        # Trial-relative descendant file path, e.g. result.json; nonempty, no absolute paths, NUL or .. segments, and not the trial root. The trainer must write it in this attempt directory.
+        path: string (required)
+
+        # Nonempty dotted JSON object-key path, e.g. eval.loss; empty segments are rejected. No list-index or literal-dot escaping syntax is provided.
+        key: string (required)
+
+        # Expected null/bool/int/finite-float/string; mappings/lists/YAML dates and nonfinite floats are rejected. Quote a date to compare a JSON string.
+        value: bool | int | float | string | null (required)
+
+      # Variant json_scalar_bound; selected by type: json_scalar_bound.
+      # Require a finite numeric JSON value inside inclusive configured bounds.
+      - type: "json_scalar_bound" (required)
+
+        # Trial-relative descendant file path, e.g. result.json; nonempty, no absolute paths, NUL or .. segments, and not the trial root. The trainer must write it in this attempt directory.
+        path: string (required)
+
+        # Nonempty dotted JSON object-key path, e.g. eval.loss; empty segments are rejected. No list-index or literal-dot escaping syntax is provided.
+        key: string (required)
+
+        # Inclusive finite lower bound in the JSON scalar's units; null adds no lower bound.
+        # Requires: phases[].gates[].min or phases[].gates[].max is nonnull, and min <= max when both are set; config load fails otherwise.
+        min: float | null = null
+
+        # Inclusive finite upper bound in the JSON scalar's units; null adds no upper bound.
+        # Requires: phases[].gates[].min or phases[].gates[].max is nonnull, and min <= max when both are set; config load fails otherwise.
+        max: float | null = null
+
+      # Variant mlflow_required; selected by type: mlflow_required.
+      # Require metric observations and metadata from the same bound MLflow run.
+      # Requires: top-level mlflow with an MLflow objective; at least one of metrics/params/tags must be nonempty, or config load fails.
+      - type: "mlflow_required" (required)
+
+        # Nonempty exact native metric names when populated, e.g. [eval_loss, train_loss]; each requires a finite last observation.
+        # Requires: metrics, params or tags must contain at least one name collectively.
+        metrics: list[string] = []
+
+        # Nonempty exact native parameter names when populated, e.g. [learning_rate, model_name]; presence is checked, values are retained as strings.
+        # Requires: metrics, params or tags must contain at least one name collectively.
+        params: list[string] = []
+
+        # Nonempty exact native tag names when populated, e.g. [trainer, dataset_revision]; presence is checked, values are retained as strings.
+        # Requires: metrics, params or tags must contain at least one name collectively.
+        tags: list[string] = []
+
+      # Variant required_file; selected by type: required_file.
+      # Require a local attempt file to exist.
+      - type: "required_file" (required)
+
+        # Trial-relative descendant file path, e.g. result.json; nonempty, no absolute paths, NUL or .. segments, and not the trial root. The trainer must write it in this attempt directory.
+        path: string (required)
+
+      # Variant sha256; selected by type: sha256.
+      # Require an exact SHA-256 file digest; hashing occurs after the trainer exits.
+      - type: "sha256" (required)
+
+        # Trial-relative descendant file path, e.g. result.json; nonempty, no absolute paths, NUL or .. segments, and not the trial root. The trainer must write it in this attempt directory.
+        path: string (required)
+
+        # Expected 64 hexadecimal characters; uppercase is accepted and normalized to lowercase. A mismatch fails the gate.
+        sha256: string (required)
+
+      # Variant wandb_summary_required; selected by type: wandb_summary_required.
+      # Require exact summary-key presence in the same accepted finished capture; values need not be numeric.
+      - type: "wandb_summary_required" (required)
+
+        # Normalized HTTP(S) API endpoint; no embedded credentials, query or fragment. Scheme/host are lowercased and trailing path slashes stripped.
+        # Requires: every W&B metric/constraint/gate agrees on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
+        base_url: string = "https://api.wandb.ai"
+
+        # Nonempty account/team name without slash or whitespace, e.g. research-team.
+        # Requires: all W&B consumers agree on target and polling fields; credentials in the composed environment must authorize this target.
+        entity: string (required)
+
+        # Nonempty project name without slash or whitespace, e.g. bart-search.
+        # Requires: all W&B consumers agree on target and polling fields; the trainer must honor managed WANDB_ENTITY/PROJECT/BASE_URL/RUN_ID and WANDB_RESUME=never and finish its run.
+        project: string (required)
+
+        # Finite positive polling interval in seconds.
+        # Requires: every W&B consumer uses the same interval; disagreement fails config load.
+        poll_seconds: float = 2.0
+
+        # Finite operation timeout in seconds, >= 1, capped by remaining phase/run budget; includes remote startup, SDK calls and visibility polling.
+        # Requires: every W&B consumer uses the same timeout; disagreement fails config load.
+        timeout_seconds: float = 120.0
+
+        # Nonempty list of nonempty exact summary keys, e.g. [eval/loss, trainer_revision]; missing keys fail the gate.
+        keys: list[string] (required)
+
+# ---------- Trainer inputs ----------
+
+# Complete base input for the external trainer, copied for each trial and written to trainer_config.yaml. PhaseSweep forwards its arbitrary keys to the program in trial_command, not to a built-in training API. Common trainer-defined keys are model.name, optimizer.lr and output_dir.
+# Only used when: override_format is yaml_file; a nonempty mapping in any other format fails config load.
+# Overridden by: phases[].inherits, phases[].fixed_overrides and phases[].search_space at their exact dotted paths; descending through an existing scalar fails config load.
+# String values recursively expand {trial_dir}, {trial_id}, {phase}, {run_name} once before applying overrides; keys and override values are not expanded. Use output_dir: "{trial_dir}/checkpoints" for separate trial outputs.
+# Values must be null, bool, int, finite float, string, lists or string-keyed mappings; quote YAML dates. No model download, optimizer setting, batch size or step budget is supplied automatically.
+trainer_config: map[string, any] = {}
+
+# Trainer input boundary. yaml_file emits the complete base plus composed overrides; json_file emits nested overrides-only JSON; argparse emits shell-safe --key=value; hydra emits native key=value without importing Hydra.
+# Requires: trial_command must consume the matching placeholder and trainer_config must be empty outside yaml_file; violations fail config load.
+# Argparse/hydra accept null, bool, int, finite float, string and recursive lists; argparse renders null as None, hydra as null. Hydra rejects control characters and ${...} strings. JSON requires strict JSON-compatible values.
+# The flat overrides_resolved.json is always the audit copy; it is not the complete YAML trainer input.
+override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
+
+# ---------- Storage and provenance ----------
+
+# Local study persistence: null is disposable in-memory storage, auto resolves to <workdir>/<experiment>/study.journal, and an explicit journal:///path/to/study.journal selects a local journal. journal:///./runs/study.journal is relative to the invocation directory; journal:////tmp/study.journal is absolute.
+# Requires: provenance must be nonempty for auto or journal storage; stochastic phases also need phases[].sampler.seed, and durable TPE/CMA-ES need phases[].sampler.acknowledge_nonresumable. Config load fails otherwise.
+# Requires: workdir must stay bound to the same supported local ledger for reuse.
+# Warning: null cannot resume or top up a later invocation; SQLite, :memory:, external database URLs and all other storage forms are rejected. Journals support parallel trials on one host, not distributed-host execution.
+storage: string | null = null
+
+# Root for per-experiment generations, phase/trial artifacts, logs and winner files; relative paths resolve against invocation cwd, not the YAML file or execution.cwd. A leading ~ is expanded.
+# Requires: storage identity must agree with an existing artifact-root binding; mismatch refuses reuse.
+# Warning: changing execution.cwd does not relocate this root. Trainer outputs need a trial-specific path supplied through trainer_config or trial_command.
+workdir: string = "./runs"
+
+# Operator-defined nonblank string keys/values identifying external trainer, data and dependency inputs, e.g. trainer_revision, dataset_revision, tokenizer_revision. These participate in persistent-study identity.
+# Requires: storage auto or journal requires at least one entry; blank keys/values fail config load.
+# Recommended: change these identifiers whenever an input outside this YAML changes; PhaseSweep does not infer downloaded model/data revisions.
+provenance: map[string, string] = {}
+
+# ---------- Constraints ----------
+
+# Optional feasibility bounds, separate from metric ranking. A measured violation is COMPLETE but cannot win; missing or invalid evidence fails the trial. Values below describe one item.
+# Requires: constraints[].name must differ from metric.name and every other constraint name.
+constraints: list[object] = []
+  # Published constraint name; any string accepted by the schema.
+  # Requires: distinct from metric.name and all constraints[].name; duplicates fail config load.
+  - name: string (required)
+
+    # Finite scalar reader; same variants and keys as metric.extractor above.
+    # Only used when: evaluation_axis remains its default for JSON-envelope/W&B constraint extractors; nondefault values fail config load because only the objective axis is read.
+    extractor: json | json_envelope | log_regex | mlflow | wandb (required)
+      # Variant json; selected by type: json.
+      # Read a finite JSON number; bool/string/container/nonfinite or unrepresentable integer evidence fails extraction.
+      type: "json" (required)
+
+      # Trial-relative descendant file path, e.g. result.json; nonempty, no absolute paths, NUL or .. segments, and not the trial root. The trainer must write it in this attempt directory.
+      path: string (required)
+
+      # Nonempty dotted JSON object-key path, e.g. eval.loss; empty segments are rejected. No list-index or literal-dot escaping syntax is provided.
+      key: string (required)
+
+      # Variant json_envelope; selected by type: json_envelope.
+      # Read an attempt-bound result envelope; the trainer can write it with phasesweep.report_objective(). Attempt identity and content fingerprint must match.
+      type: "json_envelope" (required)
+
+      # Trial-relative descendant file path, e.g. result.json; nonempty, no absolute paths, NUL or .. segments, and not the trial root. The trainer must write it in this attempt directory. The default managed objective path is result.json.
+      path: string = "result.json"
+
+      # Required nonempty exact objective.name in the envelope, e.g. eval_loss; mismatch fails extraction.
+      objective_name: string (required)
+
+      # Required nonempty exact objective.split, e.g. validation; mismatch fails extraction.
+      split: string (required)
+
+      # Required nonempty exact evaluation.policy, e.g. final or best; mismatch fails extraction. This validates reported metadata and does not select a checkpoint.
+      policy: string (required)
+
+      # Optional exact nonempty checkpoint identity to validate; null accepts any structurally valid checkpoint reported by the trainer. It never loads weights.
+      checkpoint: string | null = null
+
+      # Optional exact evaluation step, integer >= 0; null accepts any structurally valid nonnegative reported step. It does not schedule evaluation.
+      expected_step: int | null = null
+
+      # Nonempty progress key for objective comparability: step reads the envelope evaluation step; another name, e.g. tokens, reads evaluation.progress and must be reported through report_objective(progress={...}).
+      # Only used when: this is metric.extractor; constraints[].extractor must leave the default step or config load fails.
+      # Recommended: use tokens for a fixed-token comparison or trained_steps for best-checkpoint reporting, and log the full training budget on that axis.
+      evaluation_axis: string = "step"
+
+      # Variant log_regex; selected by type: log_regex.
+      # Extract numeric matches from an attempt log; missing/nonfinite evidence fails the trial.
+      type: "log_regex" (required)
+
+      # Trial-relative descendant log path, e.g. stdout.log: nonempty, no absolute paths, NUL or .. segments, and not the trial root. stdout.log and stderr.log are written automatically.
+      file: string = "stdout.log"
+
+      # Compilable Python regex with named (?P<value>...) capture, e.g. eval_loss=(?P<value>[0-9.eE+-]+); invalid regex or missing group fails config load.
+      pattern: string (required)
+
+      # Select an observation within this trial: last/first use match order, min/max use numeric values.
+      # metric.goal independently ranks the selected per-trial scalars; maximize does not change this selector.
+      select: "last" | "first" | "min" | "max" = "last"
+
+      # Variant mlflow; selected by type: mlflow.
+      # Read native unscoped metric history from the verified finished run; no local objective mirror is required.
+      # Requires: top-level mlflow and an MLflow primary objective; model/dataset-scoped metric observations are unsupported.
+      type: "mlflow" (required)
+
+      # Exact nonempty native metric name, e.g. eval_loss or eval/loss; use what the trainer actually logs, including its slashes/underscores. Aliases, summary fallbacks and fuzzy discovery are not provided.
+      # Warning: a trainer logging eval_loss cannot satisfy eval/loss; verify the real metric key before launching a sweep.
+      metric_key: string (required)
+
+      # Required explicit within-run selection: last chooses greatest step then latest timestamp; min/max choose the extreme value with earliest step then timestamp on ties; step chooses latest timestamp at the exact step.
+      # Requires: metric.extractor.step is nonnull exactly for select step; any other pairing fails config load. The same rule applies under constraints[].extractor.
+      # metric.goal only ranks trial scalars; it never supplies this selector.
+      # Warning: min/max reject any nonfinite history point; last/step require the selected point finite. Conflicting values at one step/timestamp fail, and shared capture freezes the native position.
+      select: "last" | "min" | "max" | "step" (required)
+
+      # Exact native history step, integer >= 0; null means no exact-step request. Units follow the trainer's logged step counter.
+      # Requires: metric.extractor.select step needs this value; setting it for last/min/max fails config load. The same rule applies under constraints[].extractor.
+      step: int | null = null
+
+      # Variant wandb; selected by type: wandb.
+      # Read the managed attempt's finished scalar summary, never another run; requires the installed W&B extra. Failed/crashed/killed/preempted runs cannot win.
+      type: "wandb" (required)
+
+      # Normalized HTTP(S) API endpoint; no embedded credentials, query or fragment. Scheme/host are lowercased and trailing path slashes stripped.
+      # Requires: every W&B metric/constraint/gate agrees on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
+      base_url: string = "https://api.wandb.ai"
+
+      # Nonempty account/team name without slash or whitespace, e.g. research-team.
+      # Requires: all W&B consumers agree on target and polling fields; credentials in the composed environment must authorize this target.
+      entity: string (required)
+
+      # Nonempty project name without slash or whitespace, e.g. bart-search.
+      # Requires: all W&B consumers agree on target and polling fields; the trainer must honor managed WANDB_ENTITY/PROJECT/BASE_URL/RUN_ID and WANDB_RESUME=never and finish its run.
+      project: string (required)
+
+      # Finite positive polling interval in seconds.
+      # Requires: every W&B consumer uses the same interval; disagreement fails config load.
+      poll_seconds: float = 2.0
+
+      # Finite operation timeout in seconds, >= 1, capped by remaining phase/run budget; includes remote startup, SDK calls and visibility polling.
+      # Requires: every W&B consumer uses the same timeout; disagreement fails config load.
+      timeout_seconds: float = 120.0
+
+      # Exact nonempty finished-summary key, e.g. eval/loss or eval/loss.min for a define_metric summary=min aggregate. A bare key does not substitute for its aggregate suffix.
+      # Requires: evaluation_axis must not name this metric or its aggregate's underlying series.
+      metric_key: string (required)
+
+      # Nonempty history key marking objective progress, e.g. eval/step or tokens; _step is W&B's history step. Log the axis in the same log() call as the metric. Aggregate-summary keys are positioned at the history series end.
+      # Requires: different from metric_key and its aggregate's underlying series; otherwise config load fails.
+      # Only used when: this is metric.extractor; constraints[].extractor must retain default _step or config load fails.
+      # Warning: position lookup is advisory after objective acceptance; missing/delayed history can leave no position while preserving the scalar.
+      evaluation_axis: string = "_step"
+
+    # Inclusive finite maximum in the measured scalar's units; null adds no upper bound.
+    # Requires: constraints[].min or constraints[].max must be nonnull, and min <= max when both are set; otherwise config load fails.
+    max: float | null = null
+
+    # Inclusive finite minimum in the measured scalar's units; null adds no lower bound.
+    # Requires: constraints[].min or constraints[].max must be nonnull, and min <= max when both are set; otherwise config load fails.
+    min: float | null = null
+
+# ---------- MLflow target and ownership ----------
+
+# Optional native MLflow source and result destination; no standalone or cross-backend publishing.
+# Unset: MLflow integration is off; MLflow extractors/gates without this block fail config load.
+# Requires: metric.extractor.type must be mlflow and W&B extractors/gates cannot be mixed anywhere; violations fail config load. Local JSON/log constraints and local gates remain allowed.
+# Requires: the controller must have the MLflow extra installed, the target experiment must already exist and credentials must reach both controller and trainer; validate/dry-run do not verify authentication or experiment existence.
+mlflow: object | null = null
+  # Existing tracking server target: HTTP(S) URL, databricks or databricks://profile. HTTP scheme/host are lowercased and trailing path slashes stripped; embedded credentials, query and fragment are rejected. Local file/sqlite tracking URIs are unsupported.
+  # Requires: experiment_id or experiment_name selects exactly one existing active experiment at this target; the controller verifies it before trial launch.
+  # env.MLFLOW_TRACKING_URI must match this value if explicitly configured; use credential environment variables instead of URL credentials.
+  tracking_uri: string (required)
+
+  # Nonempty native MLflow experiment ID, e.g. "123"; quote numeric IDs so YAML keeps a string. PhaseSweep looks it up and never creates an experiment.
+  # Unset: experiment_name is required instead.
+  # Conflicts with: mlflow.experiment_name; both set or both null fails config load.
+  # mlflow.tracking_uri selects the server on which this ID must already exist; an absent/deleted target fails before training.
+  experiment_id: string | null = null
+
+  # Nonempty exact existing MLflow experiment name, e.g. bart-search; lookup must resolve an active experiment. No implicit experiment creation occurs.
+  # Unset: experiment_id is required instead.
+  # Conflicts with: mlflow.experiment_id; both set or both null fails config load.
+  # mlflow.tracking_uri selects the server on which this name must already exist.
+  experiment_name: string | null = null
+
+  # Ownership of each attempt run. managed creates the real run before trainer launch and supplies MLFLOW_RUN_ID; the trainer must attach/log to that ID, and PhaseSweep can finish a still-RUNNING run after successful trainer exit. trainer requires the trainer to create and finish its actual run and call phasesweep.tracking.bind_mlflow_run(actual_run_id) inside the active run.
+  # Requires: trainer mode must bind exactly the actual run in the configured experiment; missing, foreign or conflicting binding fails the trial. The exact bound trainer run may retain an existing parent; substituting another parent/subrun for evidence or using model/dataset-scoped metrics is unsupported.
+  # Warning: a trainer that creates another run instead of attaching to the managed ID logs invisible evidence; a successful process exit alone cannot make that attempt eligible.
+  # Recommended: managed for a trainer that can honor MLFLOW_RUN_ID; trainer for code that must own start_run(). Disable conflicting autolog/nested-run behavior in the trainer itself.
+  run_mode: "managed" | "trainer" = "managed"
+
+  # Seconds between remote run/evidence visibility polls; must be > 0.
+  # Recommended: use a finite interval; current validation also accepts positive infinity, which is not a practical polling interval.
+  poll_seconds: float = 2.0
+
+  # Per controller tracking-operation budget in seconds; must be >= 1. Remaining phase/run deadlines cap it; this does not limit training time.
+  # Recommended: use a finite value long enough for server/SDK startup; current validation also accepts positive infinity.
+  # Warning: positive infinity removes this configured operation bound, subject to any remaining phase/run deadlines.
+  timeout_seconds: float = 120.0
+
+# ---------- Execution environment ----------
+
+# Explicit string environment values layered over execution.inherit_env and execution.passthrough_env. Arbitrary names are passed to the trainer; their values are semantic experiment inputs.
+# Overrides: execution.inherit_env and execution.passthrough_env values of the same name. PhaseSweep then assigns attempt identity, input/evidence paths and leased CUDA_VISIBLE_DEVICES.
+# Requires: with MLflow, MLFLOW_RUN_ID is forbidden here and explicit MLFLOW_TRACKING_URI/MLFLOW_EXPERIMENT_ID/MLFLOW_EXPERIMENT_NAME must match the configured target, or config load fails. Managed values replace ambient defaults.
+# Requires: with W&B evidence, explicit WANDB_BASE_URL/ENTITY/PROJECT/RESUME must match the evidence target, WANDB_RUN_ID is forbidden, and offline/disabled settings fail before training; PhaseSweep binds one fresh attempt ID.
+# Recommended: put rotating credentials/proxies in execution.passthrough_env and make them available to the controller too. Generic trainer telemetry settings are preserved when their backend is not an evidence consumer.
+# Recommended: set CUDA_VISIBLE_DEVICES explicitly here or list it in execution.inherit_env when narrowing inheritance; otherwise an ambient GPU restriction can be dropped. Set trainer cache variables such as HF_HOME, HF_DATASETS_CACHE, TORCH_HOME and TMPDIR to writable locations when needed; PhaseSweep does not provision or warm trainer caches.
+# Explicit phases[].gpu_ids/phases[].gpu_devices take priority over this CUDA visibility for pool discovery; the trainer receives its leased device token.
+env: map[string, string] = {}
+
+# Trainer subprocess working-directory and environment-selection contract. Nested defaults apply when the block is omitted. Effective cwd, inheritance modes/names and pass-through classification participate in study identity.
+execution: object = {}
+  # Working directory for every trainer subprocess; null uses invocation cwd. Relative paths and ~ resolve at launch against invocation cwd, not the config file. The effective absolute cwd participates in study identity.
+  # Requires: a configured directory must exist at launch; otherwise the trainer is not started.
+  # Recommended: use an absolute path for script/data resolution; workdir and local evidence retain their separate path rules.
+  cwd: string | null = null
+
+  # Ambient trainer environment: all copies every variable; none retains only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ when present; a list adds exactly those named variables to that base.
+  # Overridden by: env for matching names.
+  # Conflicts with: execution.passthrough_env must not overlap an explicit name list; duplicate, empty or padded names fail config load.
+  # Warning: inherited values outside execution.passthrough_env must match the durable study cohort before new trial allocation. all can make unrelated shell changes prevent reuse.
+  # Recommended: list required model/cache/GPU variables explicitly for controlled training; narrowed inheritance does not acquire excluded authentication or cache variables later.
+  inherit_env: "all" | "none" | list[string] = "all"
+
+  # Additional ambient variable names for rotating credentials or transport, e.g. MLFLOW_TRACKING_TOKEN, HTTPS_PROXY. Names/classification are semantic, values are excluded from the persistent environment cohort digest. Missing ambient variables are not invented.
+  # Conflicts with: execution.inherit_env explicit lists must not overlap; duplicate, empty or padded names fail config load.
+  # Overridden by: env for matching names, whose configured values remain semantic.
+  # Warning: this selects trainer/reader credentials; the controller MLflow client also needs its own ambient authentication. Model/data/cache settings that change trial meaning belong in env or execution.inherit_env instead.
+  passthrough_env: list[string] = []
+
+  # Write the composed base environment before per-trial PHASESWEEP_* and GPU bindings into trial environment.json, owner-only mode 0600. Names and the semantic digest are recorded regardless of this flag.
+  # Warning: true retains ambient and pass-through secrets in the file; use only when retaining the full environment is intentional.
+  record_env: bool = false
+
+# Whole run wallclock budget in seconds, finite and nonnegative; null adds no run deadline, zero expires immediately.
+# Combined with phases[].timeout_seconds_per_phase and phases[].timeout_seconds_per_trial, the earliest active deadline limits work. MLflow/W&B operations are also capped by the remaining phase/run budget.
+# An incomplete phase fails closed unless phases[].allow_incomplete_on_timeout permits a feasible partial winner.
+timeout_seconds_per_run: float | null = null
