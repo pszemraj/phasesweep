@@ -30,7 +30,11 @@ from phasesweep.engine.artifact_roots import (
     _bind_study_artifact_root,
     _write_artifact_root_binding,
 )
-from phasesweep.engine.attempts import _AttemptRecord, _register_active_attempt
+from phasesweep.engine.attempts import (
+    _AttemptRecord,
+    _register_active_attempt,
+    _register_tracking_operation,
+)
 from phasesweep.engine.cleanup import _reap_stale_trials
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
@@ -79,7 +83,9 @@ from tests.mcp_helpers import (
     write_unsafe_cleanup_status,
 )
 from tests.recovery_helpers import (
+    _new_phase_study,
     recover_run_cli,
+    stamp_artifact_root,
     write_launched_stale_trial,
     write_trial_identity,
     write_uncertain_failed_trial,
@@ -1009,6 +1015,45 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     assert recovery["registered_attempts_reconciled"] == 1
     assert not entry_path.exists()
     assert store.state(handle) == "failed"
+
+
+def test_operator_recovery_accepts_a_resolved_tracking_operation_as_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tracking worker whose cleanup was uncertain is the run's cleanup evidence."""
+    config = _config(tmp_path)
+    experiment = load_experiment(config)
+    assert isinstance(experiment, Experiment)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    run_id = "srv-tracking-worker-recovery"
+    mark_current_format(experiment)
+    stamp_artifact_root(_new_phase_study(experiment, experiment.phases[0].name), experiment)
+    handle = stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
+    write_run_status(
+        store,
+        run_id,
+        returncode=1,
+        error_class="UnsafeProcessCleanupError",
+        cleanup_confirmed=False,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
+    )
+    operation_id = "a" * 32
+    directory = tmp_path / "tracking-operation"
+    directory.mkdir()
+    write_attempt_lifecycle(directory, attempt_id=operation_id, state="allocated")
+    _register_tracking_operation(
+        experiment, operation_id=operation_id, generation_id=run_id, directory=directory
+    )
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
+
+    confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert not (_attempts_dir(experiment) / f"{operation_id}.json").exists()
+    assert store.state(handle) == "failed"
+    assert not store.recovery_required(handle)
 
 
 @pytest.mark.parametrize(

@@ -695,10 +695,12 @@ def _registry_attempt_fail_stale_trial(
     :param str | None current_storage: Current config's operational storage URL.
     :return str: ``"reaped"`` when the stale RUNNING trial was marked FAIL,
         ``"recovered"`` when an interrupted pass already recorded that
-        transition in the study ledger, ``"terminal"`` when nothing needed
-        to change (trial already terminal, study gone, or in-memory storage),
-        or ``"unreachable"`` when the recorded storage could not be read
-        and the entry must be retained for a later retry.
+        transition in the study ledger or the entry is a tracking operation
+        (which owns no trial, so its resolved process is the recovery
+        evidence), ``"terminal"`` when nothing needed to change (trial
+        already terminal, study gone, or in-memory storage), or
+        ``"unreachable"`` when the recorded storage could not be read and the
+        entry must be retained for a later retry.
     :raises StudySchemaMismatchError: The registry and trial record
         conflicting generation identities, or the ledger the entry names
         holds unsupported PhaseSweep study state.
@@ -709,7 +711,7 @@ def _registry_attempt_fail_stale_trial(
         study is left inconsistent rather than silently dropping the failure.
     """
     if entry["kind"] == "tracking":
-        return "terminal"
+        return "recovered"
     current_identity = canonical_storage_identity(current_storage)
     storage_url = (
         storage_recovery_locator(current_storage)
