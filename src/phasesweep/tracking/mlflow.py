@@ -102,10 +102,14 @@ def _resolve(client: Any, settings: dict[str, Any]) -> str:
 
 
 def _create(client: Any, request: dict[str, Any]) -> dict[str, Any]:
-    """Create once or reconcile an uncertain acknowledgment by exact identity.
+    """Bind the run carrying this exact identity, creating it only when none exists.
+
+    A lost creation response is indistinguishable from a request that never
+    arrived, so every attempt searches the identity tags before creating.
 
     :param Any client: Public MLflow client in the supervised worker.
     :param dict[str, Any] request: Trusted target or operation payload.
+    :raises ValueError: More than one run carries the identity.
     :return dict[str, Any]: Verified remote run binding.
     """
     binding = dict(request["binding"])
@@ -124,17 +128,13 @@ def _create(client: Any, request: dict[str, Any]) -> dict[str, Any]:
         if not token:
             break
     if len(matches) > 1:
-        raise ValueError("Multiple MLflow runs match the creation intent; binding is ambiguous.")
+        raise ValueError("Multiple MLflow runs carry this attempt identity; binding is ambiguous.")
     if matches:
         run = matches[0]
-    elif request["allow_create"]:
+    else:
         if binding.get("parent_run_id"):
             tags["mlflow.parentRunId"] = binding["parent_run_id"]
         run = client.create_run(binding["experiment_id"], tags=tags, run_name=request["run_name"])
-    else:
-        raise ValueError(
-            "MLflow creation acknowledgment is unresolved; no matching run was found. Refusing a duplicate create."
-        )
     binding["run_id"] = run.info.run_id
     verify_remote(run, binding)
     return binding

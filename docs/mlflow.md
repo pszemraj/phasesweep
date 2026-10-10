@@ -50,7 +50,7 @@ All controller network operations run in supervised workers outside GPU leases. 
 
 ## Choose run ownership
 
-In **managed** mode, PhaseSweep writes the trainer input and creation intent, creates the native MLflow run, and persists its returned ID before acquiring a GPU or launching training. The trainer receives `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID`, and `MLFLOW_RUN_ID`. Resume that supplied run:
+In **managed** mode, PhaseSweep writes the trainer input, creates the native MLflow run, and persists its returned ID before acquiring a GPU or launching training. The trainer receives `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_ID`, and `MLFLOW_RUN_ID`. Resume that supplied run:
 
 ```python
 import os
@@ -60,7 +60,7 @@ with mlflow.start_run(run_id=os.environ["MLFLOW_RUN_ID"]):
     mlflow.log_metric("eval/loss", 0.42, step=100)
 ```
 
-PhaseSweep can finish a still-running managed run after successful trainer exit and confirmed process cleanup. A FAILED or KILLED run is never converted into accepted evidence. If a creation response is lost, PhaseSweep searches by exact generation and attempt identity tags; it does not repeat the creation request.
+PhaseSweep can finish a still-running managed run after successful trainer exit and confirmed process cleanup. A FAILED or KILLED run is never converted into accepted evidence. Every creation request first searches the exact generation and attempt identity tags and binds a run it finds, so a retry after a lost response does not create a second run; it creates one only when the search finds none.
 
 In **trainer** mode, your existing logger creates and finishes the run. Bind that exact run once it exists:
 
@@ -162,7 +162,7 @@ After confirmed cleanup of a failed invocation, PhaseSweep queues a terminal pro
 
 Abrupt controller death, uncertain cleanup, or an unresolved generation binding can still leave no terminal projection. These require operator inspection and, where indicated, [MCP recovery](mcp.md#run-state-and-recovery) before further action. `sync-tracking` retries saved projections; it does not manufacture a missing terminal record.
 
-Bindings, creation intents, and mutable delivery records stay under the experiment artifact root. Delivery records live in `tracking/<generation-id>/delivery/`, separately from committed generation manifests. See [runtime layout](runtime.md#output-layout) for worker scratch and cache placement.
+Bindings and mutable delivery records stay under the experiment artifact root. Delivery records live in `tracking/<generation-id>/delivery/`, separately from committed generation manifests. See [runtime layout](runtime.md#output-layout) for worker scratch and cache placement.
 
 ## Databricks status
 

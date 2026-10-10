@@ -174,7 +174,10 @@ def _create_bound(
     deadline: float | None,
     attempt_directory: Path | None = None,
 ) -> dict[str, Any]:
-    """Persist create intent before one create, then reconcile uncertain retries.
+    """Bind or create the identity's run, retrying once after an uncertain failure.
+
+    Each try searches the identity tags before creating, so a retry after a
+    lost response binds the run that request created instead of duplicating it.
 
     :param Experiment experiment: Configured experiment.
     :param dict[str, Any] identity: Exact creation identity.
@@ -187,16 +190,9 @@ def _create_bound(
     assert experiment.mlflow is not None
     if path.exists():
         return read_binding(path.parent) if path.name == BINDING_FILE else read_record(path)
-    intent = path.with_suffix(".intent.json")
-    first = not intent.exists()
-    if first:
-        write_record(intent, identity)
-    elif read_record(intent) != identity:
-        raise ValueError("MLflow creation intent conflicts with this attempt.")
     request = {
         "action": "create",
         "binding": identity,
-        "allow_create": first,
         "run_name": f"{identity['experiment']}-{identity['phase']}-{identity['attempt_id']}",
     }
 
@@ -223,13 +219,10 @@ def _create_bound(
     except (OSError, RuntimeError) as exc:
         from phasesweep.errors import UnsafeProcessCleanupError
 
-        if (
-            not first
-            or isinstance(exc, UnsafeProcessCleanupError)
-            or (deadline is not None and time.monotonic() >= deadline)
+        if isinstance(exc, UnsafeProcessCleanupError) or (
+            deadline is not None and time.monotonic() >= deadline
         ):
             raise
-        request["allow_create"] = False
         binding = execute()
     write_record(path, binding)
     return binding

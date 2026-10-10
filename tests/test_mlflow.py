@@ -157,26 +157,32 @@ def test_unsuccessful_remote_cannot_be_finished(status):
         _capture(client, {"binding": binding, "query": {}, "settings": {"timeout_seconds": 1}})
 
 
-def test_uncertain_creation_reconciles_without_creating():
+def test_creation_binds_an_existing_identity_and_creates_only_when_absent():
     binding = _binding()
-    run = _run(binding)
+    identity = {k: v for k, v in binding.items() if k != "run_id"}
+    created = []
 
     class Page(list):
         token = None
 
+    def create_run(*args, **kwargs):
+        created.append(kwargs["tags"])
+        return _run(binding)
+
     client = SimpleNamespace(
         get_experiment=lambda _: SimpleNamespace(experiment_id="1", lifecycle_stage="active"),
-        search_runs=lambda *a, **k: Page([run]),
+        search_runs=lambda *a, **k: Page([_run(binding)]),
+        create_run=create_run,
     )
-    result = _create(
-        client, {"binding": binding, "settings": {"experiment_id": "1"}, "allow_create": False}
-    )
-    assert result == binding
+    request = {"binding": identity, "settings": {"experiment_id": "1"}, "run_name": "r"}
+    assert _create(client, request) == binding
+    assert created == []
     client.search_runs = lambda *a, **k: Page()
-    with pytest.raises(ValueError, match="Refusing a duplicate"):
-        _create(
-            client, {"binding": binding, "settings": {"experiment_id": "1"}, "allow_create": False}
-        )
+    assert _create(client, request) == binding
+    assert len(created) == 1
+    client.search_runs = lambda *a, **k: Page([_run(binding), _run(binding)])
+    with pytest.raises(ValueError, match="ambiguous"):
+        _create(client, request)
 
 
 def test_no_cross_backend_publishing(tmp_path):
@@ -214,29 +220,45 @@ def native_experiment(tmp_path):
     return Experiment.model_validate(config)
 
 
-def test_lost_acknowledgment_reconciles_exact_intent(tmp_path, monkeypatch):
-    """A successful remote create with a lost response never causes a second create."""
+def test_uncertain_creation_retries_the_same_identity(tmp_path, monkeypatch):
+    """A failed create is retried by identity, and never blocks a later creation."""
     from phasesweep.tracking import session
 
     binding = _binding()
     identity = {k: v for k, v in binding.items() if k != "run_id"}
     path = tmp_path / "mlflow-binding.json"
-    calls = []
+    requests = []
+    outcomes = [RuntimeError("response lost"), binding]
 
     def operation(request, **kwargs):
-        assert session.read_record(path.with_suffix(".intent.json")) == identity
-        calls.append(request["allow_create"])
-        if len(calls) == 1:
-            raise RuntimeError("Remote create succeeded but response was lost")
-        return binding
+        requests.append(request)
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
     monkeypatch.setattr(session, "request_operation", operation)
+    experiment = native_experiment(tmp_path)
     actual = session._create_bound(
-        native_experiment(tmp_path), identity, path, {}, deadline=None, attempt_directory=tmp_path
+        experiment, identity, path, {}, deadline=None, attempt_directory=tmp_path
     )
     assert actual == binding
-    assert calls == [True, False]
+    assert len(requests) == 2 and requests[0] == requests[1]
     assert session.read_binding(tmp_path) == binding
+
+    path.unlink()
+    outcomes[:] = [RuntimeError("server down"), RuntimeError("server down"), binding]
+    with pytest.raises(RuntimeError, match="server down"):
+        session._create_bound(
+            experiment, identity, path, {}, deadline=None, attempt_directory=tmp_path
+        )
+    assert not path.exists()
+    assert (
+        session._create_bound(
+            experiment, identity, path, {}, deadline=None, attempt_directory=tmp_path
+        )
+        == binding
+    )
 
 
 @pytest.mark.parametrize("field", ["run_id", "experiment_id", "attempt_id"])
