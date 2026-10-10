@@ -1,6 +1,6 @@
 # PhaseSweep config_reference.yaml: exhaustive primary Experiment YAML, signature form.
 # Values are signatures (key: type = default), not runnable YAML; start from examples/example.yaml.
-# Hand-maintained: tests/test_config_reference.py guards schema paths, variants, required/default signatures and the real-loader example.
+# Hand-maintained: tests/test_config_reference.py guards schema paths, variants, required/default signatures and the real-loader example. Comments and runtime interactions require source review.
 # This preserves one narrative reference for cross-field behavior; schema metadata does not contain these interactions.
 # CLI: phasesweep validate CONFIG and phasesweep run CONFIG require an explicit path; no default file or environment-to-config overlay.
 # Read once per invocation; detached MCP launch freezes the submitted config. Editing the original does not reload active work.
@@ -9,12 +9,14 @@
 # Run flags (--from-phase, --dry-run, --verbose) control execution/display; they do not override YAML keys.
 # Relative workdir, journal and execution.cwd paths resolve against invocation cwd; local evidence is trial-relative.
 # There is no general ${VAR} interpolation. Shell expansion in trial_command follows the subprocess environment.
-# YAML scalars keep loader types: 1e-3 is a string; 1.0e-3 or 0.001 is numeric. Numeric fields reject booleans.
+# Trainer pass-through values and categorical choices keep YAML scalar types: 1e-3 is a string; 1.0e-3 or 0.001 is numeric. Schema numeric fields can coerce numeric strings but reject booleans.
 # Each list/object variant below is an alternative, selected by its type; repeated type entries are documentation, not one combined object.
 # <key> in prose means any valid dotted override name, illustrated by optimizer.lr under search_space.
 # Operational environment outside YAML: XDG_CACHE_HOME places worker/cache files; PHASESWEEP_HOME selects an existing private absolute 0700 root.
 # PHASESWEEP_LOCK_DIR selects an existing safe absolute host-lock directory; by default locks use the OS account home, independent of HOME/XDG.
 # Trainer cache paths, model/data downloads, training cadence and hardware usage remain the external trainer's responsibility.
+# This reference covers the sweep schema. The separate MCP catalog's complete field table is in docs/mcp.md; examples/catalog.yaml is its starting example.
+# Publication and cleanup/recovery are engine behavior, not extra YAML blocks. Current-format state is required; no migration or legacy aliases are accepted.
 
 # ---------- Required experiment fields ----------
 
@@ -30,6 +32,8 @@ trial_command: string (required)
 
 # Primary finite scalar objective; its extractor selects one observation and its goal ranks trials. No pruning, evaluation scheduling or checkpoint selection is performed by PhaseSweep.
 # Requires: metric.name and constraints[].name must all be distinct; duplicate names fail config load.
+# Built-in confound verdicts are advisory and cannot be disabled or tuned here. evaluation_point flags positions more than 1% short of the furthest; survivorship flags when failed + pruned >= max(1, ranked), excluding infeasible trials from that threshold; tie flags exact ties between different sampled configurations.
+# Verdicts never block selection/publication. n/a means not checked: e.g. JSON/log objectives report no position, a W&B history position is unavailable, or fewer than two trials were ranked for evaluation_point/tie.
 metric: object (required)
   # Name published for the objective, e.g. validation_loss; goal is reserved and rejected.
   # Requires: constraints[].name values must all be distinct from metric.name.
@@ -37,6 +41,7 @@ metric: object (required)
 
   # Rank the scalar chosen per trial: minimize selects the smallest, maximize the largest.
   # metric.extractor.select for log_regex/mlflow only selects within a run; it does not inherit this ranking direction.
+  # Exact ties select the lower Optuna trial number among feasible candidates.
   goal: "minimize" | "maximize" = "minimize"
 
   # Scalar source, selected by type. Each variant below replaces this one object; do not combine their keys. All accepted objectives are finite scalars.
@@ -75,21 +80,23 @@ metric: object (required)
     expected_step: int | null = null
 
     # Nonempty progress key for objective comparability: step reads the envelope evaluation step; another name, e.g. tokens, reads evaluation.progress and must be reported through report_objective(progress={...}).
+    # Requires: the reported position is finite and nonnegative; a missing/invalid custom position fails extraction rather than merely making the confound check unavailable.
     # Only used when: this is metric.extractor; constraints[].extractor must leave the default step or config load fails.
     # Recommended: use tokens for a fixed-token comparison or trained_steps for best-checkpoint reporting, and log the full training budget on that axis.
     evaluation_axis: string = "step"
 
     # Variant log_regex; selected by type: log_regex.
-    # Extract numeric matches from an attempt log; missing/nonfinite evidence fails the trial.
+    # Extract numeric matches from an attempt log; missing evidence or a nonfinite selected value fails the trial.
     type: "log_regex" (required)
 
     # Trial-relative descendant log path, e.g. stdout.log: nonempty, no absolute paths, NUL or .. segments, and not the trial root. stdout.log and stderr.log are written automatically.
     file: string = "stdout.log"
 
     # Compilable Python regex with named (?P<value>...) capture, e.g. eval_loss=(?P<value>[0-9.eE+-]+); invalid regex or missing group fails config load.
+    # Matching is line by line with Python's default regex flags; inline flags such as (?i) are supported, but a match cannot span lines. Captures that float() cannot parse are skipped; no numeric matches fails extraction.
     pattern: string (required)
 
-    # Select an observation within this trial: last/first use match order, min/max use numeric values.
+    # Select an observation within this trial: last/first use numeric-match order, min/max use numeric values and keep the first equal extreme. first still reads the remaining file for its evidence digest.
     # metric.goal independently ranks the selected per-trial scalars; maximize does not change this selector.
     select: "last" | "first" | "min" | "max" = "last"
 
@@ -105,6 +112,7 @@ metric: object (required)
     # Required explicit within-run selection: last chooses greatest step then latest timestamp; min/max choose the extreme value with earliest step then timestamp on ties; step chooses latest timestamp at the exact step.
     # Requires: metric.extractor.step is nonnull exactly for select step; any other pairing fails config load. The same rule applies under constraints[].extractor.
     # metric.goal only ranks trial scalars; it never supplies this selector.
+    # The objective's selected native step supplies its advisory evaluation-point position; MLflow has no evaluation_axis override.
     # Warning: min/max reject any nonfinite history point; last/step require the selected point finite. Conflicting values at one step/timestamp fail, and shared capture freezes the native position.
     select: "last" | "min" | "max" | "step" (required)
 
@@ -117,7 +125,7 @@ metric: object (required)
     type: "wandb" (required)
 
     # Normalized HTTP(S) API endpoint; no embedded credentials, query or fragment. Scheme/host are lowercased and trailing path slashes stripped.
-    # Requires: every W&B metric/constraint/gate agrees on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
+    # Requires: within each phase, its W&B gates and the experiment-level W&B metric/constraints agree on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
     base_url: string = "https://api.wandb.ai"
 
     # Nonempty account/team name without slash or whitespace, e.g. research-team.
@@ -129,11 +137,12 @@ metric: object (required)
     project: string (required)
 
     # Finite positive polling interval in seconds.
-    # Requires: every W&B consumer uses the same interval; disagreement fails config load.
+    # Requires: every W&B consumer reached within one phase uses the same interval; disagreement fails config load.
     poll_seconds: float = 2.0
 
     # Finite operation timeout in seconds, >= 1, capped by remaining phase/run budget; includes remote startup, SDK calls and visibility polling.
-    # Requires: every W&B consumer uses the same timeout; disagreement fails config load.
+    # Requires: every W&B consumer reached within one phase uses the same timeout; disagreement fails config load.
+    # The objective's advisory history-position lookup gets a fresh operation timeout after scalar acceptance, still capped by phase/run deadlines.
     timeout_seconds: float = 120.0
 
     # Exact nonempty finished-summary key, e.g. eval/loss or eval/loss.min for a define_metric summary=min aggregate. A bare key does not substitute for its aggregate suffix.
@@ -156,6 +165,7 @@ phases: list[object] (required)
     # Target count of terminal Optuna attempts, not successful objectives; integer >= 1. New invocation continuation depends on storage and sampler type.
     # Requires: with phases[].sampler.type grid, the target equals grid cardinality unless phases[].allow_partial_grid is true, and it may never exceed cardinality; config load fails otherwise.
     # Warning: failed/infeasible attempts consume the target; no feasible eligible result fails the phase.
+    # Persistent targets cannot decrease. For resumable samplers, raising the accepted target schedules new attempts, including explicit recovery after a durable abort or accepted partial timeout; repeating the same target preserves that decision.
     n_trials: int (required)
 
     # Free-text design note shown by validate and show-winners; null adds no note. This field is excluded from semantic study identity.
@@ -172,6 +182,7 @@ phases: list[object] (required)
     # Fixed trainer-defined values applied to every trial; arbitrary JSON/YAML-compatible values are passed to the command chosen by trial_command. Keys use dotted nonempty [A-Za-z0-9_-]+ segments, e.g. optimizer.lr or training.max_steps.
     # Overrides: trainer_config and phases[].inherits at the same key; independent inherited-origin conflicts must be resolved here or config load fails.
     # Conflicts with: phases[].search_space cannot contain the same local key, and a key and its prefix cannot coexist across inherited/fixed/sampled overrides.
+    # Values follow override_format: yaml_file/json_file allow recursive lists and string-keyed mappings; argparse/hydra accept scalar/list values only. All formats reject nonfinite numbers and unsupported YAML objects such as unquoted dates.
     # Recommended: fix batch size, seed, data split and training/evaluation budgets here when comparing hyperparameters; PhaseSweep does not equalize training automatically. Override string values do not expand runtime placeholders.
     fixed_overrides: map[string, any] = {}
 
@@ -242,11 +253,12 @@ phases: list[object] (required)
     # Requires: whole_node needs phases[].n_jobs 1 and exactly one of phases[].gpu_ids/phases[].gpu_devices, containing distinct physical devices. Missing/duplicate lists fail config load; aliases and a multi-device world containing MIG tokens fail at runtime.
     # Requires: none forbids explicit device lists and requires phases[].allow_no_gpu_isolation when phases[].n_jobs > 1; config load fails otherwise.
     # Warning: the trainer sees a leased physical GPU as its local cuda:0; use local indexing. Whole-node world size is semantic, while single-device pool size controls throughput.
+    # Numeric leased tokens force CUDA_DEVICE_ORDER=PCI_BUS_ID; UUID tokens retain an explicit order or default it to PCI_BUS_ID. gpu_policy none applies no CUDA binding itself.
     gpu_policy: "single_per_trial" | "whole_node" | "none" = "single_per_trial"
 
     # Explicit nonempty list of nonnegative CUDA indices; each is resolved to physical host-lock identity.
     # Explicit lists take priority over env.CUDA_VISIBLE_DEVICES and inherited visibility for pool discovery; the trainer receives its leased token.
-    # Unset: gpu_devices, then composed CUDA_VISIBLE_DEVICES, then nvidia-smi inventory determines the pool.
+    # Unset: gpu_devices, then env.CUDA_VISIBLE_DEVICES, then the controller's ambient CUDA_VISIBLE_DEVICES, then nvidia-smi inventory determines the pool. Pool discovery reads ambient visibility even when execution.inherit_env excludes it.
     # Conflicts with: phases[].gpu_devices; setting both fails config load.
     # Requires: phases[].gpu_policy must not be none; whole_node requires one explicit unique physical-device list.
     # Recommended: use one explicit index for predictable single-GPU experiments; avoid choosing devices already occupied by another independent workload.
@@ -254,13 +266,14 @@ phases: list[object] (required)
 
     # Explicit nonempty list of CUDA tokens, e.g. ["GPU-..."] or ["MIG-..."]; whitespace is stripped, empty/comma-containing/-1 tokens fail config load.
     # Explicit lists take priority over env.CUDA_VISIBLE_DEVICES and inherited visibility for pool discovery; the trainer receives its leased token.
-    # Unset: gpu_ids, then composed CUDA_VISIBLE_DEVICES, then nvidia-smi inventory determines the pool.
+    # Unset: gpu_ids, then env.CUDA_VISIBLE_DEVICES, then the controller's ambient CUDA_VISIBLE_DEVICES, then nvidia-smi inventory determines the pool. Pool discovery reads ambient visibility even when execution.inherit_env excludes it.
     # Conflicts with: phases[].gpu_ids; setting both fails config load.
     # Requires: phases[].gpu_policy must not be none; whole_node requires unique physical devices and rejects multi-device MIG worlds at runtime.
     gpu_devices: list[string] | null = null
 
     # Permit intentional parallel CPU/external-isolation work or unavailable host-lock isolation.
     # Requires: phases[].gpu_policy none with phases[].n_jobs > 1 needs true; default false refuses that config. Under single_per_trial, unavailable GPUs with parallel jobs fail unless true.
+    # An explicit env.CUDA_VISIBLE_DEVICES value of "" or "-1" disables CUDA and pins that sentinel into each single_per_trial trainer without GPU locks; parallel jobs need no opt-in in this case. gpu_policy none still requires its parallel opt-in.
     # Warning: true can permit unrestricted GPU visibility without host locks; it does not turn a CUDA model into a CPU model. A single-job run on a host with no GPUs can proceed without this flag.
     allow_no_gpu_isolation: bool = false
 
@@ -289,12 +302,14 @@ phases: list[object] (required)
       acknowledge_nonresumable: bool = false
 
     # Abort after this many consecutive failed/infeasible trials, integer >= 1; a feasible success resets the streak. Failed attempts still count toward phases[].n_trials.
+    # The streak and abort decision persist on durable storage in completion order. Raising this limit does not undo a recorded abort; a resumable sampler needs a larger n_trials target or a new experiment identity for recovery.
     # Recommended: lower the threshold for an expensive trainer when configuration failure should stop promptly.
     max_consecutive_failures: int = 5
 
     # Trainer timeout in seconds, finite and >= 0 when nonnull; default 259200 is 72 hours. Zero expires immediately.
     # Requires: null needs phases[].allow_unbounded_trials true; config load fails otherwise.
     # Combined with phases[].timeout_seconds_per_phase and timeout_seconds_per_run, the earliest active deadline limits work.
+    # Starts at supervised launch (including supervisor startup), after GPU lease acquisition; it does not bound the lease wait or post-trainer evidence reads. Phase/run deadlines also cover those stages. This field participates in semantic study identity, so changing it cannot reuse a populated phase.
     timeout_seconds_per_trial: float | null = 259200.0
 
     # Explicitly permit a trainer invocation with no per-trial deadline.
@@ -304,10 +319,12 @@ phases: list[object] (required)
     # Phase wallclock budget in seconds, finite and >= 0 when nonnull; null adds no phase deadline and zero expires immediately.
     # Combined with phases[].timeout_seconds_per_trial and timeout_seconds_per_run, the earliest active deadline limits work.
     # phases[].allow_incomplete_on_timeout controls whether a feasible partial winner may be accepted.
+    # Starts immediately before the phase's optimize loop, after resume checks, environment preflight and GPU discovery. It covers queued GPU leases, trainer execution and evidence reads; cleanup can extend beyond the deadline.
     timeout_seconds_per_phase: float | null = null
 
     # Allow a feasible winner from fewer than phases[].n_trials attempts after a phase/run wallclock timeout and persist that accepted partial decision; default false fails closed. Reusing a partial winner also requires true.
     # Only used when: phases[].timeout_seconds_per_phase or timeout_seconds_per_run leaves an incomplete phase; this does not substitute a baseline or make missing/infeasible evidence win.
+    # Repeating the same accepted n_trials replays the partial decision without filling its unused slots. A resumable sampler needs a larger target to launch new work. A per-trial timeout alone does not enable partial acceptance.
     allow_incomplete_on_timeout: bool = false
 
     # Allow a grid target smaller than its full cardinality; false requires the full matrix.
@@ -326,7 +343,7 @@ phases: list[object] (required)
       # Require an artifact byte count inside inclusive bounds.
       - type: "artifact_size" (required)
 
-        # file uses a file's size; directory recursively counts regular files/file-symlink targets without following directory symlinks; json reads a saved byte count.
+        # file uses a file's size; directory recursively counts regular files/file-symlink targets without following directory symlinks; json reads a saved nonnegative integer byte count (booleans, floats and strings fail the gate).
         # Requires: phases[].gates[].key exactly when source is json; invalid pairing fails config load.
         source: "file" | "directory" | "json" (required)
 
@@ -412,10 +429,11 @@ phases: list[object] (required)
 
       # Variant wandb_summary_required; selected by type: wandb_summary_required.
       # Require exact summary-key presence in the same accepted finished capture; values need not be numeric.
+      # With no W&B scalar consumer, capture accepts the first finished summary and missing keys fail immediately. With scalar consumers it waits for all numeric keys before checking gate presence. Gate-only phases may use different W&B targets from one another.
       - type: "wandb_summary_required" (required)
 
         # Normalized HTTP(S) API endpoint; no embedded credentials, query or fragment. Scheme/host are lowercased and trailing path slashes stripped.
-        # Requires: every W&B metric/constraint/gate agrees on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
+        # Requires: within each phase, its W&B gates and the experiment-level W&B metric/constraints agree on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
         base_url: string = "https://api.wandb.ai"
 
         # Nonempty account/team name without slash or whitespace, e.g. research-team.
@@ -427,11 +445,11 @@ phases: list[object] (required)
         project: string (required)
 
         # Finite positive polling interval in seconds.
-        # Requires: every W&B consumer uses the same interval; disagreement fails config load.
+        # Requires: every W&B consumer reached within one phase uses the same interval; disagreement fails config load.
         poll_seconds: float = 2.0
 
         # Finite operation timeout in seconds, >= 1, capped by remaining phase/run budget; includes remote startup, SDK calls and visibility polling.
-        # Requires: every W&B consumer uses the same timeout; disagreement fails config load.
+        # Requires: every W&B consumer reached within one phase uses the same timeout; disagreement fails config load.
         timeout_seconds: float = 120.0
 
         # Nonempty list of nonempty exact summary keys, e.g. [eval/loss, trainer_revision]; missing keys fail the gate.
@@ -457,6 +475,7 @@ override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 # Local study persistence: null is disposable in-memory storage, auto resolves to <workdir>/<experiment>/study.journal, and an explicit journal:///path/to/study.journal selects a local journal. journal:///./runs/study.journal is relative to the invocation directory; journal:////tmp/study.journal is absolute.
 # Requires: provenance must be nonempty for auto or journal storage; stochastic phases also need phases[].sampler.seed, and durable TPE/CMA-ES need phases[].sampler.acknowledge_nonresumable. Config load fails otherwise.
 # Requires: workdir must stay bound to the same supported local ledger for reuse.
+# Reuse also requires current-format artifacts, matching trainer/evidence/provenance semantics and the existing semantic environment cohort. Changing semantic inputs needs a fresh experiment identity; run-control changes do not waive stored abort/partial decisions.
 # Warning: null cannot resume or top up a later invocation; SQLite, :memory:, external database URLs and all other storage forms are rejected. Journals support parallel trials on one host, not distributed-host execution.
 storage: string | null = null
 
@@ -515,21 +534,23 @@ constraints: list[object] = []
       expected_step: int | null = null
 
       # Nonempty progress key for objective comparability: step reads the envelope evaluation step; another name, e.g. tokens, reads evaluation.progress and must be reported through report_objective(progress={...}).
+      # Requires: the reported position is finite and nonnegative; a missing/invalid custom position fails extraction rather than merely making the confound check unavailable.
       # Only used when: this is metric.extractor; constraints[].extractor must leave the default step or config load fails.
       # Recommended: use tokens for a fixed-token comparison or trained_steps for best-checkpoint reporting, and log the full training budget on that axis.
       evaluation_axis: string = "step"
 
       # Variant log_regex; selected by type: log_regex.
-      # Extract numeric matches from an attempt log; missing/nonfinite evidence fails the trial.
+      # Extract numeric matches from an attempt log; missing evidence or a nonfinite selected value fails the trial.
       type: "log_regex" (required)
 
       # Trial-relative descendant log path, e.g. stdout.log: nonempty, no absolute paths, NUL or .. segments, and not the trial root. stdout.log and stderr.log are written automatically.
       file: string = "stdout.log"
 
       # Compilable Python regex with named (?P<value>...) capture, e.g. eval_loss=(?P<value>[0-9.eE+-]+); invalid regex or missing group fails config load.
+      # Matching is line by line with Python's default regex flags; inline flags such as (?i) are supported, but a match cannot span lines. Captures that float() cannot parse are skipped; no numeric matches fails extraction.
       pattern: string (required)
 
-      # Select an observation within this trial: last/first use match order, min/max use numeric values.
+      # Select an observation within this trial: last/first use numeric-match order, min/max use numeric values and keep the first equal extreme. first still reads the remaining file for its evidence digest.
       # metric.goal independently ranks the selected per-trial scalars; maximize does not change this selector.
       select: "last" | "first" | "min" | "max" = "last"
 
@@ -557,7 +578,7 @@ constraints: list[object] = []
       type: "wandb" (required)
 
       # Normalized HTTP(S) API endpoint; no embedded credentials, query or fragment. Scheme/host are lowercased and trailing path slashes stripped.
-      # Requires: every W&B metric/constraint/gate agrees on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
+      # Requires: within each phase, its W&B gates and the experiment-level W&B metric/constraints agree on base_url, entity, project, poll_seconds and timeout_seconds; disagreement fails config load. Cannot coexist with mlflow.
       base_url: string = "https://api.wandb.ai"
 
       # Nonempty account/team name without slash or whitespace, e.g. research-team.
@@ -569,11 +590,11 @@ constraints: list[object] = []
       project: string (required)
 
       # Finite positive polling interval in seconds.
-      # Requires: every W&B consumer uses the same interval; disagreement fails config load.
+      # Requires: every W&B consumer reached within one phase uses the same interval; disagreement fails config load.
       poll_seconds: float = 2.0
 
       # Finite operation timeout in seconds, >= 1, capped by remaining phase/run budget; includes remote startup, SDK calls and visibility polling.
-      # Requires: every W&B consumer uses the same timeout; disagreement fails config load.
+      # Requires: every W&B consumer reached within one phase uses the same timeout; disagreement fails config load.
       timeout_seconds: float = 120.0
 
       # Exact nonempty finished-summary key, e.g. eval/loss or eval/loss.min for a define_metric summary=min aggregate. A bare key does not substitute for its aggregate suffix.
@@ -600,6 +621,7 @@ constraints: list[object] = []
 # Unset: MLflow integration is off; MLflow extractors/gates without this block fail config load.
 # Requires: metric.extractor.type must be mlflow and W&B extractors/gates cannot be mixed anywhere; violations fail config load. Local JSON/log constraints and local gates remain allowed.
 # Requires: the controller must have the MLflow extra installed, the target experiment must already exist and credentials must reach both controller and trainer; validate/dry-run do not verify authentication or experiment existence.
+# Result projections are queued automatically for accepted trials and generation summaries. A failed upload leaves pending delivery without invalidating accepted scientific results; phasesweep sync-tracking CONFIG --generation ID retries saved projections without training or rereading metrics. No YAML publishing/retry switch is provided.
 mlflow: object | null = null
   # Existing tracking server target: HTTP(S) URL, databricks or databricks://profile. HTTP scheme/host are lowercased and trailing path slashes stripped; embedded credentials, query and fragment are rejected. Local file/sqlite tracking URIs are unsupported.
   # Requires: experiment_id or experiment_name selects exactly one existing active experiment at this target; the controller verifies it before trial launch.
@@ -639,8 +661,9 @@ mlflow: object | null = null
 # Overrides: execution.inherit_env and execution.passthrough_env values of the same name. PhaseSweep then assigns attempt identity, input/evidence paths and leased CUDA_VISIBLE_DEVICES.
 # Requires: with MLflow, MLFLOW_RUN_ID is forbidden here and explicit MLFLOW_TRACKING_URI/MLFLOW_EXPERIMENT_ID/MLFLOW_EXPERIMENT_NAME must match the configured target, or config load fails. Managed values replace ambient defaults.
 # Requires: with W&B evidence, explicit WANDB_BASE_URL/ENTITY/PROJECT/RESUME must match the evidence target, WANDB_RUN_ID is forbidden, and offline/disabled settings fail before training; PhaseSweep binds one fresh attempt ID.
+# Without W&B evidence consumers, an explicitly configured env.WANDB_RUN_ID remains trainer-owned; an ambient/inherited WANDB_RUN_ID is removed. Other trainer-owned WANDB_* settings are preserved.
 # Recommended: put rotating credentials/proxies in execution.passthrough_env and make them available to the controller too. Generic trainer telemetry settings are preserved when their backend is not an evidence consumer.
-# Recommended: set CUDA_VISIBLE_DEVICES explicitly here or list it in execution.inherit_env when narrowing inheritance; otherwise an ambient GPU restriction can be dropped. Set trainer cache variables such as HF_HOME, HF_DATASETS_CACHE, TORCH_HOME and TMPDIR to writable locations when needed; PhaseSweep does not provision or warm trainer caches.
+# Recommended: under gpu_policy none, set CUDA_VISIBLE_DEVICES here or include it in execution.inherit_env when narrowing inheritance; otherwise an ambient GPU restriction can be dropped. single_per_trial pool discovery separately reads ambient visibility and rebinds its leased tokens or disable sentinel. Set trainer cache variables such as HF_HOME, HF_DATASETS_CACHE, TORCH_HOME and TMPDIR to writable locations when needed; PhaseSweep does not provision or warm trainer caches.
 # Explicit phases[].gpu_ids/phases[].gpu_devices take priority over this CUDA visibility for pool discovery; the trainer receives its leased device token.
 env: map[string, string] = {}
 
@@ -671,4 +694,5 @@ execution: object = {}
 # Whole run wallclock budget in seconds, finite and nonnegative; null adds no run deadline, zero expires immediately.
 # Combined with phases[].timeout_seconds_per_phase and phases[].timeout_seconds_per_trial, the earliest active deadline limits work. MLflow/W&B operations are also capped by the remaining phase/run budget.
 # An incomplete phase fails closed unless phases[].allow_incomplete_on_timeout permits a feasible partial winner.
+# Starts after the generation is claimed, before execution preflight and phase work; initial locking/ledger setup is outside this clock. Cleanup/publication may extend beyond the deadline, which never waives process-cleanup requirements.
 timeout_seconds_per_run: float | null = null

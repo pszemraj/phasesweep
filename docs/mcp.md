@@ -32,11 +32,31 @@ experiments:
     visible_params: none
 ```
 
-`id` is the safe catalog identifier an agent may name. `config` and `cwd` are
-operator-only paths. `visible_params` is `none`, `all`, or a list of sampled
-parameter keys. Keep it at `none` unless exposing those values is intended.
-Side effects are opt-in: `allow.launch`, `allow.cancel`, and
-`allow.from_phase` default to false.
+The catalog is a separate YAML configuration from the experiment. Both reject
+unknown fields and duplicate YAML keys. The server validates and freezes the
+catalog and referenced experiment configurations at startup. Restart the server
+after editing either; a changed experiment file is refused by launch until it
+is reloaded. An already detached run keeps its submitted configuration snapshot.
+
+These are all accepted catalog fields. Entry paths expand `~`; relative
+`state_dir`, `experiments[].config` and `experiments[].cwd` paths resolve against
+the directory containing the catalog, independently of the server's launch
+directory.
+
+| Key | Type and default | Behavior |
+|---|---|---|
+| `state_dir` | Path; required | Private durable handles, logs, audit entries and frozen snapshots. Startup and a successful `mcp check` provision and probe the directory; see the fresh-state rules below. |
+| `max_concurrent_runs` | Integer ≥ 1; `1` | Maximum live sweeps across the shared `state_dir`, including other servers using that state. This does not set a phase's trial parallelism or assign GPUs. |
+| `experiments` | Nonempty list of objects; required | Every entry must load successfully for server startup. Each engine output/study namespace must have one catalog entry; aliases are rejected. |
+| `experiments[].id` | String; required | Unique case-sensitive agent-visible identifier matching `[A-Za-z0-9_-]+`, such as `tiny_lm`. It need not equal the experiment YAML's `experiment` name. |
+| `experiments[].config` | Path; required | Existing experiment YAML file, kept operator-only. Its configuration must satisfy the detached-run storage/path rules below. |
+| `experiments[].cwd` | Path or `null`; `null` | Existing detached-run working directory. Unset/null uses the resolved experiment file's parent directory. It also supplies the trainer's working directory when experiment `execution.cwd` is unset; an explicit absolute `execution.cwd` takes precedence for the trainer. |
+| `experiments[].description` | String, at most 500 characters; `""` | Purpose shown to the agent during catalog discovery; paths and secrets do not belong here. |
+| `experiments[].allow` | Object; `{}` | Permission block with all child permissions false by default; omitting it leaves the entry read-only. |
+| `experiments[].allow.launch` | Boolean; `false` | Permit detached launches for this entry; concurrency and experiment-busy checks still apply. |
+| `experiments[].allow.cancel` | Boolean; `false` | Permit cancellation of this entry's active runs. Grant only the authority intended for the client. |
+| `experiments[].allow.from_phase` | Boolean; `false` | Permit a launch with `from_phase`; also requires `allow.launch` and compatible earlier phase winners. It does not waive resume checks. |
+| `experiments[].visible_params` | `none`, `all`, or list of strings; `none` | Control sampled winner parameter values returned to agents. An allowlist uses exact parameter names; surrounding whitespace is stripped, duplicate names removed and blank names rejected. Keep `none` unless exposing values is intended. |
 
 MCP experiments must use a persistent local journal or `auto` ledger, an
 absolute `workdir`, and an absolute storage path after `auto` is resolved.

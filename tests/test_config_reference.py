@@ -1,4 +1,8 @@
-"""Keep the narrative signature reference aligned with the primary config schema."""
+"""Guard documented config paths/signatures and load the starting configurations.
+
+These checks detect inventory, type and default drift. They do not prove the
+reference's behavioral comments, bounds, precedence or cross-field rules.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +13,8 @@ from typing import Any
 
 import phasesweep.config as config_models
 from phasesweep.config import Experiment, load_experiment
+from phasesweep.config.io import load_experiment_bytes
+from phasesweep.mcp.registry import _Allow, _Catalog, _Entry
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -150,5 +156,35 @@ def test_minimal_starting_example_loads_through_real_loader() -> None:
     assert experiment.experiment == "first_trial"
     assert len(experiment.phases) == 1
     assert experiment.phases[0].n_trials == 1
+    assert experiment.phases[0].gpu_policy == "none"
+    assert experiment.phases[0].gates == []
+    assert experiment.metric.extractor.type == "json_envelope"
     assert experiment.storage is None
     assert experiment.mlflow is None
+
+
+def test_configuration_guide_complete_yaml_examples_load_through_real_loader() -> None:
+    """Validate complete guide examples while leaving partial illustrations alone."""
+    blocks = re.findall(r"```yaml\n(.*?)\n```", (REPO / "docs/config.md").read_text(), re.DOTALL)
+    complete = [block for block in blocks if re.search(r"^experiment:", block, re.MULTILINE)]
+    assert complete, "The configuration guide must retain a complete experiment example"
+    for index, block in enumerate(complete):
+        load_experiment_bytes(block.encode("utf-8"), source=f"docs/config.md YAML example {index}")
+
+
+def test_mcp_catalog_table_matches_all_catalog_paths() -> None:
+    """Keep the separate catalog field table complete in both directions."""
+    expected = {
+        *_Catalog.model_fields,
+        *(f"experiments[].{key}" for key in _Entry.model_fields),
+        *(f"experiments[].allow.{key}" for key in _Allow.model_fields),
+    }
+    catalog_section = (REPO / "docs/mcp.md").read_text().split("## The catalog\n", 1)[1]
+    catalog_section = catalog_section.split("\n## ", 1)[0]
+    paths = re.findall(r"^\| `([^`]+)` \|", catalog_section, re.MULTILINE)
+    assert len(paths) == len(set(paths)), "Duplicate catalog table paths"
+    actual = set(paths)
+    assert actual == expected, {
+        "missing": sorted(expected - actual),
+        "extra": sorted(actual - expected),
+    }

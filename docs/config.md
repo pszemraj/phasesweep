@@ -12,7 +12,15 @@ artifacts. A top-level `suite` is rejected: write each component as its own
 complete experiment YAML file and review its defaults explicitly.
 
 Field types, defaults, and validation constraints are in
-[config_reference.yaml](config_reference.yaml).
+[config_reference.yaml](config_reference.yaml). It is a signature reference,
+not runnable YAML; start with [example.yaml](../examples/example.yaml) for
+one local CPU toy-trainer attempt. Both CLI commands take an explicit config
+path. YAML values override built-in defaults; CLI execution flags and ambient
+environment do not form a general config-key overlay. Config is read once per
+invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal
+and `execution.cwd` paths resolve against the invocation directory, rather
+than the YAML file. MCP's separate catalog and detached-launch path rules are
+documented in the [operator reference](mcp.md#the-catalog).
 
 ## Experiment YAML
 
@@ -169,9 +177,31 @@ Grid and seeded random phases support ordinary local continuation.
 `allow_incomplete_on_timeout` control how failures and partial work are
 handled. They do not create an alternate winner.
 
+Winner ties use the lowest trial number. Built-in confound verdicts are
+advisory: `evaluation_point` flags a ranked objective more than 1% short of the
+furthest reported progress, `survivorship` flags when failed plus pruned
+trials are at least as numerous as ranked trials (infeasible trials are only
+counted), and `tie` flags exact ties between different sampled configurations.
+`n/a` means not checked, for example when objectives have no usable progress
+position or only one trial was ranked. These verdicts never block publication
+and have no YAML switches or threshold settings.
+
+Persistent trial targets cannot decrease. For resumable samplers, a larger
+`n_trials` explicitly schedules additional attempts after a durable abort or
+accepted partial timeout. Raising only `max_consecutive_failures` does not
+undo a recorded abort. Repeating an accepted partial target replays that
+decision without filling unused slots, and still requires
+`allow_incomplete_on_timeout: true`.
+
 `timeout_seconds_per_trial` defaults to 259200 (72 hours) and stops any trial
 still running then. Set it above the longest trial you expect. `null`, no
 limit, also needs `allow_unbounded_trials: true`.
+This timeout covers supervised launch and execution after GPU acquisition,
+including supervisor startup, rather than the queue for a GPU or post-trainer
+evidence. Phase/run budgets cover those stages too. Cleanup can extend beyond
+a deadline. Unlike phase/run budgets,
+the per-trial timeout participates in semantic study identity; changing it
+cannot reuse a populated phase.
 
 ## Trainer inputs
 
@@ -320,9 +350,11 @@ differences leave the position unavailable. This accommodates observed API
 numeric differences; it cannot establish whether a summary was assigned
 independently, and never changes the accepted scalar.
 
-The primary objective, W&B constraints, and each phase's W&B gates must agree
-on normalized endpoint, entity, project, poll interval, and timeout. They share
-one finished-summary capture. Only requested numeric values and gate-presence
+Within a phase, the primary objective, W&B constraints, and that phase's W&B
+gates must agree on normalized endpoint, entity, project, poll interval, and
+timeout. They share one finished-summary capture. When the objective and
+constraints are local, separate gate-only phases may use different W&B
+targets. Only requested numeric values and gate-presence
 evidence are saved. A gate-only configuration accepts the first finished
 summary and fails if required keys are missing. Failed, crashed, killed, or
 preempted remote runs cannot win.
@@ -358,8 +390,19 @@ attempt identity, evidence-path, trainer-input, and GPU variables. Use
 `execution.passthrough_env` for rotating credentials or transport settings.
 Top-level `env` values remain semantic configuration.
 
+GPU pool discovery uses explicit phase `gpu_ids`/`gpu_devices`, then top-level
+`env.CUDA_VISIBLE_DEVICES`, then the controller's ambient value, then local
+inventory. Discovery reads ambient visibility even when `inherit_env` excludes
+it. The default `single_per_trial` policy rebinds a leased device token, or
+preserves an empty/`-1` CUDA-disable sentinel, in each trainer. `gpu_policy:
+none` assigns no binding; include ambient visibility in the trainer inheritance
+contract or set it in `env` if it must be retained. See the reference for
+parallel opt-ins and whole-node requirements.
+
 When no W&B evidence consumer is configured, trainer-owned `WANDB_*` settings
-are preserved unchanged.
+are preserved except for an ambient/inherited `WANDB_RUN_ID`, which is removed.
+An ID explicitly configured in top-level `env.WANDB_RUN_ID` remains
+trainer-owned in this case.
 
 For a trainer that chooses the optional envelope contract:
 
