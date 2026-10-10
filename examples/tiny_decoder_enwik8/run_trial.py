@@ -140,11 +140,11 @@ def _evaluate_final_checkpoint(template_root: Path, trainer_run_dir: Path) -> di
     }
 
 
-def _write_result(
+def _validate_final_evaluation(
     config_sha256: str,
     metric_record: Mapping[str, Any],
 ) -> None:
-    """Write an attempt-scoped final-checkpoint result artifact."""
+    """Reject a final evaluation that is malformed or from another attempt's config."""
     val_loss = metric_record.get("val_loss")
     if (
         isinstance(val_loss, bool)
@@ -168,14 +168,17 @@ def _write_result(
     if not expected_config_sha256 or config_sha256 != expected_config_sha256:
         raise ValueError("Trainer config does not match this PhaseSweep attempt")
 
+
+def _write_result(metric_record: Mapping[str, Any]) -> None:
+    """Write an attempt-scoped final-checkpoint result artifact."""
     report_objective(
-        float(val_loss),
+        float(metric_record["val_loss"]),
         name="val_loss",
         split="validation",
         policy="final_checkpoint",
         checkpoint="final.pt",
-        step=step,
-        extra={"runtime": {"device_type": device_type}},
+        step=metric_record["step"],
+        extra={"runtime": {"device_type": metric_record["device_type"]}},
     )
 
 
@@ -246,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
 
         _run_template(template_root, config_path)
         metric_record = _evaluate_final_checkpoint(template_root, trainer_run_dir)
+        _validate_final_evaluation(config_sha256, metric_record)
         if args.mlflow:
             mlflow.log_metrics(
                 {
@@ -263,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
         else:
-            _write_result(config_sha256, metric_record)
+            _write_result(metric_record)
     return 0
 
 

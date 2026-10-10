@@ -163,6 +163,9 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
             "checkpoint": "final.pt",
         },
     )
+    monkeypatch.setenv(
+        "PHASESWEEP_OVERRIDES_SHA256", hashlib.sha256(config_path.read_bytes()).hexdigest()
+    )
     # Native mode has no JSON-envelope destination supplied by the controller.
     monkeypatch.delenv("PHASESWEEP_OBJECTIVE_PATH", raising=False)
     args = ["--config", str(config_path), "--mlflow"]
@@ -190,28 +193,50 @@ def test_wrapper_logs_native_mlflow_checkpoint_in_both_modes(
     assert observed["active"] is False
 
 
-def test_wrapper_rejects_a_config_from_another_attempt(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("mlflow_mode", [False, True])
+def test_wrapper_rejects_a_config_from_another_attempt(tmp_path, monkeypatch, mlflow_mode) -> None:
+    """Neither reporting mode publishes an evaluation of another attempt's config."""
     wrapper = _load_wrapper()
     trial_dir = tmp_path / "trial"
     trial_dir.mkdir()
+    config_path = trial_dir / "trainer_config.yaml"
+    config_path.write_text(yaml.safe_dump({"run_dir": str(trial_dir / "trainer")}))
+    scored: list[str] = []
 
+    @contextmanager
+    def start_run(*, run_id: str | None) -> Iterator[SimpleNamespace]:
+        yield SimpleNamespace(info=SimpleNamespace(run_id=run_id))
+
+    sdk = SimpleNamespace(
+        start_run=start_run,
+        log_params=lambda _params: None,
+        log_metrics=lambda *_args, **_kwargs: scored.append("metrics"),
+        set_tags=lambda _tags: scored.append("tags"),
+    )
+    monkeypatch.setitem(sys.modules, "mlflow", sdk)
+    monkeypatch.setenv("MLFLOW_RUN_ID", "managed-run")
+    monkeypatch.setattr(wrapper, "_run_template", lambda *_args: None)
+    monkeypatch.setattr(
+        wrapper,
+        "_evaluate_final_checkpoint",
+        lambda *_args: {
+            "checkpoint": "final.pt",
+            "device_type": "cuda",
+            "policy": "final_checkpoint",
+            "step": 1000,
+            "val_loss": 0.25,
+        },
+    )
     monkeypatch.setenv("PHASESWEEP_GENERATION_ID", "generation-test")
     monkeypatch.setenv("PHASESWEEP_ATTEMPT_ID", "attempt-test")
-    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", "expected")
+    monkeypatch.setenv("PHASESWEEP_OVERRIDES_SHA256", "different")
     monkeypatch.setenv("PHASESWEEP_OBJECTIVE_PATH", str(trial_dir / "result.json"))
 
+    args = ["--config", str(config_path)]
     with pytest.raises(ValueError, match="Trainer config does not match"):
-        wrapper._write_result(
-            "different",
-            {
-                "checkpoint": "final.pt",
-                "device_type": "cuda",
-                "policy": "final_checkpoint",
-                "step": 1000,
-                "val_loss": 0.25,
-            },
-        )
+        wrapper.main([*args, "--mlflow"] if mlflow_mode else args)
 
+    assert scored == []
     assert not (trial_dir / "result.json").exists()
 
 
