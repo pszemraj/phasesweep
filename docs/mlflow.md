@@ -60,7 +60,7 @@ with mlflow.start_run(run_id=os.environ["MLFLOW_RUN_ID"]):
     mlflow.log_metric("eval/loss", 0.42, step=100)
 ```
 
-PhaseSweep can finish a still-running managed run after successful trainer exit and confirmed process cleanup. A FAILED or KILLED run is never converted into accepted evidence. Every creation request first searches the exact generation and attempt identity tags and binds a run it finds, so a retry after a lost response does not create a second run; it creates one only when the search finds none.
+PhaseSweep finishes a still-running managed run after confirmed process cleanup: FINISHED after successful trainer exit, FAILED after a failed trial, or KILLED after a pruned one. A run that is already terminal keeps its status, and its `phasesweep.outcome` tag records a later trial failure. A FAILED or KILLED run is never converted into accepted evidence. Every creation request first searches the exact generation and attempt identity tags and binds a run it finds, so a retry after a lost response does not create a second run; it creates one only when the search finds none.
 
 In **trainer** mode, your existing logger creates and finishes the run. Bind that exact run once it exists:
 
@@ -158,7 +158,7 @@ phasesweep sync-tracking examples/mlflow.yaml
 
 This requires the original target configuration and retries every generation's pending projections; `--generation GENERATION_ID` limits it to one generation, which for an MCP run is its run ID. It does not train, select metrics again, or rewrite scientific evidence. Already delivered projections are skipped. The command exits nonzero if uploads remain pending. Tracking-only worker recovery uses the active-work registry without changing Optuna trials.
 
-After confirmed cleanup of a failed invocation, PhaseSweep queues a terminal projection for its own generation-summary run: FAILED for ordinary failure, or KILLED for shutdown or keyboard interruption. Upload failures leave this projection pending for `sync-tracking`; the remote summary can remain RUNNING until delivery succeeds. This does not change attempt-run status, accepted scores, or committed winners. A conflicting remote terminal status is never overwritten.
+After confirmed cleanup of a failed invocation, PhaseSweep queues terminal projections for its generation-summary run and for every managed attempt run whose trial outcome was not yet recorded: FAILED for ordinary failure, or KILLED for shutdown or keyboard interruption. Upload failures leave these projections pending for `sync-tracking`; those runs can remain RUNNING until delivery succeeds. This does not change accepted scores or committed winners. A remote terminal status is never overwritten.
 
 Abrupt controller death, uncertain cleanup, or an unresolved generation binding can still leave no terminal projection. These require operator inspection and, where indicated, [MCP recovery](mcp.md#run-state-and-recovery) before further action. `sync-tracking` retries saved projections; it does not manufacture a missing terminal record.
 

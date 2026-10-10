@@ -258,9 +258,11 @@ def test_failed_trainer_http_summary_delivery_and_sync(local_server, tmp_path, m
     assert before["finish"] == "FAILED"
     assert before["state"] == ("delivered" if outage == "none" else "pending")
     monkeypatch.setattr(publication, "call_tracking", actual_call)
-    assert sync_tracking(experiment, generation) == {"pending": 0, "delivered": 1}
+    assert sync_tracking(experiment, generation) == {"pending": 0, "delivered": 2}
     assert read_record(record_path)["projection"] == before["projection"]
     assert client.get_run(summaries[0].info.run_id).info.status == "FAILED"
+    attempt = client.get_run(attempts[0].info.run_id)
+    assert (attempt.info.status, attempt.data.tags["phasesweep.outcome"]) == ("FAILED", "FAILED")
     assert "phasesweep/summary.json" in [
         a.path for a in client.list_artifacts(summaries[0].info.run_id, "phasesweep")
     ]

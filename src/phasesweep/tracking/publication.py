@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.tracking.session import (
+    BINDING_FILE,
     call_tracking,
     read_binding,
     read_record,
@@ -105,7 +106,7 @@ def _enqueue(
     :param dict[str, Any] binding: Verified target run.
     :param dict[str, Any] projection: Frozen upload payload.
     :param Mapping[str, str] environment: Composed credentials and transport.
-    :param str | None finish: Optional generation-summary terminal status.
+    :param str | None finish: Terminal status for a still-running managed run.
     """
     assert experiment.mlflow is not None
     path = tracking_root(experiment) / generation_id / "delivery" / f"{name}.json"
@@ -193,6 +194,71 @@ def publish_trial(
     )
 
 
+def _finish_attempt(
+    experiment: Experiment,
+    generation_id: str,
+    binding: dict[str, Any],
+    status: str,
+    environment: Mapping[str, str],
+) -> None:
+    """Queue the end of a managed attempt run that produced no accepted result.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Producing generation.
+    :param dict[str, Any] binding: The attempt's managed run binding.
+    :param str status: Terminal MLflow status for a still-running run.
+    :param Mapping[str, str] environment: Composed authentication environment.
+    """
+    _enqueue(
+        experiment,
+        generation_id,
+        f"attempt-{binding['attempt_id']}",
+        binding,
+        _projection(
+            metrics={},
+            params={},
+            tags={"phasesweep.outcome": status},
+            summary={
+                "phase": binding["phase"],
+                "attempt_id": binding["attempt_id"],
+                "status": status,
+            },
+        ),
+        environment,
+        finish=status,
+    )
+
+
+def publish_unaccepted_trial(
+    experiment: Experiment,
+    generation_id: str,
+    trial: FrozenTrial,
+    environment: Mapping[str, str],
+) -> None:
+    """Finish the managed run of a failed or pruned trial after confirmed cleanup.
+
+    No evidence capture ran to finish that run, so it would otherwise stay
+    RUNNING. Trainer-owned runs and attempts that never created a run are
+    left alone.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Producing generation.
+    :param FrozenTrial trial: Locally terminal FAIL or PRUNED trial.
+    :param Mapping[str, str] environment: Composed authentication environment.
+    """
+    from optuna.trial import TrialState
+
+    from phasesweep.engine.state import TRIAL_DIR_ATTR
+
+    directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
+    if not isinstance(directory, str) or not (Path(directory) / BINDING_FILE).is_file():
+        return
+    binding = read_binding(Path(directory))
+    if binding["run_mode"] == "managed":
+        status = "KILLED" if trial.state == TrialState.PRUNED else "FAILED"
+        _finish_attempt(experiment, generation_id, binding, status, environment)
+
+
 def publish_generation(
     experiment: Experiment, generation_id: str, winners: dict[str, Winner]
 ) -> None:
@@ -261,13 +327,16 @@ def publish_generation(
 def publish_failed_generation(
     experiment: Experiment, generation_id: str, error: BaseException
 ) -> None:
-    """Mirror a failed invocation only after the engine confirms process cleanup.
+    """Finish a failed invocation's owned runs only after the engine confirms cleanup.
+
+    Covers the generation summary and every managed attempt run whose trial
+    outcome was never recorded.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Failed invocation identity.
     :param BaseException error: Authoritative engine failure, without its private message.
     """
-    from phasesweep.engine.paths import _last_successful_generation_path
+    from phasesweep.engine.paths import _experiment_dir, _last_successful_generation_path
     from phasesweep.engine.publication_validation import _read_pointer_target
     from phasesweep.engine.trial import _trainer_environment
     from phasesweep.runtime.shutdown import PhaseSweepShutdown
@@ -283,6 +352,18 @@ def publish_failed_generation(
     if target is not None and target.generation_id == generation_id:
         return
     status = "KILLED" if isinstance(error, (PhaseSweepShutdown, KeyboardInterrupt)) else "FAILED"
+    environment = _trainer_environment(experiment, experiment.phases[0].name)
+    # Attempts interrupted before their post-trial callback still own running
+    # runs. Trial directories are named by _trial_dir_for.
+    delivery = tracking_root(experiment) / generation_id / "delivery"
+    pattern = f"*/trial_*__generation_{generation_id}__attempt_*/{BINDING_FILE}"
+    for path in sorted(_experiment_dir(experiment).glob(pattern)):
+        binding = read_binding(path.parent)
+        if (
+            binding["run_mode"] == "managed"
+            and not (delivery / f"attempt-{binding['attempt_id']}.json").exists()
+        ):
+            _finish_attempt(experiment, generation_id, binding, status, environment)
     _enqueue(
         experiment,
         generation_id,
@@ -298,7 +379,7 @@ def publish_failed_generation(
                 "error_class": type(error).__name__,
             },
         ),
-        _trainer_environment(experiment, experiment.phases[0].name),
+        environment,
         finish=status,
     )
 

@@ -1165,7 +1165,7 @@ def _after_trial(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
 ) -> None:
-    """Retire cleaned attempts, mirror accepted MLflow results, and snapshot CSV.
+    """Retire cleaned attempts, mirror MLflow outcomes, and snapshot CSV.
 
     The threshold decision itself lives in ``_record_outcome``, inside the
     objective's completion-order critical section — a callback observing a
@@ -1204,6 +1204,12 @@ def _after_trial(
             trial,
             run.environment_identity.values,
             run.inherited_winners,
+        )
+    elif run.experiment.mlflow is not None and not _trial_requires_cleanup_recovery(trial):
+        from phasesweep.tracking.publication import publish_unaccepted_trial
+
+        publish_unaccepted_trial(
+            run.experiment, run.generation_id, trial, run.environment_identity.values
         )
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     now = time.monotonic()

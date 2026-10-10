@@ -2,75 +2,110 @@
 
 from __future__ import annotations
 
+import shlex
 import signal
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from phasesweep.engine import run_experiment
+from phasesweep.engine import NoFeasibleTrialError, run_experiment
+from phasesweep.engine.paths import _trial_dir_for
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.tracking import publication
 from phasesweep.tracking.mlflow import _publish
-from phasesweep.tracking.session import read_record, tracking_root, write_record
+from phasesweep.tracking.session import BINDING_FILE, read_record, tracking_root, write_record
 from tests.test_mlflow import _binding, _run, native_experiment
 
 
-@pytest.mark.parametrize("status", ["FINISHED", "FAILED", "KILLED"])
-def test_terminal_acknowledgment_retry_does_not_reterminate(status):
-    """A lost terminal response retries artifacts without reopening or changing status."""
+@pytest.mark.parametrize("requested", ["FINISHED", "FAILED", "KILLED"])
+@pytest.mark.parametrize("actual", ["RUNNING", "FINISHED", "FAILED", "KILLED"])
+def test_publish_finishes_only_a_running_owned_run(actual, requested):
+    """A terminal run keeps its status, so a retry or later outcome never rewrites it."""
     pytest.importorskip("mlflow")
-    binding = {**_binding(), "phase": "generation"}
-    uploaded = []
+    binding = _binding()
+    calls = []
     client = SimpleNamespace(
-        get_run=lambda _: _run(binding, status=status),
-        log_batch=lambda *args, **kwargs: uploaded.append("batch"),
-        log_artifact=lambda *args, **kwargs: uploaded.append("artifact"),
-        set_terminated=lambda *args, **kwargs: pytest.fail("Already terminal"),
+        get_run=lambda _: _run(binding, status=actual),
+        log_batch=lambda *args, **kwargs: calls.append("batch"),
+        log_artifact=lambda *args, **kwargs: calls.append("artifact"),
+        set_terminated=lambda run_id, status: calls.append(status),
     )
     _publish(
         client,
         {
             "binding": binding,
             "projection": publication._projection(metrics={}, params={}, tags={}, summary={}),
-            "finish": status,
+            "finish": requested,
         },
     )
-    assert uploaded == ["batch", "artifact"]
+    assert calls == ["batch", "artifact", *([requested] if actual == "RUNNING" else [])]
 
 
-@pytest.mark.parametrize(
-    "actual,requested",
-    [
-        ("FAILED", "FINISHED"),
-        ("KILLED", "FINISHED"),
-        ("FAILED", "KILLED"),
-        ("KILLED", "FAILED"),
-        ("FINISHED", "FAILED"),
-        ("FINISHED", "KILLED"),
-    ],
-)
-def test_conflicting_terminal_status_never_uploads_or_changes(actual, requested):
-    """A retry cannot rewrite another terminal outcome or publish its artifact."""
+def test_trainer_owned_run_is_never_terminated():
     pytest.importorskip("mlflow")
-    binding = {**_binding(), "phase": "generation"}
-    client = SimpleNamespace(get_run=lambda _: _run(binding, status=actual))
-    with pytest.raises(ValueError, match="different terminal status"):
-        _publish(client, {"binding": binding, "projection": {}, "finish": requested})
-
-
-@pytest.mark.parametrize(
-    "binding",
-    [
-        _binding(),
-        {**_binding(), "phase": "generation", "run_mode": "trainer"},
-    ],
-)
-def test_failure_delivery_cannot_terminate_attempt_or_trainer_owned_run(binding):
-    pytest.importorskip("mlflow")
+    binding = {**_binding(), "run_mode": "trainer"}
     client = SimpleNamespace(get_run=lambda _: _run(binding, status="RUNNING"))
-    with pytest.raises(ValueError, match="Only PhaseSweep-owned"):
+    with pytest.raises(ValueError, match="Only runs PhaseSweep created"):
         _publish(client, {"binding": binding, "projection": {}, "finish": "FAILED"})
+
+
+def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
+    """A trial that never reaches evidence capture still ends its RUNNING run."""
+    experiment = native_experiment(tmp_path).model_copy(
+        update={
+            "trial_command": shlex.join([sys.executable, "-c", "raise SystemExit(1)"])
+            + " {config_path}"
+        }
+    )
+
+    def prepare(experiment, *, phase, generation_id, attempt_id, directory, **kwargs):
+        binding = {
+            **_binding(),
+            "phase": phase,
+            "generation_id": generation_id,
+            "attempt_id": attempt_id,
+        }
+        write_record(directory / "mlflow-expected.json", binding)
+        write_record(directory / BINDING_FILE, binding)
+        return binding
+
+    requests = []
+    monkeypatch.setattr("phasesweep.tracking.session.prepare_attempt", prepare)
+    monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+    assert requests and {r["finish"] for r in requests} == {"FAILED"}
+    assert {r["binding"]["phase"] for r in requests} == {"depth"}
+
+
+def test_failed_generation_finishes_unrecorded_attempt_runs(tmp_path, monkeypatch):
+    """Attempts interrupted before their trial callback are finished with the generation."""
+    experiment = native_experiment(tmp_path)
+    generation = "a" * 32
+    write_record(
+        tracking_root(experiment) / generation / "generation-binding.json",
+        {**_binding(), "phase": "generation", "attempt_id": generation},
+    )
+    for attempt, mode in [("1" * 32, "managed"), ("2" * 32, "managed"), ("3" * 32, "trainer")]:
+        directory = _trial_dir_for(
+            experiment, "depth", 0, generation_id=generation, attempt_id=attempt
+        )
+        write_record(
+            directory / BINDING_FILE, {**_binding(), "attempt_id": attempt, "run_mode": mode}
+        )
+    write_record(
+        tracking_root(experiment) / generation / "delivery" / f"attempt-{'2' * 32}.json",
+        {"schema_version": 1, "generation_id": generation, "state": "delivered"},
+    )
+    requests = []
+    monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
+    publication.publish_failed_generation(experiment, generation, KeyboardInterrupt())
+    assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [
+        ("1" * 32, "KILLED"),
+        (generation, "KILLED"),
+    ]
 
 
 def _fail_engine(tmp_path, monkeypatch, error):
