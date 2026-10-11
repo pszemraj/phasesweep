@@ -1030,12 +1030,9 @@ def test_operator_recovery_accepts_a_resolved_tracking_operation_as_evidence(
     mark_current_format(experiment)
     stamp_artifact_root(_new_phase_study(experiment, experiment.phases[0].name), experiment)
     handle = stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
-    write_run_status(
+    write_unsafe_cleanup_status(
         store,
         run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
         result_snapshot_state="complete",
         result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
     )

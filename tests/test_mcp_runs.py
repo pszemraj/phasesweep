@@ -25,7 +25,12 @@ from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_writ
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
 from tests.ledger_fixtures import tree_snapshot
-from tests.mcp_helpers import live_runs, make_run_handle, write_run_status
+from tests.mcp_helpers import (
+    live_runs,
+    make_run_handle,
+    write_run_status,
+    write_unsafe_cleanup_status,
+)
 
 
 def _earlier_boot_id() -> str:
@@ -1179,13 +1184,7 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
         if first_read:
             first_read = False
             with store.transition_lock(handle):
-                write_run_status(
-                    store,
-                    handle.run_id,
-                    returncode=1,
-                    error_class="UnsafeProcessCleanupError",
-                    cleanup_confirmed=False,
-                )
+                write_unsafe_cleanup_status(store, handle.run_id)
                 private_atomic_write_text(
                     store.cleanup_recovery_path(handle.run_id),
                     json.dumps(
@@ -1452,13 +1451,7 @@ def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
         boot_id=_earlier_boot_id(),
     )
     store.create(handle)
-    write_run_status(
-        store,
-        "exp-1",
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, "exp-1")
 
     assert store.state(handle) == "failed"
     assert store.cleanup_recovery_required(handle)
@@ -1517,13 +1510,7 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
         starttime=111,
     )
     store.create(handle)
-    write_run_status(
-        store,
-        "exp-1",
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, "exp-1")
 
     assert store.state(handle) == "running"
     assert live_runs(store) == [handle]
@@ -1554,13 +1541,7 @@ def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> Non
         starttime=111,
     )
     store.create(handle)
-    write_run_status(
-        store,
-        "exp-1",
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, "exp-1")
     private_atomic_write_text(
         store.cleanup_recovery_path("exp-1"),
         json.dumps(
@@ -1589,13 +1570,7 @@ def test_cleanup_recovery_rejects_malformed_reaped_attempt_ids(
         starttime=111,
     )
     store.create(handle)
-    write_run_status(
-        store,
-        handle.run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, handle.run_id)
     private_atomic_write_text(
         store.cleanup_recovery_path(handle.run_id),
         json.dumps(
@@ -1623,13 +1598,7 @@ def test_cleanup_recovery_rejects_missing_reaped_fields(tmp_path: Path) -> None:
         starttime=111,
     )
     store.create(handle)
-    write_run_status(
-        store,
-        handle.run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, handle.run_id)
     private_atomic_write_text(
         store.cleanup_recovery_path(handle.run_id),
         json.dumps(
@@ -1651,12 +1620,9 @@ def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
 ) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64)
-    write_run_status(
+    write_unsafe_cleanup_status(
         store,
         handle.run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
         recovered_attempt_ids=["runner-match", "runner-other"],
         recovered_attempt_generations={
             "runner-match": handle.run_id,
@@ -1694,12 +1660,9 @@ def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
 
     # Optional runner evidence may be persisted as null by a partial writer;
     # the operator record remains independently usable.
-    write_run_status(
+    write_unsafe_cleanup_status(
         store,
         handle.run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
         recovered_attempt_ids=None,
         recovered_attempt_generations={"runner-match": handle.run_id},
     )
