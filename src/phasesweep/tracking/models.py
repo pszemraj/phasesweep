@@ -33,8 +33,13 @@ class MlflowSettings(_Frozen):
             return value
         parsed = urlsplit(value)
         if parsed.scheme == "databricks":
-            if parsed.netloc and not any(
-                (parsed.path, parsed.query, parsed.fragment, parsed.username, parsed.password)
+            # MLflow rejects whitespace in profile names at the first request.
+            if (
+                parsed.netloc
+                and not any(c.isspace() for c in parsed.netloc)
+                and not any(
+                    (parsed.path, parsed.query, parsed.fragment, parsed.username, parsed.password)
+                )
             ):
                 return value
         elif (
@@ -46,7 +51,7 @@ class MlflowSettings(_Frozen):
                 (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
             )
         raise ValueError(
-            "MLflow tracking_uri requires HTTP(S), databricks, or databricks://profile without embedded credentials, query, or fragment."
+            "MLflow tracking_uri requires HTTP(S), databricks, or databricks://profile (no spaces in the profile name) without embedded credentials, query, or fragment."
         )
 
     @model_validator(mode="after")

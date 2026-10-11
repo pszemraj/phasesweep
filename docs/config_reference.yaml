@@ -621,7 +621,7 @@ constraints: list[object] = []
 # Requires: the controller must have the MLflow extra installed, the target experiment must already exist and credentials must reach both controller and trainer; validate/dry-run do not verify authentication or experiment existence.
 # Result projections are queued automatically for accepted trials and generation summaries. A failed upload leaves pending delivery without invalidating accepted scientific results; phasesweep sync-tracking CONFIG retries every generation's saved projections (--generation ID limits it to one) without training or rereading metrics. No YAML publishing/retry switch is provided.
 mlflow: object | null = null
-  # Existing tracking server target: HTTP(S) URL, databricks or databricks://profile. HTTP scheme/host are lowercased and trailing path slashes stripped; embedded credentials, query and fragment are rejected. Local file/sqlite tracking URIs are unsupported.
+  # Existing tracking server target: HTTP(S) URL, databricks or databricks://profile. HTTP scheme/host are lowercased and trailing path slashes stripped; embedded credentials, query, fragment and profile names containing spaces are rejected. Local file/sqlite tracking URIs are unsupported.
   # Requires: experiment_id or experiment_name selects exactly one existing active experiment at this target; the controller verifies it before trial launch.
   # env.MLFLOW_TRACKING_URI must match this value if explicitly configured; use credential environment variables instead of URL credentials.
   tracking_uri: string (required)

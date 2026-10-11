@@ -71,8 +71,20 @@ def test_invalid_history(history):
         select_observation(history, spec())
 
 
-@pytest.mark.parametrize("uri", ["databricks", "databricks://WorkProfile", "http://localhost:5000"])
-def test_native_target_spelling(uri):
+@pytest.mark.parametrize(
+    "uri,accepted",
+    [
+        ("databricks", True),
+        ("databricks://WorkProfile", True),
+        ("http://localhost:5000", True),
+        ("databricks://Work Profile", False),
+    ],
+)
+def test_native_target_spelling(uri, accepted):
+    if not accepted:
+        with pytest.raises(ValidationError, match="no spaces in the profile name"):
+            MlflowSettings(tracking_uri=uri, experiment_name="existing")
+        return
     assert MlflowSettings(tracking_uri=uri, experiment_name="existing").tracking_uri == uri
 
 
