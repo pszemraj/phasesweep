@@ -56,7 +56,7 @@ from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE, _process_group_alive, read_boot_id
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
@@ -77,6 +77,7 @@ from tests.mcp_helpers import (
     live_runs,
     make_mcp_app,
     make_run_handle,
+    run_claimed_runner,
     runner_argv,
     runner_main,
     slow_mcp_config_text,
@@ -415,27 +416,8 @@ def test_missing_published_study_is_an_operator_preflight_failure(
 
     store = RunStore(tmp_path / "state")
     run_id = "missing-published-study"
-    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-        experiment_id="t",
-    )
     with pytest.raises(PublishedStudyMissingError):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config_path,
-                config_sha256=config_sha256,
-                experiment_id="t",
-                started_at=started_at,
-            ),
-            cwd=tmp_path,
-        )
+        run_claimed_runner(store, run_id, config_path, experiment_id="t", cwd=tmp_path)
 
     status = json.loads(store.status_path(run_id).read_text())
     assert status["failure"] == {
@@ -664,31 +646,12 @@ def test_external_engine_lock_is_retryable_and_freezes_pre_generation_snapshot(
     store = RunStore(tmp_path / "state")
     run_id = "lock-busy"
     status_path = store.status_path(run_id)
-    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-        experiment_id="cancel_me",
-    )
 
     with (
         _experiment_lock(experiment),
         pytest.raises(ExperimentLockBusyError),
     ):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config_path,
-                config_sha256=config_sha256,
-                experiment_id="cancel_me",
-                started_at=started_at,
-            ),
-            cwd=tmp_path,
-        )
+        run_claimed_runner(store, run_id, config_path, experiment_id="cancel_me", cwd=tmp_path)
 
     status = json.loads(status_path.read_text())
     assert status["failure"]["code"] == "experiment_busy"
@@ -1192,32 +1155,15 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
 
     store = RunStore(tmp_path / "state")
     run_id = "record-fail-run"
-    started_at = utc_now_iso()
-    store.create(
-        RunHandle(
-            run_id=run_id,
-            experiment_id="record_fail",
-            config_sha256=config_sha256,
-            pid=None,
-            pgid=None,
-            pid_starttime=None,
-            started_at=started_at,
-            visible_params_at_launch="none",
-            launch_state="launching",
-        )
-    )
     status_path = store.status_path(run_id)
 
     assert (
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config_path,
-                config_sha256=config_sha256,
-                experiment_id="record_fail",
-                started_at=started_at,
-            ),
+        run_claimed_runner(
+            store,
+            run_id,
+            config_path,
+            experiment_id="record_fail",
+            config_sha256=config_sha256,
             cwd=tmp_path,
         )
         == 0
@@ -1272,25 +1218,14 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
 
     store = RunStore(tmp_path / "state")
     run_id = "capture-cancel"
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-        experiment_id="cancel_at_capture",
-    )
 
     with pytest.raises(PhaseSweepShutdown) as exc_info:
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config_path,
-                config_sha256=config_sha256,
-                experiment_id="cancel_at_capture",
-                started_at=started_at,
-            ),
+        run_claimed_runner(
+            store,
+            run_id,
+            config_path,
+            experiment_id="cancel_at_capture",
+            config_sha256=config_sha256,
             cwd=tmp_path,
         )
 
@@ -1853,28 +1788,17 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
 
     store = RunStore(tmp_path / "state")
     run_id = "no-status-run"
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-        experiment_id="no_status",
-    )
 
     with (
         caplog.at_level(logging.ERROR, logger="phasesweep.mcp.runner"),
         pytest.raises(OSError, match="simulated persistent status write failure"),
     ):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config_path,
-                config_sha256=config_sha256,
-                experiment_id="no_status",
-                started_at=started_at,
-            ),
+        run_claimed_runner(
+            store,
+            run_id,
+            config_path,
+            experiment_id="no_status",
+            config_sha256=config_sha256,
             cwd=tmp_path,
         )
 
@@ -2217,25 +2141,14 @@ def test_runner_persists_identity_even_when_the_project_directory_is_gone(
     ``launching`` handle that only operator recovery could retire.
     """
     store = RunStore(tmp_path / "state")
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
-        run_id="r-nocwd",
-        config_sha256="a" * 64,
-        started_at=started_at,
-        experiment_id="cancel_me",
-    )
 
     with pytest.raises(FileNotFoundError):
-        runner_main(
-            runner_argv(
-                store,
-                run_id="r-nocwd",
-                config=tmp_path / "unread.yaml",
-                config_sha256="a" * 64,
-                experiment_id="cancel_me",
-                started_at=started_at,
-            ),
+        run_claimed_runner(
+            store,
+            "r-nocwd",
+            tmp_path / "unread.yaml",
+            experiment_id="cancel_me",
+            config_sha256="a" * 64,
             cwd=tmp_path / "does-not-exist",
         )
 

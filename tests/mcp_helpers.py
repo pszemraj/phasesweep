@@ -325,6 +325,51 @@ def runner_argv(
     )
 
 
+def run_claimed_runner(
+    store: RunStore,
+    run_id: str,
+    config: Path,
+    *,
+    experiment_id: str = "srv",
+    config_sha256: str | None = None,
+    started_at: str | None = None,
+    cwd: Path | None = None,
+) -> int:
+    """Claim a launch reservation for ``config`` and run the detached runner on it in-process.
+
+    :param RunStore store: Run store receiving the reservation and the terminal status.
+    :param str run_id: Run identifier to claim.
+    :param Path config: Configuration the runner loads as its snapshot.
+    :param str experiment_id: Catalog experiment identifier.
+    :param str | None config_sha256: Digest the runner must see, or the digest of ``config`` when ``None``.
+    :param str | None started_at: Claimed launch timestamp, or the current time when ``None``.
+    :param Path | None cwd: Runner working directory, or the current directory.
+    :return int: Runner process exit code.
+    """
+    if config_sha256 is None:
+        config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    if started_at is None:
+        started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+        experiment_id=experiment_id,
+    )
+    return runner_main(
+        runner_argv(
+            store,
+            run_id=run_id,
+            config=config,
+            config_sha256=config_sha256,
+            experiment_id=experiment_id,
+            started_at=started_at,
+        ),
+        cwd=cwd,
+    )
+
+
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     full_payload = {"run_id": run_id, "cleanup_confirmed": True, **payload}
     write_status_file(store.status_path(run_id), full_payload)

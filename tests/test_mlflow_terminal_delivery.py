@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shlex
 import signal
@@ -336,27 +335,15 @@ def test_mirror_failure_after_publication_keeps_the_result(tmp_path, monkeypatch
 def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, monkeypatch, failure):
     """A detached run records success; an unresolved upload worker also needs recovery."""
     from phasesweep.mcp.runs import RunStore
-    from phasesweep.runtime.time import utc_now_iso
-    from tests.mcp_helpers import claim_runner_handle, runner_argv, runner_main
+    from tests.mcp_helpers import run_claimed_runner
 
     config, _uploads = _remote_example(tmp_path, monkeypatch)
     _fail_mirror(monkeypatch, failure)
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text(yaml.safe_dump(config))
-    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
     store = RunStore(tmp_path / "state")
     run_id = "mirror-" + "a" * 32
-    started_at = utc_now_iso()
-    claim_runner_handle(store, run_id=run_id, config_sha256=config_sha256, started_at=started_at)
-    argv = runner_argv(
-        store,
-        run_id=run_id,
-        config=config_path,
-        config_sha256=config_sha256,
-        experiment_id="srv",
-        started_at=started_at,
-    )
-    assert runner_main(argv, cwd=tmp_path) == 0
+    assert run_claimed_runner(store, run_id, config_path, cwd=tmp_path) == 0
 
     status = json.loads(store.status_path(run_id).read_text())
     assert status["returncode"] == 0

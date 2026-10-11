@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import replace
@@ -71,13 +70,11 @@ from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     _catalog,
     _config,
-    claim_runner_handle,
     live_runs,
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
-    runner_argv,
-    runner_main,
+    run_claimed_runner,
     stage_dead_run,
     write_run_status,
     write_unsafe_cleanup_status,
@@ -372,14 +369,6 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     store = RunStore(tmp_path / "state")
     run_id = "r1"
     status_path = store.status_path(run_id)
-    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    started_at = "2026-06-24T00:00:00Z"
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-    )
 
     def raise_cleanup_uncertain(*args: object, **kwargs: object) -> None:
         raise UnsafeProcessCleanupError("trial cleanup uncertain")
@@ -387,16 +376,7 @@ def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
     monkeypatch.setattr("phasesweep.mcp.runner.run_experiment", raise_cleanup_uncertain)
 
     with pytest.raises(UnsafeProcessCleanupError, match="trial cleanup uncertain"):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config,
-                config_sha256=config_sha256,
-                experiment_id="srv",
-                started_at=started_at,
-            )
-        )
+        run_claimed_runner(store, run_id, config)
 
     status = json.loads(status_path.read_text())
     assert status["returncode"] == 1
@@ -413,14 +393,6 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     store = RunStore(tmp_path / "state")
     run_id = "r-secondary-cleanup"
     status_path = store.status_path(run_id)
-    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    started_at = "2026-06-24T00:00:00Z"
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-    )
     primary = NoFeasibleTrialError("trainer failed")
 
     def fail_with_uncertain_cleanup(
@@ -452,16 +424,7 @@ def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause
     )
 
     with pytest.raises(ProcessCleanupUncertainError):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config,
-                config_sha256=config_sha256,
-                experiment_id="srv",
-                started_at=started_at,
-            )
-        )
+        run_claimed_runner(store, run_id, config)
 
     status = json.loads(status_path.read_text())
     assert status["returncode"] == 1
@@ -487,14 +450,6 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     store = RunStore(tmp_path / "state")
     run_id = "r-terminal-identity"
     status_path = store.status_path(run_id)
-    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    started_at = "2026-06-24T00:00:00Z"
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-    )
 
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
@@ -533,16 +488,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
     )
 
     with pytest.raises(ProcessCleanupUncertainError, match="identity is missing"):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config,
-                config_sha256=config_sha256,
-                experiment_id="srv",
-                started_at=started_at,
-            )
-        )
+        run_claimed_runner(store, run_id, config)
 
     status = json.loads(status_path.read_text())
     assert status["cleanup_confirmed"] is False

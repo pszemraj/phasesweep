@@ -91,8 +91,7 @@ from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
-    runner_argv,
-    runner_main,
+    run_claimed_runner,
     write_mcp_catalog,
     write_run_status,
 )
@@ -469,12 +468,6 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     run_id = "srv-recover"
     started_at = "2026-06-24T00:00:00Z"
     config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-    )
     calls: list[tuple[str, str | None, bool]] = []
 
     def fake_run_experiment(
@@ -522,15 +515,8 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     )
 
     assert (
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config,
-                config_sha256=config_sha256,
-                experiment_id="srv",
-                started_at=started_at,
-            )
+        run_claimed_runner(
+            store, run_id, config, config_sha256=config_sha256, started_at=started_at
         )
         == 0
     )
@@ -1495,25 +1481,9 @@ def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     run_id = "r1"
     status_path = store.status_path(run_id)
-    started_at = "2026-06-24T00:00:00Z"
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256="0" * 64,
-        started_at=started_at,
-    )
 
     with pytest.raises(RuntimeError, match="hash mismatch"):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config,
-                config_sha256="0" * 64,
-                experiment_id="srv",
-                started_at=started_at,
-            )
-        )
+        run_claimed_runner(store, run_id, config, config_sha256="0" * 64)
 
     status = json.loads(status_path.read_text())
     assert status["returncode"] == 1
@@ -1549,26 +1519,9 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     run_id = "srv-preflight-failure"
     snapshot_path = store.config_snapshot_path(run_id)
     snapshot_path.write_bytes(config.read_bytes())
-    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    started_at = "2026-06-24T00:00:00Z"
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-    )
 
     with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=snapshot_path,
-                config_sha256=config_sha256,
-                experiment_id="srv",
-                started_at=started_at,
-            )
-        )
+        run_claimed_runner(store, run_id, snapshot_path)
 
     handle = store.get(run_id)
     assert handle is not None
@@ -1630,26 +1583,9 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
 
     store = RunStore(tmp_path / "state")
     run_id = "srv-schema-mismatch"
-    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    started_at = "2026-06-24T00:00:00Z"
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-    )
 
     with pytest.raises(StudySchemaMismatchError, match="unsupported PhaseSweep study state"):
-        runner_main(
-            runner_argv(
-                store,
-                run_id=run_id,
-                config=config,
-                config_sha256=config_sha256,
-                experiment_id="srv",
-                started_at=started_at,
-            )
-        )
+        run_claimed_runner(store, run_id, config)
 
     terminal = json.loads(store.status_path(run_id).read_text())
     assert terminal["result_snapshot_state"] == "complete"
