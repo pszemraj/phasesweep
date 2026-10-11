@@ -692,7 +692,7 @@ override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 storage: string | null = null
 
 # Directory that holds per-experiment generations, phase and attempt directories, logs and winner files.
-# A relative path resolves against the directory phasesweep is started from, not the YAML file or execution.cwd. A leading ~ is expanded and symlinks are resolved. The empty string resolves to the directory phasesweep is started from.
+# A relative path resolves against the directory phasesweep is started from, not the YAML file or execution.cwd. A leading ~ is expanded and symlinks are resolved. Write . for the directory phasesweep is started from; the empty string fails config load.
 # Requires: storage and the experiment name agree with the artifact-root binding already in <workdir>/<experiment>; a mismatch refuses reuse.
 # Excluded from the study fingerprint.
 # Warning: changing execution.cwd does not move this directory. Give trainer outputs a trial-specific path through trainer_config or trial_command.
@@ -967,6 +967,7 @@ execution: object = {}
   # Working directory of every trainer process. A leading ~ is expanded and a relative path resolves against the directory phasesweep is started from, not the config file.
   # The directory is not checked at config load or run start. It must exist when each trainer is launched; otherwise that attempt fails before the trainer starts and counts toward phases[].max_consecutive_failures.
   # The effective absolute directory is part of the study fingerprint, so two invocations from different directories do not share a study.
+  # Requires: a nonempty string when set; the empty string fails config load.
   # Unset: the trainer runs in the directory phasesweep was started from.
   # Recommended: use an absolute path so script and data paths resolve the same way from every invocation. workdir and local evidence paths keep their own rules.
   cwd: string | null = null

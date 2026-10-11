@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -469,6 +470,25 @@ def test_config_rejects_invalid_content_before_creating_workdir(
 def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]) -> None:
     with pytest.raises(ValidationError, match="provenance keys and values must be nonempty"):
         make_experiment(experiment="invalid_provenance", provenance=provenance)
+
+
+@pytest.mark.parametrize(
+    ("build", "message"),
+    [
+        pytest.param(
+            lambda: make_experiment(workdir=""), "workdir must be a nonempty path", id="workdir"
+        ),
+        pytest.param(
+            lambda: ExecutionContext(cwd=""),
+            "execution.cwd must be a nonempty path",
+            id="execution_cwd",
+        ),
+    ],
+)
+def test_empty_path_strings_are_rejected(build: Callable[[], object], message: str) -> None:
+    """An empty path would silently mean the invocation directory; omit or name it instead."""
+    with pytest.raises(ValidationError, match=message):
+        build()
 
 
 @pytest.mark.parametrize(

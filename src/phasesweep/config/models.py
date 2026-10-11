@@ -536,6 +536,22 @@ class ExecutionContext(_Frozen):
         ),
     )
 
+    @field_validator("cwd")
+    @classmethod
+    def _cwd_is_nonempty(cls, value: str | None) -> str | None:
+        """Reject an empty trainer working directory.
+
+        :param str | None value: Configured trainer working directory.
+        :raises ValueError: The path is the empty string.
+        :return str | None: The validated path, unchanged.
+        """
+        if value == "":
+            raise ValueError(
+                "execution.cwd must be a nonempty path; omit it to run trainers in the "
+                "directory phasesweep is started from."
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_inherit_names(self) -> ExecutionContext:
         """Reject inherited-variable names that no environment variable can have.
@@ -664,6 +680,22 @@ class Experiment(_Frozen):
                 "`storage: null` for an in-memory dry run."
             )
         canonical_storage_identity(value)
+        return value
+
+    @field_validator("workdir")
+    @classmethod
+    def _workdir_is_nonempty(cls, value: str) -> str:
+        """Reject an empty artifact-root directory.
+
+        :param str value: Configured per-trial directory root.
+        :raises ValueError: The path is the empty string.
+        :return str: The validated path, unchanged.
+        """
+        if value == "":
+            raise ValueError(
+                "workdir must be a nonempty path; write '.' to use the directory "
+                "phasesweep is started from, or omit workdir for ./runs."
+            )
         return value
 
     @field_validator("env")
