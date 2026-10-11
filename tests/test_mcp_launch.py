@@ -18,7 +18,6 @@ from typing import Any
 
 import optuna
 import pytest
-import yaml
 
 import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.publication_validation as validation_ops
@@ -111,6 +110,10 @@ RESUMABLE_PHASES = """\
     search_space:
       wd: { type: float, low: 0.0, high: 0.1 }
 """
+
+
+def _fail_popen(*args: object, **kwargs: object) -> None:
+    raise OSError("runner executable is unavailable")
 
 
 def _launch_with_poison_project(
@@ -558,11 +561,7 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config, app, _registry, store = side_effect_app(tmp_path)
-
-    def fail_popen(*args: object, **kwargs: object) -> None:
-        raise OSError("runner executable is unavailable")
-
-    monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", fail_popen)
+    monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", _fail_popen)
 
     with pytest.raises(OSError, match="runner executable"):
         app.launch("srv")
@@ -605,13 +604,10 @@ def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
 
     with monkeypatch.context() as faults:
 
-        def fail_popen(*args: object, **kwargs: object) -> None:
-            raise OSError("runner executable is unavailable")
-
         def fail_status(*args: object, **kwargs: object) -> None:
             raise OSError("status directory is unavailable")
 
-        faults.setattr(mcp_run_control.subprocess, "Popen", fail_popen)
+        faults.setattr(mcp_run_control.subprocess, "Popen", _fail_popen)
         faults.setattr(mcp_run_control, "write_status_file_if_absent", fail_status)
 
         with pytest.raises(OSError, match="runner executable"):
@@ -1418,7 +1414,7 @@ def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> No
     changed = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"fixed_overrides": {"k": 2}})]}
     )
-    config.write_text(yaml.safe_dump(changed.model_dump(mode="json"), sort_keys=False))
+    _write_experiment_config(config, changed)
     registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     store = RunStore(registry.state_dir)
     run_id = "srv-preflight-failure"

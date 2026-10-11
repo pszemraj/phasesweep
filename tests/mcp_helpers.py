@@ -209,6 +209,7 @@ def make_run_handle(
     allow_cancel: bool = False,
     visible_params_at_launch: VisibleParamsPolicy = "none",
     boot_id: str | None = None,
+    started_at: str | None = None,
 ) -> RunHandle:
     """Build a run handle; by default a spawned one owned by pytest itself.
 
@@ -221,6 +222,7 @@ def make_run_handle(
     :param bool allow_cancel: Whether the launch snapshot permits cancellation.
     :param VisibleParamsPolicy visible_params_at_launch: Parameter visibility frozen at launch.
     :param str | None boot_id: Boot id to record, or this host's current one when ``None``.
+    :param str | None started_at: Launch timestamp, or the current time when ``None``.
     :return RunHandle: The handle, not yet persisted.
     """
     if launch_state == "launching":
@@ -246,7 +248,7 @@ def make_run_handle(
         pid=process_id,
         pgid=process_group_id,
         pid_starttime=process_starttime,
-        started_at=utc_now_iso(),
+        started_at=utc_now_iso() if started_at is None else started_at,
         launch_state=launch_state,
         allow_cancel=allow_cancel,
         visible_params_at_launch=visible_params_at_launch,

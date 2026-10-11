@@ -72,6 +72,7 @@ from tests.conftest import (
 )
 from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
+    _write_experiment_config,
     claim_runner_handle,
     live_runs,
     make_dead_run_handle,
@@ -161,7 +162,7 @@ def _constant_trial_config(tmp_path: Path, name: str) -> tuple[Path, str]:
         search_space={},
     )
     config_path = tmp_path / f"{name}.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+    _write_experiment_config(config_path, experiment)
     return config_path, hashlib.sha256(config_path.read_bytes()).hexdigest()
 
 
@@ -461,7 +462,7 @@ def test_missing_published_study_is_an_operator_preflight_failure(
         trial_command="echo x=0.5 {overrides}",
     )
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    _write_experiment_config(config_path, experiment)
     run_experiment(experiment)
     generation_before = _generation_path(experiment).read_bytes()
     (_experiment_dir(experiment) / "study.journal").unlink()
@@ -546,10 +547,10 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
             }
         )
     config_path = tmp_path / "experiment.yaml"
-    config_path.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    _write_experiment_config(config_path, experiment)
     other = experiment.model_copy(update={"experiment": "other", "storage": "auto"})
     other_path = tmp_path / "other.yaml"
-    other_path.write_text(yaml.safe_dump(other.model_dump(mode="json")))
+    _write_experiment_config(other_path, other)
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(
             tmp_path,
@@ -744,7 +745,6 @@ def test_terminal_snapshot_reads_partial_winners_from_failed_generation(tmp_path
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'studies.journal'}",
         trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
         phases=[
             Phase(name="a", n_trials=1, sampler=SEEDED_RANDOM, search_space={}),
             Phase(

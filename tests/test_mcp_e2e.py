@@ -40,6 +40,7 @@ from phasesweep.mcp.tools import (
 )
 from tests.conftest import copy_fake_train
 from tests.mcp_helpers import (
+    ALLOW_SIDE_EFFECTS,
     cancel_mcp_run_quietly,
     make_mcp_app,
     slow_mcp_config_text,
@@ -47,7 +48,6 @@ from tests.mcp_helpers import (
     write_mcp_config_catalog,
 )
 
-ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 # Hard ceilings for the monitoring loops below. Both are far above the real
 # cost of these fixtures (a five-trial fake-trainer sweep, and one in-process
 # tool dispatch), so they only trip on a regression that would otherwise hang

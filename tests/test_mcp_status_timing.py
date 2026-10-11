@@ -16,7 +16,7 @@ from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp.errors import UnknownRunError
 from phasesweep.mcp.redaction import status_payload
-from phasesweep.mcp.runs import RunHandle, RunStore, write_status_file
+from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import (
     AWAIT_DEFAULT_TIMEOUT_SECONDS,
@@ -26,8 +26,9 @@ from phasesweep.mcp.tools import (
     _run_elapsed_seconds,
 )
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import mark_current_format, reaped_pid, single_trial_confound
+from tests.conftest import mark_current_format, single_trial_confound
 from tests.mcp_helpers import (
+    make_dead_run_handle,
     make_mcp_app,
     mcp_experiment_config_text,
     stage_live_run,
@@ -48,23 +49,9 @@ def _complete_trials(experiment, *, n: int) -> None:
         study.tell(trial, float(i))
 
 
-def _handle(run_id: str, *, started_at: str) -> RunHandle:
-    pid = reaped_pid()
-    return RunHandle(
-        run_id=run_id,
-        experiment_id="srv",
-        config_sha256="0" * 64,
-        pid=pid,
-        pgid=pid,
-        pid_starttime=None,
-        started_at=started_at,
-        visible_params_at_launch="none",
-    )
-
-
 def test_elapsed_seconds_running_counts_from_launch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = _handle("r1", started_at=utc_now_iso())
+    handle = make_dead_run_handle(run_id="r1", started_at=utc_now_iso())
     elapsed = _run_elapsed_seconds(store, handle, "running")
     assert elapsed is not None
     assert 0 <= elapsed <= 5
@@ -72,7 +59,7 @@ def test_elapsed_seconds_running_counts_from_launch(tmp_path: Path) -> None:
 
 def test_elapsed_seconds_terminal_prefers_runner_stamp(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = _handle("r1", started_at="2026-07-16T00:00:00+00:00")
+    handle = make_dead_run_handle(run_id="r1", started_at="2026-07-16T00:00:00+00:00")
     write_status_file(
         store.status_path("r1"),
         {
@@ -88,7 +75,7 @@ def test_elapsed_seconds_terminal_prefers_runner_stamp(tmp_path: Path) -> None:
 
 def test_elapsed_seconds_none_without_terminal_timestamp(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = _handle("r1", started_at=utc_now_iso())
+    handle = make_dead_run_handle(run_id="r1", started_at=utc_now_iso())
     write_status_file(
         store.status_path("r1"),
         {"run_id": "r1", "returncode": 0, "error_class": None, "cleanup_confirmed": True},
@@ -99,7 +86,8 @@ def test_elapsed_seconds_none_without_terminal_timestamp(tmp_path: Path) -> None
 def test_elapsed_seconds_none_without_status(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     # Terminal with no status.json at all (e.g. SIGKILL before any write).
-    assert _run_elapsed_seconds(store, _handle("r1", started_at=utc_now_iso()), "failed") is None
+    handle = make_dead_run_handle(run_id="r1", started_at=utc_now_iso())
+    assert _run_elapsed_seconds(store, handle, "failed") is None
 
 
 def test_status_floors_inconsistent_historical_terminal_count() -> None:

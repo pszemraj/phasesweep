@@ -8,19 +8,18 @@ import asyncio
 from pathlib import Path
 
 import pytest
-import yaml
 
 from phasesweep.config import FloatParam, JsonEnvelopeExtractor, Metric
 from phasesweep.engine import PhaseWinnerView
 from phasesweep.engine.state import WinnerSource
 from phasesweep.mcp.redaction import intersect_visible_params, winners_payload
-from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
-from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import make_experiment
 from tests.mcp_helpers import (
+    ALLOW_SIDE_EFFECTS,
+    _write_experiment_config,
     assert_no_sensitive,
+    make_mcp_app,
     patch_popen_capture,
     write_mcp_catalog,
     write_run_status,
@@ -73,12 +72,12 @@ def _write_catalog(
         search_space={"lr": FloatParam(type="float", low=1.0e-5, high=1.0e-2, log=True)},
     )
     config = tmp_path / "exp.yaml"
-    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json"), sort_keys=False))
+    _write_experiment_config(config, experiment)
     return write_mcp_catalog(tmp_path, {"redact_me": config}, allow=allow)
 
 
 def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
-    registry = Registry.load(_write_catalog(tmp_path))
+    app, registry, _store = make_mcp_app(_write_catalog(tmp_path))
     reg = registry.get("redact_me")
     sensitive = [
         reg.experiment.trial_command,
@@ -116,7 +115,6 @@ def test_payloads_never_leak_sensitive_fields(tmp_path: Path) -> None:
     assert "SECRET_FIXED_OVERRIDE" not in str(winners)
     assert "/private/data" not in str(winners)
 
-    app = PhaseSweepMCP(registry, RunStore(registry.state_dir))
     tool_results = [
         app.list_experiments(),
         app.validate(reg.id),
@@ -129,15 +127,8 @@ def test_run_workflow_payloads_never_leak_sensitive_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    registry = Registry.load(
-        _write_catalog(
-            tmp_path,
-            allow={"launch": True, "cancel": True, "from_phase": True},
-        )
-    )
+    app, registry, store = make_mcp_app(_write_catalog(tmp_path, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("redact_me")
-    store = RunStore(registry.state_dir)
-    app = PhaseSweepMCP(registry, store)
     patch_popen_capture(monkeypatch)
     sensitive = [
         reg.experiment.trial_command,
