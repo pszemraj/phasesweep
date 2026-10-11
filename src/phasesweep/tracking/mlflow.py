@@ -159,8 +159,10 @@ def _create(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     binding = dict(request["binding"])
     binding["experiment_id"] = _resolve(client, request["settings"])
     tags = identity_tags(binding)
+    # Double quotes are the identifier quoting both OSS and Databricks search
+    # document; Databricks does not document backticks.
     query = " AND ".join(
-        f"tags.`{key}` = '{tags[key]}'"
+        f"tags.\"{key}\" = '{tags[key]}'"
         for key in ("phasesweep.attempt_id", "phasesweep.generation_id")
     )
     matches = []
