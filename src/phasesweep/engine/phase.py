@@ -1491,6 +1491,7 @@ def _run_phase(
     if experiment.mlflow is not None:
         from phasesweep.tracking.session import require_tracking_target
 
+        log.info("phase=%s checking MLflow target %s", phase.name, experiment.mlflow.tracking_uri)
         require_tracking_target(
             experiment,
             generation_id=generation_id,
