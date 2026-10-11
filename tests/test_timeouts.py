@@ -10,7 +10,7 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
+from phasesweep.config import Experiment, IntParam, Metric, Phase, Sampler
 from phasesweep.engine import PhaseSweepError
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.errors import OperatorAction, WinnerIntegrityError
@@ -55,25 +55,15 @@ def _sleeping_score_experiment(
         print("x=1.0")
         """,
     )
-    return Experiment(
+    return make_experiment(
         experiment=experiment,
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        timeout_seconds_per_run=timeout_seconds_per_run,
-        phases=[
-            Phase(
-                name="p",
-                n_trials=n_trials,
-                timeout_seconds_per_phase=timeout_seconds_per_phase,
-                allow_incomplete_on_timeout=allow_incomplete_on_timeout,
-                search_space={},
-            )
-        ],
-    )
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        n_trials=n_trials,
+        timeout_seconds_per_phase=timeout_seconds_per_phase,
+        allow_incomplete_on_timeout=allow_incomplete_on_timeout,
+        search_space={},
+    ).model_copy(update={"timeout_seconds_per_run": timeout_seconds_per_run})
 
 
 @pytest.mark.integration
@@ -841,7 +831,6 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command="false {overrides}",
-        override_format="argparse",
         n_trials=1,
         max_consecutive_failures=10,
         timeout_seconds_per_phase=100.0,
@@ -892,8 +881,7 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(
         workdir=tmp_path / "runs",
-        trial_command=f"python {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=1,
         timeout_seconds_per_phase=0.5,
     )

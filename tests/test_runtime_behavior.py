@@ -19,7 +19,6 @@ from phasesweep.config import (
     Experiment,
     FloatParam,
     IntParam,
-    JsonEnvelopeExtractor,
     JsonExtractor,
     LogRegexExtractor,
     Metric,
@@ -80,6 +79,7 @@ from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from tests.conftest import (
+    FAKE_TRAIN_METRIC,
     copy_fake_train,
     make_experiment,
     make_trial_context,
@@ -339,15 +339,7 @@ def test_parallel_trials_e2e(tmp_path):
         workdir=tmp_path / "runs",
         storage=f"journal:///{journal_path}",
         trial_command=f"python {trainer} {{overrides}}",
-        metric=Metric(
-            name="eval_loss",
-            extractor=JsonEnvelopeExtractor(
-                type="json_envelope",
-                objective_name="eval_loss",
-                split="validation",
-                policy="synthetic",
-            ),
-        ),
+        metric=FAKE_TRAIN_METRIC,
         name="lr_sweep",
         n_trials=8,
         n_jobs=4,
@@ -413,7 +405,6 @@ def test_repeated_in_memory_run_cannot_reuse_stale_trial_and_preserves_last_good
     first = make_experiment(
         workdir=workdir,
         trial_command=f"python {success} {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
         n_trials=1,
     )
 
@@ -714,7 +705,7 @@ def test_abort_after_gpu_acquire_prevents_queued_trials(
     exp = make_experiment(
         experiment="abort_recheck",
         workdir=tmp_path / "runs",
-        trial_command=f"python {trainer} {{overrides}}",
+        trainer=trainer,
         n_trials=16,
         n_jobs=4,
         gpu_ids=[0],  # only one slot — n_jobs=4 will queue
@@ -917,8 +908,7 @@ def _outcome_write_experiment(
     return make_experiment(
         workdir=tmp_path / "runs",
         storage=storage,
-        trial_command=f"python {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=2,
         constraints=constraints,
         max_consecutive_failures=5,
@@ -1290,8 +1280,7 @@ def test_recovered_abort_is_retired_before_selection_survives_selection_crash(
         return make_experiment(
             workdir=tmp_path / "runs",
             storage=f"journal:///{db}",
-            trial_command=f"python {trainer} {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=n_trials,
             max_consecutive_failures=2,
             sampler={"type": "random", "seed": 7},
@@ -1351,8 +1340,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     exp = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{db}",
-        trial_command=f"python {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=3,
         n_jobs=3,
         gpu_policy="none",
@@ -1460,8 +1448,7 @@ def test_unexpected_objective_error_is_phase_fatal_and_durable(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{journal}",
-        trial_command=f"python {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=2,
         n_jobs=n_jobs,
         gpu_policy="none",
@@ -1646,7 +1633,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
         experiment="categorical_fidelity",
         workdir=tmp_path / "runs",
         storage=storage_url,
-        trial_command=f"python {trainer} {{overrides}}",
+        trainer=trainer,
         phases=[
             Phase(
                 name="pick",

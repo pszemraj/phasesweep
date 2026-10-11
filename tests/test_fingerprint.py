@@ -21,7 +21,6 @@ from phasesweep.config import (
     Experiment,
     FloatParam,
     IntParam,
-    JsonEnvelopeExtractor,
     JsonEqualsGate,
     LogRegexExtractor,
     Metric,
@@ -87,6 +86,7 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
 from tests.conftest import (
+    FAKE_TRAIN_METRIC,
     assert_published_winner_evidence_local,
     copy_fake_train,
     drop_artifact_root_binding,
@@ -214,15 +214,7 @@ def test_fingerprint_mismatch_raises(tmp_path):
             workdir=tmp_path / "runs",
             storage=f"journal:///{tmp_path / 'phases.journal'}",
             trial_command=f"python {trainer} {{overrides}}",
-            metric=Metric(
-                name="eval_loss",
-                extractor=JsonEnvelopeExtractor(
-                    type="json_envelope",
-                    objective_name="eval_loss",
-                    split="validation",
-                    policy="synthetic",
-                ),
-            ),
+            metric=FAKE_TRAIN_METRIC,
             name="a",
             n_trials=2,
             allow_partial_grid=True,
@@ -805,7 +797,7 @@ def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
         experiment="topup",
         workdir=tmp_path / "runs",
         storage=f"journal:///{db}",
-        trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
+        trainer=trainer,
         metric=Metric(
             name="eval_loss",
             extractor=LogRegexExtractor(

@@ -21,9 +21,6 @@ import pytest
 import phasesweep.engine.ledger as engine_ledger
 from phasesweep.config import (
     Experiment,
-    IntParam,
-    LogRegexExtractor,
-    Metric,
     Phase,
     Sampler,
 )
@@ -83,6 +80,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     patch_rejected_trial_user_attr,
+    write_constant_trainer,
     write_trainer,
 )
 from tests.ledger_fixtures import _write_config
@@ -184,19 +182,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     Previously, _verify_fingerprint raised before _reap_stale_trials could run,
     leaving the prior orchestrator's training process holding the GPU.
     """
-    trainer = tmp_path / "t.py"
-    write_trainer(
-        trainer,
-        """
-        import json, argparse
-        ap = argparse.ArgumentParser()
-        ap.add_argument('--out', required=True)
-        args, _ = ap.parse_known_args()
-        with open(args.out, 'w') as f: json.dump({'x': 1.0}, f)
-        """,
-    )
-    db = tmp_path / "p.journal"
-    storage = f"journal:///{db}"
+    storage = f"journal:///{tmp_path / 'p.journal'}"
 
     # Manually create a study and inject a RUNNING trial + fingerprint.
     study = optuna.create_study(
@@ -242,24 +228,12 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "_reap_stale_trials", spy_reap)
     monkeypatch.setattr(orch, "_verify_fingerprint", spy_verify)
 
-    exp = Experiment(
-        experiment="t",
+    exp = make_experiment(
         storage=storage,
-        provenance={"revision": "test-fixture-v1"},
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        phases=[
-            Phase(
-                name="a",
-                n_trials=1,
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
+        workdir=tmp_path / "runs",
+        trainer=write_constant_trainer(tmp_path),
+        name="a",
+        n_trials=1,
     )
 
     stamp_artifact_root(study, exp)
@@ -297,21 +271,13 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         else:
             alive = False
         Path(os.environ["PHASESWEEP_TRIAL_DIR"], "orphan_alive.txt").write_text(str(alive))
-        print("metric=1.0")
+        print("x=1.0")
         """,
     )
-    storage = f"journal:///{tmp_path / 'studies.journal'}"
-    experiment = Experiment(
+    experiment = make_experiment(
         experiment="cross_phase_orphan",
-        storage=storage,
-        provenance={"revision": "test-fixture-v1"},
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"{sys.executable} {trainer}",
-        override_format="argparse",
-        metric=Metric(
-            name="metric",
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"metric=(?P<value>[0-9.eE+-]+)"),
-        ),
+        persistent=tmp_path,
+        trainer=trainer,
         phases=[
             Phase(name="a", n_trials=1, sampler=Sampler(type="random", seed=0), search_space={}),
             Phase(
@@ -970,8 +936,7 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'allocation.journal'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=3,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1012,8 +977,7 @@ def test_allocation_context_covers_first_environment_write_failure(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'first-write.journal'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=1,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1145,8 +1109,7 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
         experiment="prelaunch",
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'p.journal'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1656,8 +1619,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         experiment="partial-registration",
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'partial.journal'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1750,16 +1712,9 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
             experiment="rename",
             workdir=tmp_path / "runs",
             storage=storage,
-            trial_command=f"{sys.executable} {trainer} {{overrides}}",
-            override_format="argparse",
-            phases=[
-                Phase(
-                    name=phase_name,
-                    n_trials=1,
-                    sampler=Sampler(type="random", seed=0),
-                    search_space={"x": IntParam(type="int", low=0, high=10)},
-                )
-            ],
+            trainer=trainer,
+            name=phase_name,
+            n_trials=1,
         )
 
     old_exp = _exp("old_phase")
@@ -1866,8 +1821,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
             experiment="movedstorage",
             workdir=tmp_path / "runs",
             storage=f"journal:///{tmp_path / db_name}",
-            trial_command=f"{sys.executable} {trainer} {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=1,
         )
 
@@ -1917,8 +1871,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
             experiment="unregistrable",
             workdir=tmp_path / "runs",
             storage=storage,
-            trial_command=f"{sys.executable} {trainer} {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=n_trials,
         )
 
