@@ -46,7 +46,7 @@ metric:
 
 The experiment must already exist and be active. PhaseSweep never creates it implicitly. `tracking_uri` accepts HTTP(S), `databricks`, and `databricks://profile`. HTTP credentials belong in the SDK's authentication configuration or environment rather than the URI. The top-level `mlflow` block requires an MLflow objective. Local constraint extractors and local gates can still accompany it, but every remote consumer uses the bound MLflow run.
 
-All controller network operations run in supervised workers outside GPU leases. The timeout bounds each operation. A phase or whole-run deadline also caps experiment resolution, run creation and evidence capture; result uploads happen after acceptance and, like other publication, can extend past those deadlines. Within that bound the MLflow client retries transient HTTP failures, except run creation, which reconciles by identity instead of being replayed. Trainer cleanup is confirmed before releasing its GPU lease, and launch checks cancellation and deadlines again after acquiring that lease.
+All controller network operations run in supervised workers outside GPU leases. The timeout bounds each operation. A phase or whole-run deadline also caps experiment resolution, run creation and evidence capture; result uploads happen after acceptance and, like other publication, can extend past those deadlines. Within that bound the MLflow client retries transient HTTP failures. Run creation on an HTTP(S) server is never replayed; a retry reconciles by identity instead. The Databricks SDK keeps its own retries for creation too, so a rare lost response there can leave an extra, unbound run in the experiment. Trainer cleanup is confirmed before releasing its GPU lease, and launch checks cancellation and deadlines again after acquiring that lease.
 
 ## Choose run ownership
 
@@ -166,6 +166,8 @@ Bindings and mutable delivery records stay under the experiment artifact root. D
 
 ## Databricks status
 
-Databricks targets preserve URI spelling, including profile case, and delegate authentication to the MLflow/Databricks SDK. With narrowed environment inheritance, explicitly list rotating authentication/transport variables in `execution.passthrough_env`; do not put secrets in semantic `env` values. The SDK can also use its normal profile configuration. See [Databricks authentication](https://docs.databricks.com/en/dev-tools/auth/index.html).
+Databricks targets preserve URI spelling, including profile case, and delegate authentication to the MLflow/Databricks SDK, which reads `DATABRICKS_HOST` and `DATABRICKS_TOKEN`, OAuth client variables, or a `~/.databrickscfg` profile. Exported `DATABRICKS_*` variables take precedence over the profile named in `databricks://profile`, and some MLflow artifact uploads authenticate without that profile. Prefer `tracking_uri: databricks` with `env: {DATABRICKS_CONFIG_PROFILE: <profile>}`, or with host and token variables. Experiment names are workspace paths such as `/Users/you@example.com/sweep`; quote a numeric `experiment_id` so YAML keeps it a string.
+
+In every `execution.inherit_env` mode, list rotating authentication and transport variables, such as `DATABRICKS_TOKEN`, `DATABRICKS_CLIENT_SECRET`, or `HTTPS_PROXY`, in `execution.passthrough_env`. Their values are then excluded from the environment cohort, so a refreshed token does not block resuming a sweep. Do not put secrets in semantic `env` values. See [Databricks authentication](https://docs.databricks.com/en/dev-tools/auth/index.html).
 
 Local HTTP behavior is covered by integration tests. Live Databricks access and framework integrations on Databricks remain **unverified**.

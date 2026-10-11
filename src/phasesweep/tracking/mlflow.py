@@ -131,6 +131,8 @@ def _without_sdk_replay() -> Iterator[None]:
 
     A timed-out POST can have succeeded, so the caller's next try reconciles
     by identity instead of replaying it. Idempotent reads keep SDK retries.
+    Databricks targets go through the Databricks SDK, whose own retry layer
+    this setting does not reach.
 
     :return Iterator[None]: Scope in which the SDK sends each request once.
     """
