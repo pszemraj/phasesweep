@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import threading
 import time
 from pathlib import Path
@@ -30,8 +29,8 @@ from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import mark_current_format, reaped_pid, single_trial_confound
 from tests.mcp_helpers import (
     make_mcp_app,
-    make_run_handle,
     mcp_experiment_config_text,
+    stage_live_run,
     write_mcp_config_catalog,
     write_run_status,
 )
@@ -218,14 +217,7 @@ def _app_with_run(tmp_path: Path, run_id: str = "r1"):
     config_text = mcp_experiment_config_text(tmp_path)
     catalog = write_mcp_config_catalog(tmp_path, {"srv": config_text})
     app, registry, store = make_mcp_app(catalog)
-    data = (tmp_path / "srv.yaml").read_bytes()
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id="srv",
-        config_sha256=hashlib.sha256(data).hexdigest(),
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(data)
+    stage_live_run(store, run_id, tmp_path / "srv.yaml", "srv")
     return app, registry, store
 
 

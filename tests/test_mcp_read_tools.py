@@ -68,6 +68,7 @@ from tests.mcp_helpers import (
     make_run_handle,
     side_effect_app,
     stage_dead_run,
+    stage_live_run,
     write_mcp_catalog,
     write_run_status,
 )
@@ -140,15 +141,7 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     _app, registry, store = make_mcp_app(catalog)
     reg = registry.get("srv")
     run_id = "srv-launched"
-    snapshot = config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-        )
-    )
+    stage_live_run(store, run_id, config, reg.id)
     if method_name == "winners":
         run_experiment(experiment, generation_id=run_id)
     _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phase_name="edited"))
@@ -178,15 +171,7 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, visible_params={"other": "all"})
     )
-    snapshot = old_config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id="old",
-            config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        )
-    )
+    stage_live_run(store, run_id, old_config, "old")
 
     result = app.winners(run_id=run_id)
 
@@ -207,15 +192,7 @@ def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> Non
 
     other_config = _config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(write_mcp_catalog(tmp_path, {"other": other_config}))
-    snapshot = old_config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id="old",
-            config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        )
-    )
+    stage_live_run(store, run_id, old_config, "old")
 
     status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
@@ -948,16 +925,7 @@ def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
     store = RunStore(launch_registry.state_dir)
     reg = launch_registry.get("srv")
     run_id = "srv-historical"
-    snapshot = config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-            visible_params_at_launch=reg.visible_params,
-        )
-    )
+    stage_live_run(store, run_id, config, reg.id, visible_params_at_launch=reg.visible_params)
     run_experiment(experiment, generation_id=run_id)
     (published,) = read_winners(experiment)
     expected = published.params["lr"] if visible else "<redacted>"
@@ -1034,13 +1002,7 @@ def test_read_tools_use_live_view_while_result_snapshot_is_pending(
     config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-live-pending-finalization"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    stage_live_run(store, run_id, config, reg.id)
     write_run_status(
         store,
         run_id,

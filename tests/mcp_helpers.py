@@ -9,7 +9,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -417,6 +417,27 @@ def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     write_status_file(store.status_path(run_id), full_payload)
 
 
+def _stage_run(
+    store: RunStore,
+    config: Path,
+    new_handle: Callable[..., RunHandle],
+    **handle_kwargs: Any,
+) -> RunHandle:
+    """Persist a run handle pinned to ``config`` together with ``config`` as its launch snapshot.
+
+    :param RunStore store: Store receiving the handle and the snapshot.
+    :param Path config: Configuration whose bytes become the snapshot and the pinned digest.
+    :param Callable new_handle: Builder such as :func:`make_run_handle` for the handle.
+    :param handle_kwargs: Remaining arguments for ``new_handle``.
+    :return RunHandle: The persisted handle.
+    """
+    snapshot = config.read_bytes()
+    handle = new_handle(config_sha256=hashlib.sha256(snapshot).hexdigest(), **handle_kwargs)
+    store.create(handle)
+    store.config_snapshot_path(handle.run_id).write_bytes(snapshot)
+    return handle
+
+
 def stage_dead_run(
     store: RunStore,
     run_id: str,
@@ -427,18 +448,36 @@ def stage_dead_run(
     allow_cancel: bool = False,
 ) -> RunHandle:
     """Persist a spawned run of ``config`` whose runner has exited, as recover-run finds it."""
-    snapshot = config.read_bytes()
-    handle = make_dead_run_handle(
+    handle = _stage_run(
+        store,
+        config,
+        make_dead_run_handle,
         run_id=run_id,
         experiment_id=experiment_id,
-        config_sha256=hashlib.sha256(snapshot).hexdigest(),
         allow_cancel=allow_cancel,
     )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
     if cleanup_uncertain:
         store.mark_cleanup_uncertain(handle)
     return handle
+
+
+def stage_live_run(
+    store: RunStore,
+    run_id: str,
+    config: Path,
+    experiment_id: str,
+    *,
+    visible_params_at_launch: VisibleParamsPolicy = "none",
+) -> RunHandle:
+    """Persist a spawned run of ``config`` whose runner is this live process, as a server finds it mid-run."""
+    return _stage_run(
+        store,
+        config,
+        make_run_handle,
+        run_id=run_id,
+        experiment_id=experiment_id,
+        visible_params_at_launch=visible_params_at_launch,
+    )
 
 
 def write_unsafe_cleanup_status(store: RunStore, run_id: str, **extra: object) -> None:
