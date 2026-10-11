@@ -143,7 +143,10 @@ def _validate_objective_provenance(provenance: Mapping[str, Any], *, subject: st
     """
 
     def fail(reason: str) -> NoReturn:
-        """Raise a standardized malformed-provenance error."""
+        """Raise a standardized malformed-provenance error.
+
+        :raises TrialEvidenceMissingError: Always, naming ``subject`` and ``reason``.
+        """
         raise TrialEvidenceMissingError(
             f"{subject} has malformed {OBJECTIVE_PROVENANCE_ATTR!r} evidence "
             f"({reason}). {_TRIAL_EVIDENCE_REMEDY}"

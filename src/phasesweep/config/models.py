@@ -384,8 +384,11 @@ class Phase(_Frozen):
             v: The candidate phase name.
 
         Returns:
-            The same name, unchanged. Raises ``ValueError`` if any character
-            is disallowed or the name collides with engine-managed records.
+            The same name, unchanged.
+
+        Raises:
+            ValueError: Any character is disallowed, or the name collides with
+                engine-managed records.
 
         """
         v = _validate_safe_name("Phase", v)

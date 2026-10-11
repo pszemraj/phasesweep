@@ -116,6 +116,7 @@ def winners_payload(
     :param bool | None published_config_matches_current: Whether the represented
         generation's recorded config fingerprint matches the config this read
         was interpreted through; ``None`` when undeterminable.
+    :raises RuntimeError: A winner view carries no source provenance.
     :return dict[str, Any]: MCP-safe winners payload.
     """
     winner_phases = {view.phase for view in views}

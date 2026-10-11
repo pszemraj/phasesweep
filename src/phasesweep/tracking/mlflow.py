@@ -111,6 +111,7 @@ def _resolve(client: Any, settings: dict[str, Any]) -> str:
 
     :param Any client: Public MLflow client in the supervised worker.
     :param dict[str, Any] settings: Trusted target or operation payload.
+    :raises ValueError: The experiment does not exist or has been deleted.
     :return str: Existing experiment ID.
     """
     experiment = (
@@ -196,6 +197,10 @@ def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
 
     :param Any client: Public MLflow client in the supervised worker.
     :param dict[str, Any] request: Trusted target or operation payload.
+    :raises ValueError: The run no longer matches its binding, ended FAILED or KILLED,
+        or restarted during capture.
+    :raises TimeoutError: Finished-run evidence is still missing or incomplete when
+        ``timeout_seconds`` elapses.
     :return dict[str, Any]: Frozen shared native evidence.
     """
     from phasesweep.evidence.mlflow import select_observation
@@ -314,6 +319,8 @@ def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
     """Dispatch trusted controller requests using public MLflow APIs.
 
     :param dict[str, Any] request: Trusted controller operation.
+    :raises ValueError: The request names an action other than ``resolve``, ``create``,
+        ``capture``, or ``publish``.
     :return dict[str, Any]: Successful operation payload.
     """
     from mlflow import MlflowClient

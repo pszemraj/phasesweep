@@ -329,6 +329,11 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
         earlier winners from disk.
     :param bool dry_run: Render example commands without launching subprocesses.
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
+    :raises ConfigError: The config file cannot be parsed or fails model validation.
+    :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
+        ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
+    :raises UnsafeProcessCleanupError: A trial's cleanup was refused; the message gains
+        the ``phasesweep run`` retry advice.
     """
     _configure_logging(verbose)
     # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit

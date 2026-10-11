@@ -157,6 +157,8 @@ def _trainer_environment(
     :param str phase_name: Phase whose remote consumers manage W&B identity.
     :param bool require_wandb_online: Reject offline/disabled W&B modes when the
         caller is preparing new remote work.
+    :raises PhaseSweepError: The W&B environment cannot be composed because explicit
+        settings conflict or remote logging is disabled (``FIX_CONFIG``).
     :return dict[str, str]: The composed trainer environment.
     """
     contract = experiment.execution.inherit_env
