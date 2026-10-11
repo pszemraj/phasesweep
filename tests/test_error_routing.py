@@ -1427,14 +1427,14 @@ ORIGIN_CASES = (
         trigger=_wandb_sdk_not_installed,
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
-        message='python -m pip install "phasesweep[wandb]"',
+        message='pip install "phasesweep[wandb]"',
     ),
     RoutingCase(
         id="mlflow_sdk_missing",
         trigger=_mlflow_sdk_not_installed,
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
-        message='python -m pip install "phasesweep[mlflow]"',
+        message='pip install "phasesweep[mlflow]"',
     ),
     RoutingCase(
         id="registry_entry_partial_schema",

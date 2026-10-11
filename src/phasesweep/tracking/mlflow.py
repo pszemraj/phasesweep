@@ -36,7 +36,7 @@ def require_mlflow_sdk() -> None:
 
         raise PhaseSweepError(
             "MLflow tracking requires the optional SDK in the PhaseSweep environment. "
-            'Install this distribution with its mlflow extra: python -m pip install "phasesweep[mlflow]".',
+            'Install this distribution with its mlflow extra: pip install "phasesweep[mlflow]".',
             action=OperatorAction.FIX_CONFIG,
         )
 

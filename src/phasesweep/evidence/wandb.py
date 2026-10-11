@@ -81,7 +81,7 @@ def require_wandb_sdk() -> None:
 
         raise PhaseSweepError(
             "W&B evidence requires the optional SDK in the PhaseSweep environment. "
-            'Install this distribution with its wandb extra: python -m pip install "phasesweep[wandb]".',
+            'Install this distribution with its wandb extra: pip install "phasesweep[wandb]".',
             action=OperatorAction.FIX_CONFIG,
         ) from exc
 

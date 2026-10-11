@@ -12,7 +12,7 @@ from __future__ import annotations
 import functools
 import importlib.resources
 
-MCP_EXTRA_INSTALL_COMMAND = 'python -m pip install "phasesweep[mcp]"'
+MCP_EXTRA_INSTALL_COMMAND = 'pip install "phasesweep[mcp]"'
 
 
 @functools.cache
