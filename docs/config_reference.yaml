@@ -680,11 +680,13 @@ override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 # Where the study ledger is kept. null is disposable in-memory storage, auto is <workdir>/<experiment>/study.journal, and journal:///path selects an explicit local journal file.
 # In journal URLs three slashes start a relative path and four an absolute one: journal:///./runs/study.journal is relative to the invocation directory and journal:////tmp/study.journal is absolute.
 # A leading ~ is expanded after three slashes, so journal:///~/x.journal is $HOME/x.journal. After four slashes it is literal, so journal:////~/x.journal is /~/x.journal.
-# The ledger identity is the path after symlinks are resolved. A ? in the path ends it, so journal:///a?b.journal names the journal a.
+# The ledger identity is the path after symlinks are resolved.
 # SQLite, :memory:, external database URLs and every other form are rejected.
 # Journals support parallel trials on one host, not distributed-host execution.
 # Reuse of an existing ledger also requires current-format artifacts, matching trainer, evidence and provenance semantics, and the same trainer-environment cohort.
 # Changing semantic inputs needs a new experiment name. Run-control changes do not waive a stored abort or partial-timeout decision.
+# Requires: a journal URL spells its scheme exactly as lowercase journal and names a nonempty path. JOURNAL:///x.journal, journal:/// and journal:// fail config load.
+# Requires: a journal URL carries no ? or #, because a query or fragment would silently cut the path. Config load fails; use auto when a directory name contains one.
 # Requires: provenance is nonempty for auto or a journal; stochastic phases also need phases[].sampler.seed, and tpe and cmaes need phases[].sampler.acknowledge_nonresumable. Config load fails otherwise.
 # Requires: workdir and the experiment name keep pointing at the same ledger. An artifact root <workdir>/<experiment> remembers its storage identity, which includes null, so switching between null and a journal or between two journals is refused, and so is opening one journal under another workdir or experiment name.
 # Excluded from the study fingerprint.

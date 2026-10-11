@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import textwrap
 from pathlib import Path
-from urllib.parse import quote
 
 import pytest
 
@@ -334,22 +333,22 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
             "storage must be null, auto, or a journal",
             id="memory-shorthand-refused-at-config-load",
         ),
-        # These are valid journal URLs at config load, so the registry's own
-        # path-stability checks are what refuse them.
+        pytest.param(
+            '"journal://"',
+            "journal URL names no file",
+            id="empty-journal-url-refused-at-config-load",
+        ),
+        pytest.param(
+            '"journal:///"',
+            "journal URL names no file",
+            id="empty-journal-path-refused-at-config-load",
+        ),
+        # This is a valid journal URL at config load, so the registry's own
+        # path-stability check is what refuses it.
         pytest.param(
             '"journal:///relative.journal"',
             "absolute .*journal storage path",
             id="relative-journal",
-        ),
-        pytest.param(
-            '"journal://"',
-            "non-empty absolute .*journal storage path",
-            id="empty-journal-url",
-        ),
-        pytest.param(
-            '"journal:///"',
-            "non-empty absolute .*journal storage path",
-            id="empty-journal-path",
         ),
     ],
 )
@@ -526,18 +525,6 @@ def test_missing_storage_rejected(tmp_path: Path) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path, with_storage=False))
     with pytest.raises(CatalogError, match="storage"):
         Registry.load(_catalog(tmp_path, config))
-
-
-def test_persistent_journal_uri_file_storage_allowed(tmp_path: Path) -> None:
-    storage = f'"journal:///file:{quote(str(tmp_path / "uri.journal"), safe="/")}?uri=true"'
-    config = _write(
-        tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path).replace(f"journal:///{tmp_path}/reg_ok.journal", storage),
-    )
-
-    registry = Registry.load(_catalog(tmp_path, config))
-
-    assert registry.get("reg_ok").experiment.storage == storage.strip('"')
 
 
 def test_config_not_found_rejected(tmp_path: Path) -> None:

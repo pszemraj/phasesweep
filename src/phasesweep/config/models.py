@@ -43,8 +43,8 @@ from phasesweep.evidence.models import (
 )
 from phasesweep.runtime.files import (
     canonical_storage_identity,
+    file_url_path,
     local_storage_url,
-    storage_backend,
 )
 from phasesweep.tracking.models import MlflowSettings
 
@@ -661,23 +661,36 @@ class Experiment(_Frozen):
     @field_validator("storage")
     @classmethod
     def _storage_is_local(cls, value: str | None) -> str | None:
-        """Allow only null, auto, and local journal storage.
+        """Allow only null, auto, and local journal storage that names a plain file.
 
         :param str | None value: Configured Optuna storage locator.
         :raises ValueError: The locator is not null, ``"auto"``, or a
-            ``journal:///`` URL.
+            ``journal:///`` URL with the exact lowercase scheme, or the URL
+            carries a query or fragment, or its path is empty.
         :return str | None: The validated locator, unchanged.
         """
         if value is None or value == "auto":
             return value
-        backend = storage_backend(value)
-        if backend != "journal":
+        if value.split(":", 1)[0] != "journal":
             raise ValueError(
-                "storage must be null, auto, or a journal:/// URL; got "
-                f"{value!r}. PhaseSweep keeps its persistent ledger in an Optuna "
-                "journal file: use `storage: auto` for <workdir>/<experiment>/study.journal, "
+                "storage must be null, auto, or a journal:/// URL with the lowercase "
+                f"scheme journal; got {value!r}. PhaseSweep keeps its persistent ledger "
+                "in an Optuna journal file: use `storage: auto` for "
+                "<workdir>/<experiment>/study.journal, "
                 "`storage: journal:///path/to/study.journal` for an explicit file, or "
                 "`storage: null` for an in-memory dry run."
+            )
+        if "?" in value or "#" in value:
+            raise ValueError(
+                "storage journal URLs cannot carry a query or fragment, because everything "
+                f"from the first ? or # on is dropped from the file path; got {value!r}. "
+                "Remove it. To keep the journal under a directory whose name contains ? or #, "
+                "use `storage: auto` with that workdir."
+            )
+        if file_url_path(value) == "":
+            raise ValueError(
+                f"storage journal URL names no file; got {value!r}. Write "
+                "`storage: journal:///path/to/study.journal`."
             )
         canonical_storage_identity(value)
         return value
