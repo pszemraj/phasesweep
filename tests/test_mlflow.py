@@ -536,17 +536,35 @@ def test_missing_sdk_is_refused_before_any_trial(tmp_path, monkeypatch):
             operation(experiment)
 
 
+def _permission_denied():
+    from mlflow.exceptions import MlflowException
+    from mlflow.protos.databricks_pb2 import PERMISSION_DENIED
+
+    return MlflowException("private server detail", error_code=PERMISSION_DENIED)
+
+
 @pytest.mark.parametrize(
-    "missing,expected",
-    [("mlflow", "requires phasesweep[mlflow]"), ("boto3", "needs Python module 'boto3'")],
+    "error,expected",
+    [
+        (
+            lambda: ModuleNotFoundError("No module named 'mlflow'", name="mlflow"),
+            "requires phasesweep[mlflow]",
+        ),
+        (
+            lambda: ModuleNotFoundError("No module named 'boto3'", name="boto3"),
+            "needs Python module 'boto3'",
+        ),
+        (_permission_denied, "(MlflowException: PERMISSION_DENIED)"),
+    ],
+    ids=["sdk", "dependency", "server"],
 )
-def test_worker_names_the_missing_module(tmp_path, monkeypatch, missing, expected):
+def test_worker_names_the_failure_cause(tmp_path, monkeypatch, error, expected):
     import json
 
     from phasesweep.tracking import mlflow as worker
 
     def dispatch(request):
-        raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+        raise error()
 
     monkeypatch.setattr(worker, "_dispatch", dispatch)
     request, response = tmp_path / "request.json", tmp_path / "response.json"

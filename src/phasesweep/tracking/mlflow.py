@@ -362,9 +362,13 @@ def main(argv: list[str] | None = None) -> int:
 
         if not isinstance(exc, MlflowException | RequestException | OSError):
             raise
+        # The server's error code, e.g. PERMISSION_DENIED, carries no secrets.
+        cause = type(exc).__name__
+        if isinstance(exc, MlflowException):
+            cause = f"{cause}: {exc.error_code}"
         response = {
             "status": "error",
-            "message": f"MLflow {request['action']} failed ({type(exc).__name__}); check tracking access and credentials.",
+            "message": f"MLflow {request['action']} failed ({cause}); check tracking access and credentials.",
         }
     private_atomic_write_text(args.response, json.dumps(response, allow_nan=False))
     return 0
