@@ -48,7 +48,7 @@ pre-commit install
 | tier guard | commit | every commit, collecting the whole suite |
 | `mypy src` | push | the whole package |
 
-The contract tests are `tests/test_ledger_contract.py`, `tests/test_error_routing.py`, and `tests/test_tier_guard.py`. The tier guard collects the whole suite without running it, which applies the [integration-marker guard](#test-tiers) to every test module. `doc-check` runs the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the hook prints that it skipped. It is a maintainer-local check, and CI does not run it. The module-size hook refuses a commit that touches a `src/` or `tests/` module longer than 2000 lines, so split a module before changing it. A few test modules that were already longer carry a fixed ceiling instead: they may shrink but never grow. [`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the limit and the ceilings. When Ruff rewrites a file, the commit stops; stage the fix and commit again.
+The contract tests are `tests/test_ledger_contract.py`, `tests/test_error_routing.py`, `tests/test_tier_guard.py`, and `tests/test_ledger_read_paths.py`. The tier guard collects the whole suite without running it, which applies the [integration-marker guard](#test-tiers) to every test module. `doc-check` runs the maintainer script `~/scripts/py/doc_check.py` when it exists; otherwise the hook prints that it skipped. It is a maintainer-local check, and CI does not run it. The module-size hook refuses a commit that touches a `src/` or `tests/` module longer than 2000 lines, so split a module before changing it. A few test modules that were already longer carry a fixed ceiling instead: they may shrink but never grow. [`scripts/check_module_size.sh`](../scripts/check_module_size.sh) holds the limit and the ceilings. When Ruff rewrites a file, the commit stops; stage the fix and commit again.
 
 `pre-commit run --all-files` runs the commit hooks over the whole tree; add `--hook-stage pre-push` for mypy. The hooks are a fast subset, and plain `pytest` remains the full gate.
 
@@ -79,7 +79,7 @@ The scanner cannot follow a call into another module, so a helper shared from a 
 
 An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any test whose code would send a real signal to pytest, its parent, or either one's process group; a signal-0 liveness probe passes. A test that signals its own PID on purpose, to drive a shutdown handler, carries `@pytest.mark.signals_own_pid`, which lifts only that one target.
 
-GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier guard hook runs, and the three contract tests plus `tests/test_ledger_read_paths.py`, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
+GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier guard hook runs, and the contract tests, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
 
 The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range; do not widen it without targeted validation.
 

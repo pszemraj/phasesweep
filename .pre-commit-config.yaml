@@ -47,7 +47,7 @@ repos:
       # configuration.
       - id: contract-tests
         name: contract tests
-        entry: pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py -q -p no:cacheprovider
+        entry: pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py tests/test_ledger_read_paths.py -q -p no:cacheprovider
         language: system
         pass_filenames: false
         always_run: true
