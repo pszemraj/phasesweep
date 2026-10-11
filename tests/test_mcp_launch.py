@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
-import hashlib
 import json
 import logging
 import os
@@ -16,13 +14,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-import optuna
 import pytest
 
-import phasesweep.engine.ledger as engine_ledger
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.mcp.run_control as mcp_run_control
-import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
 from phasesweep.config import (
     Experiment,
@@ -33,20 +28,12 @@ from phasesweep.config import (
     load_experiment,
 )
 from phasesweep.engine import (
-    TerminalReport,
     run_experiment,
 )
-from phasesweep.engine.errors import StudyFingerprintMismatchError, StudySchemaMismatchError
 from phasesweep.engine.paths import (
-    _experiment_dir,
-    _generation_record_path,
     _phase_dir,
 )
 from phasesweep.engine.publication_validation import ValidatedPublication
-from phasesweep.engine.state import (
-    ARTIFACT_ROOT_ATTR,
-)
-from phasesweep.errors import OperatorAction
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
@@ -73,8 +60,6 @@ from phasesweep.runtime.reaper import (
 )
 from tests.conftest import (
     file_mode,
-    make_experiment,
-    mark_current_format,
     write_constant_trainer,
 )
 from tests.ledger_fixtures import republish_as_incomplete
@@ -84,14 +69,12 @@ from tests.mcp_helpers import (
     _config,
     _drift_experiment,
     _write_experiment_config,
-    claim_runner_handle,
     live_runs,
     make_dead_run_handle,
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
     record_runner_cleanup,
-    run_claimed_runner,
     side_effect_app,
     write_mcp_catalog,
     write_run_status,
@@ -454,87 +437,6 @@ def test_launch_retries_run_id_collision_without_touching_existing_run(
     assert result["run_id"] == fresh_id
     assert store.get(collision_id) == existing
     assert {path: path.read_bytes() for path in before} == before
-
-
-@pytest.mark.integration
-def test_runner_persists_spawned_handle_for_restart_recovery(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path)
-    store = RunStore(tmp_path / "state")
-    run_id = "srv-recover"
-    started_at = "2026-06-24T00:00:00Z"
-    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    calls: list[tuple[str, str | None, bool]] = []
-
-    def fake_run_experiment(
-        config_obj: Experiment,
-        *,
-        from_phase: str | None,
-        dry_run: bool,
-        terminal_callback,
-        generation_id: str,
-        publication_hook: object,
-    ) -> None:
-        del publication_hook
-        assert generation_id == run_id
-        calls.append((config_obj.experiment, from_phase, dry_run))
-        mark_current_format(config_obj)
-        generation_path = _generation_record_path(config_obj, generation_id)
-        generation_path.parent.mkdir(parents=True, exist_ok=True)
-        generation_path.write_text(f"generation_id: {generation_id}\n")
-        terminal_callback(
-            TerminalReport(
-                generation_id=generation_id,
-                primary_error=None,
-                cleanup_confirmed=True,
-                recovered_attempt_ids=frozenset(),
-                uncertain_attempt_ids=frozenset(),
-            )
-        )
-
-    monkeypatch.setattr("phasesweep.mcp.runner.run_experiment", fake_run_experiment)
-
-    def capture_without_fake_trial_storage(
-        experiment: Experiment,
-        *,
-        generation_id: str,
-        engine_winners: object = None,
-    ) -> dict[str, object]:
-        return capture_result_snapshot(
-            experiment,
-            generation_id=generation_id,
-        )
-
-    monkeypatch.setattr(
-        "phasesweep.mcp.runner.capture_result_snapshot",
-        capture_without_fake_trial_storage,
-    )
-
-    assert (
-        run_claimed_runner(
-            store, run_id, config, config_sha256=config_sha256, started_at=started_at
-        )
-        == 0
-    )
-
-    handle = store.get(run_id)
-    assert handle is not None
-    assert handle.launch_state == "spawned"
-    assert handle.experiment_id == "srv"
-    assert handle.config_sha256 == config_sha256
-    assert handle.pid == os.getpid()
-    assert handle.pgid == (os.getpgrp() if hasattr(os, "getpgrp") else os.getpid())
-    assert handle.pid_starttime == read_proc_starttime(os.getpid())
-    assert handle.started_at == started_at
-    assert store.state(handle) == "succeeded"
-    assert calls == [("srv", None, False)]
-    terminal = store.recorded_terminal_status(handle)
-    assert terminal is not None
-    assert terminal["result_snapshot_state"] == "complete"
-    assert terminal["result_snapshot"]["status"]["phases"][0]["phase"] == "p"
-    assert terminal["result_snapshot"]["winners"] == []
 
 
 def test_launch_does_not_spawn_when_pending_handle_create_fails(
@@ -1220,36 +1122,6 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     assert terminal["returncode"] == 1
 
 
-def test_runner_does_not_persist_a_receipt_without_boot_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    run_id = "srv-no-boot"
-    started_at = "2026-06-24T00:00:00Z"
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256="0" * 64,
-        started_at=started_at,
-    )
-    monkeypatch.setattr(mcp_runner, "read_boot_id", lambda: None)
-
-    with pytest.raises(RuntimeError, match="boot id"):
-        mcp_runner._persist_spawned_handle(
-            state_dir=tmp_path / "state",
-            run_id=run_id,
-            experiment_id="srv",
-            config_sha256="0" * 64,
-            started_at=started_at,
-            allow_cancel=False,
-        )
-
-    pending = store.get(run_id)
-    assert pending is not None
-    assert pending.launch_state == "launching"
-
-
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX spawn contract")
 @pytest.mark.integration
 def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
@@ -1374,128 +1246,6 @@ def test_launch_artifacts_and_audit_are_private_under_permissive_umask(
     assert file_mode(store.log_path(run_id)) == 0o600
     assert file_mode(store.config_snapshot_path(run_id)) == 0o600
     assert file_mode(audit_path) == 0o600
-
-
-@pytest.mark.integration
-def test_runner_rejects_config_snapshot_hash_mismatch(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    store = RunStore(tmp_path / "state")
-    run_id = "r1"
-    status_path = store.status_path(run_id)
-
-    with pytest.raises(RuntimeError, match="hash mismatch"):
-        run_claimed_runner(store, run_id, config, config_sha256="0" * 64)
-
-    status = json.loads(status_path.read_text())
-    assert status["returncode"] == 1
-    assert status["error_class"] == "RuntimeError"
-    assert status["cleanup_confirmed"] is True
-
-
-@pytest.mark.integration
-def test_preflight_failure_is_actionable_through_run_reads(tmp_path: Path) -> None:
-    trainer = write_constant_trainer(tmp_path)
-    config = tmp_path / "srv.yaml"
-    experiment = make_experiment(
-        experiment="srv",
-        persistent=tmp_path,
-        trainer=trainer,
-        phases=[
-            Phase(
-                name="p",
-                n_trials=1,
-                fixed_overrides={"k": 1},
-                sampler=Sampler(type="random", seed=0),
-                search_space={},
-            )
-        ],
-    )
-    run_experiment(experiment)
-    changed = experiment.model_copy(
-        update={"phases": [experiment.phases[0].model_copy(update={"fixed_overrides": {"k": 2}})]}
-    )
-    _write_experiment_config(config, changed)
-    registry = Registry.load(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    store = RunStore(registry.state_dir)
-    run_id = "srv-preflight-failure"
-    snapshot_path = store.config_snapshot_path(run_id)
-    snapshot_path.write_bytes(config.read_bytes())
-
-    with pytest.raises(StudyFingerprintMismatchError, match="different phase config"):
-        run_claimed_runner(store, run_id, snapshot_path)
-
-    handle = store.get(run_id)
-    assert handle is not None
-    terminal = store.recorded_terminal_status(handle)
-    assert terminal is not None
-    assert terminal["result_snapshot_state"] == "complete"
-    assert terminal["failure"]["code"] == "fingerprint_mismatch"
-    app = PhaseSweepMCP(registry, store)
-    latest = app.latest_run("srv")
-    status = app.status(run_id=run_id)
-    awaited = asyncio.run(app.await_run(run_id))
-    winners = app.winners(run_id=run_id)
-
-    for payload in (latest["run"], status["run"], awaited["run"]):
-        assert payload["failure"]["code"] == "fingerprint_mismatch"
-        assert payload["failure"]["retryable"] is False
-        assert payload["failure"]["actor"] == "operator"
-    assert status["result_source"] == "frozen_run_snapshot"
-    assert status["summary_present"] is False
-    assert status["phases"][0]["attempts_launched_this_run"] == 0
-    assert awaited["reason"] == "terminal"
-    assert winners["winner_count"] == 0
-    assert winners["failure"]["code"] == "fingerprint_mismatch"
-
-
-@pytest.mark.integration
-def test_aggregated_schema_preflight_preserves_actionable_failure_category(
-    tmp_path: Path,
-) -> None:
-    config = _config(
-        tmp_path,
-        phases="""\
-  - name: a
-    n_trials: 1
-    sampler: { type: random, seed: 0 }
-    search_space: {}
-  - name: b
-    n_trials: 1
-    sampler: { type: random, seed: 1 }
-    search_space: {}
-""",
-    )
-    experiment = load_experiment(config)
-    assert isinstance(experiment, Experiment)
-    for phase in experiment.phases:
-        study = optuna.create_study(
-            study_name=f"{experiment.experiment}::{phase.name}",
-            storage=engine_ledger._resolve_storage(experiment.resolved_storage),
-            direction="minimize",
-        )
-        # Two populated, unmarked studies model an unsupported local ledger.
-        study.set_user_attr(ARTIFACT_ROOT_ATTR, str(_experiment_dir(experiment)))
-        study.add_trial(
-            optuna.trial.create_trial(
-                value=0.5,
-                state=optuna.trial.TrialState.COMPLETE,
-            )
-        )
-
-    store = RunStore(tmp_path / "state")
-    run_id = "srv-schema-mismatch"
-
-    with pytest.raises(StudySchemaMismatchError, match="unsupported PhaseSweep study state"):
-        run_claimed_runner(store, run_id, config)
-
-    terminal = json.loads(store.status_path(run_id).read_text())
-    assert terminal["result_snapshot_state"] == "complete"
-    assert terminal["failure"]["code"] == "study_schema_mismatch"
-    assert terminal["failure"]["retryable"] is False
-    # Unsupported state routes to starting fresh, rather than to archiving
-    # this study and continuing under the current one.
-    remediation = terminal["failure"]["remediation"]
-    assert mcp_runner._OPERATOR_STEPS[OperatorAction.FRESH_NAMESPACE] in remediation
 
 
 def test_launch_bookkeeping_failure_preserves_runner_status(

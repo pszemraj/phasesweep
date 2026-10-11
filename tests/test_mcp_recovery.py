@@ -19,13 +19,7 @@ from phasesweep.config import (
     Experiment,
     load_experiment,
 )
-from phasesweep.engine import (
-    NoFeasibleTrialError,
-    ProcessCleanupUncertainError,
-    TerminalReport,
-)
 from phasesweep.engine.artifact_roots import (
-    _bind_study_artifact_root,
     _write_artifact_root_binding,
 )
 from phasesweep.engine.attempts import (
@@ -45,10 +39,7 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
-    GENERATION_ID_ATTR,
-    TRIAL_DIR_ATTR,
 )
-from phasesweep.engine.trial import UnsafeProcessCleanupError
 from phasesweep.mcp.errors import (
     ExperimentBusyError,
     RunLaunchUnsettledError,
@@ -76,7 +67,6 @@ from tests.mcp_helpers import (
     make_run_handle,
     patch_popen_capture,
     record_runner_cleanup,
-    run_claimed_runner,
     side_effect_app,
     stage_dead_run,
     write_run_status,
@@ -349,148 +339,6 @@ def test_operator_recovery_refuses_leased_preparation_with_terminal_evidence(
     assert result.exit_code != 0
     assert "launch outcome is unresolved" in result.output
     assert {path: path.read_bytes() for path in artifacts} == original
-
-
-@pytest.mark.integration
-def test_runner_records_cleanup_uncertainty_for_cleanup_errors(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path)
-    store = RunStore(tmp_path / "state")
-    run_id = "r1"
-    status_path = store.status_path(run_id)
-
-    def raise_cleanup_uncertain(*args: object, **kwargs: object) -> None:
-        raise UnsafeProcessCleanupError("trial cleanup uncertain")
-
-    monkeypatch.setattr("phasesweep.mcp.runner.run_experiment", raise_cleanup_uncertain)
-
-    with pytest.raises(UnsafeProcessCleanupError, match="trial cleanup uncertain"):
-        run_claimed_runner(store, run_id, config)
-
-    status = json.loads(status_path.read_text())
-    assert status["returncode"] == 1
-    assert status["error_class"] == "UnsafeProcessCleanupError"
-    assert status["cleanup_confirmed"] is False
-
-
-@pytest.mark.integration
-def test_runner_makes_cleanup_uncertainty_actionable_and_preserves_primary_cause(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(tmp_path)
-    store = RunStore(tmp_path / "state")
-    run_id = "r-secondary-cleanup"
-    status_path = store.status_path(run_id)
-    primary = NoFeasibleTrialError("trainer failed")
-
-    def fail_with_uncertain_cleanup(
-        config_obj: Experiment,
-        *,
-        from_phase: str | None,
-        dry_run: bool,
-        terminal_callback,
-        generation_id: str,
-        publication_hook: object,
-    ) -> None:
-        del config_obj, from_phase, dry_run, publication_hook
-        terminal_callback(
-            TerminalReport(
-                generation_id=generation_id,
-                primary_error=primary,
-                cleanup_confirmed=False,
-                recovered_attempt_ids=frozenset({"attempt-reconciled"}),
-                uncertain_attempt_ids=frozenset({"attempt-1"}),
-                recovered_attempt_generations={"attempt-reconciled": generation_id},
-                cleanup_error=ProcessCleanupUncertainError("cleanup uncertain"),
-            )
-        )
-        raise ProcessCleanupUncertainError("cleanup uncertain") from primary
-
-    monkeypatch.setattr(
-        "phasesweep.mcp.runner.run_experiment",
-        fail_with_uncertain_cleanup,
-    )
-
-    with pytest.raises(ProcessCleanupUncertainError):
-        run_claimed_runner(store, run_id, config)
-
-    status = json.loads(status_path.read_text())
-    assert status["returncode"] == 1
-    assert status["error_class"] == "ProcessCleanupUncertainError"
-    assert status["cleanup_confirmed"] is False
-    assert status["recovered_attempt_ids"] == ["attempt-reconciled"]
-    assert status["recovered_attempt_generations"] == {
-        "attempt-reconciled": run_id,
-    }
-    assert status["uncertain_attempt_ids"] == ["attempt-1"]
-    assert status["failure"]["code"] == "cleanup_uncertain"
-    assert status["failure"]["stage"] == "cleanup"
-    assert status["failure"]["retryable"] is False
-    assert status["failure"]["actor"] == "operator"
-    assert status["failure"]["cause"]["code"] == "trainer_failed"
-    assert status["failure"]["cause"]["stage"] == "execution"
-
-
-@pytest.mark.integration
-def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path) -> None:
-    """A terminal trial missing its attempt id remains attributable to recover-run."""
-    config = _config(tmp_path)
-    store = RunStore(tmp_path / "state")
-    run_id = "r-terminal-identity"
-    status_path = store.status_path(run_id)
-
-    experiment = load_experiment(config)
-    assert isinstance(experiment, Experiment)
-    phase = experiment.phases[0]
-    study = optuna.create_study(
-        study_name=f"{experiment.experiment}::{phase.name}",
-        storage=_resolve_storage(experiment.resolved_storage),
-        direction="minimize",
-    )
-    mark_current_format(experiment, study)
-    _bind_study_artifact_root(study, experiment)
-    trial = study.ask()
-    attempt_id = "terminal-identity-attempt"
-    generation_id = "earlier-generation"
-    trial_dir = _trial_dir_for(
-        experiment,
-        phase.name,
-        trial.number,
-        generation_id=generation_id,
-        attempt_id=attempt_id,
-    )
-    trial_dir.mkdir(parents=True)
-    write_attempt_lifecycle(trial_dir, attempt_id=attempt_id, state="allocated")
-    trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
-    trial.set_user_attr(GENERATION_ID_ATTR, generation_id)
-    trial.set_user_attr(CLEANUP_CONFIRMED_ATTR, False)
-    study.tell(trial, state=optuna.trial.TrialState.FAIL)
-    _register_active_attempt(
-        experiment,
-        attempt_id=attempt_id,
-        phase_name=phase.name,
-        study_name=study.study_name,
-        trial_number=trial.number,
-        trial_dir=trial_dir,
-        generation_id=generation_id,
-    )
-
-    with pytest.raises(ProcessCleanupUncertainError, match="identity is missing"):
-        run_claimed_runner(store, run_id, config)
-
-    status = json.loads(status_path.read_text())
-    assert status["cleanup_confirmed"] is False
-    assert status["uncertain_attempt_ids"] == [attempt_id]
-    # The refusal names the ledger as the first repair, so the agent hears the same.
-    assert status["failure"]["code"] == "cleanup_uncertain"
-    assert status["failure"]["remediation"] == (
-        "Ask the operator to restore or repair the storage ledger and access to it, then "
-        "run phasesweep mcp recover-run before another launch. The error in the "
-        "PhaseSweep run log gives the details."
-    )
 
 
 def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:

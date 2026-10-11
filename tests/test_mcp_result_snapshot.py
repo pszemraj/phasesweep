@@ -1,6 +1,4 @@
-"""Terminal result snapshots: what the detached runner captures from the engine's
-ledger, finalizes against confirmed cleanup, and freezes into a run's status.json.
-"""
+"""Terminal result snapshots: how the runner captures, finalizes, and freezes a run's results."""
 
 from __future__ import annotations
 
