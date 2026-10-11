@@ -89,6 +89,29 @@ def test_native_target_spelling(uri, accepted):
     assert MlflowSettings(tracking_uri=uri, experiment_name="existing").tracking_uri == uri
 
 
+@pytest.mark.parametrize("field", ["poll_seconds", "timeout_seconds"])
+@pytest.mark.parametrize("value", [2.5, float("inf"), float("nan")])
+def test_timing_values_must_be_finite(tmp_path, field, value):
+    """The process supervisor needs a finite wait, so YAML loading refuses .inf and .nan."""
+    import math
+
+    import yaml
+
+    from phasesweep.config import load_experiment
+
+    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config.update(workdir=str(tmp_path / "runs"))
+    config["mlflow"][field] = value
+    path = tmp_path / "experiment.yaml"
+    path.write_text(yaml.safe_dump(config))
+    if math.isfinite(value):
+        assert getattr(load_experiment(path).mlflow, field) == value
+    else:
+        with pytest.raises(ValidationError, match="finite number"):
+            load_experiment(path)
+    assert not (tmp_path / "runs").exists()
+
+
 @pytest.mark.parametrize("extra", [{}, {"experiment_id": "1", "experiment_name": "x"}])
 def test_exactly_one_experiment(extra):
     with pytest.raises(ValidationError):

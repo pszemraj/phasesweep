@@ -17,8 +17,8 @@ class MlflowSettings(_Frozen):
     experiment_id: str | None = Field(default=None, min_length=1)
     experiment_name: str | None = Field(default=None, min_length=1)
     run_mode: Literal["managed", "trainer"] = "managed"
-    poll_seconds: ConfigFloat = Field(default=2.0, gt=0)
-    timeout_seconds: ConfigFloat = Field(default=120.0, ge=1)
+    poll_seconds: ConfigFloat = Field(default=2.0, gt=0, allow_inf_nan=False)
+    timeout_seconds: ConfigFloat = Field(default=120.0, ge=1, allow_inf_nan=False)
 
     @field_validator("tracking_uri")
     @classmethod
