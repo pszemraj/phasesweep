@@ -598,33 +598,43 @@ def _upload_forbidden():
 
 
 @pytest.mark.parametrize(
-    "error,expected",
+    "action,error,expected",
     [
         (
+            "publish",
             lambda: ModuleNotFoundError("No module named 'mlflow'", name="mlflow"),
             "requires phasesweep[mlflow]",
         ),
         (
+            "publish",
             lambda: ModuleNotFoundError("No module named 'boto3'", name="boto3"),
             "needs Python module 'boto3'",
         ),
         (
+            "publish",
             _server_error("PERMISSION_DENIED"),
             "(MlflowException: PERMISSION_DENIED); check tracking access and credentials.",
         ),
         (
+            "publish",
             _server_error("RESOURCE_DOES_NOT_EXIST"),
             "(MlflowException: RESOURCE_DOES_NOT_EXIST); the experiment or run no longer exists.",
         ),
         (
+            "publish",
             _server_error("INVALID_PARAMETER_VALUE"),
             "(MlflowException: INVALID_PARAMETER_VALUE); MLflow rejected a logged name or value.",
         ),
-        (_upload_forbidden, "(HTTPError: 403); check tracking access and credentials."),
+        (
+            "resolve",
+            _server_error("INVALID_PARAMETER_VALUE"),
+            "(MlflowException: INVALID_PARAMETER_VALUE); MLflow rejected the configured experiment.",
+        ),
+        ("publish", _upload_forbidden, "(HTTPError: 403); check tracking access and credentials."),
     ],
-    ids=["sdk", "dependency", "denied", "deleted", "rejected", "upload"],
+    ids=["sdk", "dependency", "denied", "deleted", "rejected", "bad-target", "upload"],
 )
-def test_worker_names_the_failure_cause(tmp_path, monkeypatch, error, expected):
+def test_worker_names_the_failure_cause(tmp_path, monkeypatch, action, error, expected):
     import json
 
     from phasesweep.tracking import mlflow as worker
@@ -634,7 +644,7 @@ def test_worker_names_the_failure_cause(tmp_path, monkeypatch, error, expected):
 
     monkeypatch.setattr(worker, "_dispatch", dispatch)
     request, response = tmp_path / "request.json", tmp_path / "response.json"
-    request.write_text(json.dumps({"action": "publish"}))
+    request.write_text(json.dumps({"action": action}))
     assert worker.main([str(request), str(response)]) == 0
     message = json.loads(response.read_text())["message"]
     assert expected in message

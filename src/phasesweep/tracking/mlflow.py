@@ -399,7 +399,11 @@ def main(argv: list[str] | None = None) -> int:
         if code in {"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", 404}:
             advice = "the experiment or run no longer exists"
         elif code in {"INVALID_PARAMETER_VALUE", 400}:
-            advice = "MLflow rejected a logged name or value"
+            advice = (
+                "MLflow rejected the configured experiment"
+                if request["action"] == "resolve"
+                else "MLflow rejected a logged name or value"
+            )
         else:
             advice = "check tracking access and credentials"
         response = {
