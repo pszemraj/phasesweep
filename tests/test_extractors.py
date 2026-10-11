@@ -24,7 +24,7 @@ from phasesweep.config import (
 )
 from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.evaluation import extractor_config_fingerprint
-from tests.conftest import make_trial_context, requires_nonroot
+from tests.conftest import make_trial_context
 
 
 def _wandb_poll(**kwargs):
@@ -1022,128 +1022,6 @@ def test_log_regex_reports_no_matches(tmp_path):
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
-@requires_nonroot
-def test_artifact_size_directory_gate_rejects_unreadable_subtree(tmp_path: Path) -> None:
-    """An incomplete traversal cannot establish a checkpoint-size bound."""
-    private = tmp_path / "checkpoint" / "weights"
-    private.mkdir(parents=True)
-    (private / "model.bin").write_bytes(b"x" * 16_384)
-    private.chmod(0)
-    try:
-        result = evaluate_gates(
-            make_trial_context(tmp_path),
-            [
-                ArtifactSizeGate(
-                    type="artifact_size",
-                    path="checkpoint",
-                    source="directory",
-                    max_bytes=1024,
-                )
-            ],
-        )[0]
-    finally:
-        private.chmod(0o700)
-
-    assert result.passed is False
-    assert "could not inspect checkpoint" in result.detail
-
-
-def test_artifact_size_directory_gate_counts_file_symlinks_not_directory_symlinks(
-    tmp_path: Path,
-) -> None:
-    """File-link targets count, while linked directories are not traversed."""
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    (checkpoint / "metadata.bin").write_bytes(b"meta")
-    external = tmp_path / "external"
-    external.mkdir()
-    (external / "weights.bin").write_bytes(b"x" * 16_384)
-    (external / "metadata-link.bin").write_bytes(b"linked!")
-    (checkpoint / "linked-weights").symlink_to(external, target_is_directory=True)
-    (checkpoint / "linked-metadata.bin").symlink_to(external / "metadata-link.bin")
-
-    result = evaluate_gates(
-        make_trial_context(tmp_path),
-        [
-            ArtifactSizeGate(
-                type="artifact_size",
-                path="checkpoint",
-                source="directory",
-                max_bytes=11,
-            )
-        ],
-    )[0]
-
-    assert result.passed is True
-    assert "directory size 11 within bounds" in result.detail
-
-
-def test_artifact_size_directory_gate_reports_root_inspection_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A root metadata error is failed evidence with its original path detail."""
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    real_stat = Path.stat
-
-    def fail_root_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if self == checkpoint and not follow_symlinks:
-            raise OSError("root metadata unavailable")
-        return real_stat(self, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(Path, "stat", fail_root_stat)
-
-    result = evaluate_gates(
-        make_trial_context(tmp_path),
-        [
-            ArtifactSizeGate(
-                type="artifact_size",
-                path="checkpoint",
-                source="directory",
-                max_bytes=1024,
-            )
-        ],
-    )[0]
-
-    assert result.passed is False
-    assert str(checkpoint) in result.detail
-    assert "root metadata unavailable" in result.detail
-
-
-def test_artifact_size_directory_gate_reports_descendant_stat_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A child metadata error cannot be silently excluded from a directory size."""
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    child = checkpoint / "model.bin"
-    child.write_bytes(b"payload")
-    real_stat = Path.stat
-
-    def fail_child_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if self == child and follow_symlinks:
-            raise OSError("descendant metadata unavailable")
-        return real_stat(self, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(Path, "stat", fail_child_stat)
-
-    result = evaluate_gates(
-        make_trial_context(tmp_path),
-        [
-            ArtifactSizeGate(
-                type="artifact_size",
-                path="checkpoint",
-                source="directory",
-                max_bytes=1024,
-            )
-        ],
-    )[0]
-
-    assert result.passed is False
-    assert str(child) in result.detail
-    assert "descendant metadata unavailable" in result.detail
-
-
 def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     """The provenance sink freezes the exact evidence bytes and the extractor's
     config identity at extraction time (review v0.5.17 / finding F)."""
@@ -1300,46 +1178,3 @@ def test_log_regex_first_hashes_invalid_utf8_suffix_without_decoding_it(tmp_path
     assert run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance) == 1.0
     assert provenance["source"]["sha256"] == hashlib.sha256(raw).hexdigest()
     assert provenance["source"]["size_bytes"] == len(raw)
-
-
-def test_gate_results_mark_expired_local_gate(tmp_path):
-    """An expired deadline marks an unevaluated local gate as exhausted."""
-    gate = JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)
-
-    expired = evaluate_gates(make_trial_context(tmp_path), [gate], deadline=0.0)[0]
-    ordinary = evaluate_gates(make_trial_context(tmp_path), [gate])[0]
-
-    assert expired.deadline_exhausted is True
-    assert ordinary.deadline_exhausted is False
-
-
-class _UnregisteredGate:
-    """Stand-in for a ``Gate`` union member with no ``_GATE_DISPATCH`` entry."""
-
-    type = "unregistered"
-
-    def __repr__(self) -> str:
-        return "_UnregisteredGate()"
-
-
-@pytest.mark.parametrize("deadline", [None, 0.0, "future"])
-def test_unregistered_gate_type_fails_instead_of_raising(tmp_path, deadline):
-    """An unhandled gate type degrades to one failing gate, never a KeyError.
-
-    A bare ``_GATE_DISPATCH[type(gate)]`` lookup raises ``KeyError``, which is
-    not an ``ExtractorError`` and is not in Optuna's ``catch=`` tuple, so it
-    would escape the objective and abort the entire phase and run mid-sweep.
-    """
-    ctx = make_trial_context(tmp_path)
-    resolved = time.monotonic() + 5.0 if deadline == "future" else deadline
-    known = JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)
-
-    results = evaluate_gates(ctx, [_UnregisteredGate(), known], deadline=resolved)  # type: ignore[list-item]
-
-    assert len(results) == 2
-    assert results[0].passed is False
-    assert results[0].gate_type == "_UnregisteredGate"
-    assert "unknown gate" in results[0].detail
-    # Evaluation continues past the unknown gate rather than aborting the trial.
-    assert results[1].gate_type == "json_equals"
-    assert results[1].passed is False
