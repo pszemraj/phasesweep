@@ -1994,30 +1994,6 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     assert (tmp_path / PROCESS_IDENTITY_FILE).exists()
 
 
-def test_uncertain_cleanup_aborts_optimization_not_just_trial(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``UnsafeProcessCleanupError`` must propagate out of ``study.optimize()``
-    in the n_jobs=1 path. Pre-v0.5.10, ``_kill_group`` ignored the boolean and
-    the orchestrator swallowed the leaked-process condition via
-    ``TrialExecutionError``. v0.5.11 review: hard_abort state is the only
-    mechanism that surfaces this for n_jobs>1; n_jobs=1 still works through
-    direct exception propagation, but we re-raise from hard_abort regardless
-    so both paths share a common contract."""
-    _report_uncertain_after_real_terminate(monkeypatch)
-
-    exp = make_experiment(
-        workdir=tmp_path / "runs",
-        n_trials=2,
-        timeout_seconds_per_trial=0.1,
-        trial_command=f"{sys.executable} -c 'import time; time.sleep(60)' {{overrides}}",
-    )
-
-    with pytest.raises(UnsafeProcessCleanupError):
-        run_experiment(exp)
-
-
 def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

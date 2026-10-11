@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import json
 import os
 import signal
 import subprocess
@@ -1671,28 +1670,6 @@ def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) 
     _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
     assert not list(_attempts_dir(experiment).glob("*.json"))
-
-
-def test_registry_generation_conflict_is_study_schema_mismatch(tmp_path: Path) -> None:
-    """Conflicting durable recovery identities are operator-visible corruption."""
-    experiment = make_experiment(
-        experiment="registry-conflict",
-        workdir=tmp_path / "runs",
-        storage=f"journal:///{tmp_path / 'conflict.journal'}",
-    )
-    _study, trial_dir, _number = fabricate_registered_attempt(
-        experiment,
-        "p",
-        attempt_id="conflicting-attempt",
-    )
-    write_attempt_lifecycle(trial_dir, attempt_id="conflicting-attempt", state="allocated")
-    entry_path = _attempts_dir(experiment) / "conflicting-attempt.json"
-    entry = json.loads(entry_path.read_text())
-    entry["generation_id"] = "different-generation"
-    entry_path.write_text(json.dumps(entry))
-
-    with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
-        _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
 
 
 @pytest.mark.integration

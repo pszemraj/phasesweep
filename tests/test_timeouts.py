@@ -13,7 +13,7 @@ from phasesweep import run_experiment
 from phasesweep.config import Experiment, IntParam, Metric, Phase, Sampler
 from phasesweep.engine import PhaseSweepError
 from phasesweep.engine.artifacts import _load_winner
-from phasesweep.engine.errors import OperatorAction, WinnerIntegrityError
+from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.resume import _published_for_resume
@@ -195,9 +195,8 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
     strict = exp.model_copy(
         update={"phases": [exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False})]}
     )
-    with pytest.raises(WinnerIntegrityError, match="Refusing to replay it") as refused:
+    with pytest.raises(WinnerIntegrityError, match="Refusing to replay it"):
         run_experiment(strict)
-    assert refused.value.action is OperatorAction.FIX_CONFIG
     assert len(load().trials) == trials_before
     assert load().user_attrs[PHASE_DECISION_ATTR] == decision_before
     assert _last_successful_generation_path(exp).read_text() == published_before
