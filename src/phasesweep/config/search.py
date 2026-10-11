@@ -324,6 +324,8 @@ def _validate_sampler_search_space(phase: Phase) -> None:
 
     Run at config-load (review v0.5.2 / blocker 2). Catches:
 
+    * ``allow_partial_grid: true`` with a sampler other than ``grid``; the
+      switch is read only for grid, so any other sampler would silently ignore it.
     * CMA-ES with categorical parameters — Optuna's ``CmaEsSampler`` is float-only;
       categorical params silently fail every trial trying to cast 'b' to float.
     * CMA-ES without the ``cmaes`` package importable. ``cmaes`` is a declared
@@ -348,7 +350,8 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     :func:`grid_search_space`, both before this product is taken.
 
     :param Phase phase: Phase whose sampler and search space are checked together.
-    :raises ValueError: If the CMA-ES sampler is paired with categorical params or
+    :raises ValueError: If ``allow_partial_grid`` is set with a non-grid sampler,
+        if the CMA-ES sampler is paired with categorical params or
         the ``cmaes`` package is not importable, if the grid sampler cannot
         enumerate a parameter (raised by :func:`grid_search_space`), or if
         ``n_trials`` exceeds the grid cardinality or does not equal it without
@@ -356,6 +359,14 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     """
     sampler_type = phase.sampler.type
     space = phase.search_space
+
+    if phase.allow_partial_grid and sampler_type != "grid":
+        raise ValueError(
+            f"Phase {phase.name!r}: allow_partial_grid: true applies only to "
+            f"sampler.type='grid', but this phase uses sampler.type={sampler_type!r}, "
+            "which would silently ignore it. Remove allow_partial_grid or set "
+            "sampler.type: grid."
+        )
 
     if sampler_type == "cmaes":
         cats = [name for name, p in space.items() if isinstance(p, CategoricalParam)]

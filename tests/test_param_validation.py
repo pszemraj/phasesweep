@@ -408,6 +408,20 @@ def test_validate_accepts_explicit_partial_grid() -> None:
     )
 
 
+@pytest.mark.parametrize("sampler_type", ["tpe", "random", "cmaes"])
+def test_validate_rejects_partial_grid_switch_on_a_non_grid_sampler(sampler_type: str) -> None:
+    """``allow_partial_grid`` is read only for grid, so another sampler would silently ignore it."""
+    with pytest.raises(
+        ValidationError,
+        match=rf"allow_partial_grid: true applies only to sampler\.type='grid'.*{sampler_type!r}",
+    ):
+        make_experiment(
+            n_trials=2,
+            sampler=Sampler(type=sampler_type),
+            allow_partial_grid=True,
+        )
+
+
 def test_validate_rejects_partial_grid_above_cardinality() -> None:
     """Partial-grid mode permits a subset, not an impossible oversized budget."""
     with pytest.raises(ValidationError, match="n_trials=4 exceeds the grid cardinality 3"):

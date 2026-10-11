@@ -487,7 +487,7 @@ phases: list[object] (required)
     allow_incomplete_on_timeout: bool = false
 
     # Allow phases[].n_trials smaller than the number of grid combinations. false requires the full matrix.
-    # Only used when: phases[].sampler.type is grid. It is read only at config load, so true with another sampler is silently ignored.
+    # Only used when: phases[].sampler.type is grid. true with tpe, random or cmaes fails config load.
     # phases[].n_trials must still not exceed the combination count; config load fails otherwise.
     # Excluded from the study fingerprint.
     allow_partial_grid: bool = false

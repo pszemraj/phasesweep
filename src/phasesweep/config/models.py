@@ -363,7 +363,7 @@ class Phase(_Frozen):
         default=False,
         description=(
             "Grid phases must run the full matrix by default. Set true to permit "
-            "n_trials smaller than the grid cardinality."
+            "n_trials smaller than the grid cardinality. Valid only with sampler.type grid."
         ),
     )
     allow_seed_search: bool = Field(
