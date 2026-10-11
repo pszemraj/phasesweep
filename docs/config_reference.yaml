@@ -618,7 +618,7 @@ constraints: list[object] = []
 # Optional native MLflow source and result destination; no standalone or cross-backend publishing.
 # Unset: MLflow integration is off; MLflow extractors/gates without this block fail config load.
 # Requires: metric.extractor.type must be mlflow and W&B extractors/gates cannot be mixed anywhere; violations fail config load. Local JSON/log constraints and local gates remain allowed.
-# Requires: the controller must have the MLflow extra installed, the target experiment must already exist and credentials must reach both controller and trainer; validate/dry-run do not verify authentication or experiment existence; a run checks both before allocating any trial.
+# Requires: the controller must have the MLflow extra installed, the target experiment must already exist and credentials must reach both controller and trainer; validate/dry-run do not verify authentication or experiment existence; each phase checks both before allocating any trial.
 # Result projections are queued automatically for accepted trials and generation summaries. A failed upload leaves pending delivery without invalidating accepted scientific results; phasesweep sync-tracking CONFIG retries every generation's saved projections (--generation ID limits it to one) without training or rereading metrics. No YAML publishing/retry switch is provided.
 mlflow: object | null = null
   # Existing tracking server target: HTTP(S) URL, databricks or databricks://profile. HTTP scheme/host are lowercased and trailing path slashes stripped; embedded credentials, query, fragment and profile names containing spaces are rejected. Local file/sqlite tracking URIs are unsupported.
