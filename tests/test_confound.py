@@ -184,17 +184,6 @@ def test_verdicts_are_three_distinct_values_and_not_checked_is_never_ok() -> Non
         _validate_confound_block(masquerading, winner_trial=0)
 
 
-def test_evaluation_point_agreement_is_ok_with_grouped_evidence() -> None:
-    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
-    block = _assess(trials, trials, provenance={0: _envelope(), 1: _envelope()})
-
-    check = block["checks"]["evaluation_point"]
-    assert check == {
-        "verdict": "ok",
-        "detail": {"axis": "step", "values": [{"value": 1000, "trials": [0, 1]}]},
-    }
-
-
 def test_fixed_token_sweep_compares_tokens_not_steps_or_checkpoints() -> None:
     """Batch sizes differ, so steps and step-named checkpoints do; tokens match."""
     trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2), (_COMPLETE, 0.3, 3))

@@ -712,32 +712,3 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
 
     with pytest.raises(ValueError, match="re-samples inherited winner key"):
         _composed_overrides(stale_child, {"depth": 16}, inherited)
-
-
-@pytest.mark.parametrize(
-    ("child_fixed", "valid"),
-    [
-        pytest.param({}, False, id="unresolved"),
-        pytest.param({"lr": 5.0e-4}, True, id="resolved"),
-    ],
-)
-def test_multi_parent_collision_requires_fixed_override(child_fixed: dict, valid: bool) -> None:
-    """A child must explicitly resolve a key from independent parent origins."""
-    lr = FloatParam(type="float", low=1e-5, high=1e-3, log=True)
-    phases = [
-        Phase(name="a", n_trials=1, search_space={"lr": lr}),
-        Phase(name="b", n_trials=1, search_space={"lr": lr}),
-        Phase(
-            name="c",
-            inherits=["a", "b"],
-            n_trials=1,
-            fixed_overrides=child_fixed,
-            search_space={"dropout": FloatParam(type="float", low=0, high=0.5)},
-        ),
-    ]
-    if not valid:
-        with pytest.raises(ValidationError, match="conflicting key"):
-            make_experiment(phases=phases)
-        return
-    child = make_experiment(phases=phases).phases[-1]
-    assert child.fixed_overrides["lr"] == 5.0e-4

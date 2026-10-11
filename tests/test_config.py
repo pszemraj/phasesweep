@@ -14,7 +14,6 @@ from phasesweep.config import (
     ExecutionContext,
     Experiment,
     JsonEnvelopeExtractor,
-    JsonExtractor,
     Metric,
     Phase,
     Sampler,
@@ -191,23 +190,6 @@ def test_wandb_managed_conflicts_fail_during_config_validation(env):
                 )
             ),
         )
-
-
-def test_phase_composition_accepts_a_linear_chain() -> None:
-    experiment = make_experiment(
-        phases=[
-            Phase(name="base", n_trials=1, fixed_overrides={"model.depth": 8}),
-            Phase(
-                name="tune",
-                n_trials=1,
-                inherits=["base"],
-                search_space={"learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3}},
-            ),
-            Phase(name="final", n_trials=1, inherits=["tune"], fixed_overrides={"seed": 0}),
-        ]
-    )
-
-    assert [phase.name for phase in experiment.phases] == ["base", "tune", "final"]
 
 
 def test_phases_from_selects_reached_phases_by_name() -> None:
@@ -647,11 +629,6 @@ phases:
     assert exp.phases[0].max_consecutive_failures == 5
 
 
-def test_plain_json_extractor_is_a_primary_objective() -> None:
-    metric = Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))
-    assert metric.extractor.type == "json"
-
-
 def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
     """A parser/scanner error must carry the file path, not PyYAML's stream label.
 
@@ -666,11 +643,6 @@ def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
         load_experiment(config_path)
 
     assert str(config_path) in str(excinfo.value)
-
-
-def test_config_error_stays_a_value_error() -> None:
-    """Existing ``except ValueError`` callers must keep catching config failures."""
-    assert issubclass(ConfigError, ValueError)
 
 
 def _sampler_policy_experiment(

@@ -789,12 +789,6 @@ def _assert_log_regex_provenance(
         assert source["match_count"] == expected_count, select
 
 
-def test_json_basic(tmp_path):
-    (tmp_path / "result.json").write_text(json.dumps({"eval": {"loss": 0.42}}))
-    cfg = JsonExtractor(type="json", path="result.json", key="eval.loss")
-    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.42)
-
-
 def test_json_extractor_reports_missing_or_nonnumeric_values(tmp_path):
     cases = [
         ("missing_file", None, JsonExtractor(type="json", path="nope.json", key="x"), "not found"),

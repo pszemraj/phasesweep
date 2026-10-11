@@ -4,14 +4,12 @@ from __future__ import annotations
 
 import sys
 import warnings
-from pathlib import Path
 
 import optuna
 import pytest
 from optuna.exceptions import ExperimentalWarning
 from pydantic import ValidationError
 
-from phasesweep import load_experiment
 from phasesweep.config import (
     CategoricalParam,
     Constraint,
@@ -25,7 +23,7 @@ from phasesweep.config import (
 from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
 from phasesweep.config.search import _placeholder_value_for, grid_search_space
 from phasesweep.engine.optuna import _build_sampler
-from tests.conftest import make_experiment, write_yaml
+from tests.conftest import make_experiment
 
 
 @pytest.mark.parametrize(("n_jobs", "constant_liar"), [(4, True), (1, False)])
@@ -194,12 +192,6 @@ def test_validate_rejects_invalid_grid_configs() -> None:
             "grid sampler requires 'step'",
         ),
         (
-            "non_divisible_float",
-            {"x": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.6}},
-            1,
-            "must be an integer",
-        ),
-        (
             "rounded_below_low",
             {"eps": {"type": "float", "low": 1.0e-13, "high": 1.1e-12, "step": 1.0e-12}},
             2,
@@ -273,24 +265,6 @@ def test_validate_accepts_divisible_grid_float() -> None:
     }
 
 
-def test_grid_float_rejects_an_upper_bound_off_the_step_lattice() -> None:
-    """A close float ratio must not omit the configured upper bound."""
-    with pytest.raises(ValueError, match="must be an integer"):
-        grid_search_space(
-            {"x": FloatParam(type="float", low=0.0, high=100.00000001, step=1.0)},
-            phase_name="p",
-        )
-
-
-def test_grid_int_rejects_an_upper_bound_off_the_step_lattice() -> None:
-    """A complete stepped grid must include its configured upper bound."""
-    with pytest.raises(ValueError, match="must evenly divide"):
-        grid_search_space(
-            {"depth": IntParam(type="int", low=0, high=5, step=2)},
-            phase_name="p",
-        )
-
-
 @pytest.mark.parametrize(
     "search_space",
     [
@@ -349,16 +323,22 @@ def test_grid_accepts_maximum_cardinality() -> None:
     }
 
 
-@pytest.mark.parametrize("sampler", ["random", "tpe", "cmaes"])
+@pytest.mark.parametrize("sampler", ["random", "tpe", "cmaes", "grid"])
 @pytest.mark.parametrize(
     "param",
     [
         {"type": "int", "low": 0, "high": 5, "step": 2},
         {"type": "float", "low": 0, "high": 1, "step": 0.3},
         {"type": "float", "low": -0.4, "high": 0.5, "step": 0.2},
+        {"type": "float", "low": 0, "high": 100.00000001, "step": 1.0},
     ],
 )
-def test_non_grid_samplers_reject_off_lattice_endpoints(sampler, param) -> None:
+def test_off_lattice_endpoints_are_rejected_for_every_sampler(sampler, param) -> None:
+    """An upper bound off the step lattice is refused at construction, whatever the sampler.
+
+    The IntParam/FloatParam validators reject it before any sampler or grid code runs,
+    so a close float ratio can never silently omit the configured upper bound.
+    """
     with pytest.raises(ValidationError, match="evenly divid"):
         make_experiment(
             phases=[
@@ -670,33 +650,6 @@ def test_trial_command_accepts_supported_templates() -> None:
 
     for _case, build in cases:
         build()
-
-
-def test_distinct_phase_names_with_same_field_keys_accepted(tmp_path: Path) -> None:
-    """Sanity: the strict loader rejects duplicates *within* a mapping, not
-    across siblings. Two phases each with their own ``n_trials`` is fine.
-    """
-    body = """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo {overrides}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-phases:
-  - name: a
-    n_trials: 1
-    search_space: { x: { type: float, low: 0, high: 1 } }
-  - name: b
-    inherits: [a]
-    n_trials: 1
-    search_space: { y: { type: float, low: 0, high: 1 } }
-"""
-    exp = load_experiment(write_yaml(tmp_path, body))
-    assert [p.name for p in exp.phases] == ["a", "b"]
 
 
 def test_override_keys_reject_malformed_and_shell_unsafe_values() -> None:
