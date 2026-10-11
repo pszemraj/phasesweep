@@ -415,15 +415,6 @@ def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return run_experiment(materialized.experiment)
 
 
-def _run_over_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
-    """Return a trigger that starts a run over a current golden ledger ``damage`` hit."""
-
-    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        return run_experiment(_materialize_damaged(tmp_path, fixture, "tree", damage).experiment)
-
-    return trigger
-
-
 @contextmanager
 def _read_only_once_locked(journal: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Let Optuna's journal lock succeed, then deny writes to the journal's directory.
