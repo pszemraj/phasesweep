@@ -76,7 +76,6 @@ from tests.conftest import (
     file_mode,
     make_experiment,
     mark_current_format,
-    reaped_pid,
     write_constant_trainer,
 )
 from tests.ledger_fixtures import republish_as_incomplete
@@ -88,6 +87,7 @@ from tests.mcp_helpers import (
     _write_experiment_config,
     claim_runner_handle,
     live_runs,
+    make_dead_run_handle,
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
@@ -429,12 +429,10 @@ def test_launch_retries_run_id_collision_without_touching_existing_run(
     patch_popen_capture(monkeypatch)
     collision_id = "srv-collision"
     fresh_id = "srv-fresh"
-    existing = make_run_handle(
+    existing = make_dead_run_handle(
         run_id=collision_id,
         experiment_id="srv",
         config_sha256=registry.get("srv").config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
     )
     store.create(existing)
     store.config_snapshot_path(collision_id).write_bytes(b"existing config\n")

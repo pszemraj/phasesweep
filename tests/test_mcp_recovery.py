@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable
-from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
@@ -70,7 +69,9 @@ from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     _catalog,
     _config,
+    earlier_boot_id,
     live_runs,
+    make_dead_run_handle,
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
@@ -156,14 +157,7 @@ def _stage_stale_running_recovery_scaffold(
     attempt_id, recover)``.
     """
     config = _config(tmp_path)
-    recorded_boot_id = None
-    if earlier_boot:
-        current_boot_id = read_boot_id()
-        if current_boot_id is None:
-            pytest.skip("boot id unavailable on this platform")
-        recorded_boot_id = "00000000-0000-0000-0000-000000000000"
-        if recorded_boot_id == current_boot_id:
-            recorded_boot_id = "11111111-1111-1111-1111-111111111111"
+    recorded_boot_id = earlier_boot_id() if earlier_boot else None
     trial_number = write_launched_stale_trial(
         config,
         cleanup_confirmed=False,
@@ -175,16 +169,13 @@ def _stage_stale_running_recovery_scaffold(
     assert isinstance(experiment, Experiment)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
-    handle = make_run_handle(
+    handle = make_dead_run_handle(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
         allow_cancel=allow_cancel,
+        boot_id=recorded_boot_id,
     )
-    if recorded_boot_id is not None:
-        handle = replace(handle, boot_id=recorded_boot_id)
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
     if include_generation_record:
@@ -508,14 +499,7 @@ def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-terminal-uncertain"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
+    handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
     write_unsafe_cleanup_status(store, run_id)
 
     assert store.state(handle) == "running"
@@ -617,16 +601,7 @@ def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-recovery-unknown-boot"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
-    store.mark_cleanup_uncertain(handle)
+    stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
     monkeypatch.setattr(mcp_runs, "read_boot_id", lambda: None)
     monkeypatch.setattr(mcp_recovery, "read_boot_id", lambda: None, raising=False)
     signalled: list[object] = []
@@ -662,12 +637,10 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-earlier-boot"
-    handle = replace(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-        ),
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
         boot_id="00000000-0000-0000-0000-000000000000",
     )
     store.create(handle)
@@ -698,23 +671,15 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A rebooted no-status run frees capacity without borrowing later results."""
-    current_boot = read_boot_id()
-    if current_boot is None:
-        pytest.skip("boot id unavailable on this platform")
     config = _config(tmp_path)
     app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-earlier-boot-no-status"
-    earlier_boot = "00000000-0000-0000-0000-000000000000"
-    if earlier_boot == current_boot:
-        earlier_boot = "11111111-1111-1111-1111-111111111111"
-    handle = replace(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-        ),
-        boot_id=earlier_boot,
+    handle = make_run_handle(
+        run_id=run_id,
+        experiment_id=reg.id,
+        config_sha256=reg.config_sha256,
+        boot_id=earlier_boot_id(),
     )
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
@@ -1778,12 +1743,10 @@ def test_operator_recovery_refuses_unverifiable_run(
     _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     reg = registry.get("srv")
     run_id = "srv-unverifiable-recovery"
-    handle = make_run_handle(
+    handle = make_dead_run_handle(
         run_id=run_id,
         experiment_id=reg.id,
         config_sha256=reg.config_sha256,
-        pid=reaped_pid(),
-        starttime=111,
     )
     store.create(handle)
     store.config_snapshot_path(run_id).write_bytes(config.read_bytes() + snapshot_suffix)

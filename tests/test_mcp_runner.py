@@ -65,7 +65,6 @@ from tests.conftest import (
     REPO,
     make_experiment,
     mark_current_format,
-    reaped_pid,
     requires_nonroot,
     single_trial_confound,
     write_constant_trainer,
@@ -75,6 +74,7 @@ from tests.ledger_fixtures import published_generation_id
 from tests.mcp_helpers import (
     claim_runner_handle,
     live_runs,
+    make_dead_run_handle,
     make_mcp_app,
     make_run_handle,
     run_claimed_runner,
@@ -1699,7 +1699,7 @@ def test_unpersistable_complete_transition_keeps_the_recoverable_pending_record(
     """
     store = RunStore(tmp_path / "state")
     run_id = "pending-run"
-    handle = make_run_handle(run_id=run_id, experiment_id="exp", pid=reaped_pid(), starttime=111)
+    handle = make_dead_run_handle(run_id=run_id, experiment_id="exp")
     store.create(handle)
     status_path = store.status_path(run_id)
     monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", lambda snapshot: snapshot)

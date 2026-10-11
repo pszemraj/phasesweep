@@ -28,6 +28,8 @@ from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     _catalog,
     _config,
+    earlier_boot_id,
+    make_dead_run_handle,
     make_mcp_app,
     make_run_handle,
     stage_dead_run,
@@ -112,24 +114,13 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
     Reached through a run left ``running`` by an unfinalized terminal snapshot,
     which is the state a reboot mid-finalization leaves behind.
     """
-    current_boot = read_boot_id()
-    if current_boot is None:
-        pytest.skip("boot id unavailable on this platform")
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    handle = replace(
-        make_run_handle(
-            run_id="srv-boot",
-            experiment_id="srv",
-            pid=reaped_pid(),
-            starttime=111,
-            allow_cancel=True,
-        ),
-        boot_id=(
-            "00000000-0000-0000-0000-000000000000"
-            if current_boot != "00000000-0000-0000-0000-000000000000"
-            else "11111111-1111-1111-1111-111111111111"
-        ),
+    handle = make_dead_run_handle(
+        run_id="srv-boot",
+        experiment_id="srv",
+        allow_cancel=True,
+        boot_id=earlier_boot_id(),
     )
     store.create(handle)
     write_run_status(store, "srv-boot", returncode=0, result_snapshot_state="pending")
@@ -161,14 +152,10 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
         pytest.skip("boot id unavailable on this platform")
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
-    handle = replace(
-        make_run_handle(
-            run_id="srv-unknown-boot",
-            experiment_id="srv",
-            pid=reaped_pid(),
-            starttime=111,
-            allow_cancel=True,
-        ),
+    handle = make_dead_run_handle(
+        run_id="srv-unknown-boot",
+        experiment_id="srv",
+        allow_cancel=True,
         boot_id=current_boot,
     )
     store.create(handle)

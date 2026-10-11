@@ -208,7 +208,21 @@ def make_run_handle(
     launch_state: RunLaunchState = "spawned",
     allow_cancel: bool = False,
     visible_params_at_launch: VisibleParamsPolicy = "none",
+    boot_id: str | None = None,
 ) -> RunHandle:
+    """Build a run handle; by default a spawned one owned by pytest itself.
+
+    :param str run_id: Run identifier.
+    :param str experiment_id: Catalog experiment identifier.
+    :param str config_sha256: Configuration digest the handle pins.
+    :param int | None pid: Runner PID, or this process when ``None``.
+    :param int | None starttime: Runner start time, or the one read from ``/proc`` when ``None``.
+    :param RunLaunchState launch_state: ``launching`` records no process identity at all.
+    :param bool allow_cancel: Whether the launch snapshot permits cancellation.
+    :param VisibleParamsPolicy visible_params_at_launch: Parameter visibility frozen at launch.
+    :param str | None boot_id: Boot id to record, or this host's current one when ``None``.
+    :return RunHandle: The handle, not yet persisted.
+    """
     if launch_state == "launching":
         process_id = None
         process_group_id = None
@@ -236,8 +250,35 @@ def make_run_handle(
         launch_state=launch_state,
         allow_cancel=allow_cancel,
         visible_params_at_launch=visible_params_at_launch,
-        boot_id=read_boot_id() if launch_state == "spawned" else None,
+        boot_id=(read_boot_id() if boot_id is None else boot_id)
+        if launch_state == "spawned"
+        else None,
     )
+
+
+#: Start time recorded for a runner that is gone; no live process has it.
+DEAD_RUNNER_STARTTIME = 111
+
+
+def make_dead_run_handle(**kwargs: Any) -> RunHandle:
+    """Build a spawned handle whose runner has already exited.
+
+    :param kwargs: Arguments for :func:`make_run_handle` other than ``pid`` and ``starttime``.
+    :return RunHandle: Handle naming a reaped PID and :data:`DEAD_RUNNER_STARTTIME`.
+    """
+    return make_run_handle(pid=reaped_pid(), starttime=DEAD_RUNNER_STARTTIME, **kwargs)
+
+
+def earlier_boot_id() -> str:
+    """Return a boot id that cannot be this host's current one, skipping when none is readable.
+
+    :return str: Boot id differing from ``read_boot_id()``.
+    """
+    current = read_boot_id()
+    if current is None:
+        pytest.skip("boot id unavailable on this platform")
+    other = "00000000-0000-0000-0000-000000000000"
+    return other if other != current else "11111111-1111-1111-1111-111111111111"
 
 
 def live_runs(store: RunStore) -> list[RunHandle]:
@@ -376,10 +417,6 @@ def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     write_status_file(store.status_path(run_id), full_payload)
 
 
-#: Start time recorded for a runner that is gone; no live process has it.
-DEAD_RUNNER_STARTTIME = 111
-
-
 def stage_dead_run(
     store: RunStore,
     run_id: str,
@@ -391,12 +428,10 @@ def stage_dead_run(
 ) -> RunHandle:
     """Persist a spawned run of ``config`` whose runner has exited, as recover-run finds it."""
     snapshot = config.read_bytes()
-    handle = make_run_handle(
+    handle = make_dead_run_handle(
         run_id=run_id,
         experiment_id=experiment_id,
         config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        pid=reaped_pid(),
-        starttime=DEAD_RUNNER_STARTTIME,
         allow_cancel=allow_cancel,
     )
     store.create(handle)
