@@ -384,13 +384,21 @@ def main(argv: list[str] | None = None) -> int:
 
         if not isinstance(exc, MlflowException | RequestException | OSError):
             raise
-        # The server's error code, e.g. PERMISSION_DENIED, carries no secrets.
-        cause = type(exc).__name__
-        if isinstance(exc, MlflowException):
-            cause = f"{cause}: {exc.error_code}"
+        # The server's error code, e.g. PERMISSION_DENIED, or the HTTP status of an
+        # artifact upload carries no secrets; the exception text may.
+        code = getattr(exc, "error_code", None) or getattr(
+            getattr(exc, "response", None), "status_code", None
+        )
+        cause = f"{type(exc).__name__}: {code}" if code else type(exc).__name__
+        if code in {"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", 404}:
+            advice = "the experiment or run no longer exists"
+        elif code in {"INVALID_PARAMETER_VALUE", 400}:
+            advice = "MLflow rejected a logged name or value"
+        else:
+            advice = "check tracking access and credentials"
         response = {
             "status": "error",
-            "message": f"MLflow {request['action']} failed ({cause}); check tracking access and credentials.",
+            "message": f"MLflow {request['action']} failed ({cause}); {advice}.",
         }
     private_atomic_write_text(args.response, json.dumps(response, allow_nan=False))
     return 0

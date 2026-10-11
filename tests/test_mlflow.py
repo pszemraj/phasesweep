@@ -567,11 +567,22 @@ def test_missing_sdk_is_refused_before_any_trial(tmp_path, monkeypatch):
             operation(experiment)
 
 
-def _permission_denied():
-    from mlflow.exceptions import MlflowException
-    from mlflow.protos.databricks_pb2 import PERMISSION_DENIED
+def _server_error(code):
+    def error():
+        from mlflow.exceptions import MlflowException
+        from mlflow.protos import databricks_pb2
 
-    return MlflowException("private server detail", error_code=PERMISSION_DENIED)
+        return MlflowException("private server detail", error_code=getattr(databricks_pb2, code))
+
+    return error
+
+
+def _upload_forbidden():
+    from requests import HTTPError, Response
+
+    response = Response()
+    response.status_code = 403
+    return HTTPError("private upload detail", response=response)
 
 
 @pytest.mark.parametrize(
@@ -585,9 +596,21 @@ def _permission_denied():
             lambda: ModuleNotFoundError("No module named 'boto3'", name="boto3"),
             "needs Python module 'boto3'",
         ),
-        (_permission_denied, "(MlflowException: PERMISSION_DENIED)"),
+        (
+            _server_error("PERMISSION_DENIED"),
+            "(MlflowException: PERMISSION_DENIED); check tracking access and credentials.",
+        ),
+        (
+            _server_error("RESOURCE_DOES_NOT_EXIST"),
+            "(MlflowException: RESOURCE_DOES_NOT_EXIST); the experiment or run no longer exists.",
+        ),
+        (
+            _server_error("INVALID_PARAMETER_VALUE"),
+            "(MlflowException: INVALID_PARAMETER_VALUE); MLflow rejected a logged name or value.",
+        ),
+        (_upload_forbidden, "(HTTPError: 403); check tracking access and credentials."),
     ],
-    ids=["sdk", "dependency", "server"],
+    ids=["sdk", "dependency", "denied", "deleted", "rejected", "upload"],
 )
 def test_worker_names_the_failure_cause(tmp_path, monkeypatch, error, expected):
     import json
@@ -601,7 +624,9 @@ def test_worker_names_the_failure_cause(tmp_path, monkeypatch, error, expected):
     request, response = tmp_path / "request.json", tmp_path / "response.json"
     request.write_text(json.dumps({"action": "publish"}))
     assert worker.main([str(request), str(response)]) == 0
-    assert expected in json.loads(response.read_text())["message"]
+    message = json.loads(response.read_text())["message"]
+    assert expected in message
+    assert "private" not in message
 
 
 def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
