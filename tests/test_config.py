@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -14,14 +15,13 @@ from phasesweep.config import (
     Experiment,
     JsonEnvelopeExtractor,
     JsonExtractor,
-    LogRegexExtractor,
     Metric,
     Phase,
     Sampler,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
-from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
+from tests.conftest import make_experiment, write_yaml
 
 
 @pytest.mark.parametrize(
@@ -322,102 +322,55 @@ def test_phase_composition_rejects_invalid_origins(phases: list[Phase], match: s
         make_experiment(phases=phases)
 
 
+_LOSS_METRIC = {
+    "name": "loss",
+    "goal": "minimize",
+    "extractor": {
+        "type": "json_envelope",
+        "objective_name": "loss",
+        "split": "test",
+        "policy": "test",
+    },
+}
+_BYTES_EXTRACTOR = {"type": "json", "path": "r.json", "key": "bytes"}
+
+
 @pytest.mark.parametrize(
-    ("body", "match"),
+    ("options", "match"),
     [
         pytest.param(
-            """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo {trial_dir}"
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-phases:
-  - name: a
-    inherits: [b]
-    n_trials: 1
-    search_space: { x: { type: float, low: 0.0, high: 1.0 } }
-  - name: b
-    n_trials: 1
-    search_space: { y: { type: float, low: 0.0, high: 1.0 } }
-""",
+            {
+                "phases": [
+                    Phase(name="a", n_trials=1, inherits=["b"]),
+                    Phase(name="b", n_trials=1),
+                ]
+            },
             "inherits from 'b'",
             id="inherit-must-reference-prior-phase",
         ),
         pytest.param(
-            """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo"
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-constraints:
-  - name: bytes
-    extractor: { type: json, path: r.json, key: bytes }
-phases:
-  - name: a
-    n_trials: 1
-    search_space: { x: { type: float, low: 0, high: 1 } }
-""",
+            {"constraints": [{"name": "bytes", "extractor": _BYTES_EXTRACTOR}]},
             "must define at least one",
             id="constraint-requires-bound",
         ),
         pytest.param(
-            """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo {overrides}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-constraints:
-  - name: loss
-    max: 1
-    extractor: { type: json, path: r.json, key: bytes }
-phases:
-  - name: a
-    n_trials: 1
-    search_space: { x: { type: float, low: 0, high: 1 } }
-""",
+            {
+                "metric": _LOSS_METRIC,
+                "constraints": [{"name": "loss", "max": 1, "extractor": _BYTES_EXTRACTOR}],
+            },
             "distinct",
             id="metric-constraint-name-collision",
         ),
         pytest.param(
-            """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo {overrides}"
-override_format: argparse
-metric:
-  name: goal
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: goal, split: test, policy: test }
-phases:
-  - name: a
-    n_trials: 1
-    search_space: { x: { type: float, low: 0, high: 1 } }
-""",
+            {"metric": {**_LOSS_METRIC, "name": "goal"}},
             "reserved for winner direction metadata",
             id="metric-name-goal-is-reserved",
         ),
     ],
 )
-def test_invalid_experiment_relationships(
-    tmp_path: Path,
-    body: str,
-    match: str,
-) -> None:
-    assert_invalid_experiment_yaml(tmp_path, body, match)
+def test_invalid_experiment_relationships(options: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        make_experiment(**options)
 
 
 @pytest.mark.parametrize("name", ["bad name with spaces", "bad\n"])
@@ -504,18 +457,7 @@ def test_config_rejects_reserved_phase_name_before_creating_workdir(
 )
 def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]) -> None:
     with pytest.raises(ValidationError, match="provenance keys and values must be nonempty"):
-        Experiment(
-            experiment="invalid_provenance",
-            trial_command="echo",
-            provenance=provenance,
-            metric=Metric(
-                extractor=LogRegexExtractor(
-                    type="log_regex",
-                    pattern=r"x=(?P<value>[0-9.]+)",
-                )
-            ),
-            phases=[Phase(name="p", n_trials=1)],
-        )
+        make_experiment(experiment="invalid_provenance", provenance=provenance)
 
 
 @pytest.mark.parametrize(
@@ -731,63 +673,55 @@ def test_config_error_stays_a_value_error() -> None:
     assert issubclass(ConfigError, ValueError)
 
 
-def _sampler_policy_yaml(
+def _sampler_policy_experiment(
     *,
     storage: str | None,
-    sampler: str | None = None,
+    sampler: dict[str, Any] | None = None,
     n_trials: int = 2,
-    search_space: str = "{ lr: { type: float, low: 0.1, high: 1.0 } }",
-) -> str:
-    """Build a one-phase experiment YAML for the persistent-storage sampler policy.
+    search_space: dict[str, Any] | None = None,
+) -> Experiment:
+    """Build a one-phase experiment for the persistent-storage sampler policy.
 
-    :param str | None storage: Storage URL to declare, or ``None`` to omit the key.
-    :param str | None sampler: Inline sampler mapping, or ``None`` to omit the block.
+    The phase is explicit because ``make_experiment`` seeds a default phase's
+    sampler on persistent storage, which would hide the policy under test.
+
+    :param str | None storage: Storage URL to declare, or ``None`` for in-memory.
+    :param dict | None sampler: Sampler mapping, or ``None`` to leave the default.
     :param int n_trials: Trial budget for the single phase.
-    :param str search_space: Inline search-space mapping for the single phase.
-    :return str: Complete experiment YAML text.
+    :param dict | None search_space: Search space; defaults to one float ``lr``.
+    :return Experiment: Validated experiment.
     """
-    header = (
-        f"storage: {storage}\nprovenance: {{revision: test-fixture-v1}}\n"
-        if storage is not None
-        else ""
-    )
-    sampler_line = f"    sampler: {sampler}\n" if sampler is not None else ""
-    return (
-        "experiment: t\n"
-        f"{header}"
-        'trial_command: "echo {overrides}"\n'
-        "override_format: argparse\n"
-        "metric:\n"
-        "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
-        "phases:\n"
-        "  - name: lr\n"
-        f"    n_trials: {n_trials}\n"
-        f"{sampler_line}"
-        f"    search_space: {search_space}\n"
-    )
+    phase: dict[str, Any] = {
+        "name": "lr",
+        "n_trials": n_trials,
+        "search_space": search_space or {"lr": {"type": "float", "low": 0.1, "high": 1.0}},
+    }
+    if sampler is not None:
+        phase["sampler"] = sampler
+    return make_experiment(storage=storage, phases=[phase])
 
 
 @pytest.mark.parametrize(
     ("sampler", "message"),
     [
         pytest.param(None, "requires an explicit sampler.seed", id="default_tpe_unseeded"),
-        pytest.param("{ type: tpe }", "requires an explicit sampler.seed", id="tpe_unseeded"),
-        pytest.param("{ type: cmaes }", "requires an explicit sampler.seed", id="cmaes_unseeded"),
-        pytest.param("{ type: random }", "requires an explicit sampler.seed", id="random_unseeded"),
+        pytest.param({"type": "tpe"}, "requires an explicit sampler.seed", id="tpe_unseeded"),
+        pytest.param({"type": "cmaes"}, "requires an explicit sampler.seed", id="cmaes_unseeded"),
+        pytest.param({"type": "random"}, "requires an explicit sampler.seed", id="random_unseeded"),
         pytest.param(
-            "{ type: tpe, seed: 0 }",
+            {"type": "tpe", "seed": 0},
             "requires sampler.acknowledge_nonresumable: true",
             id="tpe_unacknowledged",
         ),
         pytest.param(
-            "{ type: cmaes, seed: 1 }",
+            {"type": "cmaes", "seed": 1},
             "requires sampler.acknowledge_nonresumable: true",
             id="cmaes_unacknowledged",
         ),
     ],
 )
 def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
-    tmp_path: Path, sampler: str | None, message: str
+    tmp_path: Path, sampler: dict[str, Any] | None, message: str
 ) -> None:
     """Persistent storage must state the sampler contract at config load, not mid-run.
 
@@ -796,26 +730,27 @@ def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
     ``_validate_sampler_continuation`` hard-rejects a mid-target resume — but
     only after the operator has already been interrupted.
     """
-    body = _sampler_policy_yaml(storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler)
+    storage = f"journal:///{tmp_path}/phases.journal"
     with pytest.raises(ValueError, match=message) as excinfo:
-        load_experiment(write_yaml(tmp_path, body))
+        _sampler_policy_experiment(storage=storage, sampler=sampler)
     assert "'lr'" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
     "sampler",
     [
-        pytest.param("{ type: tpe, seed: 0, acknowledge_nonresumable: true }", id="tpe"),
-        pytest.param("{ type: cmaes, seed: 1, acknowledge_nonresumable: true }", id="cmaes"),
-        pytest.param("{ type: random, seed: 3 }", id="random_needs_no_acknowledgement"),
+        pytest.param({"type": "tpe", "seed": 0, "acknowledge_nonresumable": True}, id="tpe"),
+        pytest.param({"type": "cmaes", "seed": 1, "acknowledge_nonresumable": True}, id="cmaes"),
+        pytest.param({"type": "random", "seed": 3}, id="random_needs_no_acknowledgement"),
     ],
 )
 def test_persistent_storage_accepts_seeded_and_acknowledged_samplers(
-    tmp_path: Path, sampler: str
+    tmp_path: Path, sampler: dict[str, Any]
 ) -> None:
     """A seeded sampler with the required acknowledgement loads unchanged."""
-    body = _sampler_policy_yaml(storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler)
-    experiment = load_experiment(write_yaml(tmp_path, body))
+    experiment = _sampler_policy_experiment(
+        storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler
+    )
     assert experiment.phases[0].sampler.seed is not None
 
 
@@ -834,27 +769,35 @@ def test_sampler_seed_accepts_optuna_domain_boundaries(seed: int) -> None:
 
 def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_path: Path) -> None:
     """Grid enumerates a fixed matrix and resumes from stored assignments, so it is exempt."""
-    body = _sampler_policy_yaml(
+    experiment = _sampler_policy_experiment(
         storage=f"journal:///{tmp_path}/phases.journal",
-        sampler="{ type: grid }",
+        sampler={"type": "grid"},
         n_trials=3,
-        search_space="{ lr: { type: float, low: 0.0, high: 1.0, step: 0.5 } }",
+        search_space={"lr": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.5}},
     )
-    experiment = load_experiment(write_yaml(tmp_path, body))
     assert experiment.phases[0].sampler.seed is None
     assert experiment.phases[0].sampler.acknowledge_nonresumable is False
 
 
-@pytest.mark.parametrize("storage", [None, "null"], ids=["omitted", "explicit_null"])
-def test_in_memory_storage_keeps_the_sampler_block_optional(
-    tmp_path: Path, storage: str | None
-) -> None:
+@pytest.mark.parametrize("storage", ["", "storage: null\n"], ids=["omitted", "explicit_null"])
+def test_in_memory_storage_keeps_the_sampler_block_optional(tmp_path: Path, storage: str) -> None:
     """Without a durable study there is nothing to resume, so the tpe default stands.
 
-    Covers both spellings that leave ``storage`` in-memory: the field omitted
-    entirely, and an explicit ``storage: null``.
+    Covers both YAML spellings that leave ``storage`` in-memory: the key
+    omitted entirely, and an explicit ``storage: null``.
     """
-    experiment = load_experiment(write_yaml(tmp_path, _sampler_policy_yaml(storage=storage)))
+    body = (
+        f"experiment: t\n{storage}"
+        'trial_command: "echo {overrides}"\n'
+        "override_format: argparse\n"
+        "metric:\n"
+        "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
+        "phases:\n"
+        "  - name: lr\n"
+        "    n_trials: 2\n"
+        "    search_space: { lr: { type: float, low: 0.1, high: 1.0 } }\n"
+    )
+    experiment = load_experiment(write_yaml(tmp_path, body))
     assert experiment.phases[0].sampler.type == "tpe"
     assert experiment.phases[0].sampler.seed is None
 

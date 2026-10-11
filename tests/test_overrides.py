@@ -12,7 +12,12 @@ import yaml
 from pydantic import ValidationError
 
 from phasesweep import load_experiment, run_experiment
-from phasesweep.config import JsonEnvelopeExtractor, Metric, Phase
+from phasesweep.config import (
+    CategoricalParam,
+    FloatParam,
+    Phase,
+    Sampler,
+)
 from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
     compose_trainer_config,
@@ -24,6 +29,7 @@ from phasesweep.runtime.commands import (
     render_command,
 )
 from tests.conftest import (
+    FAKE_TRAIN_METRIC,
     assert_invalid_experiment_yaml,
     copy_fake_train,
     make_experiment,
@@ -496,17 +502,7 @@ def test_packaged_fake_trainer_consumes_dotted_cli_overrides(
         workdir=tmp_path / "runs",
         override_format=override_format,
         trial_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(trainer))} {{overrides}}",
-        metric=Metric(
-            name="eval_loss",
-            goal="minimize",
-            extractor=JsonEnvelopeExtractor(
-                type="json_envelope",
-                path="result.json",
-                objective_name="eval_loss",
-                split="validation",
-                policy="synthetic",
-            ),
-        ),
+        metric=FAKE_TRAIN_METRIC,
         phases=[
             Phase(
                 name="p",
@@ -586,21 +582,14 @@ def test_validate_rejects_unrenderable_argparse_fixed_override(tmp_path, value, 
         load_experiment(p)
 
 
-def test_validate_rejects_argparse_categorical_wire_collision(tmp_path: Path) -> None:
+def test_validate_rejects_argparse_categorical_wire_collision() -> None:
     """Distinct categorical points must not launch byte-identical argparse values."""
-    config = _override_yaml(
-        tmp_path,
-        "argparse",
-        "        phases:\n"
-        "          - name: t\n"
-        "            n_trials: 2\n"
-        "            sampler: {type: grid}\n"
-        "            search_space:\n"
-        "              knob: {type: categorical, choices: [1, '1']}\n",
-    )
-
     with pytest.raises(ValidationError, match="both render as '1'.*override_format='argparse'"):
-        load_experiment(config)
+        make_experiment(
+            n_trials=2,
+            sampler=Sampler(type="grid"),
+            search_space={"knob": CategoricalParam(type="categorical", choices=[1, "1"])},
+        )
 
 
 def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints():
@@ -627,36 +616,33 @@ def test_effective_overrides_include_fixed(tmp_path, override_format):
     """The packaged trainer consumes dotted inherited CLI values in both supported forms."""
     trainer = copy_fake_train(tmp_path)
 
-    db_path = tmp_path / "phases.journal"
-    yaml_text = f"""
-experiment: eff_override_test
-storage: journal:///{db_path}
-provenance: {{revision: test-fixture-v1}}
-workdir: {tmp_path / "runs"}
-trial_command: "python {trainer} {{overrides}}"
-override_format: {override_format}
-metric:
-  name: eval_loss
-  goal: minimize
-  extractor: {{ type: json_envelope, path: result.json, objective_name: eval_loss, split: validation, policy: synthetic }}
-phases:
-  - name: arch
-    fixed_overrides:
-      model.dropout: 0.2
-    n_trials: 2
-    sampler: {{ type: grid }}
-    search_space:
-      model.n_layers: {{ type: categorical, choices: [4, 8] }}
-  - name: opt
-    inherits: [arch]
-    n_trials: 2
-    sampler: {{ type: grid }}
-    search_space:
-      optimizer.lr: {{ type: categorical, choices: [1.0e-5, 0.0003] }}
-"""
-    yaml_path = tmp_path / "exp.yaml"
-    yaml_path.write_text(yaml_text)
-    exp = load_experiment(yaml_path)
+    exp = make_experiment(
+        experiment="eff_override_test",
+        persistent=tmp_path,
+        trial_command=f"python {trainer} {{overrides}}",
+        override_format=override_format,
+        metric=FAKE_TRAIN_METRIC,
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=2,
+                sampler=Sampler(type="grid"),
+                fixed_overrides={"model.dropout": 0.2},
+                search_space={
+                    "model.n_layers": CategoricalParam(type="categorical", choices=[4, 8])
+                },
+            ),
+            Phase(
+                name="opt",
+                inherits=["arch"],
+                n_trials=2,
+                sampler=Sampler(type="grid"),
+                search_space={
+                    "optimizer.lr": CategoricalParam(type="categorical", choices=[1.0e-5, 0.0003])
+                },
+            ),
+        ],
+    )
     winners = run_experiment(exp)
 
     # The opt phase winner should have the parent's fixed override and sampled
@@ -674,38 +660,32 @@ phases:
     assert {values["n_layers"] for values in consumed} == {8}
 
 
-def test_transitive_inherited_search_key_cannot_be_resampled(tmp_path):
+def test_transitive_inherited_search_key_cannot_be_resampled() -> None:
     """A grandchild may not re-sample a key locked two levels up."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: arch
-            n_trials: 1
-            search_space:
-              n_layers: {{ type: categorical, choices: [4, 8] }}
-          - name: lr
-            inherits: [arch]
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-          - name: reg
-            inherits: [lr]
-            n_trials: 1
-            search_space:
-              n_layers: {{ type: categorical, choices: [12, 16] }}
-        """,
-    )
     with pytest.raises(ValidationError, match="re-samples key"):
-        load_experiment(p)
+        make_experiment(
+            phases=[
+                Phase(
+                    name="arch",
+                    n_trials=1,
+                    search_space={"n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
+                ),
+                Phase(
+                    name="lr",
+                    inherits=["arch"],
+                    n_trials=1,
+                    search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
+                ),
+                Phase(
+                    name="reg",
+                    inherits=["lr"],
+                    n_trials=1,
+                    search_space={
+                        "n_layers": CategoricalParam(type="categorical", choices=[12, 16])
+                    },
+                ),
+            ]
+        )
 
 
 def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
@@ -735,47 +715,29 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
 
 
 @pytest.mark.parametrize(
-    ("resolution", "valid"),
+    ("child_fixed", "valid"),
     [
-        pytest.param("", False, id="unresolved"),
-        pytest.param(
-            "fixed_overrides:\n              lr: 5.0e-4\n            ", True, id="resolved"
-        ),
+        pytest.param({}, False, id="unresolved"),
+        pytest.param({"lr": 5.0e-4}, True, id="resolved"),
     ],
 )
-def test_multi_parent_collision_requires_fixed_override(tmp_path, resolution: str, valid: bool):
+def test_multi_parent_collision_requires_fixed_override(child_fixed: dict, valid: bool) -> None:
     """A child must explicitly resolve a key from independent parent origins."""
-    p = write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        workdir: {tmp_path}/runs
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: a
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-          - name: b
-            n_trials: 1
-            search_space:
-              lr: {{ type: float, low: 1e-5, high: 1e-3, log: true }}
-          - name: c
-            inherits: [a, b]
-            {resolution}n_trials: 1
-            search_space:
-              dropout: {{ type: float, low: 0, high: 0.5 }}
-        """,
-    )
+    lr = FloatParam(type="float", low=1e-5, high=1e-3, log=True)
+    phases = [
+        Phase(name="a", n_trials=1, search_space={"lr": lr}),
+        Phase(name="b", n_trials=1, search_space={"lr": lr}),
+        Phase(
+            name="c",
+            inherits=["a", "b"],
+            n_trials=1,
+            fixed_overrides=child_fixed,
+            search_space={"dropout": FloatParam(type="float", low=0, high=0.5)},
+        ),
+    ]
     if not valid:
         with pytest.raises(ValidationError, match="conflicting key"):
-            load_experiment(p)
+            make_experiment(phases=phases)
         return
-    exp = load_experiment(p)
-    child = exp.phases[-1]
+    child = make_experiment(phases=phases).phases[-1]
     assert child.fixed_overrides["lr"] == 5.0e-4

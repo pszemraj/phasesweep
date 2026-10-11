@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys
-import textwrap
 import warnings
 from pathlib import Path
 
@@ -16,12 +15,9 @@ from phasesweep import load_experiment
 from phasesweep.config import (
     CategoricalParam,
     Constraint,
-    Experiment,
     FloatParam,
     IntParam,
     JsonExtractor,
-    LogRegexExtractor,
-    Metric,
     Phase,
     Sampler,
     check_bounds,
@@ -29,29 +25,7 @@ from phasesweep.config import (
 from phasesweep.config.common import _find_prefix_collisions, is_sha256_hex
 from phasesweep.config.search import _placeholder_value_for, grid_search_space
 from phasesweep.engine.optuna import _build_sampler
-from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
-
-
-def _grid_yaml(tmp_path: Path, search_space: str, *, n_trials: int = 1) -> Path:
-    """Write a minimal grid-sampler config with caller-supplied search space."""
-    return write_yaml(
-        tmp_path,
-        f"""
-        experiment: t
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: p
-            n_trials: {n_trials}
-            sampler: {{ type: grid }}
-            search_space:
-{textwrap.indent(textwrap.dedent(search_space).strip(), "              ")}
-        """,
-    )
+from tests.conftest import make_experiment, write_yaml
 
 
 @pytest.mark.parametrize(("n_jobs", "constant_liar"), [(4, True), (1, False)])
@@ -188,80 +162,64 @@ def test_sampler_accepts_default_n_startup_trials_off_tpe(sampler_type: str) -> 
     assert sampler.n_startup_trials == 10
 
 
-@pytest.mark.parametrize(
-    ("body", "match"),
-    [
-        pytest.param(
-            """
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: p
-            n_trials: 1
-            sampler: { type: cmaes }
-            search_space:
-              model: { type: categorical, choices: ["a", "b"] }
-            """,
-            "cmaes.*does not support categorical",
-            id="cmaes-categorical",
-        ),
-    ],
-)
-def test_validate_rejects_incompatible_phase_settings(
-    tmp_path: Path, body: str, match: str
-) -> None:
+def test_validate_rejects_incompatible_phase_settings() -> None:
     """Validation rejects incompatible sampler and parameter declarations."""
-    assert_invalid_experiment_yaml(tmp_path, body, match)
+    with pytest.raises(ValidationError, match="cmaes.*does not support categorical"):
+        make_experiment(
+            n_trials=1,
+            sampler=Sampler(type="cmaes"),
+            search_space={"model": CategoricalParam(type="categorical", choices=["a", "b"])},
+        )
 
 
-def test_validate_rejects_invalid_grid_configs(tmp_path: Path) -> None:
+def test_validate_rejects_invalid_grid_configs() -> None:
     """Grid sampler configs must be exactly enumerable and complete by default."""
     cases = [
         (
             "log_float",
-            "lr: { type: float, low: 1e-5, high: 1e-2, log: true }",
+            {"lr": {"type": "float", "low": 1e-5, "high": 1e-2, "log": True}},
             1,
             "grid.*log-scale float",
         ),
-        ("log_int", "n: { type: int, low: 1, high: 1024, log: true }", 1, "grid.*log-scale int"),
+        (
+            "log_int",
+            {"n": {"type": "int", "low": 1, "high": 1024, "log": True}},
+            1,
+            "grid.*log-scale int",
+        ),
         (
             "float_no_step",
-            "x: { type: float, low: 0.0, high: 1.0 }",
+            {"x": {"type": "float", "low": 0.0, "high": 1.0}},
             1,
             "grid sampler requires 'step'",
         ),
         (
             "non_divisible_float",
-            "x: { type: float, low: 0.0, high: 1.0, step: 0.6 }",
+            {"x": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.6}},
             1,
             "must be an integer",
         ),
         (
             "rounded_below_low",
-            "eps: { type: float, low: 1.0e-13, high: 1.1e-12, step: 1.0e-12 }",
+            {"eps": {"type": "float", "low": 1.0e-13, "high": 1.1e-12, "step": 1.0e-12}},
             2,
             "cannot preserve its configured bounds and step",
         ),
         (
             "rounded_above_high",
-            "eps: { type: float, low: 6.0e-13, high: 1.6e-12, step: 1.0e-12 }",
+            {"eps": {"type": "float", "low": 6.0e-13, "high": 1.6e-12, "step": 1.0e-12}},
             2,
             "cannot preserve its configured bounds and step",
         ),
         (
             "partial_matrix",
-            "x: { type: categorical, choices: [1, 2, 3] }",
+            {"x": {"type": "categorical", "choices": [1, 2, 3]}},
             2,
             "grid sampler has 3 combinations",
         ),
         (
             "over_budget",
-            "x: { type: categorical, choices: [1, 2] }",
+            {"x": {"type": "categorical", "choices": [1, 2]}},
             3,
             "n_trials=3 exceeds the grid cardinality 2",
         ),
@@ -269,7 +227,9 @@ def test_validate_rejects_invalid_grid_configs(tmp_path: Path) -> None:
 
     for _case, search_space, n_trials, match in cases:
         with pytest.raises(ValidationError, match=match):
-            load_experiment(_grid_yaml(tmp_path, search_space, n_trials=n_trials))
+            make_experiment(
+                n_trials=n_trials, sampler=Sampler(type="grid"), search_space=search_space
+            )
 
 
 def test_schema_rejects_non_finite_bounds() -> None:
@@ -301,10 +261,12 @@ def test_schema_rejects_non_finite_bounds() -> None:
             build()
 
 
-def test_validate_accepts_divisible_grid_float(tmp_path: Path) -> None:
+def test_validate_accepts_divisible_grid_float() -> None:
     """low=0, high=1, step=0.25 -> exactly [0, 0.25, 0.5, 0.75, 1.0]."""
-    experiment = load_experiment(
-        _grid_yaml(tmp_path, "x: { type: float, low: 0.0, high: 1.0, step: 0.25 }", n_trials=5)
+    experiment = make_experiment(
+        n_trials=5,
+        sampler=Sampler(type="grid"),
+        search_space={"x": FloatParam(type="float", low=0.0, high=1.0, step=0.25)},
     )
     assert grid_search_space(experiment.phases[0].search_space, phase_name="p") == {
         "x": [0.0, 0.25, 0.5, 0.75, 1.0]
@@ -450,53 +412,24 @@ def test_non_grid_distributions_retain_configured_endpoints(param) -> None:
     assert not caught
 
 
-def test_validate_accepts_explicit_partial_grid(tmp_path: Path) -> None:
+def test_validate_accepts_explicit_partial_grid() -> None:
     """Partial grid phases are allowed only when explicitly requested."""
-    p = write_yaml(
-        tmp_path,
-        """
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          name: x
-          goal: minimize
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: p
-            n_trials: 2
-            sampler: { type: grid }
-            allow_partial_grid: true
-            search_space:
-              x: { type: categorical, choices: [1, 2, 3] }
-        """,
+    make_experiment(
+        n_trials=2,
+        sampler=Sampler(type="grid"),
+        allow_partial_grid=True,
+        search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3])},
     )
-    load_experiment(p)
 
 
-def test_validate_rejects_partial_grid_above_cardinality(tmp_path: Path) -> None:
+def test_validate_rejects_partial_grid_above_cardinality() -> None:
     """Partial-grid mode permits a subset, not an impossible oversized budget."""
     with pytest.raises(ValidationError, match="n_trials=4 exceeds the grid cardinality 3"):
-        load_experiment(
-            write_yaml(
-                tmp_path,
-                """
-                experiment: t
-                trial_command: "echo {overrides}"
-                override_format: argparse
-                metric:
-                  name: x
-                  goal: minimize
-                  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-                phases:
-                  - name: p
-                    n_trials: 4
-                    sampler: { type: grid }
-                    allow_partial_grid: true
-                    search_space:
-                      x: { type: categorical, choices: [1, 2, 3] }
-                """,
-            )
+        make_experiment(
+            n_trials=4,
+            sampler=Sampler(type="grid"),
+            allow_partial_grid=True,
+            search_space={"x": CategoricalParam(type="categorical", choices=[1, 2, 3])},
         )
 
 
@@ -533,15 +466,13 @@ def test_categorical_rejects_equal_but_distinct_choices(
         CategoricalParam(type="categorical", choices=choices)
 
 
-def test_categorical_config_error_uses_only_the_selected_union_branch(tmp_path: Path) -> None:
+def test_categorical_config_error_uses_only_the_selected_union_branch() -> None:
     """The ``type`` discriminator keeps upgrade errors focused on categorical choices."""
     with pytest.raises(ValidationError) as exc_info:
-        load_experiment(
-            _grid_yaml(
-                tmp_path,
-                "x: { type: categorical, choices: [1, 1.0] }",
-                n_trials=2,
-            )
+        make_experiment(
+            n_trials=2,
+            sampler=Sampler(type="grid"),
+            search_space={"x": {"type": "categorical", "choices": [1, 1.0]}},
         )
 
     errors = exc_info.value.errors()
@@ -550,15 +481,13 @@ def test_categorical_config_error_uses_only_the_selected_union_branch(tmp_path: 
     assert "must remain distinguishable" in errors[0]["msg"]
 
 
-def test_grid_float_rejects_post_canonicalization_collapse(tmp_path: Path) -> None:
+def test_grid_float_rejects_post_canonicalization_collapse() -> None:
     """Sub-1e-12 steps collapse onto the same rounded value, so cardinality would lie."""
     with pytest.raises(ValidationError, match="collapses to 2 unique value"):
-        load_experiment(
-            _grid_yaml(
-                tmp_path,
-                "x: { type: float, low: 0.0, high: 1.0e-12, step: 1.0e-13 }",
-                n_trials=11,
-            )
+        make_experiment(
+            n_trials=11,
+            sampler=Sampler(type="grid"),
+            search_space={"x": FloatParam(type="float", low=0.0, high=1.0e-12, step=1.0e-13)},
         )
 
 
@@ -651,17 +580,7 @@ def test_rejects_dotted_prefix_collisions() -> None:
 
     for case, phases in cases:
         with pytest.raises(ValueError, match="namespace collision"):
-            Experiment(
-                experiment=f"t_{case}",
-                trial_command="echo {overrides}",
-                override_format="argparse",
-                metric=Metric(
-                    extractor=LogRegexExtractor(
-                        type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"
-                    )
-                ),
-                phases=phases,
-            )
+            make_experiment(experiment=f"t_{case}", phases=phases)
 
 
 @pytest.mark.parametrize(
@@ -732,7 +651,6 @@ def test_trial_command_accepts_supported_templates() -> None:
             "field_format_spec",
             lambda: make_experiment(
                 trial_command="python train.py '{overrides:>1}'",
-                override_format="argparse",
                 n_trials=1,
                 search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True)},
             ),
@@ -745,7 +663,6 @@ def test_trial_command_accepts_supported_templates() -> None:
             "normal_template_with_output",
             lambda: make_experiment(
                 trial_command="python train.py --out {trial_dir}/result.json {overrides}",
-                override_format="argparse",
                 n_trials=1,
             ),
         ),
