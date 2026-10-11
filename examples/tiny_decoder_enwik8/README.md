@@ -51,7 +51,7 @@ The example sweeps only supported trainer controls. The upstream template does n
 The [MLflow smoke configuration](mlflow_gpu_smoke.yaml) uses the same two learning rates, model, and ten-batch budget as the local GPU fixture. It runs one trial at a time on CUDA device `0`. Complete the trainer setup above, then install the MLflow client and matching local server:
 
 ```bash
-python -m pip install -e ".[mlflow]" "mlflow==3.17.0"
+pip install "phasesweep[mlflow]" "mlflow==3.17.0"
 ```
 
 Start the [local tracking server](../../docs/mlflow.md#run-the-cpu-example-locally). In another terminal, run from the PhaseSweep repository root. Create the experiment once; if it already exists, reuse it:

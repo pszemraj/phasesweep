@@ -9,7 +9,7 @@ Requirements: Python 3.11+, the [MCP runtime requirements](mcp.md), a PhaseSweep
 Install PhaseSweep and its optional MCP dependency in the Python environment that provides the server executable:
 
 ```bash
-python -m pip install "phasesweep[mcp]"
+pip install "phasesweep[mcp]"
 ```
 
 Contributor and editable-install setup is in [development](development.md). Install the tracking extra needed by the cataloged experiment in that same environment: `phasesweep[mcp,wandb]` for W&B or `phasesweep[mcp,mlflow]` for MLflow. Config validation and frozen scientific result reads do not authenticate. New work needs the selected SDK and access to its configured account or server. MLflow additionally requires an existing experiment; the client extra does not start a tracking server. See [native MLflow setup and run ownership](mlflow.md).

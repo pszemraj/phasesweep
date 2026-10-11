@@ -5,7 +5,7 @@
 ```bash
 git clone https://github.com/pszemraj/phasesweep.git
 cd phasesweep
-python -m pip install -e ".[dev,wandb,mlflow]"
+pip install -e ".[dev,wandb,mlflow]"
 ```
 
 The development extra includes MCP and Hydra for integration checks and setuptools-scm for the release-version regression; the optional W&B and MLflow extras exercise the installed SDKs. The live MLflow server tests also need full `mlflow` at the client's version, as in the [MLflow example](mlflow.md#run-the-cpu-example-locally), and skip without it. Run Python-dependent commands in the environment where you installed the project.
@@ -13,7 +13,7 @@ The development extra includes MCP and Hydra for integration checks and setuptoo
 To install unreleased `main` without an editable checkout:
 
 ```bash
-python -m pip install git+https://github.com/pszemraj/phasesweep.git
+pip install git+https://github.com/pszemraj/phasesweep.git
 ```
 
 ## Quality gates

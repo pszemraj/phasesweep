@@ -112,7 +112,7 @@ Copy `ledger_path` exactly: Optuna creates an empty journal at a path that does 
 For the web dashboard, install `optuna-dashboard` and serve a copy of the ledger:
 
 ```bash
-python -m pip install optuna-dashboard
+pip install optuna-dashboard
 cp <ledger_path> /tmp/<experiment>.journal
 optuna-dashboard /tmp/<experiment>.journal
 ```

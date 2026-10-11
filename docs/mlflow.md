@@ -7,7 +7,7 @@ PhaseSweep reads metrics that your trainer logs natively to MLflow, selects winn
 Install the optional client and, for a local server, matching full MLflow:
 
 ```bash
-python -m pip install -e ".[mlflow]" "mlflow==3.17.0"
+pip install "phasesweep[mlflow]" "mlflow==3.17.0"
 mkdir -p /tmp/phasesweep-mlflow-demo/artifacts
 mlflow server --host 127.0.0.1 --port 5000 \
   --backend-store-uri sqlite:////tmp/phasesweep-mlflow-demo/mlflow.db \

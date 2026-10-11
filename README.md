@@ -50,7 +50,7 @@ The packaged fake trainer uses the optional `report_objective(...)` envelope hel
 Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
 
 ```bash
-python -m pip install phasesweep
+pip install phasesweep
 phasesweep --version
 
 mkdir phasesweep-demo && cd phasesweep-demo
@@ -110,7 +110,7 @@ Choose the input interface your trainer already accepts:
 For ordinary JSON output, pass an output path under `{trial_dir}` to your trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`. For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT, metric_key: eval/loss}`, have the trainer honor the supplied W&B identity, and install the extra:
 
 ```bash
-python -m pip install "phasesweep[wandb]"
+pip install "phasesweep[wandb]"
 ```
 
 For native MLflow metrics, install `phasesweep[mlflow]`, configure an existing experiment in the `mlflow` block, and use `extractor: {type: mlflow, metric_key: eval/loss, select: last}`. See the [MLflow guide](https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md) for both run ownership modes, a complete CPU example, Databricks setup, and retrying result uploads.
