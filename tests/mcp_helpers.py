@@ -565,6 +565,20 @@ def _catalog(
     )
 
 
+def side_effect_app(
+    tmp_path: Path, *, phases: str | None = None
+) -> tuple[Path, PhaseSweepMCP, Registry, RunStore]:
+    """Write the standard ``srv`` experiment and serve it with launch, cancel, and from-phase allowed.
+
+    :param Path tmp_path: Directory receiving the config, catalog, and state.
+    :param str | None phases: Phases block for the config, or the default one-phase search.
+    :return tuple[Path, PhaseSweepMCP, Registry, RunStore]: Config path, server, registry, and run store.
+    """
+    config = _config(tmp_path, phases=phases)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    return config, app, registry, store
+
+
 def _drift_experiment(
     tmp_path: Path,
     trainer: Path,

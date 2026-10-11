@@ -66,6 +66,7 @@ from tests.mcp_helpers import (
     _write_experiment_config,
     make_mcp_app,
     make_run_handle,
+    side_effect_app,
     stage_dead_run,
     write_mcp_catalog,
     write_run_status,
@@ -232,8 +233,7 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
     tmp_path: Path,
     method_name: str,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     run_id = "srv-mismatch"
     snapshot = config.read_bytes()
     store.config_snapshot_path(run_id).write_bytes(snapshot)
@@ -1031,8 +1031,7 @@ def test_read_tools_use_live_view_while_result_snapshot_is_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-live-pending-finalization"
     handle = make_run_handle(

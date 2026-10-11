@@ -77,6 +77,7 @@ from tests.mcp_helpers import (
     patch_popen_capture,
     record_runner_cleanup,
     run_claimed_runner,
+    side_effect_app,
     stage_dead_run,
     write_run_status,
     write_unsafe_cleanup_status,
@@ -239,8 +240,7 @@ def test_operator_recovery_clears_abandoned_transactional_preparation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interrupted_recovery: bool
 ) -> None:
     """A free launch lease makes a persisted launch recoverable without losing its log."""
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-abandoned-preparation"
     pending = make_run_handle(
@@ -318,8 +318,7 @@ def test_operator_recovery_refuses_leased_preparation_with_terminal_evidence(
     terminal_evidence: str,
 ) -> None:
     """Terminal evidence prevents a launch lease from proving a pre-spawn orphan."""
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     del app
     reg = registry.get("srv")
     run_id = f"srv-leased-{terminal_evidence.replace('_', '-')}"
@@ -495,8 +494,7 @@ def test_runner_persists_registered_terminal_identity_uncertainty(tmp_path: Path
 
 
 def test_terminal_cleanup_uncertainty_blocks_relaunch(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-terminal-uncertain"
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
@@ -511,8 +509,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-operator-recover"
     stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
@@ -556,8 +553,7 @@ def test_operator_recovery_clears_no_status_cleanup_uncertainty(
 def test_recovery_preserves_status_written_after_initial_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, _app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-status-during-recovery"
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
@@ -597,8 +593,7 @@ def test_operator_recovery_refuses_unknown_boot_process_cleanup(
     current_boot = read_boot_id()
     if current_boot is None:
         pytest.skip("boot id unavailable on this platform")
-    config = _config(tmp_path)
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, _app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-recovery-unknown-boot"
     stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
@@ -633,8 +628,7 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
     time — the strongest possible "looks live" collision — under a foreign
     boot id.
     """
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-earlier-boot"
     handle = make_run_handle(
@@ -671,8 +665,7 @@ def test_earlier_boot_runner_without_status_never_reads_later_shared_results(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A rebooted no-status run frees capacity without borrowing later results."""
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-earlier-boot-no-status"
     handle = make_run_handle(
@@ -725,8 +718,7 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, _app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-recovery-lock-contention"
     stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=True)
@@ -750,8 +742,7 @@ def test_operator_recovery_refuses_engine_lock_contention_before_signalling(
 
 
 def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-pending-finalization"
     handle = stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
@@ -807,8 +798,7 @@ def test_operator_recovery_keeps_unresolved_launch_reserved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-launch-failed"
     handle = make_run_handle(
@@ -1105,8 +1095,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
 
 
 def test_operator_recovery_refuses_to_rebuild_missing_historical_snapshot(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-result-repair"
     stage_dead_run(store, run_id, config, reg.id, cleanup_uncertain=False)
@@ -1739,8 +1728,7 @@ def test_operator_recovery_refuses_unverifiable_run(
     expected_message: str,
 ) -> None:
     """Recovery refuses missing cleanup evidence and altered launch snapshots."""
-    config = _config(tmp_path)
-    _app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, _app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-unverifiable-recovery"
     handle = make_dead_run_handle(

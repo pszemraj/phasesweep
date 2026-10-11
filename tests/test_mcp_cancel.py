@@ -32,6 +32,7 @@ from tests.mcp_helpers import (
     make_dead_run_handle,
     make_mcp_app,
     make_run_handle,
+    side_effect_app,
     stage_dead_run,
     write_mcp_catalog,
     write_run_status,
@@ -46,8 +47,7 @@ from tests.recovery_helpers import (
 def test_cancel_refuses_unsettled_launch_without_runner_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     pending = make_run_handle(
         run_id="srv-launch-gap",
@@ -114,8 +114,7 @@ def test_cancel_on_an_earlier_boot_confirms_cleanup_without_signalling(
     Reached through a run left ``running`` by an unfinalized terminal snapshot,
     which is the state a reboot mid-finalization leaves behind.
     """
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     handle = make_dead_run_handle(
         run_id="srv-boot",
         experiment_id="srv",
@@ -150,8 +149,7 @@ def test_cancel_refuses_to_signal_when_boot_identity_is_unknown(
     current_boot = read_boot_id()
     if current_boot is None:
         pytest.skip("boot id unavailable on this platform")
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     handle = make_dead_run_handle(
         run_id="srv-unknown-boot",
         experiment_id="srv",
@@ -303,8 +301,7 @@ def test_cancel_cleanup_confirmation_policy(
     preexisting_marker: bool,
     check_launch_gate: bool,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-cancel-policy"
     handle = make_run_handle(
@@ -352,8 +349,7 @@ def test_concurrent_cancel_calls_converge_on_the_same_terminal_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-concurrent-cancel"
     handle = make_run_handle(

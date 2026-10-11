@@ -93,6 +93,7 @@ from tests.mcp_helpers import (
     patch_popen_capture,
     record_runner_cleanup,
     run_claimed_runner,
+    side_effect_app,
     write_mcp_catalog,
     write_run_status,
 )
@@ -233,16 +234,14 @@ def test_from_phase_permission_denied_before_validation(tmp_path: Path) -> None:
 
 
 def test_invalid_from_phase_rejected_before_spawn(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, _store = side_effect_app(tmp_path)
 
     with pytest.raises(InvalidPhaseError, match="phase 'missing' is not a phase"):
         app.launch("srv", from_phase="missing")
 
 
 def test_resume_requires_prior_winner(tmp_path: Path) -> None:
-    config = _config(tmp_path, phases=RESUMABLE_PHASES)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, _store = side_effect_app(tmp_path, phases=RESUMABLE_PHASES)
 
     with pytest.raises(ResumeNotReadyError, match="earlier phase 'p' has no winner yet") as excinfo:
         app.launch("srv", from_phase="q")
@@ -344,8 +343,7 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
 
 
 def test_launch_refuses_config_changed_after_registry_load(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     config.write_text(config.read_text().replace("python train.py", "python changed.py"))
 
     with pytest.raises(ConfigChangedError, match="changed since server startup"):
@@ -360,8 +358,7 @@ def test_launch_refuses_when_persisted_run_capacity_is_unreadable(
     monkeypatch: pytest.MonkeyPatch,
     record_kind: str,
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     captured = patch_popen_capture(monkeypatch)
     if record_kind == "malformed_handle":
         (tmp_path / "state" / "runs" / "srv-broken.json").write_text("{not valid json")
@@ -424,8 +421,7 @@ def test_launch_retries_run_id_collision_without_touching_existing_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     collision_id = "srv-collision"
     fresh_id = "srv-fresh"
@@ -541,8 +537,7 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
 def test_launch_does_not_spawn_when_pending_handle_create_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     captured = patch_popen_capture(monkeypatch)
 
     def fail_create(handle: RunHandle) -> None:
@@ -562,8 +557,7 @@ def test_launch_finalizes_pending_handle_when_popen_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
 
     def fail_popen(*args: object, **kwargs: object) -> None:
         raise OSError("runner executable is unavailable")
@@ -607,8 +601,7 @@ def test_launch_retains_recoverable_lease_when_failure_status_cannot_persist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed status write cannot erase proof that Popen never succeeded."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
 
     with monkeypatch.context() as faults:
 
@@ -640,8 +633,7 @@ def test_launch_terminates_real_runner_when_log_context_exit_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A child created before log close fails is owned and terminated."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     real_popen = subprocess.Popen
     real_open_private_text = mcp_run_control.open_private_text
     spawned: list[subprocess.Popen[Any]] = []
@@ -713,8 +705,7 @@ def test_launch_records_real_cleanup_result_when_process_identity_read_fails(
     expected_state: str,
 ) -> None:
     """A fallible identity read cannot turn a created child into a pre-spawn failure."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
 
     def fail_identity_read(*_args: object) -> None:
@@ -748,8 +739,7 @@ def test_launch_cleans_up_when_identity_bookkeeping_is_interrupted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """KeyboardInterrupt after Popen is cleanup work, not a pre-spawn failure."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
 
     def interrupt_boot_id() -> None:
@@ -771,8 +761,7 @@ def test_launch_cleans_up_when_identity_bookkeeping_is_interrupted(
 
 
 def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    _first, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, _first, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     pending = make_run_handle(
         run_id="srv-launch-gap",
@@ -796,8 +785,7 @@ def test_restarted_server_reaps_abandoned_transaction_before_retry(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A retry preserves diagnostics from an abandoned launch preparation."""
-    config = _config(tmp_path)
-    _first, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, _first, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     abandoned_id = "srv-abandoned-preparation"
     pending = make_run_handle(
@@ -843,8 +831,7 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A child that never publishes a receipt never receives permission to work."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
 
     class UnreadyProc:
         pid = os.getppid()
@@ -869,8 +856,7 @@ def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An interrupted ACK write cannot prove the child stayed behind the barrier."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     real_write = os.write
 
@@ -901,8 +887,7 @@ def test_interruption_after_ack_keeps_spawn_cleanup_reserved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     real_write = os.write
 
@@ -933,8 +918,7 @@ def test_completed_lease_cleanup_failure_cannot_replace_launch_success(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Lease sidecar cleanup is non-authoritative after an acknowledged receipt."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     real_unlink = mcp_runs._strict_unlink
 
@@ -963,8 +947,7 @@ def test_launch_refuses_runner_without_linux_process_identity(
     cleanup_confirmed: bool,
     expected_state: str,
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     cleanup_calls = record_runner_cleanup(monkeypatch, confirmed=cleanup_confirmed)
     monkeypatch.setattr("phasesweep.mcp.run_control.read_proc_starttime", lambda _pid: None)
@@ -984,8 +967,7 @@ def test_launch_refuses_runner_without_linux_process_identity(
 def test_launch_terminates_spawned_runner_when_handle_update_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     updated: list[RunHandle] = []
 
@@ -1015,8 +997,7 @@ def test_launch_interrupt_during_handle_update_terminates_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A shutdown interrupt cannot escape after spawn but before durable identity."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
 
     def interrupt_update(_handle: RunHandle) -> None:
@@ -1043,8 +1024,7 @@ def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     updated: list[RunHandle] = []
 
@@ -1076,8 +1056,7 @@ def test_post_ack_launch_failure_does_not_clear_reservation_from_runner_group_on
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A dead runner group does not prove separate trial groups have stopped."""
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
 
     def fail_update(_handle: RunHandle) -> None:
@@ -1208,8 +1187,7 @@ def test_launch_records_the_current_boot_id_in_the_spawned_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
 
     run_id = app.launch("srv")["run_id"]
@@ -1230,8 +1208,7 @@ def test_launch_refuses_a_runner_receipt_without_boot_identity(
     is unreadable rather than a legitimate live handle, and the launch still
     ends in a recorded failure.
     """
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     captured = patch_popen_capture(monkeypatch)
     monkeypatch.setattr(mcp_run_control, "read_boot_id", lambda: None)
     monkeypatch.setattr("tests.mcp_helpers.read_boot_id", lambda: None)
@@ -1528,8 +1505,7 @@ def test_aggregated_schema_preflight_preserves_actionable_failure_category(
 def test_launch_bookkeeping_failure_preserves_runner_status(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
-    app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
 
     def interrupted_update(handle: RunHandle) -> None:
@@ -1560,8 +1536,7 @@ def test_launch_bookkeeping_failure_preserves_runner_status(
 def test_launch_failure_cannot_replace_status_published_during_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     pending = make_run_handle(
         run_id="srv-racing-terminal",
