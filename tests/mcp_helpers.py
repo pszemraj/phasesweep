@@ -13,6 +13,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
 from phasesweep.config import (
@@ -473,6 +474,35 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
 
     monkeypatch.setattr("phasesweep.mcp.run_control.subprocess.Popen", fake_popen)
     return captured
+
+
+def record_runner_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    confirmed: bool = True,
+    module: str = "phasesweep.mcp.run_control",
+) -> list[tuple[int | None, int | None, int | None]]:
+    """Replace ``kill_stale_group`` with a stub that records the identity it is asked to clean up.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture that undoes the replacement at teardown.
+    :param bool confirmed: Cleanup outcome the stub reports.
+    :param str module: Dotted path of the module whose ``kill_stale_group`` is replaced.
+    :return list[tuple[int | None, int | None, int | None]]: ``(pid, starttime, pgid)`` per call, in call order.
+    """
+    calls: list[tuple[int | None, int | None, int | None]] = []
+
+    def fake_kill_stale_group(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+        grace_seconds: float | None = None,
+    ) -> bool:
+        calls.append((pid, saved_starttime, pgid))
+        return confirmed
+
+    monkeypatch.setattr(f"{module}.kill_stale_group", fake_kill_stale_group)
+    return calls
 
 
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}

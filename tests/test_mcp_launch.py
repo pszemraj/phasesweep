@@ -91,6 +91,7 @@ from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
+    record_runner_cleanup,
     run_claimed_runner,
     write_mcp_catalog,
     write_run_status,
@@ -717,21 +718,11 @@ def test_launch_records_real_cleanup_result_when_process_identity_read_fails(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
 
     def fail_identity_read(*_args: object) -> None:
         raise OSError(f"injected {failing_reader} read failure")
 
-    def fake_cleanup(
-        pid: int | None,
-        saved_starttime: int | None,
-        *,
-        pgid: int | None = None,
-    ) -> bool:
-        cleanup_calls.append((pid, saved_starttime, pgid))
-        return cleanup_confirmed
-
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", fake_cleanup)
+    cleanup_calls = record_runner_cleanup(monkeypatch, confirmed=cleanup_confirmed)
     monkeypatch.setattr(
         mcp_run_control,
         "read_proc_starttime" if failing_reader == "starttime" else "read_boot_id",
@@ -762,22 +753,12 @@ def test_launch_cleans_up_when_identity_bookkeeping_is_interrupted(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
 
     def interrupt_boot_id() -> None:
         raise KeyboardInterrupt
 
-    def fake_cleanup(
-        pid: int | None,
-        saved_starttime: int | None,
-        *,
-        pgid: int | None = None,
-    ) -> bool:
-        cleanup_calls.append((pid, saved_starttime, pgid))
-        return True
-
+    cleanup_calls = record_runner_cleanup(monkeypatch)
     monkeypatch.setattr(mcp_run_control, "read_boot_id", interrupt_boot_id)
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", fake_cleanup)
 
     with pytest.raises(KeyboardInterrupt):
         app.launch("srv")
@@ -893,7 +874,6 @@ def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
     real_write = os.write
 
     def fail_ack(fd: int, data: bytes) -> int:
@@ -901,17 +881,8 @@ def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
             raise OSError("injected acknowledgement failure")
         return real_write(fd, data)
 
-    def confirm_cleanup(
-        pid: int | None,
-        starttime: int | None,
-        *,
-        pgid: int | None = None,
-    ) -> bool:
-        cleanup_calls.append((pid, starttime, pgid))
-        return True
-
+    cleanup_calls = record_runner_cleanup(monkeypatch)
     monkeypatch.setattr(mcp_run_control.os, "write", fail_ack)
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", confirm_cleanup)
 
     with pytest.raises(OSError, match="acknowledgement"):
         app.launch("srv")
@@ -935,7 +906,6 @@ def test_interruption_after_ack_keeps_spawn_cleanup_reserved(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
     real_write = os.write
 
     def interrupt_after_ack(fd: int, data: bytes) -> int:
@@ -944,17 +914,8 @@ def test_interruption_after_ack_keeps_spawn_cleanup_reserved(
             raise KeyboardInterrupt
         return written
 
-    def confirm_runner_group_cleanup(
-        pid: int | None,
-        starttime: int | None,
-        *,
-        pgid: int | None = None,
-    ) -> bool:
-        cleanup_calls.append((pid, starttime, pgid))
-        return True
-
+    cleanup_calls = record_runner_cleanup(monkeypatch)
     monkeypatch.setattr(mcp_run_control.os, "write", interrupt_after_ack)
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", confirm_runner_group_cleanup)
 
     with pytest.raises(KeyboardInterrupt):
         app.launch("srv")
@@ -1007,19 +968,8 @@ def test_launch_refuses_runner_without_linux_process_identity(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
-
-    def fake_cleanup(
-        pid: int | None,
-        saved_starttime: int | None,
-        *,
-        pgid: int | None = None,
-    ) -> bool:
-        cleanup_calls.append((pid, saved_starttime, pgid))
-        return cleanup_confirmed
-
+    cleanup_calls = record_runner_cleanup(monkeypatch, confirmed=cleanup_confirmed)
     monkeypatch.setattr("phasesweep.mcp.run_control.read_proc_starttime", lambda _pid: None)
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_cleanup)
 
     with pytest.raises(RuntimeError, match="has no Linux /proc start time"):
         app.launch("srv")
@@ -1040,23 +990,13 @@ def test_launch_terminates_spawned_runner_when_handle_update_fails(
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
     updated: list[RunHandle] = []
-    terminated: list[tuple[int | None, int | None, int | None]] = []
 
     def fail_update(handle: RunHandle) -> None:
         updated.append(handle)
         raise OSError("runs directory is not writable")
 
-    def fake_kill_stale_group(
-        pid: int | None,
-        saved_starttime: int | None,
-        *,
-        pgid: int | None = None,
-    ) -> bool:
-        terminated.append((pid, saved_starttime, pgid))
-        return True
-
+    terminated = record_runner_cleanup(monkeypatch)
     monkeypatch.setattr(store, "update", fail_update)
-    monkeypatch.setattr("phasesweep.mcp.run_control.kill_stale_group", fake_kill_stale_group)
 
     with pytest.raises(OSError, match="runs directory"):
         app.launch("srv")
@@ -1080,22 +1020,12 @@ def test_launch_interrupt_during_handle_update_terminates_runner(
     config = _config(tmp_path)
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     patch_popen_capture(monkeypatch)
-    terminated: list[tuple[int | None, int | None, int | None]] = []
 
     def interrupt_update(_handle: RunHandle) -> None:
         raise KeyboardInterrupt
 
-    def fake_cleanup(
-        pid: int | None,
-        saved_starttime: int | None,
-        *,
-        pgid: int | None = None,
-    ) -> bool:
-        terminated.append((pid, saved_starttime, pgid))
-        return True
-
+    terminated = record_runner_cleanup(monkeypatch)
     monkeypatch.setattr(store, "update", interrupt_update)
-    monkeypatch.setattr(mcp_run_control, "kill_stale_group", fake_cleanup)
 
     with pytest.raises(KeyboardInterrupt):
         app.launch("srv")

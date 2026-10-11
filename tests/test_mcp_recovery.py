@@ -74,6 +74,7 @@ from tests.mcp_helpers import (
     make_mcp_app,
     make_run_handle,
     patch_popen_capture,
+    record_runner_cleanup,
     run_claimed_runner,
     stage_dead_run,
     write_run_status,
@@ -1241,24 +1242,13 @@ def test_operator_recovery_clears_cleanup_uncertainty(
     if expect_running_before_confirm:
         assert app.status(run_id=run_id)["phases"][0]["running_trials_total"] == 1
 
-    runner_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
     trial_cleanup_calls: list[tuple[int | None, int | None, int | None]] = []
-
-    def fake_runner_cleanup(
-        pid: int | None,
-        saved_starttime: int | None,
-        *,
-        pgid: int | None = None,
-        grace_seconds: float = 30.0,
-    ) -> bool:
-        runner_cleanup_calls.append((pid, saved_starttime, pgid))
-        return True
 
     def fake_trial_cleanup(identity: StaleProcessIdentity) -> bool:
         trial_cleanup_calls.append((identity.pid, identity.proc_starttime, identity.pgid))
         return True
 
-    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", fake_runner_cleanup)
+    runner_cleanup_calls = record_runner_cleanup(monkeypatch, module="phasesweep.mcp.recovery")
     monkeypatch.setattr(
         "phasesweep.engine.attempts.cleanup_stale_trial_process", fake_trial_cleanup
     )
