@@ -324,13 +324,16 @@ def require_tracking_target(
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.errors import PhaseSweepError
 
-    target = {"generation_id": generation_id, "environment": environment, "deadline": deadline}
     try:
         if (tracking_root(experiment) / generation_id / "generation-binding.json").exists():
             # An earlier phase bound the summary run; the target must still resolve.
-            _resolve_source(experiment, **target)
+            _resolve_source(
+                experiment, generation_id=generation_id, environment=environment, deadline=deadline
+            )
         else:
-            prepare_generation(experiment, **target)
+            prepare_generation(
+                experiment, generation_id=generation_id, environment=environment, deadline=deadline
+            )
     except PhaseSweepError:
         raise
     except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
