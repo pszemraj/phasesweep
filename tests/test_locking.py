@@ -15,8 +15,6 @@ from types import SimpleNamespace
 import pytest
 
 from phasesweep.config import (
-    FloatParam,
-    IntParam,
     Phase,
     Sampler,
 )
@@ -637,31 +635,12 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
     lock would not catch this; the run lock does.
     """
     storage = f"journal:///{tmp_path / 'shared.journal'}"
+    seeded = Sampler(type="random", seed=0)
     phases_a = [
-        Phase(
-            name="arch",
-            n_trials=1,
-            sampler=Sampler(type="random", seed=0),
-            search_space={"depth": IntParam(type="int", low=1, high=2)},
-        ),
-        Phase(
-            name="lr",
-            inherits=["arch"],
-            n_trials=1,
-            sampler=Sampler(type="random", seed=1),
-            search_space={
-                "lr": FloatParam(type="float", low=1e-5, high=1e-3, log=True),
-            },
-        ),
+        Phase(name="arch", n_trials=1, sampler=seeded, search_space={}),
+        Phase(name="lr", inherits=["arch"], n_trials=1, sampler=seeded, search_space={}),
     ]
-    phases_b = [
-        Phase(
-            name="arch",
-            n_trials=2,  # top-up
-            sampler=Sampler(type="random", seed=0),
-            search_space={"depth": IntParam(type="int", low=1, high=2)},
-        ),
-    ]
+    phases_b = [Phase(name="arch", n_trials=2, sampler=seeded, search_space={})]  # top-up
 
     exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage, phases=phases_a)
     exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage, phases=phases_b)
@@ -713,9 +692,7 @@ def test_run_lock_does_not_collide_for_distinct_experiment_names(
     storage_a = f"journal:///{tmp_path / storage_a_name}"
     storage_b = f"journal:///{tmp_path / storage_b_name}"
     exp_a = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_a)
-    exp_b = make_experiment(workdir=str(tmp_path / "runs"), storage=storage_b)
-    # make_experiment hardcodes experiment="t"; clone exp_b with another name.
-    exp_b = exp_b.model_copy(update={"experiment": "other"})
+    exp_b = make_experiment(experiment="other", workdir=str(tmp_path / "runs"), storage=storage_b)
 
     assert set(_run_lock_paths(exp_a)).isdisjoint(_run_lock_paths(exp_b))
     with _experiment_lock(exp_a), _experiment_lock(exp_b):
@@ -818,14 +795,12 @@ def test_run_experiment_holds_experiment_lock_for_duration(tmp_path: Path) -> No
         workdir=str(tmp_path / "runs_a"),
         storage=storage,
         trial_command="true {overrides}",
-        override_format="argparse",
         n_trials=1,
     )
     exp_b = make_experiment(
         workdir=str(tmp_path / "runs_b"),
         storage=storage,
         trial_command="true {overrides}",
-        override_format="argparse",
         n_trials=1,
     )
 

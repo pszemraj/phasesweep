@@ -424,7 +424,6 @@ def test_public_run_experiment_enters_signal_handler_scope(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f'{sys.executable} -c "{script}" trial_dir={{trial_dir}} {{overrides}}',
-        override_format="argparse",
     )
     run_experiment(exp)
     assert installed["called"] is True
