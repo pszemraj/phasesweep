@@ -228,6 +228,93 @@ def _create_bound(
     return binding
 
 
+def prepare_generation(
+    experiment: Experiment,
+    *,
+    generation_id: str,
+    environment: Mapping[str, str],
+    deadline: float | None,
+) -> dict[str, Any]:
+    """Resolve the source experiment and bind this generation's summary run once.
+
+    :param Experiment experiment: MLflow-backed experiment.
+    :param str generation_id: Current invocation identity.
+    :param Mapping[str, str] environment: Composed trainer environment.
+    :param float | None deadline: Existing phase/run deadline.
+    :raises ValueError: The experiment resolves differently within this cohort.
+    :return dict[str, Any]: The generation summary run's binding.
+    """
+    assert experiment.mlflow is not None
+    with _PARENT_LOCK:
+        parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
+        if parent_path.exists():
+            return read_record(parent_path)
+        resolved = call_tracking(
+            experiment, generation_id, {"action": "resolve"}, environment, deadline
+        )
+        source_path = tracking_root(experiment) / "source.json"
+        source = {
+            "schema_version": 1,
+            "source": experiment.mlflow.evidence_identity(),
+            **resolved,
+        }
+        if source_path.exists() and read_record(source_path) != source:
+            raise ValueError("MLflow experiment resolution changed within this scientific cohort.")
+        write_record(source_path, source)
+        from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
+
+        parent_identity = {
+            "schema_version": 1,
+            "tracking_uri": experiment.mlflow.tracking_uri,
+            "experiment": experiment.experiment,
+            "generation_id": generation_id,
+            "overrides_sha256": _experiment_semantic_fingerprint(experiment),
+            "run_mode": "managed",
+            **resolved,
+            "phase": "generation",
+            "attempt_id": generation_id,
+        }
+        return _create_bound(
+            experiment, parent_identity, parent_path, environment, deadline=deadline
+        )
+
+
+def require_tracking_target(
+    experiment: Experiment,
+    *,
+    generation_id: str,
+    environment: Mapping[str, str],
+    deadline: float | None,
+) -> None:
+    """Reach the MLflow target before a phase allocates any trial.
+
+    A missing experiment, refused credentials, or an unreachable server then
+    stops the run once with its own cause, instead of failing every trial and
+    consuming the phase's trial budget.
+
+    :param Experiment experiment: MLflow-backed experiment.
+    :param str generation_id: Current invocation identity.
+    :param Mapping[str, str] environment: Composed trainer environment.
+    :param float | None deadline: Phase/run deadline; reaching it stays a timeout.
+    :raises PhaseSweepError: The target cannot be resolved or reached.
+    """
+    from phasesweep.errors import OperatorAction, PhaseSweepError
+
+    try:
+        prepare_generation(
+            experiment, generation_id=generation_id, environment=environment, deadline=deadline
+        )
+    except PhaseSweepError:
+        raise
+    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+        if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
+            raise
+        raise PhaseSweepError(
+            f"MLflow tracking target is not ready: {str(exc).rstrip('.')}. No trial was started.",
+            action=OperatorAction.FIX_CONFIG,
+        ) from exc
+
+
 def prepare_attempt(
     experiment: Experiment,
     *,
@@ -252,47 +339,15 @@ def prepare_attempt(
     :return dict[str, Any]: Expected binding, with a run ID in managed mode.
     """
     assert experiment.mlflow is not None
-    base = {
+    parent = prepare_generation(
+        experiment, generation_id=generation_id, environment=environment, deadline=deadline
+    )
+    identity = {
         "schema_version": 1,
         "tracking_uri": experiment.mlflow.tracking_uri,
         "experiment": experiment.experiment,
         "generation_id": generation_id,
         "overrides_sha256": overrides_sha256,
-        "run_mode": "managed",
-    }
-    with _PARENT_LOCK:
-        parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
-        if parent_path.exists():
-            parent = read_record(parent_path)
-        else:
-            resolved = call_tracking(
-                experiment, generation_id, {"action": "resolve"}, environment, deadline
-            )
-            source_path = tracking_root(experiment) / "source.json"
-            source = {
-                "schema_version": 1,
-                "source": experiment.mlflow.evidence_identity(),
-                **resolved,
-            }
-            if source_path.exists() and read_record(source_path) != source:
-                raise ValueError(
-                    "MLflow experiment resolution changed within this scientific cohort."
-                )
-            write_record(source_path, source)
-            from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
-
-            parent_identity = {
-                **base,
-                **resolved,
-                "phase": "generation",
-                "attempt_id": generation_id,
-                "overrides_sha256": _experiment_semantic_fingerprint(experiment),
-            }
-            parent = _create_bound(
-                experiment, parent_identity, parent_path, environment, deadline=deadline
-            )
-    identity = {
-        **base,
         "experiment_id": parent["experiment_id"],
         "phase": phase,
         "attempt_id": attempt_id,

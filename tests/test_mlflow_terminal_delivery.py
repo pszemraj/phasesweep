@@ -73,6 +73,7 @@ def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
         return binding
 
     requests = []
+    monkeypatch.setattr("phasesweep.tracking.session.require_tracking_target", lambda *a, **k: None)
     monkeypatch.setattr("phasesweep.tracking.session.prepare_attempt", prepare)
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
     with pytest.raises(NoFeasibleTrialError):

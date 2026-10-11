@@ -598,20 +598,35 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
         )
 
 
-def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch):
+@pytest.mark.parametrize("failure", ["target", "attempt"])
+def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch, failure):
+    """An unready target stops once before any trial; an attempt failure fails only its trial."""
     from phasesweep.engine import NoFeasibleTrialError, run_experiment
+    from phasesweep.errors import PhaseSweepError
     from phasesweep.runtime.gpu import GpuPool
 
     def unavailable(*args, **kwargs):
-        raise RuntimeError("MLflow unavailable")
+        raise RuntimeError("MLflow experiment is missing or deleted.")
 
     def no_lease(*args, **kwargs):
         pytest.fail("Run binding must precede GPU acquisition")
 
-    monkeypatch.setattr("phasesweep.tracking.session.prepare_attempt", unavailable)
     monkeypatch.setattr(GpuPool, "acquire", no_lease)
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(native_experiment(tmp_path))
+    if failure == "target":
+        monkeypatch.setattr("phasesweep.tracking.session.call_tracking", unavailable)
+        monkeypatch.setattr(
+            "phasesweep.tracking.session.prepare_attempt",
+            lambda *a, **k: pytest.fail("No trial may start against an unready target"),
+        )
+        with pytest.raises(PhaseSweepError, match=r"missing or deleted\. No trial was started"):
+            run_experiment(native_experiment(tmp_path))
+    else:
+        monkeypatch.setattr(
+            "phasesweep.tracking.session.require_tracking_target", lambda *a, **k: None
+        )
+        monkeypatch.setattr("phasesweep.tracking.session.prepare_attempt", unavailable)
+        with pytest.raises(NoFeasibleTrialError):
+            run_experiment(native_experiment(tmp_path))
 
 
 @pytest.mark.parametrize("problem", [None, "experiment", "attempt", "finished"])

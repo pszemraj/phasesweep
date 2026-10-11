@@ -1483,6 +1483,15 @@ def _run_phase(
     )
     budget = _phase_budget(phase, run_deadline)
     assert generation_id is not None
+    if experiment.mlflow is not None:
+        from phasesweep.tracking.session import require_tracking_target
+
+        require_tracking_target(
+            experiment,
+            generation_id=generation_id,
+            environment=environment_identity.values,
+            deadline=budget.deadline,
+        )
     run = _PhaseExecution(
         experiment=experiment,
         phase=phase,
