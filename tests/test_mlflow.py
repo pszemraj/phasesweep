@@ -297,7 +297,7 @@ def test_uncertain_creation_retries_the_same_identity(tmp_path, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("field", ["run_id", "experiment_id", "attempt_id"])
+@pytest.mark.parametrize("field", ["run_id", "experiment_id", "attempt_id", "unbound"])
 def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, field):
     from phasesweep.evidence.evaluation import ExtractorError, TrialContext, _capture_mlflow
     from phasesweep.tracking import session
@@ -306,10 +306,11 @@ def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, f
     expected = {k: v for k, v in binding.items() if k != "run_id"}
     if field == "run_id":
         expected["run_id"] = "another-run"
-    else:
+    elif field != "unbound":
         binding[field] = "another-identity"
     session.write_record(tmp_path / "mlflow-expected.json", expected)
-    session.write_record(tmp_path / "mlflow-binding.json", binding)
+    if field != "unbound":
+        session.write_record(tmp_path / "mlflow-binding.json", binding)
     experiment = native_experiment(tmp_path)
     ctx = TrialContext(
         experiment="test",
@@ -330,7 +331,8 @@ def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, f
         pytest.fail("A foreign binding must not contact MLflow")
 
     monkeypatch.setattr("phasesweep.tracking.mlflow.request_operation", remote)
-    with pytest.raises(ExtractorError, match="different attempt"):
+    match = "bind_mlflow_run" if field == "unbound" else "different attempt"
+    with pytest.raises(ExtractorError, match=match):
         _capture_mlflow(ctx, deadline=None)
 
 

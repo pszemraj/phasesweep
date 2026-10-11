@@ -641,13 +641,19 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> dict[str, A
 
     from phasesweep.evidence.mlflow import validate_capture
     from phasesweep.tracking.mlflow import request_operation
-    from phasesweep.tracking.session import read_binding, read_record
+    from phasesweep.tracking.session import BINDING_FILE, read_binding, read_record
 
     if ctx.mlflow_capture:
         return ctx.mlflow_capture
     if ctx.mlflow_settings is None or ctx.mlflow_query is None:
         raise ExtractorError("MLflow capture requires a configured target and query.")
     try:
+        # Managed runs are bound before launch, so only a trainer-owned run can be missing.
+        if not (ctx.trial_dir / BINDING_FILE).is_file():
+            raise ValueError(
+                "The trainer never bound its MLflow run; call "
+                "phasesweep.tracking.bind_mlflow_run(run_id) inside its active run."
+            )
         binding = read_binding(ctx.trial_dir)
         expected = read_record(ctx.trial_dir / "mlflow-expected.json")
         if (
