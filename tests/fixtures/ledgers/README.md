@@ -2,7 +2,7 @@
 
 The `current-journal` fixture contains on-disk output produced through PhaseSweep's public API:
 
-```
+```text
 current-journal/manifest.json          inventory record: backend, modes, expected verdicts, provenance
 current-journal/ledger/study.journal   journal ledger
 current-journal/artifact_root/t/...    the artifact tree that claimed that ledger
