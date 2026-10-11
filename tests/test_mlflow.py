@@ -631,6 +631,29 @@ def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch, failu
             run_experiment(native_experiment(tmp_path))
 
 
+def test_later_phase_rechecks_a_bound_target(tmp_path, monkeypatch):
+    """A summary run bound by an earlier phase does not excuse a vanished target."""
+    from phasesweep.engine.errors import TrackingTargetUnavailableError
+    from phasesweep.tracking import session
+
+    experiment = native_experiment(tmp_path)
+    bound = session.tracking_root(experiment) / "generation" / "generation-binding.json"
+    bound.parent.mkdir(parents=True)
+    session.write_record(bound, _binding())
+    actions = []
+
+    def deleted(experiment, generation_id, request, *args):
+        actions.append(request["action"])
+        raise ValueError("MLflow experiment is missing or deleted.")
+
+    monkeypatch.setattr(session, "call_tracking", deleted)
+    with pytest.raises(TrackingTargetUnavailableError, match="missing or deleted"):
+        session.require_tracking_target(
+            experiment, generation_id="generation", environment={}, deadline=None
+        )
+    assert actions == ["resolve"]
+
+
 @pytest.mark.parametrize("problem", [None, "experiment", "attempt", "finished"])
 def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch, problem):
     import sys

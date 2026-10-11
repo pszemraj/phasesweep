@@ -228,6 +228,39 @@ def _create_bound(
     return binding
 
 
+def _resolve_source(
+    experiment: Experiment,
+    *,
+    generation_id: str,
+    environment: Mapping[str, str],
+    deadline: float | None,
+) -> dict[str, Any]:
+    """Resolve the source experiment and hold it to the cohort's first resolution.
+
+    :param Experiment experiment: MLflow-backed experiment.
+    :param str generation_id: Current invocation identity.
+    :param Mapping[str, str] environment: Composed trainer environment.
+    :param float | None deadline: Existing phase/run deadline.
+    :raises ValueError: The experiment resolves differently within this cohort.
+    :return dict[str, Any]: The resolved experiment identity.
+    """
+    assert experiment.mlflow is not None
+    with _PARENT_LOCK:
+        resolved = call_tracking(
+            experiment, generation_id, {"action": "resolve"}, environment, deadline
+        )
+        source_path = tracking_root(experiment) / "source.json"
+        source = {
+            "schema_version": 1,
+            "source": experiment.mlflow.evidence_identity(),
+            **resolved,
+        }
+        if source_path.exists() and read_record(source_path) != source:
+            raise ValueError("MLflow experiment resolution changed within this scientific cohort.")
+        write_record(source_path, source)
+        return resolved
+
+
 def prepare_generation(
     experiment: Experiment,
     *,
@@ -241,7 +274,6 @@ def prepare_generation(
     :param str generation_id: Current invocation identity.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
-    :raises ValueError: The experiment resolves differently within this cohort.
     :return dict[str, Any]: The generation summary run's binding.
     """
     assert experiment.mlflow is not None
@@ -249,18 +281,9 @@ def prepare_generation(
         parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
         if parent_path.exists():
             return read_record(parent_path)
-        resolved = call_tracking(
-            experiment, generation_id, {"action": "resolve"}, environment, deadline
+        resolved = _resolve_source(
+            experiment, generation_id=generation_id, environment=environment, deadline=deadline
         )
-        source_path = tracking_root(experiment) / "source.json"
-        source = {
-            "schema_version": 1,
-            "source": experiment.mlflow.evidence_identity(),
-            **resolved,
-        }
-        if source_path.exists() and read_record(source_path) != source:
-            raise ValueError("MLflow experiment resolution changed within this scientific cohort.")
-        write_record(source_path, source)
         from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 
         parent_identity = {
@@ -296,22 +319,25 @@ def require_tracking_target(
     :param str generation_id: Current invocation identity.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Phase/run deadline; reaching it stays a timeout.
-    :raises PhaseSweepError: The target cannot be resolved or reached.
+    :raises TrackingTargetUnavailableError: The target cannot be resolved or reached.
     """
-    from phasesweep.errors import OperatorAction, PhaseSweepError
+    from phasesweep.engine.errors import TrackingTargetUnavailableError
+    from phasesweep.errors import PhaseSweepError
 
+    target = {"generation_id": generation_id, "environment": environment, "deadline": deadline}
     try:
-        prepare_generation(
-            experiment, generation_id=generation_id, environment=environment, deadline=deadline
-        )
+        if (tracking_root(experiment) / generation_id / "generation-binding.json").exists():
+            # An earlier phase bound the summary run; the target must still resolve.
+            _resolve_source(experiment, **target)
+        else:
+            prepare_generation(experiment, **target)
     except PhaseSweepError:
         raise
     except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
         if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
             raise
-        raise PhaseSweepError(
-            f"MLflow tracking target is not ready: {str(exc).rstrip('.')}. No trial was started.",
-            action=OperatorAction.FIX_CONFIG,
+        raise TrackingTargetUnavailableError(
+            f"MLflow tracking target is not ready: {str(exc).rstrip('.')}. No trial was started."
         ) from exc
 
 

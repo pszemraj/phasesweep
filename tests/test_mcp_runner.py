@@ -35,6 +35,7 @@ from phasesweep.engine import (
     SamplerContinuationUnsupportedError,
     StudyStorageUnavailableError,
     TerminalReport,
+    TrackingTargetUnavailableError,
     TrialTargetRegressionError,
     read_status,
     run_experiment,
@@ -344,6 +345,11 @@ def test_terminal_snapshot_is_captured_before_experiment_lock_release(tmp_path: 
             SamplerContinuationUnsupportedError("unsupported continuation"),
             "sampler_continuation_unsupported",
             id="sampler",
+        ),
+        pytest.param(
+            TrackingTargetUnavailableError("MLflow tracking target is not ready"),
+            "tracking_unavailable",
+            id="tracking",
         ),
         pytest.param(
             TrialTargetRegressionError("target moved backward"),
