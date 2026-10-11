@@ -1011,7 +1011,7 @@ def run_supervised(
             f"failed to persist process identity or deliver launch payload: {exc}"
         )
         log.exception(
-            "Trial PID %d (pgid %d) launched but identity persistence or launch payload "
+            "Process PID %d (pgid %d) launched but identity persistence or launch payload "
             "delivery failed; terminating group",
             proc.pid,
             target_pgid,
@@ -1063,7 +1063,7 @@ def run_supervised(
         if root_status is None and deadline is not None and time.monotonic() >= deadline:
             timed_out = True
             failure_reason = timeout_reason
-            log.warning("Trial PID %d (pgid %d) timed out — terminating group", pgid, pgid)
+            log.warning("Process PID %d (pgid %d) timed out — terminating group", pgid, pgid)
             cleanup_confirmed = _kill_group(pgid, proc)
         else:
             # The trainer root exited within its budget. Descendant cleanup is
@@ -1091,7 +1091,7 @@ def run_supervised(
                     f"but process group {pgid} still had live descendants"
                 )
                 log.warning(
-                    "Trial PID %d exited with code %s but process group %d "
+                    "Process PID %d exited with code %s but process group %d "
                     "still had live descendants; the lease guardian terminated them",
                     pgid,
                     proc.returncode,
@@ -1107,7 +1107,7 @@ def run_supervised(
                     f"but process group {pgid} still had live descendants"
                 )
                 log.warning(
-                    "Trial PID %d exited with code %s but process group %d "
+                    "Process PID %d exited with code %s but process group %d "
                     "still has live descendants — terminating group",
                     pgid,
                     proc.returncode,
