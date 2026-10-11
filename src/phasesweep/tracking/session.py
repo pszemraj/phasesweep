@@ -334,10 +334,14 @@ def require_tracking_target(
     except PhaseSweepError:
         raise
     except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
-        if isinstance(exc, TimeoutError) and deadline is not None and time.monotonic() >= deadline:
-            raise
+        cause = str(exc).rstrip(".")
+        if isinstance(exc, TimeoutError):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise
+            # The SDK retries a refused connection until the operation times out.
+            cause = "it did not answer within timeout_seconds; check that the server is reachable"
         raise TrackingTargetUnavailableError(
-            f"MLflow tracking target is not ready: {str(exc).rstrip('.')}. No trial was started."
+            f"MLflow tracking target is not ready: {cause}. No trial was started."
         ) from exc
 
 

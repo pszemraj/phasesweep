@@ -685,7 +685,15 @@ def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch, failu
             run_experiment(native_experiment(tmp_path))
 
 
-def test_later_phase_rechecks_a_bound_target(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (ValueError("MLflow experiment is missing or deleted."), "missing or deleted"),
+        (TimeoutError("MLflow operation exceeded its deadline."), "check that the server is"),
+    ],
+    ids=["deleted", "unreachable"],
+)
+def test_later_phase_rechecks_a_bound_target(tmp_path, monkeypatch, error, expected):
     """A summary run bound by an earlier phase does not excuse a vanished target."""
     from phasesweep.engine.errors import TrackingTargetUnavailableError
     from phasesweep.tracking import session
@@ -696,12 +704,12 @@ def test_later_phase_rechecks_a_bound_target(tmp_path, monkeypatch):
     session.write_record(bound, _binding())
     actions = []
 
-    def deleted(experiment, generation_id, request, *args):
+    def unavailable(experiment, generation_id, request, *args):
         actions.append(request["action"])
-        raise ValueError("MLflow experiment is missing or deleted.")
+        raise error
 
-    monkeypatch.setattr(session, "call_tracking", deleted)
-    with pytest.raises(TrackingTargetUnavailableError, match="missing or deleted"):
+    monkeypatch.setattr(session, "call_tracking", unavailable)
+    with pytest.raises(TrackingTargetUnavailableError, match=expected):
         session.require_tracking_target(
             experiment, generation_id="generation", environment={}, deadline=None
         )
