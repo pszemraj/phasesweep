@@ -702,7 +702,7 @@ def test_publication_refuses_invalid_winner_artifact(
             "has no valid winner_source trial_number",
             id="trial-number",
         ),
-        pytest.param("study", 999, True, "removed winner_source field", id="extra-key"),
+        pytest.param("study", 999, True, "missing [], unexpected ['study']", id="extra-key"),
         pytest.param(
             "phase_fingerprint",
             999,
