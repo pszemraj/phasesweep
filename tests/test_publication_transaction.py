@@ -174,59 +174,18 @@ def test_summary_readback_refusals_are_publication_commit_errors(
         )
 
 
-@pytest.mark.integration
-def test_precommit_validation_failure_keeps_prior_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A pre-commit validation failure leaves the prior publication authoritative."""
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    first_generation = published_generation_id(experiment)
-    assert first_generation is not None
+def _fail_precommit_validation(monkeypatch: pytest.MonkeyPatch, experiment: Experiment) -> None:
+    """Make the next publication's pre-commit validation raise ``RuntimeError``."""
+    del experiment
 
     def fail_validation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated pre-commit validation failure")
 
     monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
 
-    captured: list[str] = []
 
-    def capture(report: TerminalReport) -> None:
-        captured.append(report.generation_id)
-
-    with pytest.raises(RuntimeError, match="simulated pre-commit validation failure"):
-        run_experiment(experiment, terminal_callback=capture)
-
-    assert len(captured) == 1
-    second_generation = captured[0]
-    assert second_generation != first_generation
-
-    # The failed generation's own record and current pointer both name the
-    # specific publication_failed outcome, not a generic failure.
-    assert _record_state(experiment, second_generation) == "publication_failed"
-    assert _current_pointer_state(experiment) == "publication_failed"
-    payload = yaml.safe_load(_generation_record_path(experiment, second_generation).read_text())
-    assert payload["error_class"] == "RuntimeError"
-
-    # The prior publication is untouched: the pointer never advanced.
-    assert published_generation_id(experiment) == first_generation
-    published = read_winner(experiment, "p")
-    assert published is not None
-    assert published.generation_id == first_generation
-
-
-@pytest.mark.integration
-def test_pointer_commit_failure_keeps_prior_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failure writing the last-success pointer itself is the same failure shape as validation."""
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    first_generation = published_generation_id(experiment)
-    assert first_generation is not None
-
+def _fail_pointer_commit(monkeypatch: pytest.MonkeyPatch, experiment: Experiment) -> None:
+    """Make writing the last-success pointer raise ``OSError``."""
     pointer_path = _last_successful_generation_path(experiment)
     original_write = artifact_io._write_yaml_atomic
 
@@ -237,14 +196,69 @@ def test_pointer_commit_failure_keeps_prior_publication(
 
     monkeypatch.setattr(artifact_io, "_write_yaml_atomic", flaky_write)
 
-    with pytest.raises(OSError, match="simulated pointer commit failure"):
-        run_experiment(experiment)
 
-    second_generation = yaml.safe_load(_generation_path(experiment).read_text())["generation_id"]
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("inject_failure", "error_type", "error_match"),
+    [
+        pytest.param(
+            _fail_precommit_validation,
+            RuntimeError,
+            "simulated pre-commit validation failure",
+            id="precommit-validation",
+        ),
+        # A failure writing the last-success pointer itself is the same failure shape as validation.
+        pytest.param(
+            _fail_pointer_commit,
+            OSError,
+            "simulated pointer commit failure",
+            id="pointer-commit",
+        ),
+    ],
+)
+def test_publication_commit_failure_keeps_prior_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_failure: Callable[[pytest.MonkeyPatch, Experiment], None],
+    error_type: type[Exception],
+    error_match: str,
+) -> None:
+    """A failure before the pointer commits leaves the prior publication authoritative."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    first_generation = published_generation_id(experiment)
+    assert first_generation is not None
+
+    inject_failure(monkeypatch, experiment)
+
+    captured: list[str] = []
+
+    def capture(report: TerminalReport) -> None:
+        captured.append(report.generation_id)
+
+    with pytest.raises(error_type, match=error_match):
+        run_experiment(experiment, terminal_callback=capture)
+
+    assert len(captured) == 1
+    second_generation = captured[0]
     assert second_generation != first_generation
+    assert (
+        yaml.safe_load(_generation_path(experiment).read_text())["generation_id"]
+        == second_generation
+    )
+
+    # The failed generation's own record and current pointer both name the
+    # specific publication_failed outcome, not a generic failure.
     assert _record_state(experiment, second_generation) == "publication_failed"
     assert _current_pointer_state(experiment) == "publication_failed"
+    payload = yaml.safe_load(_generation_record_path(experiment, second_generation).read_text())
+    assert payload["error_class"] == error_type.__name__
+
+    # The prior publication is untouched: the pointer never advanced.
     assert published_generation_id(experiment) == first_generation
+    published = read_winner(experiment, "p")
+    assert published is not None
+    assert published.generation_id == first_generation
 
 
 @pytest.mark.integration
@@ -474,22 +488,6 @@ def test_terminal_callback_control_flow_exception_cannot_replace_success(
     generation_id = published_generation_id(experiment)
     assert generation_id is not None
     assert _record_state(experiment, generation_id) == "published"
-
-
-def test_terminal_callback_control_flow_exception_cannot_replace_failure(
-    tmp_path: Path,
-) -> None:
-    """A diagnostic callback raising KeyboardInterrupt cannot mask the primary error."""
-    trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
-    experiment = make_experiment(
-        workdir=tmp_path / "runs", trainer=trainer, n_trials=1, max_consecutive_failures=1
-    )
-
-    def interrupting_callback(_report: TerminalReport) -> None:
-        raise KeyboardInterrupt("diagnostic consumer interrupted")
-
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(experiment, terminal_callback=interrupting_callback)
 
 
 @pytest.mark.integration

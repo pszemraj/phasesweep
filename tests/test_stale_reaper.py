@@ -730,21 +730,6 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
 _MISSING = object()
 
 
-def test_kill_stale_group_refuses_live_pid_without_starttime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-    monkeypatch.setattr("phasesweep.runtime.reaper.is_pid_alive", lambda _pid: True)
-    monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda _pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.reaper._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    assert kill_stale_group(pid=12345, saved_starttime=None, pgid=12345) is False
-    assert calls == []
-
-
 @dataclass(frozen=True)
 class _KillStaleGroupCase:
     pid: int | None
@@ -871,6 +856,21 @@ class _KillStaleGroupCase:
                 expected_calls=(7777,),
             ),
             id="use-live-pid-when-starttime-matches",
+        ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=12345,
+                saved_starttime=None,
+                pgid=12345,
+                pid_alive=True,
+                group_exists=True,
+            ),
+            id="refuse-live-pid-without-starttime",
+        ),
+        # No PID, no PGID: nothing alive to clean up. Safe to mark FAIL.
+        pytest.param(
+            _KillStaleGroupCase(pid=None, saved_starttime=None, pgid=None, expected=True),
+            id="accept-no-identity",
         ),
     ],
 )
@@ -1027,11 +1027,6 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
         _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
-
-
-def test_kill_stale_group_returns_true_when_no_identity() -> None:
-    """No PID, no PGID — nothing alive to clean up. Safe to mark FAIL."""
-    assert kill_stale_group(pid=None, saved_starttime=None, pgid=None) is True
 
 
 @pytest.mark.parametrize(

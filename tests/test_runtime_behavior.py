@@ -509,23 +509,29 @@ def test_terminal_callback_reports_success_evidence(
     assert report.uncertain_attempt_ids == frozenset({"attempt-uncertain"})
 
 
+@pytest.mark.parametrize(
+    "callback_error_type",
+    [
+        pytest.param(RuntimeError, id="exception"),
+        # A diagnostic callback raising KeyboardInterrupt cannot mask the primary error.
+        pytest.param(KeyboardInterrupt, id="keyboard-interrupt"),
+    ],
+)
 def test_terminal_callback_preserves_failure_when_callback_raises(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    callback_error_type: type[BaseException],
 ) -> None:
     experiment = make_experiment(workdir=tmp_path / "runs")
     primary_error = NoFeasibleTrialError("phase failed")
     captured: list[TerminalReport] = []
-
-    class CallbackError(RuntimeError):
-        pass
 
     def fail_run(*_args, **_kwargs):
         raise primary_error
 
     def fail_callback(report: TerminalReport) -> None:
         captured.append(report)
-        raise CallbackError("snapshot failed")
+        raise callback_error_type("snapshot failed")
 
     monkeypatch.setattr(
         "phasesweep.engine.guards._preflight_existing_studies",

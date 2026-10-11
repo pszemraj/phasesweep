@@ -733,47 +733,22 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
     }
 
 
-def test_process_failure_after_deadline_is_not_relabelled(tmp_path: Path) -> None:
-    """An elapsed clock is not causal when the trainer already failed."""
-    experiment = make_experiment(workdir=tmp_path)
-    executed = ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
-            overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
-            return_code=1,
-            duration_seconds=0.1,
-        ),
-        process=ProcessResult(
-            return_code=1,
-            timed_out=False,
-            pid=123,
-            duration_seconds=0.1,
-            failure_reason="trainer failed",
-        ),
-    )
-
-    result = extract_trial_result(
-        experiment=experiment,
-        executed=executed,
-        deadline=time.monotonic() - 1.0,
-    )
-
-    assert result.failure_reason == "trainer failed"
-    assert result.deadline_exhausted is False
-
-
 @pytest.mark.parametrize(
-    ("capped_by_deadline", "timed_out", "expected"),
-    [(True, True, True), (False, True, False), (True, False, False)],
+    ("capped_by_deadline", "timed_out", "deadline_elapsed", "expected"),
+    [
+        pytest.param(True, True, False, True, id="killed-at-the-deadline-cap"),
+        pytest.param(False, True, False, False, id="killed-at-its-own-timeout"),
+        pytest.param(True, False, False, False, id="capped-but-not-killed"),
+        # An elapsed clock is not causal when the trainer already failed.
+        pytest.param(False, False, True, False, id="failed-before-the-deadline-elapsed"),
+    ],
 )
 def test_trainer_timeout_attribution_follows_wallclock_cap(
-    tmp_path: Path, capped_by_deadline: bool, timed_out: bool, expected: bool
+    tmp_path: Path,
+    capped_by_deadline: bool,
+    timed_out: bool,
+    deadline_elapsed: bool,
+    expected: bool,
 ) -> None:
     """A killed trainer is deadline-attributed only when its cap was the deadline."""
     experiment = make_experiment(workdir=tmp_path)
@@ -801,7 +776,11 @@ def test_trainer_timeout_attribution_follows_wallclock_cap(
         ),
     )
 
-    result = extract_trial_result(experiment=experiment, executed=executed)
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=executed,
+        deadline=time.monotonic() - 1.0 if deadline_elapsed else None,
+    )
 
     assert result.failure_reason == failure
     assert result.deadline_exhausted is expected
