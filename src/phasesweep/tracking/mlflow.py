@@ -116,11 +116,19 @@ def _resolve(client: Any, settings: dict[str, Any]) -> str:
     :raises ValueError: The experiment does not exist or has been deleted.
     :return str: Existing experiment ID.
     """
-    experiment = (
-        client.get_experiment(settings["experiment_id"])
-        if settings.get("experiment_id")
-        else client.get_experiment_by_name(settings["experiment_name"])
-    )
+    from mlflow.exceptions import MlflowException
+
+    try:
+        experiment = (
+            client.get_experiment(settings["experiment_id"])
+            if settings.get("experiment_id")
+            else client.get_experiment_by_name(settings["experiment_name"])
+        )
+    except MlflowException as exc:
+        # An unknown ID raises where an unknown name returns None.
+        if exc.error_code != "RESOURCE_DOES_NOT_EXIST":
+            raise
+        experiment = None
     if experiment is None or experiment.lifecycle_stage != "active":
         raise ValueError(
             "MLflow experiment is missing or deleted; provision an existing experiment first."

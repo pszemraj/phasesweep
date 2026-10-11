@@ -226,6 +226,18 @@ def test_creation_binds_an_existing_identity_and_creates_only_when_absent(monkey
         _create(client, request)
 
 
+@pytest.mark.parametrize("target", ["experiment_id", "experiment_name"])
+def test_unknown_experiment_is_reported_as_missing(target):
+    from phasesweep.tracking.mlflow import _resolve
+
+    def unknown_id(_):
+        raise _server_error("RESOURCE_DOES_NOT_EXIST")()
+
+    client = SimpleNamespace(get_experiment=unknown_id, get_experiment_by_name=lambda _: None)
+    with pytest.raises(ValueError, match="missing or deleted; provision an existing experiment"):
+        _resolve(client, {target: "404"})
+
+
 def test_no_cross_backend_publishing(tmp_path):
     config = {
         "experiment": "test",
