@@ -14,7 +14,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import optuna
@@ -181,6 +181,62 @@ def _wait_for_running_trial(config: Path, proc: subprocess.Popen, log_path: Path
                     return trial_dir
         time.sleep(0.2)
     raise AssertionError(f"trial never reached RUNNING; log:\n{log_path.read_text()}")
+
+
+@contextlib.contextmanager
+def _spawned_runner(
+    store: RunStore, run_id: str, config: Path, *, cwd: Path
+) -> Iterator[subprocess.Popen]:
+    """Claim ``run_id`` and run the detached runner on ``config`` in a real subprocess.
+
+    The runner is its own session and group leader, so its pgid is its pid. Its
+    group is killed on exit unless the body already reaped it.
+
+    :param RunStore store: Run store receiving the reservation, status, and runner log.
+    :param str run_id: Run identifier to claim.
+    :param Path config: Configuration the runner loads as its snapshot.
+    :param Path cwd: Runner working directory.
+    :return Iterator[subprocess.Popen]: The running runner process.
+    """
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+        experiment_id="cancel_me",
+    )
+    cmd = [
+        sys.executable,
+        "-m",
+        "phasesweep.mcp.runner",
+        *runner_argv(
+            store,
+            run_id=run_id,
+            config=config,
+            config_sha256=config_sha256,
+            experiment_id="cancel_me",
+            started_at=started_at,
+        ),
+        "--cwd",
+        str(cwd),
+    ]
+    with open_private_text(store.log_path(run_id), "w") as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    try:
+        yield proc
+    finally:
+        if proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
 
 
 def test_runner_persists_terminal_evidence_before_snapshot_finalization(
@@ -2167,39 +2223,7 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
     run_id = "r1"
     status_path = store.status_path(run_id)
     log_path = store.log_path(run_id)
-    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-        experiment_id="cancel_me",
-    )
-    cmd = [
-        sys.executable,
-        "-m",
-        "phasesweep.mcp.runner",
-        *runner_argv(
-            store,
-            run_id=run_id,
-            config=config,
-            config_sha256=config_sha256,
-            experiment_id="cancel_me",
-            started_at=started_at,
-        ),
-        "--cwd",
-        str(tmp_path),
-    ]
-    with open_private_text(log_path, "w") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,  # runner is its own session/group leader -> pgid == pid
-        )
-    try:
+    with _spawned_runner(store, run_id, config, cwd=tmp_path) as proc:
         trial_dir = _wait_for_running_trial(config, proc, log_path)
         trial_pgid = json.loads((trial_dir / PROCESS_IDENTITY_FILE).read_text())["pgid"]
 
@@ -2208,11 +2232,6 @@ def test_runner_cancel_records_cancelled(tmp_path: Path) -> None:
         # handler tears the trial group down, then exits 128+SIGTERM = 143.
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=30)
-    finally:
-        if proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=10)
 
     assert proc.returncode == 143, (
         f"expected 143, got {proc.returncode}; log:\n{log_path.read_text()}"
@@ -2240,39 +2259,7 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
     run_id = "r2"
     status_path = store.status_path(run_id)
     log_path = store.log_path(run_id)
-    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
-    started_at = utc_now_iso()
-    claim_runner_handle(
-        store,
-        run_id=run_id,
-        config_sha256=config_sha256,
-        started_at=started_at,
-        experiment_id="cancel_me",
-    )
-    cmd = [
-        sys.executable,
-        "-m",
-        "phasesweep.mcp.runner",
-        *runner_argv(
-            store,
-            run_id=run_id,
-            config=config,
-            config_sha256=config_sha256,
-            experiment_id="cancel_me",
-            started_at=started_at,
-        ),
-        "--cwd",
-        str(tmp_path),
-    ]
-    with open_private_text(log_path, "w") as log_file:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    try:
+    with _spawned_runner(store, run_id, config, cwd=tmp_path) as proc:
         # The spawned transition occurs after handler installation, so it is
         # the synchronization point for this pre-trial cancellation.
         deadline = time.time() + 25
@@ -2289,11 +2276,6 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
             time.sleep(0.02)
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=30)
-    finally:
-        if proc.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGKILL)
-            proc.wait(timeout=10)
 
     assert proc.returncode == 143, (
         f"expected 143, got {proc.returncode}; log:\n{log_path.read_text()}"
