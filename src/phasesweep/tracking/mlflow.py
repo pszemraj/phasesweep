@@ -96,14 +96,13 @@ def verify_remote(run: Any, binding: Mapping[str, Any]) -> None:
 
     :param Any run: Public MLflow Run entity.
     :param Mapping[str, Any] binding: Locally recorded identity.
-    :raises ValueError: Remote identity contradicts the binding.
+    :raises ValueError: Remote identity contradicts the binding, or the run is deleted.
     """
-    if (
-        run.info.run_id != binding["run_id"]
-        or run.info.experiment_id != binding["experiment_id"]
-        or run.info.lifecycle_stage != "active"
-    ):
+    if run.info.run_id != binding["run_id"] or run.info.experiment_id != binding["experiment_id"]:
         raise ValueError("MLflow run does not match the bound experiment/run identity.")
+    if run.info.lifecycle_stage != "active":
+        # Deleting an experiment deletes its runs too; restoring it restores them.
+        raise ValueError("MLflow run is deleted; restore it, or its experiment, in MLflow.")
     if any(run.data.tags.get(k) != v for k, v in identity_tags(binding).items()):
         raise ValueError("MLflow run has conflicting PhaseSweep identity tags.")
 

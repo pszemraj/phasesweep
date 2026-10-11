@@ -164,6 +164,22 @@ def test_shared_history_once():
     assert [capture["observations"][observation_id(s)]["value"] for s in selectors] == [3, 2, 2]
 
 
+@pytest.mark.parametrize(
+    "problem,message", [("deleted", "run is deleted; restore it"), ("moved", "does not match")]
+)
+def test_remote_identity_failures_name_their_cause(problem, message):
+    from phasesweep.tracking.mlflow import verify_remote
+
+    binding = _binding()
+    run = _run(binding)
+    if problem == "deleted":
+        run.info.lifecycle_stage = "deleted"
+    else:
+        run.info.experiment_id = "foreign"
+    with pytest.raises(ValueError, match=message):
+        verify_remote(run, binding)
+
+
 @pytest.mark.parametrize("status", ["FAILED", "KILLED"])
 def test_unsuccessful_remote_cannot_be_finished(status):
     binding = _binding()
