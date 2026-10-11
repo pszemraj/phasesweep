@@ -681,8 +681,15 @@ def test_run_preparation_failure_never_acquires_gpu(tmp_path, monkeypatch, failu
             "phasesweep.tracking.session.require_tracking_target", lambda *a, **k: None
         )
         monkeypatch.setattr("phasesweep.tracking.session.prepare_attempt", unavailable)
-        with pytest.raises(NoFeasibleTrialError):
-            run_experiment(native_experiment(tmp_path))
+        experiment = native_experiment(tmp_path)
+        with pytest.raises(NoFeasibleTrialError, match="reason is in run.log"):
+            run_experiment(experiment)
+        from phasesweep.engine.paths import _experiment_dir
+
+        # Both places the error points to name the cause.
+        root = _experiment_dir(experiment)
+        for record in (root / "run.log", next(root.glob("*/trials.csv"))):
+            assert "MLflow run preparation: MLflow experiment is missing" in record.read_text()
 
 
 @pytest.mark.parametrize(

@@ -940,9 +940,12 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             except UnsafeProcessCleanupError:
                 raise
             except (OSError, ValueError, RuntimeError) as exc:
+                reason = f"MLflow run preparation: {exc}"
+                log.warning("[%s/trial_%d] %s", phase.name, trial.number, reason)
+                trial.set_user_attr(FAILURE_REASON_ATTR, reason)
                 if run.optimize_deadline is not None and time.monotonic() >= run.optimize_deadline:
-                    raise _DeadlineTrialExecutionError(f"MLflow run preparation: {exc}") from exc
-                raise TrialExecutionError(f"MLflow run preparation: {exc}") from exc
+                    raise _DeadlineTrialExecutionError(reason) from exc
+                raise TrialExecutionError(reason) from exc
         with run.gpu_pool.acquire(deadline=run.optimize_deadline) as gpu_assignment:
             # Re-check abort flags inside the lease (review v0.5.2 / blocker 8,
             # extended to fatal objective errors). Without this, queued
