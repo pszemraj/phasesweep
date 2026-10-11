@@ -481,10 +481,10 @@ def test_environment_identity_digest_ignores_mapping_order(
     assert len(forward.digest) == 64
 
 
-def test_environment_identity_digest_tracks_values_and_name_boundaries(
+def test_environment_identity_digest_tracks_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Different values — and differently-split name/value pairs — are different environments."""
+    """Different values for one name are different environments."""
     monkeypatch.delenv("PHASESWEEP_TEST_AMBIENT_SECRET", raising=False)
 
     def identity_for(env: dict[str, str]) -> str:
@@ -493,9 +493,6 @@ def test_environment_identity_digest_tracks_values_and_name_boundaries(
         ).digest
 
     assert identity_for({"TOKEN": "old"}) != identity_for({"TOKEN": "new"})
-    # An injective encoding must not let a name/value boundary shift produce
-    # one digest: "A" -> "B=1" and "A=B" -> "1" are different environments.
-    assert identity_for({"A": "B=1"}) != identity_for({"A=B": "1"})
 
 
 def test_environment_identity_names_are_sorted_and_hold_no_values(

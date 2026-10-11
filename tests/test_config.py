@@ -472,6 +472,26 @@ def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]
 
 
 @pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        pytest.param({"A=B": "x"}, "env names must be nonempty", id="name_with_equals"),
+        pytest.param({"": "x"}, "env names must be nonempty", id="empty_name"),
+        pytest.param({"A\x00B": "x"}, "env names must be nonempty", id="nul_in_name"),
+        pytest.param({"A": "x\x00y"}, r"env values cannot contain NUL.*\['A'\]", id="nul_in_value"),
+    ],
+)
+def test_env_rejects_names_and_values_the_launch_cannot_pass(
+    env: dict[str, str], message: str
+) -> None:
+    """``os.execve`` raises ValueError for these, which the supervisor does not catch.
+
+    The launch would crash after the generation was claimed, so the load refuses them.
+    """
+    with pytest.raises(ValidationError, match=message):
+        make_experiment(env=env)
+
+
+@pytest.mark.parametrize(
     ("field", "names", "message"),
     [
         pytest.param("inherit_env", [""], "nonempty and unpadded", id="inherit_empty"),
@@ -485,6 +505,8 @@ def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]
             "must be unique",
             id="inherit_duplicate",
         ),
+        pytest.param("inherit_env", ["A=B"], "no '=' or NUL", id="inherit_equals"),
+        pytest.param("inherit_env", ["A\x00B"], "no '=' or NUL", id="inherit_nul"),
         pytest.param("passthrough_env", [""], "nonempty and unpadded", id="passthrough_empty"),
         pytest.param(
             "passthrough_env",
@@ -492,6 +514,8 @@ def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]
             "nonempty and unpadded",
             id="passthrough_leading_space",
         ),
+        pytest.param("passthrough_env", ["A=B"], "no '=' or NUL", id="passthrough_equals"),
+        pytest.param("passthrough_env", ["A\x00B"], "no '=' or NUL", id="passthrough_nul"),
         pytest.param(
             "passthrough_env",
             ["HF_TOKEN", "HF_TOKEN"],
@@ -503,8 +527,9 @@ def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]
 def test_execution_env_names_validated(field: str, names: list[str], message: str) -> None:
     """A named-inheritance or passthrough list must be a set of exact variable names.
 
-    Padded or empty names would silently inherit nothing (``os.environ`` has
-    no ``' PATH'``), and duplicates hide a typo in a second entry.
+    Padded, empty, ``=``-bearing, or NUL-bearing names would silently inherit
+    nothing (``os.environ`` has no ``' PATH'`` and cannot hold ``'A=B'``), and
+    duplicates hide a typo in a second entry.
     """
     with pytest.raises(ValidationError, match=message):
         ExecutionContext(**{field: names})

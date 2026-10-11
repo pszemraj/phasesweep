@@ -460,6 +460,19 @@ class Phase(_Frozen):
         return self
 
 
+def _is_environment_name(name: str) -> bool:
+    """Return whether ``name`` can be the name of a process environment variable.
+
+    ``os.execve`` raises ``ValueError`` for an empty name, a name containing
+    ``=``, and any name or value containing NUL, and no ambient variable can
+    carry such a name.
+
+    :param str name: Candidate environment variable name.
+    :return bool: ``True`` when the name is nonempty and holds no ``=`` or NUL.
+    """
+    return bool(name) and "=" not in name and "\x00" not in name
+
+
 class ExecutionContext(_Frozen):
     """Explicit trainer execution-context contract (review v0.5.17 / blocker 4).
 
@@ -525,18 +538,22 @@ class ExecutionContext(_Frozen):
 
     @model_validator(mode="after")
     def _validate_inherit_names(self) -> ExecutionContext:
-        """Reject empty or whitespace-only inherited-variable names.
+        """Reject inherited-variable names that no environment variable can have.
 
-        :raises ValueError: A listed variable name is empty or padded.
+        :raises ValueError: A listed variable name is empty, padded, or contains
+            ``=`` or NUL, or a name list repeats a name or the two lists overlap.
         :return ExecutionContext: Self, unchanged.
         """
         named_contracts = {"passthrough_env": self.passthrough_env}
         if isinstance(self.inherit_env, list):
             named_contracts["inherit_env"] = self.inherit_env
         for label, names in named_contracts.items():
-            bad = [name for name in names if not name or name != name.strip()]
+            bad = [name for name in names if name != name.strip() or not _is_environment_name(name)]
             if bad:
-                raise ValueError(f"{label} names must be nonempty and unpadded: {bad!r}")
+                raise ValueError(
+                    f"{label} names must be nonempty and unpadded, with no '=' or NUL "
+                    f"character: {bad!r}"
+                )
             if len(set(names)) != len(names):
                 raise ValueError(f"{label} names must be unique.")
         if isinstance(self.inherit_env, list):
@@ -647,6 +664,30 @@ class Experiment(_Frozen):
                 "`storage: null` for an in-memory dry run."
             )
         canonical_storage_identity(value)
+        return value
+
+    @field_validator("env")
+    @classmethod
+    def _env_is_launchable(cls, value: dict[str, str]) -> dict[str, str]:
+        """Reject trainer environment entries that ``os.execve`` cannot pass.
+
+        :param dict[str, str] value: Configured trainer environment overrides.
+        :raises ValueError: A name is empty or contains ``=`` or NUL, or a value
+            contains NUL.
+        :return dict[str, str]: The validated mapping, unchanged.
+        """
+        bad_names = [name for name in value if not _is_environment_name(name)]
+        if bad_names:
+            raise ValueError(
+                "env names must be nonempty and contain no '=' or NUL character, because "
+                f"the trainer launch cannot pass them: {bad_names!r}. Rename or remove them."
+            )
+        bad_values = [name for name, text in value.items() if "\x00" in text]
+        if bad_values:
+            raise ValueError(
+                "env values cannot contain NUL, because the trainer launch cannot pass "
+                f"them; fix the value of {bad_values!r}."
+            )
         return value
 
     @model_validator(mode="after")

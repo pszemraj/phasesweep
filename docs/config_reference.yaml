@@ -14,7 +14,7 @@
 # The file must be UTF-8 text whose top level is one mapping. That mapping describes one experiment.
 # Unknown keys are rejected at every level, and a duplicate key anywhere in the YAML is rejected.
 # trainer_config, fixed_overrides, search_space, provenance and env are maps with user-chosen keys.
-# fixed_overrides and search_space keys must be dotted paths, provenance keys and values must be nonblank, and env keys and values are not validated.
+# fixed_overrides and search_space keys must be dotted paths, provenance keys and values must be nonblank, and env keys must be valid variable names.
 # Paths: workdir, a relative journal path in storage, and execution.cwd resolve against the directory phasesweep is started from, not against the config file. A leading ~ is expanded in all three, and symlinks are resolved.
 # An MCP catalog rejects a relative workdir, execution.cwd or journal path, and an omitted execution.cwd becomes the catalog entry's cwd, which defaults to the config file's directory.
 # Trial-relative paths (extractor and gate path and file values) resolve inside the attempt directory.
@@ -940,7 +940,8 @@ mlflow: object | null = null
 # ---------- Execution environment ----------
 
 # Explicit trainer environment values, layered over the inherited environment and execution.passthrough_env values. Keys are variable names and values must be YAML strings.
-# They are semantic experiment inputs and part of the study fingerprint. Keys and values are not validated, so a key containing = or a NUL character in a value passes config load.
+# They are semantic experiment inputs and part of the study fingerprint.
+# Requires: every key is nonempty and contains no = and no NUL character, and no value contains a NUL character, because the trainer launch cannot pass such entries. Config load fails otherwise.
 # Warning: values are written in plain text to generations/<generation id>/config.snapshot.yaml (mode 0600), so rotating secrets belong in execution.passthrough_env instead.
 # PhaseSweep then assigns the per-attempt names PHASESWEEP_TRIAL_DIR, PHASESWEEP_TRIAL_ID, PHASESWEEP_PHASE, PHASESWEEP_RUN_NAME, PHASESWEEP_GENERATION_ID, PHASESWEEP_ATTEMPT_ID, PHASESWEEP_OVERRIDES_SHA256 and (for a json_envelope metric extractor) PHASESWEEP_OBJECTIVE_PATH. Values configured here for those names are discarded.
 # PHASESWEEP_TRIAL_DIR is the absolute attempt directory, PHASESWEEP_TRIAL_ID the phase-local trial number, and PHASESWEEP_GENERATION_ID the identifier of this invocation (the run ID under MCP).
@@ -973,7 +974,7 @@ execution: object = {}
   # CUDA_VISIBLE_DEVICES is never in the base set. Bind it with env.CUDA_VISIBLE_DEVICES or name it here.
   # The same selection applies to the environment of PhaseSweep's own MLflow and W&B workers.
   # Overridden by: env (a configured value replaces an inherited value of the same name).
-  # Conflicts with: execution.passthrough_env (a name cannot be in both; config load fails). Names in a list must be unique, nonempty and unpadded.
+  # Conflicts with: execution.passthrough_env (a name cannot be in both; config load fails). Names in a list must be unique, nonempty, unpadded and free of = and NUL characters.
   # Warning: before each phase that still has work, the composed environment must match the one recorded for the study's earlier attempts, or the run is refused with a fingerprint mismatch. The check compares one digest over the sorted name and value pairs, without execution.passthrough_env names, the PHASESWEEP_* names listed under env, or GPU bindings.
   # With all, that digest includes variables such as PWD, SHLVL and the ambient CUDA_VISIBLE_DEVICES, so unrelated shell changes can prevent reuse.
   # To clear a mismatch, restore the environment, move the variable to execution.passthrough_env, or use a new experiment name.
@@ -981,7 +982,7 @@ execution: object = {}
   # Recommended: list the model, cache and GPU variables the trainer needs. Narrowed inheritance does not later pick up excluded credential or cache variables.
   inherit_env: "all" | "none" | list[string] = "all"
 
-  # Names of ambient variables whose values may change between invocations, for example MLFLOW_TRACKING_TOKEN or HTTPS_PROXY. Names must be unique, nonempty and unpadded.
+  # Names of ambient variables whose values may change between invocations, for example MLFLOW_TRACKING_TOKEN or HTTPS_PROXY. Names must be unique, nonempty, unpadded and free of = and NUL characters.
   # With inherit_env all this list adds nothing to the environment, because every ambient variable is already inherited. With none or a list, it adds these variables to the base set.
   # The names are part of the study fingerprint and their values are excluded from the environment digest, so they can rotate without stopping reuse. A variable missing from the ambient environment is not invented.
   # These variables also reach PhaseSweep's own MLflow and W&B workers, so they must exist in the controller's environment, including for sync-tracking.
