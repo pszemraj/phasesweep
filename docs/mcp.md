@@ -1,21 +1,12 @@
 # MCP operator guide
 
-The optional PhaseSweep MCP server exposes only experiments an operator has
-listed in a reviewed catalog. It launches detached local processes and stores
-durable run IDs, so a client disconnect or server restart does not end an
-approved run. PhaseSweep owns the server and catalog; each MCP client owns its
-own connection configuration and instructions. See [MCP setup](mcp_setup.md)
-for installation and client-owned configuration.
+The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. PhaseSweep owns the server and catalog; each MCP client owns its own connection configuration and instructions. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
 
-The server runs over local stdio and is supported on Linux. It needs readable
-`/proc` process start times to distinguish process reuse during cancellation
-and recovery.
+The server runs over local stdio and is supported on Linux. It needs readable `/proc` process start times to distinguish process reuse during cancellation and recovery.
 
 ## The catalog
 
-The catalog maps opaque agent-visible IDs to operator-owned experiment YAML
-paths. Paths, commands, environments, storage URLs, and raw logs never appear
-in normal tool responses.
+The catalog maps opaque agent-visible IDs to operator-owned experiment YAML paths. Paths, commands, environments, storage URLs, and raw logs never appear in normal tool responses.
 
 ```yaml
 state_dir: /absolute/path/to/phasesweep-mcp-state
@@ -51,13 +42,9 @@ These are all accepted catalog fields. Entry paths expand `~`; relative `state_d
 | `experiments[].allow.from_phase` | Boolean; `false` | Permit a launch with `from_phase`; also requires `allow.launch` and compatible earlier phase winners. It does not waive resume checks. |
 | `experiments[].visible_params` | `none`, `all`, or list of strings; `none` | Control sampled winner parameter values returned to agents. An allowlist uses exact parameter names; surrounding whitespace is stripped, duplicate names removed and blank names rejected. Keep `none` unless exposing values is intended. |
 
-MCP experiments must use a persistent local journal or `auto` ledger, an
-absolute `workdir`, and an absolute storage path after `auto` is resolved.
-Set an absolute `execution.cwd` when it is present. In-memory and
-external-database storage are not durable detached-run targets.
+MCP experiments must use a persistent local journal or `auto` ledger, an absolute `workdir`, and an absolute storage path after `auto` is resolved. Set an absolute `execution.cwd` when it is present. In-memory and external-database storage are not durable detached-run targets.
 
-Follow [MCP setup](mcp_setup.md) to create, review, and validate a catalog.
-To run the stdio server directly:
+Follow [MCP setup](mcp_setup.md) to create, review, and validate a catalog. To run the stdio server directly:
 
 ```bash
 phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
@@ -71,15 +58,10 @@ phasesweep mcp serve --catalog /absolute/path/to/catalog.yaml
 
 Catalog operations use an experiment ID:
 
-1. `list_experiments` discovers the reviewed catalog, using its cursor until
-   there are no more pages.
-2. `inspect_experiment(experiment_id)` returns an approved experiment's phase
-   shape, metric descriptor, and permissions. It never launches work.
-3. After explicit user authorization, `launch_run(experiment_id, from_phase?)`
-   starts the detached run and returns its durable `run_id`.
-4. `get_latest_run(experiment_id)` is the reconnection lookup when a client
-   lost a run ID. It returns the newest handle for that catalog experiment, or
-   `found: false` when no matching run exists.
+1. `list_experiments` discovers the reviewed catalog, using its cursor until there are no more pages.
+2. `inspect_experiment(experiment_id)` returns an approved experiment's phase shape, metric descriptor, and permissions. It never launches work.
+3. After explicit user authorization, `launch_run(experiment_id, from_phase?)` starts the detached run and returns its durable `run_id`.
+4. `get_latest_run(experiment_id)` is the reconnection lookup when a client lost a run ID. It returns the newest handle for that catalog experiment, or `found: false` when no matching run exists.
 
 Run lifecycle reads use a run ID only:
 
@@ -112,17 +94,9 @@ If it returns `found: false`, `run` is null and there is no run to resume. `awai
 
 ## Reading status responses
 
-Run status and results are path-free, strict structured payloads. They expose
-the run state, phase counts, winner presence, metric semantics, and only the
-sampled winner parameters allowed by `visible_params`. Composed fixed and
-inherited overrides are not returned.
+Run status and results are path-free, strict structured payloads. They expose the run state, phase counts, winner presence, metric semantics, and only the sampled winner parameters allowed by `visible_params`. Composed fixed and inherited overrides are not returned.
 
-For a terminal run, results come from the terminal snapshot captured for that
-run, not from a later mutable study. This keeps a run's observed outcome stable
-after another launch, a catalog edit, or a new publication. A terminal snapshot
-that is absent or unreadable remains unavailable; it is not reconstructed from
-the current ledger. Availability fields may be unknown when an observation was
-not possible and must not be treated as available.
+For a terminal run, results come from the terminal snapshot captured for that run, not from a later mutable study. This keeps a run's observed outcome stable after another launch, a catalog edit, or a new publication. A terminal snapshot that is absent or unreadable remains unavailable; it is not reconstructed from the current ledger. Availability fields may be unknown when an observation was not possible and must not be treated as available.
 
 Read provenance and labels together:
 
@@ -145,17 +119,13 @@ Read provenance and labels together:
 | `permission_denied` | The server process could not read the publishing tree for validation. |
 | `unknown` | The run's terminal snapshot cannot establish an answer. |
 
-For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and
-report the condition.
+For `failed`, `permission_denied`, and `unknown`, stop automated follow-up and report the condition.
 
 Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-verdicts). `flagged` lists checks whose verdict is `heterogeneous`; report each with its counts before relying on the winner or proposing a run whose phases inherit it. `evaluation_point` exposes `distinct_values` and `winner_value`; `tie` exposes `tied_trials`. `n/a` means a check could not run and must never be read as clean. MCP exposes only enums and numbers from these checks; evidence strings such as the evaluation-axis config key stay private. The verdicts do not invalidate the result, and only the operator decides whether to re-run.
 
 Also report a winner's `incomplete: true`: a wallclock timeout cut its phase short, so selection used a partial population. The confound checks do not cover this limitation.
 
-`recovery_required: true` means cleanup, launch handoff, or snapshot
-finalization needs operator recovery. Agents should stop rather than guessing
-at process or result state; [run state and recovery](#run-state-and-recovery)
-shows where each case comes from.
+`recovery_required: true` means cleanup, launch handoff, or snapshot finalization needs operator recovery. Agents should stop rather than guessing at process or result state; [run state and recovery](#run-state-and-recovery) shows where each case comes from.
 
 Winner results describe selected values, not convergence curves, robustness, causality, or unreturned trial history. Confound counts describe the population selection ranked, not the winner's robustness. Treat `<redacted>` values as deliberate catalog policy, not missing data.
 
@@ -167,20 +137,11 @@ For MLflow, `get_run_status` and `await_run` report the run's own current local 
 
 ## Run state and recovery
 
-Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log,
-saved-config, terminal-status, and recovery sidecar files under
-`state_dir/logs/`. The control-process log is separate from trainer
-`stdout.log` and `stderr.log`, which are inside the operator-owned experiment
-workdir.
+Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, and recovery sidecar files under `state_dir/logs/`. The control-process log is separate from trainer `stdout.log` and `stderr.log`, which are inside the operator-owned experiment workdir.
 
-The server records a process identity and coordinates launch across servers
-sharing one state directory. It retains an uncertain-cleanup reservation when
-it cannot prove a detached process group has stopped. Cancellation uses the
-saved identity and can require confirmation of cleanup; a stale PID alone is
-never considered authority to signal another process.
+The server records a process identity and coordinates launch across servers sharing one state directory. It retains an uncertain-cleanup reservation when it cannot prove a detached process group has stopped. Cancellation uses the saved identity and can require confirmation of cleanup; a stale PID alone is never considered authority to signal another process.
 
-A run's reported `state` and `recovery_required` follow that durable evidence.
-Within one host boot, a run moves like this:
+A run's reported `state` and `recovery_required` follow that durable evidence. Within one host boot, a run moves like this:
 
 ```mermaid
 flowchart TD
@@ -193,11 +154,7 @@ flowchart TD
     unsettled -->|"operator runs recover-run and confirms, once no runner can still start"| removed["abandoned launch removed"]
 ```
 
-In both `recovery_required` cases the run still counts as running, so it keeps
-its concurrency slot and blocks another launch of the same experiment until
-`recover-run` settles it. A host reboot is the exception for a runner that died
-without a final status: its recorded boot proves nothing from that boot
-survived, so the run reads as `failed` without any signal being sent.
+In both `recovery_required` cases the run still counts as running, so it keeps its concurrency slot and blocks another launch of the same experiment until `recover-run` settles it. A host reboot is the exception for a runner that died without a final status: its recorded boot proves nothing from that boot survived, so the run reads as `failed` without any signal being sent.
 
 Operator recovery is deliberately a CLI operation, not an agent tool:
 
@@ -205,31 +162,18 @@ Operator recovery is deliberately a CLI operation, not an agent tool:
 phasesweep mcp recover-run --state-dir /absolute/path/to/phasesweep-mcp-state --run-id <run-id>
 ```
 
-Without `--confirm`, the command only inspects the run and reports the actions
-it would take. Read that report, then repeat the command with `--confirm` to
-perform them.
+Without `--confirm`, the command only inspects the run and reports the actions it would take. Read that report, then repeat the command with `--confirm` to perform them.
 
 > [!WARNING]
-> Do not delete run-handle files individually: a run history consists of its
-> handle and matching log/status/config sidecars. Archive that complete set only
-> between campaigns after the run is terminal and no recovery is required.
+> Do not delete run-handle files individually: a run history consists of its handle and matching log/status/config sidecars. Archive that complete set only between campaigns after the run is terminal and no recovery is required.
 
 ## Security boundary
 
-The server does not accept configuration YAML, paths, commands, storage URLs,
-environment values, search ranges, sampler settings, gates, or safety waivers
-as tool input. Only the operator-authored catalog maps an experiment ID to a
-config. A catalog permission is not a grant to alter its config.
+The server does not accept configuration YAML, paths, commands, storage URLs, environment values, search ranges, sampler settings, gates, or safety waivers as tool input. Only the operator-authored catalog maps an experiment ID to a config. A catalog permission is not a grant to alter its config.
 
-No tool returns raw trainer logs, result files, commands, storage locations,
-or unredacted fixed/inherited values. Keep secrets, private paths, and data
-identifiers out of searchable categorical choices unless exposing them is an
-intentional catalog decision.
+No tool returns raw trainer logs, result files, commands, storage locations, or unredacted fixed/inherited values. Keep secrets, private paths, and data identifiers out of searchable categorical choices unless exposing them is an intentional catalog decision.
 
 > [!NOTE]
-> Training still runs with the authority of the operator-authored command; MCP
-> restricts agent inputs and outputs, not the trainer process itself.
+> Training still runs with the authority of the operator-authored command; MCP restricts agent inputs and outputs, not the trainer process itself.
 
-Clients that support resources can read `phasesweep://catalog` for the first
-catalog page. The packaged `phasesweep_run_and_monitor` prompt supplies the
-same run-safety guidance as [the installed agent instructions](../src/phasesweep/mcp/agent_prompt.md).
+Clients that support resources can read `phasesweep://catalog` for the first catalog page. The packaged `phasesweep_run_and_monitor` prompt supplies the same run-safety guidance as [the installed agent instructions](../src/phasesweep/mcp/agent_prompt.md).

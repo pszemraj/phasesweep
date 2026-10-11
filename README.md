@@ -59,8 +59,7 @@ phasesweep validate experiment.yaml   # checks it without launching anything
 phasesweep run experiment.yaml        # four tiny trials, a few seconds
 ```
 
-`phasesweep init` never overwrites an existing file; use `-o PATH` for another
-destination.
+`phasesweep init` never overwrites an existing file; use `-o PATH` for another destination.
 
 The run log shows the phase chaining directly (abridged):
 
@@ -106,14 +105,9 @@ Choose the input interface your trainer already accepts:
 | Nested overrides-only JSON (`json_file`) | `--overrides {overrides_path}` |
 
 > [!TIP]
-> `phasesweep run experiment.yaml --dry-run` prints one rendered command per
-> phase without launching work. Use it to check that your placeholders render
-> what the trainer expects.
+> `phasesweep run experiment.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects.
 
-For ordinary JSON output, pass an output path under `{trial_dir}` to your
-trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`.
-For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT, metric_key: eval/loss}`,
-have the trainer honor the supplied W&B identity, and install the extra:
+For ordinary JSON output, pass an output path under `{trial_dir}` to your trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`. For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT, metric_key: eval/loss}`, have the trainer honor the supplied W&B identity, and install the extra:
 
 ```bash
 python -m pip install "phasesweep[wandb]"
