@@ -18,7 +18,7 @@ read.
 
 | Fixture | Backend | Modes | Binding schema | tree | ledger-only |
 | --- | --- | --- | --- | --- | --- |
-| `current-journal` | journal | tree, ledger-only | 4 | ok | ok |
+| `current-journal` | journal | tree, ledger-only | 5 | ok | ok |
 
 `tree` reads the fixture's own artifact root, so the artifact-root binding is
 validated first. `ledger-only` points the same ledger at a workdir that has

@@ -1,6 +1,6 @@
 experiment: t
-storage: journal:////tmp/phasesweep-current-fixture/current-journal/ledger/study.journal
-workdir: /tmp/phasesweep-current-fixture/current-journal/artifact_root
+storage: journal:////home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/ledger/study.journal
+workdir: /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root
 trial_command: python -c 'print("PSWOBJ=0.5")' {overrides}
 trainer_config: {}
 provenance:
