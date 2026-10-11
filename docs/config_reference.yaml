@@ -12,6 +12,7 @@
 # The file is read once per invocation. Editing it later does not change work that has already started.
 # The MCP server hashes the file when it loads its catalog. At each launch it re-reads the file and refuses to start if the SHA-256 changed, until the server restarts. The detached runner loads a copy of the verified bytes.
 # The file must be UTF-8 text whose top level is one mapping. That mapping describes one experiment.
+# A string whose escapes produce text that is not valid UTF-8, such as "\ud800", fails config load.
 # Unknown keys are rejected at every level, and a duplicate key anywhere in the YAML is rejected.
 # trainer_config, fixed_overrides, search_space, provenance and env are maps with user-chosen keys.
 # fixed_overrides and search_space keys must be dotted paths, provenance keys and values must be nonblank, and env keys must be valid variable names.

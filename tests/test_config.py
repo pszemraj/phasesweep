@@ -729,6 +729,32 @@ def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
     assert str(config_path) in str(excinfo.value)
 
 
+@pytest.mark.parametrize(
+    "env_line",
+    ['env: { A: "x\\ud800" }\n', 'env: { "\\ud800": x }\n'],
+    ids=["value", "key"],
+)
+def test_lone_surrogate_escape_is_rejected_at_load(tmp_path: Path, env_line: str) -> None:
+    """A ``\\ud800`` escape loads as text that cannot reach a trainer's environment."""
+    body = (
+        "experiment: t\n"
+        'trial_command: "echo {overrides}"\n'
+        "override_format: argparse\n"
+        f"{env_line}"
+        "metric:\n"
+        "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
+        "phases:\n"
+        "  - name: p\n"
+        "    n_trials: 1\n"
+    )
+    config_path = write_yaml(tmp_path, body)
+
+    with pytest.raises(ConfigError, match="lone surrogate") as excinfo:
+        load_experiment(config_path)
+
+    assert str(config_path) in str(excinfo.value)
+
+
 def _sampler_policy_experiment(
     *,
     storage: str | None,
