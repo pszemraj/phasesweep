@@ -50,6 +50,7 @@ experiment: string (required)
 # execution.record_env true adds environment.json to that list.
 # Supported placeholders: {config_path}, {overrides}, {overrides_path}, {trial_dir}, {trial_id}, {phase}, {run_name}.
 # Unknown placeholders and malformed braces fail config load. {{ and }} write literal braces.
+# A placeholder with attribute or index access, such as {trial_dir.name} or {trial_dir[0]}, fails config load too, including inside a format spec. Use the bare placeholder.
 # {config_path}, {overrides_path}, {trial_dir}, {phase} and {run_name} are shell-quoted by PhaseSweep, so do not wrap them in your own quotes.
 # {trial_dir} is the absolute path <workdir>/<experiment>/<phase>/trial_<trial number zero-padded to 5 digits>__generation_<generation id>__attempt_<attempt id>.
 # {trial_id} is the phase-local Optuna trial number, and {run_name} is <experiment>-<phase>-<trial_id>-<attempt_id> with the immutable attempt ID.

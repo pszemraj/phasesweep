@@ -1032,26 +1032,22 @@ def _format_field_names(template: str) -> set[str]:
 
     ``string.Formatter().parse()`` walks the template the same way
     ``str.format`` does and reports only true field references, with escaped
-    braces handled correctly.
+    braces handled correctly. Fields nested inside a format spec, as in
+    ``{trial_dir:{phase}}``, are included. Names are returned as written, so a
+    field with an attribute or index accessor (``{m.name}``, ``{a[0]}``) keeps
+    its accessor and the caller can refuse it.
 
-    Field expressions like ``{trial_dir!s}``, ``{m.name}``, and ``{a[0]}`` all
-    have the *root* name extracted (``trial_dir``, ``m``, ``a``) so a check
-    like ``"overrides" in fields`` does the right thing.
-
-    Args:
-        template: A ``str.format``-style template string.
-
-    Returns:
-        The set of root field names actually referenced (escaped ``{{...}}``
-        excluded; attribute and item accessors collapsed to the root name).
-
+    :param str template: A ``str.format``-style template string.
+    :raises ValueError: The template has unbalanced braces.
+    :return set[str]: Field names actually referenced (escaped ``{{...}}`` excluded).
     """
     fields: set[str] = set()
-    for _literal, field_name, _format_spec, _conversion in string.Formatter().parse(template):
+    for _literal, field_name, format_spec, _conversion in string.Formatter().parse(template):
         if field_name is None:
             continue
-        root = field_name.split(".", 1)[0].split("[", 1)[0]
-        fields.add(root)
+        fields.add(field_name)
+        if format_spec:
+            fields |= _format_field_names(format_spec)
     return fields
 
 
@@ -1072,6 +1068,8 @@ def _validate_trial_command_template(
     Catches at config-load (not at trial-launch, three minutes into a sweep):
 
     * Typos like ``{trail_dir}`` or any other unknown ``{placeholder}``.
+    * Attribute or index access on a placeholder (``{trial_dir.name}``,
+      ``{trial_dir[0]}``), which ``str.format`` would apply to the rendered string.
     * Unbalanced braces (``{trial_dir`` -> ``str.format`` raises ``ValueError``).
     * The primary ``yaml_file`` mode missing ``{config_path}``.
     * Phases using the explicit ``argparse`` compatibility format with
@@ -1092,9 +1090,9 @@ def _validate_trial_command_template(
             whether ``{overrides}`` is required for scalar/list CLI formats.
 
     Raises:
-        ValueError: Any of the failure modes listed above (typo, unbalanced
-            braces, missing required placeholder for the chosen
-            ``override_format``).
+        ValueError: Any of the failure modes listed above (typo, attribute or
+            index access, unbalanced braces, missing required placeholder for
+            the chosen ``override_format``).
 
     """
     # Lazy import to avoid a circular config <-> overrides cycle.
@@ -1137,6 +1135,15 @@ def _validate_trial_command_template(
             f"Phase {phase.name!r}: trial_command failed to render — "
             f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
         ) from exc
+
+    accessed = sorted(name for name in fields if "." in name or "[" in name)
+    if accessed:
+        shown = ", ".join(f"{{{name}}}" for name in accessed)
+        raise ValueError(
+            f"Phase {phase.name!r}: trial_command placeholders cannot use attribute or "
+            f"index access; found {shown}. Write the bare placeholder, such as "
+            "{trial_dir}, and do any path or string manipulation in the command itself."
+        )
 
     try:
         render_command(

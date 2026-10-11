@@ -613,6 +613,21 @@ def test_trial_command_requires_live_override_placeholder(
             "echo {trail_dir} {overrides}", "unknown placeholder", id="unknown_placeholder"
         ),
         pytest.param("echo {trial_dir", "trial_command failed to render", id="unbalanced_brace"),
+        pytest.param(
+            "echo {trial_dir.foo} {overrides}",
+            r"attribute or index access; found \{trial_dir\.foo\}",
+            id="attribute_access",
+        ),
+        pytest.param(
+            "echo {trial_dir[0]} {overrides}",
+            r"attribute or index access; found \{trial_dir\[0\]\}",
+            id="index_access",
+        ),
+        pytest.param(
+            "echo {trial_dir:{phase.foo}} {overrides}",
+            r"attribute or index access; found \{phase\.foo\}",
+            id="access_inside_nested_format_spec",
+        ),
     ],
 )
 def test_trial_command_malformed_template_rejected(template: str, match: str) -> None:
