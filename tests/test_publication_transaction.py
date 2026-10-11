@@ -686,39 +686,104 @@ def test_publication_refuses_invalid_winner_artifact(
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "mirror_summary", "error_match"),
     [
-        ("kind", "unknown_source"),
-        ("phase", "../other"),
-        ("phase", "other"),
-        ("trial_number", 999),
-        ("study", 999),
-        ("phase_fingerprint", 999),
+        pytest.param(
+            "kind", "unknown_source", True, "invalid winner_source kind", id="unknown-kind"
+        ),
+        pytest.param(
+            "phase", "../other", True, "has no valid winner_source phase", id="unsafe-phase"
+        ),
+        pytest.param("phase", "other", True, "names phase 'other', expected 'p'", id="other-phase"),
+        pytest.param(
+            "trial_number",
+            999,
+            True,
+            "has no valid winner_source trial_number",
+            id="trial-number",
+        ),
+        pytest.param("study", 999, True, "removed winner_source field", id="extra-key"),
+        pytest.param(
+            "phase_fingerprint",
+            999,
+            True,
+            "has no valid phase_fingerprint",
+            id="phase-fingerprint",
+        ),
         # The hash-covered winner's two provenance copies must identify one attempt.
-        ("generation_id", "different-generation_id"),
-        ("attempt_id", "different-attempt_id"),
+        pytest.param(
+            "generation_id",
+            "different-generation_id",
+            True,
+            "winner_source that disagrees with its generation_id",
+            id="source-generation-id",
+        ),
+        pytest.param(
+            "attempt_id",
+            "different-attempt_id",
+            True,
+            "winner_source that disagrees with its attempt_id",
+            id="source-attempt-id",
+        ),
+        # Only the winner's copy changes, so the summary's own copy disagrees with it.
+        pytest.param(
+            "generation_id",
+            "different-generation_id",
+            False,
+            "disagrees with the summary winner_source",
+            id="summary-copy-generation-id",
+        ),
+        pytest.param(
+            "attempt_id",
+            "different-attempt_id",
+            False,
+            "disagrees with the summary winner_source",
+            id="summary-copy-attempt-id",
+        ),
     ],
 )
 def test_manifest_rejects_malformed_reanchored_winner_provenance(
-    tmp_path: Path, field: str, value: object
+    tmp_path: Path, field: str, value: object, mirror_summary: bool, error_match: str
 ) -> None:
+    """Each malformed field is refused by its own check, not by an earlier cross-check.
+
+    With ``mirror_summary`` the summary's per-phase ``winner_source`` copy agrees
+    with the mutated winner, so the summary cross-check passes and only the
+    winner's payload validation can refuse it.
+    """
     experiment, generation_id = _golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     if field == "phase_fingerprint":
         winner[field] = value
     else:
         winner["winner_source"][field] = value
-    _reseal_winner(experiment, generation_id, winner)
+    _reseal_winner(experiment, generation_id, winner, mirror_summary=mirror_summary)
 
-    assert _resolve_publication_pointer(experiment).state == "failed"
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert error_match in pointer.error
     assert read_status(experiment)["publication_integrity"] == "failed"
     assert read_winner(experiment, "p") is None
 
 
-def _reseal_winner(experiment: Experiment, generation_id: str, winner: Mapping[str, Any]) -> None:
+def _reseal_winner(
+    experiment: Experiment,
+    generation_id: str,
+    winner: Mapping[str, Any],
+    *,
+    mirror_summary: bool = False,
+) -> None:
     """Rewrite phase ``p``'s winner and re-anchor the manifest to its new bytes.
 
     The hashes then match, so only payload validation can refuse the winner.
+
+    :param Experiment experiment: Experiment whose golden publication is rewritten.
+    :param str generation_id: Published generation holding the winner.
+    :param Mapping[str, Any] winner: Replacement winner payload for phase ``p``.
+    :param bool mirror_summary: Also write the winner's ``winner_source`` into the
+        summary's own per-phase copy, so the two copies agree and the summary
+        cross-check cannot be the reason the winner is refused.
     """
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(yaml.safe_dump(dict(winner), sort_keys=False))
@@ -728,6 +793,9 @@ def _reseal_winner(experiment: Experiment, generation_id: str, winner: Mapping[s
         item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
     )
     artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    if mirror_summary:
+        phase_item = next(item for item in summary["phases"] if item["name"] == "p")
+        phase_item["winner_source"] = dict(winner["winner_source"])
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
     reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
