@@ -32,7 +32,11 @@ from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_statu
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import make_experiment, reaped_pid, restored_signal_ownership
+from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
+
+# Persistent storage rejects an unseeded stochastic sampler; seeded random is
+# reproducible and resumable, so it needs no non-resumable acknowledgement.
+SEEDED_RANDOM = Sampler(type="random", seed=0)
 
 
 def write_mcp_catalog(
@@ -154,6 +158,25 @@ phases:
     search_space:
       lr: {{ type: float, low: 1.0e-5, high: 1.0e-2, log: true }}
 """
+
+
+def write_slow_mcp_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
+    """Write the slow ``cancel_me`` experiment, driven by the bundled fake trainer.
+
+    :param Path tmp_path: Directory receiving the config, journal, and workdir.
+    :param float sleep: Seconds each trial sleeps.
+    :return Path: The written ``exp.yaml``.
+    """
+    config = tmp_path / "exp.yaml"
+    config.write_text(
+        slow_mcp_config_text(
+            tmp_path,
+            trainer=REPO / "src" / "phasesweep" / "examples" / "fake_train.py",
+            name="cancel_me",
+            sleep=sleep,
+        )
+    )
+    return config
 
 
 def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
