@@ -90,6 +90,7 @@ from phasesweep.engine.trial import (
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
+    trial_run_name,
 )
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
@@ -930,6 +931,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     phase=phase.name,
                     generation_id=run.generation_id,
                     attempt_id=attempt_id,
+                    run_name=trial_run_name(experiment, phase.name, trial.number, attempt_id),
                     overrides_sha256=prepared_input.sha256,
                     directory=trial_dir,
                     environment=run.environment_identity.values,

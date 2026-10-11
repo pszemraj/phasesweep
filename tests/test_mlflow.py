@@ -293,7 +293,7 @@ def test_uncertain_creation_retries_the_same_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(session, "request_operation", operation)
     experiment = native_experiment(tmp_path)
     actual = session._create_bound(
-        experiment, identity, path, {}, deadline=None, attempt_directory=tmp_path
+        experiment, identity, path, {}, run_name="r", deadline=None, attempt_directory=tmp_path
     )
     assert actual == binding
     assert len(requests) == 2 and requests[0] == requests[1]
@@ -303,12 +303,12 @@ def test_uncertain_creation_retries_the_same_identity(tmp_path, monkeypatch):
     outcomes[:] = [RuntimeError("server down"), RuntimeError("server down"), binding]
     with pytest.raises(RuntimeError, match="server down"):
         session._create_bound(
-            experiment, identity, path, {}, deadline=None, attempt_directory=tmp_path
+            experiment, identity, path, {}, run_name="r", deadline=None, attempt_directory=tmp_path
         )
     assert not path.exists()
     assert (
         session._create_bound(
-            experiment, identity, path, {}, deadline=None, attempt_directory=tmp_path
+            experiment, identity, path, {}, run_name="r", deadline=None, attempt_directory=tmp_path
         )
         == binding
     )

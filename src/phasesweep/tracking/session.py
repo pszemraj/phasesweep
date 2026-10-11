@@ -171,6 +171,7 @@ def _create_bound(
     path: Path,
     environment: Mapping[str, str],
     *,
+    run_name: str,
     deadline: float | None,
     attempt_directory: Path | None = None,
 ) -> dict[str, Any]:
@@ -183,6 +184,7 @@ def _create_bound(
     :param dict[str, Any] identity: Exact creation identity.
     :param Path path: Durable binding destination.
     :param Mapping[str, str] environment: Composed credentials and transport.
+    :param str run_name: Display name for a newly created run.
     :param float | None deadline: Existing execution deadline.
     :param Path | None attempt_directory: Existing process slot for managed attempt creation.
     :return dict[str, Any]: Bound native run identity.
@@ -193,7 +195,7 @@ def _create_bound(
     request = {
         "action": "create",
         "binding": identity,
-        "run_name": f"{identity['experiment']}-{identity['phase']}-{identity['attempt_id']}",
+        "run_name": run_name,
     }
 
     def execute() -> dict[str, Any]:
@@ -298,7 +300,12 @@ def prepare_generation(
             "attempt_id": generation_id,
         }
         return _create_bound(
-            experiment, parent_identity, parent_path, environment, deadline=deadline
+            experiment,
+            parent_identity,
+            parent_path,
+            environment,
+            run_name=f"{experiment.experiment}-generation-{generation_id}",
+            deadline=deadline,
         )
 
 
@@ -354,6 +361,7 @@ def prepare_attempt(
     phase: str,
     generation_id: str,
     attempt_id: str,
+    run_name: str,
     overrides_sha256: str,
     directory: Path,
     environment: Mapping[str, str],
@@ -365,6 +373,7 @@ def prepare_attempt(
     :param str phase: Current phase name.
     :param str generation_id: Current invocation identity.
     :param str attempt_id: Allocated trainer identity.
+    :param str run_name: The trainer's ``PHASESWEEP_RUN_NAME``, reused for a managed run.
     :param str overrides_sha256: Existing prepared-input identity.
     :param Path directory: Registered attempt directory.
     :param Mapping[str, str] environment: Composed trainer environment.
@@ -394,6 +403,7 @@ def prepare_attempt(
             identity,
             directory / BINDING_FILE,
             environment,
+            run_name=run_name,
             deadline=deadline,
             attempt_directory=directory,
         )

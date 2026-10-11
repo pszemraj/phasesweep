@@ -460,6 +460,18 @@ def _failed_trial(
     )
 
 
+def trial_run_name(experiment: Experiment, phase_name: str, trial_id: int, attempt_id: str) -> str:
+    """Name one attempt the same way for its trainer and its tracking run.
+
+    :param Experiment experiment: Experiment whose name leads the run name.
+    :param str phase_name: Running phase.
+    :param int trial_id: Optuna trial number.
+    :param str attempt_id: Attempt identity.
+    :return str: The ``{run_name}`` placeholder and ``PHASESWEEP_RUN_NAME`` value.
+    """
+    return f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+
+
 def prepare_trainer_input(
     *,
     experiment: Experiment,
@@ -488,7 +500,7 @@ def prepare_trainer_input(
     resolved_path = trial_dir / "overrides_resolved.json"
     atomic_write_text(resolved_path, resolved_text)
 
-    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+    run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
     filename = TRAINER_INPUT_FILENAMES[experiment.override_format]
     if experiment.override_format == "yaml_file":
         text = dump_trial_trainer_config_yaml(
@@ -588,7 +600,7 @@ def launch_trial(
     # forcing trial dirs private would break normal operator/tool visibility
     # into logs and resolved overrides. See docs/runtime.md's trust-boundary
     # section.
-    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+    run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
     trainer_input = prepared_input or prepare_trainer_input(
         experiment=experiment,
         phase_name=phase_name,

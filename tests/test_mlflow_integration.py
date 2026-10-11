@@ -134,6 +134,13 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
         assert run.data.metrics["phasesweep.objective"] == run.data.metrics["eval/loss"]
         assert run.data.metrics["phasesweep.feasible"] == 1
         assert run.data.params["phasesweep.override.model.depth"] in {"1", "2"}
+        if mode == "managed":
+            tags = run.data.tags
+            # The trainer's PHASESWEEP_RUN_NAME names the managed run too.
+            assert run.info.run_name == "-".join(
+                [experiment.experiment]
+                + [tags[f"phasesweep.{k}"] for k in ("phase", "trial_number", "attempt_id")]
+            )
         assert run.data.tags["mlflow.parentRunId"] == (
             summary[0].info.run_id if mode == "managed" else parent.info.run_id
         )
