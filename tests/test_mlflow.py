@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import runpy
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -156,6 +157,7 @@ def test_shared_history_once():
             "binding": binding,
             "query": query,
             "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
+            "timeout_at": time.monotonic() + 1,
         },
     )
     assert calls == [(binding["run_id"], "loss")]
@@ -167,7 +169,10 @@ def test_unsuccessful_remote_cannot_be_finished(status):
     binding = _binding()
     client = SimpleNamespace(get_run=lambda _: _run(binding, status=status))
     with pytest.raises(ValueError, match="unsuccessfully"):
-        _capture(client, {"binding": binding, "query": {}, "settings": {"timeout_seconds": 1}})
+        _capture(
+            client,
+            {"binding": binding, "query": {}, "settings": {"timeout_seconds": 1}, "timeout_at": 0},
+        )
 
 
 def test_worker_keeps_sdk_retries_for_idempotent_operations(tmp_path, monkeypatch):
@@ -339,16 +344,28 @@ def test_wrong_binding_is_rejected_before_remote_access(tmp_path, monkeypatch, f
 def test_trainer_run_is_never_finished_by_controller():
     binding = {**_binding(), "run_mode": "trainer"}
     client = SimpleNamespace(get_run=lambda _: _run(binding, status="RUNNING"))
-    with pytest.raises(TimeoutError, match="missing or delayed"):
-        _capture(client, {"binding": binding, "query": {}, "settings": {"timeout_seconds": 0}})
+    with pytest.raises(TimeoutError, match="was still RUNNING when timeout_seconds ran out"):
+        _capture(
+            client,
+            {"binding": binding, "query": {}, "settings": {"timeout_seconds": 0}, "timeout_at": 0},
+        )
 
 
 def test_missing_metric_is_not_replaced_by_result_metric():
     binding = _binding()
     query = {"selections": {observation_id(spec()): spec().model_dump()}, "gates": []}
     client = SimpleNamespace(get_run=lambda _: _run(binding, metrics={"phasesweep.objective": 1}))
-    with pytest.raises(TimeoutError, match="missing or delayed"):
-        _capture(client, {"binding": binding, "query": query, "settings": {"timeout_seconds": 0}})
+    timeout_at = time.monotonic() + 0.4
+    request = {
+        "binding": binding,
+        "query": query,
+        "settings": {"timeout_seconds": 1, "poll_seconds": 0.01},
+        "timeout_at": timeout_at,
+    }
+    with pytest.raises(TimeoutError, match="finished without metric 'loss' when timeout_seconds"):
+        _capture(client, request)
+    # The worker reports before the parent stops it at timeout_at.
+    assert time.monotonic() < timeout_at
 
 
 def test_failed_trainer_never_reads_remote_metrics(tmp_path, monkeypatch):

@@ -17,6 +17,8 @@ from phasesweep.runtime.remote_worker import run_worker
 from phasesweep.runtime.time import utc_now_iso
 
 _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
+# Time a capture keeps for its last poll and its report before the parent stops it.
+_CAPTURE_REPORT_SECONDS = 5.0
 
 
 def require_mlflow_sdk() -> None:
@@ -199,15 +201,19 @@ def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     :param dict[str, Any] request: Trusted target or operation payload.
     :raises ValueError: The run no longer matches its binding, ended FAILED or KILLED,
         or restarted during capture.
-    :raises TimeoutError: Finished-run evidence is still missing or incomplete when
-        ``timeout_seconds`` elapses.
+    :raises TimeoutError: The run is unfinished, or its evidence is still missing, when
+        ``timeout_seconds`` runs out; the message names what is missing.
     :return dict[str, Any]: Frozen shared native evidence.
     """
     from phasesweep.evidence.mlflow import select_observation
     from phasesweep.evidence.models import MlflowExtractor
 
     binding, query = request["binding"], request["query"]
-    stop = time.monotonic() + request["settings"]["timeout_seconds"]
+    # The parent stops this worker when timeout_seconds runs out (``timeout_at``,
+    # a shared monotonic instant). Ending the wait just before lets the worker
+    # report what is missing; a nearer phase/run deadline still stops it first.
+    reserve = min(_CAPTURE_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
+    stop = request["timeout_at"] - reserve
     while True:
         run = client.get_run(binding["run_id"])
         verify_remote(run, binding)
@@ -216,18 +222,22 @@ def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
         if run.info.status == "RUNNING" and binding["run_mode"] == "managed":
             client.set_terminated(binding["run_id"], status="FINISHED")
             run = client.get_run(binding["run_id"])
+        missing: list[str] = []
         if run.info.status == "FINISHED":
             keys = sorted({s["metric_key"] for s in query["selections"].values()})
-            if all(key in run.data.metrics for key in keys) and all(
-                key in getattr(run.data, namespace)
+            missing = [f"metric {key!r}" for key in keys if key not in run.data.metrics] + [
+                f"{namespace[:-1]} {key!r}"
                 for g in query["gates"]
                 for namespace in ("params", "tags")
                 for key in g[namespace]
-            ):
+                if key not in getattr(run.data, namespace)
+            ]
+            if not missing:
                 observations: dict[str, Any] = {}
                 for key in keys:
                     history = client.get_metric_history(binding["run_id"], key)
                     if not history:
+                        missing.append(f"metric {key!r} history")
                         break
                     records = [
                         {
@@ -268,9 +278,12 @@ def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
                         **metadata,
                     }
         if time.monotonic() >= stop:
-            raise TimeoutError(
-                "MLflow finished-run evidence is missing or delayed beyond its timeout."
+            state = (
+                f"finished without {', '.join(missing)}"
+                if missing
+                else f"was still {run.info.status}"
             )
+            raise TimeoutError(f"MLflow run {state} when timeout_seconds ran out.")
         time.sleep(min(request["settings"]["poll_seconds"], max(0, stop - time.monotonic())))
 
 

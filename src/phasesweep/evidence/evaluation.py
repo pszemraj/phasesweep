@@ -670,6 +670,7 @@ def _capture_mlflow(ctx: TrialContext, *, deadline: float | None) -> dict[str, A
                 "settings": ctx.mlflow_settings,
                 "binding": binding,
                 "query": ctx.mlflow_query,
+                "timeout_at": stop,
             },
             operation_id=ctx.attempt_id,
             directory=ctx.trial_dir,
