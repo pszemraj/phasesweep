@@ -551,15 +551,19 @@ def test_unsafe_catalog_id_rejected(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config, entry_id="bad-id.evil"))
 
 
-def test_max_concurrent_runs_defaults_to_one(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("max_concurrent_runs", "expected"),
+    [
+        pytest.param(None, 1, id="defaults_to_one"),
+        pytest.param(3, 3, id="override"),
+    ],
+)
+def test_max_concurrent_runs(
+    tmp_path: Path, max_concurrent_runs: int | None, expected: int
+) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    assert Registry.load(_catalog(tmp_path, config)).max_concurrent_runs == 1
-
-
-def test_max_concurrent_runs_override(tmp_path: Path) -> None:
-    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    reg = Registry.load(_catalog(tmp_path, config, max_concurrent_runs=3))
-    assert reg.max_concurrent_runs == 3
+    reg = Registry.load(_catalog(tmp_path, config, max_concurrent_runs=max_concurrent_runs))
+    assert reg.max_concurrent_runs == expected
 
 
 def test_permission_flags_propagate(tmp_path: Path) -> None:

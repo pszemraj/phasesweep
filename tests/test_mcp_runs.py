@@ -803,21 +803,10 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
         assert not store._cleanup_recovered(handle)
 
 
-def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    payload = asdict(make_run_handle(run_id="other"))
-    private_atomic_write_text(
-        tmp_path / "state" / "runs" / "exp-1.json",
-        json.dumps(payload),
-    )
-
-    assert store.get("exp-1") is None
-    assert store.list_handles() == []
-
-
 @pytest.mark.parametrize(
     "field,value",
     [
+        ("run_id", "other"),
         ("experiment_id", "../bad"),
         ("experiment_id", 7),
         ("config_sha256", []),
@@ -846,6 +835,7 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
     ],
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
+    """A handle whose shape is invalid, or whose run id differs from its filename, is not loaded."""
     store = RunStore(tmp_path / "state")
     payload = asdict(make_run_handle(run_id="exp-1"))
     payload[field] = value
@@ -946,9 +936,14 @@ def test_successful_process_with_failed_result_snapshot_is_still_succeeded(tmp_p
     assert store.state(handle) == "succeeded"
 
 
-def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) -> None:
+@pytest.mark.parametrize("runner_live", [True, False], ids=["live_runner", "dead_runner"])
+def test_pending_result_snapshot_keeps_run_live_until_finalized(
+    tmp_path: Path, runner_live: bool
+) -> None:
+    """A pending snapshot keeps the run running; only a dead runner needs recovery for it."""
     store = RunStore(tmp_path / "state")
-    handle = make_dead_run_handle(run_id="exp-1", experiment_id="exp")
+    make_handle = make_run_handle if runner_live else make_dead_run_handle
+    handle = make_handle(run_id="exp-1", experiment_id="exp")
     store.create(handle)
     write_run_status(
         store,
@@ -960,8 +955,8 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     )
 
     assert store.state(handle) == "running"
-    assert store.snapshot_recovery_required(handle)
-    assert store.recovery_required(handle)
+    assert store.snapshot_recovery_required(handle) == (not runner_live)
+    assert store.recovery_required(handle) == (not runner_live)
     assert live_runs(store) == [handle]
 
     write_run_status(
@@ -978,24 +973,6 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     assert not store.snapshot_recovery_required(handle)
     assert not store.recovery_required(handle)
     assert live_runs(store) == []
-
-
-def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-live", experiment_id="exp")
-    store.create(handle)
-    write_run_status(
-        store,
-        handle.run_id,
-        returncode=0,
-        error_class=None,
-        cleanup_confirmed=True,
-        result_snapshot_state="pending",
-    )
-
-    assert store.state(handle) == "running"
-    assert not store.snapshot_recovery_required(handle)
-    assert not store.recovery_required(handle)
 
 
 @pytest.mark.parametrize(
@@ -1240,9 +1217,46 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
             "pid": 4242,
             "pid_starttime": 123,
         },
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": "",
+            },
+            id="boot_id_empty",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": "malformed",
+            },
+            id="boot_id_malformed",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": 12345,
+            },
+            id="boot_id_integer",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": True,
+            },
+            id="boot_id_boolean",
+        ),
     ],
 )
 def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: object) -> None:
+    """A marker with an invalid shape, including an invalid boot id, is not trusted."""
     store = RunStore(tmp_path / "state")
     handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
     store.create(handle)
@@ -1324,26 +1338,6 @@ def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) ->
     assert store.cleanup_identity(handle).boot_id == handle.boot_id
     assert store.state(handle) == "running"
     assert not store.recovery_required(handle)
-
-
-@pytest.mark.parametrize("boot_id", ["", "malformed", 12345, True])
-def test_cleanup_marker_with_invalid_boot_id_is_rejected(tmp_path: Path, boot_id: object) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
-    store.create(handle)
-    private_atomic_write_text(
-        store.cleanup_uncertain_path("exp-1"),
-        json.dumps(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": boot_id,
-            }
-        ),
-    )
-
-    assert not store.cleanup_uncertain(handle)
 
 
 def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) -> None:
@@ -1494,31 +1488,26 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     assert live_runs(store) == []
 
 
-def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
-    store.create(handle)
-    write_unsafe_cleanup_status(store, "exp-1")
-    private_atomic_write_text(
-        store.cleanup_recovery_path("exp-1"),
-        json.dumps(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "b" * 64,
-                "cleanup_confirmed": True,
-            }
-        ),
-    )
-
-    assert store.state(handle) == "running"
-
-
-@pytest.mark.parametrize("reaped_attempt_ids", ["not-a-list", [""], [1], {}])
-def test_cleanup_recovery_rejects_malformed_reaped_attempt_ids(
+@pytest.mark.parametrize(
+    "record_fields",
+    [
+        pytest.param({"config_sha256": "b" * 64}, id="hash_of_another_config"),
+        pytest.param({}, id="missing_reaped_fields"),
+        pytest.param({"reaped_attempt_ids": "not-a-list"}, id="reaped_ids_not_a_list"),
+        pytest.param({"reaped_attempt_ids": [""]}, id="reaped_ids_blank_entry"),
+        pytest.param({"reaped_attempt_ids": [1]}, id="reaped_ids_non_string_entry"),
+        pytest.param({"reaped_attempt_ids": {}}, id="reaped_ids_mapping"),
+    ],
+)
+def test_cleanup_recovery_rejects_records_that_cannot_release_the_reservation(
     tmp_path: Path,
-    reaped_attempt_ids: object,
+    record_fields: dict[str, object],
 ) -> None:
-    """Malformed recovery details cannot release a cleanup reservation."""
+    """A recovery record for another config, missing a reaped field, or malformed is refused.
+
+    ``record_fields`` overrides a record that is otherwise valid for the handle
+    but carries no reaped details.
+    """
     store = RunStore(tmp_path / "state")
     handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
     store.create(handle)
@@ -1530,29 +1519,7 @@ def test_cleanup_recovery_rejects_malformed_reaped_attempt_ids(
                 "run_id": handle.run_id,
                 "config_sha256": handle.config_sha256,
                 "cleanup_confirmed": True,
-                "reaped_attempt_ids": reaped_attempt_ids,
-            }
-        ),
-    )
-
-    assert not store._cleanup_recovered(handle)
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
-
-
-def test_cleanup_recovery_rejects_missing_reaped_fields(tmp_path: Path) -> None:
-    """A recovery record missing either reaped field entirely is refused."""
-    store = RunStore(tmp_path / "state")
-    handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
-    store.create(handle)
-    write_unsafe_cleanup_status(store, handle.run_id)
-    private_atomic_write_text(
-        store.cleanup_recovery_path(handle.run_id),
-        json.dumps(
-            {
-                "run_id": handle.run_id,
-                "config_sha256": handle.config_sha256,
-                "cleanup_confirmed": True,
+                **record_fields,
             }
         ),
     )

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -229,14 +231,17 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
             getattr(app, method_name)(run_id=run_id)
 
 
-@pytest.mark.parametrize("method_name", ["status", "winners"])
+@pytest.mark.parametrize("method_name", ["status", "winners", "await_run"])
 def test_read_tools_require_a_known_run_id(tmp_path: Path, method_name: str) -> None:
     config = _config(tmp_path)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
     method = getattr(app, method_name)
 
     with pytest.raises(UnknownRunError, match="unknown run id"):
-        method("nope-123")
+        outcome = method("nope-123")
+        # ``await_run`` is a coroutine function: the lookup runs once it is awaited.
+        if inspect.iscoroutine(outcome):
+            asyncio.run(outcome)
 
 
 @pytest.mark.parametrize("read_method", ["status", "winners"])
@@ -448,13 +453,33 @@ def test_run_scoped_snapshot_recomputes_config_drift_against_current_catalog(
     assert (results.metric.name, results.metric.goal) == ("x", "minimize")
 
 
+def _overwrite_the_winner(experiment: Experiment, run_id: str) -> None:
+    """Replace the live winner artifact of ``run_id`` with unreadable content."""
+    _generation_winner_path(experiment, run_id, "p").write_text("broken: true\n")
+
+
+def _remove_the_publication_pointer(experiment: Experiment, run_id: str) -> None:
+    """Delete the live last-successful-generation pointer (``run_id`` is unused)."""
+    _last_successful_generation_path(experiment).unlink()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param(_overwrite_the_winner, id="later_artifact_corruption"),
+        pytest.param(_remove_the_publication_pointer, id="publication_pointer_removal"),
+    ],
+)
 @pytest.mark.integration
-def test_run_scoped_snapshot_survives_later_artifact_corruption(tmp_path: Path) -> None:
+def test_run_scoped_snapshot_survives_live_publication_damage(
+    tmp_path: Path,
+    damage: Callable[[Experiment, str], None],
+) -> None:
+    """Frozen run reads stay ok after the live winner or publication pointer is damaged."""
     run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
-    winner_path = _generation_winner_path(experiment, run_id, "p")
-    winner_path.write_text("broken: true\n")
+    damage(experiment, run_id)
 
     status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
@@ -498,25 +523,6 @@ def test_run_scoped_snapshot_keeps_captured_generation_pointers(tmp_path: Path) 
     assert after_publication.published_generation_id == run_id
     assert after_publication.represented_generation_id == run_id
     assert after_publication.is_published is True
-
-
-@pytest.mark.integration
-def test_run_scoped_snapshot_survives_publication_pointer_removal(
-    tmp_path: Path,
-) -> None:
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, _store = make_mcp_app(catalog)
-    experiment = app._registry.get("srv").experiment
-    _last_successful_generation_path(experiment).unlink()
-
-    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
-    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
-
-    assert status.publication_integrity == "ok"
-    assert status.is_published is True
-    assert status.phases[0].winner_present is True
-    assert results.publication_integrity == "ok"
-    assert results.winner_count == 1
 
 
 @pytest.mark.parametrize("config_snapshot_damage", ["missing", "corrupt"])

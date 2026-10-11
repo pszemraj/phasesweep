@@ -237,35 +237,52 @@ def _spawned_runner(
 
 
 @pytest.mark.parametrize(
-    ("error", "code"),
+    ("error", "code", "remediation_fragment"),
     [
         pytest.param(
             SamplerContinuationUnsupportedError("unsupported continuation"),
             "sampler_continuation_unsupported",
+            "fresh artifact root and local storage",
             id="sampler",
         ),
         pytest.param(
             TrackingTargetUnavailableError("MLflow tracking target is not ready"),
             "tracking_unavailable",
+            "correct the experiment configuration",
             id="tracking",
         ),
         pytest.param(
             TrialTargetRegressionError("target moved backward"),
             "trial_target_regression",
+            "correct the experiment configuration",
             id="target",
+        ),
+        pytest.param(
+            ArtifactRootConflictError("bound to /a, offered /b"),
+            "artifact_root_conflict",
+            "fresh artifact root and local storage",
+            id="artifact_root",
         ),
     ],
 )
 def test_continuation_preflight_failures_have_actionable_mcp_categories(
     error: RuntimeError,
     code: str,
+    remediation_fragment: str,
 ) -> None:
+    """Each preflight refusal carries its own code and the operator step that fits it.
+
+    A workdir conflict mapped to ``fingerprint_mismatch`` would steer the operator
+    toward a new experiment name or archiving a healthy study; falling through to
+    ``internal_error`` would report a plain misconfiguration as a bug.
+    """
     failure = mcp_runner._safe_failure_payload(error, stage="preflight")
 
     assert failure["code"] == code
     assert failure["stage"] == "preflight"
     assert failure["retryable"] is False
     assert failure["actor"] == "operator"
+    assert remediation_fragment in str(failure["remediation"])
 
 
 def test_attempt_registry_failure_routes_the_workdir_repair() -> None:
@@ -1603,25 +1620,6 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
     assert app.winners(run_id=run_id)["failure"] == failure
 
 
-def test_runner_refuses_to_persist_handle_without_linux_process_identity(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(mcp_runner, "read_proc_starttime", lambda _pid: None)
-
-    with pytest.raises(RuntimeError, match="/proc start time is unavailable"):
-        mcp_runner._persist_spawned_handle(
-            state_dir=tmp_path / "state",
-            run_id="r0",
-            experiment_id="exp",
-            config_sha256="a" * 64,
-            started_at=utc_now_iso(),
-            allow_cancel=True,
-        )
-
-    assert RunStore(tmp_path / "state").get("r0") is None
-
-
 # Binds the persisted handle to the host's real process group and boot id, so
 # it needs an unconfined process namespace like the detached-runner tests.
 @pytest.mark.integration
@@ -1734,12 +1732,22 @@ def test_runner_persists_spawned_handle_for_restart_recovery(
     assert terminal["result_snapshot"]["winners"] == []
 
 
-def test_runner_does_not_persist_a_receipt_without_boot_identity(
+@pytest.mark.parametrize(
+    ("reader", "match"),
+    [
+        pytest.param("read_proc_starttime", "/proc start time is unavailable", id="proc_starttime"),
+        pytest.param("read_boot_id", "boot id", id="boot_id"),
+    ],
+)
+def test_runner_does_not_persist_a_receipt_without_process_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    reader: str,
+    match: str,
 ) -> None:
+    """A runner that cannot read its Linux process identity leaves its claimed handle launching."""
     store = RunStore(tmp_path / "state")
-    run_id = "srv-no-boot"
+    run_id = "srv-no-identity"
     started_at = "2026-06-24T00:00:00Z"
     claim_runner_handle(
         store,
@@ -1747,9 +1755,9 @@ def test_runner_does_not_persist_a_receipt_without_boot_identity(
         config_sha256="0" * 64,
         started_at=started_at,
     )
-    monkeypatch.setattr(mcp_runner, "read_boot_id", lambda: None)
+    monkeypatch.setattr(mcp_runner, reader, lambda *_args: None)
 
-    with pytest.raises(RuntimeError, match="boot id"):
+    with pytest.raises(RuntimeError, match=match):
         mcp_runner._persist_spawned_handle(
             state_dir=tmp_path / "state",
             run_id=run_id,
@@ -1939,22 +1947,3 @@ def test_runner_cancelled_before_first_trial_still_records_cancelled(tmp_path: P
     assert status["returncode"] == 143
     assert status["error_class"] == "cancelled"
     assert status["cleanup_confirmed"] is True
-
-
-def test_artifact_root_conflict_is_not_reported_as_fingerprint_or_internal() -> None:
-    """A workdir conflict must carry its own code and fresh-state remediation.
-
-    Mapping it to ``fingerprint_mismatch`` would steer the operator toward a
-    new experiment name or archiving a healthy study; falling through to
-    ``internal_error`` would report a plain misconfiguration as a bug.
-    """
-    from phasesweep.engine.errors import ArtifactRootConflictError
-
-    payload = mcp_runner._base_failure_payload(
-        ArtifactRootConflictError("bound to /a, offered /b"), stage="preflight"
-    )
-
-    assert payload["code"] == "artifact_root_conflict"
-    assert payload["retryable"] is False
-    assert payload["actor"] == "operator"
-    assert "fresh artifact root and local storage" in str(payload["remediation"])

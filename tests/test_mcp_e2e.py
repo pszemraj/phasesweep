@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,6 +38,7 @@ from phasesweep.mcp.tools import (
     AWAIT_MAX_TIMEOUT_SECONDS,
     AWAIT_MIN_TIMEOUT_SECONDS,
     DEFAULT_LIST_LIMIT,
+    PhaseSweepMCP,
 )
 from tests.conftest import copy_fake_train
 from tests.mcp_helpers import (
@@ -593,32 +595,58 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     assert blocking_result.isError is False
 
 
-def test_fastmcp_tool_errors_are_is_error_results(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    pytest.importorskip("mcp")
-    import asyncio
+def _call_inspect_experiment_tool(app: PhaseSweepMCP, arguments: dict[str, object]) -> Any:
+    """Dispatch one ``inspect_experiment`` call through the FastMCP request handler.
 
+    :param PhaseSweepMCP app: Server whose tools the FastMCP handler exposes.
+    :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
+    :return Any: The call's result, whose ``isError`` and ``content`` the caller inspects.
+    """
     from mcp import types
 
     from phasesweep.mcp.server import build_server
 
-    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
-    app, _registry, _store = make_mcp_app(catalog)
     server = build_server(app)
     handler = server._mcp_server.request_handlers[types.CallToolRequest]
-    req = types.CallToolRequest(
-        params=types.CallToolRequestParams(
-            name=TOOL_INSPECT_EXPERIMENT,
-            arguments={"experiment_id": "missing"},
-        )
+    request = types.CallToolRequest(
+        params=types.CallToolRequestParams(name=TOOL_INSPECT_EXPERIMENT, arguments=arguments)
     )
+    return asyncio.run(handler(request)).root
 
-    result = asyncio.run(handler(req)).root
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_text"),
+    [
+        pytest.param(
+            {"experiment_id": "missing"},
+            "unknown experiment id 'missing'",
+            id="unknown_experiment_id",
+        ),
+        pytest.param(
+            {"experiment_id": "e2e_lm", "unexpected": True}, "unexpected", id="extra_argument"
+        ),
+    ],
+)
+def test_fastmcp_tool_errors_are_is_error_results(
+    tmp_path: Path, arguments: dict[str, object], expected_text: str
+) -> None:
+    """A rejected call, such as an unknown id or an extra argument, is an ``isError`` result."""
+    pytest.importorskip("mcp")
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
+
+    result = _call_inspect_experiment_tool(app, arguments)
 
     assert result.isError is True
-    assert "unknown experiment id 'missing'" in result.content[0].text
+    assert expected_text in result.content[0].text
 
+
+def test_fastmcp_unexpected_errors_do_not_leak_internal_details(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("mcp")
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
     monkeypatch.setattr(
         app,
         "validate",
@@ -626,42 +654,9 @@ def test_fastmcp_tool_errors_are_is_error_results(
             OSError("/tmp/SECRET_PATH/private-config.yaml")
         ),
     )
-    leaked = asyncio.run(
-        handler(
-            types.CallToolRequest(
-                params=types.CallToolRequestParams(
-                    name=TOOL_INSPECT_EXPERIMENT,
-                    arguments={"experiment_id": "e2e_lm"},
-                )
-            )
-        )
-    ).root
+
+    leaked = _call_inspect_experiment_tool(app, {"experiment_id": "e2e_lm"})
 
     assert leaked.isError is True
     assert "internal server error" in leaked.content[0].text
     assert "SECRET_PATH" not in leaked.content[0].text
-
-
-def test_fastmcp_rejects_extra_tool_arguments(tmp_path: Path) -> None:
-    pytest.importorskip("mcp")
-    import asyncio
-
-    from mcp import types
-
-    from phasesweep.mcp.server import build_server
-
-    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
-    app, _registry, _store = make_mcp_app(catalog)
-    server = build_server(app)
-    handler = server._mcp_server.request_handlers[types.CallToolRequest]
-    req = types.CallToolRequest(
-        params=types.CallToolRequestParams(
-            name=TOOL_INSPECT_EXPERIMENT,
-            arguments={"experiment_id": "e2e_lm", "unexpected": True},
-        )
-    )
-
-    result = asyncio.run(handler(req)).root
-
-    assert result.isError is True
-    assert "unexpected" in result.content[0].text

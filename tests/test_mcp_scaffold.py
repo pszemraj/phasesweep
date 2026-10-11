@@ -100,8 +100,25 @@ def test_init_catalog_honors_umask(tmp_path: Path) -> None:
     assert stat.S_IMODE(output.stat().st_mode) == 0o664
 
 
-@pytest.mark.parametrize("filename", ["model # 1.yaml", "model: 1.yaml", "model\n1.yaml"])
-def test_init_catalog_quotes_config_paths(tmp_path: Path, filename: str) -> None:
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "model # 1.yaml",
+        "model: 1.yaml",
+        "model\n1.yaml",
+        "null.yaml",
+        "true.yaml",
+        "123.yaml",
+    ],
+)
+def test_init_catalog_quotes_config_paths_and_implicit_yaml_scalar_ids(
+    tmp_path: Path, filename: str
+) -> None:
+    """Config paths and ids survive YAML punctuation and implicit-scalar spellings.
+
+    A path with ``#``, ``:``, or a line break must round-trip into ``config_path``,
+    and an id such as ``null``, ``true``, or ``123`` must stay a quoted string.
+    """
     config = _write_config(tmp_path, filename)
     output = tmp_path / "catalog.yaml"
 
@@ -110,23 +127,11 @@ def test_init_catalog_quotes_config_paths(tmp_path: Path, filename: str) -> None
     )
 
     assert result.exit_code == 0, result.output
-    entry = Registry.load(output).get(derive_experiment_id(config))
-    assert entry.config_path == config.resolve()
-
-
-@pytest.mark.parametrize("filename", ["null.yaml", "true.yaml", "123.yaml"])
-def test_init_catalog_quotes_implicit_yaml_scalar_ids(tmp_path: Path, filename: str) -> None:
-    config = _write_config(tmp_path, filename)
-    output = tmp_path / "catalog.yaml"
-
-    result = CliRunner().invoke(
-        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
-    )
-
-    assert result.exit_code == 0, result.output
-    experiment_id = config.stem
+    experiment_id = derive_experiment_id(config)
     assert f'- id: "{experiment_id}"' in output.read_text()
-    assert Registry.load(output).get(experiment_id).id == experiment_id
+    entry = Registry.load(output).get(experiment_id)
+    assert entry.id == experiment_id
+    assert entry.config_path == config.resolve()
 
 
 def test_init_catalog_quotes_state_dir_with_yaml_punctuation(

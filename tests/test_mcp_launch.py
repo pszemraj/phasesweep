@@ -201,22 +201,27 @@ def test_safe_tool_redacts_unexpected_exception() -> None:
     assert "SECRET_PATH" not in str(excinfo.value)
 
 
-def test_launch_permission_denied_before_spawn(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("allow", "kwargs", "action"),
+    [
+        pytest.param(None, {}, "launch", id="launch"),
+        pytest.param(
+            {"launch": True, "cancel": True, "from_phase": False},
+            {"from_phase": "p"},
+            "from_phase",
+            id="from_phase",
+        ),
+    ],
+)
+def test_launch_permission_denied_before_spawn(
+    tmp_path: Path, allow: dict[str, bool] | None, kwargs: dict[str, str], action: str
+) -> None:
+    """A launch is refused for a missing permission before any validation or spawn."""
     config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, config, allow=allow))
 
-    with pytest.raises(PermissionDeniedError, match="action 'launch' is not permitted"):
-        app.launch("srv")
-
-
-def test_from_phase_permission_denied_before_validation(tmp_path: Path) -> None:
-    config = _config(tmp_path)
-    app, _registry, _store = make_mcp_app(
-        _catalog(tmp_path, config, allow={"launch": True, "cancel": True, "from_phase": False}),
-    )
-
-    with pytest.raises(PermissionDeniedError, match="action 'from_phase' is not permitted"):
-        app.launch("srv", from_phase="p")
+    with pytest.raises(PermissionDeniedError, match=f"action '{action}' is not permitted"):
+        app.launch("srv", **kwargs)
 
 
 def test_invalid_from_phase_rejected_before_spawn(tmp_path: Path) -> None:
@@ -588,26 +593,49 @@ def test_launch_terminates_real_runner_when_log_context_exit_fails(
 
 
 @pytest.mark.parametrize(
-    ("failing_reader", "cleanup_confirmed", "expected_state"),
+    ("failing_reader", "error", "cleanup_confirmed", "expected_state"),
     [
-        ("starttime", True, "failed"),
-        ("boot_id", True, "failed"),
-        ("starttime", False, "running"),
+        pytest.param(
+            "starttime",
+            OSError("injected starttime read failure"),
+            True,
+            "failed",
+            id="starttime_read_fails",
+        ),
+        pytest.param(
+            "boot_id",
+            OSError("injected boot_id read failure"),
+            True,
+            "failed",
+            id="boot_id_read_fails",
+        ),
+        pytest.param(
+            "starttime",
+            OSError("injected starttime read failure"),
+            False,
+            "running",
+            id="starttime_read_fails_cleanup_unconfirmed",
+        ),
+        pytest.param("boot_id", KeyboardInterrupt(), True, "failed", id="boot_id_read_interrupted"),
     ],
 )
 def test_launch_records_real_cleanup_result_when_process_identity_read_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failing_reader: str,
+    error: BaseException,
     cleanup_confirmed: bool,
     expected_state: str,
 ) -> None:
-    """A fallible identity read cannot turn a created child into a pre-spawn failure."""
+    """A fallible or interrupted identity read cannot turn a created child into a pre-spawn failure.
+
+    A KeyboardInterrupt after Popen is cleanup work too, not a pre-spawn failure.
+    """
     config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
 
     def fail_identity_read(*_args: object) -> None:
-        raise OSError(f"injected {failing_reader} read failure")
+        raise error
 
     cleanup_calls = record_runner_cleanup(monkeypatch, confirmed=cleanup_confirmed)
     monkeypatch.setattr(
@@ -616,13 +644,14 @@ def test_launch_records_real_cleanup_result_when_process_identity_read_fails(
         fail_identity_read,
     )
 
-    with pytest.raises(OSError, match=failing_reader):
+    with pytest.raises(type(error), match=str(error) or None):
         app.launch("srv")
 
     (pending,) = store.list_handles()
     terminal = store.recorded_terminal_status(pending)
     assert terminal is not None
     assert terminal["cleanup_confirmed"] is cleanup_confirmed
+    assert terminal["error_class"] == type(error).__name__
     assert store.state(pending) == expected_state
     assert store.recovery_required(pending) is (not cleanup_confirmed)
     assert cleanup_calls
@@ -630,32 +659,6 @@ def test_launch_records_real_cleanup_result_when_process_identity_read_fails(
         assert cleanup_calls[0][1] is None
     else:
         assert cleanup_calls[0][1] is not None
-
-
-def test_launch_cleans_up_when_identity_bookkeeping_is_interrupted(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """KeyboardInterrupt after Popen is cleanup work, not a pre-spawn failure."""
-    config, app, _registry, store = side_effect_app(tmp_path)
-    patch_popen_capture(monkeypatch)
-
-    def interrupt_boot_id() -> None:
-        raise KeyboardInterrupt
-
-    cleanup_calls = record_runner_cleanup(monkeypatch)
-    monkeypatch.setattr(mcp_run_control, "read_boot_id", interrupt_boot_id)
-
-    with pytest.raises(KeyboardInterrupt):
-        app.launch("srv")
-
-    (pending,) = store.list_handles()
-    terminal = store.recorded_terminal_status(pending)
-    assert terminal is not None
-    assert terminal["cleanup_confirmed"] is True
-    assert terminal["error_class"] == "KeyboardInterrupt"
-    assert store.state(pending) == "failed"
-    assert cleanup_calls and cleanup_calls[0][1] is not None
 
 
 def test_restarted_server_reserves_unresolved_launching_handle(tmp_path: Path) -> None:
@@ -749,24 +752,39 @@ def test_missing_runner_receipt_fails_without_reserving_retry_capacity(
     assert app.launch("srv")["state"] == "running"
 
 
+@pytest.mark.parametrize(
+    ("write_first", "error"),
+    [
+        pytest.param(False, OSError("injected acknowledgement failure"), id="write_failure"),
+        pytest.param(True, KeyboardInterrupt(), id="interruption_after_ack"),
+    ],
+)
 def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    write_first: bool,
+    error: BaseException,
 ) -> None:
-    """An interrupted ACK write cannot prove the child stayed behind the barrier."""
+    """A failed or interrupted ACK write cannot prove the child stayed behind the barrier.
+
+    ``write_first`` delivers the ACK byte before the interruption, so the child
+    may already have been released.
+    """
     config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     real_write = os.write
 
     def fail_ack(fd: int, data: bytes) -> int:
-        if data == b"A":
-            raise OSError("injected acknowledgement failure")
-        return real_write(fd, data)
+        if data != b"A":
+            return real_write(fd, data)
+        if write_first:
+            real_write(fd, data)
+        raise error
 
     cleanup_calls = record_runner_cleanup(monkeypatch)
     monkeypatch.setattr(mcp_run_control.os, "write", fail_ack)
 
-    with pytest.raises(OSError, match="acknowledgement"):
+    with pytest.raises(type(error), match=str(error) or None):
         app.launch("srv")
 
     (handle,) = store.list_handles()
@@ -779,35 +797,6 @@ def test_acknowledgement_write_failure_keeps_spawn_cleanup_reserved(
     assert status is not None
     assert status["cleanup_confirmed"] is False
     assert not store.launch_lease_path(handle.run_id).exists()
-
-
-def test_interruption_after_ack_keeps_spawn_cleanup_reserved(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config, app, _registry, store = side_effect_app(tmp_path)
-    patch_popen_capture(monkeypatch)
-    real_write = os.write
-
-    def interrupt_after_ack(fd: int, data: bytes) -> int:
-        written = real_write(fd, data)
-        if data == b"A":
-            raise KeyboardInterrupt
-        return written
-
-    cleanup_calls = record_runner_cleanup(monkeypatch)
-    monkeypatch.setattr(mcp_run_control.os, "write", interrupt_after_ack)
-
-    with pytest.raises(KeyboardInterrupt):
-        app.launch("srv")
-
-    (handle,) = store.list_handles()
-    assert cleanup_calls == [(handle.pid, handle.pid_starttime, handle.pgid)]
-    assert store.cleanup_uncertain(handle)
-    assert store.recovery_required(handle)
-    status = store.recorded_terminal_status(handle)
-    assert status is not None
-    assert status["cleanup_confirmed"] is False
 
 
 def test_completed_lease_cleanup_failure_cannot_replace_launch_success(
@@ -862,59 +851,45 @@ def test_launch_refuses_runner_without_linux_process_identity(
     assert cleanup_calls and cleanup_calls[0][1] is None
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(OSError("runs directory is not writable"), id="update_failure"),
+        pytest.param(KeyboardInterrupt(), id="shutdown_interrupt"),
+    ],
+)
 def test_launch_terminates_spawned_runner_when_handle_update_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: BaseException
 ) -> None:
+    """A failure or shutdown interrupt after spawn but before durable identity ends the runner."""
     config, app, _registry, store = side_effect_app(tmp_path)
     patch_popen_capture(monkeypatch)
     updated: list[RunHandle] = []
 
     def fail_update(handle: RunHandle) -> None:
         updated.append(handle)
-        raise OSError("runs directory is not writable")
+        raise error
 
     terminated = record_runner_cleanup(monkeypatch)
     monkeypatch.setattr(store, "update", fail_update)
 
-    with pytest.raises(OSError, match="runs directory"):
+    with pytest.raises(type(error), match=str(error) or None):
         app.launch("srv")
 
     assert [handle.launch_state for handle in updated] == ["spawned"]
     spawned = updated[0]
     assert terminated == [(spawned.pid, spawned.pid_starttime, spawned.pgid)]
+    assert terminated[0][1] is not None
     pending = store.get(spawned.run_id)
     assert pending is not None
     assert pending.launch_state == "spawned"
-    assert store.state(pending) == "running"
-    assert store.recovery_required(pending)
-    assert store.cleanup_uncertain(pending)
-
-
-def test_launch_interrupt_during_handle_update_terminates_runner(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A shutdown interrupt cannot escape after spawn but before durable identity."""
-    config, app, _registry, store = side_effect_app(tmp_path)
-    patch_popen_capture(monkeypatch)
-
-    def interrupt_update(_handle: RunHandle) -> None:
-        raise KeyboardInterrupt
-
-    terminated = record_runner_cleanup(monkeypatch)
-    monkeypatch.setattr(store, "update", interrupt_update)
-
-    with pytest.raises(KeyboardInterrupt):
-        app.launch("srv")
-
-    (pending,) = store.list_handles()
     terminal = store.recorded_terminal_status(pending)
     assert terminal is not None
     assert terminal["cleanup_confirmed"] is False
-    assert terminal["error_class"] == "KeyboardInterrupt"
+    assert terminal["error_class"] == type(error).__name__
     assert store.state(pending) == "running"
     assert store.recovery_required(pending)
-    assert terminated and terminated[0][1] is not None
+    assert store.cleanup_uncertain(pending)
 
 
 def test_launch_logs_when_cleanup_marker_write_fails_after_update_failure(
