@@ -62,7 +62,7 @@ with mlflow.start_run(run_id=os.environ["MLFLOW_RUN_ID"]):
 
 PhaseSweep finishes a still-running managed run after confirmed process cleanup: FINISHED after successful trainer exit, FAILED after a failed trial, or KILLED after a pruned one. A run that is already terminal keeps its status, and its `phasesweep.outcome` tag records a later trial failure. A FAILED or KILLED run is never converted into accepted evidence. Every creation request first searches the exact generation and attempt identity tags and binds a run it finds, so a retry after a lost response does not create a second run; it creates one only when the search finds none.
 
-In **trainer** mode, your existing logger creates and finishes the run. Bind that exact run once it exists:
+In **trainer** mode, your existing logger creates and finishes the run. The trainer receives `MLFLOW_TRACKING_URI` and the resolved `MLFLOW_EXPERIMENT_ID`, so a plain `mlflow.start_run()` opens it in the configured experiment. Bind that exact run once it exists:
 
 ```python
 import mlflow
