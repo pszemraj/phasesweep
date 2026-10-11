@@ -197,3 +197,15 @@ def test_revalidation_rejects_nested_mutations_before_artifacts(
     with pytest.raises(ValueError):
         run_experiment(experiment)
     assert not (tmp_path / "runs").exists()
+
+
+def test_run_experiment_revalidates_programmatically_copied_config(tmp_path: Path) -> None:
+    """The library boundary rejects model_copy updates that skipped validation."""
+    experiment = _experiment(tmp_path / "runs", _phase())
+    phase = experiment.phases[0].model_copy(update={"n_trials": True})
+    copied = experiment.model_copy(update={"phases": [phase]})
+
+    with pytest.raises(ValidationError, match="numbers, not booleans"):
+        run_experiment(copied)
+
+    assert not (tmp_path / "runs").exists()
