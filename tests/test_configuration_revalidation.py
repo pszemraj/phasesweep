@@ -144,17 +144,42 @@ def test_revalidation_preserves_attached_environment(
     assert run_experiment(experiment)["p"].metric == 0.125
 
 
-@pytest.mark.parametrize("level", ["experiment", "phase"])
-def test_revalidation_rejects_unknown_copied_field(tmp_path: Path, level: str) -> None:
-    """A misspelled copied timeout is rejected before artifacts or trials exist."""
+@pytest.mark.parametrize(
+    ("level", "update", "match"),
+    [
+        pytest.param(
+            "experiment",
+            {"timeout_seconds_per_rnu": 5},
+            "Extra inputs are not permitted",
+            id="experiment_unknown_field",
+        ),
+        pytest.param(
+            "phase",
+            {"timeout_seconds_per_trail": 5},
+            "Extra inputs are not permitted",
+            id="phase_unknown_field",
+        ),
+        pytest.param(
+            "phase", {"n_trials": True}, "numbers, not booleans", id="phase_boolean_n_trials"
+        ),
+    ],
+)
+def test_revalidation_rejects_invalid_copied_field(
+    tmp_path: Path, level: str, update: dict[str, Any], match: str
+) -> None:
+    """The library boundary rejects model_copy updates that skipped validation.
+
+    A misspelled copied timeout or a boolean copied into ``n_trials`` is rejected
+    before artifacts or trials exist.
+    """
     experiment = _experiment(tmp_path / "runs", _phase())
     if level == "phase":
-        phase = experiment.phases[0].model_copy(update={"timeout_seconds_per_trail": 5})
+        phase = experiment.phases[0].model_copy(update=update)
         experiment = experiment.model_copy(update={"phases": [phase]})
     else:
-        experiment = experiment.model_copy(update={"timeout_seconds_per_rnu": 5})
+        experiment = experiment.model_copy(update=update)
 
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+    with pytest.raises(ValidationError, match=match):
         run_experiment(experiment)
 
     assert not (tmp_path / "runs").exists()
@@ -187,16 +212,4 @@ def test_revalidation_rejects_nested_mutations_before_artifacts(
     )
     with pytest.raises(ValueError):
         run_experiment(experiment)
-    assert not (tmp_path / "runs").exists()
-
-
-def test_run_experiment_revalidates_programmatically_copied_config(tmp_path: Path) -> None:
-    """The library boundary rejects model_copy updates that skipped validation."""
-    experiment = _experiment(tmp_path / "runs", _phase())
-    phase = experiment.phases[0].model_copy(update={"n_trials": True})
-    copied = experiment.model_copy(update={"phases": [phase]})
-
-    with pytest.raises(ValidationError, match="numbers, not booleans"):
-        run_experiment(copied)
-
     assert not (tmp_path / "runs").exists()

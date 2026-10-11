@@ -81,15 +81,27 @@ def _assert_starter_destination_round_trip(output: Path) -> Path:
     return Path(load_experiment(output).workdir)
 
 
-def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "project_name",
+    [
+        pytest.param("\U0001f680 sweeps", id="non_bmp_character"),
+        pytest.param("__PHASESWEEP_STORAGE__", id="placeholder_literal"),
+    ],
+)
+def test_init_round_trips_awkward_destination_paths(tmp_path: Path, project_name: str) -> None:
     """Rendered paths must survive YAML decoding byte-for-byte.
 
     ``json.dumps`` with the default ``ensure_ascii=True`` escapes a non-BMP
     character as a UTF-16 surrogate pair, which a YAML double-quoted scalar
     decodes into lone surrogates; every later filesystem call on the decoded
     workdir then fails with ``UnicodeEncodeError``.
+
+    Placeholder substitution must also never rescan text it already inserted.
+    Replacing the placeholders one after another lets a destination path that
+    contains a placeholder literal be rewritten by a later replacement, which
+    corrupts a config that ``init`` still reports as written.
     """
-    project = tmp_path / "\U0001f680 sweeps"
+    project = tmp_path / project_name
     project.mkdir()
     output = project / "experiment.yaml"
     runs_dir = output.parent / "runs"
@@ -97,20 +109,6 @@ def test_init_round_trips_non_bmp_paths(tmp_path: Path) -> None:
     # Lone surrogates raise UnicodeEncodeError here; a real path does not.
     workdir.mkdir(parents=True)
     assert workdir == runs_dir
-
-
-def test_init_renders_destinations_containing_placeholder_literals(tmp_path: Path) -> None:
-    """Placeholder substitution must never rescan text it already inserted.
-
-    Replacing the placeholders one after another lets a destination path that
-    contains a placeholder literal be rewritten by a later replacement, which
-    corrupts a config that ``init`` still reports as written.
-    """
-    project = tmp_path / "__PHASESWEEP_STORAGE__"
-    output = project / "experiment.yaml"
-    runs_dir = project / "runs"
-
-    assert _assert_starter_destination_round_trip(output) == runs_dir
 
 
 def test_init_preserves_question_mark_in_journal_path(tmp_path: Path) -> None:
@@ -175,47 +173,38 @@ def test_init_refuses_broken_symlink(tmp_path: Path) -> None:
     assert output.is_symlink()
 
 
-def test_init_write_failure_does_not_claim_destination(
+@pytest.mark.parametrize(
+    ("patched", "error"),
+    [
+        pytest.param("fsync", OSError("fsync failed"), id="fsync_failure"),
+        pytest.param("link", PermissionError("hard links are not supported"), id="eperm_on_link"),
+    ],
+)
+def test_init_write_failure_is_a_user_facing_error_that_does_not_claim_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    patched: str,
+    error: OSError,
 ) -> None:
-    output = tmp_path / "experiment.yaml"
-
-    def fail_fsync(_fd: int) -> None:
-        raise OSError("fsync failed")
-
-    monkeypatch.setattr("phasesweep.runtime.files.os.fsync", fail_fsync)
-
-    result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
-
-    assert result.exit_code == 1
-    assert f"phasesweep init: cannot write {output}: fsync failed" in result.output
-    assert not output.exists()
-    assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))
-
-
-def test_init_reports_publish_errors_without_a_traceback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A hard-link failure is a user-facing error, not a traceback.
+    """A write or publish failure is a user-facing error, not a traceback.
 
     ``init`` is the first command a new user runs, and ``os.link`` fails with
     ``EPERM`` on filesystems without hard links, not only with
-    ``FileExistsError``.
+    ``FileExistsError``. Whichever step fails, the destination is never claimed
+    and no temporary file is left behind.
     """
     output = tmp_path / "experiment.yaml"
 
-    def deny_hard_link(_source: Path, _destination: Path) -> None:
-        raise PermissionError("hard links are not supported")
+    def fail(*_args: object) -> None:
+        raise error
 
-    monkeypatch.setattr("phasesweep.runtime.files.os.link", deny_hard_link)
+    monkeypatch.setattr(f"phasesweep.runtime.files.os.{patched}", fail)
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
     assert result.exit_code == 1
     assert isinstance(result.exception, SystemExit)
-    assert f"phasesweep init: cannot write {output}: hard links are not supported" in result.output
+    assert f"phasesweep init: cannot write {output}: {error}" in result.output
     assert "Traceback" not in result.output
     assert not output.exists()
     assert not list(tmp_path.glob(".experiment.yaml.*.tmp"))

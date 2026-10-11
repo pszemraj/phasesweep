@@ -142,22 +142,28 @@ def test_sampler_rejects_non_default_n_startup_trials_off_tpe(sampler_type: str)
         Sampler(type=sampler_type, n_startup_trials=999)
 
 
-def test_sampler_accepts_tpe_with_non_default_n_startup_trials() -> None:
-    """TPE is the one sampler type that actually reads n_startup_trials."""
-    sampler = Sampler(type="tpe", n_startup_trials=999)
-    assert sampler.n_startup_trials == 999
+@pytest.mark.parametrize(
+    ("sampler_type", "n_startup_trials"),
+    [
+        pytest.param("tpe", 999, id="tpe_non_default"),
+        pytest.param("random", 10, id="random_default"),
+        pytest.param("grid", 10, id="grid_default"),
+        pytest.param("cmaes", 10, id="cmaes_default"),
+    ],
+)
+def test_sampler_accepts_n_startup_trials_it_can_honor(
+    sampler_type: str, n_startup_trials: int
+) -> None:
+    """TPE accepts any n_startup_trials; every other sampler accepts only the default.
 
-
-@pytest.mark.parametrize("sampler_type", ["random", "grid", "cmaes"])
-def test_sampler_accepts_default_n_startup_trials_off_tpe(sampler_type: str) -> None:
-    """Explicitly spelling out the default n_startup_trials on a non-tpe sampler is fine.
-
-    This is checked by value, not by whether the field was explicitly set:
-    config snapshot fixtures serialize every field, including
-    n_startup_trials: 10 on sampler.type: random, and must keep loading.
+    TPE is the one sampler type that actually reads n_startup_trials. Explicitly
+    spelling out the default on a non-tpe sampler is fine too: this is checked by
+    value, not by whether the field was explicitly set, because config snapshot
+    fixtures serialize every field, including n_startup_trials: 10 on
+    sampler.type: random, and must keep loading.
     """
-    sampler = Sampler(type=sampler_type, n_startup_trials=10)
-    assert sampler.n_startup_trials == 10
+    sampler = Sampler(type=sampler_type, n_startup_trials=n_startup_trials)
+    assert sampler.n_startup_trials == n_startup_trials
 
 
 def test_validate_rejects_incompatible_phase_settings() -> None:
@@ -413,17 +419,15 @@ def test_validate_rejects_partial_grid_above_cardinality() -> None:
         )
 
 
-def test_categorical_choices_reject_duplicates() -> None:
-    """A repeated choice inflates cardinality and skews sampling weight."""
-    with pytest.raises(ValidationError, match="must remain distinguishable"):
-        CategoricalParam(type="categorical", choices=[1, 1, 2])
-    with pytest.raises(ValidationError, match="at index 2 compares equal to 'a' at index 0"):
-        CategoricalParam(type="categorical", choices=["a", "b", "a"])
-
-
 @pytest.mark.parametrize(
     ("choices", "message"),
     [
+        pytest.param([1, 1, 2], "must remain distinguishable", id="duplicate_ints"),
+        pytest.param(
+            ["a", "b", "a"],
+            "at index 2 compares equal to 'a' at index 0",
+            id="duplicate_strings",
+        ),
         pytest.param([1, 1.0], "1.0 at index 1 compares equal to 1 at index 0", id="int_float"),
         pytest.param([1, True], "True at index 1 compares equal to 1 at index 0", id="int_bool"),
         pytest.param([0, False], "False at index 1 compares equal to 0 at index 0", id="zero_bool"),
@@ -440,7 +444,9 @@ def test_categorical_rejects_equal_but_distinct_choices(
     ``CategoricalDistribution`` records a sampled value as ``choices.index(value)``,
     so ``1``, ``1.0``, and ``True`` all persist as the first equal choice. The
     trainer would run one value while the published winner and every inherited
-    override claimed another (PR #5 review / reviewer 2, blocker 1).
+    override claimed another (PR #5 review / reviewer 2, blocker 1). A plain
+    repeated choice is the same hazard and also inflates cardinality and skews
+    sampling weight.
     """
     with pytest.raises(ValidationError, match=message):
         CategoricalParam(type="categorical", choices=choices)
@@ -600,14 +606,18 @@ def test_trial_command_requires_live_override_placeholder(
         )
 
 
-def test_trial_command_unknown_placeholder_rejected() -> None:
-    with pytest.raises(ValueError, match="unknown placeholder"):
-        make_experiment(trial_command="echo {trail_dir} {overrides}", n_trials=1)
-
-
-def test_trial_command_unbalanced_brace_rejected() -> None:
-    with pytest.raises(ValueError, match="trial_command failed to render"):
-        make_experiment(trial_command="echo {trial_dir", n_trials=1)
+@pytest.mark.parametrize(
+    ("template", "match"),
+    [
+        pytest.param(
+            "echo {trail_dir} {overrides}", "unknown placeholder", id="unknown_placeholder"
+        ),
+        pytest.param("echo {trial_dir", "trial_command failed to render", id="unbalanced_brace"),
+    ],
+)
+def test_trial_command_malformed_template_rejected(template: str, match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        make_experiment(trial_command=template, n_trials=1)
 
 
 def test_invalid_trainer_config_is_not_misreported_as_a_command_template_error() -> None:

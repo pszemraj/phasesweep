@@ -391,39 +391,68 @@ def test_phase_names_preserve_authored_case_for_inherit_selectors() -> None:
 
 
 @pytest.mark.parametrize(
-    ("pattern", "match"),
-    [("(", "Invalid metric regex"), (r"loss=(?P<loss>\S+)", "requires a named")],
-)
-def test_config_rejects_invalid_metric_regex_before_creating_workdir(tmp_path, pattern, match):
-    payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
-    payload["metric"]["extractor"] = {"type": "log_regex", "pattern": pattern}
-    path = write_yaml(tmp_path, yaml.safe_dump(payload))
-
-    with pytest.raises(ValueError, match=match):
-        load_experiment(path)
-
-    assert not (tmp_path / "work").exists()
-
-
-@pytest.mark.parametrize(
-    ("name", "match"),
+    ("path", "value", "match"),
     [
-        ("attempts", "reserved for the runtime recovery registry"),
-        ("Attempts", "reserved for the runtime recovery registry"),
-        ("generations", "reserved for immutable generation records"),
-        ("Generations", "reserved for immutable generation records"),
-        ("tracking", "reserved for MLflow tracking records"),
+        pytest.param(
+            ("metric", "extractor"),
+            {"type": "log_regex", "pattern": "("},
+            "Invalid metric regex",
+            id="metric_regex_does_not_compile",
+        ),
+        pytest.param(
+            ("metric", "extractor"),
+            {"type": "log_regex", "pattern": r"loss=(?P<loss>\S+)"},
+            "requires a named",
+            id="metric_regex_lacks_the_value_group",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "attempts",
+            "reserved for the runtime recovery registry",
+            id="reserved_attempts",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "Attempts",
+            "reserved for the runtime recovery registry",
+            id="reserved_attempts_cased",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "generations",
+            "reserved for immutable generation records",
+            id="reserved_generations",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "Generations",
+            "reserved for immutable generation records",
+            id="reserved_generations_cased",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "tracking",
+            "reserved for MLflow tracking records",
+            id="reserved_tracking",
+        ),
     ],
 )
-def test_config_rejects_reserved_phase_name_before_creating_workdir(
-    tmp_path, name: str, match: str
+def test_config_rejects_invalid_content_before_creating_workdir(
+    tmp_path, path: tuple[str | int, ...], value: Any, match: str
 ):
+    """An invalid metric regex or reserved phase name fails the load before any workdir exists.
+
+    ``path`` addresses the key of the dumped experiment payload to overwrite with ``value``.
+    """
     payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
-    payload["phases"][0]["name"] = name
-    path = write_yaml(tmp_path, yaml.safe_dump(payload))
+    target = payload
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    config_path = write_yaml(tmp_path, yaml.safe_dump(payload))
 
     with pytest.raises(ValueError, match=match):
-        load_experiment(path)
+        load_experiment(config_path)
 
     assert not (tmp_path / "work").exists()
 
@@ -443,23 +472,42 @@ def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]
 
 
 @pytest.mark.parametrize(
-    ("inherit_env", "message"),
+    ("field", "names", "message"),
     [
-        ([""], "nonempty and unpadded"),
-        ([" PATH"], "nonempty and unpadded"),
-        (["PATH "], "nonempty and unpadded"),
-        (["WANDB_API_KEY", "WANDB_API_KEY"], "must be unique"),
+        pytest.param("inherit_env", [""], "nonempty and unpadded", id="inherit_empty"),
+        pytest.param("inherit_env", [" PATH"], "nonempty and unpadded", id="inherit_leading_space"),
+        pytest.param(
+            "inherit_env", ["PATH "], "nonempty and unpadded", id="inherit_trailing_space"
+        ),
+        pytest.param(
+            "inherit_env",
+            ["WANDB_API_KEY", "WANDB_API_KEY"],
+            "must be unique",
+            id="inherit_duplicate",
+        ),
+        pytest.param("passthrough_env", [""], "nonempty and unpadded", id="passthrough_empty"),
+        pytest.param(
+            "passthrough_env",
+            [" HF_TOKEN"],
+            "nonempty and unpadded",
+            id="passthrough_leading_space",
+        ),
+        pytest.param(
+            "passthrough_env",
+            ["HF_TOKEN", "HF_TOKEN"],
+            "must be unique",
+            id="passthrough_duplicate",
+        ),
     ],
-    ids=["empty", "leading_space", "trailing_space", "duplicate"],
 )
-def test_execution_inherit_env_names_validated(inherit_env: list[str], message: str) -> None:
-    """A named-inheritance list must be a set of exact variable names.
+def test_execution_env_names_validated(field: str, names: list[str], message: str) -> None:
+    """A named-inheritance or passthrough list must be a set of exact variable names.
 
     Padded or empty names would silently inherit nothing (``os.environ`` has
     no ``' PATH'``), and duplicates hide a typo in a second entry.
     """
     with pytest.raises(ValidationError, match=message):
-        ExecutionContext(inherit_env=inherit_env)
+        ExecutionContext(**{field: names})
 
 
 def test_execution_accepts_named_inherit_list() -> None:
@@ -468,21 +516,6 @@ def test_execution_accepts_named_inherit_list() -> None:
     assert execution.inherit_env == ["WANDB_API_KEY", "HF_TOKEN"]
     assert execution.cwd is None
     assert ExecutionContext().inherit_env == "all"
-
-
-@pytest.mark.parametrize(
-    ("passthrough_env", "message"),
-    [
-        ([""], "nonempty and unpadded"),
-        ([" HF_TOKEN"], "nonempty and unpadded"),
-        (["HF_TOKEN", "HF_TOKEN"], "must be unique"),
-    ],
-)
-def test_execution_passthrough_env_names_validated(
-    passthrough_env: list[str], message: str
-) -> None:
-    with pytest.raises(ValidationError, match=message):
-        ExecutionContext(passthrough_env=passthrough_env)
 
 
 def test_execution_rejects_ambiguous_environment_classification() -> None:
@@ -494,9 +527,10 @@ def test_execution_rejects_ambiguous_environment_classification() -> None:
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "match"),
     [
-        """
+        (
+            """
 experiment: t
 storage: null
 provenance: {revision: test-fixture-v1}
@@ -512,7 +546,10 @@ phases:
     n_trials: 1
     search_space: { x: { type: float, low: 0, high: 1 } }
 """,
-        """
+            "duplicate key",
+        ),
+        (
+            """
 experiment: t
 storage: null
 provenance: {revision: test-fixture-v1}
@@ -529,7 +566,10 @@ phases:
       lr: {type: float, low: 1e-5, high: 1e-3, log: true}
       lr: {type: float, low: 1e-4, high: 1e-2, log: true}
 """,
-        """
+            "duplicate key",
+        ),
+        (
+            """
 experiment: t
 storage: null
 provenance: {revision: test-fixture-v1}
@@ -545,12 +585,37 @@ phases:
     n_trials: 5
     search_space: { x: { type: float, low: 0, high: 1 } }
 """,
+            "duplicate key",
+        ),
+        (
+            """
+experiment: t
+storage: null
+provenance: {revision: test-fixture-v1}
+trial_command: "echo"
+metric:
+  name: loss
+  goal: minimize
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
+phases:
+  - &first
+    name: first
+    n_trials: 1
+  - &second
+    name: second
+    n_trials: 2
+  - <<: *first
+    <<: *second
+    name: merged
+""",
+            r"duplicate key '<<'",
+        ),
     ],
-    ids=["top_level", "search_space", "phase_mapping"],
+    ids=["top_level", "search_space", "phase_mapping", "merge_key"],
 )
-def test_duplicate_yaml_keys_rejected(tmp_path: Path, body: str) -> None:
-    """Duplicate keys fail loudly anywhere in the config tree."""
-    with pytest.raises(ValueError, match="duplicate key"):
+def test_duplicate_yaml_keys_rejected(tmp_path: Path, body: str, match: str) -> None:
+    """Duplicate keys fail loudly anywhere in the config tree, merge keys included."""
+    with pytest.raises(ValueError, match=match):
         load_experiment(write_yaml(tmp_path, body))
 
 
@@ -580,32 +645,6 @@ phases:
         ("baseline", 1),
         ("tuned", 2),
     ]
-
-
-def test_duplicate_yaml_merge_keys_rejected(tmp_path: Path) -> None:
-    body = """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo"
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-phases:
-  - &first
-    name: first
-    n_trials: 1
-  - &second
-    name: second
-    n_trials: 2
-  - <<: *first
-    <<: *second
-    name: merged
-"""
-
-    with pytest.raises(ValueError, match=r"duplicate key '<<'"):
-        load_experiment(write_yaml(tmp_path, body))
 
 
 def test_override_format_n_jobs_and_failure_limit_defaults(tmp_path):

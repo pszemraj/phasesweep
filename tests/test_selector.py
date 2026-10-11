@@ -163,41 +163,27 @@ def test_corrupt_winner_evidence_attrs_fail_closed(attr: str, value: str) -> Non
 
 
 @pytest.mark.parametrize(
-    ("goal", "first_delta", "expected_x"),
+    ("goal", "first_metric", "second_metric", "expected_x"),
     [
-        pytest.param("minimize", 1e-15, 2, id="minimize-worse-by-one-ulp-scale"),
-        pytest.param("maximize", -1e-15, 2, id="maximize-worse-by-one-ulp-scale"),
+        pytest.param("minimize", 0.1 + 1e-15, 0.1, 2, id="minimize-worse-by-one-ulp-scale"),
+        pytest.param("maximize", 0.1 - 1e-15, 0.1, 2, id="maximize-worse-by-one-ulp-scale"),
+        pytest.param("minimize", 3e-13, 1e-13, 2, id="minimize-tiny-scale"),
+        pytest.param("maximize", 3e-13, 1e-13, 1, id="maximize-tiny-scale"),
     ],
 )
 def test_metric_ordering_preserves_representable_differences(
-    goal: str, first_delta: float, expected_x: int
+    goal: str, first_metric: float, second_metric: float, expected_x: int
 ) -> None:
-    """Any representable metric difference decides the winner."""
-    exp = _make_exp(goal=goal)
-    study = _make_study()
-    _add_trial(study, 0.1 + first_delta, params={"x": 1})
-    _add_trial(study, 0.1, params={"x": 2})
-
-    winner = select_winner(study, exp)
-
-    assert winner.params == {"x": expected_x}
-
-
-@pytest.mark.parametrize(
-    ("goal", "expected_x"),
-    [pytest.param("minimize", 2, id="minimize"), pytest.param("maximize", 1, id="maximize")],
-)
-def test_tiny_scale_objectives_rank_by_value_not_trial_number(goal: str, expected_x: int) -> None:
-    """Objectives below the old 1e-12 epsilon must still rank by value.
+    """Any representable metric difference decides the winner, never the trial number.
 
     Regression for review v0.5.17 / finding H: 1e-13 and 3e-13 are 2e-13 apart,
-    which the removed absolute tie epsilon swallowed — the lower trial number
-    won regardless of which result was actually better.
+    which the removed absolute 1e-12 tie epsilon swallowed — the lower trial
+    number won regardless of which result was actually better.
     """
     exp = _make_exp(goal=goal)
     study = _make_study()
-    _add_trial(study, 3e-13, params={"x": 1})
-    _add_trial(study, 1e-13, params={"x": 2})
+    _add_trial(study, first_metric, params={"x": 1})
+    _add_trial(study, second_metric, params={"x": 2})
 
     winner = select_winner(study, exp)
 

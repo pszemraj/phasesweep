@@ -276,20 +276,40 @@ def test_artifact_size_directory_gate_counts_file_symlinks_not_directory_symlink
     assert "directory size 11 within bounds" in result.detail
 
 
-def test_artifact_size_directory_gate_reports_root_inspection_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("failing", "fail_when_following", "message"),
+    [
+        pytest.param("checkpoint", False, "root metadata unavailable", id="root"),
+        pytest.param(
+            "checkpoint/model.bin", True, "descendant metadata unavailable", id="descendant"
+        ),
+    ],
+)
+def test_artifact_size_directory_gate_reports_stat_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
+    fail_when_following: bool,
+    message: str,
 ) -> None:
-    """A root metadata error is failed evidence with its original path detail."""
+    """A root or child metadata error is failed evidence with its original path detail.
+
+    The root is inspected without following symlinks and a child with them, so each
+    case fails the one ``stat`` call its path takes. A child metadata error in
+    particular cannot be silently excluded from a directory size.
+    """
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()
+    (checkpoint / "model.bin").write_bytes(b"payload")
+    failing_path = tmp_path / failing
     real_stat = Path.stat
 
-    def fail_root_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if self == checkpoint and not follow_symlinks:
-            raise OSError("root metadata unavailable")
+    def fail_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
+        if self == failing_path and follow_symlinks is fail_when_following:
+            raise OSError(message)
         return real_stat(self, follow_symlinks=follow_symlinks)
 
-    monkeypatch.setattr(Path, "stat", fail_root_stat)
+    monkeypatch.setattr(Path, "stat", fail_stat)
 
     result = evaluate_gates(
         make_trial_context(tmp_path),
@@ -304,42 +324,8 @@ def test_artifact_size_directory_gate_reports_root_inspection_failure(
     )[0]
 
     assert result.passed is False
-    assert str(checkpoint) in result.detail
-    assert "root metadata unavailable" in result.detail
-
-
-def test_artifact_size_directory_gate_reports_descendant_stat_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A child metadata error cannot be silently excluded from a directory size."""
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    child = checkpoint / "model.bin"
-    child.write_bytes(b"payload")
-    real_stat = Path.stat
-
-    def fail_child_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if self == child and follow_symlinks:
-            raise OSError("descendant metadata unavailable")
-        return real_stat(self, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(Path, "stat", fail_child_stat)
-
-    result = evaluate_gates(
-        make_trial_context(tmp_path),
-        [
-            ArtifactSizeGate(
-                type="artifact_size",
-                path="checkpoint",
-                source="directory",
-                max_bytes=1024,
-            )
-        ],
-    )[0]
-
-    assert result.passed is False
-    assert str(child) in result.detail
-    assert "descendant metadata unavailable" in result.detail
+    assert str(failing_path) in result.detail
+    assert message in result.detail
 
 
 def test_gate_results_mark_expired_local_gate(tmp_path: Path) -> None:
