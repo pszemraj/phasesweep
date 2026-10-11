@@ -685,31 +685,6 @@ def test_publication_refuses_invalid_winner_artifact(
     assert _current_pointer_state(experiment) == "publication_failed"
 
 
-@pytest.mark.parametrize("identity_field", ["generation_id", "attempt_id"])
-def test_manifest_rejects_winner_source_identity_disagreement(
-    tmp_path: Path,
-    identity_field: str,
-) -> None:
-    """The hash-covered winner's two provenance copies must identify one attempt."""
-    experiment, generation_id = _golden_publication(tmp_path)
-
-    winner_path = _generation_winner_path(experiment, generation_id, "p")
-    winner = yaml.safe_load(winner_path.read_text())
-    winner["winner_source"][identity_field] = f"different-{identity_field}"
-    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
-
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    artifact = next(
-        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
-    )
-    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-
-    assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
-
-
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -719,6 +694,9 @@ def test_manifest_rejects_winner_source_identity_disagreement(
         ("trial_number", 999),
         ("study", 999),
         ("phase_fingerprint", 999),
+        # The hash-covered winner's two provenance copies must identify one attempt.
+        ("generation_id", "different-generation_id"),
+        ("attempt_id", "different-attempt_id"),
     ],
 )
 def test_manifest_rejects_malformed_reanchored_winner_provenance(
@@ -880,7 +858,14 @@ def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_pa
     summary = yaml.safe_load(summary_path.read_text())
     summary["generation_id"] = "not-this-generation"
     summary_path.write_text(yaml.safe_dump(summary))
+    # Re-anchored, so the pointer's byte anchors pass and only the summary's own identity is refused.
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.generation_id == generation_id
+    assert pointer.error is not None
+    assert "does not name experiment" in pointer.error
     assert published_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
@@ -1564,18 +1549,24 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
         item for item in summary["artifacts"] if item.get("kind") != "reproducibility"
     ]
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
     repro_path.unlink()
 
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert "does not list the complete generation provenance record" in pointer.error
     assert published_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
 
 @pytest.mark.parametrize(
-    ("filename", "mutate"),
+    ("filename", "mutate", "error_match"),
     [
         pytest.param(
             _REPRODUCIBILITY_NAME,
             lambda payload: {**payload, "generation_id": "not-this-generation"},
+            "reproducibility artifact names a different generation",
             id="reproducibility-names-another-generation",
         ),
         pytest.param(
@@ -1584,11 +1575,13 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
                 **payload,
                 "config_snapshot": {**payload["config_snapshot"], "sha256": "0" * 64},
             },
+            "reproducibility artifact does not anchor the config snapshot it published",
             id="reproducibility-unanchors-the-snapshot",
         ),
         pytest.param(
             _CONFIG_SNAPSHOT_NAME,
             lambda payload: {**payload, "experiment": "some-other-experiment"},
+            "config_snapshot artifact names a different experiment",
             id="snapshot-names-another-experiment",
         ),
     ],
@@ -1597,6 +1590,7 @@ def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     tmp_path: Path,
     filename: str,
     mutate,  # noqa: ANN001
+    error_match: str,
 ) -> None:
     """Re-hashing an edited provenance file into the manifest does not launder it.
 
@@ -1618,7 +1612,13 @@ def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     entry = next(item for item in summary["artifacts"] if item.get("path") == filename)
     entry["sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    # Re-anchored, so the pointer's byte anchors pass and the cross-check itself refuses it.
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert error_match in pointer.error
     assert published_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
