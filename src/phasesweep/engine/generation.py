@@ -308,7 +308,7 @@ def _validate_publishable_summary(
 
 def _validate_generation_publishable(
     experiment: Experiment, generation_id: str
-) -> tuple[dict[str, Any], bytes]:
+) -> tuple[validation_ops.ValidatedPublication, bytes]:
     """Validate a generation's complete result manifest before its publication commit.
 
     Checks the generation's immutable summary names this exact experiment and
@@ -330,20 +330,20 @@ def _validate_generation_publishable(
         or does not name this generation.
     :raises PublicationAccessError: A manifest artifact cannot be read as the current user.
     :raises PublicationIntegrityError: A manifest-listed artifact fails validation.
-    :return tuple[dict[str, Any], bytes]: Parsed summary and exact summary bytes whose
-        manifest was validated.
+    :return tuple[ValidatedPublication, bytes]: Everything the validation read, and the
+        exact summary bytes whose manifest was validated.
     """
     summary, summary_bytes = _validate_publishable_summary(
         summary_path=path_ops._generation_summary_path(experiment, generation_id),
         experiment_name=experiment.experiment,
         generation_id=generation_id,
     )
-    validation_ops._validate_generation_manifest(
+    publication = validation_ops._validate_generation_manifest(
         path_ops._generation_dir(experiment, generation_id),
         generation_id,
         summary,
     )
-    return summary, summary_bytes
+    return publication, summary_bytes
 
 
 def _publish_generation(
@@ -416,13 +416,13 @@ def _publish_generation(
     """
     with absorb_shutdown_signals() as absorbed:
         try:
-            summary, summary_bytes = _validate_generation_publishable(experiment, generation_id)
+            publication, summary_bytes = _validate_generation_publishable(experiment, generation_id)
             if publication_hook is not None:
                 publication_hook.prepare(
                     experiment=experiment,
                     generation_id=generation_id,
                     winners=MappingProxyType(dict(winners)),
-                    summary=MappingProxyType(summary),
+                    summary=MappingProxyType(publication.summary),
                 )
             artifact_io._write_yaml_atomic(
                 path_ops._last_successful_generation_path(experiment),

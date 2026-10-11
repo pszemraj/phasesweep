@@ -1,20 +1,28 @@
-"""Failed-generation delivery preserves engine outcome and cleanup authority."""
+"""Terminal delivery preserves engine outcome and cleanup authority."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 import shlex
 import signal
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
+from phasesweep.config import Experiment
 from phasesweep.engine import NoFeasibleTrialError, run_experiment
-from phasesweep.engine.paths import _trial_dir_for
+from phasesweep.engine.generation import _recorded_generation_state
+from phasesweep.engine.paths import _generation_record_path, _trial_dir_for
+from phasesweep.engine.read import read_status
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
-from phasesweep.tracking import publication
-from phasesweep.tracking.mlflow import _publish
+from phasesweep.tracking import mlflow as worker
+from phasesweep.tracking import publication, session
+from phasesweep.tracking.mlflow import _capture, _publish
 from phasesweep.tracking.session import BINDING_FILE, read_record, tracking_root, write_record
 from tests.test_mlflow import _binding, _run, native_experiment
 
@@ -209,3 +217,154 @@ def test_missing_binding_never_creates_or_discovers_a_summary(tmp_path, monkeypa
     monkeypatch.setattr(publication, "call_tracking", lambda *args: pytest.fail("No remote work"))
     publication.publish_failed_generation(experiment, "a" * 32, RuntimeError("create unresolved"))
     assert publication.delivery_status(experiment) == {"pending": 0, "delivered": 0}
+
+
+def _remote_example(tmp_path, monkeypatch):
+    """Run the native example against in-process MLflow answers and a no-op trainer."""
+    config = yaml.safe_load((Path(__file__).parents[1] / "examples/mlflow.yaml").read_text())
+    config.update(
+        workdir=str(tmp_path / "runs"),
+        storage=None,
+        trial_command=f"{sys.executable} -c pass {{config_path}}",
+    )
+    uploads = []
+
+    def respond(request, **kwargs):
+        if request["action"] == "resolve":
+            return {"experiment_id": "1"}
+        if request["action"] == "create":
+            return {**request["binding"], "run_id": "run-" + request["binding"]["attempt_id"]}
+        if request["action"] == "capture":
+            run = _run(request["binding"], metrics={"eval/loss": 1.0, "cost": 1.0})
+            run.data.params = {"depth": "1", "rate": "0"}
+            run.data.tags["trainer"] = "none"
+            point = SimpleNamespace(value=1.0, step=1, timestamp=1)
+            client = SimpleNamespace(get_run=lambda _: run, get_metric_history=lambda *_: [point])
+            return _capture(client, request)
+        uploads.append(request)
+        return {}
+
+    monkeypatch.setattr(session, "request_operation", respond)
+    monkeypatch.setattr(worker, "request_operation", respond)
+    return config, uploads
+
+
+def _fail_mirror(monkeypatch, failure):
+    """Break the first winner delivery after the pointer commit in one way.
+
+    :return BaseException | None: The injected error, or ``None`` for a failed write.
+    """
+    if failure in {"intent", "acknowledgement"}:
+        state = "pending" if failure == "intent" else "delivered"
+        actual_write = publication.write_record
+
+        def read_only(path, record):
+            if path.name == "winner-depth.json" and record["state"] == state:
+                raise PermissionError("tracking filesystem became read-only")
+            actual_write(path, record)
+
+        monkeypatch.setattr(publication, "write_record", read_only)
+        return None
+    error = (
+        UnsafeProcessCleanupError("upload worker still unresolved")
+        if failure == "worker"
+        else PhaseSweepShutdown(
+            signal.SIGTERM,
+            ShutdownCleanupReport(signum=signal.SIGTERM, cleanup_confirmed=True, child_pgids=()),
+        )
+    )
+    actual_call = publication.call_tracking
+
+    def interrupted(*args, **kwargs):
+        if args[2]["name"] == "winner-depth":
+            raise error
+        return actual_call(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "call_tracking", interrupted)
+    return error
+
+
+@pytest.mark.parametrize("failure", ["intent", "acknowledgement", "worker", "shutdown"])
+def test_mirror_failure_after_publication_keeps_the_result(tmp_path, monkeypatch, failure):
+    """Publication, returned winners, and the terminal report agree; sync finishes the mirror."""
+    config, uploads = _remote_example(tmp_path, monkeypatch)
+    experiment = Experiment.model_validate(config)
+    error = _fail_mirror(monkeypatch, failure)
+    reports = []
+    if failure == "shutdown":
+        with pytest.raises(PhaseSweepShutdown) as caught:
+            run_experiment(experiment, terminal_callback=reports.append)
+        assert caught.value is error and caught.value.published_result_committed
+    else:
+        winners = run_experiment(experiment, terminal_callback=reports.append)
+        assert set(winners) == {"depth", "rate"}
+    [report] = reports
+    generation = report.generation_id
+    assert report.primary_error is None
+    assert set(report.winners) == {"depth", "rate"}
+    # Only a worker that may still be running is cleanup evidence.
+    assert report.cleanup_confirmed is (failure != "worker")
+    assert report.cleanup_error is (error if failure == "worker" else None)
+    assert read_status(experiment)["published_generation_id"] == generation
+    assert _recorded_generation_state(_generation_record_path(experiment, generation)) == (
+        "published"
+    )
+    assert (
+        publication.delivery_status(experiment, generation)
+        == {
+            "intent": {"pending": 0, "delivered": 4},
+            "acknowledgement": {"pending": 1, "delivered": 6},
+            "worker": {"pending": 3, "delivered": 4},
+            "shutdown": {"pending": 3, "delivered": 4},
+        }[failure]
+    )
+    monkeypatch.setattr(publication, "write_record", session.write_record)
+    monkeypatch.setattr(publication, "call_tracking", session.call_tracking)
+    assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 7}
+    latest = {request["name"]: request for request in uploads}
+    assert latest["winner-depth"]["projection"]["tags"]["phasesweep.winner"] == "true"
+    winner_run = latest["winner-depth"]["binding"]["run_id"]
+    assert latest["generation"]["projection"]["tags"]["phasesweep.winner.depth"] == winner_run
+    if failure == "acknowledgement":
+        # The frozen projection MLflow already accepted is resent unchanged.
+        resent = [r for r in uploads if r["name"] == "winner-depth"]
+        assert resent == [latest["winner-depth"]] * 2
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("failure", ["intent", "worker"])
+def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, monkeypatch, failure):
+    """A detached run records success; an unresolved upload worker also needs recovery."""
+    from phasesweep.mcp.runs import RunStore
+    from phasesweep.runtime.time import utc_now_iso
+    from tests.mcp_helpers import claim_runner_handle, runner_argv, runner_main
+
+    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    _fail_mirror(monkeypatch, failure)
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+    config_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    store = RunStore(tmp_path / "state")
+    run_id = "mirror-" + "a" * 32
+    started_at = utc_now_iso()
+    claim_runner_handle(store, run_id=run_id, config_sha256=config_sha256, started_at=started_at)
+    argv = runner_argv(
+        store,
+        run_id=run_id,
+        config=config_path,
+        config_sha256=config_sha256,
+        experiment_id="srv",
+        started_at=started_at,
+    )
+    assert runner_main(argv, cwd=tmp_path) == 0
+
+    status = json.loads(store.status_path(run_id).read_text())
+    assert status["returncode"] == 0
+    assert status["failure"] is None and status["error_class"] is None
+    assert status["cleanup_confirmed"] is (failure == "intent")
+    assert status["result_snapshot_state"] == "complete"
+    assert [w["phase"] for w in status["result_snapshot"]["winners"]] == ["depth", "rate"]
+    assert read_status(Experiment.model_validate(config))["published_generation_id"] == run_id
+    handle = store.get(run_id)
+    assert handle is not None
+    assert store.cleanup_recovery_required(handle) is (failure == "worker")

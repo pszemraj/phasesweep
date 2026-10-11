@@ -76,6 +76,8 @@ def _deliver(experiment: Experiment, path: Path, environment: Mapping[str, str])
             },
             environment,
         )
+        # A lost acknowledgement resends the same projection on the next sync.
+        write_record(path, {**record, "state": "delivered"})
     except (OSError, ValueError, RuntimeError) as exc:
         if isinstance(exc, UnsafeProcessCleanupError):
             raise
@@ -85,20 +87,18 @@ def _deliver(experiment: Experiment, path: Path, environment: Mapping[str, str])
             str(exc),
         )
         return False
-    write_record(path, {**record, "state": "delivered"})
     return True
 
 
-def _enqueue(
+def _save_intent(
     experiment: Experiment,
     generation_id: str,
     name: str,
     binding: dict[str, Any],
     projection: dict[str, Any],
-    environment: Mapping[str, str],
     *,
     finish: str | None = None,
-) -> None:
+) -> Path:
     """Save delivery intent before attempting any result upload.
 
     :param Experiment experiment: Configured target.
@@ -106,8 +106,8 @@ def _enqueue(
     :param str name: Stable projection identity.
     :param dict[str, Any] binding: Verified target run.
     :param dict[str, Any] projection: Frozen upload payload.
-    :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None finish: Terminal status for a still-running managed run.
+    :return Path: The delivery record, unchanged when it already exists.
     """
     assert experiment.mlflow is not None
     path = tracking_root(experiment) / generation_id / "delivery" / f"{name}.json"
@@ -124,6 +124,30 @@ def _enqueue(
                 "state": "pending",
             },
         )
+    return path
+
+
+def _enqueue(
+    experiment: Experiment,
+    generation_id: str,
+    name: str,
+    binding: dict[str, Any],
+    projection: dict[str, Any],
+    environment: Mapping[str, str],
+    *,
+    finish: str | None = None,
+) -> None:
+    """Save delivery intent, then try the upload once.
+
+    :param Experiment experiment: Configured target.
+    :param str generation_id: Producing generation.
+    :param str name: Stable projection identity.
+    :param dict[str, Any] binding: Verified target run.
+    :param dict[str, Any] projection: Frozen upload payload.
+    :param Mapping[str, str] environment: Composed credentials and transport.
+    :param str | None finish: Terminal status for a still-running managed run.
+    """
+    path = _save_intent(experiment, generation_id, name, binding, projection, finish=finish)
     _deliver(experiment, path, environment)
 
 
@@ -260,68 +284,116 @@ def publish_unaccepted_trial(
         _finish_attempt(experiment, generation_id, binding, status, environment)
 
 
-def publish_generation(
-    experiment: Experiment, generation_id: str, winners: dict[str, Winner]
-) -> None:
-    """Publish winner references after the local generation has committed.
+def _save_generation_intents(experiment: Experiment, generation_id: str) -> list[Path]:
+    """Save a published generation's winner references from its committed artifacts.
+
+    Reading the validated artifacts instead of in-memory winners lets
+    sync-tracking rebuild records that a failed write after publication never
+    saved. Records that already exist are kept.
 
     :param Experiment experiment: Configured experiment.
-    :param str generation_id: Committed generation.
-    :param dict[str, Winner] winners: Accepted phase winners.
+    :param str generation_id: Published generation that has a summary run.
+    :raises PublicationCommitError: The generation summary cannot be read back.
+    :raises PublicationAccessError: A manifest artifact cannot be read as the current user.
+    :raises PublicationIntegrityError: A manifest-listed artifact fails validation.
+    :raises OSError: A delivery record cannot be written.
+    :return list[Path]: Winner records in phase order, then the summary run's.
     """
-    from phasesweep.engine.trial import _trainer_environment
+    from phasesweep.engine.generation import _validate_generation_publishable
 
-    parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
-    if not parent_path.exists():
-        return  # No-work replay never imports the SDK or creates remote runs.
-    parent = read_record(parent_path)
-    environment = _trainer_environment(experiment, experiment.phases[0].name)
-    references = {
-        name: {
-            "run_id": winner.objective_provenance["remote_capture"]["binding"]["run_id"],
-            "metric": winner.metric,
-            "effective_overrides": winner.effective_overrides,
-        }
-        for name, winner in winners.items()
-        if winner.objective_provenance is not None
+    parent = read_record(tracking_root(experiment) / generation_id / "generation-binding.json")
+    publication, _ = _validate_generation_publishable(experiment, generation_id)
+    bindings = {
+        name: winner.payload["objective_provenance"]["remote_capture"]["binding"]
+        for name, winner in publication.winners.items()
     }
-    for phase in experiment.phases:
-        winner = winners[phase.name]
-        assert winner.objective_provenance is not None
-        binding = winner.objective_provenance["remote_capture"]["binding"]
-        tags = {
-            "phasesweep.winner": "true",
-            f"phasesweep.winner_generation.{generation_id}": phase.name,
-            **{
-                f"phasesweep.inherits.{name}": references[name]["run_id"] for name in phase.inherits
-            },
+    references = {
+        item["name"]: {
+            "run_id": bindings[item["name"]]["run_id"],
+            "metric": item["metric"],
+            "effective_overrides": item["effective_overrides"],
         }
-        _enqueue(
+        for item in publication.summary["phases"]
+    }
+    paths = [
+        _save_intent(
             experiment,
             generation_id,
             f"winner-{phase.name}",
-            binding,
+            bindings[phase.name],
             _projection(
                 metrics={},
                 params={},
-                tags=tags,
+                tags={
+                    "phasesweep.winner": "true",
+                    f"phasesweep.winner_generation.{generation_id}": phase.name,
+                    **{
+                        f"phasesweep.inherits.{name}": references[name]["run_id"]
+                        for name in phase.inherits
+                    },
+                },
                 summary={"phase": phase.name, **references[phase.name]},
             ),
-            environment,
         )
-    _enqueue(
-        experiment,
-        generation_id,
-        "generation",
-        parent,
-        _projection(
-            metrics={},
-            params={},
-            tags={f"phasesweep.winner.{name}": r["run_id"] for name, r in references.items()},
-            summary={"generation_id": generation_id, "phases": references},
-        ),
-        environment,
-        finish="FINISHED",
+        for phase in experiment.phases
+    ]
+    paths.append(
+        _save_intent(
+            experiment,
+            generation_id,
+            "generation",
+            parent,
+            _projection(
+                metrics={},
+                params={},
+                tags={f"phasesweep.winner.{name}": r["run_id"] for name, r in references.items()},
+                summary={"generation_id": generation_id, "phases": references},
+            ),
+            finish="FINISHED",
+        )
+    )
+    return paths
+
+
+def publish_generation(experiment: Experiment, generation_id: str) -> None:
+    """Mirror a committed generation's winner references to its MLflow runs.
+
+    Every record is saved before the first upload, so an outage leaves all of
+    them pending for sync-tracking.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Committed generation.
+    :raises PublicationIntegrityError: The committed artifacts no longer validate.
+    :raises OSError: A delivery record cannot be read or written.
+    :raises UnsafeProcessCleanupError: An upload worker's cleanup is uncertain.
+    """
+    from phasesweep.engine.trial import _trainer_environment
+
+    if not (tracking_root(experiment) / generation_id / "generation-binding.json").exists():
+        return  # No-work replay never imports the SDK or creates remote runs.
+    environment = _trainer_environment(experiment, experiment.phases[0].name)
+    for path in _save_generation_intents(experiment, generation_id):
+        _deliver(experiment, path, environment)
+
+
+def _published(experiment: Experiment, generation_id: str) -> bool:
+    """Report whether a generation committed as a successful result.
+
+    :param Experiment experiment: Experiment that owns the generation.
+    :param str generation_id: Generation to check.
+    :return bool: Whether its lifecycle record or the last-success pointer names it published.
+    """
+    from phasesweep.engine.generation import _recorded_generation_state
+    from phasesweep.engine.paths import _generation_record_path, _last_successful_generation_path
+    from phasesweep.engine.publication_validation import _read_pointer_target
+
+    # The pointer commits first; the lifecycle record after it is best-effort.
+    target = _read_pointer_target(
+        _last_successful_generation_path(experiment), experiment_name=experiment.experiment
+    )
+    return (target is not None and target.generation_id == generation_id) or (
+        _recorded_generation_state(_generation_record_path(experiment, generation_id))
+        == "published"
     )
 
 
@@ -408,14 +480,19 @@ def _delivery_pattern(generation_id: str | None) -> str:
 
 
 def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
-    """Retry only retained result projections, without selecting or training.
+    """Retry result projections, without selecting or training.
+
+    A published generation whose winner records were never saved, because a
+    write failed or the controller died after publication, has them rebuilt
+    from its committed artifacts first.
 
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
         retried, or ``None`` for every generation's retained deliveries.
     :raises ValueError: No deliveries exist, or the target or generation does
         not match the saved records.
-    :raises PhaseSweepError: The MLflow SDK is not installed.
+    :raises PhaseSweepError: The MLflow SDK is not installed, or a published
+        generation's artifacts no longer validate.
     :return dict[str, int]: Remaining pending and delivered counts in that scope.
     """
     from phasesweep.config.common import _validate_safe_name
@@ -434,7 +511,16 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         _preflight_active_attempts(
             experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
         )
-        paths = sorted(tracking_root(experiment).glob(_delivery_pattern(generation_id)))
+        root = tracking_root(experiment)
+        for parent in sorted(root.glob(f"{generation_id or '*'}/generation-binding.json")):
+            if (parent.parent / "delivery" / "generation.json").exists() or not _published(
+                experiment, parent.parent.name
+            ):
+                continue
+            if read_record(root / "source.json")["source"] != experiment.mlflow.evidence_identity():
+                raise ValueError("Tracking delivery belongs to a different target or generation.")
+            _save_generation_intents(experiment, parent.parent.name)
+        paths = sorted(root.glob(_delivery_pattern(generation_id)))
         if not paths:
             raise ValueError("No tracking deliveries exist for this scope.")
         for path in paths:

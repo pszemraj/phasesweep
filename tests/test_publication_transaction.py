@@ -510,7 +510,9 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
 
     original_validate = generation_ops._validate_generation_publishable
 
-    def validate_then_signal(*args: object, **kwargs: object) -> tuple[dict[str, Any], bytes]:
+    def validate_then_signal(
+        *args: object, **kwargs: object
+    ) -> tuple[validation_ops.ValidatedPublication, bytes]:
         validated = original_validate(*args, **kwargs)
         os.kill(os.getpid(), signal.SIGTERM)
         return validated
