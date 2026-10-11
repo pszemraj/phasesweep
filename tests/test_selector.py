@@ -5,15 +5,7 @@ import json
 import optuna
 import pytest
 
-from phasesweep.config import (
-    Constraint,
-    Experiment,
-    IntParam,
-    JsonExtractor,
-    LogRegexExtractor,
-    Metric,
-    Phase,
-)
+from phasesweep.config import Constraint, JsonExtractor, Phase
 from phasesweep.engine.errors import TrialEvidenceMissingError
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
@@ -253,23 +245,14 @@ def test_rejects_nan_constraint_values_defensively():
     t1.set_user_attr(constraint_attr("size"), float("nan"))
     study.tell(t1, 0.1)  # Better metric, but invalid.
 
-    exp = Experiment(
-        experiment="t",
-        trial_command="echo {overrides}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        constraints=[
+    exp = _make_exp(
+        [
             Constraint(
                 name="size",
                 extractor=JsonExtractor(type="json", path="r.json", key="s"),
                 max=1000.0,
             )
-        ],
-        phases=[
-            Phase(name="a", n_trials=1, search_space={"x": IntParam(type="int", low=0, high=10)}),
-        ],
+        ]
     )
     sel = select_winner(study, exp)
     assert sel.trial_number == 0, (

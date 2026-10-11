@@ -8,13 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from phasesweep.config import (
-    Experiment,
-    IntParam,
-    LogRegexExtractor,
-    Metric,
-    Phase,
-)
 from phasesweep.engine import run_experiment
 from phasesweep.engine.paths import (
     _experiment_dir,
@@ -142,40 +135,12 @@ def test_inspection_does_not_create_workdir(tmp_path: Path) -> None:
 def test_experiment_name_rejected(bad_name: str) -> None:
     """Experiment name is used in lock-file paths; unsafe characters break that."""
     with pytest.raises(ValueError, match="Experiment name"):
-        Experiment(
-            experiment=bad_name,
-            trial_command="echo {overrides}",
-            override_format="argparse",
-            metric=Metric(
-                extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-            ),
-            phases=[
-                Phase(  # type: ignore[arg-type]
-                    name="p",
-                    n_trials=1,
-                    search_space={"x": IntParam(type="int", low=0, high=1)},
-                )
-            ],
-        )
+        make_experiment(experiment=bad_name)
 
 
 def test_experiment_name_accepts_valid() -> None:
     """Alphanumeric, underscore, and hyphen are safe."""
-    Experiment(
-        experiment="tiny_lm-16mb",
-        trial_command="echo {overrides}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        phases=[
-            Phase(  # type: ignore[arg-type]
-                name="p",
-                n_trials=1,
-                search_space={"x": IntParam(type="int", low=0, high=1)},
-            )
-        ],
-    )
+    make_experiment(experiment="tiny_lm-16mb")
 
 
 @pytest.mark.parametrize(("mask", "expected_mode"), [(0o022, 0o644), (0o077, 0o600)])

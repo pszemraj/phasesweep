@@ -13,17 +13,13 @@ from phasesweep.config import (
     Constraint,
     Experiment,
     LogRegexExtractor,
-    Metric,
     Phase,
     RequiredFileGate,
     Sampler,
 )
+from tests.conftest import make_experiment
 
-
-def _metric() -> Metric:
-    return Metric(
-        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-    )
+_ECHO_METRIC_COMMAND = "echo x=1 {overrides}"
 
 
 def _phase(*, explicitly_empty: bool = False) -> Phase:
@@ -37,15 +33,18 @@ def _phase(*, explicitly_empty: bool = False) -> Phase:
     )
 
 
-def _experiment(path: Path, phase: Phase, **options: Any) -> Experiment:
-    return Experiment(
+def _experiment(
+    path: Path,
+    phase: Phase,
+    *,
+    trial_command: str = _ECHO_METRIC_COMMAND,
+    **options: Any,
+) -> Experiment:
+    return make_experiment(
         experiment="revalidation",
-        workdir=str(path),
+        workdir=path,
         storage="auto",
-        provenance={"trainer": "test-shell-v1"},
-        trial_command="echo x=1 {overrides}",
-        override_format="argparse",
-        metric=_metric(),
+        trial_command=trial_command,
         phases=[phase],
         **options,
     )
@@ -134,15 +133,10 @@ def test_revalidation_preserves_attached_environment(
     """An added environment value reaches the trainer instead of being discarded."""
     monkeypatch.delenv("PHASESWEEP_REVALIDATION_VALUE", raising=False)
     options: dict[str, Any] = {"env": {}} if explicitly_empty else {}
-    experiment = Experiment(
-        experiment="revalidation",
-        workdir=str(tmp_path / "runs"),
-        storage="auto",
-        provenance={"trainer": "test-shell-v1"},
+    experiment = _experiment(
+        tmp_path / "runs",
+        _phase(),
         trial_command='echo x="$PHASESWEEP_REVALIDATION_VALUE" {overrides}',
-        override_format="argparse",
-        metric=_metric(),
-        phases=[_phase()],
         **options,
     )
     experiment.env["PHASESWEEP_REVALIDATION_VALUE"] = "0.125"
@@ -174,13 +168,10 @@ def test_revalidation_rejects_nested_mutations_before_artifacts(
 ) -> None:
     import phasesweep.engine.run as run_engine
 
-    experiment = Experiment(
+    experiment = make_experiment(
         experiment="mutated",
-        workdir=str(tmp_path / "runs"),
-        storage=None,
-        trial_command="echo x=1 {overrides}",
-        override_format="argparse",
-        metric=_metric(),
+        workdir=tmp_path / "runs",
+        trial_command=_ECHO_METRIC_COMMAND,
         phases=[_phase()],
     )
     if mutation == "phase":
