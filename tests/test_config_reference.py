@@ -1,7 +1,9 @@
 """Guard documented config paths/signatures and load the starting configurations.
 
 These checks detect inventory, type and default drift. They do not prove the
-reference's behavioral comments, bounds, precedence or cross-field rules.
+reference's behavioral comments, bounds, precedence or cross-field rules. The
+one comment check is structural: every ``Conflicts with`` and ``Overrides``
+line must have its counterpart on the key it names.
 """
 
 from __future__ import annotations
@@ -20,7 +22,11 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def _type_signature(node: dict[str, Any]) -> str:
-    """Render schema types in the reference's user-facing notation."""
+    """Render schema types in the reference's user-facing notation.
+
+    :param dict[str, Any] node: JSON-schema node of one field.
+    :return str: The type as the reference spells it.
+    """
     if "$ref" in node:
         return "object"
     if "const" in node:
@@ -56,6 +62,11 @@ def _schema_inventory() -> dict[str, str]:
     inventory: dict[str, str] = {}
 
     def children(node: dict[str, Any], path: str) -> None:
+        """Descend into the model, variants, list items or map values below one field.
+
+        :param dict[str, Any] node: JSON-schema node of the field.
+        :param str path: Inventory path of the field.
+        """
         if "$ref" in node:
             model(schema["$defs"][node["$ref"].rsplit("/", 1)[1]], path)
         elif "discriminator" in node:
@@ -74,6 +85,11 @@ def _schema_inventory() -> dict[str, str]:
                 children(values, path + ".<key>")
 
     def model(node: dict[str, Any], prefix: str) -> None:
+        """Record every field of one model schema under a path prefix.
+
+        :param dict[str, Any] node: JSON-schema node of the model.
+        :param str prefix: Inventory path of the model, with its variant tag if any.
+        """
         name = node["title"]
         model_type = getattr(config_models, name)
         tag = node["properties"].get("type", {}).get("const")
@@ -101,9 +117,9 @@ def _schema_inventory() -> dict[str, str]:
     return inventory
 
 
-def _reference_inventory() -> dict[str, str]:
-    """Read indented signatures while retaining every discriminator alternative."""
-    inventory: dict[str, str] = {}
+def _reference_entries() -> dict[str, tuple[str, list[str]]]:
+    """Read indented signatures and their comment lines, keeping every discriminator alternative."""
+    inventory: dict[str, tuple[str, list[str]]] = {}
     stack: list[tuple[int, str]] = []
     comments: list[str] = []
     for line in (REPO / "docs/config_reference.yaml").read_text().splitlines():
@@ -133,10 +149,15 @@ def _reference_inventory() -> dict[str, str]:
         assert re.search(r" = .+| \(required\)$| \(optional\)$", signature), path
         if signature.endswith(" (optional)"):
             assert any(comment.startswith("Unset:") for comment in comments), path
-        inventory[path] = signature
+        inventory[path] = (signature, comments.copy())
         stack.append((indent, key + ("[]" if signature.startswith("list[") else "")))
         comments.clear()
     return inventory
+
+
+def _reference_inventory() -> dict[str, str]:
+    """Map each documented path, with its discriminator alternative, to its signature."""
+    return {path: signature for path, (signature, _) in _reference_entries().items()}
 
 
 def test_reference_matches_every_config_path_variant_type_and_default() -> None:
@@ -148,6 +169,103 @@ def test_reference_matches_every_config_path_variant_type_and_default() -> None:
         "extra": sorted(actual.keys() - expected.keys()),
     }
     assert actual == expected
+
+
+_TAG = re.compile(r"(\[type=[^\]]+\])")
+
+
+def _plain_path_and_tags(path: str) -> tuple[str, dict[str, str]]:
+    """Split an inventory path into the path a user types and its variant tags.
+
+    :param str path: Inventory path such as ``phases[].gates[type=sha256].path``.
+    :return tuple[str, dict[str, str]]: The path without ``[type=...]`` markers,
+        and the variant tag chosen at each plain prefix along it.
+    """
+    plain = ""
+    tags: dict[str, str] = {}
+    for segment in _TAG.split(path):
+        if segment.startswith("[type="):
+            tags[plain] = segment[len("[type=") : -1]
+        else:
+            plain += segment
+    return plain, tags
+
+
+def _labeled_paths(path: str, comments: list[str], label: str, known: set[str]) -> set[str]:
+    """Return the key paths named by one entry's lines for a pairing label.
+
+    A labeled line is ``<label>: <path>[, <path>]...`` followed by nothing, a
+    parenthesis, or a semicolon and an explanation. Every listed item must be a
+    documented key path, so a line that breaks the convention fails loudly
+    instead of being skipped.
+
+    :param str path: Inventory path of the entry, for diagnostics.
+    :param list[str] comments: Comment lines above the entry.
+    :param str label: ``Conflicts with``, ``Overrides`` or ``Overridden by``.
+    :param set[str] known: Every documented path as a user types it.
+    :return set[str]: Plain paths named by the entry's lines for this label.
+    """
+    named: set[str] = set()
+    for comment in comments:
+        if not comment.startswith(f"{label}: "):
+            continue
+        head = re.split(r" \(|;", comment[len(label) + 2 :], maxsplit=1)[0].rstrip(".")
+        for item in (part.strip() for part in head.split(",")):
+            assert item in known, f"{path}: '{label}:' names {item!r}, not a documented key path"
+            named.add(item)
+    return named
+
+
+def test_conflict_and_override_labels_are_paired_on_both_keys() -> None:
+    """Fail when one side of a Conflicts with / Overrides / Overridden by pair is missing.
+
+    Each pairing label lists key paths first, then an optional explanation after
+    a parenthesis or semicolon. Where a path exists in several discriminator
+    variants, the counterpart is looked up in the variants that agree with the
+    labeled entry on every shared variant choice.
+    """
+    entries = _reference_entries()
+    parsed = {path: _plain_path_and_tags(path) for path in entries}
+    known = {plain for plain, _ in parsed.values()}
+    labels = ("Conflicts with", "Overrides", "Overridden by")
+    named = {
+        label: {
+            path: _labeled_paths(path, comments, label, known)
+            for path, (_, comments) in entries.items()
+        }
+        for label in labels
+    }
+    assert sum(len(targets) for targets in named["Conflicts with"].values()), "no Conflicts with"
+    assert sum(len(targets) for targets in named["Overrides"].values()), "no Overrides"
+
+    def counterparts(owner: str, target: str) -> list[str]:
+        """Return entries at ``target`` whose variant tags agree with ``owner``'s.
+
+        :param str owner: Inventory path of the entry that carries the label.
+        :param str target: Plain key path the label names.
+        :return list[str]: Inventory paths of the candidate counterparts.
+        """
+        owner_tags = parsed[owner][1]
+        return [
+            path
+            for path, (plain, tags) in parsed.items()
+            if plain == target and all(owner_tags.get(k, v) == v for k, v in tags.items())
+        ]
+
+    unpaired: list[str] = []
+    for label, reverse in (
+        ("Conflicts with", "Conflicts with"),
+        ("Overrides", "Overridden by"),
+        ("Overridden by", "Overrides"),
+    ):
+        for owner, targets in named[label].items():
+            for target in targets:
+                if not any(
+                    parsed[owner][0] in named[reverse][other]
+                    for other in counterparts(owner, target)
+                ):
+                    unpaired.append(f"{owner}: '{label}: {target}' lacks '{reverse}: ...' there")
+    assert not unpaired, unpaired
 
 
 def test_minimal_starting_example_loads_through_real_loader() -> None:
