@@ -127,6 +127,23 @@ follow_imports_for_stubs = true
 module = ["wandb.*", "requests.*", "mlflow.*", "databricks.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# These modules carry no explicit Any: open payloads are JsonValue, known shapes are TypedDicts, and the MLflow SDK is described by Protocols.
+module = [
+    "phasesweep.tracking.*",
+    "phasesweep.evidence.mlflow",
+    "phasesweep.runtime.remote_worker",
+    "phasesweep.examples.mlflow_train",
+]
+disallow_any_explicit = true
+disallow_any_decorated = true
+
+[[tool.mypy.overrides]]
+# Pydantic's BaseModel carries Any in its own signatures, which mypy reports at every subclass.
+module = ["phasesweep.tracking.models"]
+disallow_any_explicit = false
+disallow_any_decorated = false
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q -m 'not live' --strict-markers"
