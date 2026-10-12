@@ -9,16 +9,18 @@ import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from phasesweep.config.common import is_sha256_hex
 from phasesweep.runtime.files import private_atomic_write_text
-from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.json import JsonObject, json_object, json_text, strict_json_loads
 from phasesweep.tracking.mlflow import identity_tags, request_operation, verify_remote
+from phasesweep.tracking.records import validate_binding
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
+    from phasesweep.tracking.mlflow import _SdkClient
+    from phasesweep.tracking.records import CreateAction, RunBinding, RunIdentity, TrackingAction
 
 BINDING_FILE = "mlflow-binding.json"
 _PARENT_LOCK = threading.RLock()
@@ -35,11 +37,11 @@ def tracking_root(experiment: Experiment) -> Path:
     return _experiment_dir(experiment) / "tracking"
 
 
-def write_record(path: Path, record: Mapping[str, Any]) -> None:
+def write_record(path: Path, record: Mapping[str, object]) -> None:
     """Atomically persist private tracking state using existing file primitives.
 
     :param Path path: Record destination.
-    :param Mapping[str, Any] record: JSON-compatible payload.
+    :param Mapping[str, object] record: JSON-compatible payload.
     """
     private_atomic_write_text(
         path,
@@ -48,53 +50,27 @@ def write_record(path: Path, record: Mapping[str, Any]) -> None:
     )
 
 
-def read_record(path: Path) -> dict[str, Any]:
+def read_record(path: Path) -> JsonObject:
     """Read a current-format tracking record.
 
     :param Path path: Record to read.
     :raises ValueError: The record does not use the current format.
-    :return dict[str, Any]: Decoded current-format record.
+    :return JsonObject: Decoded current-format record.
     """
-    data = strict_json_loads(path.read_text(encoding="utf-8"))
+    data: object = strict_json_loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("schema_version") != 1:
         raise ValueError("Unsupported MLflow tracking record format.")
-    return data
+    return json_object(data)
 
 
-def validate_binding(binding: Any) -> None:
-    """Require the current binding's source and immutable attempt identities.
+def read_binding(directory: Path, name: str = BINDING_FILE) -> RunBinding:
+    """Load a local run binding.
 
-    :param Any binding: Decoded local run binding.
-    :raises ValueError: A required identity is absent or invalid.
+    :param Path directory: Directory holding the binding.
+    :param str name: Binding file name; an attempt's by default.
+    :return RunBinding: Validated binding.
     """
-    if not isinstance(binding, dict) or binding.get("schema_version") != 1:
-        raise ValueError("Invalid MLflow run binding format.")
-    fields = (
-        "tracking_uri",
-        "experiment_id",
-        "run_id",
-        "experiment",
-        "phase",
-        "generation_id",
-        "attempt_id",
-    )
-    if (
-        any(not isinstance(binding.get(k), str) or not binding[k] for k in fields)
-        or binding.get("run_mode") not in {"managed", "trainer"}
-        or not is_sha256_hex(binding.get("overrides_sha256"))
-    ):
-        raise ValueError("MLflow binding lacks a valid source/attempt identity.")
-
-
-def read_binding(directory: Path) -> dict[str, Any]:
-    """Load the authoritative local run binding.
-
-    :param Path directory: Attempt directory.
-    :return dict[str, Any]: Validated binding.
-    """
-    binding = read_record(directory / BINDING_FILE)
-    validate_binding(binding)
-    return binding
+    return validate_binding(read_record(directory / name))
 
 
 def operation_deadline(experiment: Experiment, deadline: float | None = None) -> float:
@@ -141,23 +117,23 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
 def call_tracking(
     experiment: Experiment,
     generation_id: str,
-    request: dict[str, Any],
+    request: TrackingAction,
     environment: Mapping[str, str],
     deadline: float | None = None,
-) -> dict[str, Any]:
+) -> JsonObject:
     """Perform a registered tracking-only operation.
 
     :param Experiment experiment: Experiment with configured tracking.
     :param str generation_id: Operation's generation.
-    :param dict[str, Any] request: Trusted SDK action.
+    :param TrackingAction request: Trusted SDK action.
     :param Mapping[str, str] environment: Composed credentials/transport.
     :param float | None deadline: Optional absolute run deadline.
-    :return dict[str, Any]: Successful worker response.
+    :return JsonObject: Successful worker response.
     """
     assert experiment.mlflow is not None
     with tracking_operation(experiment, generation_id) as (operation_id, directory):
         return request_operation(
-            {"settings": experiment.mlflow.model_dump(mode="json"), **request},
+            {"settings": experiment.mlflow.target(), **request},
             operation_id=operation_id,
             directory=directory,
             environment=environment,
@@ -167,54 +143,56 @@ def call_tracking(
 
 def _create_bound(
     experiment: Experiment,
-    identity: dict[str, Any],
+    identity: RunIdentity,
     path: Path,
     environment: Mapping[str, str],
     *,
     run_name: str,
     deadline: float | None,
     attempt_directory: Path | None = None,
-) -> dict[str, Any]:
+) -> RunBinding:
     """Bind or create the identity's run, retrying once after an uncertain failure.
 
     Each try searches the identity tags before creating, so a retry after a
     lost response binds the run that request created instead of duplicating it.
 
     :param Experiment experiment: Configured experiment.
-    :param dict[str, Any] identity: Exact creation identity.
+    :param RunIdentity identity: Exact creation identity.
     :param Path path: Durable binding destination.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str run_name: Display name for a newly created run.
     :param float | None deadline: Existing execution deadline.
     :param Path | None attempt_directory: Existing process slot for managed attempt creation.
-    :return dict[str, Any]: Bound native run identity.
+    :return RunBinding: Bound native run identity.
     """
     assert experiment.mlflow is not None
     if path.exists():
-        return read_binding(path.parent) if path.name == BINDING_FILE else read_record(path)
-    request = {
+        return read_binding(path.parent, path.name)
+    request: CreateAction = {
         "action": "create",
         "binding": identity,
         "run_name": run_name,
     }
 
-    def execute() -> dict[str, Any]:
+    def execute() -> RunBinding:
         """Run creation or reconciliation in the registered process slot.
 
-        :return dict[str, Any]: Verified remote binding.
+        :return RunBinding: Verified remote binding.
         """
         assert experiment.mlflow is not None
         if attempt_directory is None:
-            return call_tracking(
+            created = call_tracking(
                 experiment, identity["generation_id"], request, environment, deadline
             )
-        return request_operation(
-            {"settings": experiment.mlflow.model_dump(mode="json"), **request},
-            operation_id=identity["attempt_id"],
-            directory=attempt_directory,
-            environment=environment,
-            deadline=operation_deadline(experiment, deadline),
-        )
+        else:
+            created = request_operation(
+                {"settings": experiment.mlflow.target(), **request},
+                operation_id=identity["attempt_id"],
+                directory=attempt_directory,
+                environment=environment,
+                deadline=operation_deadline(experiment, deadline),
+            )
+        return validate_binding(created)
 
     try:
         binding = execute()
@@ -236,7 +214,7 @@ def _resolve_source(
     generation_id: str,
     environment: Mapping[str, str],
     deadline: float | None,
-) -> dict[str, Any]:
+) -> str:
     """Resolve the source experiment and hold it to the cohort's first resolution.
 
     :param Experiment experiment: MLflow-backed experiment.
@@ -244,23 +222,24 @@ def _resolve_source(
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
     :raises ValueError: The experiment resolves differently within this cohort.
-    :return dict[str, Any]: The resolved experiment identity.
+    :return str: The resolved experiment ID.
     """
     assert experiment.mlflow is not None
     with _PARENT_LOCK:
         resolved = call_tracking(
             experiment, generation_id, {"action": "resolve"}, environment, deadline
         )
+        experiment_id = json_text(resolved, "experiment_id")
         source_path = tracking_root(experiment) / "source.json"
         source = {
             "schema_version": 1,
             "source": experiment.mlflow.evidence_identity(),
-            **resolved,
+            "experiment_id": experiment_id,
         }
         if source_path.exists() and read_record(source_path) != source:
             raise ValueError("MLflow experiment resolution changed within this scientific cohort.")
         write_record(source_path, source)
-        return resolved
+        return experiment_id
 
 
 def prepare_generation(
@@ -269,33 +248,33 @@ def prepare_generation(
     generation_id: str,
     environment: Mapping[str, str],
     deadline: float | None,
-) -> dict[str, Any]:
+) -> RunBinding:
     """Resolve the source experiment and bind this generation's summary run once.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str generation_id: Current invocation identity.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
-    :return dict[str, Any]: The generation summary run's binding.
+    :return RunBinding: The generation summary run's binding.
     """
     assert experiment.mlflow is not None
     with _PARENT_LOCK:
         parent_path = tracking_root(experiment) / generation_id / "generation-binding.json"
         if parent_path.exists():
-            return read_record(parent_path)
-        resolved = _resolve_source(
+            return read_binding(parent_path.parent, parent_path.name)
+        experiment_id = _resolve_source(
             experiment, generation_id=generation_id, environment=environment, deadline=deadline
         )
         from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 
-        parent_identity = {
+        parent_identity: RunIdentity = {
             "schema_version": 1,
             "tracking_uri": experiment.mlflow.tracking_uri,
             "experiment": experiment.experiment,
             "generation_id": generation_id,
             "overrides_sha256": _experiment_semantic_fingerprint(experiment),
             "run_mode": "managed",
-            **resolved,
+            "experiment_id": experiment_id,
             "phase": "generation",
             "attempt_id": generation_id,
         }
@@ -366,7 +345,7 @@ def prepare_attempt(
     directory: Path,
     environment: Mapping[str, str],
     deadline: float | None,
-) -> dict[str, Any]:
+) -> RunIdentity:
     """Bind the source experiment and optionally create the trainer's run.
 
     :param Experiment experiment: MLflow-backed experiment.
@@ -378,13 +357,13 @@ def prepare_attempt(
     :param Path directory: Registered attempt directory.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
-    :return dict[str, Any]: Expected binding, with a run ID in managed mode.
+    :return RunIdentity: Expected identity, a full binding with a run ID in managed mode.
     """
     assert experiment.mlflow is not None
     parent = prepare_generation(
         experiment, generation_id=generation_id, environment=environment, deadline=deadline
     )
-    identity = {
+    identity: RunIdentity = {
         "schema_version": 1,
         "tracking_uri": experiment.mlflow.tracking_uri,
         "experiment": experiment.experiment,
@@ -427,11 +406,10 @@ def bind_trainer_run(run_id: str) -> None:
         or expected["overrides_sha256"] != os.environ["PHASESWEEP_OVERRIDES_SHA256"]
     ):
         raise ValueError("MLflow binding helper requires this trainer-owned attempt.")
-    binding = {**expected, "run_id": run_id}
-    validate_binding(binding)
+    binding = validate_binding({**expected, "run_id": run_id})
     if (directory / BINDING_FILE).exists() and read_binding(directory) != binding:
         raise ValueError("This attempt is already bound to another MLflow run.")
-    client = MlflowClient(tracking_uri=expected["tracking_uri"])
+    client: _SdkClient = MlflowClient(tracking_uri=binding["tracking_uri"])
     run = client.get_run(run_id)
     if run.info.experiment_id != expected["experiment_id"] or run.info.lifecycle_stage != "active":
         raise ValueError("Trainer MLflow run belongs to a different experiment.")

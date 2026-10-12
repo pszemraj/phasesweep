@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import Field, field_validator, model_validator
 
 from phasesweep.config.common import ConfigFloat, _Frozen
+from phasesweep.tracking.records import MlflowTarget, RunMode, SourceIdentity
 
 
 class MlflowSettings(_Frozen):
@@ -16,7 +16,7 @@ class MlflowSettings(_Frozen):
     tracking_uri: str = Field(min_length=1)
     experiment_id: str | None = Field(default=None, min_length=1)
     experiment_name: str | None = Field(default=None, min_length=1)
-    run_mode: Literal["managed", "trainer"] = "managed"
+    run_mode: RunMode = "managed"
     poll_seconds: ConfigFloat = Field(default=2.0, gt=0, allow_inf_nan=False)
     timeout_seconds: ConfigFloat = Field(default=120.0, ge=1, allow_inf_nan=False)
 
@@ -65,14 +65,25 @@ class MlflowSettings(_Frozen):
             raise ValueError("MLflow requires exactly one of experiment_id or experiment_name.")
         return self
 
-    def evidence_identity(self) -> dict[str, str | None]:
+    def evidence_identity(self) -> SourceIdentity:
         """Return fields that determine the scientific source.
 
-        :return dict[str, str | None]: Source identity, excluding polling budgets.
+        :return SourceIdentity: Source identity, excluding polling budgets.
         """
         return {
             "tracking_uri": self.tracking_uri,
             "experiment_id": self.experiment_id,
             "experiment_name": self.experiment_name,
             "run_mode": self.run_mode,
+        }
+
+    def target(self) -> MlflowTarget:
+        """Return the full target a supervised worker receives.
+
+        :return MlflowTarget: Source identity plus the polling budgets.
+        """
+        return {
+            **self.evidence_identity(),
+            "poll_seconds": self.poll_seconds,
+            "timeout_seconds": self.timeout_seconds,
         }

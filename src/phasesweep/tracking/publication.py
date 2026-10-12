@@ -7,9 +7,17 @@ import logging
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.runtime.json import (
+    JsonObject,
+    json_number,
+    json_object,
+    json_optional_text,
+    json_text,
+)
+from phasesweep.tracking.records import validate_binding
 from phasesweep.tracking.session import (
     BINDING_FILE,
     call_tracking,
@@ -24,6 +32,7 @@ if TYPE_CHECKING:
 
     from phasesweep.config.models import Experiment
     from phasesweep.engine.state import Winner
+    from phasesweep.tracking.records import DeliveryRecord, Projection, PublishAction, RunBinding
 
 log = logging.getLogger(__name__)
 
@@ -33,15 +42,15 @@ def _projection(
     metrics: dict[str, float],
     params: dict[str, str],
     tags: dict[str, str],
-    summary: dict[str, Any],
-) -> dict[str, Any]:
+    summary: JsonObject,
+) -> Projection:
     """Freeze a retryable result mirror with a stable metric timestamp.
 
     :param dict[str, float] metrics: Reserved scalar metrics.
     :param dict[str, str] params: Effective override parameters.
     :param dict[str, str] tags: Phase and winner references.
-    :param dict[str, Any] summary: Compact artifact contents.
-    :return dict[str, Any]: Retryable projection.
+    :param JsonObject summary: Compact artifact contents.
+    :return Projection: Retryable projection.
     """
     return {
         "timestamp": int(time.time() * 1000),
@@ -63,19 +72,16 @@ def _deliver(experiment: Experiment, path: Path, environment: Mapping[str, str])
     record = read_record(path)
     if record["state"] == "delivered":
         return True
+    generation_id = json_text(record, "generation_id")
+    action: PublishAction = {
+        "action": "publish",
+        "name": path.stem,
+        "binding": json_object(record["binding"]),
+        "projection": json_object(record["projection"]),
+        "finish": json_optional_text(record, "finish"),
+    }
     try:
-        call_tracking(
-            experiment,
-            record["generation_id"],
-            {
-                "action": "publish",
-                "name": path.stem,
-                "binding": record["binding"],
-                "projection": record["projection"],
-                "finish": record["finish"],
-            },
-            environment,
-        )
+        call_tracking(experiment, generation_id, action, environment)
         # A lost acknowledgement resends the same projection on the next sync.
         write_record(path, {**record, "state": "delivered"})
     except (OSError, ValueError, RuntimeError) as exc:
@@ -83,7 +89,7 @@ def _deliver(experiment: Experiment, path: Path, environment: Mapping[str, str])
             raise
         log.warning(
             "MLflow result upload pending for generation %s (%s). Retry with sync-tracking.",
-            record["generation_id"],
+            generation_id,
             str(exc),
         )
         return False
@@ -94,8 +100,8 @@ def _save_intent(
     experiment: Experiment,
     generation_id: str,
     name: str,
-    binding: dict[str, Any],
-    projection: dict[str, Any],
+    binding: RunBinding,
+    projection: Projection,
     *,
     finish: str | None = None,
 ) -> Path:
@@ -104,26 +110,24 @@ def _save_intent(
     :param Experiment experiment: Configured target.
     :param str generation_id: Producing generation.
     :param str name: Stable projection identity.
-    :param dict[str, Any] binding: Verified target run.
-    :param dict[str, Any] projection: Frozen upload payload.
+    :param RunBinding binding: Verified target run.
+    :param Projection projection: Frozen upload payload.
     :param str | None finish: Terminal status for a still-running managed run.
     :return Path: The delivery record, unchanged when it already exists.
     """
     assert experiment.mlflow is not None
     path = tracking_root(experiment) / generation_id / "delivery" / f"{name}.json"
     if not path.exists():
-        write_record(
-            path,
-            {
-                "schema_version": 1,
-                "generation_id": generation_id,
-                "source": experiment.mlflow.evidence_identity(),
-                "binding": binding,
-                "projection": projection,
-                "finish": finish,
-                "state": "pending",
-            },
-        )
+        record: DeliveryRecord = {
+            "schema_version": 1,
+            "generation_id": generation_id,
+            "source": experiment.mlflow.evidence_identity(),
+            "binding": binding,
+            "projection": projection,
+            "finish": finish,
+            "state": "pending",
+        }
+        write_record(path, record)
     return path
 
 
@@ -131,8 +135,8 @@ def _enqueue(
     experiment: Experiment,
     generation_id: str,
     name: str,
-    binding: dict[str, Any],
-    projection: dict[str, Any],
+    binding: RunBinding,
+    projection: Projection,
     environment: Mapping[str, str],
     *,
     finish: str | None = None,
@@ -142,8 +146,8 @@ def _enqueue(
     :param Experiment experiment: Configured target.
     :param str generation_id: Producing generation.
     :param str name: Stable projection identity.
-    :param dict[str, Any] binding: Verified target run.
-    :param dict[str, Any] projection: Frozen upload payload.
+    :param RunBinding binding: Verified target run.
+    :param Projection projection: Frozen upload payload.
     :param Mapping[str, str] environment: Composed credentials and transport.
     :param str | None finish: Terminal status for a still-running managed run.
     """
@@ -176,15 +180,16 @@ def publish_trial(
 
     directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
     binding = read_binding(directory)
-    overrides = json.loads(trial.user_attrs[OVERRIDES_ATTR])
+    overrides = json_object(json.loads(trial.user_attrs[OVERRIDES_ATTR]))
     assert trial.value is not None
     constraints = {
-        c.name: trial.user_attrs[constraint_attr(c.name)] for c in experiment.constraints
+        c.name: json_number(trial.user_attrs, constraint_attr(c.name))
+        for c in experiment.constraints
     }
     metrics = {
         "phasesweep.objective": float(trial.value),
         "phasesweep.feasible": float(trial.user_attrs[FEASIBLE_ATTR]),
-        "phasesweep.duration_seconds": trial.user_attrs[DURATION_ATTR],
+        "phasesweep.duration_seconds": json_number(trial.user_attrs, DURATION_ATTR),
         **{f"phasesweep.constraint.{k}": v for k, v in constraints.items()},
     }
     projection = _projection(
@@ -195,19 +200,21 @@ def publish_trial(
         tags={
             "phasesweep.trial_number": str(trial.number),
             **{
-                f"phasesweep.inherits.{name}": winner.objective_provenance["remote_capture"][
-                    "binding"
-                ]["run_id"]
+                f"phasesweep.inherits.{name}": validate_binding(
+                    winner.objective_provenance["remote_capture"]["binding"]
+                )["run_id"]
                 for name, winner in inherited.items()
                 if winner.objective_provenance is not None
             },
         },
-        summary={
-            "trial_number": trial.number,
-            "metric": trial.value,
-            "constraints": constraints,
-            "effective_overrides": overrides,
-        },
+        summary=json_object(
+            {
+                "trial_number": trial.number,
+                "metric": trial.value,
+                "constraints": constraints,
+                "effective_overrides": overrides,
+            }
+        ),
     )
     _enqueue(
         experiment,
@@ -222,7 +229,7 @@ def publish_trial(
 def _finish_attempt(
     experiment: Experiment,
     generation_id: str,
-    binding: dict[str, Any],
+    binding: RunBinding,
     status: str,
     environment: Mapping[str, str],
 ) -> None:
@@ -230,7 +237,7 @@ def _finish_attempt(
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
-    :param dict[str, Any] binding: The attempt's managed run binding.
+    :param RunBinding binding: The attempt's managed run binding.
     :param str status: Terminal MLflow status for a still-running run.
     :param Mapping[str, str] environment: Composed authentication environment.
     """
@@ -301,18 +308,20 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
     """
     from phasesweep.engine.generation import _validate_generation_publishable
 
-    parent = read_record(tracking_root(experiment) / generation_id / "generation-binding.json")
+    parent = read_binding(tracking_root(experiment) / generation_id, "generation-binding.json")
     publication, _ = _validate_generation_publishable(experiment, generation_id)
     bindings = {
-        name: winner.payload["objective_provenance"]["remote_capture"]["binding"]
+        name: validate_binding(winner.payload["objective_provenance"]["remote_capture"]["binding"])
         for name, winner in publication.winners.items()
     }
     references = {
-        item["name"]: {
-            "run_id": bindings[item["name"]]["run_id"],
-            "metric": item["metric"],
-            "effective_overrides": item["effective_overrides"],
-        }
+        item["name"]: json_object(
+            {
+                "run_id": bindings[item["name"]]["run_id"],
+                "metric": item["metric"],
+                "effective_overrides": item["effective_overrides"],
+            }
+        )
         for item in publication.summary["phases"]
     }
     paths = [
@@ -328,7 +337,7 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
                     "phasesweep.winner": "true",
                     f"phasesweep.winner_generation.{generation_id}": phase.name,
                     **{
-                        f"phasesweep.inherits.{name}": references[name]["run_id"]
+                        f"phasesweep.inherits.{name}": bindings[name]["run_id"]
                         for name in phase.inherits
                     },
                 },
@@ -346,8 +355,8 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
             _projection(
                 metrics={},
                 params={},
-                tags={f"phasesweep.winner.{name}": r["run_id"] for name, r in references.items()},
-                summary={"generation_id": generation_id, "phases": references},
+                tags={f"phasesweep.winner.{name}": bindings[name]["run_id"] for name in references},
+                summary=json_object({"generation_id": generation_id, "phases": references}),
             ),
             finish="FINISHED",
         )
@@ -441,7 +450,7 @@ def publish_failed_generation(
         experiment,
         generation_id,
         "generation",
-        read_record(parent_path),
+        read_binding(parent_path.parent, parent_path.name),
         _projection(
             metrics={},
             params={},
@@ -466,7 +475,10 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
     """
     counts = {"pending": 0, "delivered": 0}
     for path in tracking_root(experiment).glob(_delivery_pattern(generation_id)):
-        counts[read_record(path)["state"]] += 1
+        state = json_text(read_record(path), "state")
+        if state not in counts:
+            raise ValueError(f"Tracking delivery record {path.name!r} has unknown state {state!r}.")
+        counts[state] += 1
     return counts
 
 

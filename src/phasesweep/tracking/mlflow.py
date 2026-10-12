@@ -6,19 +6,149 @@ import argparse
 import json
 import os
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any
+from typing import TYPE_CHECKING, Protocol
 
 from phasesweep.runtime.files import private_atomic_write_text
+from phasesweep.runtime.json import (
+    JsonObject,
+    json_integer,
+    json_number,
+    json_number_map,
+    json_object,
+    json_optional_text,
+    json_text,
+    json_text_map,
+)
 from phasesweep.runtime.remote_worker import run_worker
 from phasesweep.runtime.time import utc_now_iso
+
+if TYPE_CHECKING:
+    from mlflow.entities import Metric, Param, RunTag
+
+    from phasesweep.tracking.records import (
+        CaptureRequest,
+        CreateRequest,
+        MlflowCapture,
+        MlflowTarget,
+        Observation,
+        Projection,
+        PublishRequest,
+        RunBinding,
+        RunIdentity,
+    )
 
 _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
 # Time a capture keeps for its last poll and its report before the parent stops it.
 _CAPTURE_REPORT_SECONDS = 5.0
+
+
+class _SdkExperiment(Protocol):
+    """The experiment fields read from the public client."""
+
+    @property
+    def experiment_id(self) -> str: ...
+
+    @property
+    def lifecycle_stage(self) -> str: ...
+
+
+class _SdkRunInfo(Protocol):
+    """The run metadata read from the public client."""
+
+    @property
+    def run_id(self) -> str: ...
+
+    @property
+    def experiment_id(self) -> str: ...
+
+    @property
+    def lifecycle_stage(self) -> str: ...
+
+    @property
+    def status(self) -> str: ...
+
+
+class _SdkRunData(Protocol):
+    """The logged run data read from the public client."""
+
+    @property
+    def metrics(self) -> Mapping[str, float]: ...
+
+    @property
+    def params(self) -> Mapping[str, str]: ...
+
+    @property
+    def tags(self) -> Mapping[str, str]: ...
+
+
+class _SdkRun(Protocol):
+    """A public MLflow Run entity."""
+
+    @property
+    def info(self) -> _SdkRunInfo: ...
+
+    @property
+    def data(self) -> _SdkRunData: ...
+
+
+class _SdkMetric(Protocol):
+    """One logged point of a metric history."""
+
+    @property
+    def value(self) -> float: ...
+
+    @property
+    def step(self) -> int: ...
+
+    @property
+    def timestamp(self) -> int: ...
+
+
+class _SdkRunPage(Protocol):
+    """One page of run-search results, with the token of the next page."""
+
+    @property
+    def token(self) -> str | None: ...
+
+    def __iter__(self) -> Iterator[_SdkRun]: ...
+
+
+class _SdkClient(Protocol):
+    """The public MLflow client methods PhaseSweep calls, and nothing else."""
+
+    def get_experiment(self, experiment_id: str) -> _SdkExperiment: ...
+
+    def get_experiment_by_name(self, name: str) -> _SdkExperiment | None: ...
+
+    def search_runs(
+        self, experiment_ids: list[str], *, filter_string: str, page_token: str | None
+    ) -> _SdkRunPage: ...
+
+    def create_run(self, experiment_id: str, *, tags: dict[str, str], run_name: str) -> _SdkRun: ...
+
+    def get_run(self, run_id: str) -> _SdkRun: ...
+
+    def get_metric_history(self, run_id: str, key: str) -> Sequence[_SdkMetric]: ...
+
+    def set_terminated(self, run_id: str, *, status: str) -> None: ...
+
+    def set_tag(self, run_id: str, key: str, value: str) -> object: ...
+
+    def log_batch(
+        self,
+        run_id: str,
+        *,
+        metrics: Sequence[Metric],
+        params: Sequence[Param],
+        tags: Sequence[RunTag],
+        synchronous: bool,
+    ) -> object: ...
+
+    def log_artifact(self, run_id: str, local_path: str, *, artifact_path: str) -> None: ...
 
 
 def require_mlflow_sdk() -> None:
@@ -42,22 +172,23 @@ def require_mlflow_sdk() -> None:
 
 
 def request_operation(
-    request: dict[str, Any],
+    request: Mapping[str, object],
     *,
     operation_id: str,
     directory: Path,
     environment: Mapping[str, str],
     deadline: float,
-) -> dict[str, Any]:
+) -> JsonObject:
     """Execute a bounded SDK operation in a registered process slot.
 
-    :param dict[str, Any] request: Trusted operation and payload.
+    :param Mapping[str, object] request: Trusted operation and payload; it must serialize to JSON.
     :param str operation_id: PhaseSweep process identity, never the MLflow ID.
     :param Path directory: Registered operation or attempt directory.
     :param Mapping[str, str] environment: Composed authentication environment.
     :param float deadline: Absolute monotonic deadline.
     :raises RuntimeError: The worker failed, timed out, or rejected the request.
-    :return dict[str, Any]: Successful public-client response.
+    :raises ValueError: The worker's response is malformed.
+    :return JsonObject: Successful public-client response.
     """
     result, response, diagnostic_path = run_worker(
         request,
@@ -75,14 +206,14 @@ def request_operation(
         diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
         raise RuntimeError(f"MLflow worker failed (exit {result.return_code}).{diagnostic}")
     if response["status"] == "error":
-        raise RuntimeError(response["message"])
-    return dict(response["result"])
+        raise RuntimeError(json_text(response, "message"))
+    return json_object(response["result"])
 
 
-def identity_tags(binding: Mapping[str, Any]) -> dict[str, str]:
+def identity_tags(binding: Mapping[str, object]) -> dict[str, str]:
     """Return the reserved identity tags shared with trainer-created runs.
 
-    :param Mapping[str, Any] binding: Durable PhaseSweep run identity.
+    :param Mapping[str, object] binding: Durable PhaseSweep run identity.
     :return dict[str, str]: Reserved remote identity, without credentials.
     """
     return {
@@ -91,11 +222,11 @@ def identity_tags(binding: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
-def verify_remote(run: Any, binding: Mapping[str, Any]) -> None:
+def verify_remote(run: _SdkRun, binding: RunBinding) -> None:
     """Require a remote run to retain its exact experiment and attempt tags.
 
-    :param Any run: Public MLflow Run entity.
-    :param Mapping[str, Any] binding: Locally recorded identity.
+    :param _SdkRun run: Public MLflow Run entity.
+    :param RunBinding binding: Locally recorded identity.
     :raises ValueError: Remote identity contradicts the binding, or the run is deleted.
     """
     if run.info.run_id != binding["run_id"] or run.info.experiment_id != binding["experiment_id"]:
@@ -107,20 +238,24 @@ def verify_remote(run: Any, binding: Mapping[str, Any]) -> None:
         raise ValueError("MLflow run has conflicting PhaseSweep identity tags.")
 
 
-def _resolve(client: Any, settings: dict[str, Any]) -> str:
+def _resolve(client: _SdkClient, settings: MlflowTarget) -> str:
     """Resolve an existing, active experiment through the public client.
 
-    :param Any client: Public MLflow client in the supervised worker.
-    :param dict[str, Any] settings: Trusted target or operation payload.
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param MlflowTarget settings: Trusted target or operation payload.
     :raises ValueError: The experiment does not exist or has been deleted.
     :return str: Existing experiment ID.
     """
+    experiment_id = settings.get("experiment_id")
+    experiment_name = settings.get("experiment_name")
+    experiment: _SdkExperiment | None
     try:
-        experiment = (
-            client.get_experiment(settings["experiment_id"])
-            if settings.get("experiment_id")
-            else client.get_experiment_by_name(settings["experiment_name"])
-        )
+        if experiment_id:
+            experiment = client.get_experiment(experiment_id)
+        elif experiment_name:
+            experiment = client.get_experiment_by_name(experiment_name)
+        else:
+            raise ValueError("MLflow requires exactly one of experiment_id or experiment_name.")
     except Exception as exc:
         # An unknown ID raises where an unknown name returns None.
         if getattr(exc, "error_code", None) != "RESOURCE_DOES_NOT_EXIST":
@@ -155,30 +290,30 @@ def _without_sdk_replay() -> Iterator[None]:
             os.environ[_SDK_RETRIES] = previous
 
 
-def _create(client: Any, request: dict[str, Any]) -> dict[str, Any]:
+def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
     """Bind the run carrying this exact identity, creating it only when none exists.
 
     A lost creation response is indistinguishable from a request that never
     arrived, so every attempt searches the identity tags before creating.
 
-    :param Any client: Public MLflow client in the supervised worker.
-    :param dict[str, Any] request: Trusted target or operation payload.
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param CreateRequest request: Trusted target and identity.
     :raises ValueError: More than one run carries the identity.
-    :return dict[str, Any]: Verified remote run binding.
+    :return RunBinding: Verified remote run binding.
     """
-    binding = dict(request["binding"])
-    binding["experiment_id"] = _resolve(client, request["settings"])
-    tags = identity_tags(binding)
+    experiment_id = _resolve(client, request["settings"])
+    identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
+    tags = identity_tags(identity)
     # Double quotes are the identifier quoting both OSS and Databricks search
     # document; Databricks does not document backticks.
     query = " AND ".join(
         f"tags.\"{key}\" = '{tags[key]}'"
         for key in ("phasesweep.attempt_id", "phasesweep.generation_id")
     )
-    matches = []
-    token = None
+    matches: list[_SdkRun] = []
+    token: str | None = None
     while True:
-        page = client.search_runs([binding["experiment_id"]], filter_string=query, page_token=token)
+        page = client.search_runs([experiment_id], filter_string=query, page_token=token)
         matches.extend(page)
         token = page.token
         if not token:
@@ -188,30 +323,29 @@ def _create(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     if matches:
         run = matches[0]
     else:
-        if binding.get("parent_run_id"):
-            tags["mlflow.parentRunId"] = binding["parent_run_id"]
+        parent_run_id = identity.get("parent_run_id")
+        if parent_run_id:
+            tags["mlflow.parentRunId"] = parent_run_id
         with _without_sdk_replay():
-            run = client.create_run(
-                binding["experiment_id"], tags=tags, run_name=request["run_name"]
-            )
-    binding["run_id"] = run.info.run_id
+            run = client.create_run(experiment_id, tags=tags, run_name=request["run_name"])
+    binding: RunBinding = {**identity, "run_id": run.info.run_id}
     verify_remote(run, binding)
     return binding
 
 
-def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
+def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     """Fetch finished evidence, sharing complete histories across selectors.
 
-    :param Any client: Public MLflow client in the supervised worker.
-    :param dict[str, Any] request: Trusted target or operation payload.
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param CaptureRequest request: Trusted target, bound run, and shared query.
     :raises ValueError: The run no longer matches its binding, ended FAILED or KILLED,
         or restarted during capture.
     :raises TimeoutError: The run is unfinished, or its evidence is still missing, when
         ``timeout_seconds`` runs out; the message names what is missing.
-    :return dict[str, Any]: Frozen shared native evidence.
+    :return MlflowCapture: Frozen shared native evidence.
     """
     from phasesweep.evidence.mlflow import select_observation
-    from phasesweep.evidence.models import MlflowExtractor
+    from phasesweep.evidence.models import MlflowExtractor, MlflowRequiredGate
 
     binding, query = request["binding"], request["query"]
     # The parent stops this worker when timeout_seconds runs out (``timeout_at``,
@@ -229,22 +363,30 @@ def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
             run = client.get_run(binding["run_id"])
         missing: list[str] = []
         if run.info.status == "FINISHED":
-            keys = sorted({s["metric_key"] for s in query["selections"].values()})
+            selections = {
+                identity: MlflowExtractor.model_validate(specification)
+                for identity, specification in query["selections"].items()
+            }
+            gates = [MlflowRequiredGate.model_validate(gate) for gate in query["gates"]]
+            keys = sorted({spec.metric_key for spec in selections.values()})
             missing = [f"metric {key!r}" for key in keys if key not in run.data.metrics] + [
                 f"{namespace[:-1]} {key!r}"
-                for g in query["gates"]
-                for namespace in ("params", "tags")
-                for key in g[namespace]
-                if key not in getattr(run.data, namespace)
+                for gate in gates
+                for namespace, wanted, present in (
+                    ("params", gate.params, run.data.params),
+                    ("tags", gate.tags, run.data.tags),
+                )
+                for key in wanted
+                if key not in present
             ]
             if not missing:
-                observations: dict[str, Any] = {}
+                observations: dict[str, Observation] = {}
                 for key in keys:
                     history = client.get_metric_history(binding["run_id"], key)
                     if not history:
                         missing.append(f"metric {key!r} history")
                         break
-                    records = [
+                    records: list[Mapping[str, object]] = [
                         {
                             "value": m.value,
                             "step": m.step,
@@ -255,24 +397,14 @@ def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
                         }
                         for m in history
                     ]
-                    for identity, specification in query["selections"].items():
-                        if specification["metric_key"] == key:
-                            observations[identity] = select_observation(
-                                records, MlflowExtractor.model_validate(specification)
-                            )
+                    for identity, spec in selections.items():
+                        if spec.metric_key == key:
+                            observations[identity] = select_observation(records, spec)
                 else:
                     final = client.get_run(binding["run_id"])
                     verify_remote(final, binding)
                     if final.info.status != "FINISHED":
                         raise ValueError("MLflow run restarted during evidence capture.")
-                    metadata = {
-                        namespace: {
-                            key: getattr(final.data, namespace)[key]
-                            for gate in query["gates"]
-                            for key in gate[namespace]
-                        }
-                        for namespace in ("params", "tags")
-                    }
                     return {
                         "kind": "mlflow",
                         "binding": binding,
@@ -280,7 +412,10 @@ def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
                         "query": query,
                         "observations": observations,
                         "retrieved_at": utc_now_iso(),
-                        **metadata,
+                        "params": {
+                            key: final.data.params[key] for gate in gates for key in gate.params
+                        },
+                        "tags": {key: final.data.tags[key] for gate in gates for key in gate.tags},
                     }
         if time.monotonic() >= stop:
             state = (
@@ -292,7 +427,7 @@ def _capture(client: Any, request: dict[str, Any]) -> dict[str, Any]:
         time.sleep(min(request["settings"]["poll_seconds"], max(0, stop - time.monotonic())))
 
 
-def _publish(client: Any, request: dict[str, Any]) -> dict[str, Any]:
+def _publish(client: _SdkClient, request: PublishRequest) -> JsonObject:
     """Mirror one retained projection, then finish a still-running owned run.
 
     A run that is already terminal keeps its status, so a remote outcome is
@@ -300,10 +435,10 @@ def _publish(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     summary artifact is named after the projection, so a winner projection
     never replaces its run's trial summary.
 
-    :param Any client: Public MLflow client in the supervised worker.
-    :param dict[str, Any] request: Trusted target or operation payload.
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param PublishRequest request: Trusted target, bound run, and projection.
     :raises ValueError: Termination was requested for a trainer-owned run.
-    :return dict[str, Any]: Empty success response.
+    :return JsonObject: Empty success response.
     """
     from mlflow.entities import Metric, Param, RunTag
 
@@ -333,27 +468,90 @@ def _publish(client: Any, request: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _dispatch(request: dict[str, Any]) -> dict[str, Any]:
+def _projection(value: object) -> Projection:
+    """Narrow a decoded retry projection to the shape the upload reads.
+
+    :param object value: Decoded projection from a delivery record.
+    :raises ValueError: A field is absent or has the wrong type.
+    :return Projection: The narrowed projection.
+    """
+    projection = json_object(value)
+    metrics = json_number_map(projection["metrics"])
+    params = json_text_map(projection["params"])
+    tags = json_text_map(projection["tags"])
+    if metrics is None or params is None or tags is None:
+        raise ValueError("MLflow projection needs numeric metrics and string params and tags.")
+    return {
+        "timestamp": json_integer(projection, "timestamp"),
+        "metrics": metrics,
+        "params": params,
+        "tags": tags,
+        "summary": json_object(projection["summary"]),
+    }
+
+
+def _dispatch(request: JsonObject) -> JsonObject:
     """Dispatch trusted controller requests using public MLflow APIs.
 
-    :param dict[str, Any] request: Trusted controller operation.
+    :param JsonObject request: Trusted controller operation.
     :raises ValueError: The request names an action other than ``resolve``, ``create``,
-        ``capture``, or ``publish``.
-    :return dict[str, Any]: Successful operation payload.
+        ``capture``, or ``publish``, or its payload is malformed.
+    :return JsonObject: Successful operation payload.
     """
     from mlflow import MlflowClient
 
-    client = MlflowClient(tracking_uri=request["settings"]["tracking_uri"])
+    from phasesweep.evidence.mlflow import parse_query
+    from phasesweep.tracking.models import MlflowSettings
+    from phasesweep.tracking.records import validate_binding, validate_identity
+
+    settings = MlflowSettings.model_validate(request["settings"]).target()
+    client: _SdkClient = MlflowClient(tracking_uri=settings["tracking_uri"])
     action = request["action"]
     if action == "resolve":
-        return {"experiment_id": _resolve(client, request["settings"])}
+        return {"experiment_id": _resolve(client, settings)}
     if action == "create":
-        return _create(client, request)
+        created = _create(
+            client,
+            {
+                "action": "create",
+                "settings": settings,
+                "binding": validate_identity(request["binding"]),
+                "run_name": json_text(request, "run_name"),
+            },
+        )
+        return json_object(created)
     if action == "capture":
-        return _capture(client, request)
+        captured = _capture(
+            client,
+            {
+                "action": "capture",
+                "settings": settings,
+                "binding": validate_binding(request["binding"]),
+                "query": parse_query(request["query"]),
+                "timeout_at": json_number(request, "timeout_at"),
+            },
+        )
+        return json_object(captured)
     if action == "publish":
-        return _publish(client, request)
+        return _publish(
+            client,
+            {
+                "action": "publish",
+                "settings": settings,
+                "name": json_text(request, "name"),
+                "binding": validate_binding(request["binding"]),
+                "projection": _projection(request["projection"]),
+                "finish": json_optional_text(request, "finish"),
+            },
+        )
     raise ValueError("Unknown internal MLflow operation.")
+
+
+class _Arguments(argparse.Namespace):
+    """Private request and response paths."""
+
+    request: Path
+    response: Path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -367,8 +565,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("request", type=Path)
     parser.add_argument("response", type=Path)
-    args = parser.parse_args(argv)
-    request = json.loads(args.request.read_text(encoding="utf-8"))
+    args = parser.parse_args(argv, namespace=_Arguments())
+    request = json_object(json.loads(args.request.read_text(encoding="utf-8")))
+    response: JsonObject
     try:
         response = {"status": "ok", "result": _dispatch(request)}
     except ImportError as exc:
@@ -391,7 +590,7 @@ def main(argv: list[str] | None = None) -> int:
             raise
         # The server's error code, e.g. PERMISSION_DENIED, or the HTTP status of an
         # artifact upload carries no secrets; the exception text may.
-        code = getattr(exc, "error_code", None) or getattr(
+        code: object = getattr(exc, "error_code", None) or getattr(
             getattr(exc, "response", None), "status_code", None
         )
         cause = f"{type(exc).__name__}: {code}" if code else type(exc).__name__

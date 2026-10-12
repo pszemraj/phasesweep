@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from phasesweep.evidence.models import (
     Gate,
@@ -14,9 +14,12 @@ from phasesweep.evidence.models import (
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.runtime.json import dump_json, json_object, json_text_map
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
+    from phasesweep.runtime.json import JsonObject
+    from phasesweep.tracking.records import MlflowCapture, MlflowQuery, Observation
 
 
 def observation_id(spec: MlflowExtractor) -> str:
@@ -28,13 +31,13 @@ def observation_id(spec: MlflowExtractor) -> str:
     return json.dumps([spec.metric_key, spec.select, spec.step], separators=(",", ":"))
 
 
-def compile_query(experiment: Experiment, gates: list[Gate]) -> dict[str, Any] | None:
+def compile_query(experiment: Experiment, gates: list[Gate]) -> MlflowQuery | None:
     """Compile one MLflow capture and enforce one tracking backend per sweep.
 
     :param Experiment experiment: Parsed experiment, without live SDK state.
     :param list[Gate] gates: Gates for the current phase.
     :raises ValueError: Targets or evidence backends conflict.
-    :return dict[str, Any] | None: Shared query, or no MLflow integration.
+    :return MlflowQuery | None: Shared query, or no MLflow integration.
     """
     objective = experiment.metric.extractor
     consumers = [objective, *(c.extractor for c in experiment.constraints), *gates]
@@ -63,11 +66,11 @@ def compile_query(experiment: Experiment, gates: list[Gate]) -> dict[str, Any] |
             "A sweep must use one remote evidence backend; W&B and MLflow cannot be mixed."
         )
     constraints = {
-        c.name: c.extractor.model_dump(mode="json")
+        c.name: dump_json(c.extractor)
         for c in experiment.constraints
         if isinstance(c.extractor, MlflowExtractor)
     }
-    required = [g.model_dump(mode="json") for g in gates if isinstance(g, MlflowRequiredGate)]
+    required = [g for g in gates if isinstance(g, MlflowRequiredGate)]
     selections = [
         objective,
         *(c.extractor for c in experiment.constraints if isinstance(c.extractor, MlflowExtractor)),
@@ -75,28 +78,28 @@ def compile_query(experiment: Experiment, gates: list[Gate]) -> dict[str, Any] |
     selections.extend(
         MlflowExtractor(type="mlflow", metric_key=k, select="last")
         for g in required
-        for k in g["metrics"]
+        for k in g.metrics
     )
     return {
         "revision": 1,
-        "objective": objective.model_dump(mode="json"),
+        "objective": dump_json(objective),
         "constraints": constraints,
-        "gates": required,
-        "selections": {observation_id(s): s.model_dump(mode="json") for s in selections},
+        "gates": [dump_json(g) for g in required],
+        "selections": {observation_id(s): dump_json(s) for s in selections},
     }
 
 
 def select_observation(
-    history: Sequence[Mapping[str, Any]], spec: MlflowExtractor
-) -> dict[str, Any]:
+    history: Sequence[Mapping[str, object]], spec: MlflowExtractor
+) -> Observation:
     """Reduce an unordered, complete native history without using summary ordering.
 
-    :param Sequence[Mapping[str, Any]] history: Public MLflow metric records.
+    :param Sequence[Mapping[str, object]] history: Public MLflow metric records.
     :param MlflowExtractor spec: Explicit within-run selection policy.
     :raises ValueError: Missing, ambiguous, scoped, or invalid observations.
-    :return dict[str, Any]: Selected finite value, native step, and timestamp.
+    :return Observation: Selected finite value, native step, and timestamp.
     """
-    points: dict[tuple[int, int], dict[str, Any]] = {}
+    points: dict[tuple[int, int], Observation] = {}
     for record in history:
         if any(record.get(k) is not None for k in ("model_id", "dataset_name", "dataset_digest")):
             raise ValueError("Model/dataset-scoped MLflow metrics are unsupported.")
@@ -132,39 +135,88 @@ def select_observation(
     return selected
 
 
-def validate_capture(capture: Mapping[str, Any]) -> None:
+def _members(query: JsonObject, key: str) -> JsonObject:
+    """Read an object member of a decoded query.
+
+    :param JsonObject query: Decoded query.
+    :param str key: Member name.
+    :raises KeyError: The member is absent.
+    :raises ValueError: The member is not an object.
+    :return JsonObject: The member.
+    """
+    return json_object(query[key])
+
+
+def parse_query(value: object) -> MlflowQuery:
+    """Narrow a decoded query to the shape :func:`compile_query` produces.
+
+    :param object value: Decoded shared query.
+    :raises KeyError: A query member is absent.
+    :raises ValueError: The query is not a current-revision object, or a member has the
+        wrong type.
+    :return MlflowQuery: The narrowed query.
+    """
+    if not isinstance(value, dict) or value.get("revision") != 1:
+        raise ValueError("Invalid MLflow query or selected observations.")
+    query = json_object(value)
+    gates = query["gates"]
+    if not isinstance(gates, list):
+        raise ValueError("Invalid MLflow query gates.")
+    return {
+        "revision": 1,
+        "objective": _members(query, "objective"),
+        "constraints": {k: json_object(v) for k, v in _members(query, "constraints").items()},
+        "gates": [json_object(gate) for gate in gates],
+        "selections": {k: json_object(v) for k, v in _members(query, "selections").items()},
+    }
+
+
+def validate_capture(capture: Mapping[str, object]) -> MlflowCapture:
     """Validate the retained MLflow subset without constructing a client.
 
-    :param Mapping[str, Any] capture: Accepted remote evidence.
+    :param Mapping[str, object] capture: Accepted remote evidence.
     :raises ValueError: Capture structure or required evidence disagrees.
+    :return MlflowCapture: The narrowed evidence.
     """
-    from phasesweep.tracking.session import validate_binding
+    from phasesweep.tracking.records import validate_binding
 
     if capture.get("kind") != "mlflow" or capture.get("run_state") != "FINISHED":
         raise ValueError("MLflow capture must name a finished run.")
-    binding = capture.get("binding")
-    validate_binding(binding)
-    query, observations = capture.get("query"), capture.get("observations")
-    if (
-        not isinstance(query, dict)
-        or query.get("revision") != 1
-        or not isinstance(observations, dict)
-    ):
+    binding = validate_binding(capture.get("binding"))
+    query = parse_query(capture.get("query"))
+    raw_observations = capture.get("observations")
+    if not isinstance(raw_observations, dict):
         raise ValueError("Invalid MLflow query or selected observations.")
-    if set(observations) != set(query["selections"]):
+    if set(raw_observations) != set(query["selections"]):
         raise ValueError("MLflow selections differ from the captured query.")
+    observations: dict[str, Observation] = {}
     for identity, specification in query["selections"].items():
         spec = MlflowExtractor.model_validate(specification)
-        point = observations[identity]
-        if identity != observation_id(spec) or select_observation([point], spec) != point:
+        point = raw_observations[identity]
+        if identity != observation_id(spec) or not isinstance(point, dict):
             raise ValueError("Invalid selected MLflow observation.")
-    if not isinstance(capture.get("retrieved_at"), str) or not capture["retrieved_at"]:
+        selected = select_observation([point], spec)
+        if selected != point:
+            raise ValueError("Invalid selected MLflow observation.")
+        observations[identity] = selected
+    retrieved_at = capture.get("retrieved_at")
+    if not isinstance(retrieved_at, str) or not retrieved_at:
         raise ValueError("Missing MLflow retrieval timestamp.")
-    for namespace in ("params", "tags"):
-        metadata = capture.get(namespace)
-        if not isinstance(metadata, dict) or any(
-            not isinstance(k, str) or not isinstance(v, str) for k, v in metadata.items()
+    params, tags = json_text_map(capture.get("params")), json_text_map(capture.get("tags"))
+    if params is None or tags is None:
+        raise ValueError("Invalid MLflow metadata subset.")
+    for gate in (MlflowRequiredGate.model_validate(g) for g in query["gates"]):
+        if any(key not in params for key in gate.params) or any(
+            key not in tags for key in gate.tags
         ):
-            raise ValueError("Invalid MLflow metadata subset.")
-        if any(key not in metadata for gate in query["gates"] for key in gate[namespace]):
             raise ValueError("MLflow capture lacks required metadata.")
+    return {
+        "kind": "mlflow",
+        "binding": binding,
+        "run_state": "FINISHED",
+        "query": query,
+        "observations": observations,
+        "retrieved_at": retrieved_at,
+        "params": params,
+        "tags": tags,
+    }

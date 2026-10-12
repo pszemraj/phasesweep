@@ -10,9 +10,12 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+
+from phasesweep.runtime.json import json_object
 
 if TYPE_CHECKING:
+    from phasesweep.runtime.json import JsonObject
     from phasesweep.runtime.process import ProcessResult
 
 # Workers run SDK clients on the orchestrator's behalf, so its usage-telemetry
@@ -43,7 +46,7 @@ def worker_environment(environment: Mapping[str, str] | None) -> dict[str, str]:
 
 
 def run_worker(
-    request: Mapping[str, Any],
+    request: Mapping[str, object],
     worker_path: Path,
     backend: str,
     *,
@@ -52,10 +55,10 @@ def run_worker(
     trial_dir: Path,
     environment: Mapping[str, str] | None,
     deadline: float,
-) -> tuple[ProcessResult, dict[str, Any], Path | None]:
+) -> tuple[ProcessResult, JsonObject, Path | None]:
     """Run one supervised worker request in the attempt's process slot.
 
-    :param Mapping[str, Any] request: Backend request payload.
+    :param Mapping[str, object] request: Backend request payload; it must serialize to JSON.
     :param Path worker_path: Backend worker entry point.
     :param str backend: Backend name for scratch files and diagnostics.
     :param frozenset[str] statuses: Response statuses the task can report; any
@@ -64,10 +67,11 @@ def run_worker(
     :param Path trial_dir: Existing attempt directory and durable process slot.
     :param Mapping[str, str] | None environment: Actual composed trainer environment.
     :param float deadline: Absolute ``time.monotonic()`` time the worker is stopped at.
-    :return tuple[ProcessResult, dict[str, Any], Path | None]: The worker's
+    :return tuple[ProcessResult, JsonObject, Path | None]: The worker's
         process result, its response (empty when it wrote none), and the
         preserved stderr path, if any.
     :raises UnsafeProcessCleanupError: Worker cleanup is uncertain.
+    :raises ValueError: The worker's response is not a JSON object.
     """
     from phasesweep.errors import UnsafeProcessCleanupError
     from phasesweep.runtime.files import cache_dir, private_atomic_write_text
@@ -112,7 +116,9 @@ def run_worker(
                 f"{backend} worker cleanup is uncertain for attempt {run_id!r}; recover {trial_dir}."
             )
         response = (
-            json.loads(response_path.read_text(encoding="utf-8")) if response_path.is_file() else {}
+            json_object(json.loads(response_path.read_text(encoding="utf-8")))
+            if response_path.is_file()
+            else {}
         )
         if not result.timed_out and (
             result.return_code != 0
