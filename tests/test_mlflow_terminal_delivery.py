@@ -729,41 +729,108 @@ def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(
     ]
 
 
-def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(tmp_path, monkeypatch):
-    """A run a timed-out creation made late is bound by sync and finished with its failed trial."""
+def _stub_mlflow_worker_process(monkeypatch, reply, late, *, unreadable):
+    """Replace only the MLflow worker process behind the real controller and its response reader.
+
+    The worker answers every request with ``reply`` for the run ``late`` names: ``"ok"``
+    reports the run created and ``"unknown"`` reports that it may still be created. With
+    ``unreadable``, the controller's first read of a worker response fails with EIO. Trainer
+    processes still run for real.
+    """
+    import errno
+
+    from phasesweep.runtime import process
+    from phasesweep.runtime.process import ProcessResult
+
+    real_supervised = process.run_supervised
+    real_read = Path.read_text
+    faults = [OSError(errno.EIO, "injected worker response read failure")] if unreadable else []
+
+    def read_text(path, *args, **kwargs):
+        if path.name == "response.json" and faults:
+            raise faults.pop()
+        return real_read(path, *args, **kwargs)
+
+    def supervised(command, **kwargs):
+        parts = shlex.split(command)
+        if not any(part.endswith("/tracking/mlflow.py") for part in parts):
+            return real_supervised(command, **kwargs)
+        response = (
+            {"status": "ok", "result": dict(late)}
+            if reply == "ok"
+            else {"status": "unknown", "message": "Creation may still commit; reply unavailable."}
+        )
+        Path(parts[-1]).write_text(json.dumps(response), encoding="utf-8")
+        return ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(process, "run_supervised", supervised)
+
+
+@pytest.mark.parametrize(
+    "reply,unreadable",
+    [(None, False), ("unknown", False), ("unknown", True), ("ok", False), ("ok", True)],
+    ids=["lost-response", "unknown", "unknown-unreadable", "ok", "ok-unreadable"],
+)
+def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(
+    tmp_path, monkeypatch, reply, unreadable
+):
+    """A creation never acknowledged is searched for, not resent, and sync binds the run it made late.
+
+    The first attempt's creation is lost outright (``None``) or answered by the worker process
+    through the real response reader, which may then fail to read the answer.
+    """
     from phasesweep.tracking.mlflow import OperationOutcomeUnknownError
 
+    real_operation = worker.request_operation  # ``_remote_example`` replaces it
     config, uploads = _remote_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)
     respond = session.request_operation
     late: dict[str, str] = {}
+    # A worker that reported success made its run before the controller looked; others, only later.
+    appeared = {"late": reply == "ok"}
+    creations: list[str] = []
+    if reply is not None:
+        _stub_mlflow_worker_process(monkeypatch, reply, late, unreadable=unreadable)
 
-    def lost_first_attempt_creation(request, **kwargs):
+    def first_attempt_creation(request, **kwargs):
         binding = request.get("binding", {})
+        if request["action"] == "create":
+            creations.append(binding["attempt_id"])
         if request["action"] == "create" and binding["phase"] != "generation" and not late:
             late.update(binding, run_id="late-run")
-            raise OperationOutcomeUnknownError("response lost")
+            if reply is None:
+                raise OperationOutcomeUnknownError("response lost")
+            return real_operation(request, **kwargs)
         if request["action"] == "find":
-            appeared = binding["attempt_id"] == late.get("attempt_id") and kwargs.get("appeared")
-            return {"found": True, "binding": late} if appeared else {"found": False}
+            found = appeared["late"] and binding["attempt_id"] == late.get("attempt_id")
+            return {"found": True, "binding": late} if found else {"found": False}
         return respond(request, **kwargs)
 
-    monkeypatch.setattr(session, "request_operation", lost_first_attempt_creation)
+    monkeypatch.setattr(session, "request_operation", first_attempt_creation)
     reports = []
     run_experiment(experiment, terminal_callback=reports.append)
     generation = reports[0].generation_id
-    [pending] = _experiment_dir(experiment).glob("*/trial_*/mlflow-binding.pending.json")
-    assert not (pending.parent / BINDING_FILE).exists()
+    pattern = f"*/trial_*__generation_{generation}__attempt_{late['attempt_id']}"
+    [attempt_directory] = _experiment_dir(experiment).glob(pattern)
+    pending = attempt_directory / "mlflow-binding.pending.json"
+    # An existing run is bound before sync, directly or by the search that follows an unreadable
+    # reply. A run that does not exist yet leaves its pending record for sync to resolve.
+    assert pending.exists() is (reply != "ok")
+    assert (attempt_directory / BINDING_FILE).exists() is (reply == "ok")
 
-    def appeared(request, **kwargs):
-        return lost_first_attempt_creation(request, **kwargs, appeared=True)
-
-    monkeypatch.setattr(session, "request_operation", appeared)
+    appeared["late"] = True
     uploads.clear()
-    # Three accepted attempts, two winners, the summary, and the late run.
+    journal = tmp_path / "study.journal"
+    before = journal.read_bytes()
+    # Three accepted attempts, two winners, the summary, and the late run, readable reply or not.
     assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 7}
+    assert journal.read_bytes() == before
     assert not pending.exists()
-    assert session.read_binding(pending.parent)["run_id"] == "late-run"
-    [finished] = [r for r in uploads if r["binding"]["run_id"] == "late-run"]
-    assert finished["finish"] == "FAILED"
+    assert session.read_binding(attempt_directory)["run_id"] == "late-run"
+    assert creations.count(late["attempt_id"]) == 1
+    # Sync finishes a run it bound with its failed trial; an accepted attempt was delivered earlier.
+    assert [r["finish"] for r in uploads if r["binding"]["run_id"] == "late-run"] == (
+        [] if reply == "ok" else ["FAILED"]
+    )

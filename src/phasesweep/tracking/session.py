@@ -23,6 +23,7 @@ from phasesweep.runtime.json import (
 )
 from phasesweep.tracking.mlflow import (
     OperationOutcomeUnknownError,
+    OperationRejectedError,
     identity_tags,
     request_operation,
     verify_remote,
@@ -189,10 +190,13 @@ def _create_bound(
 ) -> RunBinding:
     """Bind or create the identity's run, sending the creation request at most once.
 
-    A pending record marks the request before it is sent. A request that
-    fails without a server rejection may still create its run, so the identity
-    is then only searched, never created again; an empty search leaves the
-    creation unresolved and the record in place, across restarts.
+    A pending record marks the request before it is sent. Only a worker's
+    well-formed rejection proves that nothing was created, and it removes the
+    record. An unconfirmed outcome or a timeout may still have created the
+    run, so the identity is then only searched, never created again; an empty
+    search leaves the creation unresolved and the record in place, across
+    restarts. Any other failure propagates with the record kept, since it
+    shows nothing about the request.
 
     :param Experiment experiment: Configured experiment.
     :param RunIdentity identity: Exact creation identity.
@@ -201,18 +205,18 @@ def _create_bound(
     :param str run_name: Display name for a newly created run.
     :param float | None deadline: Existing execution deadline.
     :param Path | None attempt_directory: Existing process slot for managed attempt creation.
+    :raises OperationRejectedError: The worker reported that the request failed.
     :raises RuntimeError: The creation outcome is unresolved.
     :return RunBinding: Bound native run identity.
     """
-    from phasesweep.errors import UnsafeProcessCleanupError
-
     if path.exists():
         return read_binding(path.parent, path.name)
     pending = path.with_suffix(_PENDING_SUFFIX)
 
-    def reconcile() -> RunBinding:
+    def reconcile(cause: BaseException | None = None) -> RunBinding:
         """Look for the run a sent creation request may have created; never create one.
 
+        :param BaseException | None cause: The failure that left the request unconfirmed, if any.
         :raises RuntimeError: No run carries the identity before the deadline.
         :return RunBinding: The run that request created.
         """
@@ -231,7 +235,7 @@ def _create_bound(
             f"MLflow run creation for attempt {identity['attempt_id']} of generation "
             f"{identity['generation_id']} is unresolved: an earlier request may still create "
             "the run, so it is not sent again. sync-tracking binds the run if it appears."
-        )
+        ) from cause
 
     if pending.exists():
         binding = reconcile()
@@ -241,14 +245,12 @@ def _create_bound(
         request: CreateAction = {"action": "create", "binding": identity, "run_name": run_name}
         try:
             created = _send(experiment, identity, request, environment, deadline, attempt_directory)
-        except UnsafeProcessCleanupError:
-            raise
-        except (OperationOutcomeUnknownError, TimeoutError):
-            binding = reconcile()
-        except Exception:
-            # Nothing was created, so a later call may send the request afresh.
+        except OperationRejectedError:
+            # A refused or unsent request created nothing, so a later call may send it afresh.
             pending.unlink(missing_ok=True)
             raise
+        except (OperationOutcomeUnknownError, TimeoutError) as exc:
+            binding = reconcile(exc)
         else:
             binding = validate_binding(created)
     write_record(path, binding)

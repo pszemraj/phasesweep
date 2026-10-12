@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import errno
+import json
 import os
 import runpy
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -16,7 +19,13 @@ from phasesweep.config import Experiment, MlflowSettings
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.mlflow import compile_query, observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor
-from phasesweep.tracking.mlflow import OperationOutcomeUnknownError, _capture, _create, _find
+from phasesweep.tracking.mlflow import (
+    OperationOutcomeUnknownError,
+    OperationRejectedError,
+    _capture,
+    _create,
+    _find,
+)
 
 
 def test_cpu_example_import_and_help_without_sdk(monkeypatch, capsys):
@@ -375,6 +384,31 @@ def test_worker_separates_definite_failures_from_unknown_outcomes(stage, failure
         assert type(error).__name__ in str(caught.value)
 
 
+def test_verification_failure_is_unknown_only_for_a_run_this_call_created():
+    """A run this call created exists whatever verification says; only its binding is in doubt."""
+    binding = _binding()
+    deleted = _run(binding)
+    deleted.info.lifecycle_stage = "deleted"
+    created = []
+
+    def create_run(*args, **kwargs):
+        created.append(kwargs["tags"])
+        return deleted
+
+    client = _creation_client(create_run=create_run)
+    request = {"binding": _identity(), "settings": {"experiment_id": "1"}, "run_name": "r"}
+    with pytest.raises(OperationOutcomeUnknownError, match="not bound") as caught:
+        _create(client, request)
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert len(created) == 1
+    # A run found by search was not created by this call, so contradicting the identity is definite.
+    client.search_runs = lambda *a, **k: _Page([deleted])
+    with pytest.raises(ValueError, match="run is deleted") as caught:
+        _create(client, request)
+    assert not isinstance(caught.value, OperationOutcomeUnknownError)
+    assert len(created) == 1
+
+
 def test_worker_reports_an_unknown_outcome_with_its_own_status(tmp_path, monkeypatch):
     import json
 
@@ -537,14 +571,15 @@ class _ScriptedWorker:
         return outcome
 
 
-def _binder(tmp_path, slot, *, experiment=None, identity=None):
+def _binder(tmp_path, slot, *, experiment=None, identity=None, directory=None):
     """Return the binding path and a ``_create_bound`` call for one creation in either slot."""
     from phasesweep.tracking import session
 
     experiment = experiment or native_experiment(tmp_path)
     identity = identity or _identity()
     if slot == "attempt":
-        path, slot_arguments = tmp_path / "mlflow-binding.json", {"attempt_directory": tmp_path}
+        directory = directory or tmp_path
+        path, slot_arguments = directory / "mlflow-binding.json", {"attempt_directory": directory}
     else:
         path = (
             session.tracking_root(experiment)
@@ -611,12 +646,15 @@ def test_unresolved_creation_survives_restarts_until_its_run_appears(tmp_path, m
         find=[_ABSENT, _ABSENT, {"found": True, "binding": binding}],
     )
     unresolved = f"attempt {'b' * 32} of generation {'a' * 32} is unresolved"
-    with pytest.raises(RuntimeError, match=unresolved):
+    with pytest.raises(RuntimeError, match=unresolved) as first:
         bind()
+    # The failure that left the request unconfirmed stays the diagnostic cause.
+    assert isinstance(first.value.__cause__, OperationOutcomeUnknownError)
     assert pending.exists() and not path.exists()
     # Only the record survives a restart; the retry reconciles and does not create.
-    with pytest.raises(RuntimeError, match=unresolved):
+    with pytest.raises(RuntimeError, match=unresolved) as retry:
         bind()
+    assert retry.value.__cause__ is None
     assert worker.actions == ["create", "find", "find"]
     assert bind() == binding
     assert worker.actions == ["create", "find", "find", "find"]
@@ -628,8 +666,8 @@ def test_unresolved_creation_survives_restarts_until_its_run_appears(tmp_path, m
 def test_rejected_creation_leaves_no_record_and_is_not_reconciled(tmp_path, monkeypatch):
     bind, path = _binder(tmp_path, "attempt")
     rejection = "MLflow create failed (MlflowException: PERMISSION_DENIED); check access."
-    worker = _ScriptedWorker(monkeypatch, create=[RuntimeError(rejection), _binding()])
-    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+    worker = _ScriptedWorker(monkeypatch, create=[OperationRejectedError(rejection), _binding()])
+    with pytest.raises(OperationRejectedError, match="PERMISSION_DENIED"):
         bind()
     assert worker.actions == ["create"]
     assert not path.exists() and not path.with_name(f"{path.stem}.pending.json").exists()
@@ -666,6 +704,142 @@ def test_creation_that_cannot_be_reconciled_keeps_its_record(
         bind(deadline)
     assert worker.actions == later_actions
     assert path.with_name(f"{path.stem}.pending.json").exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        OSError(errno.EIO, "response unreadable"),
+        ValueError("response malformed"),
+        KeyError("result"),
+        RuntimeError("unclassified"),
+    ],
+    ids=["os-error", "value-error", "key-error", "runtime-error"],
+)
+def test_unclassified_creation_failure_keeps_its_record_and_is_not_resent(
+    tmp_path, monkeypatch, failure
+):
+    """Only a worker's rejection proves nothing was created; any other failure keeps the record."""
+    bind, path = _binder(tmp_path, "attempt")
+    pending = path.with_name(f"{path.stem}.pending.json")
+    binding = _binding()
+    worker = _ScriptedWorker(
+        monkeypatch, create=[failure], find=[_ABSENT, {"found": True, "binding": binding}]
+    )
+    with pytest.raises(type(failure)) as caught:
+        bind()
+    assert caught.value is failure
+    assert worker.actions == ["create"]
+    assert pending.exists() and not path.exists()
+    # A later call only searches: it never sends a second create.
+    with pytest.raises(RuntimeError, match="unresolved"):
+        bind()
+    assert worker.actions == ["create", "find"]
+    assert pending.exists()
+    assert bind() == binding
+    assert worker.actions == ["create", "find", "find"]
+    assert not pending.exists()
+
+
+class _WorkerProcess:
+    """A stand-in for the worker process behind the real controller and its response reader.
+
+    Each request is answered with the next scripted response for its action. The controller's
+    first read of the response to an action named in ``unreadable`` fails with EIO.
+    """
+
+    def __init__(self, monkeypatch, *, unreadable=(), **script):
+        from phasesweep.runtime import process
+
+        self.script = {action: list(responses) for action, responses in script.items()}
+        self.unreadable = set(unreadable)
+        self.requests = []
+        real_read = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path.name == "response.json" and self.requests:
+                action = self.requests[-1]["action"]
+                if action in self.unreadable:
+                    self.unreadable.discard(action)
+                    raise OSError(errno.EIO, "injected response read failure", str(path))
+            return real_read(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", read_text)
+        monkeypatch.setattr(process, "run_supervised", self)
+
+    @property
+    def actions(self):
+        return [request["action"] for request in self.requests]
+
+    def __call__(self, command, **kwargs):
+        from phasesweep.runtime.process import ProcessResult
+
+        request_path, response_path = (Path(part) for part in shlex.split(command)[-2:])
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        self.requests.append(request)
+        if not self.script.get(request["action"]):
+            pytest.fail(f"Unscripted {request['action']} request.")
+        response = self.script[request["action"]].pop(0)
+        response_path.write_text(json.dumps(response), encoding="utf-8")
+        return ProcessResult(return_code=0, timed_out=False, pid=0, duration_seconds=0)
+
+
+@pytest.mark.parametrize("recovery", ["bind", "sync"])
+@pytest.mark.parametrize("reply", ["ok", "unknown"])
+@pytest.mark.parametrize("slot", ["attempt", "generation"])
+def test_unreadable_creation_response_leaves_the_run_recoverable(
+    tmp_path, monkeypatch, slot, reply, recovery
+):
+    """A response the controller cannot read says nothing about a creation, whatever it held."""
+    from phasesweep.engine.paths import _trial_dir_for
+    from phasesweep.tracking import session
+
+    experiment = native_experiment(tmp_path)
+    identity = _identity()
+    directory = _trial_dir_for(
+        experiment,
+        "p",
+        3,
+        generation_id=identity["generation_id"],
+        attempt_id=identity["attempt_id"],
+    )
+    directory.mkdir(parents=True)
+    bind, path = _binder(
+        tmp_path, slot, experiment=experiment, identity=identity, directory=directory
+    )
+    pending = path.with_name(f"{path.stem}.pending.json")
+    binding = _binding()
+    created = (
+        {"status": "ok", "result": binding}
+        if reply == "ok"
+        else {"status": "unknown", "message": "Creation may still commit."}
+    )
+    worker = _WorkerProcess(
+        monkeypatch,
+        unreadable=["create"],
+        create=[created],
+        find=[
+            {"status": "ok", "result": _ABSENT},
+            {"status": "ok", "result": {"found": True, "binding": binding}},
+        ],
+    )
+    with pytest.raises(RuntimeError, match="unresolved") as caught:
+        bind()
+    # The unreadable acknowledgement stays the diagnostic cause; the request is only searched for.
+    unconfirmed = caught.value.__cause__
+    assert isinstance(unconfirmed, OperationOutcomeUnknownError)
+    assert isinstance(unconfirmed.__cause__, OSError) and unconfirmed.__cause__.errno == errno.EIO
+    assert worker.actions == ["create", "find"]
+    assert pending.exists() and not path.exists()
+
+    # The run appears and reads work again: the identity binds it without a second create.
+    if recovery == "bind":
+        assert bind() == binding
+    else:
+        session.resolve_pending_creations(experiment, {}, identity["generation_id"])
+    assert worker.actions == ["create", "find", "find"]
+    assert session.read_record(path) == binding
+    assert not pending.exists()
 
 
 def _write_pending(path, identity):
@@ -1098,7 +1272,7 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
     "return_code,timed_out,response,expected",
     [
         (0, False, {"status": "ok", "result": {"x": 1}}, {"x": 1}),
-        (0, False, {"status": "error", "message": "rejected"}, RuntimeError),
+        (0, False, {"status": "error", "message": "rejected"}, OperationRejectedError),
         (
             0,
             False,
@@ -1108,31 +1282,75 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
         (1, False, {}, OperationOutcomeUnknownError),
         (0, False, {"status": "other"}, OperationOutcomeUnknownError),
         (0, True, {}, TimeoutError),
+        (0, False, {"status": "ok", "result": [1]}, OperationOutcomeUnknownError),
+        (0, False, {"status": "ok"}, OperationOutcomeUnknownError),
+        (0, False, {"status": "error", "message": 5}, OperationOutcomeUnknownError),
+        (0, False, {"status": "error"}, OperationOutcomeUnknownError),
+        (0, False, {"status": "unknown", "message": ["lost"]}, OperationOutcomeUnknownError),
+        (
+            0,
+            False,
+            OSError(errno.EIO, "private path", "response.json"),
+            OperationOutcomeUnknownError,
+        ),
+        (0, False, json.JSONDecodeError("Expecting value", "", 0), OperationOutcomeUnknownError),
+        (0, False, ValueError("Expected a JSON object, not list."), OperationOutcomeUnknownError),
+        (
+            0,
+            False,
+            UnsafeProcessCleanupError("worker cleanup is uncertain"),
+            UnsafeProcessCleanupError,
+        ),
     ],
-    ids=["ok", "error", "unknown", "crashed", "invalid-status", "timed-out"],
+    ids=[
+        "ok",
+        "error",
+        "unknown",
+        "crashed",
+        "invalid-status",
+        "timed-out",
+        "ok-result-not-an-object",
+        "ok-result-missing",
+        "error-message-not-text",
+        "error-message-missing",
+        "unknown-message-not-text",
+        "response-unreadable",
+        "response-not-json",
+        "response-not-an-object",
+        "cleanup-uncertain",
+    ],
 )
 def test_worker_outcomes_reach_the_controller_as_distinct_exceptions(
     tmp_path, monkeypatch, return_code, timed_out, response, expected
 ):
-    """Only a reported error proves the request failed; a crash or lost response proves nothing."""
+    """Only a well-formed error proves the request failed; an untrusted response proves nothing."""
     from phasesweep.runtime.process import ProcessResult
     from phasesweep.tracking import mlflow as worker
 
     result = ProcessResult(return_code=return_code, timed_out=timed_out, pid=0, duration_seconds=0)
     seen = []
-    monkeypatch.setattr(
-        worker,
-        "run_worker",
-        lambda *args, **kwargs: seen.append(kwargs["statuses"]) or (result, response, None),
-    )
+
+    def run_worker(*args, **kwargs):
+        seen.append(kwargs["statuses"])
+        if isinstance(response, Exception):
+            raise response
+        return result, response, None
+
+    monkeypatch.setattr(worker, "run_worker", run_worker)
     call = {"operation_id": "op", "directory": tmp_path, "environment": {}, "deadline": 0.0}
     if isinstance(expected, dict):
         assert worker.request_operation({}, **call) == expected
     else:
         with pytest.raises(expected) as caught:
             worker.request_operation({}, **call)
-        # A plain RuntimeError is a definite failure, so it must not be the unknown subclass.
+        # Each outcome is exactly its class, so a definite rejection is never the unknown subclass.
         assert type(caught.value) is expected
+        if isinstance(response, Exception):
+            # A response that cannot be read keeps its cause; uncertain cleanup passes through as is.
+            assert (
+                caught.value if expected is type(response) else caught.value.__cause__
+            ) is response
+            assert "private" not in str(caught.value)
     assert seen == [frozenset({"ok", "error", "unknown"})]
 
 

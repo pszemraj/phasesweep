@@ -62,7 +62,14 @@ _REJECTED_CREATION = frozenset(
 
 
 class OperationOutcomeUnknownError(RuntimeError):
-    """An operation failed in a way that does not show whether its request took effect."""
+    """An operation failed without proving that its request took no effect."""
+
+
+class OperationRejectedError(RuntimeError):
+    """The worker returned a well-formed error, the only positive evidence that a request failed.
+
+    For a creation, the server rejected the request or it failed before the create was sent.
+    """
 
 
 class _SdkExperiment(Protocol):
@@ -206,22 +213,29 @@ def request_operation(
     :param Mapping[str, str] environment: Composed authentication environment.
     :param float deadline: Absolute monotonic deadline.
     :raises TimeoutError: The worker did not finish by the deadline.
-    :raises OperationOutcomeUnknownError: The worker crashed or wrote no valid response, or
-        reported that a creation may have taken effect.
-    :raises RuntimeError: The worker rejected the request.
-    :raises ValueError: The worker's response is malformed.
+    :raises UnsafeProcessCleanupError: The worker's cleanup is uncertain, so it may still run.
+    :raises OperationOutcomeUnknownError: The worker crashed, its response could not be read
+        or trusted, or it reported that a creation may have taken effect.
+    :raises OperationRejectedError: The worker reported that the request failed.
     :return JsonObject: Successful public-client response.
     """
-    result, response, diagnostic_path = run_worker(
-        request,
-        Path(__file__).resolve(),
-        "mlflow",
-        statuses=_STATUSES,
-        run_id=operation_id,
-        trial_dir=directory,
-        environment=environment,
-        deadline=deadline,
-    )
+    try:
+        result, response, diagnostic_path = run_worker(
+            request,
+            Path(__file__).resolve(),
+            "mlflow",
+            statuses=_STATUSES,
+            run_id=operation_id,
+            trial_dir=directory,
+            environment=environment,
+            deadline=deadline,
+        )
+    except (OSError, ValueError) as exc:
+        # The worker has usually run to completion by now, so an unreadable response says nothing.
+        raise OperationOutcomeUnknownError(
+            f"MLflow worker response could not be read ({_failure_cause(exc)}); "
+            "its outcome is unconfirmed."
+        ) from exc
     if result.timed_out:
         raise TimeoutError("MLflow operation exceeded its deadline.")
     if result.return_code != 0 or response.get("status") not in _STATUSES:
@@ -229,11 +243,19 @@ def request_operation(
         raise OperationOutcomeUnknownError(
             f"MLflow worker failed (exit {result.return_code}).{diagnostic}"
         )
-    if response["status"] == "error":
-        raise RuntimeError(json_text(response, "message"))
-    if response["status"] == "unknown":
-        raise OperationOutcomeUnknownError(json_text(response, "message"))
-    return json_object(response["result"])
+    status = response["status"]
+    try:
+        if status == "ok":
+            return json_object(response["result"])
+        message = json_text(response, "message")
+    except (KeyError, ValueError) as exc:
+        raise OperationOutcomeUnknownError(
+            f"MLflow worker response is malformed ({_failure_cause(exc)}); "
+            "its outcome is unconfirmed."
+        ) from exc
+    if status == "error":
+        raise OperationRejectedError(message)
+    raise OperationOutcomeUnknownError(message)
 
 
 def identity_tags(binding: Mapping[str, object]) -> dict[str, str]:
@@ -372,17 +394,22 @@ def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
 
     The creation request is sent at most once per call, with no SDK retry. A
     failure of that request that is not a server rejection does not show
-    whether the run was created, so it is reported as an unknown outcome.
+    whether the run was created, so it is reported as an unknown outcome. So
+    is a run this call created that fails verification: it exists, but
+    nothing has bound it.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
     :param CreateRequest request: Trusted target and identity.
-    :raises ValueError: More than one run carries the identity.
-    :raises OperationOutcomeUnknownError: The creation request failed without a server rejection.
+    :raises ValueError: More than one run carries the identity, or a run found by
+        search contradicts it.
+    :raises OperationOutcomeUnknownError: The creation request failed without a server
+        rejection, or the run it created fails verification.
     :return RunBinding: Verified remote run binding.
     """
     experiment_id = _resolve(client, request["settings"])
     identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
     run = _identity_run(client, identity)
+    created = run is None
     if run is None:
         tags = identity_tags(identity)
         parent_run_id = identity.get("parent_run_id")
@@ -401,7 +428,14 @@ def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
                 "its outcome is unconfirmed."
             ) from exc
     binding: RunBinding = {**identity, "run_id": run.info.run_id}
-    verify_remote(run, binding)
+    try:
+        verify_remote(run, binding)
+    except ValueError as exc:
+        if not created:
+            raise
+        raise OperationOutcomeUnknownError(
+            f"MLflow created a run that failed verification ({exc}); it is not bound."
+        ) from exc
     return binding
 
 
