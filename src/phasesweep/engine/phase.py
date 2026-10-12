@@ -653,7 +653,7 @@ class _PhaseExecution:
             self.study.stop()
 
     def record_fatal(self, error: BaseException) -> None:
-        """Record the first fatal objective exception and stop peer launches.
+        """Record the first fatal objective or post-trial exception and stop peer launches.
 
         First-writer wins so the root failure is not replaced by secondary
         peer-prune or persistence fallout. The original exception object keeps
@@ -1170,6 +1170,33 @@ def _after_trial(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
 ) -> None:
+    """Settle one finished trial, routing an escaping failure through the fatal channel.
+
+    Optuna never retrieves the futures of its final ``n_jobs > 1`` batch, so
+    an exception escaping this callback there would vanish and the phase
+    could publish with cleanup reported confirmed. Recording it first makes
+    every ``n_jobs`` setting raise it after the workers drain, as for
+    objective errors, and stops queued launches. The trial's accepted Optuna
+    state is untouched. A shutdown is a cancellation, never a fatal error.
+
+    :param _PhaseExecution run: The phase execution the trial belongs to.
+    :param optuna.Study study: The running Optuna study.
+    :param optuna.trial.FrozenTrial trial: The just-finished trial.
+    """
+    try:
+        _settle_finished_trial(run, study, trial)
+    except PhaseSweepShutdown:
+        raise
+    except BaseException as exc:
+        run.record_fatal(exc)
+        raise
+
+
+def _settle_finished_trial(
+    run: _PhaseExecution,
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+) -> None:
     """Retire cleaned attempts, mirror MLflow outcomes, and snapshot CSV.
 
     The threshold decision itself lives in ``_record_outcome``, inside the
@@ -1558,7 +1585,8 @@ def _run_phase(
                 _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
 
         # Optuna's threaded path can absorb any uncaught objective exception
-        # after marking that trial FAIL. Re-raise the first one before timeout,
+        # after marking that trial FAIL, and any callback exception in its
+        # final batch. Re-raise the first one before timeout,
         # soft abort, completeness, or winner-selection logic can relabel it.
         run.raise_if_fatal()
     except _TrialOutcomeUnrecordedAbort as exc:

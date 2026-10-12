@@ -89,6 +89,40 @@ def test_failed_trial_finishes_its_managed_run(tmp_path, monkeypatch):
     assert {r["binding"]["phase"] for r in requests} == {"depth"}
 
 
+@pytest.mark.parametrize("trainer", ["accepted", "failed"])
+@pytest.mark.parametrize("n_jobs", [1, 2])
+def test_unresolved_attempt_upload_worker_fails_the_run(tmp_path, monkeypatch, n_jobs, trainer):
+    """Optuna drops callback errors in its final threaded batch; the fatal channel must not."""
+    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config["phases"][0].update(n_jobs=n_jobs, allow_no_gpu_isolation=True)
+    if trainer == "failed":
+        config["trial_command"] = (
+            shlex.join([sys.executable, "-c", "raise SystemExit(1)"]) + " {config_path}"
+        )
+    experiment = Experiment.model_validate(config)
+    error = UnsafeProcessCleanupError("upload worker still unresolved")
+    uploaded_phases = []
+
+    def unresolved(*args, **kwargs):
+        if args[2]["name"].startswith("attempt-"):
+            uploaded_phases.append(args[2]["binding"]["phase"])
+            raise error
+        return session.call_tracking(*args, **kwargs)
+
+    monkeypatch.setattr(publication, "call_tracking", unresolved)
+    reports = []
+    with pytest.raises(UnsafeProcessCleanupError) as caught:
+        run_experiment(experiment, terminal_callback=reports.append)
+    assert caught.value is error
+    [report] = reports
+    assert report.primary_error is error
+    assert not report.cleanup_confirmed
+    assert report.winners is None
+    assert read_status(experiment)["published_generation_id"] is None
+    # The inheriting phase never launched.
+    assert set(uploaded_phases) == {"depth"}
+
+
 def test_failed_generation_finishes_unrecorded_attempt_runs(tmp_path, monkeypatch):
     """Attempts interrupted before their trial callback are finished with the generation."""
     experiment = native_experiment(tmp_path)
