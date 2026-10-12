@@ -364,6 +364,50 @@ def test_mirror_failure_after_publication_keeps_the_result(tmp_path, monkeypatch
         assert resent == [latest["winner-depth"]] * 2
 
 
+@pytest.mark.parametrize("edit", ["append", "rewire"])
+def test_rebuilt_winner_references_keep_the_generation_graph(tmp_path, monkeypatch, edit):
+    """Sync rebuilds an older generation from its own phase plan and lineage, not today's."""
+    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    if edit == "rewire":
+        config["phases"][1]["inherits"] = []
+    _fail_mirror(monkeypatch, "intent")
+    reports = []
+    run_experiment(Experiment.model_validate(config), terminal_callback=reports.append)
+    generation = reports[0].generation_id
+    monkeypatch.setattr(publication, "write_record", session.write_record)
+    if edit == "append":
+        config["phases"].append(
+            {
+                "name": "momentum",
+                "inherits": ["rate"],
+                "n_trials": 1,
+                "sampler": {"type": "grid"},
+                "search_space": {"optimizer.momentum": {"type": "categorical", "choices": [0.9]}},
+            }
+        )
+    else:
+        config["phases"][1]["inherits"] = ["depth"]
+    edited = Experiment.model_validate(config)
+    if edit == "append":
+        # Extending a finished experiment reuses its studies and publishes anew.
+        assert list(run_experiment(edited)) == ["depth", "rate", "momentum"]
+
+    assert publication.sync_tracking(edited, generation) == {"pending": 0, "delivered": 7}
+    delivery = tracking_root(edited) / generation / "delivery"
+    assert sorted(path.name for path in delivery.glob("[!a]*.json")) == [
+        "generation.json",
+        "winner-depth.json",
+        "winner-rate.json",
+    ]
+    depth_run = read_record(delivery / "winner-depth.json")["binding"]["run_id"]
+    rate_tags = read_record(delivery / "winner-rate.json")["projection"]["tags"]
+    expected = {"phasesweep.inherits.depth": depth_run} if edit == "append" else {}
+    assert {k: v for k, v in rate_tags.items() if "inherits" in k} == expected
+    summary_tags = read_record(delivery / "generation.json")["projection"]["tags"]
+    assert sorted(summary_tags) == ["phasesweep.winner.depth", "phasesweep.winner.rate"]
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("failure", ["intent", "worker"])
 def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, monkeypatch, failure):

@@ -296,7 +296,10 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
 
     Reading the validated artifacts instead of in-memory winners lets
     sync-tracking rebuild records that a failed write after publication never
-    saved. Records that already exist are kept.
+    saved. Phase membership, order, and lineage come from the generation's own
+    validated config snapshot, so a phase appended or rewired since cannot
+    change what an older generation reports. Every projection is built before
+    the first record is saved. Records that already exist are kept.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Published generation that has a summary run.
@@ -324,27 +327,25 @@ def _save_generation_intents(experiment: Experiment, generation_id: str) -> list
         )
         for item in publication.summary["phases"]
     }
-    paths = [
-        _save_intent(
-            experiment,
-            generation_id,
-            f"winner-{phase.name}",
-            bindings[phase.name],
-            _projection(
-                metrics={},
-                params={},
-                tags={
-                    "phasesweep.winner": "true",
-                    f"phasesweep.winner_generation.{generation_id}": phase.name,
-                    **{
-                        f"phasesweep.inherits.{name}": bindings[name]["run_id"]
-                        for name in phase.inherits
-                    },
+    winners = {
+        phase.name: _projection(
+            metrics={},
+            params={},
+            tags={
+                "phasesweep.winner": "true",
+                f"phasesweep.winner_generation.{generation_id}": phase.name,
+                **{
+                    f"phasesweep.inherits.{name}": bindings[name]["run_id"]
+                    for name in publication.inherits[phase.name]
                 },
-                summary={"phase": phase.name, **references[phase.name]},
-            ),
+            },
+            summary={"phase": phase.name, **references[phase.name]},
         )
-        for phase in experiment.phases
+        for phase in publication.phase_plan
+    }
+    paths = [
+        _save_intent(experiment, generation_id, f"winner-{name}", bindings[name], projection)
+        for name, projection in winners.items()
     ]
     paths.append(
         _save_intent(
