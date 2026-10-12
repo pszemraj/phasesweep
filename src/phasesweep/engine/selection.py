@@ -137,8 +137,8 @@ def select_winner(
 
     if not survivors:
         raise NoFeasibleTrialError(
-            "No feasible completed trials in phase. "
-            "Check stdout/stderr logs in the phase's trial_* directories."
+            "No feasible completed trials in phase. The phase's trials.csv records each "
+            "failed trial's reason; trainer output is in its trial_* directory."
         )
 
     best_value = (

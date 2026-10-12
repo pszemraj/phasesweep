@@ -2,10 +2,10 @@
   "config_fingerprint": "028e0ae227e984f3e0ba40afad2921234a2387a221b33f6d7dc54a1b2fb839cf",
   "config_snapshot": {
     "path": "config.snapshot.yaml",
-    "sha256": "be4f46e2a798e0e8e802da204fda6a6cded4be67fc6825e885b4af59c249b1cf"
+    "sha256": "3d54c0f7f6990c3ee338687629ac5452e6d9d4900c1a63cef33ea453783b612e"
   },
   "experiment": "t",
-  "generation_id": "cd4512ad12d842a1ab02d436d9e82348",
+  "generation_id": "de5853ae14ef4e939d9d61f287d15ce3",
   "generation_id_source": "engine",
   "phase_config_fingerprints": [
     {
@@ -13,7 +13,7 @@
       "sha256": "62efce7e3c5c0b67956a99a3845b28713beaa382d959821ba510af5e5afac392"
     }
   ],
-  "phasesweep_version": "0.3.4",
+  "phasesweep_version": "0.3.7.dev13+g14807858c",
   "provenance": {
     "revision": "golden-fixture-v1"
   },
@@ -23,6 +23,6 @@
     "generation_summary": 3,
     "phase_fingerprint": 6,
     "reproducibility": 2,
-    "study_storage": 5
+    "study_storage": 6
   }
 }

@@ -26,12 +26,15 @@ from phasesweep.evidence.models import (
     JsonExtractor,
     JsonScalarBoundGate,
     LogRegexExtractor,
+    MlflowExtractor,
+    MlflowRequiredGate,
     ObjectiveExtractor,
     RequiredFileGate,
     Sha256Gate,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.tracking.models import MlflowSettings
 
 __all__ = [
     "ArtifactSizeGate",
@@ -50,6 +53,9 @@ __all__ = [
     "JsonScalarBoundGate",
     "LogRegexExtractor",
     "Metric",
+    "MlflowExtractor",
+    "MlflowRequiredGate",
+    "MlflowSettings",
     "ObjectiveExtractor",
     "Phase",
     "RequiredFileGate",

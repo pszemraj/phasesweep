@@ -156,10 +156,13 @@ def test_explicit_journal_storage_allows_parallel_jobs(tmp_path: Path) -> None:
         ":memory:",
         "postgresql://user:pass@host/db",
         "mysql://user@host/db",
+        "JOURNAL:///tmp/x.journal",
+        "Journal:////tmp/x.journal",
+        "journal+file:///tmp/x.journal",
     ],
 )
 def test_non_journal_storage_is_refused_at_config_load(tmp_path: Path, storage: str) -> None:
-    """Every spelling but null, auto, and journal:/// is refused, with the remedy spelled out."""
+    """Every spelling but null, auto, and lowercase journal:/// is refused, with the remedy spelled out."""
     path = _storage_policy_config(tmp_path, storage=json.dumps(storage), n_jobs=1)
 
     with pytest.raises(ValidationError) as excinfo:
@@ -169,6 +172,37 @@ def test_non_journal_storage_is_refused_at_config_load(tmp_path: Path, storage: 
     assert "storage must be null, auto, or a journal:/// URL" in message
     assert "journal:///path/to/study.journal" in message
     assert "storage: null" in message
+
+
+@pytest.mark.parametrize(
+    ("storage", "match"),
+    [
+        pytest.param(
+            "journal:///tmp/a?b.journal", "cannot carry a query or fragment", id="question_mark"
+        ),
+        pytest.param(
+            "journal:////tmp/a.journal?timeout=30", "cannot carry a query or fragment", id="query"
+        ),
+        pytest.param(
+            "journal:////tmp/a.journal#frag", "cannot carry a query or fragment", id="fragment"
+        ),
+        pytest.param(
+            "journal:///file:/tmp/a.journal?uri=true",
+            "cannot carry a query or fragment",
+            id="escaped_file_uri",
+        ),
+        pytest.param("journal:///", "names no file", id="empty_path"),
+        pytest.param("journal://", "names no file", id="empty_authority_and_path"),
+    ],
+)
+def test_malformed_journal_storage_is_refused_at_config_load(
+    tmp_path: Path, storage: str, match: str
+) -> None:
+    """A journal URL must name its file: ``?``/``#`` would silently truncate the path."""
+    path = _storage_policy_config(tmp_path, storage=json.dumps(storage), n_jobs=1)
+
+    with pytest.raises(ValidationError, match=match):
+        load_experiment(path)
 
 
 def test_canonical_storage_identity_resolves_paths(tmp_path: Path) -> None:

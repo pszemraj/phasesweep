@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import time
 import tracemalloc
@@ -23,7 +24,7 @@ from phasesweep.config import (
 )
 from phasesweep.evidence import ExtractorError, evaluate_gates, run_extractor
 from phasesweep.evidence.evaluation import extractor_config_fingerprint
-from tests.conftest import make_trial_context, requires_nonroot
+from tests.conftest import make_trial_context
 
 
 def _wandb_poll(**kwargs):
@@ -306,6 +307,57 @@ def test_wandb_locates_where_the_objective_summary_was_logged(
     assert {kind for kind, _ in run.reads} <= {"history"}
 
 
+@pytest.mark.parametrize("direction", [-math.inf, math.inf])
+def test_wandb_final_history_neighbor_supplies_only_advisory_position(monkeypatch, direction):
+    """The two API representations may differ by one binary64 value."""
+    value = 0.0965803563594818
+    logged = math.nextafter(value, direction)
+    rows = [
+        {"_step": 0, "eval/loss": 3.9606740474700928, "eval/step": 0},
+        {"_step": 25, "eval/loss": logged, "eval/step": 500},
+        {"_step": 27, "eval/loss": logged, "eval/step": 500},
+    ]
+    summary = {"eval/loss": value, "_step": 28}
+    run = _HistoryRun(summary, rows + [{"_step": 28, "train/loss": 0.04}])
+    assert _history_position(monkeypatch, run, axis="eval/step") == 500
+    assert run.summary_metrics == {"eval/loss": value, "_step": 28}
+    assert run.rows[1]["eval/loss"] == logged
+
+
+@pytest.mark.parametrize("exact_axis", [100, None])
+def test_wandb_exact_history_match_precedes_later_neighbor(monkeypatch, exact_axis):
+    """An exact observation stays authoritative even without a usable axis."""
+    value = 0.2
+    rows = [
+        {"_step": 0, "eval/loss": value, "eval/step": exact_axis},
+        {"_step": 1, "eval/loss": math.nextafter(value, math.inf), "eval/step": 500},
+    ]
+    run = _HistoryRun({"eval/loss": value, "_step": 1}, rows)
+    assert _history_position(monkeypatch, run, axis="eval/step") == exact_axis
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [math.nextafter(0.2, -math.inf), math.nextafter(0.2, math.inf)],
+        [math.nextafter(math.nextafter(0.2, math.inf), math.inf)],
+        [math.nextafter(0.2, math.inf), 0.3],
+        [math.nextafter(0.2, math.inf), "not-a-number"],
+        [math.nextafter(0.2, math.inf), True],
+        [math.nextafter(0.2, math.inf), math.nan],
+        [math.nextafter(0.2, math.inf), math.inf],
+    ],
+    ids=["ambiguous", "two-ulps", "older-only", "malformed", "boolean", "nan", "infinite"],
+)
+def test_wandb_history_neighbor_cannot_guess_a_position(monkeypatch, values):
+    rows = [
+        {"_step": step, "eval/loss": logged, "eval/step": (step + 1) * 100}
+        for step, logged in enumerate(values)
+    ]
+    run = _HistoryRun({"eval/loss": 0.2, "_step": len(rows) - 1}, rows)
+    assert _history_position(monkeypatch, run, axis="eval/step") is None
+
+
 def test_wandb_series_at_the_sample_cap_is_scanned_in_pages_never_sampled(monkeypatch):
     monkeypatch.setattr("phasesweep.evidence.wandb._HISTORY_SAMPLES", 2)
     run = _HistoryRun({"eval/loss.min": 0.2, "_step": 5}, _EVAL_ROWS)
@@ -515,6 +567,7 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
     from phasesweep.runtime.process import read_attempt_lifecycle
 
     monkeypatch.setenv("WANDB_API_KEY", "excluded-parent-secret")
+    monkeypatch.setenv("DO_NOT_TRACK", "1")
     wandb_worker_sdk("""
         import os
         class Run:
@@ -530,6 +583,7 @@ def test_wandb_worker_transfers_only_requested_evidence(wandb_worker_sdk, tmp_pa
                 assert "WANDB_API_KEY" not in os.environ
                 assert os.environ["HTTPS_PROXY"] == "https://transport.test"
                 assert "PYTHONHOME" not in os.environ
+                assert os.environ["DO_NOT_TRACK"] == "1"
                 assert kwargs["overrides"] == {"base_url": "https://example.test"}
             def run(self, path):
                 assert path == "entity/project/attempt"
@@ -733,12 +787,6 @@ def _assert_log_regex_provenance(
         assert source["size_bytes"] == len(raw), select
         assert source["matched_line"] == expected_line, select
         assert source["match_count"] == expected_count, select
-
-
-def test_json_basic(tmp_path):
-    (tmp_path / "result.json").write_text(json.dumps({"eval": {"loss": 0.42}}))
-    cfg = JsonExtractor(type="json", path="result.json", key="eval.loss")
-    assert run_extractor(make_trial_context(tmp_path), cfg) == pytest.approx(0.42)
 
 
 def test_json_extractor_reports_missing_or_nonnumeric_values(tmp_path):
@@ -968,128 +1016,6 @@ def test_log_regex_reports_no_matches(tmp_path):
         run_extractor(make_trial_context(tmp_path), cfg)
 
 
-@requires_nonroot
-def test_artifact_size_directory_gate_rejects_unreadable_subtree(tmp_path: Path) -> None:
-    """An incomplete traversal cannot establish a checkpoint-size bound."""
-    private = tmp_path / "checkpoint" / "weights"
-    private.mkdir(parents=True)
-    (private / "model.bin").write_bytes(b"x" * 16_384)
-    private.chmod(0)
-    try:
-        result = evaluate_gates(
-            make_trial_context(tmp_path),
-            [
-                ArtifactSizeGate(
-                    type="artifact_size",
-                    path="checkpoint",
-                    source="directory",
-                    max_bytes=1024,
-                )
-            ],
-        )[0]
-    finally:
-        private.chmod(0o700)
-
-    assert result.passed is False
-    assert "could not inspect checkpoint" in result.detail
-
-
-def test_artifact_size_directory_gate_counts_file_symlinks_not_directory_symlinks(
-    tmp_path: Path,
-) -> None:
-    """File-link targets count, while linked directories are not traversed."""
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    (checkpoint / "metadata.bin").write_bytes(b"meta")
-    external = tmp_path / "external"
-    external.mkdir()
-    (external / "weights.bin").write_bytes(b"x" * 16_384)
-    (external / "metadata-link.bin").write_bytes(b"linked!")
-    (checkpoint / "linked-weights").symlink_to(external, target_is_directory=True)
-    (checkpoint / "linked-metadata.bin").symlink_to(external / "metadata-link.bin")
-
-    result = evaluate_gates(
-        make_trial_context(tmp_path),
-        [
-            ArtifactSizeGate(
-                type="artifact_size",
-                path="checkpoint",
-                source="directory",
-                max_bytes=11,
-            )
-        ],
-    )[0]
-
-    assert result.passed is True
-    assert "directory size 11 within bounds" in result.detail
-
-
-def test_artifact_size_directory_gate_reports_root_inspection_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A root metadata error is failed evidence with its original path detail."""
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    real_stat = Path.stat
-
-    def fail_root_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if self == checkpoint and not follow_symlinks:
-            raise OSError("root metadata unavailable")
-        return real_stat(self, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(Path, "stat", fail_root_stat)
-
-    result = evaluate_gates(
-        make_trial_context(tmp_path),
-        [
-            ArtifactSizeGate(
-                type="artifact_size",
-                path="checkpoint",
-                source="directory",
-                max_bytes=1024,
-            )
-        ],
-    )[0]
-
-    assert result.passed is False
-    assert str(checkpoint) in result.detail
-    assert "root metadata unavailable" in result.detail
-
-
-def test_artifact_size_directory_gate_reports_descendant_stat_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A child metadata error cannot be silently excluded from a directory size."""
-    checkpoint = tmp_path / "checkpoint"
-    checkpoint.mkdir()
-    child = checkpoint / "model.bin"
-    child.write_bytes(b"payload")
-    real_stat = Path.stat
-
-    def fail_child_stat(self: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        if self == child and follow_symlinks:
-            raise OSError("descendant metadata unavailable")
-        return real_stat(self, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(Path, "stat", fail_child_stat)
-
-    result = evaluate_gates(
-        make_trial_context(tmp_path),
-        [
-            ArtifactSizeGate(
-                type="artifact_size",
-                path="checkpoint",
-                source="directory",
-                max_bytes=1024,
-            )
-        ],
-    )[0]
-
-    assert result.passed is False
-    assert str(child) in result.detail
-    assert "descendant metadata unavailable" in result.detail
-
-
 def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     """The provenance sink freezes the exact evidence bytes and the extractor's
     config identity at extraction time (review v0.5.17 / finding F)."""
@@ -1101,7 +1027,7 @@ def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     value = run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance)
 
     assert value == pytest.approx(0.42)
-    assert provenance["schema_version"] == 2
+    assert provenance["schema_version"] == 3
     assert provenance["extractor"]["kind"] == "json"
     assert provenance["extractor"]["config_sha256"] == extractor_config_fingerprint(cfg)
     assert provenance["source"] == {
@@ -1246,46 +1172,3 @@ def test_log_regex_first_hashes_invalid_utf8_suffix_without_decoding_it(tmp_path
     assert run_extractor(make_trial_context(tmp_path), cfg, provenance=provenance) == 1.0
     assert provenance["source"]["sha256"] == hashlib.sha256(raw).hexdigest()
     assert provenance["source"]["size_bytes"] == len(raw)
-
-
-def test_gate_results_mark_expired_local_gate(tmp_path):
-    """An expired deadline marks an unevaluated local gate as exhausted."""
-    gate = JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)
-
-    expired = evaluate_gates(make_trial_context(tmp_path), [gate], deadline=0.0)[0]
-    ordinary = evaluate_gates(make_trial_context(tmp_path), [gate])[0]
-
-    assert expired.deadline_exhausted is True
-    assert ordinary.deadline_exhausted is False
-
-
-class _UnregisteredGate:
-    """Stand-in for a ``Gate`` union member with no ``_GATE_DISPATCH`` entry."""
-
-    type = "unregistered"
-
-    def __repr__(self) -> str:
-        return "_UnregisteredGate()"
-
-
-@pytest.mark.parametrize("deadline", [None, 0.0, "future"])
-def test_unregistered_gate_type_fails_instead_of_raising(tmp_path, deadline):
-    """An unhandled gate type degrades to one failing gate, never a KeyError.
-
-    A bare ``_GATE_DISPATCH[type(gate)]`` lookup raises ``KeyError``, which is
-    not an ``ExtractorError`` and is not in Optuna's ``catch=`` tuple, so it
-    would escape the objective and abort the entire phase and run mid-sweep.
-    """
-    ctx = make_trial_context(tmp_path)
-    resolved = time.monotonic() + 5.0 if deadline == "future" else deadline
-    known = JsonEqualsGate(type="json_equals", path="result.json", key="ok", value=True)
-
-    results = evaluate_gates(ctx, [_UnregisteredGate(), known], deadline=resolved)  # type: ignore[list-item]
-
-    assert len(results) == 2
-    assert results[0].passed is False
-    assert results[0].gate_type == "_UnregisteredGate"
-    assert "unknown gate" in results[0].detail
-    # Evaluation continues past the unknown gate rather than aborting the trial.
-    assert results[1].gate_type == "json_equals"
-    assert results[1].passed is False

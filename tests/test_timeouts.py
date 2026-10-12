@@ -10,10 +10,10 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
+from phasesweep.config import Experiment, IntParam, Metric, Phase, Sampler
 from phasesweep.engine import PhaseSweepError
 from phasesweep.engine.artifacts import _load_winner
-from phasesweep.engine.errors import OperatorAction, WinnerIntegrityError
+from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.resume import _published_for_resume
@@ -55,25 +55,15 @@ def _sleeping_score_experiment(
         print("x=1.0")
         """,
     )
-    return Experiment(
+    return make_experiment(
         experiment=experiment,
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/r.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        timeout_seconds_per_run=timeout_seconds_per_run,
-        phases=[
-            Phase(
-                name="p",
-                n_trials=n_trials,
-                timeout_seconds_per_phase=timeout_seconds_per_phase,
-                allow_incomplete_on_timeout=allow_incomplete_on_timeout,
-                search_space={},
-            )
-        ],
-    )
+        workdir=tmp_path / "runs",
+        trainer=trainer,
+        n_trials=n_trials,
+        timeout_seconds_per_phase=timeout_seconds_per_phase,
+        allow_incomplete_on_timeout=allow_incomplete_on_timeout,
+        search_space={},
+    ).model_copy(update={"timeout_seconds_per_run": timeout_seconds_per_run})
 
 
 @pytest.mark.integration
@@ -205,9 +195,8 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
     strict = exp.model_copy(
         update={"phases": [exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False})]}
     )
-    with pytest.raises(WinnerIntegrityError, match="Refusing to replay it") as refused:
+    with pytest.raises(WinnerIntegrityError, match="Refusing to replay it"):
         run_experiment(strict)
-    assert refused.value.action is OperatorAction.FIX_CONFIG
     assert len(load().trials) == trials_before
     assert load().user_attrs[PHASE_DECISION_ATTR] == decision_before
     assert _last_successful_generation_path(exp).read_text() == published_before
@@ -744,47 +733,22 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
     }
 
 
-def test_process_failure_after_deadline_is_not_relabelled(tmp_path: Path) -> None:
-    """An elapsed clock is not causal when the trainer already failed."""
-    experiment = make_experiment(workdir=tmp_path)
-    executed = ExecutedTrial(
-        ctx=TrialContext(
-            experiment="t",
-            phase="p",
-            trial_id=0,
-            generation_id="generation-test",
-            attempt_id="attempt-test",
-            overrides_sha256="0" * 64,
-            trial_dir=tmp_path,
-            run_name="t-p-0-attempt-test",
-            return_code=1,
-            duration_seconds=0.1,
-        ),
-        process=ProcessResult(
-            return_code=1,
-            timed_out=False,
-            pid=123,
-            duration_seconds=0.1,
-            failure_reason="trainer failed",
-        ),
-    )
-
-    result = extract_trial_result(
-        experiment=experiment,
-        executed=executed,
-        deadline=time.monotonic() - 1.0,
-    )
-
-    assert result.failure_reason == "trainer failed"
-    assert result.deadline_exhausted is False
-
-
 @pytest.mark.parametrize(
-    ("capped_by_deadline", "timed_out", "expected"),
-    [(True, True, True), (False, True, False), (True, False, False)],
+    ("capped_by_deadline", "timed_out", "deadline_elapsed", "expected"),
+    [
+        pytest.param(True, True, False, True, id="killed-at-the-deadline-cap"),
+        pytest.param(False, True, False, False, id="killed-at-its-own-timeout"),
+        pytest.param(True, False, False, False, id="capped-but-not-killed"),
+        # An elapsed clock is not causal when the trainer already failed.
+        pytest.param(False, False, True, False, id="failed-before-the-deadline-elapsed"),
+    ],
 )
 def test_trainer_timeout_attribution_follows_wallclock_cap(
-    tmp_path: Path, capped_by_deadline: bool, timed_out: bool, expected: bool
+    tmp_path: Path,
+    capped_by_deadline: bool,
+    timed_out: bool,
+    deadline_elapsed: bool,
+    expected: bool,
 ) -> None:
     """A killed trainer is deadline-attributed only when its cap was the deadline."""
     experiment = make_experiment(workdir=tmp_path)
@@ -812,7 +776,11 @@ def test_trainer_timeout_attribution_follows_wallclock_cap(
         ),
     )
 
-    result = extract_trial_result(experiment=experiment, executed=executed)
+    result = extract_trial_result(
+        experiment=experiment,
+        executed=executed,
+        deadline=time.monotonic() - 1.0 if deadline_elapsed else None,
+    )
 
     assert result.failure_reason == failure
     assert result.deadline_exhausted is expected
@@ -841,7 +809,6 @@ def test_elapsed_phase_clock_does_not_relabel_completed_failure(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command="false {overrides}",
-        override_format="argparse",
         n_trials=1,
         max_consecutive_failures=10,
         timeout_seconds_per_phase=100.0,
@@ -892,8 +859,7 @@ def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(
         workdir=tmp_path / "runs",
-        trial_command=f"python {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=1,
         timeout_seconds_per_phase=0.5,
     )

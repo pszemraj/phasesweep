@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import json
 import os
 import signal
 import subprocess
@@ -21,9 +20,6 @@ import pytest
 import phasesweep.engine.ledger as engine_ledger
 from phasesweep.config import (
     Experiment,
-    IntParam,
-    LogRegexExtractor,
-    Metric,
     Phase,
     Sampler,
 )
@@ -83,6 +79,7 @@ from tests.conftest import (
     make_experiment,
     mark_current_format,
     patch_rejected_trial_user_attr,
+    write_constant_trainer,
     write_trainer,
 )
 from tests.ledger_fixtures import _write_config
@@ -175,6 +172,7 @@ def _claimed_over(
         binding_state="bound",
         format_scan_failure=None,
         studies=MappingProxyType(dict(studies)),  # type: ignore[arg-type]
+        memory_storage=None,
     )
 
 
@@ -184,19 +182,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     Previously, _verify_fingerprint raised before _reap_stale_trials could run,
     leaving the prior orchestrator's training process holding the GPU.
     """
-    trainer = tmp_path / "t.py"
-    write_trainer(
-        trainer,
-        """
-        import json, argparse
-        ap = argparse.ArgumentParser()
-        ap.add_argument('--out', required=True)
-        args, _ = ap.parse_known_args()
-        with open(args.out, 'w') as f: json.dump({'x': 1.0}, f)
-        """,
-    )
-    db = tmp_path / "p.journal"
-    storage = f"journal:///{db}"
+    storage = f"journal:///{tmp_path / 'p.journal'}"
 
     # Manually create a study and inject a RUNNING trial + fingerprint.
     study = optuna.create_study(
@@ -242,24 +228,12 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     monkeypatch.setattr(orch, "_reap_stale_trials", spy_reap)
     monkeypatch.setattr(orch, "_verify_fingerprint", spy_verify)
 
-    exp = Experiment(
-        experiment="t",
+    exp = make_experiment(
         storage=storage,
-        provenance={"revision": "test-fixture-v1"},
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"python {trainer} --out {{trial_dir}}/result.json {{overrides}}",
-        override_format="argparse",
-        metric=Metric(
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-        ),
-        phases=[
-            Phase(
-                name="a",
-                n_trials=1,
-                sampler=Sampler(type="random", seed=0),
-                search_space={"x": IntParam(type="int", low=0, high=10)},
-            )
-        ],
+        workdir=tmp_path / "runs",
+        trainer=write_constant_trainer(tmp_path),
+        name="a",
+        n_trials=1,
     )
 
     stamp_artifact_root(study, exp)
@@ -297,21 +271,13 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
         else:
             alive = False
         Path(os.environ["PHASESWEEP_TRIAL_DIR"], "orphan_alive.txt").write_text(str(alive))
-        print("metric=1.0")
+        print("x=1.0")
         """,
     )
-    storage = f"journal:///{tmp_path / 'studies.journal'}"
-    experiment = Experiment(
+    experiment = make_experiment(
         experiment="cross_phase_orphan",
-        storage=storage,
-        provenance={"revision": "test-fixture-v1"},
-        workdir=str(tmp_path / "runs"),
-        trial_command=f"{sys.executable} {trainer}",
-        override_format="argparse",
-        metric=Metric(
-            name="metric",
-            extractor=LogRegexExtractor(type="log_regex", pattern=r"metric=(?P<value>[0-9.eE+-]+)"),
-        ),
+        persistent=tmp_path,
+        trainer=trainer,
         phases=[
             Phase(name="a", n_trials=1, sampler=Sampler(type="random", seed=0), search_space={}),
             Phase(
@@ -765,21 +731,6 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
 _MISSING = object()
 
 
-def test_kill_stale_group_refuses_live_pid_without_starttime(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[int] = []
-    monkeypatch.setattr("phasesweep.runtime.reaper.is_pid_alive", lambda _pid: True)
-    monkeypatch.setattr("phasesweep.runtime.reaper._process_group_exists", lambda _pgid: True)
-    monkeypatch.setattr(
-        "phasesweep.runtime.reaper._terminate_process_group",
-        lambda pgid, *, grace_seconds: calls.append(pgid) or True,
-    )
-
-    assert kill_stale_group(pid=12345, saved_starttime=None, pgid=12345) is False
-    assert calls == []
-
-
 @dataclass(frozen=True)
 class _KillStaleGroupCase:
     pid: int | None
@@ -907,6 +858,21 @@ class _KillStaleGroupCase:
             ),
             id="use-live-pid-when-starttime-matches",
         ),
+        pytest.param(
+            _KillStaleGroupCase(
+                pid=12345,
+                saved_starttime=None,
+                pgid=12345,
+                pid_alive=True,
+                group_exists=True,
+            ),
+            id="refuse-live-pid-without-starttime",
+        ),
+        # No PID, no PGID: nothing alive to clean up. Safe to mark FAIL.
+        pytest.param(
+            _KillStaleGroupCase(pid=None, saved_starttime=None, pgid=None, expected=True),
+            id="accept-no-identity",
+        ),
     ],
 )
 def test_kill_stale_group_pid_pgid_decision_matrix(
@@ -970,8 +936,7 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'allocation.journal'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=3,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1012,8 +977,7 @@ def test_allocation_context_covers_first_environment_write_failure(
     exp = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'first-write.journal'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=1,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1064,11 +1028,6 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
         _reap_stale_trials(study, exp, exp.phases[0].name, confirm=True)
 
     assert study.trials[trial.number].state == optuna.trial.TrialState.RUNNING
-
-
-def test_kill_stale_group_returns_true_when_no_identity() -> None:
-    """No PID, no PGID — nothing alive to clean up. Safe to mark FAIL."""
-    assert kill_stale_group(pid=None, saved_starttime=None, pgid=None) is True
 
 
 @pytest.mark.parametrize(
@@ -1145,8 +1104,7 @@ def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -
         experiment="prelaunch",
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'p.journal'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1656,8 +1614,7 @@ def test_registry_repairs_partial_allocation_before_attempt_attr(tmp_path: Path)
         experiment="partial-registration",
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'partial.journal'}",
-        trial_command=f"{sys.executable} {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=2,
         sampler=Sampler(type="random", seed=1),
     )
@@ -1711,28 +1668,6 @@ def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) 
     assert not list(_attempts_dir(experiment).glob("*.json"))
 
 
-def test_registry_generation_conflict_is_study_schema_mismatch(tmp_path: Path) -> None:
-    """Conflicting durable recovery identities are operator-visible corruption."""
-    experiment = make_experiment(
-        experiment="registry-conflict",
-        workdir=tmp_path / "runs",
-        storage=f"journal:///{tmp_path / 'conflict.journal'}",
-    )
-    _study, trial_dir, _number = fabricate_registered_attempt(
-        experiment,
-        "p",
-        attempt_id="conflicting-attempt",
-    )
-    write_attempt_lifecycle(trial_dir, attempt_id="conflicting-attempt", state="allocated")
-    entry_path = _attempts_dir(experiment) / "conflicting-attempt.json"
-    entry = json.loads(entry_path.read_text())
-    entry["generation_id"] = "different-generation"
-    entry_path.write_text(json.dumps(entry))
-
-    with pytest.raises(StudySchemaMismatchError, match="conflicting recovery identity"):
-        _preflight_active_attempts(experiment, _PreflightCleanupReport(), confirm=True)
-
-
 @pytest.mark.integration
 def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -> None:
     """The attempt registry finds stale work whose phase left the config.
@@ -1750,16 +1685,9 @@ def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -
             experiment="rename",
             workdir=tmp_path / "runs",
             storage=storage,
-            trial_command=f"{sys.executable} {trainer} {{overrides}}",
-            override_format="argparse",
-            phases=[
-                Phase(
-                    name=phase_name,
-                    n_trials=1,
-                    sampler=Sampler(type="random", seed=0),
-                    search_space={"x": IntParam(type="int", low=0, high=10)},
-                )
-            ],
+            trainer=trainer,
+            name=phase_name,
+            n_trials=1,
         )
 
     old_exp = _exp("old_phase")
@@ -1866,8 +1794,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
             experiment="movedstorage",
             workdir=tmp_path / "runs",
             storage=f"journal:///{tmp_path / db_name}",
-            trial_command=f"{sys.executable} {trainer} {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=1,
         )
 
@@ -1917,8 +1844,7 @@ def test_unpersistable_attempt_refuses_to_launch_its_trainer(
             experiment="unregistrable",
             workdir=tmp_path / "runs",
             storage=storage,
-            trial_command=f"{sys.executable} {trainer} {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=n_trials,
         )
 

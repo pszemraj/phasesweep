@@ -31,6 +31,7 @@ from phasesweep.config import (
     ExecutionContext,
     Experiment,
     IntParam,
+    JsonEnvelopeExtractor,
     LogRegexExtractor,
     Metric,
     Phase,
@@ -467,6 +468,17 @@ def copy_fake_train(tmp_path: Path) -> Path:
     shutil.copy(REPO / "src" / "phasesweep" / "examples" / "fake_train.py", trainer)
     return trainer
 
+
+#: The objective the packaged ``fake_train`` example writes to ``result.json``.
+FAKE_TRAIN_METRIC = Metric(
+    name="eval_loss",
+    extractor=JsonEnvelopeExtractor(
+        type="json_envelope",
+        objective_name="eval_loss",
+        split="validation",
+        policy="synthetic",
+    ),
+)
 
 #: The command every runnable-trainer experiment uses, ``trainer`` still to fill in.
 _RUNNABLE_TRIAL_COMMAND = "python {trainer} --out {{trial_dir}}/r.json {{overrides}}"

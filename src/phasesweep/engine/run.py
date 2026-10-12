@@ -303,6 +303,8 @@ def _run_experiment_outcome(
     :raises ProcessCleanupUncertainError: The run failed and post-failure
         reconciliation could not confirm process cleanup; the original failure
         is chained as the cause but is unsafe to handle on its own.
+    :raises PhaseSweepShutdown: A shutdown arrived while the published result was
+        mirrored to MLflow; it is marked ``published_result_committed``.
     :raises BaseException: The run's own failure, re-raised unchanged after the
         generation is durably recorded as failed — or, when reconciliation was
         interrupted by ``KeyboardInterrupt``, ``SystemExit``, or
@@ -430,15 +432,6 @@ def _run_experiment_outcome(
                 run_deadline=run_deadline,
                 publication_hook=publication_hook,
             )
-            terminal_report = _terminal_report_from_cleanup(
-                generation_id,
-                cleanup,
-                primary_error=None,
-                failure_stage=None,
-                winners=result,
-                cleanup_confirmed=True,
-            )
-            return MappingProxyType(dict(result))
         except BaseException as exc:
             terminal_error = exc
             control_error: BaseException | None = None
@@ -499,6 +492,23 @@ def _run_experiment_outcome(
                     error_class=failed_error_class,
                 ),
             )
+            if experiment.mlflow is not None and cleanup.cleanup_confirmed:
+                from phasesweep.tracking.publication import publish_failed_generation
+
+                try:
+                    publish_failed_generation(experiment, generation_id, primary_error, claimed)
+                except ProcessCleanupUncertainError as tracking_exc:
+                    cleanup.mark_uncertain(tracking_exc)
+                    log.exception("MLflow failure delivery cleanup could not be confirmed")
+                except BaseException as tracking_exc:  # noqa: BLE001 - primary error must survive
+                    if (
+                        isinstance(tracking_exc, PhaseSweepShutdown)
+                        and not tracking_exc.report.cleanup_confirmed
+                    ):
+                        cleanup.mark_uncertain(tracking_exc)
+                    log.exception(
+                        "MLflow failure delivery did not complete; preserving the original error"
+                    )
             terminal_report = _terminal_report_from_cleanup(
                 generation_id,
                 cleanup,
@@ -532,6 +542,21 @@ def _run_experiment_outcome(
             if control_error is not None:
                 raise control_error from exc
             raise
+        else:
+            # Outside the except clause: the pointer has committed, so nothing
+            # the MLflow mirror raises may enter the failure handling above.
+            try:
+                if experiment.mlflow is not None:
+                    _mirror_publication(experiment, generation_id, cleanup)
+            finally:
+                terminal_report = _terminal_report_from_cleanup(
+                    generation_id,
+                    cleanup,
+                    primary_error=None,
+                    failure_stage=None,
+                    winners=result,
+                )
+            return MappingProxyType(dict(result))
         finally:
             if terminal_callback is not None:
                 try:
@@ -557,6 +582,51 @@ def _run_experiment_outcome(
                     # signals are honored separately by the signal handler,
                     # not by exceptions leaking out of a diagnostic consumer.
                     log.exception("terminal callback failed; the engine outcome is unchanged")
+
+
+def _mirror_publication(
+    experiment: Experiment,
+    generation_id: str,
+    cleanup: attempt_ops._PreflightCleanupReport,
+) -> None:
+    """Mirror a committed generation to MLflow without changing the run's outcome.
+
+    Once the last-success pointer has committed, nothing may fail the run. An
+    ordinary failure only leaves the mirror for ``phasesweep sync-tracking``,
+    which rebuilds any record this left unsaved. An upload worker whose cleanup
+    is uncertain is recorded as cleanup evidence, and a shutdown still ends the
+    run, marked as arriving after the published result.
+
+    :param Experiment experiment: MLflow-backed experiment.
+    :param str generation_id: Generation whose publication just committed.
+    :param attempt_ops._PreflightCleanupReport cleanup: Cleanup evidence for the
+        terminal report.
+    :raises PhaseSweepShutdown: A shutdown signal arrived during the mirror.
+    """
+    from phasesweep.tracking.publication import publish_generation
+
+    try:
+        publish_generation(experiment, generation_id)
+    except ProcessCleanupUncertainError as exc:
+        cleanup.mark_uncertain(exc)
+        log.exception(
+            "An MLflow upload worker for published generation %s may still be running; the "
+            "published result is unaffected. Run `phasesweep sync-tracking` with the same "
+            "config to retry its cleanup and the uploads.",
+            generation_id,
+        )
+    except PhaseSweepShutdown as exc:
+        if not exc.report.cleanup_confirmed:
+            cleanup.mark_uncertain(exc)
+        exc.published_result_committed = True
+        raise
+    except Exception:
+        log.exception(
+            "MLflow delivery records for published generation %s were not all saved; the "
+            "published result is unaffected. `phasesweep sync-tracking` rebuilds them from "
+            "the published generation.",
+            generation_id,
+        )
 
 
 def _run_experiment_inner(
@@ -818,8 +888,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       projections never establish publication authority.
     * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"``, and ``publication_error`` beside either failure
-      verdict -- the one
-      conditional key in this payload (review v0.5.18 / finding F4). Published
+      verdict -- conditional on that verdict (review v0.5.18 / finding F4). Published
       results that no longer validate are reported as corrupt rather than as
       an experiment that never published. After printing this payload, the CLI
       turns ``"failed"`` into
@@ -833,6 +902,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       (a published phase's local trial identity could not be matched), and
       ``trial_data_available`` (true for known counts, including confirmed
       absence; false when inspection failed).
+    * ``tracking_delivery``: MLflow configs only, last; pending and delivered
+      result-upload counts across every generation, the scope
+      ``phasesweep sync-tracking`` retries by default.
 
     ``read_status``'s summary-derived fields (``metric``, ``result_context``,
     ``published_config_matches_current``, ``summary_present``) are deliberately
@@ -849,7 +921,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     status = read_status(experiment)
     integrity = status["publication_integrity"]
     ledger_path = ledger_ops.resolved_ledger_path(experiment)
-    return {
+    payload: dict[str, object] = {
         "kind": "experiment",
         "experiment": status["experiment"],
         "workdir": str(path_ops._experiment_dir(experiment)),
@@ -868,3 +940,8 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
             experiment, status["phases"], status["published_generation_id"]
         ),
     }
+    if experiment.mlflow is not None:
+        from phasesweep.tracking.publication import delivery_status
+
+        payload["tracking_delivery"] = delivery_status(experiment)
+    return payload

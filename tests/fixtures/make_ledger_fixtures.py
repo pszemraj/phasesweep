@@ -26,7 +26,6 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -60,10 +59,10 @@ TRIAL_COMMAND = f"python -c 'print(\"{OBJECTIVE_TOKEN}={OBJECTIVE_VALUE}\")' {{o
 #: PhaseSweep study schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.state.STUDY_SCHEMA_VERSION``; kept as a literal so this
 #: module names no PhaseSweep import before ``_isolate_environment`` runs.
-TARGET_STUDY_SCHEMA_VERSION = 5
+TARGET_STUDY_SCHEMA_VERSION = 6
 #: Artifact-root binding schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.artifact_roots.ARTIFACT_ROOT_BINDING_SCHEMA_VERSION``.
-TARGET_BINDING_SCHEMA_VERSION = 4
+TARGET_BINDING_SCHEMA_VERSION = 5
 #: Study user attribute holding the PhaseSweep study schema version.
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
 #: Optuna journal op code for ``SET_STUDY_USER_ATTR``.
@@ -152,7 +151,6 @@ class FixtureSpec:
     expect: dict[str, str] | None
     derivation: str
     derived_from: str | None = None
-    apply: Callable[[FixturePaths], None] | None = None
     notes: str = ""
 
 
@@ -204,19 +202,6 @@ FIXTURE_SPECS: tuple[FixtureSpec, ...] = (
         notes="Unedited output of this release on the journal backend.",
     ),
 )
-
-
-def _spec_by_name(name: str) -> FixtureSpec:
-    """Return the spec with a given name.
-
-    :param str name: Fixture name.
-    :return FixtureSpec: The matching spec.
-    :raises KeyError: No spec carries that name.
-    """
-    for spec in FIXTURE_SPECS:
-        if spec.name == name:
-            return spec
-    raise KeyError(name)
 
 
 def _select(only: str | None) -> list[FixtureSpec]:
@@ -468,8 +453,6 @@ def generate(
     )
     paths.ledger_dir.mkdir(parents=True)
     _run_experiment_into(paths, scratch)
-    if spec.apply is not None:
-        spec.apply(paths)
     expect = _computed_expectations(paths, spec.modes)
     if spec.expect is not None and expect != spec.expect:
         raise RuntimeError(

@@ -190,36 +190,40 @@ def test_check_catalog_raises_on_catalog_level_error(tmp_path: Path) -> None:
         check_catalog(catalog)
 
 
-def test_mcp_catalog_rejected_off_linux_before_state_creation(
+@pytest.mark.parametrize(
+    ("patch_target", "value", "match"),
+    [
+        pytest.param(
+            "phasesweep.mcp.registry.sys.platform",
+            "darwin",
+            "supported only on Linux",
+            id="off_linux",
+        ),
+        pytest.param(
+            "phasesweep.mcp.registry.read_proc_starttime",
+            lambda _pid: None,
+            "cannot read this process's Linux /proc start time",
+            id="proc_identity_unavailable",
+        ),
+    ],
+)
+def test_mcp_catalog_rejected_without_linux_process_identity_before_state_creation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    patch_target: str,
+    value: object,
+    match: str,
 ) -> None:
     catalog = write_mcp_config_catalog(
         tmp_path,
         {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
     )
-    monkeypatch.setattr("phasesweep.mcp.registry.sys.platform", "darwin")
+    monkeypatch.setattr(patch_target, value)
 
-    with pytest.raises(CatalogError, match="supported only on Linux"):
+    with pytest.raises(CatalogError, match=match):
         check_catalog(catalog)
-    with pytest.raises(CatalogError, match="supported only on Linux"):
+    with pytest.raises(CatalogError, match=match):
         Registry.load(catalog)
-
-    assert not (tmp_path / "state").exists()
-
-
-def test_mcp_catalog_rejected_when_proc_identity_is_unavailable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    catalog = write_mcp_config_catalog(
-        tmp_path,
-        {"tiny": mcp_experiment_config_text(tmp_path, name="tiny")},
-    )
-    monkeypatch.setattr("phasesweep.mcp.registry.read_proc_starttime", lambda _pid: None)
-
-    with pytest.raises(CatalogError, match="cannot read this process's Linux /proc start time"):
-        check_catalog(catalog)
 
     assert not (tmp_path / "state").exists()
 

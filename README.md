@@ -43,16 +43,14 @@ phases:
       optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-The packaged fake trainer uses the optional `report_objective(...)` envelope
-helper. Your own trainer can report through W&B, ordinary JSON, or logs without
-importing PhaseSweep.
+The packaged fake trainer uses the optional `report_objective(...)` envelope helper. Your own trainer can report through W&B, MLflow, ordinary JSON, or logs.
 
 ## Install and try it
 
 Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
 
 ```bash
-python -m pip install phasesweep
+pip install phasesweep
 phasesweep --version
 
 mkdir phasesweep-demo && cd phasesweep-demo
@@ -61,8 +59,7 @@ phasesweep validate experiment.yaml   # checks it without launching anything
 phasesweep run experiment.yaml        # four tiny trials, a few seconds
 ```
 
-`phasesweep init` never overwrites an existing file; use `-o PATH` for another
-destination.
+`phasesweep init` never overwrites an existing file; use `-o PATH` for another destination.
 
 The run log shows the phase chaining directly (abridged):
 
@@ -96,13 +93,6 @@ effective_overrides:
 # verdicts on the ranked population follow
 ```
 
-The starter uses `storage: auto`, so its ledger and outputs live together under
-`<workdir>/<experiment>/`. The ledger is an Optuna journal: `phasesweep status`
-prints its path, and Optuna's own CLI and dashboard can
-[read it](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspect-the-ledger-with-optuna). See
-[runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md) for state layout, current-format
-requirements, locks, cleanup, GPU isolation, and resume.
-
 ## Use your own trainer
 
 Choose the input interface your trainer already accepts:
@@ -115,28 +105,15 @@ Choose the input interface your trainer already accepts:
 | Nested overrides-only JSON (`json_file`) | `--overrides {overrides_path}` |
 
 > [!TIP]
-> `phasesweep run experiment.yaml --dry-run` prints one rendered command per
-> phase without launching work. Use it to check that your placeholders render
-> what the trainer expects.
+> `phasesweep run experiment.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects.
 
-For ordinary JSON output, pass an output path under `{trial_dir}` to your
-trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`.
-For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT, metric_key: eval/loss}`,
-have the trainer honor the supplied W&B identity, and install the extra:
+For ordinary JSON output, pass an output path under `{trial_dir}` to your trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`. For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT, metric_key: eval/loss}`, have the trainer honor the supplied W&B identity, and install the extra:
 
 ```bash
-python -m pip install "phasesweep[wandb]"
+pip install "phasesweep[wandb]"
 ```
 
-`metric.goal` ranks each trial's selected scalar. Log matching selects the
-last observation by default; W&B selects an exact finished-summary key.
-The trainer owns evaluation, early stopping, checkpoint selection, and
-aggregation. Inheritance transfers parameters, not model weights.
-
-See the [configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md) for input types, reporting,
-credentials, and selection details. The [Tiny Decoder Enwik8
-example](https://github.com/pszemraj/phasesweep/blob/main/examples/tiny_decoder_enwik8/README.md) is a complete real-trainer
-integration.
+For native MLflow metrics, install `phasesweep[mlflow]`, configure an existing experiment in the `mlflow` block, and use `extractor: {type: mlflow, metric_key: eval/loss, select: last}`. See the [MLflow guide](https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md) for both run ownership modes, a complete CPU example, Databricks setup, and retrying result uploads.
 
 ## Connect an agent
 
@@ -146,6 +123,7 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 
 - [Configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md): Experiment YAML, search spaces, inheritance, gates, and objective extractors.
 - [Configuration reference](https://github.com/pszemraj/phasesweep/blob/main/docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
+- [Minimal starting configuration](https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml): one local toy-trainer attempt; validate or run it from the checkout root.
 - [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
 - [MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.
 - [MCP operator reference](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp.md): catalog fields, tools, authorization, run state, and recovery.

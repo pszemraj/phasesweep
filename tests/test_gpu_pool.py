@@ -20,6 +20,7 @@ from phasesweep.config import (
     IntParam,
     Phase,
 )
+from phasesweep.config.models import GpuPolicy
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import open_lock_file
 from phasesweep.runtime.gpu import (
@@ -568,19 +569,29 @@ def test_mig_token_locks_on_the_mig_instance(tmp_path, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("explicit_ids", "explicit_devices", "error_match"),
+    ("explicit_ids", "explicit_devices", "error_match", "policy"),
     [
         pytest.param(
             [0, 1],
             None,
             "Cannot validate configured CUDA device index",
+            "single_per_trial",
             id="numeric-indices",
         ),
         pytest.param(
             None,
             ["0", "GPU-deadbeef"],
             "Cannot validate configured GPU UUID",
+            "single_per_trial",
             id="mixed-token-forms",
+        ),
+        # A declared whole_node world cannot use lock identities that another run may spell as UUIDs.
+        pytest.param(
+            [0, 1],
+            None,
+            "Cannot validate configured CUDA device index",
+            "whole_node",
+            id="whole-node-numeric-indices",
         ),
     ],
 )
@@ -589,15 +600,18 @@ def test_unreadable_uuid_map_rejects_unverified_tokens(
     explicit_ids: list[int] | None,
     explicit_devices: list[str] | None,
     error_match: str,
+    policy: GpuPolicy,
 ) -> None:
     """Unverified numeric and opaque GPU tokens fail closed, not silently."""
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
 
     with pytest.raises(RuntimeError, match=error_match):
         GpuPool.create(
-            n_jobs=2 if explicit_ids is not None else 1,
+            # whole_node is a single-job policy; the other cases keep their original job counts.
+            n_jobs=2 if explicit_ids is not None and policy == "single_per_trial" else 1,
             explicit_ids=explicit_ids,
             explicit_devices=explicit_devices,
+            policy=policy,
         )
 
 
@@ -650,40 +664,29 @@ def test_uuid_map_parser_rejects_placeholder_values(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    "prefix",
+    "spelling",
     [
         pytest.param("GPU-2b23", id="uppercase-prefix"),
         pytest.param("gpu-2b23", id="lowercase-prefix"),
+        # Full UUID spellings are case-insensitive for both validation and locking.
+        pytest.param("gpu-2b234567-89ab-cdef-0123-456789abcdef", id="lowercase-full-uuid"),
     ],
 )
-def test_abbreviated_uuid_prefix_shares_the_full_uuid_lock(tmp_path, monkeypatch, prefix) -> None:
-    """CUDA UUID prefixes, regardless of case, share the full UUID's lock."""
+def test_uuid_spellings_share_the_full_uuid_lock(tmp_path, monkeypatch, spelling) -> None:
+    """CUDA UUID prefixes and lowercase full UUIDs share the full UUID's lock."""
     uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
     monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
     monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
 
-    prefix_pool = GpuPool.create(n_jobs=1, explicit_devices=[prefix])
+    spelled_pool = GpuPool.create(n_jobs=1, explicit_devices=[spelling])
     index_pool = GpuPool.create(n_jobs=1, explicit_ids=[0])
     full_pool = GpuPool.create(n_jobs=1, explicit_devices=[uuid])
 
-    prefix_lock = _gpu_lock_path(prefix_pool._devices[0])
-    assert prefix_lock == _gpu_lock_path(index_pool._devices[0])
-    assert prefix_lock == _gpu_lock_path(full_pool._devices[0])
-    # CUDA receives the inventory spelling, not an abbreviated alias.
-    assert prefix_pool._devices[0].visible_token == uuid
-
-
-def test_lowercase_full_uuid_shares_the_numeric_index_lock(tmp_path, monkeypatch) -> None:
-    """Full UUID spellings are case-insensitive for both validation and locking."""
-    uuid = "GPU-2b234567-89ab-cdef-0123-456789abcdef"
-    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {"0": uuid})
-
-    lowercase = GpuPool.create(n_jobs=1, explicit_devices=[uuid.lower()])
-    by_index = GpuPool.create(n_jobs=1, explicit_ids=[0])
-
-    assert _gpu_lock_path(lowercase._devices[0]) == _gpu_lock_path(by_index._devices[0])
-    assert lowercase._devices[0].visible_token == uuid
+    spelled_lock = _gpu_lock_path(spelled_pool._devices[0])
+    assert spelled_lock == _gpu_lock_path(index_pool._devices[0])
+    assert spelled_lock == _gpu_lock_path(full_pool._devices[0])
+    # CUDA receives the inventory spelling, not an abbreviated or re-cased alias.
+    assert spelled_pool._devices[0].visible_token == uuid
 
 
 def test_lowercase_mig_uuid_rebinds_trainer_visibility_to_inventory_spelling(
@@ -793,45 +796,44 @@ def test_explicit_cpu_visibility_needs_no_gpu_detection_opt_in(monkeypatch) -> N
         assert gid.visible_devices == "-1"
 
 
-def test_ambient_scheduler_sentinel_warns_and_becomes_empty_visibility(monkeypatch, caplog) -> None:
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "NoDevFiles")
-
-    with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
-        pool = GpuPool.create(n_jobs=1)
-
-    with pool.acquire() as gid:
-        assert gid.visible_devices == ""
-    assert any("treating it as empty visibility" in record.message for record in caplog.records)
-
-
-def test_ambient_mixed_disable_sentinel_warns_and_becomes_empty_visibility(
+@pytest.mark.parametrize(
+    ("ambient", "log_fragment"),
+    [
+        pytest.param("NoDevFiles", "treating it as empty visibility", id="scheduler-sentinel"),
+        pytest.param("0,-1", "mixes the '-1' disable sentinel", id="mixed-disable-sentinel"),
+    ],
+)
+def test_ambient_sentinel_warns_and_becomes_empty_visibility(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    ambient: str,
+    log_fragment: str,
 ) -> None:
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,-1")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ambient)
 
     with caplog.at_level(logging.WARNING, logger="phasesweep.runtime.gpu"):
         pool = GpuPool.create(n_jobs=1)
 
     with pool.acquire() as gid:
         assert gid.visible_devices == ""
-    assert any("mixes the '-1' disable sentinel" in record.message for record in caplog.records)
+    assert any(log_fragment in record.message for record in caplog.records)
 
 
-def test_configured_mixed_disable_sentinel_remains_invalid(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        pytest.param("0,-1", "cannot be mixed", id="mixed-disable-sentinel"),
+        pytest.param(",", "not the empty string", id="junk-is-not-a-disable-sentinel"),
+    ],
+)
+def test_configured_invalid_visibility_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str, match: str
 ) -> None:
+    """A configured visibility that mixes the disable sentinel or is junk stays invalid."""
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
 
-    with pytest.raises(RuntimeError, match="cannot be mixed"):
-        GpuPool.create(n_jobs=1, cuda_visible_devices="0,-1")
-
-
-def test_configured_junk_visibility_is_not_a_disable_sentinel(monkeypatch) -> None:
-    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-
-    with pytest.raises(RuntimeError, match="not the empty string"):
-        GpuPool.create(n_jobs=1, cuda_visible_devices=",")
+    with pytest.raises(RuntimeError, match=match):
+        GpuPool.create(n_jobs=1, cuda_visible_devices=value)
 
 
 @pytest.mark.parametrize(
@@ -934,67 +936,67 @@ def test_real_nvidia_smi_resolves_index_zero_to_a_uuid(monkeypatch) -> None:
     assert _gpu_lock_path(pool._devices[0]) == _gpu_lock_path(GpuDevice(uuid_map["0"]))
 
 
-def test_gpu_ids_rejects_negative() -> None:
-    with pytest.raises(ValueError, match="non-negative CUDA device indices"):
+@pytest.mark.parametrize(
+    ("gpu_kwargs", "match"),
+    [
+        pytest.param(
+            {"gpu_ids": [0, -1, 2]},
+            "non-negative CUDA device indices",
+            id="gpu-ids-negative",
+        ),
+        pytest.param(
+            {"gpu_ids": []},
+            "at least one CUDA device index",
+            id="gpu-ids-empty",
+        ),
+        pytest.param(
+            {"gpu_devices": ["GPU-ok", "bad,token"]},
+            "gpu_devices entries",
+            id="gpu-devices-ambiguous-token",
+        ),
+        pytest.param(
+            {"gpu_ids": [0], "gpu_devices": ["GPU-deadbeef"]},
+            "mutually exclusive",
+            id="gpu-ids-and-gpu-devices-exclusive",
+        ),
+        pytest.param(
+            {"n_jobs": 2, "gpu_policy": "whole_node"},
+            "whole_node.*requires n_jobs=1",
+            id="whole-node-requires-single-job",
+        ),
+        # whole_node's device set is the trainer's world size, a semantic input, so leaving it to ambient detection is rejected (review v0.5.17 gap hunt).
+        pytest.param(
+            {"gpu_policy": "whole_node"},
+            "whole_node.*explicit gpu_ids or gpu_devices",
+            id="whole-node-requires-explicit-device-set",
+        ),
+        pytest.param(
+            {"gpu_policy": "none", "gpu_ids": [0]},
+            "cannot be combined",
+            id="none-policy-rejects-explicit-gpu-list",
+        ),
+        # The fingerprint records the declared count, so a repeat is a semantic lie: gpu_ids=[0, 0] would fingerprint a 2-GPU world and lease one card (PR #5 review / reviewer 2, blocker 2).
+        pytest.param(
+            {"gpu_policy": "whole_node", "gpu_ids": [0, 0]},
+            "whole_node.*requires unique device tokens",
+            id="whole-node-duplicate-gpu-ids",
+        ),
+        # Whitespace is not a distinguishing feature: the runtime strips tokens before deduping, so the declared count must be counted post-strip too.
+        pytest.param(
+            {"gpu_policy": "whole_node", "gpu_devices": [" GPU-a ", "GPU-a"]},
+            "whole_node.*requires unique device tokens",
+            id="whole-node-duplicate-gpu-devices-after-stripping",
+        ),
+    ],
+)
+def test_phase_rejects_invalid_gpu_config(gpu_kwargs: dict[str, object], match: str) -> None:
+    """Each invalid GPU declaration is rejected at config validation, not at run time."""
+    with pytest.raises(ValueError, match=match):
         Phase(  # type: ignore[arg-type]
             name="p",
             n_trials=1,
             search_space={"x": IntParam(type="int", low=0, high=1)},
-            gpu_ids=[0, -1, 2],
-        )
-
-
-def test_gpu_ids_rejects_empty() -> None:
-    with pytest.raises(ValueError, match="at least one CUDA device index"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            search_space={"x": IntParam(type="int", low=0, high=1)},
-            gpu_ids=[],
-        )
-
-
-def test_gpu_devices_rejects_ambiguous_tokens() -> None:
-    with pytest.raises(ValueError, match="gpu_devices entries"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            search_space={"x": IntParam(type="int", low=0, high=1)},
-            gpu_devices=["GPU-ok", "bad,token"],
-        )
-
-
-def test_gpu_ids_and_gpu_devices_are_mutually_exclusive() -> None:
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            search_space={"x": IntParam(type="int", low=0, high=1)},
-            gpu_ids=[0],
-            gpu_devices=["GPU-deadbeef"],
-        )
-
-
-def test_gpu_policy_whole_node_requires_single_job() -> None:
-    with pytest.raises(ValueError, match="whole_node.*requires n_jobs=1"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            n_jobs=2,
-            gpu_policy="whole_node",
-            search_space={"x": IntParam(type="int", low=0, high=1)},
-        )
-
-
-def test_gpu_policy_whole_node_requires_explicit_device_set() -> None:
-    """whole_node's device set is the trainer's world size — a semantic input —
-    so leaving it to ambient detection is rejected (review v0.5.17 gap hunt)."""
-    with pytest.raises(ValueError, match="whole_node.*explicit gpu_ids or gpu_devices"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            gpu_policy="whole_node",
-            search_space={"x": IntParam(type="int", low=0, high=1)},
+            **gpu_kwargs,
         )
 
 
@@ -1018,31 +1020,6 @@ def test_gpu_policy_none_parallel_requires_explicit_no_isolation_opt_in() -> Non
     )
 
 
-def test_gpu_policy_none_rejects_explicit_gpu_lists() -> None:
-    with pytest.raises(ValueError, match="cannot be combined"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            gpu_policy="none",
-            gpu_ids=[0],
-            search_space={"x": IntParam(type="int", low=0, high=1)},
-        )
-
-
-def test_gpu_policy_whole_node_rejects_duplicate_gpu_ids() -> None:
-    """The fingerprint records the declared count, so a repeat is a semantic lie:
-    gpu_ids=[0, 0] would fingerprint a 2-GPU world and lease one card
-    (PR #5 review / reviewer 2, blocker 2)."""
-    with pytest.raises(ValueError, match="whole_node.*requires unique device tokens"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            gpu_policy="whole_node",
-            gpu_ids=[0, 0],
-            search_space={"x": IntParam(type="int", low=0, high=1)},
-        )
-
-
 def test_gpu_policy_whole_node_accepts_distinct_gpu_ids() -> None:
     phase = Phase(  # type: ignore[arg-type]
         name="p",
@@ -1053,19 +1030,6 @@ def test_gpu_policy_whole_node_accepts_distinct_gpu_ids() -> None:
     )
 
     assert phase.gpu_ids == [0, 1]
-
-
-def test_gpu_policy_whole_node_rejects_duplicate_gpu_devices_after_stripping() -> None:
-    """Whitespace is not a distinguishing feature: the runtime strips tokens
-    before deduping, so the declared count must be counted post-strip too."""
-    with pytest.raises(ValueError, match=r"whole_node.*requires unique device tokens"):
-        Phase(  # type: ignore[arg-type]
-            name="p",
-            n_trials=1,
-            gpu_policy="whole_node",
-            gpu_devices=[" GPU-a ", "GPU-a"],
-            search_space={"x": IntParam(type="int", low=0, high=1)},
-        )
 
 
 def test_single_per_trial_still_accepts_duplicate_device_tokens() -> None:
@@ -1126,11 +1090,3 @@ def test_single_per_trial_still_dedupes_aliased_tokens_with_a_warning(monkeypatc
 
     assert [device.visible_token for device in pool._devices] == ["0"]
     assert any("same physical GPU" in record.message for record in caplog.records)
-
-
-def test_whole_node_fails_closed_when_uuid_resolution_is_unavailable(monkeypatch) -> None:
-    """A declared world cannot use lock identities that another run may spell as UUIDs."""
-    monkeypatch.setattr("phasesweep.runtime.gpu._detect_gpu_uuid_map", lambda: {})
-
-    with pytest.raises(RuntimeError, match="Cannot validate configured CUDA device index"):
-        GpuPool.create(n_jobs=1, explicit_ids=[0, 1], policy="whole_node")

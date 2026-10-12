@@ -244,6 +244,7 @@ def _winner_source_snapshot(
     """Return the concrete source model for a stored or engine-returned winner.
 
     :param PhaseWinnerView | Winner winner: Winner whose source should be captured.
+    :raises RuntimeError: The winner carries no source provenance.
     :return WinnerSourceSnapshot: Concrete, validated source snapshot.
     """
     source = winner.source
@@ -266,6 +267,9 @@ def _winner_snapshot(
 
     :param str phase: Phase under which the winner is exposed.
     :param PhaseWinnerView | Winner winner: Winner representation to serialize.
+    :raises RuntimeError: A ``PhaseWinnerView`` carries no confound verdicts, or either
+        representation carries no source provenance.
+    :raises ValueError: A stored ``Winner``'s confound block fails validation.
     :return WinnerSnapshot: Validated path-free winner snapshot.
     """
     if isinstance(winner, Winner):

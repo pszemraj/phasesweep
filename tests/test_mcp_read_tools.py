@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -66,7 +68,9 @@ from tests.mcp_helpers import (
     _write_experiment_config,
     make_mcp_app,
     make_run_handle,
+    side_effect_app,
     stage_dead_run,
+    stage_live_run,
     write_mcp_catalog,
     write_run_status,
 )
@@ -139,15 +143,7 @@ def test_run_tools_read_launched_config_snapshot_after_catalog_edit(
     _app, registry, store = make_mcp_app(catalog)
     reg = registry.get("srv")
     run_id = "srv-launched"
-    snapshot = config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-        )
-    )
+    stage_live_run(store, run_id, config, reg.id)
     if method_name == "winners":
         run_experiment(experiment, generation_id=run_id)
     _write_experiment_config(config, _drift_experiment(tmp_path, trainer, phase_name="edited"))
@@ -177,15 +173,7 @@ def test_winners_by_run_id_defaults_to_redacted_params_after_decatalog(
     app, _registry, store = make_mcp_app(
         write_mcp_catalog(tmp_path, {"other": other_config}, visible_params={"other": "all"})
     )
-    snapshot = old_config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id="old",
-            config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        )
-    )
+    stage_live_run(store, run_id, old_config, "old")
 
     result = app.winners(run_id=run_id)
 
@@ -206,15 +194,7 @@ def test_decataloged_live_run_leaves_config_drift_unknown(tmp_path: Path) -> Non
 
     other_config = _config(tmp_path, name="other")
     app, _registry, store = make_mcp_app(write_mcp_catalog(tmp_path, {"other": other_config}))
-    snapshot = old_config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id="old",
-            config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        )
-    )
+    stage_live_run(store, run_id, old_config, "old")
 
     status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
@@ -232,8 +212,7 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
     tmp_path: Path,
     method_name: str,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     run_id = "srv-mismatch"
     snapshot = config.read_bytes()
     store.config_snapshot_path(run_id).write_bytes(snapshot)
@@ -252,14 +231,17 @@ def test_run_tools_reject_config_snapshot_hash_mismatch(
             getattr(app, method_name)(run_id=run_id)
 
 
-@pytest.mark.parametrize("method_name", ["status", "winners"])
+@pytest.mark.parametrize("method_name", ["status", "winners", "await_run"])
 def test_read_tools_require_a_known_run_id(tmp_path: Path, method_name: str) -> None:
     config = _config(tmp_path)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))
     method = getattr(app, method_name)
 
     with pytest.raises(UnknownRunError, match="unknown run id"):
-        method("nope-123")
+        outcome = method("nope-123")
+        # ``await_run`` is a coroutine function: the lookup runs once it is awaited.
+        if inspect.iscoroutine(outcome):
+            asyncio.run(outcome)
 
 
 @pytest.mark.parametrize("read_method", ["status", "winners"])
@@ -471,13 +453,33 @@ def test_run_scoped_snapshot_recomputes_config_drift_against_current_catalog(
     assert (results.metric.name, results.metric.goal) == ("x", "minimize")
 
 
+def _overwrite_the_winner(experiment: Experiment, run_id: str) -> None:
+    """Replace the live winner artifact of ``run_id`` with unreadable content."""
+    _generation_winner_path(experiment, run_id, "p").write_text("broken: true\n")
+
+
+def _remove_the_publication_pointer(experiment: Experiment, run_id: str) -> None:
+    """Delete the live last-successful-generation pointer (``run_id`` is unused)."""
+    _last_successful_generation_path(experiment).unlink()
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        pytest.param(_overwrite_the_winner, id="later_artifact_corruption"),
+        pytest.param(_remove_the_publication_pointer, id="publication_pointer_removal"),
+    ],
+)
 @pytest.mark.integration
-def test_run_scoped_snapshot_survives_later_artifact_corruption(tmp_path: Path) -> None:
+def test_run_scoped_snapshot_survives_live_publication_damage(
+    tmp_path: Path,
+    damage: Callable[[Experiment, str], None],
+) -> None:
+    """Frozen run reads stay ok after the live winner or publication pointer is damaged."""
     run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
     app, _registry, _store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
-    winner_path = _generation_winner_path(experiment, run_id, "p")
-    winner_path.write_text("broken: true\n")
+    damage(experiment, run_id)
 
     status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
     results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
@@ -521,25 +523,6 @@ def test_run_scoped_snapshot_keeps_captured_generation_pointers(tmp_path: Path) 
     assert after_publication.published_generation_id == run_id
     assert after_publication.represented_generation_id == run_id
     assert after_publication.is_published is True
-
-
-@pytest.mark.integration
-def test_run_scoped_snapshot_survives_publication_pointer_removal(
-    tmp_path: Path,
-) -> None:
-    run_id, _trainer, _config, catalog = _record_published_run_snapshot(tmp_path)
-    app, _registry, _store = make_mcp_app(catalog)
-    experiment = app._registry.get("srv").experiment
-    _last_successful_generation_path(experiment).unlink()
-
-    status = GetRunStatusResult.model_validate(app.status(run_id=run_id))
-    results = GetRunResultsResult.model_validate(app.winners(run_id=run_id))
-
-    assert status.publication_integrity == "ok"
-    assert status.is_published is True
-    assert status.phases[0].winner_present is True
-    assert results.publication_integrity == "ok"
-    assert results.winner_count == 1
 
 
 @pytest.mark.parametrize("config_snapshot_damage", ["missing", "corrupt"])
@@ -948,16 +931,7 @@ def test_run_winner_visibility_intersects_launch_and_restarted_catalog_policy(
     store = RunStore(launch_registry.state_dir)
     reg = launch_registry.get("srv")
     run_id = "srv-historical"
-    snapshot = config.read_bytes()
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
-    store.create(
-        make_run_handle(
-            run_id=run_id,
-            experiment_id=reg.id,
-            config_sha256=reg.config_sha256,
-            visible_params_at_launch=reg.visible_params,
-        )
-    )
+    stage_live_run(store, run_id, config, reg.id, visible_params_at_launch=reg.visible_params)
     run_experiment(experiment, generation_id=run_id)
     (published,) = read_winners(experiment)
     expected = published.params["lr"] if visible else "<redacted>"
@@ -1031,17 +1005,10 @@ def test_read_tools_use_live_view_while_result_snapshot_is_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _config(tmp_path)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    config, app, registry, store = side_effect_app(tmp_path)
     reg = registry.get("srv")
     run_id = "srv-live-pending-finalization"
-    handle = make_run_handle(
-        run_id=run_id,
-        experiment_id=reg.id,
-        config_sha256=reg.config_sha256,
-    )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(config.read_bytes())
+    stage_live_run(store, run_id, config, reg.id)
     write_run_status(
         store,
         run_id,

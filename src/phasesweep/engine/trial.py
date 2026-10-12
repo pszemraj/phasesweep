@@ -38,6 +38,7 @@ from phasesweep.evidence.evaluation import (
     locate_objective_position,
     run_extractor,
 )
+from phasesweep.evidence.mlflow import compile_query as compile_mlflow_query
 from phasesweep.evidence.models import JsonEnvelopeExtractor, compose_wandb_environment
 from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
@@ -156,6 +157,8 @@ def _trainer_environment(
     :param str phase_name: Phase whose remote consumers manage W&B identity.
     :param bool require_wandb_online: Reject offline/disabled W&B modes when the
         caller is preparing new remote work.
+    :raises PhaseSweepError: The W&B environment cannot be composed because explicit
+        settings conflict or remote logging is disabled (``FIX_CONFIG``).
     :return dict[str, str]: The composed trainer environment.
     """
     contract = experiment.execution.inherit_env
@@ -189,6 +192,15 @@ def _trainer_environment(
         # remains trainer-owned. An ambient/inherited ID is not stable trial
         # semantics and must not split the persistent-study cohort.
         env.pop("WANDB_RUN_ID", None)
+    if experiment.mlflow is not None:
+        env.pop("MLFLOW_RUN_ID", None)
+        env.pop("MLFLOW_EXPERIMENT_NAME", None)
+        env["MLFLOW_TRACKING_URI"] = experiment.mlflow.tracking_uri
+        if experiment.mlflow.experiment_id is not None:
+            env["MLFLOW_EXPERIMENT_ID"] = experiment.mlflow.experiment_id
+        else:
+            env.pop("MLFLOW_EXPERIMENT_ID", None)
+            env["MLFLOW_EXPERIMENT_NAME"] = str(experiment.mlflow.experiment_name)
     return env
 
 
@@ -448,6 +460,18 @@ def _failed_trial(
     )
 
 
+def trial_run_name(experiment: Experiment, phase_name: str, trial_id: int, attempt_id: str) -> str:
+    """Name one attempt the same way for its trainer and its tracking run.
+
+    :param Experiment experiment: Experiment whose name leads the run name.
+    :param str phase_name: Running phase.
+    :param int trial_id: Optuna trial number.
+    :param str attempt_id: Attempt identity.
+    :return str: The ``{run_name}`` placeholder and ``PHASESWEEP_RUN_NAME`` value.
+    """
+    return f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+
+
 def prepare_trainer_input(
     *,
     experiment: Experiment,
@@ -476,7 +500,7 @@ def prepare_trainer_input(
     resolved_path = trial_dir / "overrides_resolved.json"
     atomic_write_text(resolved_path, resolved_text)
 
-    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+    run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
     filename = TRAINER_INPUT_FILENAMES[experiment.override_format]
     if experiment.override_format == "yaml_file":
         text = dump_trial_trainer_config_yaml(
@@ -576,7 +600,7 @@ def launch_trial(
     # forcing trial dirs private would break normal operator/tool visibility
     # into logs and resolved overrides. See docs/runtime.md's trust-boundary
     # section.
-    run_name = f"{experiment.experiment}-{phase_name}-{trial_id}-{attempt_id}"
+    run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
     trainer_input = prepared_input or prepare_trainer_input(
         experiment=experiment,
         phase_name=phase_name,
@@ -619,6 +643,15 @@ def launch_trial(
     # Without a W&B evidence consumer, monitoring remains trainer-owned: keep
     # any configured/ambient W&B identity unchanged. Trainers can still bind
     # monitoring to this attempt explicitly through PHASESWEEP_ATTEMPT_ID.
+    if experiment.mlflow is not None:
+        from phasesweep.runtime.json import json_text
+        from phasesweep.tracking.session import read_binding, read_record
+
+        expected = read_record(workdir / "mlflow-expected.json")
+        env.pop("MLFLOW_EXPERIMENT_NAME", None)
+        env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
+        if experiment.mlflow.run_mode == "managed":
+            env["MLFLOW_RUN_ID"] = read_binding(workdir)["run_id"]
     trainer_cwd = _resolved_execution_cwd(experiment)
     env["PHASESWEEP_TRIAL_DIR"] = str(workdir)
     env["PHASESWEEP_TRIAL_ID"] = str(trial_id)
@@ -681,6 +714,9 @@ def launch_trial(
         duration_seconds=proc_result.duration_seconds,
         wandb_environment=env if wandb_query is not None else None,
         wandb_query=wandb_query,
+        mlflow_settings=None if experiment.mlflow is None else experiment.mlflow.target(),
+        mlflow_query=compile_mlflow_query(experiment, phase.gates),
+        mlflow_environment=env if experiment.mlflow is not None else None,
     )
 
     return ExecutedTrial(
@@ -887,6 +923,8 @@ def extract_trial_result(
             feasible = False
 
     gate_results = evaluate_gates(executed.ctx, gates or [], deadline=deadline)
+    if executed.ctx.mlflow_capture:
+        objective_provenance["remote_capture"] = dict(executed.ctx.mlflow_capture)
     if executed.ctx.wandb_capture:
         objective_provenance["remote_capture"] = dict(executed.ctx.wandb_capture)
     failed_gates = [gate for gate in gate_results if not gate.passed]

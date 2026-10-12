@@ -45,6 +45,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.tiers import _dotted
+
 SRC = Path(__file__).resolve().parent.parent / "src"
 PACKAGE_ROOT = SRC / "phasesweep"
 
@@ -215,24 +217,6 @@ def _parse(path: Path, relpath: str | None) -> tuple[ast.Module, dict[str, str]]
     """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     return tree, _alias_table(tree, _package(path, relpath))
-
-
-def _dotted(node: ast.expr) -> str | None:
-    """Flatten a ``Name``/``Attribute`` chain into a dotted string.
-
-    :param ast.expr node: Expression to flatten.
-    :return str | None: Dotted source text, or ``None`` when the chain is not
-        a pure attribute access on a bare name (e.g. ``self.conn.connect``).
-    """
-    parts: list[str] = []
-    current: ast.expr = node
-    while isinstance(current, ast.Attribute):
-        parts.append(current.attr)
-        current = current.value
-    if not isinstance(current, ast.Name):
-        return None
-    parts.append(current.id)
-    return ".".join(reversed(parts))
 
 
 def _resolve(dotted: str, aliases: dict[str, str]) -> str | None:

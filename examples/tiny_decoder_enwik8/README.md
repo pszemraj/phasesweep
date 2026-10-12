@@ -15,9 +15,7 @@ The submodule checkout also brings the [dataset](upstream/data/README.md): `upst
 
 For MCP runs, install the [MCP extra](../../docs/mcp_setup.md#1-install-the-mcp-extra) as well.
 
-Review the pinned trainer's [device and precision support](upstream/README.md#device-selection--precision)
-and [requirements](upstream/README.md#requirements) before extending this example.
-Make trainer changes upstream, then update the submodule pointer here.
+Review the pinned trainer's [device and precision support](upstream/README.md#device-selection--precision) and [requirements](upstream/README.md#requirements) before extending this example. Make trainer changes upstream, then update the submodule pointer here.
 
 ## CLI smoke sweep
 
@@ -44,29 +42,44 @@ A fresh study targets nine terminal trial attempts (3 phases x 3 attempts, 1000 
 
 The upstream trainer records periodic validation with labels 0, 100, ..., 900, after that iteration's optimizer update, then saves `final.pt` at step 1000. After training exits, `run_trial.py` reloads that checkpoint and evaluates it once with the same validation settings. Only this step-1000 `final_checkpoint` evaluation is published through `report_objective(...)`; the periodic log minimum is not used. The configured [`json_envelope` extractor](../../docs/config.md#objective-evidence-constraints-and-gates) validates that report.
 
-Checkpoint loading and final evaluation belong to this example's trainer
-wrapper. PhaseSweep reads the reported scalar and checks its envelope metadata;
-it does not evaluate models. Other trainers can use ordinary JSON, log matching,
-or finished W&B summaries without the envelope helper. Phase inheritance carries
-selected parameter values, not checkpoint weights.
+Checkpoint loading and final evaluation belong to this example's trainer wrapper. See [objective evidence](../../docs/config.md#objective-evidence-constraints-and-gates) for other reporting formats and [phase composition](../../docs/config.md#phase-composition) for inheritance.
 
 The example sweeps only supported trainer controls. The upstream template does not expose warmup ratio or grouped-query attention, and its SwiGLU feedforward rounds hidden width to a multiple of 256. At `dim: 128`, `ffn_dim_multiplier` values up to 2.0 therefore build the same 256-wide feedforward layer.
 
+## Native MLflow GPU smoke
+
+The [MLflow smoke configuration](mlflow_gpu_smoke.yaml) uses the same two learning rates, model, and ten-batch budget as the local GPU fixture. It runs one trial at a time on CUDA device `0`. Complete the trainer setup above, then install the MLflow client and matching local server:
+
+```bash
+pip install "phasesweep[mlflow]" "mlflow==3.17.0"
+```
+
+Start the [local tracking server](../../docs/mlflow.md#run-the-cpu-example-locally). In another terminal, run from the PhaseSweep repository root. Create the experiment once; if it already exists, reuse it:
+
+```bash
+python -c 'from mlflow import MlflowClient; c = MlflowClient(tracking_uri="http://127.0.0.1:5000"); c.get_experiment_by_name("phasesweep-tiny-decoder") or c.create_experiment("phasesweep-tiny-decoder")'
+phasesweep validate examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
+phasesweep run examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
+phasesweep show-winners examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
+phasesweep status examples/tiny_decoder_enwik8/mlflow_gpu_smoke.yaml
+```
+
+The wrapper's `--mlflow` option logs the evaluated `final.pt` loss as native `val_loss` at step `10`, with trainer parameters and evaluation/device tags. It logs `runtime/cuda=1` when final evaluation uses CUDA; a native constraint requires that value before a trial can win. Periodic upstream validation losses remain local and do not enter the objective. In this mode, the objective comes from MLflow rather than a JSON envelope. The pinned upstream trainer is unchanged.
+
+The default `mlflow.run_mode: managed` resumes PhaseSweep's supplied run. To check trainer ownership, copy the configuration, change `run_mode` to `trainer`, and choose a fresh `experiment` and `workdir`. The wrapper then creates its run, calls `bind_mlflow_run`, and closes it after evaluation. Both modes publish results and a generation summary to the same configured MLflow experiment. Open `http://127.0.0.1:5000` to inspect the native metrics and `phasesweep.*` results. See [MLflow tracking](../../docs/mlflow.md) for ownership, selectors, offline replay, and pending-upload recovery.
+
+Unlike `gpu_smoke.yaml`, this variant uses persistent storage: a completed `run` is reused without training again. For fresh trials, copy the config with a new local experiment name and workdir. When placing a copy outside the repo, set `execution.cwd` to the absolute PhaseSweep repository path so the relative trainer command still resolves. To use another server, change `mlflow.tracking_uri` and provision `mlflow.experiment_name` there first.
+
 ## MCP smoke
 
-For the same two-trial, 10-batch check through MCP, start from [`gpu_smoke.yaml`](gpu_smoke.yaml)
-instead of the full MCP experiment. Following the [fresh MCP state
-requirement](../../docs/mcp.md#fresh-mcp-state), copy it into a new scratch
-directory from the repo root:
+For the same two-trial, 10-batch check through MCP, start from [`gpu_smoke.yaml`](gpu_smoke.yaml) instead of the full MCP experiment. Following the [fresh MCP state requirement](../../docs/mcp.md#fresh-mcp-state), copy it into a new scratch directory from the repo root:
 
 ```bash
 mkdir -p /tmp/phasesweep-tiny-decoder-mcp-smoke
 cp examples/tiny_decoder_enwik8/gpu_smoke.yaml /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml
 ```
 
-In that copy, replace or add these **root keys**, using your actual absolute
-repo path for `execution.cwd`. Keep its trainer configuration, metric, and
-two-trial phase unchanged:
+In that copy, replace or add these **root keys**, using your actual absolute repo path for `execution.cwd`. Keep its trainer configuration, metric, and two-trial phase unchanged:
 
 ```yaml
 experiment: tiny_decoder_enwik8_mcp_smoke
@@ -79,22 +92,14 @@ execution:
   cwd: /absolute/path/to/phasesweep
 ```
 
-These root-key changes preserve the smoke search while satisfying the
-[persistent storage and absolute path requirements for MCP](../../docs/mcp.md#the-catalog).
+These root-key changes preserve the smoke search while satisfying the [persistent storage and absolute path requirements for MCP](../../docs/mcp.md#the-catalog).
 
 ```bash
 phasesweep validate /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml
 phasesweep mcp init-catalog --from /tmp/phasesweep-tiny-decoder-mcp-smoke/experiment.yaml -o /tmp/phasesweep-tiny-decoder-mcp-smoke/catalog.yaml
 ```
 
-Review the generated catalog, enable `allow.launch`, and set `visible_params:
-all` if the agent should report the winning learning rate. Follow the
-[MCP client setup](../../docs/mcp_setup.md), authorize the two-trial smoke,
-then use the [status response workflow](../../docs/mcp.md#reading-status-responses).
-A completed persistent smoke is
-reused on a later launch; choose a new experiment name and scratch directory
-when you want two fresh trials. GPU leasing does not impose a VRAM quota:
-verify the workload and monitor GPU memory separately when sharing a device.
+Review the generated catalog, enable `allow.launch`, and set `visible_params: all` if the agent should report the winning learning rate. Follow the [MCP client setup](../../docs/mcp_setup.md), authorize the two-trial smoke, then use the [status response workflow](../../docs/mcp.md#reading-status-responses). A completed persistent smoke is reused on a later launch; choose a new experiment name and scratch directory when you want two fresh trials. GPU leasing does not impose a VRAM quota: verify the workload and monitor GPU memory separately when sharing a device.
 
 ## MCP full sweep
 
@@ -106,7 +111,4 @@ phasesweep mcp check --catalog examples/tiny_decoder_enwik8/catalog.yaml
 
 Configure your client with the absolute `phasesweep-mcp` executable and this catalog's absolute path, then verify the read-only catalog operation as described in [MCP setup](../../docs/mcp_setup.md#3-configure-your-client).
 
-The MCP variant uses scratch `workdir`, storage, and state paths under
-`/tmp/phasesweep-mcp-tiny-decoder-enwik8`; choose a fresh root before the first
-run as described in the [fresh MCP state](../../docs/mcp.md#fresh-mcp-state)
-section.
+The MCP variant uses scratch `workdir`, storage, and state paths under `/tmp/phasesweep-mcp-tiny-decoder-enwik8`; choose a fresh root before the first run as described in the [fresh MCP state](../../docs/mcp.md#fresh-mcp-state) section.

@@ -27,7 +27,8 @@ trainer_config:
 
 metric:
   # This toy trainer chooses the optional envelope reporter. Existing trainers
-  # may use json, log_regex, or wandb without a PhaseSweep reporting import.
+  # may use json, log_regex, wandb, or mlflow (with a top-level mlflow block)
+  # without a PhaseSweep reporting import.
   name: eval_loss
   goal: minimize
   # Goal ranks trial scalars; the trainer owns evaluation and aggregation.

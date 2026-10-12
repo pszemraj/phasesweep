@@ -90,6 +90,7 @@ from phasesweep.engine.trial import (
     extract_trial_result,
     launch_trial,
     prepare_trainer_input,
+    trial_run_name,
 )
 from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
@@ -652,7 +653,7 @@ class _PhaseExecution:
             self.study.stop()
 
     def record_fatal(self, error: BaseException) -> None:
-        """Record the first fatal objective exception and stop peer launches.
+        """Record the first fatal objective or post-trial exception and stop peer launches.
 
         First-writer wins so the root failure is not replaced by secondary
         peer-prune or persistence fallout. The original exception object keeps
@@ -911,6 +912,41 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     trial.set_user_attr(TRIAL_DIR_ATTR, str(trial_dir))
     # GPU lease covers only subprocess lifetime, not extraction (#2).
     try:
+        _refuse_launch_after_deadline(run)
+        prepared_input = prepare_trainer_input(
+            experiment=experiment,
+            phase_name=phase.name,
+            trial_id=trial.number,
+            attempt_id=attempt_id,
+            trial_dir=trial_dir,
+            overrides=overrides,
+        )
+        trial.set_user_attr(TRAINER_INPUT_ATTR, prepared_input.record())
+        if experiment.mlflow is not None:
+            from phasesweep.tracking.session import prepare_attempt
+
+            try:
+                prepare_attempt(
+                    experiment,
+                    phase=phase.name,
+                    generation_id=run.generation_id,
+                    attempt_id=attempt_id,
+                    run_name=trial_run_name(experiment, phase.name, trial.number, attempt_id),
+                    overrides_sha256=prepared_input.sha256,
+                    inherited=run.inherited_winners,
+                    directory=trial_dir,
+                    environment=run.environment_identity.values,
+                    deadline=run.optimize_deadline,
+                )
+            except UnsafeProcessCleanupError:
+                raise
+            except (OSError, ValueError, RuntimeError) as exc:
+                reason = f"MLflow run preparation: {exc}"
+                log.warning("[%s/trial_%d] %s", phase.name, trial.number, reason)
+                trial.set_user_attr(FAILURE_REASON_ATTR, reason)
+                if run.optimize_deadline is not None and time.monotonic() >= run.optimize_deadline:
+                    raise _DeadlineTrialExecutionError(reason) from exc
+                raise TrialExecutionError(reason) from exc
         with run.gpu_pool.acquire(deadline=run.optimize_deadline) as gpu_assignment:
             # Re-check abort flags inside the lease (review v0.5.2 / blocker 8,
             # extended to fatal objective errors). Without this, queued
@@ -923,19 +959,6 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             if run.aborted:
                 raise optuna.TrialPruned("phase aborted")
 
-            _refuse_launch_after_deadline(run)
-            prepared_input = prepare_trainer_input(
-                experiment=experiment,
-                phase_name=phase.name,
-                trial_id=trial.number,
-                attempt_id=attempt_id,
-                trial_dir=trial_dir,
-                overrides=overrides,
-            )
-            # Persist the historical input identity before the trainer is
-            # started. If this ledger write fails, no subprocess consumes
-            # evidence that the study cannot later verify.
-            trial.set_user_attr(TRAINER_INPUT_ATTR, prepared_input.record())
             _refuse_launch_after_deadline(run)
             executed = launch_trial(
                 experiment=experiment,
@@ -1148,12 +1171,39 @@ def _after_trial(
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
 ) -> None:
-    """Post-trial callback: re-assert a tripped abort and snapshot ``trials.csv``.
+    """Settle one finished trial, routing an escaping failure through the fatal channel.
+
+    Optuna never retrieves the futures of its final ``n_jobs > 1`` batch, so
+    an exception escaping this callback there would vanish and the phase
+    could publish with cleanup reported confirmed. Recording it first makes
+    every ``n_jobs`` setting raise it after the workers drain, as for
+    objective errors, and stops queued launches. The trial's accepted Optuna
+    state is untouched. A shutdown is a cancellation, never a fatal error.
+
+    :param _PhaseExecution run: The phase execution the trial belongs to.
+    :param optuna.Study study: The running Optuna study.
+    :param optuna.trial.FrozenTrial trial: The just-finished trial.
+    """
+    try:
+        _settle_finished_trial(run, study, trial)
+    except PhaseSweepShutdown:
+        raise
+    except BaseException as exc:
+        run.record_fatal(exc)
+        raise
+
+
+def _settle_finished_trial(
+    run: _PhaseExecution,
+    study: optuna.Study,
+    trial: optuna.trial.FrozenTrial,
+) -> None:
+    """Retire cleaned attempts, mirror MLflow outcomes, and snapshot CSV.
 
     The threshold decision itself lives in ``_record_outcome``, inside the
     objective's completion-order critical section — a callback observing a
     mutable aggregate counter is race-prone under ``n_jobs > 1`` (review
-    v0.5.17 / blocker 7). This callback only repeats ``study.stop()`` in
+    v0.5.17 / blocker 7). This callback repeats ``study.stop()`` in
     case the tripping thread's stop call failed transiently.
 
     Args:
@@ -1178,6 +1228,16 @@ def _after_trial(
         and not _trial_requires_cleanup_recovery(trial)
     ):
         _retire_active_attempt(run.experiment, finished_attempt)
+    if run.experiment.mlflow is not None and trial.state == optuna.trial.TrialState.COMPLETE:
+        from phasesweep.tracking.publication import publish_trial
+
+        publish_trial(run.experiment, run.generation_id, trial, run.environment_identity.values)
+    elif run.experiment.mlflow is not None and not _trial_requires_cleanup_recovery(trial):
+        from phasesweep.tracking.publication import publish_unaccepted_trial
+
+        publish_unaccepted_trial(
+            run.experiment, run.generation_id, trial, run.environment_identity.values
+        )
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
     now = time.monotonic()
     if run.csv_throttle.should_write(finished, now):
@@ -1433,9 +1493,12 @@ def _run_phase(
 
     from phasesweep.config.models import _wandb_query
     from phasesweep.evidence.wandb import require_wandb_sdk
+    from phasesweep.tracking.mlflow import require_mlflow_sdk
 
     if _wandb_query(experiment, phase.gates) is not None:
         require_wandb_sdk()
+    if experiment.mlflow is not None:
+        require_mlflow_sdk()
 
     gpu_pool = GpuPool.create(
         n_jobs=phase.n_jobs,
@@ -1447,6 +1510,16 @@ def _run_phase(
     )
     budget = _phase_budget(phase, run_deadline)
     assert generation_id is not None
+    if experiment.mlflow is not None:
+        from phasesweep.tracking.session import require_tracking_target
+
+        log.info("phase=%s checking MLflow target %s", phase.name, experiment.mlflow.tracking_uri)
+        require_tracking_target(
+            experiment,
+            generation_id=generation_id,
+            environment=environment_identity.values,
+            deadline=budget.deadline,
+        )
     run = _PhaseExecution(
         experiment=experiment,
         phase=phase,
@@ -1507,7 +1580,8 @@ def _run_phase(
                 _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
 
         # Optuna's threaded path can absorb any uncaught objective exception
-        # after marking that trial FAIL. Re-raise the first one before timeout,
+        # after marking that trial FAIL, and any callback exception in its
+        # final batch. Re-raise the first one before timeout,
         # soft abort, completeness, or winner-selection logic can relabel it.
         run.raise_if_fatal()
     except _TrialOutcomeUnrecordedAbort as exc:

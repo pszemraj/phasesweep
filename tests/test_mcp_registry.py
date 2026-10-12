@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import textwrap
 from pathlib import Path
-from urllib.parse import quote
 
 import pytest
 
@@ -334,22 +333,22 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
             "storage must be null, auto, or a journal",
             id="memory-shorthand-refused-at-config-load",
         ),
-        # These are valid journal URLs at config load, so the registry's own
-        # path-stability checks are what refuse them.
+        pytest.param(
+            '"journal://"',
+            "journal URL names no file",
+            id="empty-journal-url-refused-at-config-load",
+        ),
+        pytest.param(
+            '"journal:///"',
+            "journal URL names no file",
+            id="empty-journal-path-refused-at-config-load",
+        ),
+        # This is a valid journal URL at config load, so the registry's own
+        # path-stability check is what refuses it.
         pytest.param(
             '"journal:///relative.journal"',
             "absolute .*journal storage path",
             id="relative-journal",
-        ),
-        pytest.param(
-            '"journal://"',
-            "non-empty absolute .*journal storage path",
-            id="empty-journal-url",
-        ),
-        pytest.param(
-            '"journal:///"',
-            "non-empty absolute .*journal storage path",
-            id="empty-journal-path",
         ),
     ],
 )
@@ -528,18 +527,6 @@ def test_missing_storage_rejected(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config))
 
 
-def test_persistent_journal_uri_file_storage_allowed(tmp_path: Path) -> None:
-    storage = f'"journal:///file:{quote(str(tmp_path / "uri.journal"), safe="/")}?uri=true"'
-    config = _write(
-        tmp_path / "exp.yaml",
-        _experiment_yaml(tmp_path).replace(f"journal:///{tmp_path}/reg_ok.journal", storage),
-    )
-
-    registry = Registry.load(_catalog(tmp_path, config))
-
-    assert registry.get("reg_ok").experiment.storage == storage.strip('"')
-
-
 def test_config_not_found_rejected(tmp_path: Path) -> None:
     with pytest.raises(CatalogError, match="not found"):
         Registry.load(_catalog(tmp_path, tmp_path / "nope.yaml"))
@@ -551,15 +538,19 @@ def test_unsafe_catalog_id_rejected(tmp_path: Path) -> None:
         Registry.load(_catalog(tmp_path, config, entry_id="bad-id.evil"))
 
 
-def test_max_concurrent_runs_defaults_to_one(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("max_concurrent_runs", "expected"),
+    [
+        pytest.param(None, 1, id="defaults_to_one"),
+        pytest.param(3, 3, id="override"),
+    ],
+)
+def test_max_concurrent_runs(
+    tmp_path: Path, max_concurrent_runs: int | None, expected: int
+) -> None:
     config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    assert Registry.load(_catalog(tmp_path, config)).max_concurrent_runs == 1
-
-
-def test_max_concurrent_runs_override(tmp_path: Path) -> None:
-    config = _write(tmp_path / "exp.yaml", _experiment_yaml(tmp_path))
-    reg = Registry.load(_catalog(tmp_path, config, max_concurrent_runs=3))
-    assert reg.max_concurrent_runs == 3
+    reg = Registry.load(_catalog(tmp_path, config, max_concurrent_runs=max_concurrent_runs))
+    assert reg.max_concurrent_runs == expected
 
 
 def test_permission_flags_propagate(tmp_path: Path) -> None:

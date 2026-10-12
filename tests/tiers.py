@@ -77,10 +77,11 @@ PROCESS_PRIMITIVES: dict[str, frozenset[str]] = {
 OS_SPAWN_PREFIX = "spawn"
 
 #: Bare call names of shared helpers that manage a real process. ``runner_main``
-#: drives a full detached-run lifecycle in pytest's own process. ``reaped_pid``
+#: drives a full detached-run lifecycle in pytest's own process, and
+#: ``run_claimed_runner`` claims a reservation and then drives it. ``reaped_pid``
 #: in conftest is deliberately absent: it runs ``true`` to completion before
 #: returning, so the calling test neither manages a live process nor waits.
-PROCESS_DRIVER_CALLS = frozenset({"runner_main"})
+PROCESS_DRIVER_CALLS = frozenset({"runner_main", "run_claimed_runner"})
 
 #: Bare call names of shared helpers that wait on the wall clock.
 WALLCLOCK_HELPER_CALLS = frozenset({"wait_for_mcp_running_trial"})

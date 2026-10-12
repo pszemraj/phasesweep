@@ -13,17 +13,13 @@ from phasesweep.config import (
     Constraint,
     Experiment,
     LogRegexExtractor,
-    Metric,
     Phase,
     RequiredFileGate,
     Sampler,
 )
+from tests.conftest import make_experiment
 
-
-def _metric() -> Metric:
-    return Metric(
-        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
-    )
+_ECHO_METRIC_COMMAND = "echo x=1 {overrides}"
 
 
 def _phase(*, explicitly_empty: bool = False) -> Phase:
@@ -37,17 +33,22 @@ def _phase(*, explicitly_empty: bool = False) -> Phase:
     )
 
 
-def _experiment(path: Path, phase: Phase, **options: Any) -> Experiment:
-    return Experiment(
+def _experiment(
+    path: Path,
+    phase: Phase,
+    *,
+    trial_command: str = _ECHO_METRIC_COMMAND,
+    constraints: list[Constraint] | None = None,
+    env: dict[str, str] | None = None,
+) -> Experiment:
+    return make_experiment(
         experiment="revalidation",
-        workdir=str(path),
+        workdir=path,
         storage="auto",
-        provenance={"trainer": "test-shell-v1"},
-        trial_command="echo x=1 {overrides}",
-        override_format="argparse",
-        metric=_metric(),
+        trial_command=trial_command,
         phases=[phase],
-        **options,
+        constraints=constraints,
+        env=env,
     )
 
 
@@ -134,15 +135,10 @@ def test_revalidation_preserves_attached_environment(
     """An added environment value reaches the trainer instead of being discarded."""
     monkeypatch.delenv("PHASESWEEP_REVALIDATION_VALUE", raising=False)
     options: dict[str, Any] = {"env": {}} if explicitly_empty else {}
-    experiment = Experiment(
-        experiment="revalidation",
-        workdir=str(tmp_path / "runs"),
-        storage="auto",
-        provenance={"trainer": "test-shell-v1"},
+    experiment = _experiment(
+        tmp_path / "runs",
+        _phase(),
         trial_command='echo x="$PHASESWEEP_REVALIDATION_VALUE" {overrides}',
-        override_format="argparse",
-        metric=_metric(),
-        phases=[_phase()],
         **options,
     )
     experiment.env["PHASESWEEP_REVALIDATION_VALUE"] = "0.125"
@@ -150,17 +146,42 @@ def test_revalidation_preserves_attached_environment(
     assert run_experiment(experiment)["p"].metric == 0.125
 
 
-@pytest.mark.parametrize("level", ["experiment", "phase"])
-def test_revalidation_rejects_unknown_copied_field(tmp_path: Path, level: str) -> None:
-    """A misspelled copied timeout is rejected before artifacts or trials exist."""
+@pytest.mark.parametrize(
+    ("level", "update", "match"),
+    [
+        pytest.param(
+            "experiment",
+            {"timeout_seconds_per_rnu": 5},
+            "Extra inputs are not permitted",
+            id="experiment_unknown_field",
+        ),
+        pytest.param(
+            "phase",
+            {"timeout_seconds_per_trail": 5},
+            "Extra inputs are not permitted",
+            id="phase_unknown_field",
+        ),
+        pytest.param(
+            "phase", {"n_trials": True}, "numbers, not booleans", id="phase_boolean_n_trials"
+        ),
+    ],
+)
+def test_revalidation_rejects_invalid_copied_field(
+    tmp_path: Path, level: str, update: dict[str, object], match: str
+) -> None:
+    """The library boundary rejects model_copy updates that skipped validation.
+
+    A misspelled copied timeout or a boolean copied into ``n_trials`` is rejected
+    before artifacts or trials exist.
+    """
     experiment = _experiment(tmp_path / "runs", _phase())
     if level == "phase":
-        phase = experiment.phases[0].model_copy(update={"timeout_seconds_per_trail": 5})
+        phase = experiment.phases[0].model_copy(update=update)
         experiment = experiment.model_copy(update={"phases": [phase]})
     else:
-        experiment = experiment.model_copy(update={"timeout_seconds_per_rnu": 5})
+        experiment = experiment.model_copy(update=update)
 
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+    with pytest.raises(ValidationError, match=match):
         run_experiment(experiment)
 
     assert not (tmp_path / "runs").exists()
@@ -174,13 +195,10 @@ def test_revalidation_rejects_nested_mutations_before_artifacts(
 ) -> None:
     import phasesweep.engine.run as run_engine
 
-    experiment = Experiment(
+    experiment = make_experiment(
         experiment="mutated",
-        workdir=str(tmp_path / "runs"),
-        storage=None,
-        trial_command="echo x=1 {overrides}",
-        override_format="argparse",
-        metric=_metric(),
+        workdir=tmp_path / "runs",
+        trial_command=_ECHO_METRIC_COMMAND,
         phases=[_phase()],
     )
     if mutation == "phase":

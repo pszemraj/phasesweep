@@ -329,6 +329,11 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
         earlier winners from disk.
     :param bool dry_run: Render example commands without launching subprocesses.
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
+    :raises ConfigError: The config file cannot be parsed or fails model validation.
+    :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a
+        ``PhaseSweepShutdown`` from an interrupted run is re-raised unchanged.
+    :raises UnsafeProcessCleanupError: A trial's cleanup was refused; the message gains
+        the ``phasesweep run`` retry advice.
     """
     _configure_logging(verbose)
     # Install before config parsing so CLI SIGINT/SIGTERM behavior and exit
@@ -572,6 +577,37 @@ def status(config_path: Path) -> None:
     payload = experiment_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
     _raise_on_failed_publication(payload)
+
+
+@cli.command(
+    "sync-tracking",
+    context_settings=CONTEXT_SETTINGS,
+    help="Retry pending MLflow uploads without training or metric selection.",
+)
+@click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
+@click.option(
+    "--generation",
+    "generation_id",
+    default=None,
+    help="Retry only this generation's uploads instead of every pending one.",
+)
+def sync_tracking(config_path: Path, generation_id: str | None) -> None:
+    """Retry retained native MLflow result projections.
+
+    :param Path config_path: Matching experiment configuration.
+    :param str | None generation_id: Generation to synchronize, or ``None`` for all.
+    :raises ClickException: Target mismatch or incomplete delivery.
+    """
+    from phasesweep.tracking.publication import sync_tracking as sync
+
+    config = _load_cli_config(config_path)
+    try:
+        counts = sync(config, generation_id)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(yaml.safe_dump(counts, sort_keys=False).rstrip())
+    if counts["pending"]:
+        raise click.ClickException("MLflow uploads remain pending.")
 
 
 @cli.group(

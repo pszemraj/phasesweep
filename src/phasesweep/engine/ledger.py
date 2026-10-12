@@ -106,12 +106,14 @@ from phasesweep.runtime.files import fsync_directory, journal_file_path
 
 __all__ = [
     "ClaimedLedger",
+    "PhaseTrials",
     "ValidatedLedger",
     "claim_ledger",
     "open_existing_study",
     "open_phase_study",
     "open_preview_study",
     "open_registry_study",
+    "read_phase_trials",
     "read_trial_stats",
     "repair_incomplete_journal_record",
     "resolved_ledger_path",
@@ -143,7 +145,8 @@ class ValidatedLedger:
     nothing else. The type split does not keep this handle away from live
     storage, though: :func:`open_existing_study` takes it and returns a live,
     writable study. Pure read paths never call that opener; they read through
-    :func:`read_trial_stats`, which never constructs file-backed storage.
+    :func:`read_trial_stats` or :func:`read_phase_trials`, which never
+    construct file-backed storage.
     Outside this module, the one caller that opens existing studies live on
     this handle is MCP recovery. Because it reaps and tells trials through
     them, it applies the per-study artifact-root ownership check itself before
@@ -196,6 +199,10 @@ class ClaimedLedger(ValidatedLedger):
     #: objects, so a second, luckier read can never hand recovery a study whose
     #: root was never checked.
     studies: Mapping[str, optuna.Study]
+    #: The one storage every phase of a ``"memory"`` ledger shares, so the
+    #: invocation can still read its own trials after a phase fails; ``None``
+    #: for a journal ledger.
+    memory_storage: optuna.storages.InMemoryStorage | None
 
 
 def _resolve_storage(url: str | None) -> Any:
@@ -997,7 +1004,7 @@ def open_existing_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.S
 
     The study returned is live: it is built on the ledger's real backend and
     can be written through, so this is not a read path's opener (those use
-    :func:`read_trial_stats`). It never creates a study or a ledger
+    :func:`read_trial_stats` or :func:`read_phase_trials`). It never creates a study or a ledger
     file, because absence is settled first by a read-only probe (a complete
     journal snapshot), and the live replay must then agree with that snapshot
     (:func:`_open_existing_journal_study`). It checks nothing about which
@@ -1075,6 +1082,69 @@ def read_trial_stats(
             for phase in ledger.experiment.phases
         }
     return _trial_stats(ledger, published_trials)
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseTrials:
+    """One phase study's trials and its confirmed cleanup recoveries, from one snapshot.
+
+    Trial numbers are study-local, so :attr:`cleanup_recovered` answers only
+    for the trials beside it, never for another phase's study.
+    """
+
+    #: The study's trials, with their historical attributes exactly as recorded.
+    trials: list[optuna.trial.FrozenTrial]
+    #: Numbers of this study's trials whose cleanup uncertainty a recovery
+    #: confirmed. Recovery never rewrites the trial's own attributes, so this
+    #: study-level ledger is the only place the confirmation is recorded.
+    cleanup_recovered: frozenset[int]
+
+
+def read_phase_trials(ledger: ValidatedLedger, phase: Phase | str) -> PhaseTrials | None:
+    """Read one phase's trials from a validated ledger, writing nothing.
+
+    A journal is read from one complete snapshot, as :func:`read_trial_stats`
+    reads it, so no file-backed storage is constructed and no study is
+    created. A memory ledger holds trials only inside the invocation that
+    claimed it, so only that :class:`ClaimedLedger` can answer. The trials and
+    the study's cleanup recovery ledger come from the same snapshot, so they
+    describe the same moment.
+
+    :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
+    :param Phase | str phase: Phase or historical phase name whose study is read.
+    :return PhaseTrials | None: The study's trials and confirmed cleanup
+        recoveries, or ``None`` when no such study exists or this handle cannot reach it.
+    :raises StudyStorageUnavailableError: The handle's format scan did not
+        complete, or the journal could not be completely read.
+    :raises StudySchemaMismatchError: The study is populated under an unsupported schema.
+    """
+    # attempts imports this module at load time, so the recovery ledger's parser is reached late.
+    from phasesweep.engine.attempts import _cleanup_recovered_trial_numbers
+
+    failure = ledger.format_scan_failure
+    if failure is not None:
+        raise type(failure).rewrap(failure, str(failure)) from failure
+    study_name = _phase_study_name(ledger.experiment, phase)
+    study: optuna.Study | None
+    if ledger.backend == "memory":
+        if not isinstance(ledger, ClaimedLedger) or ledger.memory_storage is None:
+            return None
+        try:
+            study = optuna.load_study(study_name=study_name, storage=ledger.memory_storage)
+        except KeyError:
+            return None
+    else:
+        assert ledger.storage_url is not None
+        study = _load_journal_study_snapshot(ledger.storage_url, study_name)
+        if study is None:
+            return None
+    trials = study.get_trials(deepcopy=False)
+    _validate_storage_versions(
+        [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
+    )
+    return PhaseTrials(
+        trials=trials, cleanup_recovered=frozenset(_cleanup_recovered_trial_numbers(study))
+    )
 
 
 # Creating a directory fails with these when the configured path itself is
@@ -1225,6 +1295,7 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
         binding_state="bound",
         format_scan_failure=None,
         studies=MappingProxyType(loaded),
+        memory_storage=optuna.storages.InMemoryStorage() if ledger.backend == "memory" else None,
     )
 
 
@@ -1259,7 +1330,12 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
             f"{type(ledger).__name__}."
         )
     experiment = ledger.experiment
-    study = _build_phase_study(experiment, phase, _resolve_storage(ledger.storage_url))
+    storage = (
+        ledger.memory_storage
+        if ledger.memory_storage is not None
+        else _resolve_storage(ledger.storage_url)
+    )
+    study = _build_phase_study(experiment, phase, storage)
     _bind_study_artifact_root(study, experiment)
     return study
 

@@ -63,6 +63,8 @@ class ValidatedPublication:
     """The validated generation summary."""
     phase_plan: tuple[PlannedPhase, ...]
     """The recorded phase plan, whose names are safe path components."""
+    inherits: Mapping[str, tuple[str, ...]]
+    """Each planned phase's parents, from the validated config snapshot."""
     metric: Mapping[str, Any]
     """The summary's metric semantics, checked against the config snapshot."""
     winners: Mapping[str, ValidatedWinner]
@@ -304,7 +306,7 @@ def _validate_generation_manifest(
         if key in listed:
             raise _fail(f"duplicate artifact entry for {key}")
         listed[key] = entry
-    _validate_generation_provenance_files(
+    inherits = _validate_generation_provenance_files(
         generation_dir,
         summary,
         listed_files,
@@ -450,6 +452,7 @@ def _validate_generation_manifest(
         generation_id=generation_id,
         summary=summary,
         phase_plan=phase_plan,
+        inherits=inherits,
         metric=metric,
         winners=winners,
     )
@@ -664,7 +667,7 @@ def _validate_generation_provenance_files(
     listed_files: Mapping[str, Mapping[str, Any]],
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
-) -> None:
+) -> Mapping[str, tuple[str, ...]]:
     """Validate a generation's claim-time provenance files against its manifest.
 
     Extends the manifest invariant -- every listed artifact exists and hashes
@@ -695,6 +698,7 @@ def _validate_generation_provenance_files(
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
+    :return Mapping[str, tuple[str, ...]]: Each snapshot phase's parents, in plan order.
     """
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
@@ -769,6 +773,18 @@ def _validate_generation_provenance_files(
         raise fail("config_snapshot artifact has malformed metric semantics") from exc
     if summary.get("metric") != _metric_semantics_payload(snapshot_metric):
         raise fail("summary metric semantics disagree with the config_snapshot artifact")
+
+    # Rebuilding a generation's lineage reads this graph, never the current
+    # config's, so every parent must name a phase planned before its child.
+    inherits: dict[str, tuple[str, ...]] = {}
+    for phase in snapshot_phases:
+        parents = phase.get("inherits")
+        if not isinstance(parents, list) or any(
+            not isinstance(parent, str) or parent not in inherits for parent in parents
+        ):
+            raise fail("config_snapshot artifact has a malformed inheritance graph")
+        inherits[phase["name"]] = tuple(parents)
+    return inherits
 
 
 @dataclass(frozen=True)

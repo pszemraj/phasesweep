@@ -55,8 +55,7 @@ def test_aborted_phase_is_not_published_by_identical_noop_retry(tmp_path: Path) 
     exp = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{db}",
-        trial_command=f"python {trainer} {{overrides}}",
-        override_format="argparse",
+        trainer=trainer,
         n_trials=3,
         max_consecutive_failures=2,
         sampler={"type": "random", "seed": 7},
@@ -90,8 +89,7 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
         return make_experiment(
             workdir=tmp_path / "runs",
             storage=storage,
-            trial_command=f"python {trainer} {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=n_trials,
             max_consecutive_failures=2,
             sampler={"type": "random", "seed": 7},
@@ -138,8 +136,7 @@ def test_topup_after_abort_runs_new_work_and_clears_durable_abort(tmp_path: Path
         return make_experiment(
             workdir=tmp_path / "runs",
             storage=f"journal:///{db}",
-            trial_command=f"python {trainer} {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=n_trials,
             max_consecutive_failures=2,
             sampler={"type": "random", "seed": 7},
@@ -175,8 +172,7 @@ def test_supported_topup_preserves_consecutive_failure_streak(tmp_path: Path) ->
         return make_experiment(
             workdir=tmp_path / "runs",
             storage=f"journal:///{db}",
-            trial_command=f"python {trainer} {{overrides}}",
-            override_format="argparse",
+            trainer=trainer,
             n_trials=n_trials,
             max_consecutive_failures=3,
             sampler={"type": "random", "seed": 7},

@@ -47,6 +47,7 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
+    TrackingTargetUnavailableError,
     TrialTargetRegressionError,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
@@ -78,6 +79,7 @@ FailureCode: TypeAlias = Literal[
     "artifact_root_conflict",
     "study_schema_mismatch",
     "storage_unavailable",
+    "tracking_unavailable",
     "published_study_missing",
     "sampler_continuation_unsupported",
     "trial_target_regression",
@@ -207,6 +209,7 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (StudySchemaMismatchError, "study_schema_mismatch"),
     (PublishedStudyMissingError, "published_study_missing"),
     (StudyStorageUnavailableError, "storage_unavailable"),
+    (TrackingTargetUnavailableError, "tracking_unavailable"),
     # An unwritable workdir still fits the storage category.
     (ActiveAttemptPersistenceError, "storage_unavailable"),
     (SamplerContinuationUnsupportedError, "sampler_continuation_unsupported"),

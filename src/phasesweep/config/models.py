@@ -43,9 +43,10 @@ from phasesweep.evidence.models import (
 )
 from phasesweep.runtime.files import (
     canonical_storage_identity,
+    file_url_path,
     local_storage_url,
-    storage_backend,
 )
+from phasesweep.tracking.models import MlflowSettings
 
 OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
 
@@ -362,7 +363,7 @@ class Phase(_Frozen):
         default=False,
         description=(
             "Grid phases must run the full matrix by default. Set true to permit "
-            "n_trials smaller than the grid cardinality."
+            "n_trials smaller than the grid cardinality. Valid only with sampler.type grid."
         ),
     )
     allow_seed_search: bool = Field(
@@ -383,8 +384,11 @@ class Phase(_Frozen):
             v: The candidate phase name.
 
         Returns:
-            The same name, unchanged. Raises ``ValueError`` if any character
-            is disallowed or the name collides with engine-managed records.
+            The same name, unchanged.
+
+        Raises:
+            ValueError: Any character is disallowed, or the name collides with
+                engine-managed records.
 
         """
         v = _validate_safe_name("Phase", v)
@@ -394,6 +398,8 @@ class Phase(_Frozen):
             raise ValueError(
                 "Phase name 'generations' is reserved for immutable generation records."
             )
+        if v.casefold() == "tracking":
+            raise ValueError("Phase name 'tracking' is reserved for MLflow tracking records.")
         return v
 
     @model_validator(mode="after")
@@ -452,6 +458,19 @@ class Phase(_Frozen):
                     "allow_seed_search: true for an explicit variance audit."
                 )
         return self
+
+
+def _is_environment_name(name: str) -> bool:
+    """Return whether ``name`` can be the name of a process environment variable.
+
+    ``os.execve`` raises ``ValueError`` for an empty name, a name containing
+    ``=``, and any name or value containing NUL, and no ambient variable can
+    carry such a name.
+
+    :param str name: Candidate environment variable name.
+    :return bool: ``True`` when the name is nonempty and holds no ``=`` or NUL.
+    """
+    return bool(name) and "=" not in name and "\x00" not in name
 
 
 class ExecutionContext(_Frozen):
@@ -517,20 +536,40 @@ class ExecutionContext(_Frozen):
         ),
     )
 
+    @field_validator("cwd")
+    @classmethod
+    def _cwd_is_nonempty(cls, value: str | None) -> str | None:
+        """Reject an empty trainer working directory.
+
+        :param str | None value: Configured trainer working directory.
+        :raises ValueError: The path is the empty string.
+        :return str | None: The validated path, unchanged.
+        """
+        if value == "":
+            raise ValueError(
+                "execution.cwd must be a nonempty path; omit it to run trainers in the "
+                "directory phasesweep is started from."
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_inherit_names(self) -> ExecutionContext:
-        """Reject empty or whitespace-only inherited-variable names.
+        """Reject inherited-variable names that no environment variable can have.
 
-        :raises ValueError: A listed variable name is empty or padded.
+        :raises ValueError: A listed variable name is empty, padded, or contains
+            ``=`` or NUL, or a name list repeats a name or the two lists overlap.
         :return ExecutionContext: Self, unchanged.
         """
         named_contracts = {"passthrough_env": self.passthrough_env}
         if isinstance(self.inherit_env, list):
             named_contracts["inherit_env"] = self.inherit_env
         for label, names in named_contracts.items():
-            bad = [name for name in names if not name or name != name.strip()]
+            bad = [name for name in names if name != name.strip() or not _is_environment_name(name)]
             if bad:
-                raise ValueError(f"{label} names must be nonempty and unpadded: {bad!r}")
+                raise ValueError(
+                    f"{label} names must be nonempty and unpadded, with no '=' or NUL "
+                    f"character: {bad!r}"
+                )
             if len(set(names)) != len(names):
                 raise ValueError(f"{label} names must be unique.")
         if isinstance(self.inherit_env, list):
@@ -579,6 +618,7 @@ class Experiment(_Frozen):
         ),
     )
     override_format: OverrideFormat = "yaml_file"
+    mlflow: MlflowSettings | None = None
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
     phases: list[Phase] = Field(min_length=1)
@@ -621,25 +661,78 @@ class Experiment(_Frozen):
     @field_validator("storage")
     @classmethod
     def _storage_is_local(cls, value: str | None) -> str | None:
-        """Allow only null, auto, and local journal storage.
+        """Allow only null, auto, and local journal storage that names a plain file.
 
         :param str | None value: Configured Optuna storage locator.
         :raises ValueError: The locator is not null, ``"auto"``, or a
-            ``journal:///`` URL.
+            ``journal:///`` URL with the exact lowercase scheme, or the URL
+            carries a query or fragment, or its path is empty.
         :return str | None: The validated locator, unchanged.
         """
         if value is None or value == "auto":
             return value
-        backend = storage_backend(value)
-        if backend != "journal":
+        if value.split(":", 1)[0] != "journal":
             raise ValueError(
-                "storage must be null, auto, or a journal:/// URL; got "
-                f"{value!r}. PhaseSweep keeps its persistent ledger in an Optuna "
-                "journal file: use `storage: auto` for <workdir>/<experiment>/study.journal, "
+                "storage must be null, auto, or a journal:/// URL with the lowercase "
+                f"scheme journal; got {value!r}. PhaseSweep keeps its persistent ledger "
+                "in an Optuna journal file: use `storage: auto` for "
+                "<workdir>/<experiment>/study.journal, "
                 "`storage: journal:///path/to/study.journal` for an explicit file, or "
                 "`storage: null` for an in-memory dry run."
             )
+        if "?" in value or "#" in value:
+            raise ValueError(
+                "storage journal URLs cannot carry a query or fragment, because everything "
+                f"from the first ? or # on is dropped from the file path; got {value!r}. "
+                "Remove it. To keep the journal under a directory whose name contains ? or #, "
+                "use `storage: auto` with that workdir."
+            )
+        if file_url_path(value) == "":
+            raise ValueError(
+                f"storage journal URL names no file; got {value!r}. Write "
+                "`storage: journal:///path/to/study.journal`."
+            )
         canonical_storage_identity(value)
+        return value
+
+    @field_validator("workdir")
+    @classmethod
+    def _workdir_is_nonempty(cls, value: str) -> str:
+        """Reject an empty artifact-root directory.
+
+        :param str value: Configured per-trial directory root.
+        :raises ValueError: The path is the empty string.
+        :return str: The validated path, unchanged.
+        """
+        if value == "":
+            raise ValueError(
+                "workdir must be a nonempty path; write '.' to use the directory "
+                "phasesweep is started from, or omit workdir for ./runs."
+            )
+        return value
+
+    @field_validator("env")
+    @classmethod
+    def _env_is_launchable(cls, value: dict[str, str]) -> dict[str, str]:
+        """Reject trainer environment entries that ``os.execve`` cannot pass.
+
+        :param dict[str, str] value: Configured trainer environment overrides.
+        :raises ValueError: A name is empty or contains ``=`` or NUL, or a value
+            contains NUL.
+        :return dict[str, str]: The validated mapping, unchanged.
+        """
+        bad_names = [name for name in value if not _is_environment_name(name)]
+        if bad_names:
+            raise ValueError(
+                "env names must be nonempty and contain no '=' or NUL character, because "
+                f"the trainer launch cannot pass them: {bad_names!r}. Rename or remove them."
+            )
+        bad_values = [name for name, text in value.items() if "\x00" in text]
+        if bad_values:
+            raise ValueError(
+                "env values cannot contain NUL, because the trainer launch cannot pass "
+                f"them; fix the value of {bad_values!r}."
+            )
         return value
 
     @model_validator(mode="after")
@@ -793,6 +886,9 @@ class Experiment(_Frozen):
             _validate_sampler_resumability(self.resolved_storage, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
+            from phasesweep.evidence.mlflow import compile_query
+
+            compile_query(self, phase.gates)
             query = _wandb_query(self, phase.gates, gate_location=f"phases[{len(seen)}].gates")
             if query is not None:
                 compose_wandb_environment(query, self.env, self.env)
@@ -981,26 +1077,22 @@ def _format_field_names(template: str) -> set[str]:
 
     ``string.Formatter().parse()`` walks the template the same way
     ``str.format`` does and reports only true field references, with escaped
-    braces handled correctly.
+    braces handled correctly. Fields nested inside a format spec, as in
+    ``{trial_dir:{phase}}``, are included. Names are returned as written, so a
+    field with an attribute or index accessor (``{m.name}``, ``{a[0]}``) keeps
+    its accessor and the caller can refuse it.
 
-    Field expressions like ``{trial_dir!s}``, ``{m.name}``, and ``{a[0]}`` all
-    have the *root* name extracted (``trial_dir``, ``m``, ``a``) so a check
-    like ``"overrides" in fields`` does the right thing.
-
-    Args:
-        template: A ``str.format``-style template string.
-
-    Returns:
-        The set of root field names actually referenced (escaped ``{{...}}``
-        excluded; attribute and item accessors collapsed to the root name).
-
+    :param str template: A ``str.format``-style template string.
+    :raises ValueError: The template has unbalanced braces.
+    :return set[str]: Field names actually referenced (escaped ``{{...}}`` excluded).
     """
     fields: set[str] = set()
-    for _literal, field_name, _format_spec, _conversion in string.Formatter().parse(template):
+    for _literal, field_name, format_spec, _conversion in string.Formatter().parse(template):
         if field_name is None:
             continue
-        root = field_name.split(".", 1)[0].split("[", 1)[0]
-        fields.add(root)
+        fields.add(field_name)
+        if format_spec:
+            fields |= _format_field_names(format_spec)
     return fields
 
 
@@ -1021,6 +1113,8 @@ def _validate_trial_command_template(
     Catches at config-load (not at trial-launch, three minutes into a sweep):
 
     * Typos like ``{trail_dir}`` or any other unknown ``{placeholder}``.
+    * Attribute or index access on a placeholder (``{trial_dir.name}``,
+      ``{trial_dir[0]}``), which ``str.format`` would apply to the rendered string.
     * Unbalanced braces (``{trial_dir`` -> ``str.format`` raises ``ValueError``).
     * The primary ``yaml_file`` mode missing ``{config_path}``.
     * Phases using the explicit ``argparse`` compatibility format with
@@ -1041,9 +1135,9 @@ def _validate_trial_command_template(
             whether ``{overrides}`` is required for scalar/list CLI formats.
 
     Raises:
-        ValueError: Any of the failure modes listed above (typo, unbalanced
-            braces, missing required placeholder for the chosen
-            ``override_format``).
+        ValueError: Any of the failure modes listed above (typo, attribute or
+            index access, unbalanced braces, missing required placeholder for
+            the chosen ``override_format``).
 
     """
     # Lazy import to avoid a circular config <-> overrides cycle.
@@ -1086,6 +1180,15 @@ def _validate_trial_command_template(
             f"Phase {phase.name!r}: trial_command failed to render — "
             f"{type(exc).__name__}: {exc}. Check for unbalanced braces."
         ) from exc
+
+    accessed = sorted(name for name in fields if "." in name or "[" in name)
+    if accessed:
+        shown = ", ".join(f"{{{name}}}" for name in accessed)
+        raise ValueError(
+            f"Phase {phase.name!r}: trial_command placeholders cannot use attribute or "
+            f"index access; found {shown}. Write the bare placeholder, such as "
+            "{trial_dir}, and do any path or string manipulation in the command itself."
+        )
 
     try:
         render_command(

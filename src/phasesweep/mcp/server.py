@@ -127,14 +127,15 @@ PublicationIntegrity = Annotated[
     McpPublicationState,
     Field(
         description=(
-            "Whether this experiment's recorded publication still validates. 'ok': it does. "
-            "'absent': nothing has ever published here, which is normal for a new experiment "
-            "and for one whose first run has not finished. 'failed': a publication WAS "
-            "recorded but its artifacts no longer validate, so every result field reads as "
+            "Publication validation for this result view. Terminal responses preserve "
+            "snapshot-time validation rather than rechecking the current publishing tree. "
+            "'ok': the publication passed validation. 'absent': no publication was "
+            "recorded in this view, which is normal before the first publication. "
+            "'failed': a publication was recorded but failed validation, so result fields read as "
             "if nothing published. On 'failed', report the corruption to the operator and do "
             "not launch a run against this experiment: a successful run advances the "
             "publication pointer past the corrupt result and nothing reports it afterwards. "
-            "'permission_denied': the publication may be healthy, but this user cannot "
+            "'permission_denied': the publication may be healthy, but the server could not "
             "validate its owner-only evidence; expose no winners and ask the operator to "
             "re-read it as the publishing user or restore read permission. 'unknown': the "
             "terminal placeholder could not inspect publication state; expose no winners "
@@ -362,6 +363,13 @@ class PhaseStatusPayload(_ToolPayload):
     )
 
 
+class TrackingDeliveryPayload(_ToolPayload):
+    """Mutable path-free upload counts, separate from accepted scientific facts."""
+
+    pending: int
+    delivered: int
+
+
 class GetRunStatusResult(_ToolPayload):
     """Structured output for get_run_status."""
 
@@ -416,6 +424,15 @@ class GetRunStatusResult(_ToolPayload):
     phases: list[PhaseStatusPayload]
     summary_present: bool
     run: RunPayload
+    tracking_delivery: TrackingDeliveryPayload | None = Field(
+        default=None,
+        description=(
+            "This run's own MLflow result-upload counts, read live even for a terminal run. "
+            "Null when the run does not use MLflow or its launch config is unavailable. "
+            "Pending uploads never change accepted scores or winners; report them to the "
+            "operator instead of launching another run."
+        ),
+    )
     elapsed_seconds: int | None = Field(
         description=(
             "Seconds since launch while running; total run duration once terminal; "

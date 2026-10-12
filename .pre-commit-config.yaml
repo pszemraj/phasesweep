@@ -43,11 +43,19 @@ repos:
         entry: bash scripts/check_module_size.sh
         language: system
         files: ^(src|tests)/.*\.py$
+      # Any, typing.cast and `# type: ignore` on a line the commit adds. The
+      # script reads the staged diff itself, so it takes no file arguments.
+      - id: typing-escapes
+        name: typing escapes
+        entry: python scripts/check_typing_escapes.py
+        language: system
+        files: ^(src|tests)/.*\.py$
+        pass_filenames: false
       # Runs on every commit: the contracts span all of src/ and the pytest
       # configuration.
       - id: contract-tests
         name: contract tests
-        entry: pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py -q -p no:cacheprovider
+        entry: pytest tests/test_ledger_contract.py tests/test_error_routing.py tests/test_tier_guard.py tests/test_ledger_read_paths.py -q -p no:cacheprovider
         language: system
         pass_filenames: false
         always_run: true

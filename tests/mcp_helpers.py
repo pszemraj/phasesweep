@@ -9,10 +9,11 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Required, TypedDict, Unpack
 
+import pytest
 import yaml
 
 from phasesweep.config import (
@@ -31,7 +32,11 @@ from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_statu
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
-from tests.conftest import make_experiment, reaped_pid, restored_signal_ownership
+from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
+
+# Persistent storage rejects an unseeded stochastic sampler; seeded random is
+# reproducible and resumable, so it needs no non-resumable acknowledgement.
+SEEDED_RANDOM = Sampler(type="random", seed=0)
 
 
 def write_mcp_catalog(
@@ -155,6 +160,25 @@ phases:
 """
 
 
+def write_slow_mcp_config(tmp_path: Path, *, sleep: float = 30.0) -> Path:
+    """Write the slow ``cancel_me`` experiment, driven by the bundled fake trainer.
+
+    :param Path tmp_path: Directory receiving the config, journal, and workdir.
+    :param float sleep: Seconds each trial sleeps.
+    :return Path: The written ``exp.yaml``.
+    """
+    config = tmp_path / "exp.yaml"
+    config.write_text(
+        slow_mcp_config_text(
+            tmp_path,
+            trainer=REPO / "src" / "phasesweep" / "examples" / "fake_train.py",
+            name="cancel_me",
+            sleep=sleep,
+        )
+    )
+    return config
+
+
 def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
     registry = Registry.load(catalog)
     store = RunStore(registry.state_dir)
@@ -207,7 +231,23 @@ def make_run_handle(
     launch_state: RunLaunchState = "spawned",
     allow_cancel: bool = False,
     visible_params_at_launch: VisibleParamsPolicy = "none",
+    boot_id: str | None = None,
+    started_at: str | None = None,
 ) -> RunHandle:
+    """Build a run handle; by default a spawned one owned by pytest itself.
+
+    :param str run_id: Run identifier.
+    :param str experiment_id: Catalog experiment identifier.
+    :param str config_sha256: Configuration digest the handle pins.
+    :param int | None pid: Runner PID, or this process when ``None``.
+    :param int | None starttime: Runner start time, or the one read from ``/proc`` when ``None``.
+    :param RunLaunchState launch_state: ``launching`` records no process identity at all.
+    :param bool allow_cancel: Whether the launch snapshot permits cancellation.
+    :param VisibleParamsPolicy visible_params_at_launch: Parameter visibility frozen at launch.
+    :param str | None boot_id: Boot id to record, or this host's current one when ``None``.
+    :param str | None started_at: Launch timestamp, or the current time when ``None``.
+    :return RunHandle: The handle, not yet persisted.
+    """
     if launch_state == "launching":
         process_id = None
         process_group_id = None
@@ -231,12 +271,57 @@ def make_run_handle(
         pid=process_id,
         pgid=process_group_id,
         pid_starttime=process_starttime,
-        started_at=utc_now_iso(),
+        started_at=utc_now_iso() if started_at is None else started_at,
         launch_state=launch_state,
         allow_cancel=allow_cancel,
         visible_params_at_launch=visible_params_at_launch,
-        boot_id=read_boot_id() if launch_state == "spawned" else None,
+        boot_id=(read_boot_id() if boot_id is None else boot_id)
+        if launch_state == "spawned"
+        else None,
     )
+
+
+#: Start time recorded for a runner that is gone; no live process has it.
+DEAD_RUNNER_STARTTIME = 111
+
+
+class StagedRunOptions(TypedDict, total=False):
+    """Arguments of :func:`make_run_handle` that identify a run, other than its configuration digest."""
+
+    run_id: Required[str]
+    experiment_id: str
+    launch_state: RunLaunchState
+    allow_cancel: bool
+    visible_params_at_launch: VisibleParamsPolicy
+    boot_id: str | None
+    started_at: str | None
+
+
+class DeadRunOptions(StagedRunOptions, total=False):
+    """Arguments of :func:`make_run_handle` other than ``pid`` and ``starttime``."""
+
+    config_sha256: str
+
+
+def make_dead_run_handle(**kwargs: Unpack[DeadRunOptions]) -> RunHandle:
+    """Build a spawned handle whose runner has already exited.
+
+    :param kwargs: Arguments for :func:`make_run_handle` other than ``pid`` and ``starttime``.
+    :return RunHandle: Handle naming a reaped PID and :data:`DEAD_RUNNER_STARTTIME`.
+    """
+    return make_run_handle(pid=reaped_pid(), starttime=DEAD_RUNNER_STARTTIME, **kwargs)
+
+
+def earlier_boot_id() -> str:
+    """Return a boot id that cannot be this host's current one, skipping when none is readable.
+
+    :return str: Boot id differing from ``read_boot_id()``.
+    """
+    current = read_boot_id()
+    if current is None:
+        pytest.skip("boot id unavailable on this platform")
+    other = "00000000-0000-0000-0000-000000000000"
+    return other if other != current else "11111111-1111-1111-1111-111111111111"
 
 
 def live_runs(store: RunStore) -> list[RunHandle]:
@@ -325,13 +410,75 @@ def runner_argv(
     )
 
 
+def run_claimed_runner(
+    store: RunStore,
+    run_id: str,
+    config: Path,
+    *,
+    experiment_id: str = "srv",
+    config_sha256: str | None = None,
+    started_at: str | None = None,
+    cwd: Path | None = None,
+) -> int:
+    """Claim a launch reservation for ``config`` and run the detached runner on it in-process.
+
+    :param RunStore store: Run store receiving the reservation and the terminal status.
+    :param str run_id: Run identifier to claim.
+    :param Path config: Configuration the runner loads as its snapshot.
+    :param str experiment_id: Catalog experiment identifier.
+    :param str | None config_sha256: Digest the runner must see, or the digest of ``config`` when ``None``.
+    :param str | None started_at: Claimed launch timestamp, or the current time when ``None``.
+    :param Path | None cwd: Runner working directory, or the current directory.
+    :return int: Runner process exit code.
+    """
+    if config_sha256 is None:
+        config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    if started_at is None:
+        started_at = utc_now_iso()
+    claim_runner_handle(
+        store,
+        run_id=run_id,
+        config_sha256=config_sha256,
+        started_at=started_at,
+        experiment_id=experiment_id,
+    )
+    return runner_main(
+        runner_argv(
+            store,
+            run_id=run_id,
+            config=config,
+            config_sha256=config_sha256,
+            experiment_id=experiment_id,
+            started_at=started_at,
+        ),
+        cwd=cwd,
+    )
+
+
 def write_run_status(store: RunStore, run_id: str, **payload: object) -> None:
     full_payload = {"run_id": run_id, "cleanup_confirmed": True, **payload}
     write_status_file(store.status_path(run_id), full_payload)
 
 
-#: Start time recorded for a runner that is gone; no live process has it.
-DEAD_RUNNER_STARTTIME = 111
+def _stage_run(
+    store: RunStore,
+    config: Path,
+    new_handle: Callable[..., RunHandle],
+    **handle_kwargs: Unpack[StagedRunOptions],
+) -> RunHandle:
+    """Persist a run handle pinned to ``config`` together with ``config`` as its launch snapshot.
+
+    :param RunStore store: Store receiving the handle and the snapshot.
+    :param Path config: Configuration whose bytes become the snapshot and the pinned digest.
+    :param Callable new_handle: Builder such as :func:`make_run_handle` for the handle.
+    :param handle_kwargs: Remaining arguments for ``new_handle``.
+    :return RunHandle: The persisted handle.
+    """
+    snapshot = config.read_bytes()
+    handle = new_handle(config_sha256=hashlib.sha256(snapshot).hexdigest(), **handle_kwargs)
+    store.create(handle)
+    store.config_snapshot_path(handle.run_id).write_bytes(snapshot)
+    return handle
 
 
 def stage_dead_run(
@@ -344,20 +491,36 @@ def stage_dead_run(
     allow_cancel: bool = False,
 ) -> RunHandle:
     """Persist a spawned run of ``config`` whose runner has exited, as recover-run finds it."""
-    snapshot = config.read_bytes()
-    handle = make_run_handle(
+    handle = _stage_run(
+        store,
+        config,
+        make_dead_run_handle,
         run_id=run_id,
         experiment_id=experiment_id,
-        config_sha256=hashlib.sha256(snapshot).hexdigest(),
-        pid=reaped_pid(),
-        starttime=DEAD_RUNNER_STARTTIME,
         allow_cancel=allow_cancel,
     )
-    store.create(handle)
-    store.config_snapshot_path(run_id).write_bytes(snapshot)
     if cleanup_uncertain:
         store.mark_cleanup_uncertain(handle)
     return handle
+
+
+def stage_live_run(
+    store: RunStore,
+    run_id: str,
+    config: Path,
+    experiment_id: str,
+    *,
+    visible_params_at_launch: VisibleParamsPolicy = "none",
+) -> RunHandle:
+    """Persist a spawned run of ``config`` whose runner is this live process, as a server finds it mid-run."""
+    return _stage_run(
+        store,
+        config,
+        make_run_handle,
+        run_id=run_id,
+        experiment_id=experiment_id,
+        visible_params_at_launch=visible_params_at_launch,
+    )
 
 
 def write_unsafe_cleanup_status(store: RunStore, run_id: str, **extra: object) -> None:
@@ -430,6 +593,35 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
     return captured
 
 
+def record_runner_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    confirmed: bool = True,
+    module: str = "phasesweep.mcp.run_control",
+) -> list[tuple[int | None, int | None, int | None]]:
+    """Replace ``kill_stale_group`` with a stub that records the identity it is asked to clean up.
+
+    :param pytest.MonkeyPatch monkeypatch: Fixture that undoes the replacement at teardown.
+    :param bool confirmed: Cleanup outcome the stub reports.
+    :param str module: Dotted path of the module whose ``kill_stale_group`` is replaced.
+    :return list[tuple[int | None, int | None, int | None]]: ``(pid, starttime, pgid)`` per call, in call order.
+    """
+    calls: list[tuple[int | None, int | None, int | None]] = []
+
+    def fake_kill_stale_group(
+        pid: int | None,
+        saved_starttime: int | None,
+        *,
+        pgid: int | None = None,
+        grace_seconds: float | None = None,
+    ) -> bool:
+        calls.append((pid, saved_starttime, pgid))
+        return confirmed
+
+    monkeypatch.setattr(f"{module}.kill_stale_group", fake_kill_stale_group)
+    return calls
+
+
 ALLOW_SIDE_EFFECTS = {"launch": True, "cancel": True, "from_phase": True}
 
 
@@ -453,6 +645,20 @@ def _catalog(
         visible_params=None if visible_params is None else {"srv": visible_params},
         filename="srv.catalog.yaml",
     )
+
+
+def side_effect_app(
+    tmp_path: Path, *, phases: str | None = None
+) -> tuple[Path, PhaseSweepMCP, Registry, RunStore]:
+    """Write the standard ``srv`` experiment and serve it with launch, cancel, and from-phase allowed.
+
+    :param Path tmp_path: Directory receiving the config, catalog, and state.
+    :param str | None phases: Phases block for the config, or the default one-phase search.
+    :return tuple[Path, PhaseSweepMCP, Registry, RunStore]: Config path, server, registry, and run store.
+    """
+    config = _config(tmp_path, phases=phases)
+    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    return config, app, registry, store
 
 
 def _drift_experiment(

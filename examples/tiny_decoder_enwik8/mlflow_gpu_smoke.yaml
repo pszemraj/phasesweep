@@ -1,0 +1,66 @@
+# Native MLflow version of the two-trial, ten-batch CUDA fixture.
+# Provision the existing MLflow experiment first; see README.md.
+experiment: tiny_decoder_enwik8_mlflow_gpu_smoke
+storage: auto
+workdir: /tmp/phasesweep-tiny-decoder-enwik8-mlflow-gpu-smoke
+provenance:
+  trainer: "run-trial-mlflow-v1+decoder-template@9c90a551"
+  data: "enwik8-template-download"
+  tracking: "mlflow-3.17"
+trial_command: "python examples/tiny_decoder_enwik8/run_trial.py --mlflow --template-root examples/tiny_decoder_enwik8/upstream --config {config_path}"
+trainer_config:
+  run_dir: "{trial_dir}/trainer"
+  num_tokens: 256
+  dim: 128
+  depth: 2
+  heads: 4
+  dim_head: 32
+  tied_embedding: true
+  flash_attn: true
+  compile: false
+  use_autocast: true
+  num_batches: 10
+  batch_size: 2
+  grad_accum_every: 1
+  learning_rate: 0.001
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  data_path: data/enwik8.gz
+  seq_len: 128
+  validate_every: 10
+  val_batches: 2
+  generate_every: 1000000
+  save_every: 1000000
+  seed: 7
+timeout_seconds_per_run: 300
+env:
+  CUDA_DEVICE_ORDER: PCI_BUS_ID
+  WANDB_MODE: disabled
+mlflow:
+  tracking_uri: http://127.0.0.1:5000
+  experiment_name: phasesweep-tiny-decoder
+  run_mode: managed
+metric:
+  name: val_loss
+  goal: minimize
+  extractor: {type: mlflow, metric_key: val_loss, select: step, step: 10}
+constraints:
+  - name: cuda_evaluation
+    extractor: {type: mlflow, metric_key: runtime/cuda, select: step, step: 10}
+    min: 1
+    max: 1
+phases:
+  - name: learning_rate_smoke
+    comment: "Run two short CUDA trials with native MLflow final-checkpoint evidence."
+    n_trials: 2
+    n_jobs: 1
+    gpu_ids: [0]
+    timeout_seconds_per_trial: 120
+    sampler: {type: grid}
+    gates:
+      - type: mlflow_required
+        metrics: [val_loss, runtime/cuda]
+        params: [learning_rate, num_batches]
+        tags: [runtime.device_type, evaluation.policy, evaluation.checkpoint, evaluation.split]
+    search_space:
+      learning_rate: {type: categorical, choices: [0.0003, 0.001]}

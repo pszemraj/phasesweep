@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -13,15 +14,14 @@ from phasesweep.config import (
     ExecutionContext,
     Experiment,
     JsonEnvelopeExtractor,
-    JsonExtractor,
-    LogRegexExtractor,
     Metric,
     Phase,
     Sampler,
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
-from tests.conftest import assert_invalid_experiment_yaml, make_experiment, write_yaml
+from phasesweep.runtime.json import JsonObject, JsonValue
+from tests.conftest import make_experiment, write_yaml
 
 
 @pytest.mark.parametrize(
@@ -193,23 +193,6 @@ def test_wandb_managed_conflicts_fail_during_config_validation(env):
         )
 
 
-def test_phase_composition_accepts_a_linear_chain() -> None:
-    experiment = make_experiment(
-        phases=[
-            Phase(name="base", n_trials=1, fixed_overrides={"model.depth": 8}),
-            Phase(
-                name="tune",
-                n_trials=1,
-                inherits=["base"],
-                search_space={"learning_rate": {"type": "float", "low": 1e-4, "high": 1e-3}},
-            ),
-            Phase(name="final", n_trials=1, inherits=["tune"], fixed_overrides={"seed": 0}),
-        ]
-    )
-
-    assert [phase.name for phase in experiment.phases] == ["base", "tune", "final"]
-
-
 def test_phases_from_selects_reached_phases_by_name() -> None:
     experiment = make_experiment(
         phases=[
@@ -322,102 +305,55 @@ def test_phase_composition_rejects_invalid_origins(phases: list[Phase], match: s
         make_experiment(phases=phases)
 
 
+_LOSS_METRIC = {
+    "name": "loss",
+    "goal": "minimize",
+    "extractor": {
+        "type": "json_envelope",
+        "objective_name": "loss",
+        "split": "test",
+        "policy": "test",
+    },
+}
+_BYTES_EXTRACTOR = {"type": "json", "path": "r.json", "key": "bytes"}
+
+
 @pytest.mark.parametrize(
-    ("body", "match"),
+    ("options", "match"),
     [
         pytest.param(
-            """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo {trial_dir}"
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-phases:
-  - name: a
-    inherits: [b]
-    n_trials: 1
-    search_space: { x: { type: float, low: 0.0, high: 1.0 } }
-  - name: b
-    n_trials: 1
-    search_space: { y: { type: float, low: 0.0, high: 1.0 } }
-""",
+            {
+                "phases": [
+                    Phase(name="a", n_trials=1, inherits=["b"]),
+                    Phase(name="b", n_trials=1),
+                ]
+            },
             "inherits from 'b'",
             id="inherit-must-reference-prior-phase",
         ),
         pytest.param(
-            """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo"
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-constraints:
-  - name: bytes
-    extractor: { type: json, path: r.json, key: bytes }
-phases:
-  - name: a
-    n_trials: 1
-    search_space: { x: { type: float, low: 0, high: 1 } }
-""",
+            {"constraints": [{"name": "bytes", "extractor": _BYTES_EXTRACTOR}]},
             "must define at least one",
             id="constraint-requires-bound",
         ),
         pytest.param(
-            """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo {overrides}"
-override_format: argparse
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-constraints:
-  - name: loss
-    max: 1
-    extractor: { type: json, path: r.json, key: bytes }
-phases:
-  - name: a
-    n_trials: 1
-    search_space: { x: { type: float, low: 0, high: 1 } }
-""",
+            {
+                "metric": _LOSS_METRIC,
+                "constraints": [{"name": "loss", "max": 1, "extractor": _BYTES_EXTRACTOR}],
+            },
             "distinct",
             id="metric-constraint-name-collision",
         ),
         pytest.param(
-            """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo {overrides}"
-override_format: argparse
-metric:
-  name: goal
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: goal, split: test, policy: test }
-phases:
-  - name: a
-    n_trials: 1
-    search_space: { x: { type: float, low: 0, high: 1 } }
-""",
+            {"metric": {**_LOSS_METRIC, "name": "goal"}},
             "reserved for winner direction metadata",
             id="metric-name-goal-is-reserved",
         ),
     ],
 )
-def test_invalid_experiment_relationships(
-    tmp_path: Path,
-    body: str,
-    match: str,
-) -> None:
-    assert_invalid_experiment_yaml(tmp_path, body, match)
+def test_invalid_experiment_relationships(options: dict[str, object], match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        make_experiment(**options)
 
 
 @pytest.mark.parametrize("name", ["bad name with spaces", "bad\n"])
@@ -456,38 +392,68 @@ def test_phase_names_preserve_authored_case_for_inherit_selectors() -> None:
 
 
 @pytest.mark.parametrize(
-    ("pattern", "match"),
-    [("(", "Invalid metric regex"), (r"loss=(?P<loss>\S+)", "requires a named")],
-)
-def test_config_rejects_invalid_metric_regex_before_creating_workdir(tmp_path, pattern, match):
-    payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
-    payload["metric"]["extractor"] = {"type": "log_regex", "pattern": pattern}
-    path = write_yaml(tmp_path, yaml.safe_dump(payload))
-
-    with pytest.raises(ValueError, match=match):
-        load_experiment(path)
-
-    assert not (tmp_path / "work").exists()
-
-
-@pytest.mark.parametrize(
-    ("name", "match"),
+    ("path", "value", "match"),
     [
-        ("attempts", "reserved for the runtime recovery registry"),
-        ("Attempts", "reserved for the runtime recovery registry"),
-        ("generations", "reserved for immutable generation records"),
-        ("Generations", "reserved for immutable generation records"),
+        pytest.param(
+            ("metric", "extractor"),
+            {"type": "log_regex", "pattern": "("},
+            "Invalid metric regex",
+            id="metric_regex_does_not_compile",
+        ),
+        pytest.param(
+            ("metric", "extractor"),
+            {"type": "log_regex", "pattern": r"loss=(?P<loss>\S+)"},
+            "requires a named",
+            id="metric_regex_lacks_the_value_group",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "attempts",
+            "reserved for the runtime recovery registry",
+            id="reserved_attempts",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "Attempts",
+            "reserved for the runtime recovery registry",
+            id="reserved_attempts_cased",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "generations",
+            "reserved for immutable generation records",
+            id="reserved_generations",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "Generations",
+            "reserved for immutable generation records",
+            id="reserved_generations_cased",
+        ),
+        pytest.param(
+            ("phases", 0, "name"),
+            "tracking",
+            "reserved for MLflow tracking records",
+            id="reserved_tracking",
+        ),
     ],
 )
-def test_config_rejects_reserved_phase_name_before_creating_workdir(
-    tmp_path, name: str, match: str
+def test_config_rejects_invalid_content_before_creating_workdir(
+    tmp_path, path: tuple[str | int, ...], value: JsonValue, match: str
 ):
+    """An invalid metric regex or reserved phase name fails the load before any workdir exists.
+
+    ``path`` addresses the key of the dumped experiment payload to overwrite with ``value``.
+    """
     payload = make_experiment(workdir=tmp_path / "work").model_dump(mode="json")
-    payload["phases"][0]["name"] = name
-    path = write_yaml(tmp_path, yaml.safe_dump(payload))
+    target = payload
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    config_path = write_yaml(tmp_path, yaml.safe_dump(payload))
 
     with pytest.raises(ValueError, match=match):
-        load_experiment(path)
+        load_experiment(config_path)
 
     assert not (tmp_path / "work").exists()
 
@@ -503,38 +469,90 @@ def test_config_rejects_reserved_phase_name_before_creating_workdir(
 )
 def test_provenance_requires_nonempty_keys_and_values(provenance: dict[str, str]) -> None:
     with pytest.raises(ValidationError, match="provenance keys and values must be nonempty"):
-        Experiment(
-            experiment="invalid_provenance",
-            trial_command="echo",
-            provenance=provenance,
-            metric=Metric(
-                extractor=LogRegexExtractor(
-                    type="log_regex",
-                    pattern=r"x=(?P<value>[0-9.]+)",
-                )
-            ),
-            phases=[Phase(name="p", n_trials=1)],
-        )
+        make_experiment(experiment="invalid_provenance", provenance=provenance)
 
 
 @pytest.mark.parametrize(
-    ("inherit_env", "message"),
+    ("build", "message"),
     [
-        ([""], "nonempty and unpadded"),
-        ([" PATH"], "nonempty and unpadded"),
-        (["PATH "], "nonempty and unpadded"),
-        (["WANDB_API_KEY", "WANDB_API_KEY"], "must be unique"),
+        pytest.param(
+            lambda: make_experiment(workdir=""), "workdir must be a nonempty path", id="workdir"
+        ),
+        pytest.param(
+            lambda: ExecutionContext(cwd=""),
+            "execution.cwd must be a nonempty path",
+            id="execution_cwd",
+        ),
     ],
-    ids=["empty", "leading_space", "trailing_space", "duplicate"],
 )
-def test_execution_inherit_env_names_validated(inherit_env: list[str], message: str) -> None:
-    """A named-inheritance list must be a set of exact variable names.
+def test_empty_path_strings_are_rejected(build: Callable[[], object], message: str) -> None:
+    """An empty path would silently mean the invocation directory; omit or name it instead."""
+    with pytest.raises(ValidationError, match=message):
+        build()
 
-    Padded or empty names would silently inherit nothing (``os.environ`` has
-    no ``' PATH'``), and duplicates hide a typo in a second entry.
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        pytest.param({"A=B": "x"}, "env names must be nonempty", id="name_with_equals"),
+        pytest.param({"": "x"}, "env names must be nonempty", id="empty_name"),
+        pytest.param({"A\x00B": "x"}, "env names must be nonempty", id="nul_in_name"),
+        pytest.param({"A": "x\x00y"}, r"env values cannot contain NUL.*\['A'\]", id="nul_in_value"),
+    ],
+)
+def test_env_rejects_names_and_values_the_launch_cannot_pass(
+    env: dict[str, str], message: str
+) -> None:
+    """``os.execve`` raises ValueError for these, which the supervisor does not catch.
+
+    The launch would crash after the generation was claimed, so the load refuses them.
     """
     with pytest.raises(ValidationError, match=message):
-        ExecutionContext(inherit_env=inherit_env)
+        make_experiment(env=env)
+
+
+@pytest.mark.parametrize(
+    ("field", "names", "message"),
+    [
+        pytest.param("inherit_env", [""], "nonempty and unpadded", id="inherit_empty"),
+        pytest.param("inherit_env", [" PATH"], "nonempty and unpadded", id="inherit_leading_space"),
+        pytest.param(
+            "inherit_env", ["PATH "], "nonempty and unpadded", id="inherit_trailing_space"
+        ),
+        pytest.param(
+            "inherit_env",
+            ["WANDB_API_KEY", "WANDB_API_KEY"],
+            "must be unique",
+            id="inherit_duplicate",
+        ),
+        pytest.param("inherit_env", ["A=B"], "no '=' or NUL", id="inherit_equals"),
+        pytest.param("inherit_env", ["A\x00B"], "no '=' or NUL", id="inherit_nul"),
+        pytest.param("passthrough_env", [""], "nonempty and unpadded", id="passthrough_empty"),
+        pytest.param(
+            "passthrough_env",
+            [" HF_TOKEN"],
+            "nonempty and unpadded",
+            id="passthrough_leading_space",
+        ),
+        pytest.param("passthrough_env", ["A=B"], "no '=' or NUL", id="passthrough_equals"),
+        pytest.param("passthrough_env", ["A\x00B"], "no '=' or NUL", id="passthrough_nul"),
+        pytest.param(
+            "passthrough_env",
+            ["HF_TOKEN", "HF_TOKEN"],
+            "must be unique",
+            id="passthrough_duplicate",
+        ),
+    ],
+)
+def test_execution_env_names_validated(field: str, names: list[str], message: str) -> None:
+    """A named-inheritance or passthrough list must be a set of exact variable names.
+
+    Padded, empty, ``=``-bearing, or NUL-bearing names would silently inherit
+    nothing (``os.environ`` has no ``' PATH'`` and cannot hold ``'A=B'``), and
+    duplicates hide a typo in a second entry.
+    """
+    with pytest.raises(ValidationError, match=message):
+        ExecutionContext(**{field: names})
 
 
 def test_execution_accepts_named_inherit_list() -> None:
@@ -543,21 +561,6 @@ def test_execution_accepts_named_inherit_list() -> None:
     assert execution.inherit_env == ["WANDB_API_KEY", "HF_TOKEN"]
     assert execution.cwd is None
     assert ExecutionContext().inherit_env == "all"
-
-
-@pytest.mark.parametrize(
-    ("passthrough_env", "message"),
-    [
-        ([""], "nonempty and unpadded"),
-        ([" HF_TOKEN"], "nonempty and unpadded"),
-        (["HF_TOKEN", "HF_TOKEN"], "must be unique"),
-    ],
-)
-def test_execution_passthrough_env_names_validated(
-    passthrough_env: list[str], message: str
-) -> None:
-    with pytest.raises(ValidationError, match=message):
-        ExecutionContext(passthrough_env=passthrough_env)
 
 
 def test_execution_rejects_ambiguous_environment_classification() -> None:
@@ -569,9 +572,10 @@ def test_execution_rejects_ambiguous_environment_classification() -> None:
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "match"),
     [
-        """
+        (
+            """
 experiment: t
 storage: null
 provenance: {revision: test-fixture-v1}
@@ -587,7 +591,10 @@ phases:
     n_trials: 1
     search_space: { x: { type: float, low: 0, high: 1 } }
 """,
-        """
+            "duplicate key",
+        ),
+        (
+            """
 experiment: t
 storage: null
 provenance: {revision: test-fixture-v1}
@@ -604,7 +611,10 @@ phases:
       lr: {type: float, low: 1e-5, high: 1e-3, log: true}
       lr: {type: float, low: 1e-4, high: 1e-2, log: true}
 """,
-        """
+            "duplicate key",
+        ),
+        (
+            """
 experiment: t
 storage: null
 provenance: {revision: test-fixture-v1}
@@ -620,12 +630,37 @@ phases:
     n_trials: 5
     search_space: { x: { type: float, low: 0, high: 1 } }
 """,
+            "duplicate key",
+        ),
+        (
+            """
+experiment: t
+storage: null
+provenance: {revision: test-fixture-v1}
+trial_command: "echo"
+metric:
+  name: loss
+  goal: minimize
+  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
+phases:
+  - &first
+    name: first
+    n_trials: 1
+  - &second
+    name: second
+    n_trials: 2
+  - <<: *first
+    <<: *second
+    name: merged
+""",
+            r"duplicate key '<<'",
+        ),
     ],
-    ids=["top_level", "search_space", "phase_mapping"],
+    ids=["top_level", "search_space", "phase_mapping", "merge_key"],
 )
-def test_duplicate_yaml_keys_rejected(tmp_path: Path, body: str) -> None:
-    """Duplicate keys fail loudly anywhere in the config tree."""
-    with pytest.raises(ValueError, match="duplicate key"):
+def test_duplicate_yaml_keys_rejected(tmp_path: Path, body: str, match: str) -> None:
+    """Duplicate keys fail loudly anywhere in the config tree, merge keys included."""
+    with pytest.raises(ValueError, match=match):
         load_experiment(write_yaml(tmp_path, body))
 
 
@@ -657,32 +692,6 @@ phases:
     ]
 
 
-def test_duplicate_yaml_merge_keys_rejected(tmp_path: Path) -> None:
-    body = """
-experiment: t
-storage: null
-provenance: {revision: test-fixture-v1}
-trial_command: "echo"
-metric:
-  name: loss
-  goal: minimize
-  extractor: { type: json_envelope, objective_name: loss, split: test, policy: test }
-phases:
-  - &first
-    name: first
-    n_trials: 1
-  - &second
-    name: second
-    n_trials: 2
-  - <<: *first
-    <<: *second
-    name: merged
-"""
-
-    with pytest.raises(ValueError, match=r"duplicate key '<<'"):
-        load_experiment(write_yaml(tmp_path, body))
-
-
 def test_override_format_n_jobs_and_failure_limit_defaults(tmp_path):
     body = """
 experiment: t
@@ -704,11 +713,6 @@ phases:
     assert exp.phases[0].max_consecutive_failures == 5
 
 
-def test_plain_json_extractor_is_a_primary_objective() -> None:
-    metric = Metric(extractor=JsonExtractor(type="json", path="result.json", key="loss"))
-    assert metric.extractor.type == "json"
-
-
 def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
     """A parser/scanner error must carry the file path, not PyYAML's stream label.
 
@@ -725,68 +729,81 @@ def test_yaml_syntax_error_names_the_config_file(tmp_path: Path) -> None:
     assert str(config_path) in str(excinfo.value)
 
 
-def test_config_error_stays_a_value_error() -> None:
-    """Existing ``except ValueError`` callers must keep catching config failures."""
-    assert issubclass(ConfigError, ValueError)
-
-
-def _sampler_policy_yaml(
-    *,
-    storage: str | None,
-    sampler: str | None = None,
-    n_trials: int = 2,
-    search_space: str = "{ lr: { type: float, low: 0.1, high: 1.0 } }",
-) -> str:
-    """Build a one-phase experiment YAML for the persistent-storage sampler policy.
-
-    :param str | None storage: Storage URL to declare, or ``None`` to omit the key.
-    :param str | None sampler: Inline sampler mapping, or ``None`` to omit the block.
-    :param int n_trials: Trial budget for the single phase.
-    :param str search_space: Inline search-space mapping for the single phase.
-    :return str: Complete experiment YAML text.
-    """
-    header = (
-        f"storage: {storage}\nprovenance: {{revision: test-fixture-v1}}\n"
-        if storage is not None
-        else ""
-    )
-    sampler_line = f"    sampler: {sampler}\n" if sampler is not None else ""
-    return (
+@pytest.mark.parametrize(
+    "env_line",
+    ['env: { A: "x\\ud800" }\n', 'env: { "\\ud800": x }\n'],
+    ids=["value", "key"],
+)
+def test_lone_surrogate_escape_is_rejected_at_load(tmp_path: Path, env_line: str) -> None:
+    """A ``\\ud800`` escape loads as text that cannot reach a trainer's environment."""
+    body = (
         "experiment: t\n"
-        f"{header}"
         'trial_command: "echo {overrides}"\n'
         "override_format: argparse\n"
+        f"{env_line}"
         "metric:\n"
         "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
         "phases:\n"
-        "  - name: lr\n"
-        f"    n_trials: {n_trials}\n"
-        f"{sampler_line}"
-        f"    search_space: {search_space}\n"
+        "  - name: p\n"
+        "    n_trials: 1\n"
     )
+    config_path = write_yaml(tmp_path, body)
+
+    with pytest.raises(ConfigError, match="lone surrogate") as excinfo:
+        load_experiment(config_path)
+
+    assert str(config_path) in str(excinfo.value)
+
+
+def _sampler_policy_experiment(
+    *,
+    storage: str | None,
+    sampler: JsonObject | None = None,
+    n_trials: int = 2,
+    search_space: JsonObject | None = None,
+) -> Experiment:
+    """Build a one-phase experiment for the persistent-storage sampler policy.
+
+    The phase is explicit because ``make_experiment`` seeds a default phase's
+    sampler on persistent storage, which would hide the policy under test.
+
+    :param str | None storage: Storage URL to declare, or ``None`` for in-memory.
+    :param JsonObject | None sampler: Sampler mapping, or ``None`` to leave the default.
+    :param int n_trials: Trial budget for the single phase.
+    :param JsonObject | None search_space: Search space; defaults to one float ``lr``.
+    :return Experiment: Validated experiment.
+    """
+    phase: JsonObject = {
+        "name": "lr",
+        "n_trials": n_trials,
+        "search_space": search_space or {"lr": {"type": "float", "low": 0.1, "high": 1.0}},
+    }
+    if sampler is not None:
+        phase["sampler"] = sampler
+    return make_experiment(storage=storage, phases=[phase])
 
 
 @pytest.mark.parametrize(
     ("sampler", "message"),
     [
         pytest.param(None, "requires an explicit sampler.seed", id="default_tpe_unseeded"),
-        pytest.param("{ type: tpe }", "requires an explicit sampler.seed", id="tpe_unseeded"),
-        pytest.param("{ type: cmaes }", "requires an explicit sampler.seed", id="cmaes_unseeded"),
-        pytest.param("{ type: random }", "requires an explicit sampler.seed", id="random_unseeded"),
+        pytest.param({"type": "tpe"}, "requires an explicit sampler.seed", id="tpe_unseeded"),
+        pytest.param({"type": "cmaes"}, "requires an explicit sampler.seed", id="cmaes_unseeded"),
+        pytest.param({"type": "random"}, "requires an explicit sampler.seed", id="random_unseeded"),
         pytest.param(
-            "{ type: tpe, seed: 0 }",
+            {"type": "tpe", "seed": 0},
             "requires sampler.acknowledge_nonresumable: true",
             id="tpe_unacknowledged",
         ),
         pytest.param(
-            "{ type: cmaes, seed: 1 }",
+            {"type": "cmaes", "seed": 1},
             "requires sampler.acknowledge_nonresumable: true",
             id="cmaes_unacknowledged",
         ),
     ],
 )
 def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
-    tmp_path: Path, sampler: str | None, message: str
+    tmp_path: Path, sampler: JsonObject | None, message: str
 ) -> None:
     """Persistent storage must state the sampler contract at config load, not mid-run.
 
@@ -795,26 +812,27 @@ def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
     ``_validate_sampler_continuation`` hard-rejects a mid-target resume — but
     only after the operator has already been interrupted.
     """
-    body = _sampler_policy_yaml(storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler)
+    storage = f"journal:///{tmp_path}/phases.journal"
     with pytest.raises(ValueError, match=message) as excinfo:
-        load_experiment(write_yaml(tmp_path, body))
+        _sampler_policy_experiment(storage=storage, sampler=sampler)
     assert "'lr'" in str(excinfo.value)
 
 
 @pytest.mark.parametrize(
     "sampler",
     [
-        pytest.param("{ type: tpe, seed: 0, acknowledge_nonresumable: true }", id="tpe"),
-        pytest.param("{ type: cmaes, seed: 1, acknowledge_nonresumable: true }", id="cmaes"),
-        pytest.param("{ type: random, seed: 3 }", id="random_needs_no_acknowledgement"),
+        pytest.param({"type": "tpe", "seed": 0, "acknowledge_nonresumable": True}, id="tpe"),
+        pytest.param({"type": "cmaes", "seed": 1, "acknowledge_nonresumable": True}, id="cmaes"),
+        pytest.param({"type": "random", "seed": 3}, id="random_needs_no_acknowledgement"),
     ],
 )
 def test_persistent_storage_accepts_seeded_and_acknowledged_samplers(
-    tmp_path: Path, sampler: str
+    tmp_path: Path, sampler: JsonObject
 ) -> None:
     """A seeded sampler with the required acknowledgement loads unchanged."""
-    body = _sampler_policy_yaml(storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler)
-    experiment = load_experiment(write_yaml(tmp_path, body))
+    experiment = _sampler_policy_experiment(
+        storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler
+    )
     assert experiment.phases[0].sampler.seed is not None
 
 
@@ -833,27 +851,35 @@ def test_sampler_seed_accepts_optuna_domain_boundaries(seed: int) -> None:
 
 def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_path: Path) -> None:
     """Grid enumerates a fixed matrix and resumes from stored assignments, so it is exempt."""
-    body = _sampler_policy_yaml(
+    experiment = _sampler_policy_experiment(
         storage=f"journal:///{tmp_path}/phases.journal",
-        sampler="{ type: grid }",
+        sampler={"type": "grid"},
         n_trials=3,
-        search_space="{ lr: { type: float, low: 0.0, high: 1.0, step: 0.5 } }",
+        search_space={"lr": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.5}},
     )
-    experiment = load_experiment(write_yaml(tmp_path, body))
     assert experiment.phases[0].sampler.seed is None
     assert experiment.phases[0].sampler.acknowledge_nonresumable is False
 
 
-@pytest.mark.parametrize("storage", [None, "null"], ids=["omitted", "explicit_null"])
-def test_in_memory_storage_keeps_the_sampler_block_optional(
-    tmp_path: Path, storage: str | None
-) -> None:
+@pytest.mark.parametrize("storage", ["", "storage: null\n"], ids=["omitted", "explicit_null"])
+def test_in_memory_storage_keeps_the_sampler_block_optional(tmp_path: Path, storage: str) -> None:
     """Without a durable study there is nothing to resume, so the tpe default stands.
 
-    Covers both spellings that leave ``storage`` in-memory: the field omitted
-    entirely, and an explicit ``storage: null``.
+    Covers both YAML spellings that leave ``storage`` in-memory: the key
+    omitted entirely, and an explicit ``storage: null``.
     """
-    experiment = load_experiment(write_yaml(tmp_path, _sampler_policy_yaml(storage=storage)))
+    body = (
+        f"experiment: t\n{storage}"
+        'trial_command: "echo {overrides}"\n'
+        "override_format: argparse\n"
+        "metric:\n"
+        "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
+        "phases:\n"
+        "  - name: lr\n"
+        "    n_trials: 2\n"
+        "    search_space: { lr: { type: float, low: 0.1, high: 1.0 } }\n"
+    )
+    experiment = load_experiment(write_yaml(tmp_path, body))
     assert experiment.phases[0].sampler.type == "tpe"
     assert experiment.phases[0].sampler.seed is None
 

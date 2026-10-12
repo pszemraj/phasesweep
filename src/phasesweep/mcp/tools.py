@@ -434,6 +434,9 @@ class PhaseSweepMCP(RunControl):
             # The final probe can also reserve cleanup or discover an
             # orphaned pending snapshot without producing a result view.
             run = self._run_payload(handle)
+        delivery = self._tracking_delivery(handle, experiment)
+        if delivery is not None:
+            status["tracking_delivery"] = delivery
         if result_source == "terminal_snapshot_unavailable":
             run["failure"] = self._run_failure_payload(
                 handle,
@@ -441,6 +444,31 @@ class PhaseSweepMCP(RunControl):
                 force_snapshot_unavailable=True,
             )
         return target_id, status, run, handle, result_source
+
+    def _tracking_delivery(
+        self, handle: RunHandle, experiment: Experiment | None
+    ) -> dict[str, int] | None:
+        """Count this run's own MLflow result uploads from its launch config.
+
+        Delivery records are mutable, so only status reads them; frozen result
+        reads never depend on them. A terminal read loads the run's config
+        snapshot just for this and reports no counts when it is unavailable.
+
+        :param RunHandle handle: Run whose generation owns the uploads.
+        :param Experiment | None experiment: Launch config, when already loaded.
+        :return dict[str, int] | None: Pending and delivered counts, or ``None``
+            when the run does not use MLflow or its config is unavailable.
+        """
+        if experiment is None:
+            try:
+                experiment = self._load_run_experiment(handle)
+            except RunSnapshotUnavailableError:
+                return None
+        if experiment.mlflow is None:
+            return None
+        from phasesweep.tracking.publication import delivery_status
+
+        return delivery_status(experiment, handle.run_id)
 
     def _catalog_comparison_experiment(self, experiment_id: str) -> Experiment | None:
         """Return the config a future catalog launch would execute, if available.

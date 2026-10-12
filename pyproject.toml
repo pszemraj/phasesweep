@@ -40,6 +40,7 @@ dependencies = [
 
 [project.optional-dependencies]
 wandb = ["wandb>=0.28,<0.29"]
+mlflow = ["mlflow-skinny>=3.17,<3.18"]
 mcp = ["mcp>=1.27,<1.28"]
 dev = [
     "hydra-core>=1.3,<1.4",
@@ -123,8 +124,25 @@ follow_imports_for_stubs = true
 # wandb is an optional extra and requests is its transitive dependency; both
 # are imported lazily inside the W&B reader. A checkout without the extra must
 # still type-check.
-module = ["wandb.*", "requests.*"]
+module = ["wandb.*", "requests.*", "mlflow.*", "databricks.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# These modules carry no explicit Any: open payloads are JsonValue, known shapes are TypedDicts, and the MLflow SDK is described by Protocols.
+module = [
+    "phasesweep.tracking.*",
+    "phasesweep.evidence.mlflow",
+    "phasesweep.runtime.remote_worker",
+    "phasesweep.examples.mlflow_train",
+]
+disallow_any_explicit = true
+disallow_any_decorated = true
+
+[[tool.mypy.overrides]]
+# Pydantic's BaseModel carries Any in its own signatures, which mypy reports at every subclass.
+module = ["phasesweep.tracking.models"]
+disallow_any_explicit = false
+disallow_any_decorated = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -25,19 +25,14 @@ from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_writ
 from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
 from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
 from tests.ledger_fixtures import tree_snapshot
-from tests.mcp_helpers import live_runs, make_run_handle, write_run_status
-
-
-def _earlier_boot_id() -> str:
-    """Return a boot id that cannot be this host's current one.
-
-    :return str: Boot id differing from ``read_boot_id()``.
-    """
-    current = read_boot_id()
-    if current is None:
-        pytest.skip("boot id unavailable on this platform")
-    other = "00000000-0000-0000-0000-000000000000"
-    return other if other != current else "11111111-1111-1111-1111-111111111111"
+from tests.mcp_helpers import (
+    earlier_boot_id,
+    live_runs,
+    make_dead_run_handle,
+    make_run_handle,
+    write_run_status,
+    write_unsafe_cleanup_status,
+)
 
 
 def test_create_get_roundtrip(tmp_path: Path) -> None:
@@ -808,21 +803,10 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
         assert not store._cleanup_recovered(handle)
 
 
-def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    payload = asdict(make_run_handle(run_id="other"))
-    private_atomic_write_text(
-        tmp_path / "state" / "runs" / "exp-1.json",
-        json.dumps(payload),
-    )
-
-    assert store.get("exp-1") is None
-    assert store.list_handles() == []
-
-
 @pytest.mark.parametrize(
     "field,value",
     [
+        ("run_id", "other"),
         ("experiment_id", "../bad"),
         ("experiment_id", 7),
         ("config_sha256", []),
@@ -851,6 +835,7 @@ def test_loaded_handle_must_match_filename(tmp_path: Path) -> None:
     ],
 )
 def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: object) -> None:
+    """A handle whose shape is invalid, or whose run id differs from its filename, is not loaded."""
     store = RunStore(tmp_path / "state")
     payload = asdict(make_run_handle(run_id="exp-1"))
     payload[field] = value
@@ -951,14 +936,14 @@ def test_successful_process_with_failed_result_snapshot_is_still_succeeded(tmp_p
     assert store.state(handle) == "succeeded"
 
 
-def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) -> None:
+@pytest.mark.parametrize("runner_live", [True, False], ids=["live_runner", "dead_runner"])
+def test_pending_result_snapshot_keeps_run_live_until_finalized(
+    tmp_path: Path, runner_live: bool
+) -> None:
+    """A pending snapshot keeps the run running; only a dead runner needs recovery for it."""
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(
-        run_id="exp-1",
-        experiment_id="exp",
-        pid=reaped_pid(),
-        starttime=111,
-    )
+    make_handle = make_run_handle if runner_live else make_dead_run_handle
+    handle = make_handle(run_id="exp-1", experiment_id="exp")
     store.create(handle)
     write_run_status(
         store,
@@ -970,8 +955,8 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     )
 
     assert store.state(handle) == "running"
-    assert store.snapshot_recovery_required(handle)
-    assert store.recovery_required(handle)
+    assert store.snapshot_recovery_required(handle) == (not runner_live)
+    assert store.recovery_required(handle) == (not runner_live)
     assert live_runs(store) == [handle]
 
     write_run_status(
@@ -988,24 +973,6 @@ def test_pending_result_snapshot_keeps_run_live_until_finalized(tmp_path: Path) 
     assert not store.snapshot_recovery_required(handle)
     assert not store.recovery_required(handle)
     assert live_runs(store) == []
-
-
-def test_live_runner_pending_snapshot_does_not_require_recovery(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-live", experiment_id="exp")
-    store.create(handle)
-    write_run_status(
-        store,
-        handle.run_id,
-        returncode=0,
-        error_class=None,
-        cleanup_confirmed=True,
-        result_snapshot_state="pending",
-    )
-
-    assert store.state(handle) == "running"
-    assert not store.snapshot_recovery_required(handle)
-    assert not store.recovery_required(handle)
 
 
 @pytest.mark.parametrize(
@@ -1095,7 +1062,7 @@ def test_status_read_failures_do_not_break_state_scans(
 
 def test_state_failed_from_ordinary_cleanup_confirmed_failure(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
+    handle = make_dead_run_handle(run_id="exp-1")
     store.create(handle)
     write_run_status(
         store,
@@ -1117,7 +1084,7 @@ def test_state_running_for_live_pid_without_status(tmp_path: Path) -> None:
 
 def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
+    handle = make_dead_run_handle(run_id="exp-1")
     store.create(handle)
 
     assert store.state(handle) == "running"
@@ -1146,7 +1113,7 @@ def test_clear_cleanup_uncertain_uses_durable_idempotent_unlink(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
+    handle = make_dead_run_handle(run_id="exp-1")
     store.mark_cleanup_uncertain(handle)
     marker = store.cleanup_uncertain_path(handle.run_id)
     real_unlink = mcp_runs._strict_unlink
@@ -1169,7 +1136,7 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
+    handle = make_dead_run_handle(run_id="exp-1")
     store.create(handle)
     original_recovered = store._cleanup_recovered
     first_read = True
@@ -1179,13 +1146,7 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
         if first_read:
             first_read = False
             with store.transition_lock(handle):
-                write_run_status(
-                    store,
-                    handle.run_id,
-                    returncode=1,
-                    error_class="UnsafeProcessCleanupError",
-                    cleanup_confirmed=False,
-                )
+                write_unsafe_cleanup_status(store, handle.run_id)
                 private_atomic_write_text(
                     store.cleanup_recovery_path(handle.run_id),
                     json.dumps(
@@ -1211,7 +1172,7 @@ def test_state_does_not_restore_cleanup_marker_after_recovery(
 
 def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
+    handle = make_dead_run_handle(run_id="exp-1")
     store.create(handle)
     started = Event()
     finished = Event()
@@ -1256,16 +1217,48 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
             "pid": 4242,
             "pid_starttime": 123,
         },
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": "",
+            },
+            id="boot_id_empty",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": "malformed",
+            },
+            id="boot_id_malformed",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": 12345,
+            },
+            id="boot_id_integer",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "boot_id": True,
+            },
+            id="boot_id_boolean",
+        ),
     ],
 )
 def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: object) -> None:
+    """A marker with an invalid shape, including an invalid boot id, is not trusted."""
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(
-        run_id="exp-1",
-        config_sha256="a" * 64,
-        pid=reaped_pid(),
-        starttime=111,
-    )
+    handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
     store.create(handle)
     private_atomic_write_text(store.cleanup_uncertain_path("exp-1"), json.dumps(payload))
 
@@ -1308,9 +1301,7 @@ def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) ->
     boot_id = read_boot_id()
     if boot_id is None:
         pytest.skip("boot id unavailable on this platform")
-    handle = replace(
-        make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111), boot_id=boot_id
-    )
+    handle = make_dead_run_handle(run_id="exp-1", boot_id=boot_id)
 
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
@@ -1336,7 +1327,7 @@ def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) ->
                 "pid": handle.pid,
                 "pgid": handle.pgid,
                 "pid_starttime": handle.pid_starttime,
-                "boot_id": _earlier_boot_id(),
+                "boot_id": earlier_boot_id(),
                 "cleanup_confirmed": False,
             }
         ),
@@ -1349,28 +1340,6 @@ def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) ->
     assert not store.recovery_required(handle)
 
 
-@pytest.mark.parametrize("boot_id", ["", "malformed", 12345, True])
-def test_cleanup_marker_with_invalid_boot_id_is_rejected(tmp_path: Path, boot_id: object) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_run_handle(
-        run_id="exp-1", config_sha256="a" * 64, pid=reaped_pid(), starttime=111
-    )
-    store.create(handle)
-    private_atomic_write_text(
-        store.cleanup_uncertain_path("exp-1"),
-        json.dumps(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "a" * 64,
-                "cleanup_confirmed": False,
-                "boot_id": boot_id,
-            }
-        ),
-    )
-
-    assert not store.cleanup_uncertain(handle)
-
-
 def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) -> None:
     # PID and starttime are this live process's, so only the boot id can prove
     # the runner is gone. It does: nothing survives a reboot, so the run derives
@@ -1380,9 +1349,8 @@ def test_earlier_boot_identity_is_dead_without_cleanup_recovery(tmp_path: Path) 
     starttime = read_proc_starttime(os.getpid())
     if starttime is None:
         pytest.skip("/proc starttime unavailable (non-Linux)")
-    handle = replace(
-        make_run_handle(run_id="exp-1", pid=os.getpid(), starttime=starttime),
-        boot_id=_earlier_boot_id(),
+    handle = make_run_handle(
+        run_id="exp-1", pid=os.getpid(), starttime=starttime, boot_id=earlier_boot_id()
     )
     store.create(handle)
 
@@ -1397,7 +1365,7 @@ def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path:
     # Same identity as the boot-mismatch case minus the boot id: an unknown
     # boot id cannot rule out PID reuse, so it must still fail closed.
     store = RunStore(tmp_path / "state")
-    handle = replace(make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111), boot_id=None)
+    handle = replace(make_dead_run_handle(run_id="exp-1"), boot_id=None)
     assert handle.boot_id is None
     store.create(handle)
 
@@ -1410,7 +1378,7 @@ def test_terminal_status_written_during_liveness_check_does_not_require_recovery
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-racing-status", pid=reaped_pid(), starttime=111)
+    handle = make_dead_run_handle(run_id="exp-racing-status")
     store.create(handle)
 
     def runner_finishes(_pid: int | None, _starttime: int | None) -> bool:
@@ -1431,10 +1399,7 @@ def test_terminal_status_written_during_liveness_check_does_not_require_recovery
 
 def test_earlier_boot_clears_a_persisted_cleanup_uncertainty_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = replace(
-        make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111),
-        boot_id=_earlier_boot_id(),
-    )
+    handle = make_dead_run_handle(run_id="exp-1", boot_id=earlier_boot_id())
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
 
@@ -1447,18 +1412,9 @@ def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = replace(
-        make_run_handle(run_id="exp-1", experiment_id="exp", pid=reaped_pid(), starttime=111),
-        boot_id=_earlier_boot_id(),
-    )
+    handle = make_dead_run_handle(run_id="exp-1", experiment_id="exp", boot_id=earlier_boot_id())
     store.create(handle)
-    write_run_status(
-        store,
-        "exp-1",
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, "exp-1")
 
     assert store.state(handle) == "failed"
     assert store.cleanup_recovery_required(handle)
@@ -1472,9 +1428,8 @@ def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> Non
     starttime = read_proc_starttime(os.getpid())
     if starttime is None:
         pytest.skip("/proc starttime unavailable (non-Linux)")
-    handle = replace(
-        make_run_handle(run_id="exp-1", pid=os.getpid(), starttime=starttime),
-        boot_id=_earlier_boot_id(),
+    handle = make_run_handle(
+        run_id="exp-1", pid=os.getpid(), starttime=starttime, boot_id=earlier_boot_id()
     )
     store.create(handle)
     write_run_status(store, "exp-1", returncode=0, result_snapshot_state="pending")
@@ -1485,7 +1440,7 @@ def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> Non
 
 def test_confirmed_terminal_status_overrides_stale_cleanup_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(run_id="exp-1", pid=reaped_pid(), starttime=111)
+    handle = make_dead_run_handle(run_id="exp-1")
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
     write_run_status(
@@ -1509,21 +1464,9 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(
-        run_id="exp-1",
-        experiment_id="exp",
-        config_sha256="a" * 64,
-        pid=reaped_pid(),
-        starttime=111,
-    )
+    handle = make_dead_run_handle(run_id="exp-1", experiment_id="exp", config_sha256="a" * 64)
     store.create(handle)
-    write_run_status(
-        store,
-        "exp-1",
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, "exp-1")
 
     assert store.state(handle) == "running"
     assert live_runs(store) == [handle]
@@ -1545,57 +1488,30 @@ def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
     assert live_runs(store) == []
 
 
-def test_terminal_cleanup_recovery_must_match_handle_hash(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_run_handle(
-        run_id="exp-1",
-        config_sha256="a" * 64,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    write_run_status(
-        store,
-        "exp-1",
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
-    private_atomic_write_text(
-        store.cleanup_recovery_path("exp-1"),
-        json.dumps(
-            {
-                "run_id": "exp-1",
-                "config_sha256": "b" * 64,
-                "cleanup_confirmed": True,
-            }
-        ),
-    )
-
-    assert store.state(handle) == "running"
-
-
-@pytest.mark.parametrize("reaped_attempt_ids", ["not-a-list", [""], [1], {}])
-def test_cleanup_recovery_rejects_malformed_reaped_attempt_ids(
+@pytest.mark.parametrize(
+    "record_fields",
+    [
+        pytest.param({"config_sha256": "b" * 64}, id="hash_of_another_config"),
+        pytest.param({}, id="missing_reaped_fields"),
+        pytest.param({"reaped_attempt_ids": "not-a-list"}, id="reaped_ids_not_a_list"),
+        pytest.param({"reaped_attempt_ids": [""]}, id="reaped_ids_blank_entry"),
+        pytest.param({"reaped_attempt_ids": [1]}, id="reaped_ids_non_string_entry"),
+        pytest.param({"reaped_attempt_ids": {}}, id="reaped_ids_mapping"),
+    ],
+)
+def test_cleanup_recovery_rejects_records_that_cannot_release_the_reservation(
     tmp_path: Path,
-    reaped_attempt_ids: object,
+    record_fields: dict[str, object],
 ) -> None:
-    """Malformed recovery details cannot release a cleanup reservation."""
+    """A recovery record for another config, missing a reaped field, or malformed is refused.
+
+    ``record_fields`` overrides a record that is otherwise valid for the handle
+    but carries no reaped details.
+    """
     store = RunStore(tmp_path / "state")
-    handle = make_run_handle(
-        run_id="exp-1",
-        config_sha256="a" * 64,
-        pid=reaped_pid(),
-        starttime=111,
-    )
+    handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
     store.create(handle)
-    write_run_status(
-        store,
-        handle.run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
+    write_unsafe_cleanup_status(store, handle.run_id)
     private_atomic_write_text(
         store.cleanup_recovery_path(handle.run_id),
         json.dumps(
@@ -1603,40 +1519,7 @@ def test_cleanup_recovery_rejects_malformed_reaped_attempt_ids(
                 "run_id": handle.run_id,
                 "config_sha256": handle.config_sha256,
                 "cleanup_confirmed": True,
-                "reaped_attempt_ids": reaped_attempt_ids,
-            }
-        ),
-    )
-
-    assert not store._cleanup_recovered(handle)
-    assert store.state(handle) == "running"
-    assert store.recovery_required(handle)
-
-
-def test_cleanup_recovery_rejects_missing_reaped_fields(tmp_path: Path) -> None:
-    """A recovery record missing either reaped field entirely is refused."""
-    store = RunStore(tmp_path / "state")
-    handle = make_run_handle(
-        run_id="exp-1",
-        config_sha256="a" * 64,
-        pid=reaped_pid(),
-        starttime=111,
-    )
-    store.create(handle)
-    write_run_status(
-        store,
-        handle.run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
-    )
-    private_atomic_write_text(
-        store.cleanup_recovery_path(handle.run_id),
-        json.dumps(
-            {
-                "run_id": handle.run_id,
-                "config_sha256": handle.config_sha256,
-                "cleanup_confirmed": True,
+                **record_fields,
             }
         ),
     )
@@ -1651,12 +1534,9 @@ def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
 ) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1", config_sha256="a" * 64)
-    write_run_status(
+    write_unsafe_cleanup_status(
         store,
         handle.run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
         recovered_attempt_ids=["runner-match", "runner-other"],
         recovered_attempt_generations={
             "runner-match": handle.run_id,
@@ -1694,12 +1574,9 @@ def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
 
     # Optional runner evidence may be persisted as null by a partial writer;
     # the operator record remains independently usable.
-    write_run_status(
+    write_unsafe_cleanup_status(
         store,
         handle.run_id,
-        returncode=1,
-        error_class="UnsafeProcessCleanupError",
-        cleanup_confirmed=False,
         recovered_attempt_ids=None,
         recovered_attempt_generations={"runner-match": handle.run_id},
     )

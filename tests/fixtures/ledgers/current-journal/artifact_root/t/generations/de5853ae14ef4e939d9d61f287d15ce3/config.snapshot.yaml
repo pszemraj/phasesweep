@@ -6,6 +6,7 @@ trainer_config: {}
 provenance:
   revision: golden-fixture-v1
 override_format: argparse
+mlflow: null
 metric:
   name: objective
   goal: minimize

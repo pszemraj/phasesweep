@@ -31,7 +31,8 @@ class _StrictMappingLoader(yaml.SafeLoader):
 
     would run a sweep against the *second* range with no warning. We override
     the default mapping constructor to raise on collisions, mirroring how
-    ``Phase``'s collision validators behave for cross-phase keys.
+    ``Phase``'s collision validators behave for cross-phase keys. Strings that
+    are not encodable as UTF-8 are rejected too.
     """
 
 
@@ -97,6 +98,46 @@ _StrictMappingLoader.add_constructor(
     yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
     _construct_mapping_strict,
 )
+
+
+def _construct_str_strict(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> str:
+    r"""Construct a YAML string while rejecting text that is not encodable as UTF-8.
+
+    The config bytes are strict UTF-8, but a double-quoted ``"\ud800"`` escape
+    still yields a lone surrogate. Such a string loads, then fails wherever it
+    is encoded: an ``env`` value at trainer launch, any field when the config
+    snapshot is written.
+
+    Args:
+        loader: The active YAML loader.
+        node: The scalar node to construct.
+
+    Returns:
+        The constructed string.
+
+    Raises:
+        yaml.constructor.ConstructorError: The scalar does not construct a string,
+            or the string contains a lone surrogate.
+
+    """
+    value = yaml.constructor.SafeConstructor.construct_yaml_str(loader, node)
+    if not isinstance(value, str):
+        raise yaml.constructor.ConstructorError(
+            None, None, f"expected a string, found {type(value).__name__}", node.start_mark
+        )
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise yaml.constructor.ConstructorError(
+            None,
+            None,
+            "found a string with a lone surrogate escape, which is not valid UTF-8 text",
+            node.start_mark,
+        ) from None
+    return value
+
+
+_StrictMappingLoader.add_constructor("tag:yaml.org,2002:str", _construct_str_strict)
 
 
 def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any]:

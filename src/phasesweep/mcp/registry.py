@@ -273,8 +273,7 @@ def _require_mcp_stable_paths(
     :param Path config_dir: Directory of the experiment config, used to compute
         concrete fix suggestions for ``phasesweep mcp check``.
     :raises CatalogError: If storage is absent or in-memory, ``workdir`` or
-        ``execution.cwd`` is relative, or the journal storage path is empty
-        or relative.
+        ``execution.cwd`` is relative, or the journal storage path is relative.
     """
     storage = experiment.resolved_storage
     if storage is None:
@@ -310,13 +309,6 @@ def _require_mcp_stable_paths(
         )
 
     raw_path = file_url_path(storage)
-    if raw_path == "":
-        raise CatalogError(
-            f"{experiment_id!r}: MCP experiments must use a non-empty absolute "
-            "journal storage path; empty file-backed storage URLs cannot be "
-            "monitored across detached processes",
-            suggestion=_suggest_storage(config_dir),
-        )
     storage_path = Path(raw_path).expanduser()
     if not storage_path.is_absolute():
         raise CatalogError(

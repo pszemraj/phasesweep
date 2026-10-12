@@ -43,7 +43,6 @@ from phasesweep.engine import (
 from phasesweep.engine.paths import (
     _generation_dir,
     _generation_path,
-    _generation_winner_path,
     _last_successful_generation_path,
     _winner_path,
 )
@@ -589,23 +588,19 @@ def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: P
     assert "new hypothesis" not in result.output
 
 
-def _corrupt_the_publication(experiment: Experiment) -> str:
-    """Edit a published winner artifact so its generation manifest stops validating.
-
-    :param Experiment experiment: Experiment whose published generation should be corrupted.
-    :return str: The corrupted generation id.
-    """
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    winner_path = _generation_winner_path(experiment, generation_id, "p")
-    winner_path.write_text(winner_path.read_text() + "\n# edited after publication\n")
-    return generation_id
-
-
+@pytest.mark.parametrize(
+    ("artifact", "appended"),
+    [
+        pytest.param("phases/p/winner.yaml", b"\n# edited after publication\n", id="winner"),
+        pytest.param("reproducibility.json", b"\n", id="reproducibility_record"),
+    ],
+)
 def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    artifact: str,
+    appended: bytes,
 ) -> None:
     """Review v0.5.18 / finding F4: a corrupt publication is not a fresh tree.
 
@@ -613,11 +608,16 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     and exit 0, so the operator's natural next move -- re-run -- advanced the
     pointer and erased the only evidence of corruption. ``show-winners`` must
     likewise not answer "no winner yet" over it. Both commands are read-only,
-    so they share one corrupted tree.
+    so they share one corrupted tree. Editing a published winner artifact or
+    the claim-time reproducibility record (which feeds the same reporting as
+    any winner) stops the generation manifest from validating.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path = materialized.config_path
-    generation_id = _corrupt_the_publication(materialized.experiment)
+    generation_id = published_generation_id(materialized.experiment)
+    assert generation_id is not None
+    tampered = _generation_dir(materialized.experiment, generation_id) / artifact
+    tampered.write_bytes(tampered.read_bytes() + appended)
 
     exit_code = invoke_cli_boundary(["status", str(config_path)], monkeypatch)
 
@@ -643,30 +643,6 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     assert generation_id in captured.err
     assert "does not match its recorded hash" in captured.err
     assert "Do not run anything over this tree" in captured.err
-
-
-def test_tampered_reproducibility_record_fails_both_reporting_surfaces(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The claim-time provenance files feed the same reporting as any winner."""
-    materialized = materialize("current-journal", tmp_path, mode="tree")
-    config_path, experiment = materialized.config_path, materialized.experiment
-    generation_id = published_generation_id(experiment)
-    assert generation_id is not None
-    record = _generation_dir(experiment, generation_id) / "reproducibility.json"
-    record.write_bytes(record.read_bytes() + b"\n")
-
-    assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 1
-    status_captured = capsys.readouterr()
-    assert yaml.safe_load(status_captured.out)["publication_integrity"] == "failed"
-    assert "Do not run anything over this tree" in status_captured.err
-
-    assert invoke_cli_boundary(["show-winners", str(config_path)], monkeypatch) == 1
-    winners_captured = capsys.readouterr()
-    assert "Do not run anything over this tree" in winners_captured.err
-    assert "Traceback" not in winners_captured.err
 
 
 @requires_nonroot
@@ -810,19 +786,28 @@ def test_cli_trial_cleanup_refusal_names_the_cli_recovery(
     )
 
 
-def test_cli_boundary_reports_config_syntax_error_without_traceback(
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        pytest.param("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n", id="syntax_error"),
+        pytest.param("experiment: t\nphases: []\n", id="schema_validation_error"),
+    ],
+)
+def test_cli_boundary_reports_config_error_without_traceback(
+    config_text: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A YAML syntax error is bad input: exit 2, the file named, no traceback.
+    """A bad config is bad input: exit 2, the file named, no traceback.
 
     Bad indentation is one of the two most common YAML mistakes, and PyYAML
     labels it ``in "<unicode string>"``; without the config loader's own source
-    label the operator cannot tell which file failed.
+    label the operator cannot tell which file failed. A schema validation error
+    must name the file the same way.
     """
     config_path = tmp_path / "broken.yaml"
-    config_path.write_text("experiment: t\nphases:\n  - name: a\n   n_trials: 1\n")
+    config_path.write_text(config_text)
 
     exit_code = invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
 
@@ -831,22 +816,6 @@ def test_cli_boundary_reports_config_syntax_error_without_traceback(
     assert str(config_path) in captured.err
     assert "Traceback" not in captured.err
     assert "Traceback" not in captured.out
-
-
-def test_cli_boundary_names_config_for_schema_validation_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    config_path = tmp_path / "invalid-schema.yaml"
-    config_path.write_text("experiment: t\nphases: []\n")
-
-    exit_code = invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 2
-    assert str(config_path) in captured.err
-    assert "Traceback" not in captured.err
 
 
 @pytest.mark.parametrize(
@@ -943,61 +912,69 @@ def test_cli_boundary_classifies_relative_lock_directory_as_operational(
     assert "internal error" not in captured.err
 
 
-def test_cli_boundary_reports_unexpected_failure_as_internal_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """An exception that is not an expected outcome is a bug: exit 70 with a traceback."""
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, RuntimeError("injected-internal"))
+def _unexpected_validation_error() -> ValidationError:
+    """Build a real Pydantic error raised outside the config-loading layer.
 
-    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 70
-    assert "internal error" in captured.err
-    assert "Traceback" in captured.err
-    assert "injected-internal" in captured.err
-
-
-def test_cli_boundary_does_not_misclassify_unexpected_validation_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Only the config-loading layer may classify Pydantic errors as bad input."""
-    config_path = tmp_path / "experiment.yaml"
-    config_path.write_text("placeholder: true\n")
+    :return ValidationError: The error from validating an empty experiment payload.
+    """
     with pytest.raises(ValidationError) as exc_info:
         Experiment.model_validate({})
-    _stub_run_command(monkeypatch, exc_info.value)
-
-    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
-
-    captured = capsys.readouterr()
-    assert exit_code == 70
-    assert "internal error" in captured.err
-    assert "Traceback" in captured.err
+    return exc_info.value
 
 
-def test_cli_boundary_reports_environmental_io_failure_as_operational(
+@pytest.mark.parametrize(
+    ("error", "exit_code", "present", "absent"),
+    [
+        pytest.param(
+            RuntimeError("injected-internal"),
+            70,
+            ["internal error", "Traceback", "injected-internal"],
+            [],
+            id="unexpected_failure",
+        ),
+        pytest.param(
+            _unexpected_validation_error(),
+            70,
+            ["internal error", "Traceback"],
+            [],
+            id="unexpected_validation_error",
+        ),
+        pytest.param(
+            PermissionError("workdir is not writable"),
+            1,
+            ["workdir is not writable"],
+            ["Traceback", "internal error"],
+            id="environmental_io_failure",
+        ),
+    ],
+)
+def test_cli_boundary_separates_internal_errors_from_operational_failures(
+    error: BaseException,
+    exit_code: int,
+    present: list[str],
+    absent: list[str],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """An exception that is not an expected outcome is a bug: exit 70 with a traceback.
+
+    Only the config-loading layer may classify Pydantic errors as bad input, so
+    a validation error raised during a run is still an internal error. An
+    environmental I/O failure is operational: exit 1, no traceback.
+    """
     config_path = tmp_path / "experiment.yaml"
     config_path.write_text("placeholder: true\n")
-    _stub_run_command(monkeypatch, PermissionError("workdir is not writable"))
+    _stub_run_command(monkeypatch, error)
 
-    exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
+    actual_exit_code = invoke_cli_boundary(["run", str(config_path)], monkeypatch)
 
     captured = capsys.readouterr()
-    assert exit_code == 1
-    assert "workdir is not writable" in captured.err
-    assert "Traceback" not in captured.err
-    assert "internal error" not in captured.err
+    assert actual_exit_code == exit_code
+    for text in present:
+        assert text in captured.err
+    for text in absent:
+        assert text not in captured.err
 
 
 def test_cli_boundary_leaves_help_exit_status_unchanged(

@@ -97,6 +97,7 @@ from phasesweep.runtime.files import (
     phasesweep_home,
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.tracking.mlflow import require_mlflow_sdk
 from tests.conftest import make_experiment, requires_nonroot
 from tests.ledger_fixtures import (
     Materialized,
@@ -412,15 +413,6 @@ def _run_while_discovery_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     materialized = materialize("current-journal", tmp_path, mode="tree")
     monkeypatch.setattr(engine_ledger, "_load_existing_phase_study", _raiser(_storage_gone()))
     return run_experiment(materialized.experiment)
-
-
-def _run_over_damaged(fixture: str, damage: Callable[[Path], None]) -> Trigger:
-    """Return a trigger that starts a run over a current golden ledger ``damage`` hit."""
-
-    def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
-        return run_experiment(_materialize_damaged(tmp_path, fixture, "tree", damage).experiment)
-
-    return trigger
 
 
 @contextmanager
@@ -1069,6 +1061,12 @@ def _wandb_sdk_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     return require_wandb_sdk()
 
 
+def _mlflow_sdk_not_installed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Check for the MLflow SDK in an environment that cannot import it."""
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    return require_mlflow_sdk()
+
+
 def _field_dropped(entry: Path) -> None:
     """Drop a field every current registry entry carries, keeping its owner-only file."""
     payload = json.loads(entry.read_text())
@@ -1420,7 +1418,14 @@ ORIGIN_CASES = (
         trigger=_wandb_sdk_not_installed,
         raised=PhaseSweepError,
         action=OperatorAction.FIX_CONFIG,
-        message='python -m pip install "phasesweep[wandb]"',
+        message='pip install "phasesweep[wandb]"',
+    ),
+    RoutingCase(
+        id="mlflow_sdk_missing",
+        trigger=_mlflow_sdk_not_installed,
+        raised=PhaseSweepError,
+        action=OperatorAction.FIX_CONFIG,
+        message='pip install "phasesweep[mlflow]"',
     ),
     RoutingCase(
         id="registry_entry_partial_schema",

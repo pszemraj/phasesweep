@@ -662,25 +662,38 @@ def _spy_write_process_identity(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
     return written
 
 
-def test_supervisor_never_imports_poisoned_phasesweep_from_pythonpath(
+@pytest.mark.parametrize(
+    ("poison_file", "marker_name", "attempt_id"),
+    [
+        # Pre-fix (review v0.5.15 / blocker 1), the supervisor ran ``-m phasesweep.runtime.supervisor`` under the FULL trainer environment, including any ``PYTHONPATH`` composed from ``experiment.env``, so a shadowed ``phasesweep`` package executed at import time, before ``process_identity.json`` existed. The fix launches a stdlib-only script directly under a sanitized ``{"PATH": ...}`` environment.
+        pytest.param(
+            "phasesweep/__init__.py",
+            "poison-marker",
+            "poison-pythonpath",
+            id="phasesweep-package",
+        ),
+        # Even without an ``-m phasesweep...`` import, a bare ``python`` runs ``sitecustomize``/``usercustomize`` during site initialization when their directory is importable at process start; ``-S`` disables that (review v0.5.15 / blocker 1).
+        pytest.param(
+            "sitecustomize.py",
+            "sitecustomize-marker",
+            "poison-sitecustomize",
+            id="sitecustomize",
+        ),
+    ],
+)
+def test_supervisor_never_imports_poisoned_modules_from_pythonpath(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    poison_file: str,
+    marker_name: str,
+    attempt_id: str,
 ) -> None:
-    """A poisoned PYTHONPATH on the trainer env must never reach the supervisor.
-
-    Pre-fix (review v0.5.15 / blocker 1), the supervisor ran ``-m
-    phasesweep.runtime.supervisor`` under the FULL trainer environment,
-    including any ``PYTHONPATH`` composed from ``experiment.env``. A
-    shadowed/poisoned ``phasesweep`` package on that path would execute at
-    import time, before ``process_identity.json`` exists. The fix launches a
-    stdlib-only script directly under a sanitized ``{"PATH": ...}``
-    environment, so the poisoned package must never even be importable.
-    """
+    """A poisoned PYTHONPATH on the trainer env must never reach the supervisor pre-ACK."""
     poison_root = tmp_path / "poison"
-    package_dir = poison_root / "phasesweep"
-    package_dir.mkdir(parents=True)
-    marker = tmp_path / "poison-marker"
-    (package_dir / "__init__.py").write_text(
+    poison_path = poison_root / poison_file
+    poison_path.parent.mkdir(parents=True)
+    marker = tmp_path / marker_name
+    poison_path.write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text('poisoned')\n"
     )
 
@@ -690,46 +703,10 @@ def test_supervisor_never_imports_poisoned_phasesweep_from_pythonpath(
     trial_dir.mkdir()
     env = os.environ.copy()
     env["PYTHONPATH"] = str(poison_root)
-    result = _run_supervised(
-        trial_dir, "true", env=env, timeout=None, attempt_id="poison-pythonpath"
-    )
+    result = _run_supervised(trial_dir, "true", env=env, timeout=None, attempt_id=attempt_id)
 
     assert result.return_code == 0
-    assert not marker.exists(), "supervisor imported the poisoned phasesweep package"
-    assert written == [True], "process_identity.json was never written before exec"
-
-
-def test_supervisor_never_imports_poisoned_sitecustomize_from_pythonpath(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``-S`` must keep site initialization (and thus ``sitecustomize``) off pre-ACK.
-
-    Even without an ``-m phasesweep...`` import, a bare ``python`` invocation
-    still runs ``sitecustomize``/``usercustomize`` during site initialization
-    when their directory is importable at process start — e.g. via a
-    ``PYTHONPATH`` composed into the trainer environment. ``-S`` disables
-    that (review v0.5.15 / blocker 1).
-    """
-    poison_root = tmp_path / "site-poison"
-    poison_root.mkdir()
-    marker = tmp_path / "sitecustomize-marker"
-    (poison_root / "sitecustomize.py").write_text(
-        f"from pathlib import Path\nPath({str(marker)!r}).write_text('poisoned')\n"
-    )
-
-    written = _spy_write_process_identity(monkeypatch)
-
-    trial_dir = tmp_path / "trial"
-    trial_dir.mkdir()
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(poison_root)
-    result = _run_supervised(
-        trial_dir, "true", env=env, timeout=None, attempt_id="poison-sitecustomize"
-    )
-
-    assert result.return_code == 0
-    assert not marker.exists(), "supervisor ran a poisoned sitecustomize.py"
+    assert not marker.exists(), f"supervisor loaded the poisoned {poison_file}"
     assert written == [True], "process_identity.json was never written before exec"
 
 
@@ -905,27 +882,29 @@ def test_supervisor_main_rejects_malformed_payload(
     os.close(ready_read)
 
 
-def test_reap_child_is_strictly_nonblocking(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("waitpid_result", "reaped"),
+    [
+        pytest.param((0, 0), False, id="still-running"),
+        pytest.param((12345, 0), True, id="reaped"),
+    ],
+)
+def test_reap_child_is_strictly_nonblocking_and_reports_whether_it_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+    waitpid_result: tuple[int, int],
+    reaped: bool,
+) -> None:
     calls: list[tuple[int, int]] = []
 
     def fake_waitpid(pid: int, flags: int) -> tuple[int, int]:
         calls.append((pid, flags))
-        return (0, 0)
+        return waitpid_result
 
     monkeypatch.setattr("phasesweep.runtime.reaper.os.waitpid", fake_waitpid)
 
-    assert reap_child(12345) is False
+    assert reap_child(12345) is reaped
 
     assert calls == [(12345, os.WNOHANG)]
-
-
-def test_reap_child_reports_when_it_reaped(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "phasesweep.runtime.reaper.os.waitpid",
-        lambda pid, flags: (pid, 0),
-    )
-
-    assert reap_child(12345) is True
 
 
 # Both duplicate-victim tests below spawn a background child that ignores
@@ -1418,7 +1397,6 @@ def test_phase_deadline_expiring_during_launch_fails_as_timeout(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"touch {trial_dir_marker} && echo x=1.0 {{overrides}}",
-        override_format="argparse",
         n_trials=1,
         timeout_seconds_per_phase=0.2,
     )
@@ -1448,7 +1426,6 @@ def test_phase_deadline_expiring_during_input_preparation_prevents_launch(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"touch {trial_dir_marker} && echo x=1.0 {{overrides}}",
-        override_format="argparse",
         n_trials=1,
         timeout_seconds_per_phase=0.2,
     )
@@ -1486,7 +1463,6 @@ def test_deadline_expiring_during_launch_preparation_prevents_trainer_start(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         trial_command=f"touch {shlex.quote(str(marker))} && echo x=1.0 {{overrides}}",
-        override_format="argparse",
         execution=ExecutionContext(record_env=True),
         n_trials=1,
         timeout_seconds_per_phase=budget if scope == "phase" else None,
@@ -1997,31 +1973,6 @@ def test_run_supervised_reports_uncertain_cleanup_on_timeout(
     assert (tmp_path / PROCESS_IDENTITY_FILE).exists()
 
 
-def test_uncertain_cleanup_aborts_optimization_not_just_trial(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``UnsafeProcessCleanupError`` must propagate out of ``study.optimize()``
-    in the n_jobs=1 path. Pre-v0.5.10, ``_kill_group`` ignored the boolean and
-    the orchestrator swallowed the leaked-process condition via
-    ``TrialExecutionError``. v0.5.11 review: hard_abort state is the only
-    mechanism that surfaces this for n_jobs>1; n_jobs=1 still works through
-    direct exception propagation, but we re-raise from hard_abort regardless
-    so both paths share a common contract."""
-    _report_uncertain_after_real_terminate(monkeypatch)
-
-    exp = make_experiment(
-        workdir=tmp_path / "runs",
-        n_trials=2,
-        timeout_seconds_per_trial=0.1,
-        trial_command=f"{sys.executable} -c 'import time; time.sleep(60)' {{overrides}}",
-        override_format="argparse",
-    )
-
-    with pytest.raises(UnsafeProcessCleanupError):
-        run_experiment(exp)
-
-
 def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2057,7 +2008,6 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
         timeout_seconds_per_trial=0.2,
         max_consecutive_failures=100,  # large, so we don't abort via that path
         trial_command=f"{sys.executable} -c 'import time; time.sleep(60)' {{overrides}}",
-        override_format="argparse",
     )
 
     phase_dir = tmp_path / "runs" / exp.experiment / exp.phases[0].name
@@ -2178,7 +2128,6 @@ def test_trials_csv_written_even_when_hard_abort_propagates_through_optimize(
         n_jobs=1,  # serial path: UnsafeProcessCleanupError exits via study.optimize raise
         timeout_seconds_per_trial=0.2,
         trial_command=f"{sys.executable} -c 'import time; time.sleep(60)' {{overrides}}",
-        override_format="argparse",
     )
 
     phase_dir = tmp_path / "runs" / exp.experiment / exp.phases[0].name

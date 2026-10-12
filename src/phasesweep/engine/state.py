@@ -70,8 +70,14 @@ def _parse_winner_source(data: object, *, expected_phase: str) -> WinnerSource:
     kind = data.get("kind")
     if kind not in get_args(WinnerSourceKind):
         raise ValueError("invalid winner_source kind")
-    if set(data) != {"kind", "phase", "trial_number", "generation_id", "attempt_id"}:
-        raise ValueError("removed winner_source field")
+    fields = {"kind", "phase", "trial_number", "generation_id", "attempt_id"}
+    if set(data) != fields:
+        missing = sorted(fields - set(data))
+        unexpected = sorted(str(key) for key in set(data) - fields)
+        raise ValueError(
+            f"winner_source fields are not the current set (missing {missing}, "
+            f"unexpected {unexpected})"
+        )
     phase = data.get("phase")
     if not isinstance(phase, str) or not phase:
         raise ValueError("invalid winner_source phase")
@@ -148,7 +154,7 @@ GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 5
+STUDY_SCHEMA_VERSION = 6
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The

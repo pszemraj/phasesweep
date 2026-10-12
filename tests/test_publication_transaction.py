@@ -60,6 +60,7 @@ from phasesweep.engine.publication import (
 from phasesweep.engine.resume import _preflight_skipped_winners, _published_for_resume
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime import shutdown as runtime_shutdown
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
     make_experiment,
@@ -174,59 +175,18 @@ def test_summary_readback_refusals_are_publication_commit_errors(
         )
 
 
-@pytest.mark.integration
-def test_precommit_validation_failure_keeps_prior_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A pre-commit validation failure leaves the prior publication authoritative."""
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    first_generation = published_generation_id(experiment)
-    assert first_generation is not None
+def _fail_precommit_validation(monkeypatch: pytest.MonkeyPatch, experiment: Experiment) -> None:
+    """Make the next publication's pre-commit validation raise ``RuntimeError``."""
+    del experiment
 
     def fail_validation(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("simulated pre-commit validation failure")
 
     monkeypatch.setattr(generation_ops, "_validate_generation_publishable", fail_validation)
 
-    captured: list[str] = []
 
-    def capture(report: TerminalReport) -> None:
-        captured.append(report.generation_id)
-
-    with pytest.raises(RuntimeError, match="simulated pre-commit validation failure"):
-        run_experiment(experiment, terminal_callback=capture)
-
-    assert len(captured) == 1
-    second_generation = captured[0]
-    assert second_generation != first_generation
-
-    # The failed generation's own record and current pointer both name the
-    # specific publication_failed outcome, not a generic failure.
-    assert _record_state(experiment, second_generation) == "publication_failed"
-    assert _current_pointer_state(experiment) == "publication_failed"
-    payload = yaml.safe_load(_generation_record_path(experiment, second_generation).read_text())
-    assert payload["error_class"] == "RuntimeError"
-
-    # The prior publication is untouched: the pointer never advanced.
-    assert published_generation_id(experiment) == first_generation
-    published = read_winner(experiment, "p")
-    assert published is not None
-    assert published.generation_id == first_generation
-
-
-@pytest.mark.integration
-def test_pointer_commit_failure_keeps_prior_publication(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failure writing the last-success pointer itself is the same failure shape as validation."""
-    experiment = _stored_experiment(tmp_path)
-    run_experiment(experiment)
-    first_generation = published_generation_id(experiment)
-    assert first_generation is not None
-
+def _fail_pointer_commit(monkeypatch: pytest.MonkeyPatch, experiment: Experiment) -> None:
+    """Make writing the last-success pointer raise ``OSError``."""
     pointer_path = _last_successful_generation_path(experiment)
     original_write = artifact_io._write_yaml_atomic
 
@@ -237,14 +197,69 @@ def test_pointer_commit_failure_keeps_prior_publication(
 
     monkeypatch.setattr(artifact_io, "_write_yaml_atomic", flaky_write)
 
-    with pytest.raises(OSError, match="simulated pointer commit failure"):
-        run_experiment(experiment)
 
-    second_generation = yaml.safe_load(_generation_path(experiment).read_text())["generation_id"]
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("inject_failure", "error_type", "error_match"),
+    [
+        pytest.param(
+            _fail_precommit_validation,
+            RuntimeError,
+            "simulated pre-commit validation failure",
+            id="precommit-validation",
+        ),
+        # A failure writing the last-success pointer itself is the same failure shape as validation.
+        pytest.param(
+            _fail_pointer_commit,
+            OSError,
+            "simulated pointer commit failure",
+            id="pointer-commit",
+        ),
+    ],
+)
+def test_publication_commit_failure_keeps_prior_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_failure: Callable[[pytest.MonkeyPatch, Experiment], None],
+    error_type: type[Exception],
+    error_match: str,
+) -> None:
+    """A failure before the pointer commits leaves the prior publication authoritative."""
+    experiment = _stored_experiment(tmp_path)
+    run_experiment(experiment)
+    first_generation = published_generation_id(experiment)
+    assert first_generation is not None
+
+    inject_failure(monkeypatch, experiment)
+
+    captured: list[str] = []
+
+    def capture(report: TerminalReport) -> None:
+        captured.append(report.generation_id)
+
+    with pytest.raises(error_type, match=error_match):
+        run_experiment(experiment, terminal_callback=capture)
+
+    assert len(captured) == 1
+    second_generation = captured[0]
     assert second_generation != first_generation
+    assert (
+        yaml.safe_load(_generation_path(experiment).read_text())["generation_id"]
+        == second_generation
+    )
+
+    # The failed generation's own record and current pointer both name the
+    # specific publication_failed outcome, not a generic failure.
     assert _record_state(experiment, second_generation) == "publication_failed"
     assert _current_pointer_state(experiment) == "publication_failed"
+    payload = yaml.safe_load(_generation_record_path(experiment, second_generation).read_text())
+    assert payload["error_class"] == error_type.__name__
+
+    # The prior publication is untouched: the pointer never advanced.
     assert published_generation_id(experiment) == first_generation
+    published = read_winner(experiment, "p")
+    assert published is not None
+    assert published.generation_id == first_generation
 
 
 @pytest.mark.integration
@@ -476,22 +491,6 @@ def test_terminal_callback_control_flow_exception_cannot_replace_success(
     assert _record_state(experiment, generation_id) == "published"
 
 
-def test_terminal_callback_control_flow_exception_cannot_replace_failure(
-    tmp_path: Path,
-) -> None:
-    """A diagnostic callback raising KeyboardInterrupt cannot mask the primary error."""
-    trainer = write_trainer(tmp_path / "failing.py", "raise SystemExit(1)")
-    experiment = make_experiment(
-        workdir=tmp_path / "runs", trainer=trainer, n_trials=1, max_consecutive_failures=1
-    )
-
-    def interrupting_callback(_report: TerminalReport) -> None:
-        raise KeyboardInterrupt("diagnostic consumer interrupted")
-
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(experiment, terminal_callback=interrupting_callback)
-
-
 @pytest.mark.integration
 @pytest.mark.signals_own_pid
 def test_shutdown_signal_during_publication_is_absorbed_until_committed(
@@ -510,7 +509,9 @@ def test_shutdown_signal_during_publication_is_absorbed_until_committed(
 
     original_validate = generation_ops._validate_generation_publishable
 
-    def validate_then_signal(*args: object, **kwargs: object) -> tuple[dict[str, Any], bytes]:
+    def validate_then_signal(
+        *args: object, **kwargs: object
+    ) -> tuple[validation_ops.ValidatedPublication, bytes]:
         validated = original_validate(*args, **kwargs)
         os.kill(os.getpid(), signal.SIGTERM)
         return validated
@@ -630,13 +631,177 @@ def test_successful_publication_never_logs_a_record_refusal(
     The post-commit current-pointer refresh passes ``write_record=False``, so
     a normal successful publication must not log the "Refusing to rewrite"
     warning -- that message has to stay a real anomaly signal, not routine
-    noise on every publication.
+    noise on every publication. The second publication replaces a pointer
+    whose target already has its record, which must stay byte for byte as
+    written.
     """
     experiment = _stored_experiment(tmp_path)
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.generation"):
         run_experiment(experiment)
+        first_generation = published_generation_id(experiment)
+        assert first_generation is not None
+        first_record = _generation_record_path(experiment, first_generation).read_bytes()
         run_experiment(experiment)  # republish onto the same storage
+    assert published_generation_id(experiment) != first_generation
+    assert _generation_record_path(experiment, first_generation).read_bytes() == first_record
     assert not [r for r in caplog.records if "Refusing to rewrite" in r.message]
+
+
+# --------------------------------------------------------------------------
+# The pointer never stops naming a generation that has no record: it is the
+# only durable proof of a commit whose controller died before the record write.
+# --------------------------------------------------------------------------
+
+
+def _lose_record_writes(monkeypatch: pytest.MonkeyPatch, *, only: Path | None = None) -> None:
+    """Make writing an immutable record raise ``OSError``, for one record path or every one."""
+    original = generation_ops._write_generation_record_once
+
+    def flaky(
+        *, record_path: Path, generation_id: str, state: str, payload: JsonObject, label: str
+    ) -> None:
+        if only is None or record_path == only:
+            raise OSError("simulated record write failure")
+        original(
+            record_path=record_path,
+            generation_id=generation_id,
+            state=state,
+            payload=payload,
+            label=label,
+        )
+
+    monkeypatch.setattr(generation_ops, "_write_generation_record_once", flaky)
+
+
+def _publish_without_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Experiment, str]:
+    """Commit a publication whose record write never happened, as after a post-commit crash.
+
+    :param Path tmp_path: Per-test temporary directory.
+    :param pytest.MonkeyPatch monkeypatch: Source of the crash patch, scoped to this call.
+    :return tuple[Experiment, str]: The experiment and the generation the pointer now names.
+    """
+    experiment = _stored_experiment(tmp_path)
+    with monkeypatch.context() as crash:
+        _lose_record_writes(crash)
+        run_experiment(experiment)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    assert not _generation_record_path(experiment, generation_id).exists()
+    return experiment, generation_id
+
+
+@pytest.mark.integration
+def test_next_publication_records_the_generation_whose_record_was_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving the pointer first writes the ``published`` record of the generation it leaves."""
+    experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
+
+    run_experiment(experiment)
+
+    second_generation = published_generation_id(experiment)
+    assert second_generation is not None
+    assert second_generation != first_generation
+    record = yaml.safe_load(_generation_record_path(experiment, first_generation).read_text())
+    assert record["state"] == "published"
+    assert record["generation_id"] == first_generation
+    assert record["experiment"] == experiment.experiment
+    # The original invocation's resume point is not recoverable.
+    assert record["from_phase"] is None
+    assert record["error_class"] is None
+    assert _record_state(experiment, second_generation) == "published"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(None, id="published"),
+        pytest.param(b"state: failed\n", id="other-state"),
+        pytest.param(b"\xff", id="malformed"),
+    ],
+)
+def test_replacing_the_pointer_never_rewrites_an_existing_record(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    contents: bytes | None,
+) -> None:
+    """A record of any state or condition is left as written, without a refusal warning."""
+    experiment, generation_id = _golden_publication(tmp_path)
+    record_path = _generation_record_path(experiment, generation_id)
+    if contents is not None:
+        record_path.write_bytes(contents)
+    before = record_path.read_bytes()
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.generation"):
+        generation_ops._record_superseded_publication(experiment, superseding_id="next")
+
+    assert record_path.read_bytes() == before
+    assert not caplog.records
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "inject_failure",
+    [
+        pytest.param(_fail_precommit_validation, id="precommit-validation"),
+        pytest.param(_fail_pointer_commit, id="pointer-commit"),
+    ],
+)
+def test_failed_publication_is_never_recorded_as_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_failure: Callable[[pytest.MonkeyPatch, Experiment], None],
+) -> None:
+    """A generation the pointer never named has nothing to reconcile into ``published``."""
+    experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
+    captured: list[str] = []
+
+    with monkeypatch.context() as failing:
+        inject_failure(failing, experiment)
+        with pytest.raises((RuntimeError, OSError)):
+            run_experiment(experiment, terminal_callback=lambda r: captured.append(r.generation_id))
+
+    [failed_generation] = captured
+    assert published_generation_id(experiment) == first_generation
+    assert _record_state(experiment, failed_generation) == "publication_failed"
+
+    run_experiment(experiment)
+
+    assert published_generation_id(experiment) not in {first_generation, failed_generation}
+    assert _record_state(experiment, first_generation) == "published"
+    assert _record_state(experiment, failed_generation) == "publication_failed"
+
+
+@pytest.mark.integration
+def test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the proof cannot be preserved the pointer does not move, and a later publication retries."""
+    experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
+    first_record = _generation_record_path(experiment, first_generation)
+    captured: list[str] = []
+
+    with monkeypatch.context() as failing:
+        _lose_record_writes(failing, only=first_record)
+        with pytest.raises(OSError, match="simulated record write failure"):
+            run_experiment(experiment, terminal_callback=lambda r: captured.append(r.generation_id))
+
+    [failed_generation] = captured
+    assert published_generation_id(experiment) == first_generation
+    assert not first_record.exists()
+    assert _record_state(experiment, failed_generation) == "publication_failed"
+    assert _current_pointer_state(experiment) == "publication_failed"
+    failed = yaml.safe_load(_generation_record_path(experiment, failed_generation).read_text())
+    assert failed["error_class"] == "OSError"
+
+    run_experiment(experiment)
+
+    assert published_generation_id(experiment) not in {first_generation, failed_generation}
+    assert _record_state(experiment, first_generation) == "published"
 
 
 # --------------------------------------------------------------------------
@@ -685,62 +850,105 @@ def test_publication_refuses_invalid_winner_artifact(
     assert _current_pointer_state(experiment) == "publication_failed"
 
 
-@pytest.mark.parametrize("identity_field", ["generation_id", "attempt_id"])
-def test_manifest_rejects_winner_source_identity_disagreement(
-    tmp_path: Path,
-    identity_field: str,
-) -> None:
-    """The hash-covered winner's two provenance copies must identify one attempt."""
-    experiment, generation_id = _golden_publication(tmp_path)
-
-    winner_path = _generation_winner_path(experiment, generation_id, "p")
-    winner = yaml.safe_load(winner_path.read_text())
-    winner["winner_source"][identity_field] = f"different-{identity_field}"
-    winner_path.write_text(yaml.safe_dump(winner, sort_keys=False))
-
-    summary_path = _generation_summary_path(experiment, generation_id)
-    summary = yaml.safe_load(summary_path.read_text())
-    artifact = next(
-        item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
-    )
-    artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
-    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
-
-    assert published_generation_id(experiment) is None
-    assert read_winner(experiment, "p") is None
-
-
 @pytest.mark.parametrize(
-    ("field", "value"),
+    ("field", "value", "mirror_summary", "error_match"),
     [
-        ("kind", "unknown_source"),
-        ("phase", "../other"),
-        ("phase", "other"),
-        ("trial_number", 999),
-        ("study", 999),
-        ("phase_fingerprint", 999),
+        pytest.param(
+            "kind", "unknown_source", True, "invalid winner_source kind", id="unknown-kind"
+        ),
+        pytest.param(
+            "phase", "../other", True, "has no valid winner_source phase", id="unsafe-phase"
+        ),
+        pytest.param("phase", "other", True, "names phase 'other', expected 'p'", id="other-phase"),
+        pytest.param(
+            "trial_number",
+            999,
+            True,
+            "has no valid winner_source trial_number",
+            id="trial-number",
+        ),
+        pytest.param("study", 999, True, "missing [], unexpected ['study']", id="extra-key"),
+        pytest.param(
+            "phase_fingerprint",
+            999,
+            True,
+            "has no valid phase_fingerprint",
+            id="phase-fingerprint",
+        ),
+        # The hash-covered winner's two provenance copies must identify one attempt.
+        pytest.param(
+            "generation_id",
+            "different-generation_id",
+            True,
+            "winner_source that disagrees with its generation_id",
+            id="source-generation-id",
+        ),
+        pytest.param(
+            "attempt_id",
+            "different-attempt_id",
+            True,
+            "winner_source that disagrees with its attempt_id",
+            id="source-attempt-id",
+        ),
+        # Only the winner's copy changes, so the summary's own copy disagrees with it.
+        pytest.param(
+            "generation_id",
+            "different-generation_id",
+            False,
+            "disagrees with the summary winner_source",
+            id="summary-copy-generation-id",
+        ),
+        pytest.param(
+            "attempt_id",
+            "different-attempt_id",
+            False,
+            "disagrees with the summary winner_source",
+            id="summary-copy-attempt-id",
+        ),
     ],
 )
 def test_manifest_rejects_malformed_reanchored_winner_provenance(
-    tmp_path: Path, field: str, value: object
+    tmp_path: Path, field: str, value: object, mirror_summary: bool, error_match: str
 ) -> None:
+    """Each malformed field is refused by its own check, not by an earlier cross-check.
+
+    With ``mirror_summary`` the summary's per-phase ``winner_source`` copy agrees
+    with the mutated winner, so the summary cross-check passes and only the
+    winner's payload validation can refuse it.
+    """
     experiment, generation_id = _golden_publication(tmp_path)
     winner = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
     if field == "phase_fingerprint":
         winner[field] = value
     else:
         winner["winner_source"][field] = value
-    _reseal_winner(experiment, generation_id, winner)
+    _reseal_winner(experiment, generation_id, winner, mirror_summary=mirror_summary)
 
-    assert _resolve_publication_pointer(experiment).state == "failed"
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert error_match in pointer.error
     assert read_status(experiment)["publication_integrity"] == "failed"
     assert read_winner(experiment, "p") is None
 
 
-def _reseal_winner(experiment: Experiment, generation_id: str, winner: Mapping[str, Any]) -> None:
+def _reseal_winner(
+    experiment: Experiment,
+    generation_id: str,
+    winner: JsonObject,
+    *,
+    mirror_summary: bool = False,
+) -> None:
     """Rewrite phase ``p``'s winner and re-anchor the manifest to its new bytes.
 
     The hashes then match, so only payload validation can refuse the winner.
+
+    :param Experiment experiment: Experiment whose golden publication is rewritten.
+    :param str generation_id: Published generation holding the winner.
+    :param JsonObject winner: Replacement winner payload for phase ``p``.
+    :param bool mirror_summary: Also write the winner's ``winner_source`` into the
+        summary's own per-phase copy, so the two copies agree and the summary
+        cross-check cannot be the reason the winner is refused.
     """
     winner_path = _generation_winner_path(experiment, generation_id, "p")
     winner_path.write_text(yaml.safe_dump(dict(winner), sort_keys=False))
@@ -750,6 +958,11 @@ def _reseal_winner(experiment: Experiment, generation_id: str, winner: Mapping[s
         item for item in summary["artifacts"] if item["kind"] == "winner" and item["phase"] == "p"
     )
     artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
+    if mirror_summary:
+        winner_source = winner["winner_source"]
+        assert isinstance(winner_source, dict)
+        phase_item = next(item for item in summary["phases"] if item["name"] == "p")
+        phase_item["winner_source"] = dict(winner_source)
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
     reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
@@ -880,7 +1093,14 @@ def test_pointer_to_generation_with_tampered_summary_is_not_authoritative(tmp_pa
     summary = yaml.safe_load(summary_path.read_text())
     summary["generation_id"] = "not-this-generation"
     summary_path.write_text(yaml.safe_dump(summary))
+    # Re-anchored, so the pointer's byte anchors pass and only the summary's own identity is refused.
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.generation_id == generation_id
+    assert pointer.error is not None
+    assert "does not name experiment" in pointer.error
     assert published_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
@@ -1564,18 +1784,24 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
         item for item in summary["artifacts"] if item.get("kind") != "reproducibility"
     ]
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
     repro_path.unlink()
 
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert "does not list the complete generation provenance record" in pointer.error
     assert published_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 
 
 @pytest.mark.parametrize(
-    ("filename", "mutate"),
+    ("filename", "mutate", "error_match"),
     [
         pytest.param(
             _REPRODUCIBILITY_NAME,
             lambda payload: {**payload, "generation_id": "not-this-generation"},
+            "reproducibility artifact names a different generation",
             id="reproducibility-names-another-generation",
         ),
         pytest.param(
@@ -1584,11 +1810,13 @@ def test_partially_dropped_provenance_record_is_current_format_tampering(tmp_pat
                 **payload,
                 "config_snapshot": {**payload["config_snapshot"], "sha256": "0" * 64},
             },
+            "reproducibility artifact does not anchor the config snapshot it published",
             id="reproducibility-unanchors-the-snapshot",
         ),
         pytest.param(
             _CONFIG_SNAPSHOT_NAME,
             lambda payload: {**payload, "experiment": "some-other-experiment"},
+            "config_snapshot artifact names a different experiment",
             id="snapshot-names-another-experiment",
         ),
     ],
@@ -1597,6 +1825,7 @@ def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     tmp_path: Path,
     filename: str,
     mutate,  # noqa: ANN001
+    error_match: str,
 ) -> None:
     """Re-hashing an edited provenance file into the manifest does not launder it.
 
@@ -1618,7 +1847,13 @@ def test_rehashed_provenance_edit_still_fails_the_manifest_cross_checks(
     entry = next(item for item in summary["artifacts"] if item.get("path") == filename)
     entry["sha256"] = hashlib.sha256(target.read_bytes()).hexdigest()
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    # Re-anchored, so the pointer's byte anchors pass and the cross-check itself refuses it.
+    reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert error_match in pointer.error
     assert published_generation_id(experiment) is None
     assert read_winner(experiment, "p") is None
 

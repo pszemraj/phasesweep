@@ -308,7 +308,7 @@ def _validate_publishable_summary(
 
 def _validate_generation_publishable(
     experiment: Experiment, generation_id: str
-) -> tuple[dict[str, Any], bytes]:
+) -> tuple[validation_ops.ValidatedPublication, bytes]:
     """Validate a generation's complete result manifest before its publication commit.
 
     Checks the generation's immutable summary names this exact experiment and
@@ -330,20 +330,54 @@ def _validate_generation_publishable(
         or does not name this generation.
     :raises PublicationAccessError: A manifest artifact cannot be read as the current user.
     :raises PublicationIntegrityError: A manifest-listed artifact fails validation.
-    :return tuple[dict[str, Any], bytes]: Parsed summary and exact summary bytes whose
-        manifest was validated.
+    :return tuple[ValidatedPublication, bytes]: Everything the validation read, and the
+        exact summary bytes whose manifest was validated.
     """
     summary, summary_bytes = _validate_publishable_summary(
         summary_path=path_ops._generation_summary_path(experiment, generation_id),
         experiment_name=experiment.experiment,
         generation_id=generation_id,
     )
-    validation_ops._validate_generation_manifest(
+    publication = validation_ops._validate_generation_manifest(
         path_ops._generation_dir(experiment, generation_id),
         generation_id,
         summary,
     )
-    return summary, summary_bytes
+    return publication, summary_bytes
+
+
+def _record_superseded_publication(experiment: Experiment, *, superseding_id: str) -> None:
+    """Write the lifecycle record of the generation the last-success pointer names, if missing.
+
+    The pointer commits before its target's record is written best-effort, so
+    a controller that died in between leaves the pointer as the only durable
+    proof that the target committed. Replacing the pointer would discard that
+    proof, so the record is written first. A well-formed pointer is sufficient
+    proof: its target's artifacts are validated whenever they are read, so
+    nothing is re-validated here. ``from_phase`` is ``None`` because the
+    original invocation's resume point is not recoverable. An existing record
+    of any state is never touched.
+
+    :param Experiment experiment: Experiment whose pointer is about to move.
+    :param str superseding_id: Generation about to replace the pointer's target.
+    :raises PublicationAccessError: The current pointer cannot be read by the current user.
+    :raises OSError: The record could not be written; the caller must not move the pointer.
+    """
+    target = validation_ops._read_pointer_target(
+        path_ops._last_successful_generation_path(experiment),
+        experiment_name=experiment.experiment,
+    )
+    if target is None or target.generation_id == superseding_id:
+        return
+    if path_ops._generation_record_path(experiment, target.generation_id).exists():
+        return
+    _write_generation_state(
+        experiment,
+        generation_id=target.generation_id,
+        state="published",
+        from_phase=None,
+        publish_current=False,
+    )
 
 
 def _publish_generation(
@@ -364,13 +398,17 @@ def _publish_generation(
     2. Pre-commit validation (:func:`_validate_generation_publishable`, item
        A): parse this generation's own summary and winner files back and
        confirm they name themselves correctly.
-    3. When supplied, require the detached runner's sidecar hook to durably
+    3. Write the lifecycle record of the generation the last-success pointer
+       currently names when it has none (:func:`_record_superseded_publication`):
+       step 5 is about to stop naming it, and the pointer may be the only
+       proof it committed.
+    4. When supplied, require the detached runner's sidecar hook to durably
        prepare its frozen result.
-    4. Commit ``last_successful_generation.yaml`` atomically -- the single
-       authoritative publication event. Failures in either preceding step
+    5. Commit ``last_successful_generation.yaml`` atomically -- the single
+       authoritative publication event. Failures in any preceding step
        leave the prior pointer untouched.
 
-    If step 2 or 3 raises, the immutable per-generation record is written
+    If any of steps 2 through 5 raises, the immutable per-generation record is written
     once with state ``"publication_failed"`` (+ ``error_class``), the current
     pointer is driven to ``"publication_failed"``, the prior last-success
     pointer is left untouched (still authoritative), and the original
@@ -378,11 +416,11 @@ def _publish_generation(
     (:func:`_persist_terminal_failure`): a secondary failure while writing it
     is logged, never substituted for the primary error.
 
-    Once step 4 has committed, nothing after it may fail the run:
+    Once step 5 has committed, nothing after it may fail the run:
 
-    5. Best-effort, notify the prepared sidecar that the pointer committed.
-    6. Write the immutable per-generation record once, state ``"published"``.
-    7. Best-effort, diagnostic-only: drive the current pointer to
+    6. Best-effort, notify the prepared sidecar that the pointer committed.
+    7. Write the immutable per-generation record once, state ``"published"``.
+    8. Best-effort, diagnostic-only: drive the current pointer to
        ``"published"``, then refresh the convenience projections
        (root ``winner.yaml`` / ``summary.yaml``; review
        v0.5.15 / item D). These are post-commit caches for humans only -- no
@@ -391,7 +429,7 @@ def _publish_generation(
        :func:`phasesweep.engine.publication._published_winner_path_for`), so a
        failure projecting them never affects what callers actually see.
 
-    Steps 5 through 7 each independently log and swallow their own failure so one
+    Steps 6 through 8 each independently log and swallow their own failure so one
     cannot prevent the other from running.
 
     The whole transaction runs inside an
@@ -411,18 +449,21 @@ def _publish_generation(
     :param Mapping[str, Winner] winners: Engine-selected winners to hand to a
         required publication sidecar.
     :param PublicationHook | None publication_hook: Optional detached-run sidecar.
-    :raises Exception: Whatever steps 2 through 4 raised, after best-effort
+    :raises Exception: Whatever steps 2 through 5 raised, after best-effort
         "publication_failed" bookkeeping.
     """
     with absorb_shutdown_signals() as absorbed:
         try:
-            summary, summary_bytes = _validate_generation_publishable(experiment, generation_id)
+            publication, summary_bytes = _validate_generation_publishable(experiment, generation_id)
+            # Before the pointer stops naming its current target, which may
+            # have no record yet if its invocation died after the commit.
+            _record_superseded_publication(experiment, superseding_id=generation_id)
             if publication_hook is not None:
                 publication_hook.prepare(
                     experiment=experiment,
                     generation_id=generation_id,
                     winners=MappingProxyType(dict(winners)),
-                    summary=MappingProxyType(summary),
+                    summary=MappingProxyType(publication.summary),
                 )
             artifact_io._write_yaml_atomic(
                 path_ops._last_successful_generation_path(experiment),
@@ -456,7 +497,7 @@ def _publish_generation(
             )
 
         def _write_published_record() -> None:
-            """Step 6: write the immutable per-generation record once, state ``published``."""
+            """Step 7: write the immutable per-generation record once, state ``published``."""
             _write_generation_state(
                 experiment,
                 generation_id=generation_id,

@@ -177,3 +177,9 @@ class TrialTargetRegressionError(PhaseSweepError):
     """Raised when a persistent study requests less than its accepted trial target."""
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
+class TrackingTargetUnavailableError(PhaseSweepError):
+    """Raised before a phase allocates trials when its MLflow target cannot be reached."""
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
