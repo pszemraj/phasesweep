@@ -433,3 +433,53 @@ def test_mcp_status_agrees_with_a_mirror_failure_after_publication(tmp_path, mon
     handle = store.get(run_id)
     assert handle is not None
     assert store.cleanup_recovery_required(handle) is (failure == "worker")
+
+
+def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(
+    tmp_path, monkeypatch
+):
+    """A controller that dies right after the pointer commit loses neither its proof nor its mirror.
+
+    The first invocation dies before it writes the lifecycle record and before
+    the in-process mirror. A later no-work replay moves the pointer, which must
+    first leave the record that keeps the generation published, so
+    ``sync-tracking`` still rebuilds its winner and summary uploads.
+    """
+    from phasesweep.engine import generation as generation_ops
+    from phasesweep.engine.paths import _last_successful_generation_path
+
+    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"  # the replay must find the studies
+    experiment = Experiment.model_validate(config)
+    pointer_path = _last_successful_generation_path(experiment)
+
+    def die_before_record(**kwargs):
+        raise OSError("controller died after the pointer commit")
+
+    with monkeypatch.context() as crash:
+        crash.setattr(generation_ops, "_write_generation_record_once", die_before_record)
+        crash.setattr(publication, "publish_generation", lambda *args: None)
+        run_experiment(experiment)
+    first = yaml.safe_load(pointer_path.read_text())["generation_id"]
+    first_delivery = tracking_root(experiment) / first / "delivery"
+    intents = ["winner-depth.json", "winner-rate.json", "generation.json"]
+    assert not _generation_record_path(experiment, first).exists()
+    assert len(list(first_delivery.glob("attempt-*.json"))) == 4
+    assert not any((first_delivery / name).exists() for name in intents)
+    uploads.clear()  # the attempt uploads are already delivered; only sync's remain to count
+
+    reports = []
+    run_experiment(experiment, terminal_callback=reports.append)
+    second = reports[0].generation_id
+    assert second != first
+    assert yaml.safe_load(pointer_path.read_text())["generation_id"] == second
+    assert _recorded_generation_state(_generation_record_path(experiment, first)) == "published"
+    assert publication._published(experiment, first)
+
+    assert publication.sync_tracking(experiment) == {"pending": 0, "delivered": 7}
+    assert all((first_delivery / name).exists() for name in intents)
+    assert sorted(request["name"] for request in uploads) == [
+        "generation",
+        "winner-depth",
+        "winner-rate",
+    ]

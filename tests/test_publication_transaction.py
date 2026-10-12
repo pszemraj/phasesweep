@@ -631,13 +631,177 @@ def test_successful_publication_never_logs_a_record_refusal(
     The post-commit current-pointer refresh passes ``write_record=False``, so
     a normal successful publication must not log the "Refusing to rewrite"
     warning -- that message has to stay a real anomaly signal, not routine
-    noise on every publication.
+    noise on every publication. The second publication replaces a pointer
+    whose target already has its record, which must stay byte for byte as
+    written.
     """
     experiment = _stored_experiment(tmp_path)
     with caplog.at_level(logging.WARNING, logger="phasesweep.engine.generation"):
         run_experiment(experiment)
+        first_generation = published_generation_id(experiment)
+        assert first_generation is not None
+        first_record = _generation_record_path(experiment, first_generation).read_bytes()
         run_experiment(experiment)  # republish onto the same storage
+    assert published_generation_id(experiment) != first_generation
+    assert _generation_record_path(experiment, first_generation).read_bytes() == first_record
     assert not [r for r in caplog.records if "Refusing to rewrite" in r.message]
+
+
+# --------------------------------------------------------------------------
+# The pointer never stops naming a generation that has no record: it is the
+# only durable proof of a commit whose controller died before the record write.
+# --------------------------------------------------------------------------
+
+
+def _lose_record_writes(monkeypatch: pytest.MonkeyPatch, *, only: Path | None = None) -> None:
+    """Make writing an immutable record raise ``OSError``, for one record path or every one."""
+    original = generation_ops._write_generation_record_once
+
+    def flaky(
+        *, record_path: Path, generation_id: str, state: str, payload: JsonObject, label: str
+    ) -> None:
+        if only is None or record_path == only:
+            raise OSError("simulated record write failure")
+        original(
+            record_path=record_path,
+            generation_id=generation_id,
+            state=state,
+            payload=payload,
+            label=label,
+        )
+
+    monkeypatch.setattr(generation_ops, "_write_generation_record_once", flaky)
+
+
+def _publish_without_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Experiment, str]:
+    """Commit a publication whose record write never happened, as after a post-commit crash.
+
+    :param Path tmp_path: Per-test temporary directory.
+    :param pytest.MonkeyPatch monkeypatch: Source of the crash patch, scoped to this call.
+    :return tuple[Experiment, str]: The experiment and the generation the pointer now names.
+    """
+    experiment = _stored_experiment(tmp_path)
+    with monkeypatch.context() as crash:
+        _lose_record_writes(crash)
+        run_experiment(experiment)
+    generation_id = published_generation_id(experiment)
+    assert generation_id is not None
+    assert not _generation_record_path(experiment, generation_id).exists()
+    return experiment, generation_id
+
+
+@pytest.mark.integration
+def test_next_publication_records_the_generation_whose_record_was_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving the pointer first writes the ``published`` record of the generation it leaves."""
+    experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
+
+    run_experiment(experiment)
+
+    second_generation = published_generation_id(experiment)
+    assert second_generation is not None
+    assert second_generation != first_generation
+    record = yaml.safe_load(_generation_record_path(experiment, first_generation).read_text())
+    assert record["state"] == "published"
+    assert record["generation_id"] == first_generation
+    assert record["experiment"] == experiment.experiment
+    # The original invocation's resume point is not recoverable.
+    assert record["from_phase"] is None
+    assert record["error_class"] is None
+    assert _record_state(experiment, second_generation) == "published"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        pytest.param(None, id="published"),
+        pytest.param(b"state: failed\n", id="other-state"),
+        pytest.param(b"\xff", id="malformed"),
+    ],
+)
+def test_replacing_the_pointer_never_rewrites_an_existing_record(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    contents: bytes | None,
+) -> None:
+    """A record of any state or condition is left as written, without a refusal warning."""
+    experiment, generation_id = _golden_publication(tmp_path)
+    record_path = _generation_record_path(experiment, generation_id)
+    if contents is not None:
+        record_path.write_bytes(contents)
+    before = record_path.read_bytes()
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.generation"):
+        generation_ops._record_superseded_publication(experiment, superseding_id="next")
+
+    assert record_path.read_bytes() == before
+    assert not caplog.records
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "inject_failure",
+    [
+        pytest.param(_fail_precommit_validation, id="precommit-validation"),
+        pytest.param(_fail_pointer_commit, id="pointer-commit"),
+    ],
+)
+def test_failed_publication_is_never_recorded_as_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject_failure: Callable[[pytest.MonkeyPatch, Experiment], None],
+) -> None:
+    """A generation the pointer never named has nothing to reconcile into ``published``."""
+    experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
+    captured: list[str] = []
+
+    with monkeypatch.context() as failing:
+        inject_failure(failing, experiment)
+        with pytest.raises((RuntimeError, OSError)):
+            run_experiment(experiment, terminal_callback=lambda r: captured.append(r.generation_id))
+
+    [failed_generation] = captured
+    assert published_generation_id(experiment) == first_generation
+    assert _record_state(experiment, failed_generation) == "publication_failed"
+
+    run_experiment(experiment)
+
+    assert published_generation_id(experiment) not in {first_generation, failed_generation}
+    assert _record_state(experiment, first_generation) == "published"
+    assert _record_state(experiment, failed_generation) == "publication_failed"
+
+
+@pytest.mark.integration
+def test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the proof cannot be preserved the pointer does not move, and a later publication retries."""
+    experiment, first_generation = _publish_without_record(tmp_path, monkeypatch)
+    first_record = _generation_record_path(experiment, first_generation)
+    captured: list[str] = []
+
+    with monkeypatch.context() as failing:
+        _lose_record_writes(failing, only=first_record)
+        with pytest.raises(OSError, match="simulated record write failure"):
+            run_experiment(experiment, terminal_callback=lambda r: captured.append(r.generation_id))
+
+    [failed_generation] = captured
+    assert published_generation_id(experiment) == first_generation
+    assert not first_record.exists()
+    assert _record_state(experiment, failed_generation) == "publication_failed"
+    assert _current_pointer_state(experiment) == "publication_failed"
+    failed = yaml.safe_load(_generation_record_path(experiment, failed_generation).read_text())
+    assert failed["error_class"] == "OSError"
+
+    run_experiment(experiment)
+
+    assert published_generation_id(experiment) not in {first_generation, failed_generation}
+    assert _record_state(experiment, first_generation) == "published"
 
 
 # --------------------------------------------------------------------------
