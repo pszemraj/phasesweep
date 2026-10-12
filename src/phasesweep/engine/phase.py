@@ -933,6 +933,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
                     attempt_id=attempt_id,
                     run_name=trial_run_name(experiment, phase.name, trial.number, attempt_id),
                     overrides_sha256=prepared_input.sha256,
+                    inherited=run.inherited_winners,
                     directory=trial_dir,
                     environment=run.environment_identity.values,
                     deadline=run.optimize_deadline,
@@ -1230,13 +1231,7 @@ def _settle_finished_trial(
     if run.experiment.mlflow is not None and trial.state == optuna.trial.TrialState.COMPLETE:
         from phasesweep.tracking.publication import publish_trial
 
-        publish_trial(
-            run.experiment,
-            run.generation_id,
-            trial,
-            run.environment_identity.values,
-            run.inherited_winners,
-        )
+        publish_trial(run.experiment, run.generation_id, trial, run.environment_identity.values)
     elif run.experiment.mlflow is not None and not _trial_requires_cleanup_recovery(trial):
         from phasesweep.tracking.publication import publish_unaccepted_trial
 

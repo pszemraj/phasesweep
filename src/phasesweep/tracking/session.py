@@ -13,16 +13,24 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from phasesweep.runtime.files import private_atomic_write_text
-from phasesweep.runtime.json import JsonObject, json_object, json_text, strict_json_loads
+from phasesweep.runtime.json import (
+    JsonObject,
+    json_object,
+    json_text,
+    json_text_map,
+    strict_json_loads,
+)
 from phasesweep.tracking.mlflow import identity_tags, request_operation, verify_remote
 from phasesweep.tracking.records import validate_binding
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
+    from phasesweep.engine.state import Winner
     from phasesweep.tracking.mlflow import _SdkClient
     from phasesweep.tracking.records import CreateAction, RunBinding, RunIdentity, TrackingAction
 
 BINDING_FILE = "mlflow-binding.json"
+INHERITS_FILE = "mlflow-inherits.json"
 _PARENT_LOCK = threading.RLock()
 
 
@@ -71,6 +79,19 @@ def read_binding(directory: Path, name: str = BINDING_FILE) -> RunBinding:
     :return RunBinding: Validated binding.
     """
     return validate_binding(read_record(directory / name))
+
+
+def read_inherits(directory: Path) -> dict[str, str]:
+    """Load the native run of each parent winner an attempt inherited.
+
+    :param Path directory: Attempt directory.
+    :raises ValueError: The record is not a mapping of phase names to run IDs.
+    :return dict[str, str]: Run ID by parent phase name.
+    """
+    inherits = json_text_map(read_record(directory / INHERITS_FILE).get("inherits"))
+    if inherits is None:
+        raise ValueError("MLflow inherited-run record is malformed.")
+    return inherits
 
 
 def operation_deadline(experiment: Experiment, deadline: float | None = None) -> float:
@@ -342,11 +363,16 @@ def prepare_attempt(
     attempt_id: str,
     run_name: str,
     overrides_sha256: str,
+    inherited: Mapping[str, Winner],
     directory: Path,
     environment: Mapping[str, str],
     deadline: float | None,
 ) -> RunIdentity:
     """Bind the source experiment and optionally create the trainer's run.
+
+    The native runs of the inherited winners are recorded beside the
+    identity, so the attempt's projection can be rebuilt after the process
+    that launched it is gone.
 
     :param Experiment experiment: MLflow-backed experiment.
     :param str phase: Current phase name.
@@ -354,6 +380,7 @@ def prepare_attempt(
     :param str attempt_id: Allocated trainer identity.
     :param str run_name: The trainer's ``PHASESWEEP_RUN_NAME``, reused for a managed run.
     :param str overrides_sha256: Existing prepared-input identity.
+    :param Mapping[str, Winner] inherited: Parent-phase winners fixed into this attempt.
     :param Path directory: Registered attempt directory.
     :param Mapping[str, str] environment: Composed trainer environment.
     :param float | None deadline: Existing phase/run deadline.
@@ -375,6 +402,19 @@ def prepare_attempt(
         "run_mode": experiment.mlflow.run_mode,
         "parent_run_id": parent["run_id"],
     }
+    write_record(
+        directory / INHERITS_FILE,
+        {
+            "schema_version": 1,
+            "inherits": {
+                name: validate_binding(winner.objective_provenance["remote_capture"]["binding"])[
+                    "run_id"
+                ]
+                for name, winner in inherited.items()
+                if winner.objective_provenance is not None
+            },
+        },
+    )
     write_record(directory / "mlflow-expected.json", identity)
     if experiment.mlflow.run_mode == "managed":
         return _create_bound(

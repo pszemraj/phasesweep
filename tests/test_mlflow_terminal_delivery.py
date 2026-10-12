@@ -11,18 +11,36 @@ from types import SimpleNamespace
 
 import pytest
 import yaml
+from optuna.trial import TrialState, create_trial
 
 from phasesweep.config import Experiment
 from phasesweep.engine import NoFeasibleTrialError, run_experiment
 from phasesweep.engine.generation import _recorded_generation_state
+from phasesweep.engine.ledger import claim_ledger, open_phase_study, validate_ledger
 from phasesweep.engine.paths import _generation_record_path, _trial_dir_for
 from phasesweep.engine.read import read_status
+from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    DURATION_ATTR,
+    FEASIBLE_ATTR,
+    GENERATION_ID_ATTR,
+    OVERRIDES_ATTR,
+    STUDY_SCHEMA_ATTR,
+    STUDY_SCHEMA_VERSION,
+    constraint_attr,
+)
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
 from phasesweep.runtime.shutdown import PhaseSweepShutdown, ShutdownCleanupReport
 from phasesweep.tracking import mlflow as worker
 from phasesweep.tracking import publication, session
 from phasesweep.tracking.mlflow import _capture, _publish
-from phasesweep.tracking.session import BINDING_FILE, read_record, tracking_root, write_record
+from phasesweep.tracking.session import (
+    BINDING_FILE,
+    INHERITS_FILE,
+    read_record,
+    tracking_root,
+    write_record,
+)
 from tests.test_mlflow import _binding, _run, native_experiment
 
 
@@ -123,20 +141,45 @@ def test_unresolved_attempt_upload_worker_fails_the_run(tmp_path, monkeypatch, n
     assert set(uploaded_phases) == {"depth"}
 
 
-def test_failed_generation_finishes_unrecorded_attempt_runs(tmp_path, monkeypatch):
-    """Attempts interrupted before their trial callback are finished with the generation."""
+def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path, monkeypatch):
+    """The Optuna outcome, never a missing record, decides what an unrecorded attempt reports."""
     experiment = native_experiment(tmp_path)
     generation = "a" * 32
     write_record(
         tracking_root(experiment) / generation / "generation-binding.json",
         {**_binding(), "phase": "generation", "attempt_id": generation},
     )
-    for attempt, mode in [("1" * 32, "managed"), ("2" * 32, "managed"), ("3" * 32, "trainer")]:
+    ledger = claim_ledger(validate_ledger(experiment))
+    study = open_phase_study(ledger, experiment.phases[0])
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    attempts = {
+        "1": ("managed", TrialState.RUNNING),  # interrupted before its callback
+        "2": ("managed", TrialState.FAIL),  # its callback already recorded it
+        "3": ("trainer", TrialState.FAIL),  # PhaseSweep never ends a trainer's run
+        "4": ("managed", TrialState.COMPLETE),  # accepted; its record was never saved
+        "5": ("managed", TrialState.PRUNED),
+    }
+    for number, (digit, (mode, state)) in enumerate(attempts.items()):
+        attempt = digit * 32
         directory = _trial_dir_for(
-            experiment, "depth", 0, generation_id=generation, attempt_id=attempt
+            experiment, "depth", number, generation_id=generation, attempt_id=attempt
         )
-        write_record(
-            directory / BINDING_FILE, {**_binding(), "attempt_id": attempt, "run_mode": mode}
+        binding = {**_binding(), "phase": "depth", "attempt_id": attempt, "run_mode": mode}
+        write_record(directory / BINDING_FILE, binding)
+        write_record(directory / INHERITS_FILE, {"schema_version": 1, "inherits": {}})
+        study.add_trial(
+            create_trial(
+                state=state,
+                value=0.5 if state == TrialState.COMPLETE else None,
+                user_attrs={
+                    ATTEMPT_ID_ATTR: attempt,
+                    GENERATION_ID_ATTR: generation,
+                    OVERRIDES_ATTR: json.dumps({"model.depth": 2}),
+                    FEASIBLE_ATTR: True,
+                    DURATION_ATTR: 3.0,
+                    constraint_attr("cost"): 1.0,
+                },
+            )
         )
     write_record(
         tracking_root(experiment) / generation / "delivery" / f"attempt-{'2' * 32}.json",
@@ -144,11 +187,82 @@ def test_failed_generation_finishes_unrecorded_attempt_runs(tmp_path, monkeypatc
     )
     requests = []
     monkeypatch.setattr(publication, "call_tracking", lambda *args: requests.append(args[2]))
-    publication.publish_failed_generation(experiment, generation, KeyboardInterrupt())
-    assert [(r["binding"]["attempt_id"], r["finish"]) for r in requests] == [
-        ("1" * 32, "KILLED"),
-        (generation, "KILLED"),
+    publication.publish_failed_generation(experiment, generation, KeyboardInterrupt(), ledger)
+    assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in requests] == [
+        ("1", "KILLED"),
+        ("4", None),
+        ("5", "KILLED"),
+        ("a", "KILLED"),
     ]
+    accepted = requests[1]["projection"]
+    assert accepted["metrics"] == {
+        "phasesweep.objective": 0.5,
+        "phasesweep.feasible": 1.0,
+        "phasesweep.duration_seconds": 3.0,
+        "phasesweep.constraint.cost": 1.0,
+    }
+    assert accepted["params"] == {"phasesweep.override.model.depth": "2"}
+    assert "phasesweep.outcome" not in accepted["tags"]
+
+
+@pytest.mark.parametrize("storage", ["memory", "journal"])
+def test_unsaved_accepted_attempt_keeps_its_accepted_projection(tmp_path, monkeypatch, storage):
+    """A record write that fails after Optuna accepts a trial never turns it into a failure."""
+    config, uploads = _remote_example(tmp_path, monkeypatch)
+    if storage == "journal":
+        config["storage"] = f"journal:///{tmp_path}/study.journal"
+    experiment = Experiment.model_validate(config)
+    actual_write = publication.write_record
+    failed = []
+
+    def fail_first_accepted(path, record):
+        if not failed and path.name.startswith("attempt-") and record["state"] == "pending":
+            failed.append(path)
+            raise OSError("tracking disk full")
+        actual_write(path, record)
+
+    monkeypatch.setattr(publication, "write_record", fail_first_accepted)
+    reports = []
+    with pytest.raises(OSError, match="tracking disk full"):
+        run_experiment(experiment, terminal_callback=reports.append)
+    [path] = failed
+    record = read_record(path)
+    assert record["finish"] is None
+    assert record["projection"]["metrics"]["phasesweep.objective"] == 1.0
+    assert "phasesweep.outcome" not in record["projection"]["tags"]
+    assert [r["projection"] for r in uploads if r["name"] == path.stem] == [record["projection"]]
+    failure = read_record(
+        tracking_root(experiment) / reports[0].generation_id / "delivery" / "generation.json"
+    )
+    assert failure["finish"] == "FAILED"
+    if storage == "journal":
+        # Resuming selects that very trial and leaves its record as it is.
+        assert run_experiment(experiment)["depth"].attempt_id == record["binding"]["attempt_id"]
+        assert read_record(path) == record
+
+
+def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkeypatch):
+    """A controller that dies between Optuna's commit and its callback saved no record."""
+    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    experiment = Experiment.model_validate(config)
+    monkeypatch.setattr(publication, "publish_trial", lambda *args: None)
+    run_experiment(experiment)
+    [generation] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
+    delivery = tracking_root(experiment) / generation / "delivery"
+    assert not list(delivery.glob("attempt-*.json"))
+    journal = (tmp_path / "study.journal").read_bytes()
+
+    assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 7}
+    assert (tmp_path / "study.journal").read_bytes() == journal
+    records = [read_record(path) for path in sorted(delivery.glob("attempt-*.json"))]
+    assert len(records) == 4
+    for record in records:
+        assert record["finish"] is None
+        assert record["projection"]["metrics"]["phasesweep.objective"] == 1.0
+    rate = [r for r in records if r["binding"]["phase"] == "rate"]
+    depth_runs = {r["binding"]["run_id"] for r in records if r["binding"]["phase"] == "depth"}
+    assert all(r["projection"]["tags"]["phasesweep.inherits.depth"] in depth_runs for r in rate)
 
 
 def _fail_engine(tmp_path, monkeypatch, error):
@@ -248,7 +362,9 @@ def test_missing_binding_never_creates_or_discovers_a_summary(tmp_path, monkeypa
     """An unresolved create response cannot identify a run to finish by guessing."""
     experiment = native_experiment(tmp_path)
     monkeypatch.setattr(publication, "call_tracking", lambda *args: pytest.fail("No remote work"))
-    publication.publish_failed_generation(experiment, "a" * 32, RuntimeError("create unresolved"))
+    publication.publish_failed_generation(
+        experiment, "a" * 32, RuntimeError("create unresolved"), validate_ledger(experiment)
+    )
     assert publication.delivery_status(experiment) == {"pending": 0, "delivered": 0}
 
 

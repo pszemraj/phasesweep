@@ -496,7 +496,7 @@ def _run_experiment_outcome(
                 from phasesweep.tracking.publication import publish_failed_generation
 
                 try:
-                    publish_failed_generation(experiment, generation_id, primary_error)
+                    publish_failed_generation(experiment, generation_id, primary_error, claimed)
                 except ProcessCleanupUncertainError as tracking_exc:
                     cleanup.mark_uncertain(tracking_exc)
                     log.exception("MLflow failure delivery cleanup could not be confirmed")

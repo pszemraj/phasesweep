@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +22,7 @@ from phasesweep.tracking.session import (
     BINDING_FILE,
     call_tracking,
     read_binding,
+    read_inherits,
     read_record,
     tracking_root,
     write_record,
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
 
     from phasesweep.config.models import Experiment
-    from phasesweep.engine.state import Winner
+    from phasesweep.engine.ledger import ValidatedLedger
     from phasesweep.tracking.records import DeliveryRecord, Projection, PublishAction, RunBinding
 
 log = logging.getLogger(__name__)
@@ -155,57 +156,43 @@ def _enqueue(
     _deliver(experiment, path, environment)
 
 
-def publish_trial(
-    experiment: Experiment,
-    generation_id: str,
-    trial: FrozenTrial,
-    environment: Mapping[str, str],
-    inherited: Mapping[str, Winner],
-) -> None:
-    """Mirror an accepted Optuna trial to its native bound MLflow run.
+def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Projection:
+    """Freeze one accepted trial's result from its durable Optuna record.
 
-    :param Experiment experiment: Configured experiment.
-    :param str generation_id: Producing generation.
-    :param FrozenTrial trial: Locally terminal accepted trial.
-    :param Mapping[str, str] environment: Composed authentication environment.
-    :param Mapping[str, Winner] inherited: Source winners fixed into this attempt.
+    Constraints come from the trial's own attributes rather than the current
+    config, so the projection can be rebuilt for any accepted trial later.
+
+    :param FrozenTrial trial: COMPLETE trial.
+    :param Mapping[str, str] inherits: Native run of each parent winner the attempt inherited.
+    :return Projection: The attempt's accepted projection.
     """
     from phasesweep.engine.state import (
+        CONSTRAINT_PREFIX,
         DURATION_ATTR,
         FEASIBLE_ATTR,
         OVERRIDES_ATTR,
-        TRIAL_DIR_ATTR,
-        constraint_attr,
     )
 
-    directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
-    binding = read_binding(directory)
     overrides = json_object(json.loads(trial.user_attrs[OVERRIDES_ATTR]))
     assert trial.value is not None
     constraints = {
-        c.name: json_number(trial.user_attrs, constraint_attr(c.name))
-        for c in experiment.constraints
+        key.removeprefix(CONSTRAINT_PREFIX): json_number(trial.user_attrs, key)
+        for key in sorted(trial.user_attrs)
+        if key.startswith(CONSTRAINT_PREFIX)
     }
-    metrics = {
-        "phasesweep.objective": float(trial.value),
-        "phasesweep.feasible": float(trial.user_attrs[FEASIBLE_ATTR]),
-        "phasesweep.duration_seconds": json_number(trial.user_attrs, DURATION_ATTR),
-        **{f"phasesweep.constraint.{k}": v for k, v in constraints.items()},
-    }
-    projection = _projection(
-        metrics=metrics,
+    return _projection(
+        metrics={
+            "phasesweep.objective": float(trial.value),
+            "phasesweep.feasible": float(trial.user_attrs[FEASIBLE_ATTR]),
+            "phasesweep.duration_seconds": json_number(trial.user_attrs, DURATION_ATTR),
+            **{f"phasesweep.constraint.{k}": v for k, v in constraints.items()},
+        },
         params={
             f"phasesweep.override.{k}": json.dumps(v, sort_keys=True) for k, v in overrides.items()
         },
         tags={
             "phasesweep.trial_number": str(trial.number),
-            **{
-                f"phasesweep.inherits.{name}": validate_binding(
-                    winner.objective_provenance["remote_capture"]["binding"]
-                )["run_id"]
-                for name, winner in inherited.items()
-                if winner.objective_provenance is not None
-            },
+            **{f"phasesweep.inherits.{name}": run_id for name, run_id in inherits.items()},
         },
         summary=json_object(
             {
@@ -216,12 +203,50 @@ def publish_trial(
             }
         ),
     )
+
+
+def _unaccepted_projection(binding: RunBinding, status: str) -> Projection:
+    """Freeze the end of a managed attempt run that produced no accepted result.
+
+    :param RunBinding binding: The attempt's managed run binding.
+    :param str status: Terminal MLflow status for a still-running run.
+    :return Projection: The attempt's outcome projection.
+    """
+    return _projection(
+        metrics={},
+        params={},
+        tags={"phasesweep.outcome": status},
+        summary={
+            "phase": binding["phase"],
+            "attempt_id": binding["attempt_id"],
+            "status": status,
+        },
+    )
+
+
+def publish_trial(
+    experiment: Experiment,
+    generation_id: str,
+    trial: FrozenTrial,
+    environment: Mapping[str, str],
+) -> None:
+    """Mirror an accepted Optuna trial to its native bound MLflow run.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Producing generation.
+    :param FrozenTrial trial: Locally terminal accepted trial.
+    :param Mapping[str, str] environment: Composed authentication environment.
+    """
+    from phasesweep.engine.state import TRIAL_DIR_ATTR
+
+    directory = Path(trial.user_attrs[TRIAL_DIR_ATTR])
+    binding = read_binding(directory)
     _enqueue(
         experiment,
         generation_id,
         f"attempt-{binding['attempt_id']}",
         binding,
-        projection,
+        _accepted_projection(trial, read_inherits(directory)),
         environment,
     )
 
@@ -246,16 +271,7 @@ def _finish_attempt(
         generation_id,
         f"attempt-{binding['attempt_id']}",
         binding,
-        _projection(
-            metrics={},
-            params={},
-            tags={"phasesweep.outcome": status},
-            summary={
-                "phase": binding["phase"],
-                "attempt_id": binding["attempt_id"],
-                "status": status,
-            },
-        ),
+        _unaccepted_projection(binding, status),
         environment,
         finish=status,
     )
@@ -289,6 +305,121 @@ def publish_unaccepted_trial(
     if binding["run_mode"] == "managed":
         status = "KILLED" if trial.state == TrialState.PRUNED else "FAILED"
         _finish_attempt(experiment, generation_id, binding, status, environment)
+
+
+def _unrecorded_attempts(
+    experiment: Experiment, generation_id: str
+) -> list[tuple[Path, RunBinding]]:
+    """Find a generation's bound attempts that have no delivery record yet.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Producing generation.
+    :return list[tuple[Path, RunBinding]]: Trial directory and binding of each such attempt.
+    """
+    from phasesweep.engine.paths import _experiment_dir
+
+    delivery = tracking_root(experiment) / generation_id / "delivery"
+    # Trial directories are named by _trial_dir_for.
+    pattern = f"*/trial_*__generation_{generation_id}__attempt_*/{BINDING_FILE}"
+    attempts = [
+        (path.parent, read_binding(path.parent))
+        for path in sorted(_experiment_dir(experiment).glob(pattern))
+    ]
+    return [
+        (directory, binding)
+        for directory, binding in attempts
+        if not (delivery / f"attempt-{binding['attempt_id']}.json").exists()
+    ]
+
+
+def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str, FrozenTrial]:
+    """Index the ledger's trials of some phases by attempt id.
+
+    A phase whose study cannot be read contributes nothing, so its attempts
+    stay unresolved instead of being guessed.
+
+    :param ValidatedLedger ledger: Ledger the trials were recorded in.
+    :param Iterable[str] phases: Phase names whose studies are read.
+    :return dict[str, FrozenTrial]: Trials that carry an attempt id.
+    """
+    from phasesweep.engine.errors import StudySchemaMismatchError, StudyStorageUnavailableError
+    from phasesweep.engine.ledger import read_phase_trials
+    from phasesweep.engine.state import ATTEMPT_ID_ATTR
+
+    trials: dict[str, FrozenTrial] = {}
+    for phase in sorted(set(phases)):
+        try:
+            phase_trials = read_phase_trials(ledger, phase) or []
+        except (StudyStorageUnavailableError, StudySchemaMismatchError) as exc:
+            log.warning(
+                "MLflow attempt outcomes of phase %s are unresolved: its study is unreadable (%s).",
+                phase,
+                exc,
+            )
+            continue
+        for trial in phase_trials:
+            attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
+            if isinstance(attempt_id, str):
+                trials[attempt_id] = trial
+    return trials
+
+
+def _save_attempt_intents(
+    experiment: Experiment,
+    generation_id: str,
+    attempts: list[tuple[Path, RunBinding]],
+    trials: Mapping[str, FrozenTrial],
+    *,
+    ended: str | None,
+) -> list[Path]:
+    """Save the delivery intent of each unrecorded attempt whose Optuna outcome settles it.
+
+    The trial's state decides what an attempt reports, never the absence of a
+    record: a COMPLETE trial whose callback saved nothing, because a write
+    failed or the controller died after Optuna committed it, gets its accepted
+    projection. A managed run of a trial that was not accepted is finished
+    once its cleanup is confirmed. An attempt without a readable trial stays
+    unresolved.
+
+    :param Experiment experiment: Configured experiment.
+    :param str generation_id: Producing generation.
+    :param list[tuple[Path, RunBinding]] attempts: From :func:`_unrecorded_attempts`.
+    :param Mapping[str, FrozenTrial] trials: Ledger trials by attempt id.
+    :param str | None ended: Status for every unaccepted managed run once the
+        invocation that owned it ended with confirmed cleanup, or ``None`` to
+        finish only trials Optuna failed or pruned with confirmed cleanup.
+    :return list[Path]: The records saved, in attempt order.
+    """
+    from optuna.trial import TrialState
+
+    from phasesweep.engine.attempts import _trial_requires_cleanup_recovery
+
+    paths: list[Path] = []
+    for directory, binding in attempts:
+        trial = trials.get(binding["attempt_id"])
+        if trial is None:
+            continue
+        name = f"attempt-{binding['attempt_id']}"
+        if trial.state == TrialState.COMPLETE:
+            projection = _accepted_projection(trial, read_inherits(directory))
+            paths.append(_save_intent(experiment, generation_id, name, binding, projection))
+            continue
+        if binding["run_mode"] != "managed":
+            continue
+        settled = trial.state.is_finished() and not _trial_requires_cleanup_recovery(trial)
+        if settled and trial.state == TrialState.PRUNED:
+            status = "KILLED"
+        elif ended is not None:
+            status = ended
+        elif settled:
+            status = "FAILED"
+        else:
+            continue
+        projection = _unaccepted_projection(binding, status)
+        paths.append(
+            _save_intent(experiment, generation_id, name, binding, projection, finish=status)
+        )
+    return paths
 
 
 def _save_generation_intents(experiment: Experiment, generation_id: str) -> list[Path]:
@@ -408,18 +539,24 @@ def _published(experiment: Experiment, generation_id: str) -> bool:
 
 
 def publish_failed_generation(
-    experiment: Experiment, generation_id: str, error: BaseException
+    experiment: Experiment,
+    generation_id: str,
+    error: BaseException,
+    ledger: ValidatedLedger,
 ) -> None:
     """Finish a failed invocation's owned runs only after the engine confirms cleanup.
 
-    Covers the generation summary and every managed attempt run whose trial
-    outcome was never recorded.
+    Covers the generation summary and every attempt whose post-trial callback
+    saved no record. Each attempt's Optuna outcome decides what it reports:
+    an accepted trial gets its accepted projection, and the managed run of
+    any other attempt is finished with the invocation's status.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Failed invocation identity.
     :param BaseException error: Authoritative engine failure, without its private message.
+    :param ValidatedLedger ledger: The invocation's ledger, holding its trials.
     """
-    from phasesweep.engine.paths import _experiment_dir, _last_successful_generation_path
+    from phasesweep.engine.paths import _last_successful_generation_path
     from phasesweep.engine.publication_validation import _read_pointer_target
     from phasesweep.engine.trial import _trainer_environment
     from phasesweep.runtime.shutdown import PhaseSweepShutdown
@@ -436,35 +573,57 @@ def publish_failed_generation(
         return
     status = "KILLED" if isinstance(error, (PhaseSweepShutdown, KeyboardInterrupt)) else "FAILED"
     environment = _trainer_environment(experiment, experiment.phases[0].name)
-    # Attempts interrupted before their post-trial callback still own running
-    # runs. Trial directories are named by _trial_dir_for.
-    delivery = tracking_root(experiment) / generation_id / "delivery"
-    pattern = f"*/trial_*__generation_{generation_id}__attempt_*/{BINDING_FILE}"
-    for path in sorted(_experiment_dir(experiment).glob(pattern)):
-        binding = read_binding(path.parent)
-        if (
-            binding["run_mode"] == "managed"
-            and not (delivery / f"attempt-{binding['attempt_id']}.json").exists()
-        ):
-            _finish_attempt(experiment, generation_id, binding, status, environment)
-    _enqueue(
-        experiment,
-        generation_id,
-        "generation",
-        read_binding(parent_path.parent, parent_path.name),
-        _projection(
-            metrics={},
-            params={},
-            tags={"phasesweep.outcome": status},
-            summary={
-                "generation_id": generation_id,
-                "status": status,
-                "error_class": type(error).__name__,
-            },
-        ),
-        environment,
-        finish=status,
+    attempts = _unrecorded_attempts(experiment, generation_id)
+    trials = _attempt_trials(ledger, {binding["phase"] for _, binding in attempts})
+    paths = _save_attempt_intents(experiment, generation_id, attempts, trials, ended=status)
+    paths.append(
+        _save_intent(
+            experiment,
+            generation_id,
+            "generation",
+            read_binding(parent_path.parent, parent_path.name),
+            _projection(
+                metrics={},
+                params={},
+                tags={"phasesweep.outcome": status},
+                summary={
+                    "generation_id": generation_id,
+                    "status": status,
+                    "error_class": type(error).__name__,
+                },
+            ),
+            finish=status,
+        )
     )
+    for path in paths:
+        _deliver(experiment, path, environment)
+
+
+def _rebuild_attempt_intents(experiment: Experiment, generation_ids: Iterable[str]) -> None:
+    """Save the attempt records an interrupted or failed invocation never saved.
+
+    :param Experiment experiment: Configured experiment.
+    :param Iterable[str] generation_ids: Generations whose attempts are checked.
+    """
+    from phasesweep.engine.ledger import validate_ledger
+    from phasesweep.errors import PhaseSweepError
+
+    unrecorded = {
+        generation_id: attempts
+        for generation_id in generation_ids
+        if (attempts := _unrecorded_attempts(experiment, generation_id))
+    }
+    if not unrecorded:
+        return
+    try:
+        ledger = validate_ledger(experiment)
+    except PhaseSweepError as exc:
+        log.warning("Unsaved MLflow attempt results stay unresolved: %s", exc)
+        return
+    phases = {binding["phase"] for attempts in unrecorded.values() for _, binding in attempts}
+    trials = _attempt_trials(ledger, phases)
+    for generation_id, attempts in unrecorded.items():
+        _save_attempt_intents(experiment, generation_id, attempts, trials, ended=None)
 
 
 def delivery_status(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
@@ -495,9 +654,10 @@ def _delivery_pattern(generation_id: str | None) -> str:
 def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
     """Retry result projections, without selecting or training.
 
-    A published generation whose winner records were never saved, because a
-    write failed or the controller died after publication, has them rebuilt
-    from its committed artifacts first.
+    Records an invocation never saved, because a write failed or the
+    controller died, are rebuilt first: an attempt's from its trial in the
+    Optuna ledger, and a published generation's winner records from its
+    committed artifacts.
 
     :param Experiment experiment: Matching source experiment configuration.
     :param str | None generation_id: Generation whose deliveries should be
@@ -525,13 +685,20 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
         )
         root = tracking_root(experiment)
-        for parent in sorted(root.glob(f"{generation_id or '*'}/generation-binding.json")):
+        source = root / "source.json"
+        # Rebuilt records take the configured target, so it must be the recorded one.
+        if (
+            source.exists()
+            and read_record(source)["source"] != experiment.mlflow.evidence_identity()
+        ):
+            raise ValueError("Tracking delivery belongs to a different target or generation.")
+        parents = sorted(root.glob(f"{generation_id or '*'}/generation-binding.json"))
+        _rebuild_attempt_intents(experiment, [parent.parent.name for parent in parents])
+        for parent in parents:
             if (parent.parent / "delivery" / "generation.json").exists() or not _published(
                 experiment, parent.parent.name
             ):
                 continue
-            if read_record(root / "source.json")["source"] != experiment.mlflow.evidence_identity():
-                raise ValueError("Tracking delivery belongs to a different target or generation.")
             _save_generation_intents(experiment, parent.parent.name)
         paths = sorted(root.glob(_delivery_pattern(generation_id)))
         if not paths:

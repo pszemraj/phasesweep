@@ -16,6 +16,7 @@ import yaml
 
 from phasesweep.config import Experiment
 from phasesweep.engine import run_experiment
+from phasesweep.engine.ledger import validate_ledger
 from phasesweep.engine.read import read_status, read_winners
 from phasesweep.tracking.publication import delivery_status, sync_tracking
 
@@ -145,7 +146,9 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
             summary[0].info.run_id if mode == "managed" else parent.info.run_id
         )
     assert summary[0].info.status == "FINISHED"
-    publication.publish_failed_generation(experiment, generation_id, RuntimeError("late error"))
+    publication.publish_failed_generation(
+        experiment, generation_id, RuntimeError("late error"), validate_ledger(experiment)
+    )
     assert client.get_run(summary[0].info.run_id).info.status == "FINISHED"
     assert delivery_status(experiment, generation_id) == {"pending": 0, "delivered": 7}
     assert [a.path for a in client.list_artifacts(summary[0].info.run_id, "phasesweep")] == [

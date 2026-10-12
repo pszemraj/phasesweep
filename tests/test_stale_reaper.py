@@ -172,6 +172,7 @@ def _claimed_over(
         binding_state="bound",
         format_scan_failure=None,
         studies=MappingProxyType(dict(studies)),  # type: ignore[arg-type]
+        memory_storage=None,
     )
 
 

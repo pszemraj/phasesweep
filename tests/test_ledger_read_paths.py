@@ -28,6 +28,7 @@ import yaml
 
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
+from phasesweep.engine.ledger import read_phase_trials, validate_ledger
 from phasesweep.engine.read import read_status, read_winners
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -55,6 +56,7 @@ REQUIRED_FIXTURES = ("current-journal",)
 PURE_READ_PATHS = (
     "engine-read_status",
     "engine-read_winners",
+    "ledger-read_phase_trials",
     "cli-status",
     "cli-show-winners",
     "mcp-snapshot",
@@ -210,6 +212,11 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
             verdict = _engine_verdict(lambda: read_status(materialized.experiment))
         elif read_path == "engine-read_winners":
             verdict = _engine_verdict(lambda: read_winners(materialized.experiment))
+        elif read_path == "ledger-read_phase_trials":
+            ledger = validate_ledger(materialized.experiment)
+            verdict = _engine_verdict(
+                lambda: [read_phase_trials(ledger, p) for p in materialized.experiment.phases]
+            )
         elif read_path == "mcp-snapshot":
             verdict = _engine_verdict(lambda: capture_result_snapshot(materialized.experiment))
         elif read_path == "cli-status":
