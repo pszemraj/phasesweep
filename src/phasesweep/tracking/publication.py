@@ -24,6 +24,7 @@ from phasesweep.tracking.session import (
     read_binding,
     read_inherits,
     read_record,
+    resolve_pending_creations,
     tracking_root,
     write_record,
 )
@@ -654,8 +655,9 @@ def _delivery_pattern(generation_id: str | None) -> str:
 def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
     """Retry result projections, without selecting or training.
 
+    A run whose creation timed out is bound first if it has since appeared.
     Records an invocation never saved, because a write failed or the
-    controller died, are rebuilt first: an attempt's from its trial in the
+    controller died, are then rebuilt: an attempt's from its trial in the
     Optuna ledger, and a published generation's winner records from its
     committed artifacts.
 
@@ -686,12 +688,16 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
         )
         root = tracking_root(experiment)
         source = root / "source.json"
-        # Rebuilt records take the configured target, so it must be the recorded one.
+        # Searched runs and rebuilt records take the configured target, so it
+        # must be the recorded one.
         if (
             source.exists()
             and read_record(source)["source"] != experiment.mlflow.evidence_identity()
         ):
             raise ValueError("Tracking delivery belongs to a different target or generation.")
+        environment = _trainer_environment(experiment, experiment.phases[0].name)
+        # A run a timed-out creation made late is bound before its records are rebuilt.
+        resolve_pending_creations(experiment, environment, generation_id)
         parents = sorted(root.glob(f"{generation_id or '*'}/generation-binding.json"))
         _rebuild_attempt_intents(experiment, [parent.parent.name for parent in parents])
         for parent in parents:
@@ -710,7 +716,6 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
                 or record["generation_id"] != path.parent.parent.name
             ):
                 raise ValueError("Tracking delivery belongs to a different target or generation.")
-        environment = _trainer_environment(experiment, experiment.phases[0].name)
         for path in paths:
             _deliver(experiment, path, environment)
     return delivery_status(experiment, generation_id)

@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     from phasesweep.tracking.records import (
         CaptureRequest,
         CreateRequest,
+        FindRequest,
+        FindResult,
         MlflowCapture,
         MlflowTarget,
         Observation,
@@ -42,8 +44,25 @@ if TYPE_CHECKING:
     )
 
 _SDK_RETRIES = "MLFLOW_HTTP_REQUEST_MAX_RETRIES"
-# Time a capture keeps for its last poll and its report before the parent stops it.
-_CAPTURE_REPORT_SECONDS = 5.0
+# Time a capture or find keeps for its last poll and its report before the parent stops it.
+_REPORT_SECONDS = 5.0
+# Worker response statuses; "unknown" reports a creation that may have taken effect.
+_STATUSES = frozenset({"ok", "error", "unknown"})
+# Server verdicts that reject a creation request outright, so no run was created.
+_REJECTED_CREATION = frozenset(
+    {
+        "INVALID_PARAMETER_VALUE",
+        "PERMISSION_DENIED",
+        "UNAUTHENTICATED",
+        "RESOURCE_DOES_NOT_EXIST",
+        "BAD_REQUEST",
+        "RESOURCE_ALREADY_EXISTS",
+    }
+)
+
+
+class OperationOutcomeUnknownError(RuntimeError):
+    """An operation failed in a way that does not show whether its request took effect."""
 
 
 class _SdkExperiment(Protocol):
@@ -186,7 +205,10 @@ def request_operation(
     :param Path directory: Registered operation or attempt directory.
     :param Mapping[str, str] environment: Composed authentication environment.
     :param float deadline: Absolute monotonic deadline.
-    :raises RuntimeError: The worker failed, timed out, or rejected the request.
+    :raises TimeoutError: The worker did not finish by the deadline.
+    :raises OperationOutcomeUnknownError: The worker crashed or wrote no valid response, or
+        reported that a creation may have taken effect.
+    :raises RuntimeError: The worker rejected the request.
     :raises ValueError: The worker's response is malformed.
     :return JsonObject: Successful public-client response.
     """
@@ -194,7 +216,7 @@ def request_operation(
         request,
         Path(__file__).resolve(),
         "mlflow",
-        statuses=frozenset({"ok", "error"}),
+        statuses=_STATUSES,
         run_id=operation_id,
         trial_dir=directory,
         environment=environment,
@@ -202,11 +224,15 @@ def request_operation(
     )
     if result.timed_out:
         raise TimeoutError("MLflow operation exceeded its deadline.")
-    if result.return_code != 0 or response.get("status") not in {"ok", "error"}:
+    if result.return_code != 0 or response.get("status") not in _STATUSES:
         diagnostic = f" Diagnostic preserved at {diagnostic_path}." if diagnostic_path else ""
-        raise RuntimeError(f"MLflow worker failed (exit {result.return_code}).{diagnostic}")
+        raise OperationOutcomeUnknownError(
+            f"MLflow worker failed (exit {result.return_code}).{diagnostic}"
+        )
     if response["status"] == "error":
         raise RuntimeError(json_text(response, "message"))
+    if response["status"] == "unknown":
+        raise OperationOutcomeUnknownError(json_text(response, "message"))
     return json_object(response["result"])
 
 
@@ -272,8 +298,8 @@ def _resolve(client: _SdkClient, settings: MlflowTarget) -> str:
 def _without_sdk_replay() -> Iterator[None]:
     """Disable the SDK's HTTP retries for one non-idempotent request.
 
-    A timed-out POST can have succeeded, so the caller's next try reconciles
-    by identity instead of replaying it. Idempotent reads keep SDK retries.
+    A timed-out POST can have succeeded, so the caller reconciles by identity
+    instead of replaying it. Idempotent reads keep SDK retries.
     Databricks targets go through the Databricks SDK, whose own retry layer
     this setting does not reach.
 
@@ -290,19 +316,14 @@ def _without_sdk_replay() -> Iterator[None]:
             os.environ[_SDK_RETRIES] = previous
 
 
-def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
-    """Bind the run carrying this exact identity, creating it only when none exists.
-
-    A lost creation response is indistinguishable from a request that never
-    arrived, so every attempt searches the identity tags before creating.
+def _identity_run(client: _SdkClient, identity: RunIdentity) -> _SdkRun | None:
+    """Search the run carrying this exact attempt and generation identity.
 
     :param _SdkClient client: Public MLflow client in the supervised worker.
-    :param CreateRequest request: Trusted target and identity.
+    :param RunIdentity identity: Identity with its resolved experiment ID.
     :raises ValueError: More than one run carries the identity.
-    :return RunBinding: Verified remote run binding.
+    :return _SdkRun | None: The one matching run, or ``None`` when no run carries the identity.
     """
-    experiment_id = _resolve(client, request["settings"])
-    identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
     tags = identity_tags(identity)
     # Double quotes are the identifier quoting both OSS and Databricks search
     # document; Databricks does not document backticks.
@@ -313,24 +334,102 @@ def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
     matches: list[_SdkRun] = []
     token: str | None = None
     while True:
-        page = client.search_runs([experiment_id], filter_string=query, page_token=token)
+        page = client.search_runs(
+            [identity["experiment_id"]], filter_string=query, page_token=token
+        )
         matches.extend(page)
         token = page.token
         if not token:
             break
     if len(matches) > 1:
         raise ValueError("Multiple MLflow runs carry this attempt identity; binding is ambiguous.")
-    if matches:
-        run = matches[0]
-    else:
+    return matches[0] if matches else None
+
+
+def _error_code(exc: BaseException) -> object:
+    """Return the secret-free code a failure carries: its MLflow error code or HTTP status.
+
+    :param BaseException exc: SDK or transport failure.
+    :return object: The code, or ``None`` when the failure carries none.
+    """
+    return getattr(exc, "error_code", None) or getattr(
+        getattr(exc, "response", None), "status_code", None
+    )
+
+
+def _failure_cause(exc: BaseException) -> str:
+    """Name a failure by its type and code, never by its text, which may hold secrets.
+
+    :param BaseException exc: SDK or transport failure.
+    :return str: Type name, with the code when there is one.
+    """
+    code = _error_code(exc)
+    return f"{type(exc).__name__}: {code}" if code else type(exc).__name__
+
+
+def _create(client: _SdkClient, request: CreateRequest) -> RunBinding:
+    """Bind the run carrying this exact identity, creating it only when none exists.
+
+    The creation request is sent at most once per call, with no SDK retry. A
+    failure of that request that is not a server rejection does not show
+    whether the run was created, so it is reported as an unknown outcome.
+
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param CreateRequest request: Trusted target and identity.
+    :raises ValueError: More than one run carries the identity.
+    :raises OperationOutcomeUnknownError: The creation request failed without a server rejection.
+    :return RunBinding: Verified remote run binding.
+    """
+    experiment_id = _resolve(client, request["settings"])
+    identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
+    run = _identity_run(client, identity)
+    if run is None:
+        tags = identity_tags(identity)
         parent_run_id = identity.get("parent_run_id")
         if parent_run_id:
             tags["mlflow.parentRunId"] = parent_run_id
-        with _without_sdk_replay():
-            run = client.create_run(experiment_id, tags=tags, run_name=request["run_name"])
+        try:
+            with _without_sdk_replay():
+                run = client.create_run(experiment_id, tags=tags, run_name=request["run_name"])
+        except Exception as exc:
+            from mlflow.exceptions import MlflowException
+
+            if isinstance(exc, MlflowException) and exc.error_code in _REJECTED_CREATION:
+                raise
+            raise OperationOutcomeUnknownError(
+                f"MLflow create may have taken effect ({_failure_cause(exc)}); "
+                "its outcome is unconfirmed."
+            ) from exc
     binding: RunBinding = {**identity, "run_id": run.info.run_id}
     verify_remote(run, binding)
     return binding
+
+
+def _find(client: _SdkClient, request: FindRequest) -> FindResult:
+    """Look for the run carrying this exact identity, without ever creating one.
+
+    Polls every ``poll_seconds`` until the run appears. The parent stops this
+    worker at ``timeout_at``, so the polling ends just before it, as a capture's
+    does, to report that no run was found; the first search always happens.
+
+    :param _SdkClient client: Public MLflow client in the supervised worker.
+    :param FindRequest request: Trusted target, identity, and polling bound.
+    :raises ValueError: More than one run carries the identity, or the run contradicts it.
+    :return FindResult: The verified binding, or that no run carries the identity.
+    """
+    experiment_id = _resolve(client, request["settings"])
+    identity: RunIdentity = {**request["binding"], "experiment_id": experiment_id}
+    reserve = min(_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
+    stop = request["timeout_at"] - reserve
+    while True:
+        run = _identity_run(client, identity)
+        if run is not None:
+            binding: RunBinding = {**identity, "run_id": run.info.run_id}
+            verify_remote(run, binding)
+            return {"found": True, "binding": binding}
+        if time.monotonic() >= stop:
+            return {"found": False}
+        time.sleep(min(request["settings"]["poll_seconds"], max(0, stop - time.monotonic())))
 
 
 def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
@@ -351,7 +450,7 @@ def _capture(client: _SdkClient, request: CaptureRequest) -> MlflowCapture:
     # The parent stops this worker when timeout_seconds runs out (``timeout_at``,
     # a shared monotonic instant). Ending the wait just before lets the worker
     # report what is missing; a nearer phase/run deadline still stops it first.
-    reserve = min(_CAPTURE_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
+    reserve = min(_REPORT_SECONDS, request["settings"]["timeout_seconds"] / 2)
     stop = request["timeout_at"] - reserve
     while True:
         run = client.get_run(binding["run_id"])
@@ -495,7 +594,7 @@ def _dispatch(request: JsonObject) -> JsonObject:
 
     :param JsonObject request: Trusted controller operation.
     :raises ValueError: The request names an action other than ``resolve``, ``create``,
-        ``capture``, or ``publish``, or its payload is malformed.
+        ``find``, ``capture``, or ``publish``, or its payload is malformed.
     :return JsonObject: Successful operation payload.
     """
     from mlflow import MlflowClient
@@ -520,6 +619,17 @@ def _dispatch(request: JsonObject) -> JsonObject:
             },
         )
         return json_object(created)
+    if action == "find":
+        found = _find(
+            client,
+            {
+                "action": "find",
+                "settings": settings,
+                "binding": validate_identity(request["binding"]),
+                "timeout_at": json_number(request, "timeout_at"),
+            },
+        )
+        return json_object(found)
     if action == "capture":
         captured = _capture(
             client,
@@ -578,6 +688,8 @@ def main(argv: list[str] | None = None) -> int:
             if missing.partition(".")[0] == "mlflow"
             else f"MLflow {request['action']} needs Python module {missing!r}, which is not installed in the controller environment.",
         }
+    except OperationOutcomeUnknownError as exc:
+        response = {"status": "unknown", "message": str(exc)}
     except (ValueError, TimeoutError) as exc:
         response = {"status": "error", "message": str(exc)}
     except KeyboardInterrupt:
@@ -590,10 +702,8 @@ def main(argv: list[str] | None = None) -> int:
             raise
         # The server's error code, e.g. PERMISSION_DENIED, or the HTTP status of an
         # artifact upload carries no secrets; the exception text may.
-        code: object = getattr(exc, "error_code", None) or getattr(
-            getattr(exc, "response", None), "status_code", None
-        )
-        cause = f"{type(exc).__name__}: {code}" if code else type(exc).__name__
+        code = _error_code(exc)
+        cause = _failure_cause(exc)
         if code in {"RESOURCE_DOES_NOT_EXIST", "NOT_FOUND", 404}:
             advice = "the experiment or run no longer exists"
         elif code in {"INVALID_PARAMETER_VALUE", 400}:

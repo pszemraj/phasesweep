@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import builtins
+import http.client
+import http.server
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 import yaml
@@ -75,6 +80,197 @@ def local_server(tmp_path):
             process.wait(timeout=15)
 
 
+@pytest.fixture
+def held_create(local_server, monkeypatch):
+    """Front the real server with a proxy that holds its first run-creation POST.
+
+    The held POST reaches the server only after the client timed out, so it
+    commits late, as a request still executing server-side would. It is
+    released after ``release_after_searches`` run searches, or by ``release``.
+    """
+    uri, client, experiment_id, _process = local_server
+    upstream = urlsplit(uri)
+    state = SimpleNamespace(
+        lock=threading.Lock(),
+        creates=0,
+        searches=0,
+        release_after_searches=None,
+        release=threading.Event(),
+        committed=threading.Event(),
+        client=client,
+        experiment_id=experiment_id,
+    )
+
+    class Proxy(http.server.BaseHTTPRequestHandler):
+        def forward(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length) if length else None
+            creating = self.command == "POST" and self.path.endswith("/runs/create")
+            searching = self.command == "POST" and self.path.endswith("/runs/search")
+            held = False
+            if creating:
+                with state.lock:
+                    state.creates += 1
+                    held = state.creates == 1
+            if held:
+                assert state.release.wait(60), "The held creation was never released."
+            connection = http.client.HTTPConnection(upstream.hostname, upstream.port, timeout=30)
+            hop_by_hop = {"host", "connection"}
+            connection.request(
+                self.command,
+                self.path,
+                body=body,
+                headers={k: v for k, v in self.headers.items() if k.lower() not in hop_by_hop},
+            )
+            reply = connection.getresponse()
+            payload = reply.read()
+            connection.close()
+            if held:
+                state.committed.set()
+            try:
+                self.send_response(reply.status)
+                for key, value in reply.getheaders():
+                    if key.lower() not in {"transfer-encoding", "connection", "content-length"}:
+                        self.send_header(key, value)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+            except OSError:
+                pass  # The client gave up on the held request.
+            if searching:
+                with state.lock:
+                    state.searches += 1
+                    due = state.release_after_searches
+                    if due is not None and state.searches >= due:
+                        state.release.set()
+
+        do_GET = do_POST = do_PUT = do_DELETE = forward
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    state.uri = f"http://127.0.0.1:{server.server_port}"
+    monkeypatch.setenv("MLFLOW_HTTP_REQUEST_TIMEOUT", "1")
+    try:
+        yield state
+    finally:
+        state.release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _late_creation(server, tmp_path, monkeypatch, *, timeout_seconds):
+    """Prepare one attempt's creation through the proxy, with the worker run in-process.
+
+    The stand-in reports outcomes to ``_create_bound`` as ``request_operation``
+    does, but runs the worker's actions against the real SDK without a subprocess.
+    """
+    from mlflow import MlflowClient
+    from mlflow.exceptions import MlflowException
+
+    from phasesweep.engine.paths import _trial_dir_for
+    from phasesweep.runtime.json import json_object
+    from phasesweep.tracking import mlflow as worker
+    from phasesweep.tracking import session
+    from tests.test_mlflow import _binder, _identity, native_experiment
+
+    calls = []
+
+    def request_operation(request, **kwargs):
+        calls.append(request["action"])
+        client = MlflowClient(tracking_uri=request["settings"]["tracking_uri"])
+        try:
+            if request["action"] == "create":
+                return json_object(worker._create(client, request))
+            return json_object(worker._find(client, request))
+        except MlflowException as exc:
+            # The worker reports a server rejection as status "error".
+            raise RuntimeError(str(exc)) from exc
+
+    monkeypatch.setattr(session, "request_operation", request_operation)
+    experiment = native_experiment(tmp_path)
+    experiment = experiment.model_copy(
+        update={
+            "mlflow": experiment.mlflow.model_copy(
+                update={
+                    "tracking_uri": server.uri,
+                    "timeout_seconds": timeout_seconds,
+                    "poll_seconds": 0.05,
+                }
+            )
+        }
+    )
+    identity = {
+        **_identity(),
+        "tracking_uri": server.uri,
+        "experiment": experiment.experiment,
+        "experiment_id": server.experiment_id,
+    }
+    trial_dir = _trial_dir_for(
+        experiment,
+        identity["phase"],
+        0,
+        generation_id=identity["generation_id"],
+        attempt_id=identity["attempt_id"],
+    )
+    trial_dir.mkdir(parents=True)
+    bind, path = _binder(trial_dir, "attempt", experiment=experiment, identity=identity)
+    return bind, path, calls, experiment
+
+
+def test_create_committing_after_a_timeout_binds_the_one_run(held_create, tmp_path, monkeypatch):
+    """A timed-out creation that commits mid-reconciliation is bound, never re-sent."""
+    from phasesweep.tracking import session
+
+    held_create.release_after_searches = 2
+    bind, path, calls, _experiment = _late_creation(
+        held_create, tmp_path, monkeypatch, timeout_seconds=4
+    )
+    bound = bind()
+    assert held_create.committed.wait(10)
+    runs = held_create.client.search_runs([held_create.experiment_id])
+    assert [run.info.run_id for run in runs] == [bound["run_id"]]
+    assert runs[0].data.tags["phasesweep.attempt_id"] == bound["attempt_id"]
+    assert held_create.creates == 1
+    assert calls == ["create", "find"]
+    assert session.read_binding(path.parent) == bound
+    assert not path.with_name("mlflow-binding.pending.json").exists()
+
+
+@pytest.mark.parametrize("recovery", ["restart", "sync"])
+def test_create_committing_after_the_controller_gave_up_is_bound_later(
+    held_create, tmp_path, monkeypatch, recovery
+):
+    """An unresolved creation keeps its record, and its late run is bound without a new POST."""
+    from phasesweep.tracking import session
+
+    bind, path, calls, experiment = _late_creation(
+        held_create, tmp_path, monkeypatch, timeout_seconds=2
+    )
+    pending = path.with_name("mlflow-binding.pending.json")
+    with pytest.raises(RuntimeError, match="unresolved"):
+        bind()
+    assert pending.exists() and not path.exists()
+    assert held_create.client.search_runs([held_create.experiment_id]) == []
+    held_create.release.set()
+    assert held_create.committed.wait(10)
+    if recovery == "restart":
+        bound = bind()
+    else:
+        generation_id = "a" * 32
+        session.resolve_pending_creations(experiment, {}, generation_id)
+        bound = session.read_binding(path.parent)
+    runs = held_create.client.search_runs([held_create.experiment_id])
+    assert [run.info.run_id for run in runs] == [bound["run_id"]]
+    assert held_create.creates == 1
+    assert "create" not in calls[1:]
+    assert not pending.exists()
+
+
 @pytest.mark.parametrize("mode", ["managed", "trainer"])
 def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch, mode):
     """Both ownership modes publish four trials and replay without the SDK/server."""
@@ -117,6 +313,8 @@ def test_two_phases_native_http_then_offline(local_server, tmp_path, monkeypatch
     assert winners["depth"].metric == 9
     assert winners["rate"].effective_overrides == {"model.depth": 2, "optimizer.rate": 3}
     assert winners["rate"].metric == 0
+    # Every confirmed creation removed its pending record.
+    assert not list((tmp_path / "work").rglob("*.pending.json"))
     status = read_status(experiment)
     generation_id = status["published_generation_id"]
     assert delivery_status(experiment, generation_id) == {"pending": 1, "delivered": 6}

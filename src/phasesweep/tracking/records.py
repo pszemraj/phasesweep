@@ -116,6 +116,14 @@ class CreateAction(TypedDict):
     run_name: str
 
 
+class FindAction(TypedDict):
+    """Controller request to look up, and never create, the run carrying an identity."""
+
+    action: Literal["find"]
+    binding: RunIdentity
+    timeout_at: float
+
+
 class PublishAction(TypedDict):
     """Controller request to mirror a retained delivery record, as persisted."""
 
@@ -126,7 +134,7 @@ class PublishAction(TypedDict):
     finish: str | None
 
 
-TrackingAction: TypeAlias = ResolveAction | CreateAction | PublishAction
+TrackingAction: TypeAlias = ResolveAction | CreateAction | FindAction | PublishAction
 """A controller request before the configured target is attached."""
 
 
@@ -140,6 +148,27 @@ class CreateRequest(CreateAction):
     """A create action with its target."""
 
     settings: MlflowTarget
+
+
+class FindRequest(FindAction):
+    """A find action with its target."""
+
+    settings: MlflowTarget
+
+
+class FindResult(TypedDict):
+    """The outcome of a find: the verified binding when exactly one run carries the identity."""
+
+    found: bool
+    binding: NotRequired[RunBinding]
+
+
+class PendingCreation(TypedDict):
+    """A creation request that may have been sent, kept until its run is bound."""
+
+    schema_version: Literal[1]
+    identity: RunIdentity
+    run_name: str
 
 
 class CaptureRequest(TypedDict):

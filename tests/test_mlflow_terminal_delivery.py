@@ -17,7 +17,7 @@ from phasesweep.config import Experiment
 from phasesweep.engine import NoFeasibleTrialError, run_experiment
 from phasesweep.engine.generation import _recorded_generation_state
 from phasesweep.engine.ledger import claim_ledger, open_phase_study, validate_ledger
-from phasesweep.engine.paths import _generation_record_path, _trial_dir_for
+from phasesweep.engine.paths import _experiment_dir, _generation_record_path, _trial_dir_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -599,3 +599,43 @@ def test_sync_rebuilds_a_generation_the_pointer_left_after_a_post_commit_crash(
         "winner-depth",
         "winner-rate",
     ]
+
+
+def test_sync_binds_and_finishes_a_run_created_after_its_attempt_gave_up(tmp_path, monkeypatch):
+    """A run a timed-out creation made late is bound by sync and finished with its failed trial."""
+    from phasesweep.tracking.mlflow import OperationOutcomeUnknownError
+
+    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    experiment = Experiment.model_validate(config)
+    respond = session.request_operation
+    late: dict[str, str] = {}
+
+    def lost_first_attempt_creation(request, **kwargs):
+        binding = request.get("binding", {})
+        if request["action"] == "create" and binding["phase"] != "generation" and not late:
+            late.update(binding, run_id="late-run")
+            raise OperationOutcomeUnknownError("response lost")
+        if request["action"] == "find":
+            appeared = binding["attempt_id"] == late.get("attempt_id") and kwargs.get("appeared")
+            return {"found": True, "binding": late} if appeared else {"found": False}
+        return respond(request, **kwargs)
+
+    monkeypatch.setattr(session, "request_operation", lost_first_attempt_creation)
+    reports = []
+    run_experiment(experiment, terminal_callback=reports.append)
+    generation = reports[0].generation_id
+    [pending] = _experiment_dir(experiment).glob("*/trial_*/mlflow-binding.pending.json")
+    assert not (pending.parent / BINDING_FILE).exists()
+
+    def appeared(request, **kwargs):
+        return lost_first_attempt_creation(request, **kwargs, appeared=True)
+
+    monkeypatch.setattr(session, "request_operation", appeared)
+    uploads.clear()
+    # Three accepted attempts, two winners, the summary, and the late run.
+    assert publication.sync_tracking(experiment, generation) == {"pending": 0, "delivered": 7}
+    assert not pending.exists()
+    assert session.read_binding(pending.parent)["run_id"] == "late-run"
+    [finished] = [r for r in uploads if r["binding"]["run_id"] == "late-run"]
+    assert finished["finish"] == "FAILED"

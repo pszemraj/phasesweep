@@ -13,9 +13,10 @@ import pytest
 from pydantic import ValidationError
 
 from phasesweep.config import Experiment, MlflowSettings
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.mlflow import compile_query, observation_id, select_observation
 from phasesweep.evidence.models import MlflowExtractor
-from phasesweep.tracking.mlflow import _capture, _create
+from phasesweep.tracking.mlflow import OperationOutcomeUnknownError, _capture, _create, _find
 
 
 def test_cpu_example_import_and_help_without_sdk(monkeypatch, capsys):
@@ -233,14 +234,17 @@ def test_worker_keeps_sdk_retries_for_idempotent_operations(tmp_path, monkeypatc
     assert seen == [None]
 
 
+class _Page(list):
+    """One page of run-search results with no next page."""
+
+    token = None
+
+
 def test_creation_binds_an_existing_identity_and_creates_only_when_absent(monkeypatch):
     monkeypatch.delenv("MLFLOW_HTTP_REQUEST_MAX_RETRIES", raising=False)
     binding = _binding()
     identity = {k: v for k, v in binding.items() if k != "run_id"}
     created = []
-
-    class Page(list):
-        token = None
 
     def create_run(*args, **kwargs):
         # Only the non-idempotent create is never replayed by the SDK.
@@ -250,19 +254,214 @@ def test_creation_binds_an_existing_identity_and_creates_only_when_absent(monkey
 
     client = SimpleNamespace(
         get_experiment=lambda _: SimpleNamespace(experiment_id="1", lifecycle_stage="active"),
-        search_runs=lambda *a, **k: Page([_run(binding)]),
+        search_runs=lambda *a, **k: _Page([_run(binding)]),
         create_run=create_run,
     )
     request = {"binding": identity, "settings": {"experiment_id": "1"}, "run_name": "r"}
     assert _create(client, request) == binding
     assert created == []
-    client.search_runs = lambda *a, **k: Page()
+    client.search_runs = lambda *a, **k: _Page()
     assert _create(client, request) == binding
     assert len(created) == 1
     assert "MLFLOW_HTTP_REQUEST_MAX_RETRIES" not in os.environ
-    client.search_runs = lambda *a, **k: Page([_run(binding), _run(binding)])
+    client.search_runs = lambda *a, **k: _Page([_run(binding), _run(binding)])
     with pytest.raises(ValueError, match="ambiguous"):
         _create(client, request)
+
+
+def _creation_client(*, search=None, create_run=None):
+    """Build a fake SDK client over one experiment whose creation never succeeds unprompted."""
+
+    def never_created(*args, **kwargs):
+        pytest.fail("This test never creates a run.")
+
+    return SimpleNamespace(
+        get_experiment=lambda _: SimpleNamespace(experiment_id="1", lifecycle_stage="active"),
+        search_runs=search or (lambda *a, **k: _Page()),
+        create_run=create_run or never_created,
+    )
+
+
+def _server_error(code):
+    def error():
+        from mlflow.exceptions import MlflowException
+        from mlflow.protos import databricks_pb2
+
+        return MlflowException("private server detail", error_code=getattr(databricks_pb2, code))
+
+    return error
+
+
+def _upload_forbidden():
+    from requests import HTTPError, Response
+
+    response = Response()
+    response.status_code = 403
+    return HTTPError("private upload detail", response=response)
+
+
+def _connection_lost():
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+
+    return RequestsConnectionError("private connection detail")
+
+
+def _timed_out():
+    from mlflow.exceptions import MlflowException
+
+    return MlflowException("API request to private-host failed with timeout exception.")
+
+
+def _identity(generation_id="a" * 32, attempt_id="b" * 32):
+    """Return the creation identity of one attempt, which names no native run yet."""
+    binding = {**_binding(), "generation_id": generation_id, "attempt_id": attempt_id}
+    return {k: v for k, v in binding.items() if k != "run_id"}
+
+
+_REJECTIONS = (
+    "INVALID_PARAMETER_VALUE",
+    "PERMISSION_DENIED",
+    "UNAUTHENTICATED",
+    "RESOURCE_DOES_NOT_EXIST",
+    "BAD_REQUEST",
+    "RESOURCE_ALREADY_EXISTS",
+)
+
+
+@pytest.mark.parametrize(
+    "stage,failure,definite",
+    [
+        *[("create_run", _server_error(code), True) for code in _REJECTIONS],
+        ("create_run", _server_error("INTERNAL_ERROR"), False),
+        ("create_run", _server_error("TEMPORARILY_UNAVAILABLE"), False),
+        ("create_run", _timed_out, False),
+        ("create_run", _connection_lost, False),
+        ("create_run", lambda: OSError("private socket detail"), False),
+        ("search_runs", _server_error("INTERNAL_ERROR"), True),
+        ("search_runs", _timed_out, True),
+    ],
+    ids=[
+        *[f"rejected-{code.lower()}" for code in _REJECTIONS],
+        "server-error",
+        "unavailable",
+        "timeout",
+        "connection",
+        "socket",
+        "search-server-error",
+        "search-timeout",
+    ],
+)
+def test_worker_separates_definite_failures_from_unknown_outcomes(stage, failure, definite):
+    """Only a server rejection, or a failure before the request is sent, proves no run exists."""
+    error = failure()
+
+    def fail(*args, **kwargs):
+        raise error
+
+    client = _creation_client(
+        search=fail if stage == "search_runs" else None,
+        create_run=fail if stage == "create_run" else None,
+    )
+    request = {"binding": _identity(), "settings": {"experiment_id": "1"}, "run_name": "r"}
+    if definite:
+        with pytest.raises(type(error)) as caught:
+            _create(client, request)
+        assert caught.value is error
+    else:
+        with pytest.raises(OperationOutcomeUnknownError) as caught:
+            _create(client, request)
+        assert caught.value.__cause__ is error
+        assert "private" not in str(caught.value)
+        assert type(error).__name__ in str(caught.value)
+
+
+def test_worker_reports_an_unknown_outcome_with_its_own_status(tmp_path, monkeypatch):
+    import json
+
+    from phasesweep.tracking import mlflow as worker
+
+    def dispatch(request):
+        raise OperationOutcomeUnknownError("MLflow create may have taken effect.")
+
+    monkeypatch.setattr(worker, "_dispatch", dispatch)
+    request, response = tmp_path / "request.json", tmp_path / "response.json"
+    request.write_text(json.dumps({"action": "create"}))
+    assert worker.main([str(request), str(response)]) == 0
+    assert json.loads(response.read_text()) == {
+        "status": "unknown",
+        "message": "MLflow create may have taken effect.",
+    }
+
+
+@pytest.mark.parametrize(
+    "pages,timeout_after,expected_searches,expected",
+    [
+        ([[_run(_binding())]], 10, 1, {"found": True, "binding": _binding()}),
+        ([[], [], [_run(_binding())]], 10, 3, {"found": True, "binding": _binding()}),
+        ([[]], 0, 1, {"found": False}),
+        ([[_run(_binding()), _run(_binding())]], 10, 1, ValueError),
+    ],
+    ids=["found", "found-late", "absent", "ambiguous"],
+)
+def test_find_polls_for_the_identity_and_never_creates(
+    pages, timeout_after, expected_searches, expected
+):
+    """A find searches at least once, polls until its bound, and has no way to create."""
+    searches = []
+    remaining = list(pages)
+
+    def search(*args, **kwargs):
+        searches.append(kwargs["filter_string"])
+        return _Page(remaining.pop(0))
+
+    client = _creation_client(search=search)
+    request = {
+        "action": "find",
+        "binding": _identity(),
+        "settings": {"experiment_id": "1", "poll_seconds": 0.01, "timeout_seconds": 10},
+        "timeout_at": time.monotonic() + timeout_after,
+    }
+    if expected is ValueError:
+        with pytest.raises(ValueError, match="ambiguous"):
+            _find(client, request)
+    else:
+        assert _find(client, request) == expected
+    assert len(searches) == expected_searches
+    assert all("phasesweep.attempt_id" in query for query in searches)
+
+
+def test_find_action_runs_through_the_worker_entry_point(tmp_path, monkeypatch):
+    """The worker routes a find request to a read-only lookup and reports its result."""
+    import json
+
+    from phasesweep.tracking import mlflow as worker
+
+    binding = _binding()
+    client = _creation_client(search=lambda *a, **k: _Page([_run(binding)]))
+    monkeypatch.setitem(
+        sys.modules, "mlflow", SimpleNamespace(MlflowClient=lambda **kwargs: client)
+    )
+    settings = {
+        **native_experiment(tmp_path).mlflow.target(),
+        "experiment_id": "1",
+        "experiment_name": None,
+    }
+    request, response = tmp_path / "request.json", tmp_path / "response.json"
+    request.write_text(
+        json.dumps(
+            {
+                "action": "find",
+                "settings": settings,
+                "binding": _identity(),
+                "timeout_at": time.monotonic() + 10,
+            }
+        )
+    )
+    assert worker.main([str(request), str(response)]) == 0
+    assert json.loads(response.read_text()) == {
+        "status": "ok",
+        "result": {"found": True, "binding": binding},
+    }
 
 
 @pytest.mark.parametrize("target", ["experiment_id", "experiment_name"])
@@ -312,45 +511,255 @@ def native_experiment(tmp_path):
     return Experiment.model_validate(config)
 
 
-def test_uncertain_creation_retries_the_same_identity(tmp_path, monkeypatch):
-    """A failed create is retried by identity, and never blocks a later creation."""
-    from phasesweep.tracking import session
+class _ScriptedWorker:
+    """A stand-in for the supervised worker that answers each action from a script."""
 
-    binding = _binding()
-    identity = {k: v for k, v in binding.items() if k != "run_id"}
-    path = tmp_path / "mlflow-binding.json"
-    requests = []
-    outcomes = [RuntimeError("response lost"), binding]
+    def __init__(self, monkeypatch, **script):
+        from phasesweep.tracking import session
 
-    def operation(request, **kwargs):
-        requests.append(request)
-        outcome = outcomes.pop(0)
-        if isinstance(outcome, Exception):
+        self.script = {action: list(outcomes) for action, outcomes in script.items()}
+        self.requests = []
+        monkeypatch.setattr(session, "request_operation", self)
+
+    @property
+    def actions(self):
+        return [request["action"] for request in self.requests]
+
+    def __call__(self, request, **kwargs):
+        self.requests.append(request)
+        if not self.script.get(request["action"]):
+            pytest.fail(f"Unscripted {request['action']} request.")
+        outcome = self.script[request["action"]].pop(0)
+        if callable(outcome):
+            outcome = outcome()
+        if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
-    monkeypatch.setattr(session, "request_operation", operation)
-    experiment = native_experiment(tmp_path)
-    actual = session._create_bound(
-        experiment, identity, path, {}, run_name="r", deadline=None, attempt_directory=tmp_path
-    )
-    assert actual == binding
-    assert len(requests) == 2 and requests[0] == requests[1]
-    assert session.read_binding(tmp_path) == binding
 
-    path.unlink()
-    outcomes[:] = [RuntimeError("server down"), RuntimeError("server down"), binding]
-    with pytest.raises(RuntimeError, match="server down"):
-        session._create_bound(
-            experiment, identity, path, {}, run_name="r", deadline=None, attempt_directory=tmp_path
+def _binder(tmp_path, slot, *, experiment=None, identity=None):
+    """Return the binding path and a ``_create_bound`` call for one creation in either slot."""
+    from phasesweep.tracking import session
+
+    experiment = experiment or native_experiment(tmp_path)
+    identity = identity or _identity()
+    if slot == "attempt":
+        path, slot_arguments = tmp_path / "mlflow-binding.json", {"attempt_directory": tmp_path}
+    else:
+        path = (
+            session.tracking_root(experiment)
+            / identity["generation_id"]
+            / "generation-binding.json"
         )
-    assert not path.exists()
-    assert (
-        session._create_bound(
-            experiment, identity, path, {}, run_name="r", deadline=None, attempt_directory=tmp_path
+        path.parent.mkdir(parents=True)
+        slot_arguments = {}
+
+    def bind(deadline=None):
+        return session._create_bound(
+            experiment, identity, path, {}, run_name="r", deadline=deadline, **slot_arguments
         )
-        == binding
+
+    return bind, path
+
+
+_ABSENT = {"found": False}
+
+
+@pytest.mark.parametrize("slot", ["attempt", "generation"])
+@pytest.mark.parametrize(
+    "failure",
+    [TimeoutError("exceeded its deadline"), OperationOutcomeUnknownError("response lost")],
+    ids=["timeout", "unknown"],
+)
+def test_unconfirmed_creation_is_reconciled_and_never_resent(tmp_path, monkeypatch, slot, failure):
+    """A request that may have created its run is only searched for afterwards."""
+    import json
+
+    from phasesweep.tracking import session
+
+    bind, path = _binder(tmp_path, slot)
+    pending = path.with_name(f"{path.stem}.pending.json")
+    binding = _binding()
+
+    def marked_before_sending():
+        record = json.loads(pending.read_text())
+        assert (record["schema_version"], record["identity"], record["run_name"]) == (
+            1,
+            _identity(),
+            "r",
+        )
+        return failure
+
+    worker = _ScriptedWorker(
+        monkeypatch, create=[marked_before_sending], find=[{"found": True, "binding": binding}]
     )
+    assert bind() == binding
+    assert worker.actions == ["create", "find"]
+    assert worker.requests[1]["binding"] == _identity()
+    assert worker.requests[1]["timeout_at"] > time.monotonic()
+    assert session.read_record(path) == binding
+    assert not pending.exists()
+
+
+def test_unresolved_creation_survives_restarts_until_its_run_appears(tmp_path, monkeypatch):
+    bind, path = _binder(tmp_path, "attempt")
+    pending = path.with_name(f"{path.stem}.pending.json")
+    binding = _binding()
+    worker = _ScriptedWorker(
+        monkeypatch,
+        create=[OperationOutcomeUnknownError("response lost")],
+        find=[_ABSENT, _ABSENT, {"found": True, "binding": binding}],
+    )
+    unresolved = f"attempt {'b' * 32} of generation {'a' * 32} is unresolved"
+    with pytest.raises(RuntimeError, match=unresolved):
+        bind()
+    assert pending.exists() and not path.exists()
+    # Only the record survives a restart; the retry reconciles and does not create.
+    with pytest.raises(RuntimeError, match=unresolved):
+        bind()
+    assert worker.actions == ["create", "find", "find"]
+    assert bind() == binding
+    assert worker.actions == ["create", "find", "find", "find"]
+    assert not pending.exists()
+    assert bind() == binding
+    assert len(worker.requests) == 4
+
+
+def test_rejected_creation_leaves_no_record_and_is_not_reconciled(tmp_path, monkeypatch):
+    bind, path = _binder(tmp_path, "attempt")
+    rejection = "MLflow create failed (MlflowException: PERMISSION_DENIED); check access."
+    worker = _ScriptedWorker(monkeypatch, create=[RuntimeError(rejection), _binding()])
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        bind()
+    assert worker.actions == ["create"]
+    assert not path.exists() and not path.with_name(f"{path.stem}.pending.json").exists()
+    # Nothing was created, so a later call sends the request afresh.
+    assert bind() == _binding()
+    assert worker.actions == ["create", "create"]
+
+
+@pytest.mark.parametrize(
+    "failure,expired,error,later_actions",
+    [
+        (
+            UnsafeProcessCleanupError("worker cleanup is uncertain"),
+            False,
+            UnsafeProcessCleanupError,
+            ["create", "find"],
+        ),
+        (TimeoutError("exceeded its deadline"), True, RuntimeError, ["create"]),
+    ],
+    ids=["cleanup-uncertain", "deadline-passed"],
+)
+def test_creation_that_cannot_be_reconciled_keeps_its_record(
+    tmp_path, monkeypatch, failure, expired, error, later_actions
+):
+    bind, path = _binder(tmp_path, "attempt")
+    deadline = time.monotonic() - 1 if expired else None
+    worker = _ScriptedWorker(monkeypatch, create=[failure], find=[_ABSENT])
+    with pytest.raises(error):
+        bind(deadline)
+    assert worker.actions == ["create"]
+    assert path.with_name(f"{path.stem}.pending.json").exists()
+    # Later calls never create; an expired deadline does not even search.
+    with pytest.raises(RuntimeError, match="unresolved"):
+        bind(deadline)
+    assert worker.actions == later_actions
+    assert path.with_name(f"{path.stem}.pending.json").exists()
+
+
+def _write_pending(path, identity):
+    from phasesweep.tracking import session
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    session.write_record(path, {"schema_version": 1, "identity": identity, "run_name": "r"})
+    return path
+
+
+def test_sync_binds_late_runs_and_leaves_absent_ones_pending(tmp_path, monkeypatch):
+    """Leftover records get one read-only search each; a found run is bound, an absent one waits."""
+    from phasesweep.engine.paths import _trial_dir_for
+    from phasesweep.tracking import session
+
+    experiment = native_experiment(tmp_path)
+    first, second = "1" * 32, "2" * 32
+    root = session.tracking_root(experiment)
+
+    def attempt_dir(generation, attempt):
+        return _trial_dir_for(experiment, "p", 3, generation_id=generation, attempt_id=attempt)
+
+    pending = {
+        "generation": _write_pending(
+            root / first / "generation-binding.pending.json", _identity(first, first)
+        ),
+        "absent": _write_pending(
+            attempt_dir(first, "absent") / "mlflow-binding.pending.json", _identity(first, "absent")
+        ),
+        "bound": _write_pending(
+            attempt_dir(first, "bound") / "mlflow-binding.pending.json", _identity(first, "bound")
+        ),
+        "other": _write_pending(
+            attempt_dir(second, "late") / "mlflow-binding.pending.json", _identity(second, "late")
+        ),
+    }
+    session.write_record(pending["bound"].with_name("mlflow-binding.json"), _binding())
+    searched = []
+
+    def find(experiment, generation_id, request, environment, deadline=None):
+        searched.append((generation_id, request["action"], request["binding"]["attempt_id"]))
+        assert request["timeout_at"] <= time.monotonic()
+        if request["binding"]["attempt_id"] == "absent":
+            return _ABSENT
+        return {"found": True, "binding": {**request["binding"], "run_id": "late-run"}}
+
+    monkeypatch.setattr(session, "call_tracking", find)
+    session.resolve_pending_creations(experiment, {}, first)
+    assert sorted(searched) == sorted([(first, "find", first), (first, "find", "absent")])
+    assert session.read_binding(root / first, "generation-binding.json")["run_id"] == "late-run"
+    assert not pending["generation"].exists()
+    assert not pending["bound"].exists()
+    # A record whose search finds nothing, and another generation's, stay pending.
+    assert pending["absent"].exists() and pending["other"].exists()
+    assert not pending["absent"].with_name("mlflow-binding.json").exists()
+
+    session.resolve_pending_creations(experiment, {}, None)
+    assert not pending["other"].exists()
+    assert session.read_binding(pending["other"].parent)["run_id"] == "late-run"
+    assert pending["absent"].exists()
+    assert {action for _, action, _ in searched} == {"find"}
+
+
+@pytest.mark.parametrize(
+    "error,raises",
+    [
+        (RuntimeError("MLflow find failed (MlflowException: PERMISSION_DENIED)."), False),
+        (ValueError("Multiple MLflow runs carry this attempt identity."), False),
+        (UnsafeProcessCleanupError("worker cleanup is uncertain"), True),
+    ],
+    ids=["failed", "ambiguous", "cleanup-uncertain"],
+)
+def test_sync_keeps_a_record_whose_search_fails(tmp_path, monkeypatch, caplog, error, raises):
+    from phasesweep.tracking import session
+
+    experiment = native_experiment(tmp_path)
+    generation = "1" * 32
+    path = _write_pending(
+        session.tracking_root(experiment) / generation / "generation-binding.pending.json",
+        _identity(generation, generation),
+    )
+
+    def find(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(session, "call_tracking", find)
+    if raises:
+        with pytest.raises(type(error)):
+            session.resolve_pending_creations(experiment, {}, generation)
+    else:
+        session.resolve_pending_creations(experiment, {}, generation)
+        assert "still unresolved" in caplog.text
+    assert path.exists()
+    assert not path.with_name("generation-binding.json").exists()
 
 
 @pytest.mark.parametrize("field", ["run_id", "experiment_id", "attempt_id", "unbound"])
@@ -618,24 +1027,6 @@ def test_missing_sdk_is_refused_before_any_trial(tmp_path, monkeypatch):
             operation(experiment)
 
 
-def _server_error(code):
-    def error():
-        from mlflow.exceptions import MlflowException
-        from mlflow.protos import databricks_pb2
-
-        return MlflowException("private server detail", error_code=getattr(databricks_pb2, code))
-
-    return error
-
-
-def _upload_forbidden():
-    from requests import HTTPError, Response
-
-    response = Response()
-    response.status_code = 403
-    return HTTPError("private upload detail", response=response)
-
-
 @pytest.mark.parametrize(
     "action,error,expected",
     [
@@ -697,10 +1088,52 @@ def test_worker_crash_names_its_preserved_diagnostic(tmp_path, monkeypatch):
     diagnostic = tmp_path / "mlflow-worker.stderr.log"
     crashed = ProcessResult(return_code=1, timed_out=False, pid=0, duration_seconds=0)
     monkeypatch.setattr(worker, "run_worker", lambda *args, **kwargs: (crashed, {}, diagnostic))
-    with pytest.raises(RuntimeError, match=f"exit 1.*{diagnostic}"):
+    with pytest.raises(OperationOutcomeUnknownError, match=f"exit 1.*{diagnostic}"):
         worker.request_operation(
             {}, operation_id="op", directory=tmp_path, environment={}, deadline=0.0
         )
+
+
+@pytest.mark.parametrize(
+    "return_code,timed_out,response,expected",
+    [
+        (0, False, {"status": "ok", "result": {"x": 1}}, {"x": 1}),
+        (0, False, {"status": "error", "message": "rejected"}, RuntimeError),
+        (
+            0,
+            False,
+            {"status": "unknown", "message": "may have taken effect"},
+            OperationOutcomeUnknownError,
+        ),
+        (1, False, {}, OperationOutcomeUnknownError),
+        (0, False, {"status": "other"}, OperationOutcomeUnknownError),
+        (0, True, {}, TimeoutError),
+    ],
+    ids=["ok", "error", "unknown", "crashed", "invalid-status", "timed-out"],
+)
+def test_worker_outcomes_reach_the_controller_as_distinct_exceptions(
+    tmp_path, monkeypatch, return_code, timed_out, response, expected
+):
+    """Only a reported error proves the request failed; a crash or lost response proves nothing."""
+    from phasesweep.runtime.process import ProcessResult
+    from phasesweep.tracking import mlflow as worker
+
+    result = ProcessResult(return_code=return_code, timed_out=timed_out, pid=0, duration_seconds=0)
+    seen = []
+    monkeypatch.setattr(
+        worker,
+        "run_worker",
+        lambda *args, **kwargs: seen.append(kwargs["statuses"]) or (result, response, None),
+    )
+    call = {"operation_id": "op", "directory": tmp_path, "environment": {}, "deadline": 0.0}
+    if isinstance(expected, dict):
+        assert worker.request_operation({}, **call) == expected
+    else:
+        with pytest.raises(expected) as caught:
+            worker.request_operation({}, **call)
+        # A plain RuntimeError is a definite failure, so it must not be the unknown subclass.
+        assert type(caught.value) is expected
+    assert seen == [frozenset({"ok", "error", "unknown"})]
 
 
 @pytest.mark.parametrize("failure", ["target", "attempt"])

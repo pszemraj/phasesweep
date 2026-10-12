@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
@@ -20,17 +21,31 @@ from phasesweep.runtime.json import (
     json_text_map,
     strict_json_loads,
 )
-from phasesweep.tracking.mlflow import identity_tags, request_operation, verify_remote
-from phasesweep.tracking.records import validate_binding
+from phasesweep.tracking.mlflow import (
+    OperationOutcomeUnknownError,
+    identity_tags,
+    request_operation,
+    verify_remote,
+)
+from phasesweep.tracking.records import validate_binding, validate_identity
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
     from phasesweep.engine.state import Winner
     from phasesweep.tracking.mlflow import _SdkClient
-    from phasesweep.tracking.records import CreateAction, RunBinding, RunIdentity, TrackingAction
+    from phasesweep.tracking.records import (
+        CreateAction,
+        FindAction,
+        PendingCreation,
+        RunBinding,
+        RunIdentity,
+        TrackingAction,
+    )
 
+log = logging.getLogger(__name__)
 BINDING_FILE = "mlflow-binding.json"
 INHERITS_FILE = "mlflow-inherits.json"
+_PENDING_SUFFIX = ".pending.json"
 _PARENT_LOCK = threading.RLock()
 
 
@@ -172,10 +187,12 @@ def _create_bound(
     deadline: float | None,
     attempt_directory: Path | None = None,
 ) -> RunBinding:
-    """Bind or create the identity's run, retrying once after an uncertain failure.
+    """Bind or create the identity's run, sending the creation request at most once.
 
-    Each try searches the identity tags before creating, so a retry after a
-    lost response binds the run that request created instead of duplicating it.
+    A pending record marks the request before it is sent. A request that
+    fails without a server rejection may still create its run, so the identity
+    is then only searched, never created again; an empty search leaves the
+    creation unresolved and the record in place, across restarts.
 
     :param Experiment experiment: Configured experiment.
     :param RunIdentity identity: Exact creation identity.
@@ -184,49 +201,170 @@ def _create_bound(
     :param str run_name: Display name for a newly created run.
     :param float | None deadline: Existing execution deadline.
     :param Path | None attempt_directory: Existing process slot for managed attempt creation.
+    :raises RuntimeError: The creation outcome is unresolved.
     :return RunBinding: Bound native run identity.
     """
-    assert experiment.mlflow is not None
+    from phasesweep.errors import UnsafeProcessCleanupError
+
     if path.exists():
         return read_binding(path.parent, path.name)
-    request: CreateAction = {
-        "action": "create",
-        "binding": identity,
-        "run_name": run_name,
-    }
+    pending = path.with_suffix(_PENDING_SUFFIX)
 
-    def execute() -> RunBinding:
-        """Run creation or reconciliation in the registered process slot.
+    def reconcile() -> RunBinding:
+        """Look for the run a sent creation request may have created; never create one.
 
-        :return RunBinding: Verified remote binding.
+        :raises RuntimeError: No run carries the identity before the deadline.
+        :return RunBinding: The run that request created.
         """
-        assert experiment.mlflow is not None
-        if attempt_directory is None:
-            created = call_tracking(
-                experiment, identity["generation_id"], request, environment, deadline
+        if deadline is None or time.monotonic() < deadline:
+            found = _find_bound(
+                experiment,
+                identity,
+                environment,
+                timeout_at=operation_deadline(experiment, deadline),
+                deadline=deadline,
+                attempt_directory=attempt_directory,
             )
-        else:
-            created = request_operation(
-                {"settings": experiment.mlflow.target(), **request},
-                operation_id=identity["attempt_id"],
-                directory=attempt_directory,
-                environment=environment,
-                deadline=operation_deadline(experiment, deadline),
-            )
-        return validate_binding(created)
+            if found is not None:
+                return found
+        raise RuntimeError(
+            f"MLflow run creation for attempt {identity['attempt_id']} of generation "
+            f"{identity['generation_id']} is unresolved: an earlier request may still create "
+            "the run, so it is not sent again. sync-tracking binds the run if it appears."
+        )
 
-    try:
-        binding = execute()
-    except (OSError, RuntimeError) as exc:
-        from phasesweep.errors import UnsafeProcessCleanupError
-
-        if isinstance(exc, UnsafeProcessCleanupError) or (
-            deadline is not None and time.monotonic() >= deadline
-        ):
+    if pending.exists():
+        binding = reconcile()
+    else:
+        record: PendingCreation = {"schema_version": 1, "identity": identity, "run_name": run_name}
+        write_record(pending, record)
+        request: CreateAction = {"action": "create", "binding": identity, "run_name": run_name}
+        try:
+            created = _send(experiment, identity, request, environment, deadline, attempt_directory)
+        except UnsafeProcessCleanupError:
             raise
-        binding = execute()
+        except (OperationOutcomeUnknownError, TimeoutError):
+            binding = reconcile()
+        except Exception:
+            # Nothing was created, so a later call may send the request afresh.
+            pending.unlink(missing_ok=True)
+            raise
+        else:
+            binding = validate_binding(created)
     write_record(path, binding)
+    pending.unlink(missing_ok=True)
     return binding
+
+
+def _send(
+    experiment: Experiment,
+    identity: RunIdentity,
+    request: TrackingAction,
+    environment: Mapping[str, str],
+    deadline: float | None,
+    attempt_directory: Path | None,
+) -> JsonObject:
+    """Send one request through the process slot the identity's creation uses.
+
+    :param Experiment experiment: Configured experiment.
+    :param RunIdentity identity: Creation identity owning the slot.
+    :param TrackingAction request: Trusted SDK action.
+    :param Mapping[str, str] environment: Composed credentials and transport.
+    :param float | None deadline: Existing execution deadline.
+    :param Path | None attempt_directory: A managed attempt's directory; ``None`` for the
+        generation run, which takes a registered tracking operation.
+    :return JsonObject: Successful worker response.
+    """
+    assert experiment.mlflow is not None
+    if attempt_directory is None:
+        return call_tracking(experiment, identity["generation_id"], request, environment, deadline)
+    return request_operation(
+        {"settings": experiment.mlflow.target(), **request},
+        operation_id=identity["attempt_id"],
+        directory=attempt_directory,
+        environment=environment,
+        deadline=operation_deadline(experiment, deadline),
+    )
+
+
+def _find_bound(
+    experiment: Experiment,
+    identity: RunIdentity,
+    environment: Mapping[str, str],
+    *,
+    timeout_at: float,
+    deadline: float | None,
+    attempt_directory: Path | None,
+) -> RunBinding | None:
+    """Search an identity's run read-only, polling until ``timeout_at``.
+
+    :param Experiment experiment: Configured experiment.
+    :param RunIdentity identity: Exact creation identity.
+    :param Mapping[str, str] environment: Composed credentials and transport.
+    :param float timeout_at: Absolute monotonic time the search stops polling at.
+    :param float | None deadline: Existing execution deadline.
+    :param Path | None attempt_directory: A managed attempt's directory, if it owns the slot.
+    :return RunBinding | None: The verified binding, or ``None`` when no run carries the identity.
+    """
+    request: FindAction = {"action": "find", "binding": identity, "timeout_at": timeout_at}
+    found = _send(experiment, identity, request, environment, deadline, attempt_directory)
+    return validate_binding(found["binding"]) if found.get("found") is True else None
+
+
+def resolve_pending_creations(
+    experiment: Experiment, environment: Mapping[str, str], generation_id: str | None
+) -> None:
+    """Bind the runs that unresolved creations left behind, without creating any.
+
+    Each pending record in scope gets one read-only search with no polling: a
+    run that a timed-out request created late is bound and its record
+    removed, while an absent run leaves its record for a later call. A search
+    that fails leaves its record too, with a warning.
+
+    :param Experiment experiment: Configured experiment.
+    :param Mapping[str, str] environment: Composed credentials and transport.
+    :param str | None generation_id: Generation to resolve, or ``None`` for every generation.
+    :raises UnsafeProcessCleanupError: A search worker's cleanup is uncertain.
+    """
+    from phasesweep.engine.paths import _experiment_dir
+    from phasesweep.errors import UnsafeProcessCleanupError
+
+    scope = generation_id or "*"
+    attempt_pending = Path(BINDING_FILE).with_suffix(_PENDING_SUFFIX).name
+    pending_records = sorted(
+        tracking_root(experiment).glob(f"{scope}/generation-binding{_PENDING_SUFFIX}")
+    ) + sorted(
+        _experiment_dir(experiment).glob(
+            f"*/trial_*__generation_{scope}__attempt_*/{attempt_pending}"
+        )
+    )
+    for pending in pending_records:
+        path = pending.with_suffix("").with_suffix(".json")
+        if not path.exists():
+            identity = validate_identity(read_record(pending)["identity"])
+            try:
+                binding = _find_bound(
+                    experiment,
+                    identity,
+                    environment,
+                    timeout_at=time.monotonic(),
+                    deadline=None,
+                    attempt_directory=None,
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                if isinstance(exc, UnsafeProcessCleanupError):
+                    raise
+                log.warning(
+                    "MLflow run creation for attempt %s of generation %s is still unresolved (%s).",
+                    identity["attempt_id"],
+                    identity["generation_id"],
+                    exc,
+                )
+                continue
+            if binding is None:
+                continue
+            write_record(path, binding)
+        pending.unlink(missing_ok=True)
 
 
 def _resolve_source(
