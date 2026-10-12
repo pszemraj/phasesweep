@@ -42,7 +42,7 @@ The root `summary.yaml` and per-phase `winner.yaml` files are convenience projec
 
 `config.snapshot.yaml` is the executed configuration, including materialized defaults and the resolved invocation context. `reproducibility.json` is the shareable generation identity record. Trial directories retain local evidence and attempt lifecycle information used for supported continuation and winner validation.
 
-MLflow-backed experiments additionally retain native run bindings in each trial directory and mutable delivery state under `tracking/<generation-id>/`. These records support upload retries and are separate from the committed scientific manifests. Disposable supervised-worker scratch uses `~/.cache/phasesweep/<backend>/workers/`, or the corresponding `XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`. Each operation removes its temporary directory. Host lock placement retains its separate OS-account-home contract. See [MLflow tracking](mlflow.md) for ownership and offline replay.
+MLflow-backed experiments additionally retain native run bindings in each trial directory and mutable delivery state and worker cleanup receipts under `tracking/<generation-id>/`. These records support upload retries and recovery and are separate from the committed scientific manifests. Disposable supervised-worker scratch uses `~/.cache/phasesweep/<backend>/workers/`, or the corresponding `XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`. Each operation removes its temporary directory. Host lock placement retains its separate OS-account-home contract. See [MLflow tracking](mlflow.md) for ownership and offline replay.
 
 ### Confound verdicts
 

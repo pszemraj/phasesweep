@@ -7,27 +7,34 @@ import json
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
+from typing import NamedTuple
 
 import optuna
 import pytest
 import yaml
 from click.testing import Result
 
+import phasesweep.engine.attempts as attempts_module
 import phasesweep.mcp.recovery as mcp_recovery
 import phasesweep.mcp.runs as mcp_runs
 from phasesweep.config import (
     Experiment,
     load_experiment,
 )
+from phasesweep.engine import run_experiment
 from phasesweep.engine.artifact_roots import (
     _write_artifact_root_binding,
 )
 from phasesweep.engine.attempts import (
     _AttemptRecord,
+    _preflight_active_attempts,
+    _PreflightCleanupReport,
     _register_active_attempt,
     _register_tracking_operation,
+    _tracking_cleanup_receipts,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
+from phasesweep.engine.guards import _reconcile_existing_studies
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.locking import _experiment_lock
 from phasesweep.engine.paths import (
@@ -47,11 +54,14 @@ from phasesweep.mcp.errors import (
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot, finalize_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.reaper import (
     StaleProcessIdentity,
     read_boot_id,
 )
+from phasesweep.tracking.publication import sync_tracking
+from phasesweep.tracking.session import tracking_root
 from tests.conftest import (
     mark_current_format,
     reaped_pid,
@@ -767,22 +777,55 @@ def test_operator_recovery_reconciles_registry_attempt_when_storage_is_missing(
     assert store.state(handle) == "failed"
 
 
-def test_operator_recovery_accepts_a_resolved_tracking_operation_as_evidence(
+class _TrackingRun(NamedTuple):
+    """A dead run whose cleanup uncertainty rests on one registered tracking operation."""
+
+    experiment: Experiment
+    state_dir: Path
+    store: RunStore
+    handle: RunHandle
+    study: optuna.Study
+    operation_id: str
+
+    @property
+    def entry_path(self) -> Path:
+        """Return the operation's active-attempt registry entry."""
+        return _attempts_dir(self.experiment) / f"{self.operation_id}.json"
+
+    def receipt_path(self, generation_id: str) -> Path:
+        """Return the operation's cleanup receipt under its producing generation."""
+        root = tracking_root(self.experiment)
+        return root / generation_id / "cleanup-receipts" / f"{self.operation_id}.json"
+
+
+def _stage_tracking_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A tracking worker whose cleanup was uncertain is the run's cleanup evidence."""
+    *,
+    operation_generation: str | None = None,
+    uncertain_attempt_ids: list[str] | None = None,
+) -> _TrackingRun:
+    """Stage a dead cleanup-uncertain run plus a registered tracking operation.
+
+    :param Path tmp_path: Test directory holding the config, catalog, and operation directory.
+    :param pytest.MonkeyPatch monkeypatch: Patches the runner process-group cleanup to succeed.
+    :param str | None operation_generation: Generation producing the operation; the run's own by default.
+    :param list[str] | None uncertain_attempt_ids: Attempts the runner's terminal status reported.
+    :return _TrackingRun: The staged run, its study, and the operation id.
+    """
     config = _config(tmp_path)
     experiment = load_experiment(config)
     assert isinstance(experiment, Experiment)
-    app, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
+    _, registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
     run_id = "srv-tracking-worker-recovery"
     mark_current_format(experiment)
-    stamp_artifact_root(_new_phase_study(experiment, experiment.phases[0].name), experiment)
+    study = _new_phase_study(experiment, experiment.phases[0].name)
+    stamp_artifact_root(study, experiment)
     handle = stage_dead_run(store, run_id, config, registry.get("srv").id, cleanup_uncertain=True)
     write_unsafe_cleanup_status(
         store,
         run_id,
+        uncertain_attempt_ids=uncertain_attempt_ids or [],
         result_snapshot_state="complete",
         result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
     )
@@ -791,16 +834,241 @@ def test_operator_recovery_accepts_a_resolved_tracking_operation_as_evidence(
     directory.mkdir()
     write_attempt_lifecycle(directory, attempt_id=operation_id, state="allocated")
     _register_tracking_operation(
+        experiment,
+        operation_id=operation_id,
+        generation_id=operation_generation or run_id,
+        directory=directory,
+    )
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
+    return _TrackingRun(experiment, registry.state_dir, store, handle, study, operation_id)
+
+
+def _recovered_tracking_run(run: _TrackingRun) -> None:
+    """Assert that recover-run clears the run on tracking evidence alone, inspecting first."""
+    trials_before = run.study.get_trials()
+
+    inspected = recover_run_cli(run.state_dir, run.handle.run_id)
+
+    assert inspected.exit_code == 0, inspected.output
+    assert not run.store.cleanup_recovery_path(run.handle.run_id).exists()
+    confirmed = recover_run_cli(run.state_dir, run.handle.run_id, confirm=True)
+
+    assert confirmed.exit_code == 0, confirmed.output
+    recovery = json.loads(run.store.cleanup_recovery_path(run.handle.run_id).read_text())
+    assert recovery["reaped_attempt_ids"] == [run.operation_id]
+    assert recovery["reaped_running_trials"] == 0
+    assert not run.entry_path.exists()
+    assert run.store.state(run.handle) == "failed"
+    assert not run.store.recovery_required(run.handle)
+    assert run.study.get_trials() == trials_before
+
+
+@pytest.mark.parametrize("consumer", ["nobody", "sync_preflight", "run_preflight"])
+def test_operator_recovery_accepts_a_resolved_tracking_operation_as_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consumer: str
+) -> None:
+    """A tracking worker whose cleanup was uncertain stays the run's evidence after any pass."""
+    run = _stage_tracking_run(tmp_path, monkeypatch)
+    if consumer == "sync_preflight":
+        _preflight_active_attempts(
+            run.experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
+        )
+    elif consumer == "run_preflight":
+        _reconcile_existing_studies(run.experiment, cleanup_report=_PreflightCleanupReport())
+    assert run.entry_path.exists() == (consumer == "nobody")
+    assert run.receipt_path(run.handle.run_id).is_file() == (consumer != "nobody")
+
+    _recovered_tracking_run(run)
+
+
+@pytest.mark.parametrize("failing_pass", ["sync_preflight", "recover_run"])
+def test_tracking_entry_outlives_a_failed_receipt_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing_pass: str
+) -> None:
+    """The entry is the operation's only proof until some pass records its receipt."""
+    run = _stage_tracking_run(tmp_path, monkeypatch)
+    run_id = run.handle.run_id
+
+    def read_only_receipts(path: Path, text: str, **kwargs: bool) -> None:
+        if path.parent.name == "cleanup-receipts":
+            raise PermissionError("tracking tree is read-only")
+        private_atomic_write_text(path, text, **kwargs)
+
+    report = _PreflightCleanupReport()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(attempts_module, "private_atomic_write_text", read_only_receipts)
+        if failing_pass == "sync_preflight":
+            _preflight_active_attempts(run.experiment, report, confirm=True, tracking_only=True)
+        else:
+            # The run's own recovery record is proof enough for the run, but
+            # the entry must still wait for a receipt that any other run could use.
+            recovered = recover_run_cli(run.state_dir, run_id, confirm=True)
+            assert recovered.exit_code == 0, recovered.output
+            record = json.loads(run.store.cleanup_recovery_path(run_id).read_text())
+            assert record["reaped_attempt_ids"] == [run.operation_id]
+            assert not run.store.recovery_required(run.handle)
+
+    assert run.entry_path.is_file()
+    assert not run.receipt_path(run_id).exists()
+    if failing_pass == "sync_preflight":
+        assert report.recovered_attempt_ids == {run.operation_id}
+        assert report.unreceipted_attempt_ids == {run.operation_id}
+
+    _preflight_active_attempts(
+        run.experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
+    )
+
+    assert not run.entry_path.exists()
+    assert run.receipt_path(run_id).is_file()
+    if failing_pass == "sync_preflight":
+        _recovered_tracking_run(run)
+
+
+@pytest.mark.parametrize("causally_reported", [False, True])
+def test_tracking_receipt_of_another_generation_is_evidence_only_when_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, causally_reported: bool
+) -> None:
+    """A receipt names its own generation, so a run needs its runner's report to claim it."""
+    run = _stage_tracking_run(
+        tmp_path,
+        monkeypatch,
+        operation_generation="other-generation",
+        uncertain_attempt_ids=["a" * 32] if causally_reported else [],
+    )
+    _preflight_active_attempts(
+        run.experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
+    )
+    assert run.receipt_path("other-generation").is_file()
+
+    if causally_reported:
+        _recovered_tracking_run(run)
+        return
+    refused = recover_run_cli(run.state_dir, run.handle.run_id, confirm=True)
+
+    assert refused.exit_code != 0
+    assert "could not confirm any trial-level cleanup evidence" in refused.output
+    assert run.store.recovery_required(run.handle)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "schema_version",
+        "boolean_schema_version",
+        "operation_id",
+        "generation_id",
+        "unconfirmed",
+        "truthy_not_true",
+        "extra_field",
+        "missing_field",
+        "not_json",
+        "shared_mode",
+        "symlink",
+        "misfiled",
+        "renamed",
+    ],
+)
+def test_damaged_tracking_receipt_is_not_cleanup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    damage: str,
+) -> None:
+    """Only an intact receipt filed under its own generation and operation proves cleanup."""
+    run = _stage_tracking_run(tmp_path, monkeypatch)
+    run_id = run.handle.run_id
+    _preflight_active_attempts(
+        run.experiment, _PreflightCleanupReport(), confirm=True, tracking_only=True
+    )
+    path = run.receipt_path(run_id)
+    receipt = json.loads(path.read_text())
+    assert _tracking_cleanup_receipts(run.experiment) == {run.operation_id: run_id}
+    field_damage: dict[str, dict[str, object]] = {
+        "schema_version": {"schema_version": 2},
+        "boolean_schema_version": {"schema_version": True},
+        "operation_id": {"operation_id": "b" * 32},
+        "generation_id": {"generation_id": "other-generation"},
+        "unconfirmed": {"cleanup_confirmed": False},
+        "truthy_not_true": {"cleanup_confirmed": 1},
+        "extra_field": {"note": "unexpected"},
+    }
+    if damage in field_damage:
+        text = json.dumps({**receipt, **field_damage[damage]}) + "\n"
+        private_atomic_write_text(path, text, require_private_dir=False)
+    elif damage == "missing_field":
+        del receipt["cleanup_confirmed"]
+        private_atomic_write_text(path, json.dumps(receipt) + "\n", require_private_dir=False)
+    elif damage == "not_json":
+        private_atomic_write_text(path, "{", require_private_dir=False)
+    elif damage == "shared_mode":
+        path.chmod(0o644)
+    elif damage == "symlink":
+        forged = tmp_path / "forged.json"
+        path.rename(forged)
+        path.symlink_to(forged)
+    elif damage == "misfiled":
+        elsewhere = run.receipt_path("other-generation")
+        elsewhere.parent.mkdir(parents=True)
+        path.rename(elsewhere)
+    else:
+        path.rename(path.with_name(f"{'b' * 32}.json"))
+
+    with caplog.at_level("WARNING", logger=attempts_module.log.name):
+        assert _tracking_cleanup_receipts(run.experiment) == {}
+    refused = recover_run_cli(run.state_dir, run_id, confirm=True)
+
+    assert "Ignoring" in caplog.text
+    assert refused.exit_code != 0
+    assert "could not confirm any trial-level cleanup evidence" in refused.output
+    assert run.store.recovery_required(run.handle)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("scope", ["own_generation", "other_generation"])
+def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scope: str
+) -> None:
+    """The real sync retires a tracking entry in any generation scope, with its proof kept."""
+    pytest.importorskip("mlflow")
+    from tests.test_mlflow_terminal_delivery import _remote_example
+
+    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = "journal:///" + str(tmp_path / "study.journal")
+    config["phases"] = config["phases"][:1]
+    experiment = Experiment.model_validate(config)
+    run_id = "tracking-recovery-run"
+    run_experiment(experiment, generation_id=run_id)
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    _, registry, store = make_mcp_app(_catalog(tmp_path, config_path, allow=ALLOW_SIDE_EFFECTS))
+    handle = stage_dead_run(
+        store, run_id, config_path, registry.get("srv").id, cleanup_uncertain=True
+    )
+    write_unsafe_cleanup_status(
+        store,
+        run_id,
+        result_snapshot_state="complete",
+        result_snapshot=capture_result_snapshot(experiment, generation_id=run_id),
+    )
+    operation_id = "a" * 32
+    directory = tracking_root(experiment) / run_id / "operations" / operation_id
+    directory.mkdir(parents=True)
+    write_attempt_lifecycle(directory, attempt_id=operation_id, state="allocated")
+    _register_tracking_operation(
         experiment, operation_id=operation_id, generation_id=run_id, directory=directory
     )
     monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
 
-    confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
+    if scope == "own_generation":
+        assert sync_tracking(experiment, run_id)["pending"] == 0
+    else:
+        with pytest.raises(ValueError, match="No tracking deliveries exist"):
+            sync_tracking(experiment, "other-generation")
 
-    assert confirmed.exit_code == 0, confirmed.output
-    assert not (_attempts_dir(experiment) / f"{operation_id}.json").exists()
-    assert store.state(handle) == "failed"
-    assert not store.recovery_required(handle)
+    study = _load_first_phase_study(config_path)
+    _recovered_tracking_run(
+        _TrackingRun(experiment, registry.state_dir, store, handle, study, operation_id)
+    )
 
 
 @pytest.mark.parametrize(

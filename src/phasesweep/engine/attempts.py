@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 import optuna
 
 from phasesweep.config import Experiment
+from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.errors import (
     ActiveAttemptPersistenceError,
     OperatorAction,
@@ -77,6 +78,8 @@ class _PreflightCleanupReport:
     recovered_attempt_ids: set[str] = field(default_factory=set)
     recovered_attempt_generations: dict[str, str] = field(default_factory=dict)
     uncertain_attempt_ids: set[str] = field(default_factory=set)
+    unreceipted_attempt_ids: set[str] = field(default_factory=set)
+    """Recovered tracking operations whose cleanup receipt could not be written."""
     error: BaseException | None = None
 
     def mark_uncertain(self, error: BaseException) -> None:
@@ -221,6 +224,10 @@ _ATTEMPT_ENTRY_REQUIRED_FIELDS = frozenset(
         "generation_id",
     }
 )
+_TRACKING_RECEIPT_SCHEMA_VERSION = 1
+_TRACKING_RECEIPT_FIELDS = frozenset(
+    {"schema_version", "operation_id", "generation_id", "cleanup_confirmed"}
+)
 
 
 def _register_tracking_operation(
@@ -245,6 +252,79 @@ def _register_tracking_operation(
     private_atomic_write_text(
         _attempts_dir(experiment) / f"{operation_id}.json", json.dumps(entry, sort_keys=True) + "\n"
     )
+
+
+def _write_tracking_cleanup_receipt(
+    experiment: Experiment, *, operation_id: str, generation_id: str
+) -> None:
+    """Durably record that a tracking operation's cleanup was confirmed.
+
+    A tracking operation owns no Optuna trial, so its registry entry is the only
+    record of the cleanup. The receipt outlives the entry and is filed under the
+    originating generation, so ``recover-run`` can still attribute the cleanup to
+    that generation after another pass retired the entry.
+
+    :param Experiment experiment: Local experiment namespace.
+    :param str operation_id: Tracking operation whose cleanup was confirmed.
+    :param str generation_id: Generation that produced the operation.
+    :raises OSError: The receipt could not be written.
+    :raises PlatformCapabilityError: The platform lacks the required file primitives.
+    :raises UnsafePrivatePathError: The receipt destination is unsafe.
+    """
+    from phasesweep.tracking.session import tracking_root
+
+    receipt = {
+        "schema_version": _TRACKING_RECEIPT_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "generation_id": generation_id,
+        "cleanup_confirmed": True,
+    }
+    private_atomic_write_text(
+        tracking_root(experiment) / generation_id / "cleanup-receipts" / f"{operation_id}.json",
+        json.dumps(receipt, sort_keys=True) + "\n",
+        require_private_dir=False,
+    )
+
+
+def _tracking_cleanup_receipts(experiment: Experiment) -> dict[str, str]:
+    """Read the tracking operations whose cleanup was confirmed, keyed to their generation.
+
+    A receipt is proof only when it is an owner-only current-format record filed
+    where it claims to belong. A receipt that is unreadable, malformed, or filed
+    under another name is skipped with a warning, so damage can only withhold proof.
+
+    :param Experiment experiment: Local experiment namespace.
+    :return dict[str, str]: Operation ids mapped to their producing generation ids.
+    """
+    from phasesweep.tracking.session import tracking_root
+
+    receipts: dict[str, str] = {}
+    for path in sorted(tracking_root(experiment).glob("*/cleanup-receipts/*.json")):
+        try:
+            directory_fd = open_directory_fd(path.parent, create=False, private_final=False)
+            try:
+                payload: object = strict_json_loads(
+                    read_private_text_at(directory_fd, path.name, path)
+                )
+            finally:
+                os.close(directory_fd)
+        except (OSError, UnsafePrivatePathError, ValueError) as exc:
+            log.warning("Ignoring unreadable tracking cleanup receipt %s: %s", path, exc)
+            continue
+        generation_id = path.parent.parent.name
+        if not (
+            isinstance(payload, dict)
+            and set(payload) == _TRACKING_RECEIPT_FIELDS
+            and type(payload["schema_version"]) is int
+            and payload["schema_version"] == _TRACKING_RECEIPT_SCHEMA_VERSION
+            and payload["operation_id"] == path.stem
+            and payload["generation_id"] == generation_id
+            and payload["cleanup_confirmed"] is True
+        ):
+            log.warning("Ignoring malformed tracking cleanup receipt %s.", path)
+            continue
+        receipts[path.stem] = generation_id
+    return receipts
 
 
 def _register_active_attempt(
@@ -415,6 +495,9 @@ def _load_attempt_entry(entry_path: Path, *, directory_fd: int) -> dict[str, Any
             and all(
                 isinstance(payload[k], str) and payload[k] for k in required - {"schema_version"}
             )
+            # Both ids become path components of the operation's cleanup receipt.
+            and SAFE_NAME_PATTERN.fullmatch(payload["attempt_id"])
+            and SAFE_NAME_PATTERN.fullmatch(payload["generation_id"])
         ):
             return payload
         raise ProcessCleanupUncertainError(
@@ -833,6 +916,8 @@ def _preflight_active_attempts(
     :param bool confirm: Clean each attempt's process group, repair its
         recorded study, and retire its entry when true; otherwise validate
         each entry's recovery evidence without signalling or changing state.
+        A tracking operation's entry is retired only after its cleanup receipt
+        is durable, because the entry is its sole cleanup evidence.
     :param bool retain_recovery_evidence: Keep entries backed by uncommitted
         cleanup evidence so interrupted operator recovery can retry even when
         the attempt's recorded storage differs from the current config.
@@ -872,8 +957,27 @@ def _preflight_active_attempts(
             if outcome in {"reaped", "recovered"}:
                 report.recovered_attempt_ids.add(attempt_id)
                 report.recovered_attempt_generations[attempt_id] = entry["generation_id"]
-            if outcome != "unreachable" and not (
-                retain_recovery_evidence and outcome in {"reaped", "recovered"}
+            if entry["kind"] == "tracking" and outcome == "recovered":
+                # The entry is the operation's only cleanup evidence, so no pass
+                # may retire it before the originating generation holds a receipt.
+                try:
+                    _write_tracking_cleanup_receipt(
+                        experiment, operation_id=attempt_id, generation_id=entry["generation_id"]
+                    )
+                except (OSError, PlatformCapabilityError, UnsafePrivatePathError) as exc:
+                    report.unreceipted_attempt_ids.add(attempt_id)
+                    log.warning(
+                        "Could not record the cleanup receipt for tracking operation %s: %s. "
+                        "Its registry entry is retained for a later pass.",
+                        attempt_id,
+                        exc,
+                    )
+                else:
+                    report.unreceipted_attempt_ids.discard(attempt_id)
+            if (
+                outcome != "unreachable"
+                and attempt_id not in report.unreceipted_attempt_ids
+                and not (retain_recovery_evidence and outcome in {"reaped", "recovered"})
             ):
                 with contextlib.suppress(OSError):
                     os.unlink(entry_path.name, dir_fd=directory_fd)

@@ -21,6 +21,7 @@ from phasesweep.engine.attempts import (
     _preflight_active_attempts,
     _PreflightCleanupReport,
     _retire_active_attempt,
+    _tracking_cleanup_receipts,
 )
 from phasesweep.engine.cleanup import (
     _previously_recovered_attempt_locations,
@@ -653,9 +654,9 @@ def _recover_trial_evidence(
 ) -> _CleanupEvidence:
     """Collect attributable cleanup evidence, optionally reconciling attempts and trials.
 
-    When cleanup is needed, both modes read run, registry, and study evidence through the same
-    cleanup helpers. Confirmed recovery lets them signal and write; preflight only validates
-    and does not persist the collected run evidence.
+    When cleanup is needed, both modes read run, registry, tracking-receipt, and study evidence
+    through the same cleanup helpers. Confirmed recovery lets them signal and write; preflight
+    only validates and does not persist the collected run evidence.
 
     :param RunStore store: Existing run store containing prior cleanup evidence and attempt IDs.
     :param RunHandle handle: Durable handle for the run being recovered.
@@ -681,7 +682,11 @@ def _recover_trial_evidence(
         )
         if confirm:
             registered_evidence = active_report.recovered_attempt_generations
-            evidence.registered_recovery_attempt_ids.update(active_report.recovered_attempt_ids)
+            # An entry without its receipt stays registered: it is still the
+            # only proof of that cleanup for any generation but this run's.
+            evidence.registered_recovery_attempt_ids.update(
+                active_report.recovered_attempt_ids - active_report.unreceipted_attempt_ids
+            )
         else:
             # Preflight cannot know which entries a confirmed pass will reap,
             # so every registered attempt stands as potential evidence.
@@ -691,6 +696,13 @@ def _recover_trial_evidence(
             attempt_id
             for attempt_id, generation_id in registered_evidence.items()
             if generation_id == run_id or attempt_id in causal_attempt_ids
+        )
+        # A tracking operation owns no trial, so another pass may have retired
+        # its registry entry; the receipt that pass left is the same evidence.
+        evidence.reaped_attempt_ids.update(
+            operation_id
+            for operation_id, generation_id in _tracking_cleanup_receipts(config).items()
+            if generation_id == run_id or operation_id in causal_attempt_ids
         )
         for phase in config.phases:
             study = loaded_studies.get(phase.name)
@@ -756,8 +768,8 @@ def _require_cleanup_evidence(
         else:
             detail = (
                 "no RUNNING trials were reaped, no terminal trials recorded cleanup "
-                "uncertainty, and no prior recovery pass left durable trial-level "
-                "evidence"
+                "uncertainty, and no prior recovery pass or tracking cleanup left "
+                "durable evidence"
             )
         raise RunRecoveryError(
             "runner status recorded cleanup_confirmed=false, but recovery could not "
