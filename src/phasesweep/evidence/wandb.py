@@ -16,9 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from phasesweep.runtime.json import progress_position
+from phasesweep.runtime.json import json_text, progress_position
 
 if TYPE_CHECKING:
+    from phasesweep.runtime.json import JsonObject
     from phasesweep.runtime.process import ProcessResult
 
 _HistoryRead = Literal["settled", "lagging", "retry"]
@@ -169,23 +170,23 @@ def _error_detail(exc: Exception) -> str:
 
 
 def _run_worker(
-    request: Mapping[str, Any],
+    request: Mapping[str, object],
     *,
     statuses: frozenset[str],
     run_id: str,
     trial_dir: Path,
     environment: Mapping[str, str] | None,
     deadline: float,
-) -> tuple[ProcessResult, dict[str, Any], Path | None]:
+) -> tuple[ProcessResult, JsonObject, Path | None]:
     """Run a W&B request in the registered attempt's process slot.
 
-    :param Mapping[str, Any] request: Backend request payload.
+    :param Mapping[str, object] request: Backend request payload; it must serialize to JSON.
     :param frozenset[str] statuses: Accepted worker response statuses.
     :param str run_id: PhaseSweep attempt identity, not a remote run ID.
     :param Path trial_dir: Registered process slot.
     :param Mapping[str, str] | None environment: Composed trainer environment.
     :param float deadline: Absolute monotonic operation deadline.
-    :return tuple[ProcessResult, dict[str, Any], Path | None]: Process, response, diagnostic.
+    :return tuple[ProcessResult, JsonObject, Path | None]: Process, response, diagnostic.
     """
     from phasesweep.runtime.remote_worker import run_worker
 
@@ -270,9 +271,9 @@ def poll_wandb_summary(
     )
     # Definite operational causes remain definite even if cleanup crossed a deadline.
     if response.get("status") == "setup_error":
-        raise WandbSetupError(run_id, response["cause"])
+        raise WandbSetupError(run_id, json_text(response, "cause"))
     if response.get("status") == "terminal_error":
-        raise WandbRunTerminalError(run_id, response["state"])
+        raise WandbRunTerminalError(run_id, json_text(response, "state"))
     if response.get("status") == "invalid_evidence":
         raise ValueError(response["cause"])
     if response.get("status") == "import_error":

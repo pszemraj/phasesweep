@@ -54,6 +54,7 @@ from phasesweep.runtime.process import (
 
 if TYPE_CHECKING:
     from phasesweep.engine.selection import SelectedTrial
+    from phasesweep.tracking.records import MlflowQuery, SourceIdentity
 
 _TRIAL_EVIDENCE_REMEDY = (
     "PhaseSweep will not select or republish a result whose evidence is gone: restore the "
@@ -442,8 +443,8 @@ def _verify_trial_evidence_dir(
     metric_value: float,
     wandb_query: WandbQuery | None,
     constraints: Mapping[str, Any],
-    mlflow_query: dict[str, Any] | None = None,
-    mlflow_target: dict[str, Any] | None = None,
+    mlflow_query: MlflowQuery | None = None,
+    mlflow_target: SourceIdentity | None = None,
 ) -> None:
     """Require one trial's evidence directory and audit artifacts to still exist.
 
@@ -468,8 +469,8 @@ def _verify_trial_evidence_dir(
     :param float metric_value: Selected scalar recorded by the study or winner.
     :param WandbQuery | None wandb_query: Shared remote evidence binding for this phase.
     :param Mapping[str, Any] constraints: Saved constraint measurements.
-    :param dict[str, Any] | None mlflow_query: Shared native metric selections and gates.
-    :param dict[str, Any] | None mlflow_target: Configured native target and ownership mode.
+    :param MlflowQuery | None mlflow_query: Shared native metric selections and gates.
+    :param SourceIdentity | None mlflow_target: Configured native target and ownership mode.
     :raises TrialEvidenceMissingError: The directory, an audit artifact, the
         generated trainer input, or recorded objective source is missing,
         foreign, or altered.

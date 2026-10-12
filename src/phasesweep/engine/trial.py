@@ -644,11 +644,12 @@ def launch_trial(
     # any configured/ambient W&B identity unchanged. Trainers can still bind
     # monitoring to this attempt explicitly through PHASESWEEP_ATTEMPT_ID.
     if experiment.mlflow is not None:
+        from phasesweep.runtime.json import json_text
         from phasesweep.tracking.session import read_binding, read_record
 
         expected = read_record(workdir / "mlflow-expected.json")
         env.pop("MLFLOW_EXPERIMENT_NAME", None)
-        env["MLFLOW_EXPERIMENT_ID"] = expected["experiment_id"]
+        env["MLFLOW_EXPERIMENT_ID"] = json_text(expected, "experiment_id")
         if experiment.mlflow.run_mode == "managed":
             env["MLFLOW_RUN_ID"] = read_binding(workdir)["run_id"]
     trainer_cwd = _resolved_execution_cwd(experiment)
@@ -713,9 +714,7 @@ def launch_trial(
         duration_seconds=proc_result.duration_seconds,
         wandb_environment=env if wandb_query is not None else None,
         wandb_query=wandb_query,
-        mlflow_settings=None
-        if experiment.mlflow is None
-        else experiment.mlflow.model_dump(mode="json"),
+        mlflow_settings=None if experiment.mlflow is None else experiment.mlflow.target(),
         mlflow_query=compile_mlflow_query(experiment, phase.gates),
         mlflow_environment=env if experiment.mlflow is not None else None,
     )

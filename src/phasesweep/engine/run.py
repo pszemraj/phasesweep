@@ -921,7 +921,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     status = read_status(experiment)
     integrity = status["publication_integrity"]
     ledger_path = ledger_ops.resolved_ledger_path(experiment)
-    payload: dict[str, Any] = {
+    payload: dict[str, object] = {
         "kind": "experiment",
         "experiment": status["experiment"],
         "workdir": str(path_ops._experiment_dir(experiment)),
