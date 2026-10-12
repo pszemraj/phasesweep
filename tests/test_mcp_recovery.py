@@ -31,6 +31,7 @@ from phasesweep.engine.attempts import (
     _PreflightCleanupReport,
     _register_active_attempt,
     _register_tracking_operation,
+    _retire_active_attempt,
     _tracking_cleanup_receipts,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
@@ -1069,6 +1070,56 @@ def test_sync_tracking_leaves_the_originating_runs_recovery_evidence(
     _recovered_tracking_run(
         _TrackingRun(experiment, registry.state_dir, store, handle, study, operation_id)
     )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("entry", ["registered", "retired"])
+def test_sync_tracking_finishes_an_attempt_whose_cleanup_recover_run_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    """recover-run consumes a failed attempt's uncertainty in the study ledger, and sync honors that.
+
+    A registered attempt is confirmed through the registry pass. Once its entry is gone, only the
+    terminal trial's own record remains, which the terminal-trial pass confirms instead. Neither
+    rewrites the trial, so the ledger is the only place sync can see the confirmation.
+    """
+    pytest.importorskip("mlflow")
+    from tests.test_mlflow_terminal_delivery import (
+        _leave_cleanup_uncertain_attempt,
+        _remote_example,
+    )
+
+    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = "journal:///" + str(tmp_path / "study.journal")
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
+    experiment = Experiment.model_validate(config)
+    run_id = "mcp-uncertain-attempt"
+    attempt = _leave_cleanup_uncertain_attempt(experiment, monkeypatch, generation_id=run_id)
+    if entry == "retired":
+        _retire_active_attempt(experiment, attempt)
+    config_path = tmp_path / "experiment.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    _, registry, store = make_mcp_app(_catalog(tmp_path, config_path, allow=ALLOW_SIDE_EFFECTS))
+    stage_dead_run(store, run_id, config_path, registry.get("srv").id, cleanup_uncertain=True)
+    write_unsafe_cleanup_status(store, run_id)
+    monkeypatch.setattr("phasesweep.mcp.recovery.kill_stale_group", lambda *a, **k: True)
+    uploads.clear()
+    with pytest.raises(ValueError, match="No tracking deliveries exist"):
+        sync_tracking(experiment, run_id)
+    assert uploads == []
+
+    confirmed = recover_run_cli(registry.state_dir, run_id, confirm=True)
+
+    assert confirmed.exit_code == 0, confirmed.output
+    assert _load_phase_trial(config_path, 0).user_attrs[CLEANUP_CONFIRMED_ATTR] is False
+    study = _load_first_phase_study(config_path)
+    assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [0]
+    journal = (tmp_path / "study.journal").read_bytes()
+    assert sync_tracking(experiment, run_id)["pending"] == 0
+    [upload] = [r for r in uploads if r["binding"]["attempt_id"] == attempt]
+    assert upload["finish"] == "FAILED"
+    assert (tmp_path / "study.journal").read_bytes() == journal
 
 
 @pytest.mark.parametrize(

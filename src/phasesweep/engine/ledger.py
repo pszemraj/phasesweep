@@ -106,6 +106,7 @@ from phasesweep.runtime.files import fsync_directory, journal_file_path
 
 __all__ = [
     "ClaimedLedger",
+    "PhaseTrials",
     "ValidatedLedger",
     "claim_ledger",
     "open_existing_study",
@@ -1083,24 +1084,43 @@ def read_trial_stats(
     return _trial_stats(ledger, published_trials)
 
 
-def read_phase_trials(
-    ledger: ValidatedLedger, phase: Phase | str
-) -> list[optuna.trial.FrozenTrial] | None:
+@dataclass(frozen=True, slots=True)
+class PhaseTrials:
+    """One phase study's trials and its confirmed cleanup recoveries, from one snapshot.
+
+    Trial numbers are study-local, so :attr:`cleanup_recovered` answers only
+    for the trials beside it, never for another phase's study.
+    """
+
+    #: The study's trials, with their historical attributes exactly as recorded.
+    trials: list[optuna.trial.FrozenTrial]
+    #: Numbers of this study's trials whose cleanup uncertainty a recovery
+    #: confirmed. Recovery never rewrites the trial's own attributes, so this
+    #: study-level ledger is the only place the confirmation is recorded.
+    cleanup_recovered: frozenset[int]
+
+
+def read_phase_trials(ledger: ValidatedLedger, phase: Phase | str) -> PhaseTrials | None:
     """Read one phase's trials from a validated ledger, writing nothing.
 
     A journal is read from one complete snapshot, as :func:`read_trial_stats`
     reads it, so no file-backed storage is constructed and no study is
     created. A memory ledger holds trials only inside the invocation that
-    claimed it, so only that :class:`ClaimedLedger` can answer.
+    claimed it, so only that :class:`ClaimedLedger` can answer. The trials and
+    the study's cleanup recovery ledger come from the same snapshot, so they
+    describe the same moment.
 
     :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
     :param Phase | str phase: Phase or historical phase name whose study is read.
-    :return list[optuna.trial.FrozenTrial] | None: The study's trials, or ``None``
-        when no such study exists or this handle cannot reach it.
+    :return PhaseTrials | None: The study's trials and confirmed cleanup
+        recoveries, or ``None`` when no such study exists or this handle cannot reach it.
     :raises StudyStorageUnavailableError: The handle's format scan did not
         complete, or the journal could not be completely read.
     :raises StudySchemaMismatchError: The study is populated under an unsupported schema.
     """
+    # attempts imports this module at load time, so the recovery ledger's parser is reached late.
+    from phasesweep.engine.attempts import _cleanup_recovered_trial_numbers
+
     failure = ledger.format_scan_failure
     if failure is not None:
         raise type(failure).rewrap(failure, str(failure)) from failure
@@ -1122,7 +1142,9 @@ def read_phase_trials(
     _validate_storage_versions(
         [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
     )
-    return trials
+    return PhaseTrials(
+        trials=trials, cleanup_recovered=frozenset(_cleanup_recovered_trial_numbers(study))
+    )
 
 
 # Creating a directory fails with these when the configured path itself is

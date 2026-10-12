@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import shlex
 import signal
@@ -13,14 +14,24 @@ import pytest
 import yaml
 from optuna.trial import TrialState, create_trial
 
+import phasesweep.engine.attempts as attempts_module
+import phasesweep.engine.cleanup as cleanup_module
+import phasesweep.engine.phase as phase_module
 from phasesweep.config import Experiment
 from phasesweep.engine import NoFeasibleTrialError, run_experiment
 from phasesweep.engine.generation import _recorded_generation_state
-from phasesweep.engine.ledger import claim_ledger, open_phase_study, validate_ledger
+from phasesweep.engine.ledger import (
+    claim_ledger,
+    open_phase_study,
+    read_phase_trials,
+    validate_ledger,
+)
 from phasesweep.engine.paths import _experiment_dir, _generation_record_path, _trial_dir_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
+    CLEANUP_CONFIRMED_ATTR,
+    CLEANUP_RECOVERED_TRIALS_ATTR,
     DURATION_ATTR,
     FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
@@ -205,6 +216,43 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     assert "phasesweep.outcome" not in accepted["tags"]
 
 
+def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, monkeypatch):
+    """Trial numbers are study-local, so one study's recovery never settles another study's attempt."""
+    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    experiment = Experiment.model_validate(config)
+    generation = "a" * 32
+    ledger = claim_ledger(validate_ledger(experiment))
+    # Trial 0 failed with unconfirmed cleanup in both studies; only depth's was recovered.
+    for phase, digit, recovered in (("depth", "1", [0]), ("rate", "2", [])):
+        study = open_phase_study(ledger, next(p for p in experiment.phases if p.name == phase))
+        study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+        if recovered:
+            study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)
+        attempt = digit * 32
+        directory = _trial_dir_for(
+            experiment, phase, 0, generation_id=generation, attempt_id=attempt
+        )
+        write_record(
+            directory / BINDING_FILE,
+            {**_binding(), "phase": phase, "attempt_id": attempt, "run_mode": "managed"},
+        )
+        study.add_trial(
+            create_trial(
+                state=TrialState.FAIL,
+                user_attrs={
+                    ATTEMPT_ID_ATTR: attempt,
+                    GENERATION_ID_ATTR: generation,
+                    CLEANUP_CONFIRMED_ATTR: False,
+                },
+            )
+        )
+    publication._rebuild_attempt_intents(experiment, [generation])
+    delivery = tracking_root(experiment) / generation / "delivery"
+    assert [path.name for path in delivery.glob("attempt-*.json")] == [f"attempt-{'1' * 32}.json"]
+    assert read_record(delivery / f"attempt-{'1' * 32}.json")["finish"] == "FAILED"
+
+
 @pytest.mark.parametrize("storage", ["memory", "journal"])
 def test_unsaved_accepted_attempt_keeps_its_accepted_projection(tmp_path, monkeypatch, storage):
     """A record write that fails after Optuna accepts a trial never turns it into a failure."""
@@ -263,6 +311,86 @@ def test_sync_rebuilds_accepted_attempt_records_from_the_ledger(tmp_path, monkey
     rate = [r for r in records if r["binding"]["phase"] == "rate"]
     depth_runs = {r["binding"]["run_id"] for r in records if r["binding"]["phase"] == "depth"}
     assert all(r["projection"]["tags"]["phasesweep.inherits.depth"] in depth_runs for r in rate)
+
+
+def _leave_cleanup_uncertain_attempt(experiment, monkeypatch, **run_kwargs):
+    """Fail the one trial of ``depth`` with unconfirmed cleanup, recorded as recovered by nobody.
+
+    The trainer really exits. The launch result reports its cleanup unconfirmed, and the engine's
+    own reconciliation after the failure cannot prove the group gone, so the trial keeps its
+    uncertainty and its attempt-registry entry stays for a later pass. The injected faults are
+    undone before this returns.
+
+    :return str: The failed trial's attempt id.
+    """
+    original_launch = phase_module.launch_trial
+
+    def uncertain_launch(*args, **kwargs):
+        executed = original_launch(*args, **kwargs)
+        return dataclasses.replace(
+            executed, process=dataclasses.replace(executed.process, cleanup_confirmed=False)
+        )
+
+    def unproven(*args, **kwargs):
+        raise ProcessCleanupUncertainError("the process group may still be alive")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(phase_module, "launch_trial", uncertain_launch)
+        # The registry pass and the terminal-trial pass each resolve attempts through their own name.
+        patch.setattr(attempts_module, "_resolve_attempt", unproven)
+        patch.setattr(cleanup_module, "_resolve_attempt", unproven)
+        with pytest.raises(UnsafeProcessCleanupError):
+            run_experiment(experiment, **run_kwargs)
+    read = read_phase_trials(validate_ledger(experiment), "depth")
+    [trial] = read.trials
+    assert trial.state == TrialState.FAIL
+    assert trial.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
+    assert trial.number not in read.cleanup_recovered
+    return trial.user_attrs[ATTEMPT_ID_ATTR]
+
+
+def test_sync_finishes_an_attempt_once_recovery_confirms_its_cleanup(tmp_path, monkeypatch):
+    """Recovery never rewrites the failed trial; the study's ledger is what settles its attempt."""
+    config, uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    config["phases"] = config["phases"][:1]
+    config["phases"][0].update(n_trials=1, sampler={"type": "random", "seed": 123})
+    attempt = _leave_cleanup_uncertain_attempt(Experiment.model_validate(config), monkeypatch)
+    # The same config with a larger budget, so the resumed invocation is ordinary preflight.
+    config["phases"][0]["n_trials"] = 2
+    experiment = Experiment.model_validate(config)
+    [generation] = [path.name for path in tracking_root(experiment).iterdir() if path.is_dir()]
+    delivery = tracking_root(experiment) / generation / "delivery"
+    record = delivery / f"attempt-{attempt}.json"
+    journal = tmp_path / "study.journal"
+    before = journal.read_bytes()
+
+    # While its cleanup is unresolved, the attempt reports nothing: there is nothing to deliver.
+    uploads.clear()
+    with pytest.raises(ValueError, match="No tracking deliveries exist"):
+        publication.sync_tracking(experiment)
+    assert not record.exists()
+    assert uploads == []
+    assert journal.read_bytes() == before
+
+    run_experiment(experiment)
+    read = read_phase_trials(validate_ledger(experiment), "depth")
+    failed = next(trial for trial in read.trials if trial.user_attrs[ATTEMPT_ID_ATTR] == attempt)
+    assert failed.state == TrialState.FAIL
+    assert failed.user_attrs[CLEANUP_CONFIRMED_ATTR] is False
+    assert failed.number in read.cleanup_recovered
+    uploads.clear()
+    before = journal.read_bytes()
+
+    counts = publication.sync_tracking(experiment)
+    assert counts["pending"] == 0
+    [upload] = [r for r in uploads if r["binding"]["attempt_id"] == attempt]
+    assert upload["finish"] == "FAILED"
+    assert read_record(record)["state"] == "delivered"
+    assert publication.sync_tracking(experiment) == counts
+    # A second sync delivers nothing again, and neither sync rewrote the ledger.
+    assert [r for r in uploads if r["binding"]["attempt_id"] == attempt] == [upload]
+    assert journal.read_bytes() == before
 
 
 def _fail_engine(tmp_path, monkeypatch, error):

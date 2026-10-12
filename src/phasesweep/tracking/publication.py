@@ -7,7 +7,7 @@ import logging
 import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.runtime.json import (
@@ -333,24 +333,32 @@ def _unrecorded_attempts(
     ]
 
 
-def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str, FrozenTrial]:
+class _AttemptTrial(NamedTuple):
+    """An attempt's Optuna trial and whether its own study recorded the trial's cleanup recovery."""
+
+    trial: FrozenTrial
+    cleanup_recovered: bool
+
+
+def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str, _AttemptTrial]:
     """Index the ledger's trials of some phases by attempt id.
 
     A phase whose study cannot be read contributes nothing, so its attempts
-    stay unresolved instead of being guessed.
+    stay unresolved instead of being guessed. Trial numbers are study-local,
+    so each trial is paired with the recovery ledger of the study it came from.
 
     :param ValidatedLedger ledger: Ledger the trials were recorded in.
     :param Iterable[str] phases: Phase names whose studies are read.
-    :return dict[str, FrozenTrial]: Trials that carry an attempt id.
+    :return dict[str, _AttemptTrial]: Trials that carry an attempt id.
     """
     from phasesweep.engine.errors import StudySchemaMismatchError, StudyStorageUnavailableError
     from phasesweep.engine.ledger import read_phase_trials
     from phasesweep.engine.state import ATTEMPT_ID_ATTR
 
-    trials: dict[str, FrozenTrial] = {}
+    trials: dict[str, _AttemptTrial] = {}
     for phase in sorted(set(phases)):
         try:
-            phase_trials = read_phase_trials(ledger, phase) or []
+            phase_trials = read_phase_trials(ledger, phase)
         except (StudyStorageUnavailableError, StudySchemaMismatchError) as exc:
             log.warning(
                 "MLflow attempt outcomes of phase %s are unresolved: its study is unreadable (%s).",
@@ -358,10 +366,14 @@ def _attempt_trials(ledger: ValidatedLedger, phases: Iterable[str]) -> dict[str,
                 exc,
             )
             continue
-        for trial in phase_trials:
+        if phase_trials is None:
+            continue
+        for trial in phase_trials.trials:
             attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
             if isinstance(attempt_id, str):
-                trials[attempt_id] = trial
+                trials[attempt_id] = _AttemptTrial(
+                    trial, trial.number in phase_trials.cleanup_recovered
+                )
     return trials
 
 
@@ -369,7 +381,7 @@ def _save_attempt_intents(
     experiment: Experiment,
     generation_id: str,
     attempts: list[tuple[Path, RunBinding]],
-    trials: Mapping[str, FrozenTrial],
+    trials: Mapping[str, _AttemptTrial],
     *,
     ended: str | None,
 ) -> list[Path]:
@@ -379,13 +391,17 @@ def _save_attempt_intents(
     record: a COMPLETE trial whose callback saved nothing, because a write
     failed or the controller died after Optuna committed it, gets its accepted
     projection. A managed run of a trial that was not accepted is finished
-    once its cleanup is confirmed. An attempt without a readable trial stays
-    unresolved.
+    once its cleanup is established, either by the trial's own positive
+    evidence or by a recovery its study recorded; cleanup recovery never
+    rewrites the trial's attributes, so the study's ledger is the only place
+    the second form is visible. An attempt without a readable trial stays
+    unresolved, as does one whose cleanup is still uncertain.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
     :param list[tuple[Path, RunBinding]] attempts: From :func:`_unrecorded_attempts`.
-    :param Mapping[str, FrozenTrial] trials: Ledger trials by attempt id.
+    :param Mapping[str, _AttemptTrial] trials: Ledger trials by attempt id, each with
+        its study's recovery.
     :param str | None ended: Status for every unaccepted managed run once the
         invocation that owned it ended with confirmed cleanup, or ``None`` to
         finish only trials Optuna failed or pruned with confirmed cleanup.
@@ -397,9 +413,10 @@ def _save_attempt_intents(
 
     paths: list[Path] = []
     for directory, binding in attempts:
-        trial = trials.get(binding["attempt_id"])
-        if trial is None:
+        found = trials.get(binding["attempt_id"])
+        if found is None:
             continue
+        trial = found.trial
         name = f"attempt-{binding['attempt_id']}"
         if trial.state == TrialState.COMPLETE:
             projection = _accepted_projection(trial, read_inherits(directory))
@@ -407,7 +424,9 @@ def _save_attempt_intents(
             continue
         if binding["run_mode"] != "managed":
             continue
-        settled = trial.state.is_finished() and not _trial_requires_cleanup_recovery(trial)
+        settled = trial.state.is_finished() and (
+            found.cleanup_recovered or not _trial_requires_cleanup_recovery(trial)
+        )
         if settled and trial.state == TrialState.PRUNED:
             status = "KILLED"
         elif ended is not None:
