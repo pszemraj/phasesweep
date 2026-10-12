@@ -38,7 +38,8 @@ def _experiment(
     phase: Phase,
     *,
     trial_command: str = _ECHO_METRIC_COMMAND,
-    **options: Any,
+    constraints: list[Constraint] | None = None,
+    env: dict[str, str] | None = None,
 ) -> Experiment:
     return make_experiment(
         experiment="revalidation",
@@ -46,7 +47,8 @@ def _experiment(
         storage="auto",
         trial_command=trial_command,
         phases=[phase],
-        **options,
+        constraints=constraints,
+        env=env,
     )
 
 
@@ -165,7 +167,7 @@ def test_revalidation_preserves_attached_environment(
     ],
 )
 def test_revalidation_rejects_invalid_copied_field(
-    tmp_path: Path, level: str, update: dict[str, Any], match: str
+    tmp_path: Path, level: str, update: dict[str, object], match: str
 ) -> None:
     """The library boundary rejects model_copy updates that skipped validation.
 

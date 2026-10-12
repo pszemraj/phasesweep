@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 import yaml
@@ -21,6 +20,7 @@ from phasesweep.config import (
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.runtime.json import JsonObject, JsonValue
 from tests.conftest import make_experiment, write_yaml
 
 
@@ -351,7 +351,7 @@ _BYTES_EXTRACTOR = {"type": "json", "path": "r.json", "key": "bytes"}
         ),
     ],
 )
-def test_invalid_experiment_relationships(options: dict[str, Any], match: str) -> None:
+def test_invalid_experiment_relationships(options: dict[str, object], match: str) -> None:
     with pytest.raises(ValidationError, match=match):
         make_experiment(**options)
 
@@ -439,7 +439,7 @@ def test_phase_names_preserve_authored_case_for_inherit_selectors() -> None:
     ],
 )
 def test_config_rejects_invalid_content_before_creating_workdir(
-    tmp_path, path: tuple[str | int, ...], value: Any, match: str
+    tmp_path, path: tuple[str | int, ...], value: JsonValue, match: str
 ):
     """An invalid metric regex or reserved phase name fails the load before any workdir exists.
 
@@ -758,9 +758,9 @@ def test_lone_surrogate_escape_is_rejected_at_load(tmp_path: Path, env_line: str
 def _sampler_policy_experiment(
     *,
     storage: str | None,
-    sampler: dict[str, Any] | None = None,
+    sampler: JsonObject | None = None,
     n_trials: int = 2,
-    search_space: dict[str, Any] | None = None,
+    search_space: JsonObject | None = None,
 ) -> Experiment:
     """Build a one-phase experiment for the persistent-storage sampler policy.
 
@@ -768,12 +768,12 @@ def _sampler_policy_experiment(
     sampler on persistent storage, which would hide the policy under test.
 
     :param str | None storage: Storage URL to declare, or ``None`` for in-memory.
-    :param dict | None sampler: Sampler mapping, or ``None`` to leave the default.
+    :param JsonObject | None sampler: Sampler mapping, or ``None`` to leave the default.
     :param int n_trials: Trial budget for the single phase.
-    :param dict | None search_space: Search space; defaults to one float ``lr``.
+    :param JsonObject | None search_space: Search space; defaults to one float ``lr``.
     :return Experiment: Validated experiment.
     """
-    phase: dict[str, Any] = {
+    phase: JsonObject = {
         "name": "lr",
         "n_trials": n_trials,
         "search_space": search_space or {"lr": {"type": "float", "low": 0.1, "high": 1.0}},
@@ -803,7 +803,7 @@ def _sampler_policy_experiment(
     ],
 )
 def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
-    tmp_path: Path, sampler: dict[str, Any] | None, message: str
+    tmp_path: Path, sampler: JsonObject | None, message: str
 ) -> None:
     """Persistent storage must state the sampler contract at config load, not mid-run.
 
@@ -827,7 +827,7 @@ def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
     ],
 )
 def test_persistent_storage_accepts_seeded_and_acknowledged_samplers(
-    tmp_path: Path, sampler: dict[str, Any]
+    tmp_path: Path, sampler: JsonObject
 ) -> None:
     """A seeded sampler with the required acknowledgement loads unchanged."""
     experiment = _sampler_policy_experiment(

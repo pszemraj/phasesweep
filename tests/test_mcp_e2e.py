@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -49,6 +49,9 @@ from tests.mcp_helpers import (
     wait_for_mcp_running_trial,
     write_mcp_config_catalog,
 )
+
+if TYPE_CHECKING:
+    from mcp.types import CallToolResult
 
 # Hard ceilings for the monitoring loops below. Both are far above the real
 # cost of these fixtures (a five-trial fake-trainer sweep, and one in-process
@@ -595,12 +598,14 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     assert blocking_result.isError is False
 
 
-def _call_inspect_experiment_tool(app: PhaseSweepMCP, arguments: dict[str, object]) -> Any:
+def _call_inspect_experiment_tool(
+    app: PhaseSweepMCP, arguments: dict[str, object]
+) -> CallToolResult:
     """Dispatch one ``inspect_experiment`` call through the FastMCP request handler.
 
     :param PhaseSweepMCP app: Server whose tools the FastMCP handler exposes.
     :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
-    :return Any: The call's result, whose ``isError`` and ``content`` the caller inspects.
+    :return CallToolResult: The call's result, whose ``isError`` and ``content`` the caller inspects.
     """
     from mcp import types
 
@@ -611,7 +616,10 @@ def _call_inspect_experiment_tool(app: PhaseSweepMCP, arguments: dict[str, objec
     request = types.CallToolRequest(
         params=types.CallToolRequestParams(name=TOOL_INSPECT_EXPERIMENT, arguments=arguments)
     )
-    return asyncio.run(handler(request)).root
+    result = asyncio.run(handler(request)).root
+    if not isinstance(result, types.CallToolResult):
+        raise TypeError(f"A tool call answered with {type(result).__name__}, not CallToolResult.")
+    return result
 
 
 @pytest.mark.parametrize(

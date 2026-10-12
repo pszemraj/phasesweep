@@ -60,6 +60,7 @@ from phasesweep.engine.publication import (
 from phasesweep.engine.resume import _preflight_skipped_winners, _published_for_resume
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.runtime import shutdown as runtime_shutdown
+from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
 from tests.conftest import (
     make_experiment,
@@ -770,7 +771,7 @@ def test_manifest_rejects_malformed_reanchored_winner_provenance(
 def _reseal_winner(
     experiment: Experiment,
     generation_id: str,
-    winner: Mapping[str, Any],
+    winner: JsonObject,
     *,
     mirror_summary: bool = False,
 ) -> None:
@@ -780,7 +781,7 @@ def _reseal_winner(
 
     :param Experiment experiment: Experiment whose golden publication is rewritten.
     :param str generation_id: Published generation holding the winner.
-    :param Mapping[str, Any] winner: Replacement winner payload for phase ``p``.
+    :param JsonObject winner: Replacement winner payload for phase ``p``.
     :param bool mirror_summary: Also write the winner's ``winner_source`` into the
         summary's own per-phase copy, so the two copies agree and the summary
         cross-check cannot be the reason the winner is refused.
@@ -794,8 +795,10 @@ def _reseal_winner(
     )
     artifact["sha256"] = hashlib.sha256(winner_path.read_bytes()).hexdigest()
     if mirror_summary:
+        winner_source = winner["winner_source"]
+        assert isinstance(winner_source, dict)
         phase_item = next(item for item in summary["phases"] if item["name"] == "p")
-        phase_item["winner_source"] = dict(winner["winner_source"])
+        phase_item["winner_source"] = dict(winner_source)
     summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
     reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 

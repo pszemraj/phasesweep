@@ -11,20 +11,20 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
 
 import phasesweep.config as config_models
 from phasesweep.config import Experiment, load_experiment
 from phasesweep.config.io import load_experiment_bytes
 from phasesweep.mcp.registry import _Allow, _Catalog, _Entry
+from phasesweep.runtime.json import JsonObject
 
 REPO = Path(__file__).resolve().parent.parent
 
 
-def _type_signature(node: dict[str, Any]) -> str:
+def _type_signature(node: JsonObject) -> str:
     """Render schema types in the reference's user-facing notation.
 
-    :param dict[str, Any] node: JSON-schema node of one field.
+    :param JsonObject node: JSON-schema node of one field.
     :return str: The type as the reference spells it.
     """
     if "$ref" in node:
@@ -61,10 +61,10 @@ def _schema_inventory() -> dict[str, str]:
     schema = Experiment.model_json_schema()
     inventory: dict[str, str] = {}
 
-    def children(node: dict[str, Any], path: str) -> None:
+    def children(node: JsonObject, path: str) -> None:
         """Descend into the model, variants, list items or map values below one field.
 
-        :param dict[str, Any] node: JSON-schema node of the field.
+        :param JsonObject node: JSON-schema node of the field.
         :param str path: Inventory path of the field.
         """
         if "$ref" in node:
@@ -84,10 +84,10 @@ def _schema_inventory() -> dict[str, str]:
                 inventory[path + ".<key>"] = _type_signature(values) + " (required)"
                 children(values, path + ".<key>")
 
-    def model(node: dict[str, Any], prefix: str) -> None:
+    def model(node: JsonObject, prefix: str) -> None:
         """Record every field of one model schema under a path prefix.
 
-        :param dict[str, Any] node: JSON-schema node of the model.
+        :param JsonObject node: JSON-schema node of the model.
         :param str prefix: Inventory path of the model, with its variant tag if any.
         """
         name = node["title"]

@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Required, TypedDict, Unpack
 
 import pytest
 import yaml
@@ -285,7 +285,25 @@ def make_run_handle(
 DEAD_RUNNER_STARTTIME = 111
 
 
-def make_dead_run_handle(**kwargs: Any) -> RunHandle:
+class StagedRunOptions(TypedDict, total=False):
+    """Arguments of :func:`make_run_handle` that identify a run, other than its configuration digest."""
+
+    run_id: Required[str]
+    experiment_id: str
+    launch_state: RunLaunchState
+    allow_cancel: bool
+    visible_params_at_launch: VisibleParamsPolicy
+    boot_id: str | None
+    started_at: str | None
+
+
+class DeadRunOptions(StagedRunOptions, total=False):
+    """Arguments of :func:`make_run_handle` other than ``pid`` and ``starttime``."""
+
+    config_sha256: str
+
+
+def make_dead_run_handle(**kwargs: Unpack[DeadRunOptions]) -> RunHandle:
     """Build a spawned handle whose runner has already exited.
 
     :param kwargs: Arguments for :func:`make_run_handle` other than ``pid`` and ``starttime``.
@@ -446,7 +464,7 @@ def _stage_run(
     store: RunStore,
     config: Path,
     new_handle: Callable[..., RunHandle],
-    **handle_kwargs: Any,
+    **handle_kwargs: Unpack[StagedRunOptions],
 ) -> RunHandle:
     """Persist a run handle pinned to ``config`` together with ``config`` as its launch snapshot.
 
