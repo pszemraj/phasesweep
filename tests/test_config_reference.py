@@ -330,6 +330,7 @@ def test_first_sentence_stops_at_the_first_full_stop_and_shortens_long_ones() ->
     assert first_sentence(storage) == "Where the study ledger is kept."
     long = ReferenceEntry("k", "string", ("Word " * 40 + "end. Second.",), "S")
     assert first_sentence(long, 30) == "Word Word Word Word Word..."
+    assert first_sentence(long, None) == "Word " * 40 + "end."
     assert first_sentence(ReferenceEntry("k", "string", (), "S")) == ""
 
 

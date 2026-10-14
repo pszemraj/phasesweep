@@ -8,7 +8,7 @@ Field types, defaults, and validation constraints are in [config_reference.yaml]
 
 ## Reference index
 
-`phasesweep explain` with no argument lists every top-level key with its signature, a one-line summary and its sub-key count. `phasesweep explain KEY` prints the key and every key below it, one entry per discriminator variant labelled `[type=...]`. `phases[].sampler`, `phases.sampler` and `phases.0.sampler` name the same key. An unknown key exits 2 and names the closest documented keys.
+`phasesweep explain` with no argument lists every top-level key with its signature, a one-line summary and its sub-key count. `phasesweep explain KEY` prints the key and every key below it, one entry per discriminator variant labelled `[type=...]`. `phases[].sampler`, `phases.sampler` and `phases.0.sampler` name the same key. An unknown key exits 2 and names the closest documented keys. The MCP server offers the same lookup as its `explain_config` tool for config-authoring help.
 
 | Section | Top-level keys | Command |
 | --- | --- | --- |

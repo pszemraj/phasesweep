@@ -26,6 +26,7 @@ from phasesweep.mcp.server import CATALOG_RESOURCE_URI, PROMPT_RUN_AND_MONITOR
 from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
+    TOOL_EXPLAIN_CONFIG,
     TOOL_GET_LATEST_RUN,
     TOOL_GET_RUN_RESULTS,
     TOOL_GET_RUN_STATUS,
@@ -299,7 +300,7 @@ def test_cancel_rejects_unknown_run(tmp_path: Path) -> None:
         app.cancel("nope-123")
 
 
-def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
+def test_fastmcp_registers_nine_tools(tmp_path: Path) -> None:
     pytest.importorskip("mcp")
     import asyncio
 
@@ -320,11 +321,13 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
         "Never open raw datasets",
         "Never open W&B dashboards",
         "`winner_generation`",
+        "call `explain_config`",
     ):
         assert safety_contract in initialization.instructions
     tools = asyncio.run(server.list_tools())
     assert {t.name for t in tools} == {
         TOOL_LIST_EXPERIMENTS,
+        TOOL_EXPLAIN_CONFIG,
         TOOL_INSPECT_EXPERIMENT,
         TOOL_GET_LATEST_RUN,
         TOOL_GET_RUN_STATUS,
@@ -342,6 +345,7 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
         TOOL_CANCEL_RUN: ("user explicitly asks", "Never cancel automatically"),
         TOOL_GET_RUN_STATUS: ("run.state", "stop if run.recovery_required"),
         TOOL_AWAIT_RUN: ("run.state", "stop immediately if run.recovery_required"),
+        TOOL_EXPLAIN_CONFIG: ("config-authoring help", "not any catalog experiment"),
     }.items():
         for safety_contract in safety_contracts:
             assert safety_contract in descriptions[tool_name]
@@ -379,6 +383,12 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     assert timeout_schema["maximum"] == AWAIT_MAX_TIMEOUT_SECONDS
     assert schemas[TOOL_INSPECT_EXPERIMENT]["required"] == ["experiment_id"]
     assert schemas[TOOL_GET_LATEST_RUN]["required"] == ["experiment_id"]
+    assert sorted(schemas[TOOL_EXPLAIN_CONFIG]["properties"]) == ["key"]
+    assert schemas[TOOL_EXPLAIN_CONFIG].get("required") is None
+    key_schema = schemas[TOOL_EXPLAIN_CONFIG]["properties"]["key"]
+    assert key_schema["description"]
+    assert {"type": "string", "maxLength": 200} in key_schema["anyOf"]
+    assert server._tool_manager.get_tool(TOOL_EXPLAIN_CONFIG).is_async is False
     assert sorted(schemas[TOOL_LIST_EXPERIMENTS]["properties"]) == ["cursor", "limit"]
     assert schemas[TOOL_LIST_EXPERIMENTS].get("required") is None
     assert schemas[TOOL_LIST_EXPERIMENTS]["properties"]["limit"]["default"] == DEFAULT_LIST_LIMIT
@@ -387,6 +397,9 @@ def test_fastmcp_registers_eight_tools(tmp_path: Path) -> None:
     annotations = {t.name: t.annotations for t in tools}
     assert annotations[TOOL_LIST_EXPERIMENTS].readOnlyHint is True
     assert annotations[TOOL_AWAIT_RUN].readOnlyHint is True
+    assert annotations[TOOL_EXPLAIN_CONFIG].readOnlyHint is True
+    assert annotations[TOOL_EXPLAIN_CONFIG].destructiveHint is False
+    assert annotations[TOOL_EXPLAIN_CONFIG].openWorldHint is False
     assert annotations[TOOL_LAUNCH_RUN].readOnlyHint is False
     assert annotations[TOOL_LAUNCH_RUN].destructiveHint is True
     assert annotations[TOOL_LAUNCH_RUN].openWorldHint is True
@@ -599,12 +612,11 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
     assert blocking_result.isError is False
 
 
-def _call_inspect_experiment_tool(
-    app: PhaseSweepMCP, arguments: dict[str, object]
-) -> CallToolResult:
-    """Dispatch one ``inspect_experiment`` call through the FastMCP request handler.
+def _call_tool(app: PhaseSweepMCP, tool_name: str, arguments: dict[str, object]) -> CallToolResult:
+    """Dispatch one tool call through the FastMCP request handler.
 
     :param PhaseSweepMCP app: Server whose tools the FastMCP handler exposes.
+    :param str tool_name: Registered tool to call.
     :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
     :return CallToolResult: The call's result, whose ``isError`` and ``content`` the caller inspects.
     """
@@ -615,12 +627,76 @@ def _call_inspect_experiment_tool(
     server = build_server(app)
     handler = server._mcp_server.request_handlers[types.CallToolRequest]
     request = types.CallToolRequest(
-        params=types.CallToolRequestParams(name=TOOL_INSPECT_EXPERIMENT, arguments=arguments)
+        params=types.CallToolRequestParams(name=tool_name, arguments=arguments)
     )
     result = asyncio.run(handler(request)).root
     if not isinstance(result, types.CallToolResult):
         raise TypeError(f"A tool call answered with {type(result).__name__}, not CallToolResult.")
     return result
+
+
+def _call_inspect_experiment_tool(
+    app: PhaseSweepMCP, arguments: dict[str, object]
+) -> CallToolResult:
+    """Dispatch one ``inspect_experiment`` call through the FastMCP request handler.
+
+    :param PhaseSweepMCP app: Server whose tools the FastMCP handler exposes.
+    :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
+    :return CallToolResult: The call's result, whose ``isError`` and ``content`` the caller inspects.
+    """
+    return _call_tool(app, TOOL_INSPECT_EXPERIMENT, arguments)
+
+
+def test_fastmcp_explain_config_dispatch_returns_structured_entries(tmp_path: Path) -> None:
+    """The tool answers through the real SDK dispatch, with structured content and no paths."""
+    pytest.importorskip("mcp")
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
+
+    found = _call_tool(app, TOOL_EXPLAIN_CONFIG, {"key": "phases.0.sampler.type"})
+    assert found.isError is False
+    assert found.structuredContent is not None
+    assert found.structuredContent["found"] is True
+    assert found.structuredContent["key"] == "phases.0.sampler.type"
+    assert [entry["path"] for entry in found.structuredContent["entries"]] == [
+        "phases[].sampler.type"
+    ]
+    assert str(tmp_path) not in json.dumps(found.structuredContent)
+
+    top_level = _call_tool(app, TOOL_EXPLAIN_CONFIG, {})
+    assert top_level.isError is False
+    assert top_level.structuredContent is not None
+    assert top_level.structuredContent["key"] is None
+    assert [entry["path"] for entry in top_level.structuredContent["entries"]][:2] == [
+        "experiment",
+        "trial_command",
+    ]
+
+    missing = _call_tool(app, TOOL_EXPLAIN_CONFIG, {"key": "inherit_env"})
+    assert missing.isError is False
+    assert missing.structuredContent is not None
+    assert missing.structuredContent["found"] is False
+    assert missing.structuredContent["entries"] == []
+    assert missing.structuredContent["closest"] == ["execution.inherit_env"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        pytest.param({"key": "k" * 201}, id="key_over_200_characters"),
+        pytest.param({"key": 3}, id="key_not_a_string"),
+        pytest.param({"key": "execution", "unexpected": True}, id="extra_argument"),
+    ],
+)
+def test_fastmcp_explain_config_rejects_malformed_input(
+    tmp_path: Path, arguments: dict[str, object]
+) -> None:
+    """The input schema bounds the key and rejects anything undeclared."""
+    pytest.importorskip("mcp")
+    catalog = write_mcp_config_catalog(tmp_path, {"e2e_lm": _chained_config(tmp_path)})
+    app, _registry, _store = make_mcp_app(catalog)
+
+    assert _call_tool(app, TOOL_EXPLAIN_CONFIG, arguments).isError is True
 
 
 @pytest.mark.parametrize(

@@ -167,19 +167,19 @@ def sub_key_count(entry: ReferenceEntry) -> int:
     return len(lookup(entry.path)) - 1
 
 
-def first_sentence(entry: ReferenceEntry, limit: int = 80) -> str:
+def first_sentence(entry: ReferenceEntry, limit: int | None = 80) -> str:
     """Return the first sentence of an entry's description, shortened to fit a listing.
 
     :param ReferenceEntry entry: A documented key.
-    :param int limit: Longest result in characters; a longer sentence is cut at a word
-        boundary and ends in ``...``.
+    :param int | None limit: Longest result in characters; a longer sentence is cut at a word
+        boundary and ends in ``...``. None keeps the whole sentence.
     :return str: The first sentence, or an empty string when the entry has no comments.
     """
     if not entry.comments:
         return ""
     head = re.match(r"(.+?[.!?])(?:\s|$)", entry.comments[0])
     sentence = head[1] if head else entry.comments[0]
-    if len(sentence) <= limit:
+    if limit is None or len(sentence) <= limit:
         return sentence
     return sentence[: limit - 3].rsplit(" ", 1)[0].rstrip(",;:") + "..."
 

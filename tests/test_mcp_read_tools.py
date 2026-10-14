@@ -972,6 +972,54 @@ def test_list_experiments_pages_catalog(tmp_path: Path) -> None:
         app.list_experiments(limit=0)
 
 
+def test_explain_config_returns_entries_and_closest(tmp_path: Path) -> None:
+    """A known key returns its subtree, an unknown one the nearest keys, and neither touches the catalog."""
+    app, _registry, _store = make_mcp_app(_catalog(tmp_path, _config(tmp_path)))
+
+    sampler = app.explain_config("phases[].sampler")
+    assert sampler["found"] is True
+    assert sampler["closest"] == []
+    paths = [entry["path"] for entry in sampler["entries"]]
+    assert paths[0] == "phases[].sampler"
+    assert "phases[].sampler.type" in paths
+    assert app.explain_config("phases.0.sampler") == {**sampler, "key": "phases.0.sampler"}
+    first = sampler["entries"][0]
+    assert set(first) == {"path", "signature", "section", "description"}
+    assert first["section"] == "Required experiment fields"
+    assert "\n" in first["description"]
+
+    variants = app.explain_config("metric.extractor.path")
+    assert {"metric.extractor[type=json].path", "metric.extractor[type=json_envelope].path"} <= {
+        entry["path"] for entry in variants["entries"]
+    }
+
+    missing = app.explain_config("inherit_env")
+    assert missing == {
+        "key": "inherit_env",
+        "found": False,
+        "entries": [],
+        "closest": ["execution.inherit_env"],
+    }
+    assert app.explain_config("zzzzzz")["closest"] == []
+    assert app.explain_config(".")["found"] is False
+
+    # No path or catalog value reaches the agent.
+    assert str(tmp_path) not in json.dumps([sampler, variants, missing])
+
+
+def test_explain_config_without_a_key_lists_top_level_keys_and_needs_no_catalog() -> None:
+    """The index returns each top-level key once with one sentence, from the class alone."""
+    index = PhaseSweepMCP.explain_config(None)
+    assert index["found"] is True
+    assert index["key"] is None
+    paths = [entry["path"] for entry in index["entries"]]
+    assert paths[:4] == ["experiment", "trial_command", "metric", "phases"]
+    assert len(paths) == len(set(paths))
+    assert all("." not in path for path in paths)
+    assert all("\n" not in entry["description"] for entry in index["entries"])
+    assert PhaseSweepMCP.explain_config("  ")["entries"] == index["entries"]
+
+
 def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:
     config = _config(tmp_path)
     app, _registry, _store = make_mcp_app(_catalog(tmp_path, config))

@@ -18,6 +18,14 @@ from typing import Any, NoReturn
 from pydantic import ValidationError
 
 from phasesweep.config import Experiment
+from phasesweep.config.reference import (
+    ReferenceEntry,
+    closest,
+    first_sentence,
+    lookup,
+    plain_path,
+    top_level_entries,
+)
 from phasesweep.engine import (
     ArtifactRootConflictError,
     PhaseWinnerView,
@@ -56,7 +64,7 @@ from phasesweep.mcp.snapshots import (
     capture_pre_generation_result_snapshot,
     parse_result_snapshot,
 )
-from phasesweep.runtime.json import JsonObject
+from phasesweep.runtime.json import JsonObject, JsonValue
 from phasesweep.runtime.time import parse_utc_iso
 
 # The tools log on the server's channel, so one logger name covers everything served.
@@ -74,6 +82,21 @@ AWAIT_MAX_TIMEOUT_SECONDS = 600
 # default-length wait rechecks run state several times mid-wait instead of only
 # at entry and at the deadline.
 AWAIT_RECHECK_SECONDS = 5
+
+
+def _config_entry_payload(entry: ReferenceEntry, description: str) -> JsonObject:
+    """Build the agent-visible record of one documented config key.
+
+    :param ReferenceEntry entry: Documented key from the packaged reference.
+    :param str description: Description text to report for the key.
+    :return JsonObject: The key's path, signature, section and description.
+    """
+    return {
+        "path": entry.path,
+        "signature": entry.signature,
+        "section": entry.section,
+        "description": description,
+    }
 
 
 def _cursor_offset(cursor: str | None) -> int:
@@ -197,6 +220,32 @@ class PhaseSweepMCP(RunControl):
             "total_count": total_count,
             "next_cursor": str(next_offset) if next_offset < total_count else None,
         }
+
+    @staticmethod
+    def explain_config(key: str | None = None) -> JsonObject:
+        """Describe configuration keys from the packaged reference, independent of the catalog.
+
+        With no key, or a blank one, the entries are the top-level keys with the first sentence
+        of their description. With a key, they are that key and every key below it with the full
+        description, one entry per discriminator variant. Nothing here touches the catalog,
+        a config file or the filesystem.
+
+        :param str | None key: Config key as the reference spells it, such as ``phases[].sampler``,
+            ``phases.sampler`` or ``phases.0.sampler``.
+        :return JsonObject: The echoed key, whether it matched, the entries, and the closest
+            documented keys when it did not.
+        """
+        entries: list[JsonValue]
+        if key is None or not key.strip():
+            entries = [
+                _config_entry_payload(entry, first_sentence(entry, None))
+                for entry in top_level_entries()
+            ]
+            return {"key": key, "found": True, "entries": entries, "closest": []}
+        matches = lookup(key) if plain_path(key) else ()
+        entries = [_config_entry_payload(entry, "\n".join(entry.comments)) for entry in matches]
+        suggestions: list[JsonValue] = [] if matches else list(closest(key))
+        return {"key": key, "found": bool(matches), "entries": entries, "closest": suggestions}
 
     def validate(self, experiment_id: str) -> dict[str, Any]:
         """Report an experiment's phase structure (never the command/env/storage).

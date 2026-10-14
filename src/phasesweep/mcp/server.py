@@ -36,6 +36,7 @@ from phasesweep.mcp.snapshots import ConfoundSummary, McpPublicationState, Repea
 from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
+    TOOL_EXPLAIN_CONFIG,
     TOOL_GET_LATEST_RUN,
     TOOL_GET_RUN_RESULTS,
     TOOL_GET_RUN_STATUS,
@@ -66,6 +67,13 @@ DESCRIPTION_LIST_EXPERIMENTS = (
     "List the operator-approved experiments and their permitted actions. Call this first for "
     "discovery; follow next_cursor until null, then call inspect_experiment. Read-only: use only "
     "ids returned by this catalog."
+)
+DESCRIPTION_EXPLAIN_CONFIG = (
+    "Explain the experiment configuration schema: the type, default and rules of one config key "
+    "and every key below it, or the top-level keys when key is omitted. Call only when the user "
+    "asks for config-authoring help, narrowing with a key such as phases[].sampler; when "
+    "found=false, retry with one of closest. Read-only: it describes the schema, not any "
+    "catalog experiment, and needs no experiment id."
 )
 DESCRIPTION_INSPECT_EXPERIMENT = (
     "Inspect one approved experiment's metric, permissions, phases, trial targets, samplers, "
@@ -193,6 +201,16 @@ MaybeCursor = Annotated[
         description=f"Opaque pagination cursor returned by a previous {TOOL_LIST_EXPERIMENTS} call.",
     ),
 ]
+ConfigKey = Annotated[
+    str | None,
+    Field(
+        description=(
+            "Config key to explain, such as phases[].sampler, phases.sampler or "
+            "phases.0.sampler. Omit it to list the top-level keys."
+        ),
+        max_length=200,
+    ),
+]
 AwaitTimeoutSeconds = Annotated[
     int,
     Field(
@@ -260,6 +278,40 @@ class ListExperimentsResult(_ToolPayload):
     next_cursor: str | None = Field(
         default=None,
         description="Opaque cursor for the next page, or null when this page is complete.",
+    )
+
+
+class ConfigEntryPayload(_ToolPayload):
+    """One documented config key from the packaged reference."""
+
+    path: str = Field(
+        description=(
+            "Documented key path. [] follows a list key, [type=...] labels one discriminator "
+            "variant of the key, and <key> stands for a user-chosen map key."
+        )
+    )
+    signature: str = Field(
+        description="Type and default, or '(required)', as the reference spells it."
+    )
+    section: str = Field(description="Reference section the key belongs to.")
+    description: str = Field(
+        description=(
+            "The key's rules, one line per paragraph. When key is omitted this is only the "
+            "first sentence of each top-level key."
+        )
+    )
+
+
+class ExplainConfigResult(_ToolPayload):
+    """Structured output for explain_config."""
+
+    key: str | None = Field(description="The requested key, echoed; null when it was omitted.")
+    found: bool = Field(description="Whether the key matches a documented config key.")
+    entries: list[ConfigEntryPayload] = Field(
+        description="The key and every key below it in reference order; empty when not found."
+    )
+    closest: list[str] = Field(
+        description="Nearest documented keys when nothing matched; otherwise empty."
     )
 
 
@@ -785,6 +837,21 @@ def build_server(app: PhaseSweepMCP) -> Any:
         )
 
     @mcp.tool(
+        name=TOOL_EXPLAIN_CONFIG,
+        description=DESCRIPTION_EXPLAIN_CONFIG,
+        annotations=_tool_annotations("Explain Config"),
+        structured_output=True,
+    )
+    @_safe_tool
+    def explain_config(key: ConfigKey = None) -> ExplainConfigResult:
+        """Explain a configuration key and everything below it, or list the top-level keys. Read-only; needs no catalog entry.
+
+        :param ConfigKey key: Optional config key, such as ``phases[].sampler``.
+        :return ExplainConfigResult: Matching reference entries, or the closest documented keys.
+        """
+        return ExplainConfigResult.model_validate(app.explain_config(key))
+
+    @mcp.tool(
         name=TOOL_INSPECT_EXPERIMENT,
         description=DESCRIPTION_INSPECT_EXPERIMENT,
         annotations=_tool_annotations("Inspect Experiment"),
@@ -954,7 +1021,7 @@ def build_server(app: PhaseSweepMCP) -> Any:
 
 
 def serve(catalog: Path) -> int:
-    """Load the catalog, build the run store, and serve the eight tools over stdio.
+    """Load the catalog, build the run store, and serve the nine tools over stdio.
 
     :param Path catalog: Operator-authored catalog file.
     :return int: Process exit code, where 2 means a startup prerequisite or
