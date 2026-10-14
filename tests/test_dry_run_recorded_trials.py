@@ -561,7 +561,7 @@ def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
     _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
 
 
-@pytest.mark.parametrize("target", [4, 2], ids=["interrupted-mid-target", "target-raised"])
+@pytest.mark.parametrize("target", [4, 2], ids=["failed-mid-target", "target-raised"])
 def test_tpe_phase_cut_short_or_raised_previews_its_remaining_trials(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, target: int
 ) -> None:
