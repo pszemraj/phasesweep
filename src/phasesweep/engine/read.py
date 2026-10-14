@@ -38,6 +38,7 @@ from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.ledger import read_phase_trials, read_trial_stats, validate_ledger
 from phasesweep.engine.optuna import (
+    _draw_positions,
     _published_phase_trial_refs,
     _published_trial_history_available,
     _trial_state_label,
@@ -932,7 +933,12 @@ def _trial_table(
     :return TrialTable: The rows and the columns they carry.
     """
     axis = repeat_axis(phase)
-    groups = {} if axis is None else group_labels(((t.number, t.params) for t in trials), axis)
+    positions = _draw_positions(trials)
+    groups = (
+        {}
+        if axis is None
+        else group_labels(((t.number, positions[t.number], t.params) for t in trials), axis)
+    )
     observed = sorted(
         {name for t in trials for name in t.user_attrs if name.startswith(OBSERVED_PREFIX)}
     )

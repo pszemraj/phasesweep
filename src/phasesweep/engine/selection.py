@@ -17,6 +17,7 @@ from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import _assess_population, _describe_flagged
 from phasesweep.engine.errors import OperatorAction, PhaseSweepError, TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
+from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.repeats import (
     RankedGroup,
     RepeatAxis,
@@ -293,9 +294,11 @@ def _rank_groups(
         eligible trials left in incomplete groups, and how many groups were incomplete.
     """
     by_key: dict[str, list[optuna.trial.FrozenTrial]] = {}
+    draw_positions = _draw_positions(trials)
     for trial in trials:
         if axis.key in trial.params:
-            by_key.setdefault(group_key(trial.number, trial.params, axis), []).append(trial)
+            key = group_key(draw_positions[trial.number], trial.params, axis)
+            by_key.setdefault(key, []).append(trial)
     groups: list[RankedGroup] = []
     members: dict[int, list[optuna.trial.FrozenTrial]] = {}
     for found in by_key.values():

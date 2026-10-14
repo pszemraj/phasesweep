@@ -111,14 +111,28 @@ def test_group_labels_name_each_grid_configuration_by_its_last_member() -> None:
     """Grid groups have no slots, so interleaved configurations label by their params alone."""
     axis = RepeatAxis(key="seed", values=(0, 1), reduce="mean", slot_size=None)
     trials = [
-        (0, {"lr": 0.1, "seed": 0}),
-        (1, {"lr": 0.2, "seed": 1}),
-        (2, {"lr": 0.1, "seed": 1}),
-        (3, {"lr": 0.2, "seed": 0}),
-        (4, {"lr": 0.3}),
+        (0, 0, {"lr": 0.1, "seed": 0}),
+        (1, 1, {"lr": 0.2, "seed": 1}),
+        (2, 2, {"lr": 0.1, "seed": 1}),
+        (3, 3, {"lr": 0.2, "seed": 0}),
+        (4, 4, {"lr": 0.3}),
     ]
 
     assert group_labels(trials, axis) == {0: 2, 1: 3, 2: 2, 3: 3}
+
+
+def test_group_labels_put_a_seeded_random_rerun_in_its_source_slot() -> None:
+    """A rerun shares its source's draw position, so it joins its source's slot, not the next one."""
+    axis = RepeatAxis(key="seed", values=(0, 1), reduce="mean", slot_size=2)
+    trials = [
+        (0, 0, {"lr": 0.1, "seed": 0}),
+        (1, 1, {"lr": 0.1, "seed": 1}),
+        (2, 2, {"lr": 0.2, "seed": 0}),
+        (3, 1, {"lr": 0.1, "seed": 1}),
+        (4, 3, {"lr": 0.2, "seed": 1}),
+    ]
+
+    assert group_labels(trials, axis) == {0: 3, 1: 3, 2: 4, 3: 3, 4: 4}
 
 
 def test_within_noise_compares_aggregates_against_two_standard_errors() -> None:

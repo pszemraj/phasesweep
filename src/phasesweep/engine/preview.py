@@ -421,9 +421,6 @@ def _dry_run_phase(
     )
     sampled: dict[str, object] | None = None
     if remaining > 0:
-        # The preview study is discarded unfinished: telling it would run
-        # GridSampler.after_trial, whose study.stop() is illegal outside
-        # optimize once a one-point grid is exhausted.
         sample_trial = study.ask()
         sampled = {
             name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()

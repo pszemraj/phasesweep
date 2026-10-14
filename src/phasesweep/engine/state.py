@@ -194,6 +194,9 @@ TRIAL_OUTCOME_ABORT_KEY = "abort"
 # could finish: a signal, a phase or run deadline, or recovery after the orchestrator died.
 # The outcome's ``cause`` says which.
 _TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "interrupted", "fatal"})
+# On a rerun of an interrupted trial: the source's trial number, written in the rerun's
+# creation record. A rerun takes its source's draw position.
+RERUN_OF_ATTR = "phasesweep_rerun_of"
 # Durable boundary established when the operator explicitly raises n_trials
 # after an abort. Outcomes through this sequence belong to the aborted attempt;
 # later failures form the new recovery streak.

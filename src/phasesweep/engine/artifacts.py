@@ -22,6 +22,7 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     WinnerIntegrityError,
 )
+from phasesweep.engine.optuna import _draw_positions
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
     RepeatAxis,
@@ -136,8 +137,11 @@ def _write_trials_csv(
         return
     param_names = sorted({n for t in trials for n in t.params})
     attr_names = sorted({n for t in trials for n in t.user_attrs} - {TRAINER_ENV_ATTR})
+    positions = _draw_positions(trials)
     labels = (
-        {} if repeats is None else group_labels(((t.number, t.params) for t in trials), repeats)
+        {}
+        if repeats is None
+        else group_labels(((t.number, positions[t.number], t.params) for t in trials), repeats)
     )
     fieldnames = [
         "number",

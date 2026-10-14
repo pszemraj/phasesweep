@@ -211,25 +211,27 @@ def repeat_axis(phase: Phase) -> RepeatAxis | None:
     )
 
 
-def group_key(trial_number: int, params: Mapping[str, object], axis: RepeatAxis) -> str:
+def group_key(position: int, params: Mapping[str, object], axis: RepeatAxis) -> str:
     """Return the key that groups a trial with the other repeats of its configuration.
 
     The key is the params without the repeat key, plus the configuration slot
     for seeded random, so two slots that drew the same params stay separate
-    groups and a complete group never gains a member.
+    groups and a complete group never gains a member. The slot comes from the
+    trial's draw position (:func:`phasesweep.engine.optuna._draw_positions`),
+    so a rerun lands in its source's slot.
 
-    :param int trial_number: The trial's number.
+    :param int position: The trial's draw position.
     :param Mapping[str, object] params: The trial's recorded params.
     :param RepeatAxis axis: The phase's repeat axis.
     :return str: Canonical JSON of the slot and the remaining params.
     """
-    slot = None if axis.slot_size is None else trial_number // axis.slot_size
+    slot = None if axis.slot_size is None else position // axis.slot_size
     rest = {name: value for name, value in params.items() if name != axis.key}
     return json.dumps([slot, rest], sort_keys=True, separators=(",", ":"))
 
 
 def group_labels(
-    trials: Iterable[tuple[int, Mapping[str, object]]], axis: RepeatAxis
+    trials: Iterable[tuple[int, int, Mapping[str, object]]], axis: RepeatAxis
 ) -> dict[int, int]:
     """Label each trial of a repeats phase with the highest trial number of its group so far.
 
@@ -238,13 +240,15 @@ def group_labels(
     repeat key, which was stopped before sampling it, belongs to no group and
     gets no label.
 
-    :param Iterable[tuple[int, Mapping[str, object]]] trials: ``(trial_number, params)``
-        of every trial of the phase.
+    :param Iterable[tuple[int, int, Mapping[str, object]]] trials: ``(trial_number,
+        draw_position, params)`` of every trial of the phase.
     :param RepeatAxis axis: The phase's repeat axis.
     :return dict[int, int]: Group label by trial number, for the trials that have one.
     """
     keyed = {
-        number: group_key(number, params, axis) for number, params in trials if axis.key in params
+        number: group_key(position, params, axis)
+        for number, position, params in trials
+        if axis.key in params
     }
     last: dict[str, int] = {}
     for number, key in keyed.items():

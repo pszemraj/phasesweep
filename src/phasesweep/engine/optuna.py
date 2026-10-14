@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import warnings
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, assert_never
 
@@ -31,6 +31,7 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     FEASIBLE_ATTR,
     GENERATION_ID_ATTR,
+    RERUN_OF_ATTR,
     TERMINAL_TRIAL_STATES,
 )
 
@@ -202,22 +203,77 @@ def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRe
     )
 
 
-class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
-    """Seeded random sampler whose draws survive process-local RNG restarts."""
+def _draw_positions(trials: Iterable[optuna.trial.FrozenTrial]) -> dict[int, int]:
+    """Map each trial number to its draw position.
+
+    Walking trials in number order, a trial that is not a rerun takes the next
+    position and a rerun (one carrying :data:`~phasesweep.engine.state.RERUN_OF_ATTR`)
+    takes its source's. Optuna numbers trials in creation order and the marker
+    is part of a trial's creation record, so a position never changes once its
+    trial exists, and the trials that are not reruns hold exactly positions
+    ``0..M-1`` however many interruptions came between them.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :raises ValueError: A rerun names a source that is not an earlier trial.
+    :return dict[int, int]: Draw position by trial number.
+    """
+    positions: dict[int, int] = {}
+    next_position = 0
+    for trial in sorted(trials, key=lambda candidate: candidate.number):
+        source = trial.user_attrs.get(RERUN_OF_ATTR)
+        if source is None:
+            positions[trial.number] = next_position
+            next_position += 1
+        elif type(source) is int and source in positions:
+            positions[trial.number] = positions[source]
+        else:
+            raise ValueError(
+                f"Trial {trial.number} names {source!r} under {RERUN_OF_ATTR!r}, "
+                "which is not an earlier trial of its study."
+            )
+    return positions
+
+
+def _draw_position(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> int:
+    """Return one trial's draw position, read from the study's storage.
+
+    :param optuna.Study study: Study holding ``trial``.
+    :param optuna.trial.FrozenTrial trial: Trial whose position is wanted.
+    :return int: The trial's draw position (:func:`_draw_positions`).
+    """
+    trials = study._storage.get_all_trials(study._study_id, deepcopy=False)
+    return _draw_positions(trials)[trial.number]
+
+
+def _position_seed(base_seed: int, study_name: str, position: int, label: str) -> int:
+    """Derive the seed of one random choice from the draw position that owns it.
+
+    :param int base_seed: The phase's ``sampler.seed``.
+    :param str study_name: The phase's study name.
+    :param int position: The trial's draw position.
+    :param str label: What the seed is for, such as a parameter name.
+    :return int: A 32-bit seed, the same in every process for the same inputs.
+    """
+    material = json.dumps(
+        [base_seed, study_name, position, label],
+        separators=(",", ":"),
+    ).encode()
+    return int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
+
+
+class _PositionRandomSampler(optuna.samplers.RandomSampler):
+    """Seeded random sampler whose every draw is a function of the trial's draw position."""
 
     def __init__(self, *, seed: int, repeats: Repeats | None = None) -> None:
         """Store the caller's seed without handing it to the base sampler.
 
-        The base ``RandomSampler`` is constructed with ``seed=None`` because
-        this sampler never draws through it directly; ``seed`` is instead
-        mixed into a fresh per-draw seed by :meth:`sample_independent`, so
-        continuation across process restarts stays deterministic.
+        The base ``RandomSampler`` gets no seed because this sampler never draws
+        through its stream: each draw seeds a fresh one from the draw position,
+        so a restarted process draws exactly what the first one would have.
 
-        Args:
-            seed: Base seed supplied by the phase's sampler config.
-            repeats: The phase's repeat axis, whose values cycle through each
-                configuration slot of ``len(values)`` consecutive trials.
-
+        :param int seed: Base seed supplied by the phase's sampler config.
+        :param Repeats | None repeats: The phase's repeat axis, whose values cycle
+            through each configuration slot of ``len(values)`` consecutive positions.
         """
         super().__init__(seed=None)
         self._base_seed = seed
@@ -229,44 +285,79 @@ class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
         trial: optuna.trial.FrozenTrial,
         param_name: str,
         param_distribution: optuna.distributions.BaseDistribution,
-    ) -> Any:
-        """Sample from a deterministic stream position owned by the durable trial.
+    ) -> object:
+        """Draw one parameter from the stream its draw position owns.
 
-        Derives a fresh per-parameter seed from the base seed, study name,
-        draw position, and parameter name, so the same (position, param) pair
-        always draws the same value regardless of process restarts or call
-        ordering. The position is the trial number, or under repeats the
-        configuration slot ``trial.number // len(values)``, so every trial of
-        a slot draws one configuration; its repeat value is
-        ``values[trial.number % len(values)]``.
+        The position is :func:`_draw_position`, or under repeats the
+        configuration slot ``position // len(values)``, so every trial of a slot
+        draws one configuration and its repeat value is
+        ``values[position % len(values)]``. A rerun has its source's position and
+        therefore draws its source's values.
 
-        Args:
-            study: The active Optuna study (contributes ``study_name`` to the
-                derived seed).
-            trial: The trial being sampled for (its number gives the position).
-            param_name: Name of the parameter being sampled.
-            param_distribution: The parameter's Optuna distribution.
-
-        Returns:
-            The repeat value for the repeat key, otherwise the value drawn from
-            a fresh :class:`optuna.samplers.RandomSampler` seeded
-            deterministically from ``(base_seed, study_name, position, param_name)``.
-
+        :param optuna.Study study: The active study; its name is part of the seed.
+        :param optuna.trial.FrozenTrial trial: The trial being sampled for.
+        :param str param_name: Name of the parameter being sampled.
+        :param optuna.distributions.BaseDistribution param_distribution: The
+            parameter's distribution.
+        :return object: The repeat value for the repeat key, otherwise the value a
+            fresh ``RandomSampler`` seeded by :func:`_position_seed` draws.
         """
-        if self._repeats is None:
-            position = trial.number
-        else:
+        position = _draw_position(study, trial)
+        if self._repeats is not None:
             count = len(self._repeats.values)
             if param_name == self._repeats.key:
-                return self._repeats.values[trial.number % count]
-            position = trial.number // count
-        material = json.dumps(
-            [self._base_seed, study.study_name, position, param_name],
-            separators=(",", ":"),
-        ).encode()
-        derived_seed = int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
-        sampler = optuna.samplers.RandomSampler(seed=derived_seed)
+                return self._repeats.values[position % count]
+            position //= count
+        seed = _position_seed(self._base_seed, study.study_name, position, param_name)
+        sampler = optuna.samplers.RandomSampler(seed=seed)
         return sampler.sample_independent(study, trial, param_name, param_distribution)
+
+
+class _PositionGridSampler(optuna.samplers.GridSampler):
+    """Grid sampler that gives each trial the grid point at its draw position and never stops a study."""
+
+    def before_trial(self, study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        """Assign the grid point at the trial's draw position, unless the trial already has one.
+
+        A rerun copies its source's ``grid_id``. New draws take positions
+        ``0..M-1`` in the grid's seeded shuffle, so no two trials that are not
+        reruns share a point under any ``n_jobs``. A fixed configuration's grid
+        is one empty point, which each of its retries takes.
+
+        :param optuna.Study study: The active study.
+        :param optuna.trial.FrozenTrial trial: The trial about to run.
+        :raises RuntimeError: The position lies past a nonempty grid, which the
+            trial target's cardinality check rules out.
+        """
+        if "grid_id" in trial.system_attrs or "fixed_params" in trial.system_attrs:
+            return
+        grid_id = _draw_position(study, trial) if self._search_space else 0
+        if grid_id >= len(self._all_grids):
+            raise RuntimeError(
+                f"Trial {trial.number} of study {study.study_name!r} has draw position "
+                f"{grid_id}, past the {len(self._all_grids)}-point grid."
+            )
+        study._storage.set_trial_system_attr(trial._trial_id, "search_space", self._search_space)
+        study._storage.set_trial_system_attr(trial._trial_id, "grid_id", grid_id)
+
+    def after_trial(
+        self,
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        state: optuna.trial.TrialState,
+        values: Sequence[float] | None,
+    ) -> None:
+        """Leave the study running: the trial target, not the grid, bounds the loop.
+
+        Optuna's own early stop counts an interrupted point as visited and
+        would strand its pending rerun.
+
+        :param optuna.Study study: The active study.
+        :param optuna.trial.FrozenTrial trial: The trial that finished.
+        :param optuna.trial.TrialState state: Its terminal state.
+        :param Sequence[float] | None values: Its objective values.
+        """
+        return
 
 
 def _build_sampler(
@@ -310,9 +401,9 @@ def _build_sampler(
     if cfg.type == "random":
         if cfg.seed is None:
             return optuna.samplers.RandomSampler()
-        return _TrialNumberRandomSampler(seed=cfg.seed, repeats=repeats)
+        return _PositionRandomSampler(seed=cfg.seed, repeats=repeats)
     if cfg.type == "grid":
-        return optuna.samplers.GridSampler(grid_search_space(search_space), seed=cfg.seed)
+        return _PositionGridSampler(grid_search_space(search_space), seed=cfg.seed)
     if cfg.type == "cmaes":
         return optuna.samplers.CmaEsSampler(seed=cfg.seed)
     assert_never(cfg.type)

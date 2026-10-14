@@ -278,9 +278,9 @@ def test_grid_top_up_never_reruns_a_failed_point(tmp_path: Path) -> None:
 def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
     """Failing a stale trial that holds a grid's last unfinished point commits FAIL.
 
-    GridSampler.after_trial calls study.stop() once no grid point is left
-    unfinished, and study.stop() raises outside optimize, so recovery must not
-    report the committed FAIL as a storage failure.
+    The phase's grid sampler never stops the study, so committing the last
+    point outside ``optimize`` raises nothing and recovery reports no storage
+    failure.
     """
     search_space = {"x": CategoricalParam(type="categorical", choices=[1])}
     exp = make_experiment(
@@ -317,14 +317,14 @@ def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
             Sampler(type="random", seed=0),
             {"x": CategoricalParam(type="categorical", choices=[1, 2])},
             1,
-            "_TrialNumberRandomSampler",
+            "_PositionRandomSampler",
             id="random",
         ),
         pytest.param(
             Sampler(type="grid", seed=0),
             {"x": CategoricalParam(type="categorical", choices=[1, 2])},
             2,
-            "GridSampler",
+            "_PositionGridSampler",
             id="grid",
         ),
         # tpe/cmaes are the point of these two cases, so they carry the

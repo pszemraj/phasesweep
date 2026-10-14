@@ -1066,11 +1066,7 @@ def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
     ids=["one-categorical-choice", "empty-search-space"],
 )
 def test_dry_run_previews_a_one_point_grid(tmp_path, caplog, search_space):
-    """A one-point grid previews without the sampler stopping the study.
-
-    Exhausting the grid makes GridSampler.after_trial call study.stop(), which
-    raises outside optimize, so the preview must never finish its trial.
-    """
+    """A one-point grid, or a phase with no search space, previews its one sample."""
     caplog.set_level(logging.INFO)
     exp = make_experiment(
         persistent=tmp_path,
