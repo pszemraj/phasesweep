@@ -19,8 +19,9 @@ module's handles, in one fixed order.
    claims the ledger: it reads it only through :func:`validate_ledger` and
    :func:`read_phase_trials`. ``status``, ``show-winners``, live MCP reads,
    and ``recover-run`` inspection hold no lock, which is why everything they
-   reach writes nothing. A dry run reads no ledger at all: it previews on an
-   in-memory study (:func:`open_preview_study`).
+   reach writes nothing. A dry run is the same kind of read: it counts the
+   attempts a ledger already holds (:func:`read_recorded_counts`) and renders
+   its example command on an in-memory study (:func:`open_preview_study`).
 2. :func:`validate_ledger` checks the artifact-root binding, then scans the
    ledger's format, writing nothing and constructing no file-backed storage.
    On a bound tree an unreadable scan is tolerated and recorded on the
@@ -105,12 +106,14 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TERMINAL_TRIAL_STATES,
 )
 from phasesweep.runtime.files import fsync_directory, journal_file_path
 
 __all__ = [
     "ClaimedLedger",
     "PhaseTrials",
+    "RecordedCounts",
     "ValidatedLedger",
     "claim_ledger",
     "open_existing_study",
@@ -118,6 +121,7 @@ __all__ = [
     "open_preview_study",
     "open_registry_study",
     "read_phase_trials",
+    "read_recorded_counts",
     "read_trial_stats",
     "repair_incomplete_journal_record",
     "resolved_ledger_path",
@@ -1091,6 +1095,48 @@ def read_trial_stats(
             for phase in ledger.experiment.phases
         }
     return _trial_stats(ledger, published_trials)
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedCounts:
+    """How many attempts a phase's study already holds, counted the way a launch counts them."""
+
+    #: Terminal attempts, including a RUNNING one a launch recovers as failed first.
+    finished: int
+    #: How many of those are COMPLETE.
+    completed: int
+
+
+def read_recorded_counts(ledger: ValidatedLedger) -> dict[str, RecordedCounts | None]:
+    """Read every phase's recorded attempt counts from a validated ledger, writing nothing.
+
+    This is :func:`read_trial_stats` reduced to the two numbers a launch's
+    target rules use. A launch recovers a stale RUNNING attempt as failed
+    before it counts, so a RUNNING attempt counts as finished here. A missing
+    ledger or study counts zero attempts. In-memory storage keeps nothing
+    between invocations, so every phase counts zero.
+
+    :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
+    :return dict[str, RecordedCounts | None]: One entry per configured phase, by
+        phase name; ``None`` for a phase whose trials could not be read.
+    :raises StudySchemaMismatchError: A phase's study is populated under an
+        unsupported schema.
+    """
+    phases = ledger.experiment.phases
+    if ledger.backend != "journal":
+        return {phase.name: RecordedCounts(finished=0, completed=0) for phase in phases}
+    recorded: dict[str, RecordedCounts | None] = {}
+    for name, stats in read_trial_stats(ledger, {}).items():
+        if not stats.available:
+            recorded[name] = None
+            continue
+        recorded[name] = RecordedCounts(
+            finished=sum(
+                stats.counts.get(state, 0) for state in (*TERMINAL_TRIAL_STATES, "RUNNING")
+            ),
+            completed=stats.counts.get("COMPLETE", 0),
+        )
+    return recorded
 
 
 @dataclass(frozen=True, slots=True)

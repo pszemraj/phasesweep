@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 import yaml
 
+from phasesweep import run_experiment
 from phasesweep.engine.artifact_roots import ARTIFACT_ROOT_BINDING_SCHEMA_VERSION
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from phasesweep.engine.ledger import read_phase_trials, validate_ledger
@@ -63,7 +64,12 @@ PURE_READ_PATHS = (
     "cli-status-trials",
     "cli-show-winners",
     "mcp-snapshot",
+    "engine-run_dry_run",
+    "cli-run-dry-run",
 )
+#: Dry runs, which preview their example command on a throwaway study that has no
+#: storage, so they may call ``optuna.create_study`` for that one study and no other.
+DRY_RUN_READ_PATHS = ("engine-run_dry_run", "cli-run-dry-run")
 #: Recovery preflight, which needs live studies and is only held to
 #: bytes-unchanged plus its verdict.
 RECOVERY_READ_PATH = "mcp-recover-inspect"
@@ -210,7 +216,9 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
             expected = _RECOVERY_LEDGER_ONLY_VERDICTS.get(expected, expected)
         verdict, state_changes = _recover_inspect(materialized, tmp_path)
     else:
-        attempts = forbid_file_backed_storage(monkeypatch)
+        attempts = forbid_file_backed_storage(
+            monkeypatch, allow_memory_studies=read_path in DRY_RUN_READ_PATHS
+        )
         if read_path == "engine-read_status":
             verdict = _engine_verdict(lambda: read_status(materialized.experiment))
         elif read_path == "engine-read_winners":
@@ -233,6 +241,12 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
         elif read_path == "cli-show-winners":
             verdict = _cli_verdict(
                 ["show-winners", str(materialized.config_path)], monkeypatch, capsys
+            )
+        elif read_path == "engine-run_dry_run":
+            verdict = _engine_verdict(lambda: run_experiment(materialized.experiment, dry_run=True))
+        elif read_path == "cli-run-dry-run":
+            verdict = _cli_verdict(
+                ["run", str(materialized.config_path), "--dry-run"], monkeypatch, capsys
             )
         else:  # pragma: no cover - guarded by READ_PATHS
             raise AssertionError(f"unknown read path: {read_path}")

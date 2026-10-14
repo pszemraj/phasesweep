@@ -33,7 +33,12 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.evidence import _verify_winner_objective_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
-from phasesweep.engine.ledger import ClaimedLedger, open_phase_study, open_preview_study
+from phasesweep.engine.ledger import (
+    ClaimedLedger,
+    RecordedCounts,
+    open_phase_study,
+    open_preview_study,
+)
 from phasesweep.engine.optuna import (
     _completed_trial_count,
     _finished_trial_count,
@@ -1458,6 +1463,7 @@ def _run_phase(
     generation_id: str | None,
     ledger: ClaimedLedger | None,
     run_deadline: float | None = None,
+    recorded: RecordedCounts | None = None,
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
@@ -1477,6 +1483,9 @@ def _run_phase(
             placeholder winner instead of launching any subprocesses.
         run_deadline: Optional ``time.monotonic()`` deadline inherited from
             the experiment-level wallclock guard.
+        recorded: Dry runs only: the attempts the phase's study already holds,
+            or ``None`` when they could not be read and the preview treats the
+            phase as fresh. A live run reads its own study and ignores this.
 
     Returns:
         The selected phase :class:`Winner`.
@@ -1521,7 +1530,12 @@ def _run_phase(
             return resumed
         resume = resumed
 
-    completed = _finished_trial_count(study.get_trials(deepcopy=False))
+    if dry_run:
+        # The preview study is always empty; the attempts the ledger holds are
+        # what a launch would count.
+        completed = 0 if recorded is None else recorded.finished
+    else:
+        completed = _finished_trial_count(study.get_trials(deepcopy=False))
     remaining = max(0, phase.n_trials - completed)
     log.info(
         "phase=%s study=%s completed=%d remaining=%d n_jobs=%d",
@@ -1533,7 +1547,7 @@ def _run_phase(
     )
 
     if dry_run:
-        return _dry_run_phase(experiment, phase, inherited_winners, study, remaining)
+        return _dry_run_phase(experiment, phase, inherited_winners, study, remaining, recorded)
     assert resume is not None
 
     if remaining == 0:
@@ -1754,6 +1768,7 @@ def _dry_run_phase(
     inherited_winners: dict[str, Winner],
     study: optuna.Study,
     remaining: int,
+    recorded: RecordedCounts | None,
 ) -> Winner:
     """Render and log one example trial command for the phase without launching anything.
 
@@ -1762,7 +1777,11 @@ def _dry_run_phase(
         phase: The phase being previewed.
         inherited_winners: Winners loaded for phases earlier in the chain.
         study: An in-memory Optuna study used to ``ask`` for one sample.
-        remaining: Number of trials that *would* run; logged for the user.
+        remaining: Number of trials that *would* run; logged for the user. Zero
+            is the live run's replay rule: nothing launches and the phase
+            republishes its existing result.
+        recorded: The attempts the phase's study already holds, or ``None``
+            when they could not be read, which is logged as a warning.
 
     Returns:
         A :class:`Winner` placeholder built from the previewed sample, or from
@@ -1770,7 +1789,22 @@ def _dry_run_phase(
         previews see consistent inherited context.
 
     """
-    log.info("DRY RUN phase=%s would launch %d trials", phase.name, remaining)
+    if recorded is None:
+        log.warning(
+            "DRY RUN warning: phase=%s recorded trial counts could not be read, so it is "
+            "previewed as a fresh phase and a real run may launch fewer trials",
+            phase.name,
+        )
+    if remaining == 0 and recorded is not None:
+        log.info(
+            "DRY RUN phase=%s target met (%d of %d trials recorded): would replay its "
+            "existing result and launch no trials",
+            phase.name,
+            recorded.finished,
+            phase.n_trials,
+        )
+    else:
+        log.info("DRY RUN phase=%s would launch %d trials", phase.name, remaining)
     sampled: dict[str, Any] | None = None
     if remaining > 0:
         # The preview study is discarded unfinished: telling it would run

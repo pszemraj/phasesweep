@@ -10,8 +10,6 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
-import optuna
-
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
 import phasesweep.engine.evidence as evidence_ops
@@ -86,54 +84,56 @@ def _preflight_missing_reached_phase_environments(
             _trainer_environment(experiment, phase.name)
 
 
+def _read_recorded_counts_for_preview(
+    experiment: Experiment,
+) -> dict[str, ledger_ops.RecordedCounts | None]:
+    """Read what every phase's study already holds, for a dry run to preview from.
+
+    The read goes through the write-nothing door ``status`` uses, so it neither
+    creates a study nor constructs file-backed storage. A missing ledger or
+    study counts zero attempts. A ledger that cannot be inspected leaves every
+    phase unread, so the preview falls back to a fresh study and says so.
+
+    :param Experiment experiment: Parsed experiment being previewed.
+    :raises ArtifactRootConflictError: The tree is bound to a different owner.
+    :raises StudySchemaMismatchError: A ledger study uses an unsupported schema.
+    :return dict[str, ledger_ops.RecordedCounts | None]: One entry per phase, by
+        phase name; ``None`` for a phase whose trials could not be read.
+    """
+    try:
+        ledger = ledger_ops.validate_ledger(experiment)
+    except StudyStorageUnavailableError as exc:
+        log.warning("DRY RUN warning: the ledger could not be inspected: %s", exc)
+        return {phase.name: None for phase in experiment.phases}
+    return ledger_ops.read_recorded_counts(ledger)
+
+
 def _preview_fixed_configuration_targets(
     experiment: Experiment,
+    recorded: Mapping[str, ledger_ops.RecordedCounts | None],
     *,
     from_phase: str | None,
 ) -> None:
     """Refuse in a dry run a fixed configuration's target that a launch would refuse.
 
     Only a reached fixed configuration asking for more than one trial depends
-    on the ledger, so only then does the preview read it, through the same
-    write-nothing door ``status`` uses. A missing ledger or study counts zero
-    attempts. A stale RUNNING attempt counts as failed, because a launch
-    recovers it as failed before it checks the target. A phase whose trials
-    cannot be read is skipped: the preview cannot tell, and a launch refuses an
-    unreadable ledger on its own.
+    on the recorded attempts. A phase whose trials could not be read is
+    skipped: the preview cannot tell, and a launch refuses an unreadable ledger
+    on its own.
 
     :param Experiment experiment: Parsed experiment being previewed.
+    :param Mapping[str, ledger_ops.RecordedCounts | None] recorded: Attempts each
+        phase's study holds, from :func:`_read_recorded_counts_for_preview`.
     :param str | None from_phase: Optional first phase a launch would execute.
     :raises TrialTargetRefusedError: A reached fixed configuration asks for
         more attempts than it may retry given the trials recorded so far.
-    :raises ArtifactRootConflictError: The tree is bound to a different owner.
-    :raises StudySchemaMismatchError: A ledger study uses an unsupported schema.
-    :raises StudyStorageUnavailableError: An unbound tree's ledger cannot be inspected.
     """
-    candidates = [
-        phase
-        for _index, phase in experiment.phases_from(from_phase)
-        if not phase_draws(phase) and phase.n_trials > 1
-    ]
-    if not candidates:
-        return
-    ledger = ledger_ops.validate_ledger(experiment)
-    stats = ledger_ops.read_trial_stats(ledger, {}) if ledger.backend == "journal" else {}
-    for phase in candidates:
-        phase_stats = stats.get(phase.name)
-        if phase_stats is not None and not phase_stats.available:
+    for _index, phase in experiment.phases_from(from_phase):
+        counts = recorded.get(phase.name)
+        if phase_draws(phase) or phase.n_trials <= 1 or counts is None:
             continue
-        counts = {} if phase_stats is None else phase_stats.counts
-        completed = counts.get(optuna.trial.TrialState.COMPLETE.name, 0)
-        finished = completed + sum(
-            counts.get(state.name, 0)
-            for state in (
-                optuna.trial.TrialState.PRUNED,
-                optuna.trial.TrialState.FAIL,
-                optuna.trial.TrialState.RUNNING,
-            )
-        )
         study_policy_ops._validate_fixed_configuration_target(
-            phase, finished=finished, completed=completed
+            phase, finished=counts.finished, completed=counts.completed
         )
 
 
@@ -240,7 +240,8 @@ def run_experiment(
     """Run all phases in order, returning a map of phase name to Winner.
 
     If ``from_phase`` is given, prior phases are loaded from disk.
-    If ``dry_run`` is True, example commands are logged but nothing launches.
+    If ``dry_run`` is True, the trials each phase would launch and an example
+    command are logged but nothing launches.
 
     For non-dry-run invocations this acquires an
     :func:`phasesweep.engine.locking._experiment_lock` for
@@ -258,8 +259,10 @@ def run_experiment(
         from_phase: Name of a phase to resume from; earlier phases are loaded
             from their persisted ``winner.yaml`` files (with fingerprint
             verification). ``None`` runs every phase from scratch.
-        dry_run: If ``True``, render and log one example trial command per
-            phase but launch no subprocesses; no summary is written.
+        dry_run: If ``True``, log the trials each phase would launch given the
+            attempts the ledger already records, and render one example trial
+            command per phase, but launch no subprocesses; no summary is
+            written and the ledger is only read.
         terminal_callback: Optional synchronous callback invoked with the
             structured terminal report while the experiment lock is still held.
         publication_hook: Optional required precommit/postcommit sidecar used by
@@ -707,8 +710,9 @@ def _run_experiment_inner(
         ledger: The claimed ledger every phase opens its live study through,
             claimed for this same ``experiment``. ``None`` is a dry run: no
             subprocesses launch, no ``summary.yaml`` is written, each phase
-            previews against an in-memory study, and each phase's sampler
-            capability line is logged up front.
+            previews its example command against an in-memory study and its
+            launch count against the attempts the ledger already records, and
+            each phase's sampler capability line is logged up front.
         generation_id: Current invocation identity, or ``None`` for dry-run.
         preloaded_winners: Strictly validated skipped-phase winners loaded before
             the current generation was committed.
@@ -732,6 +736,7 @@ def _run_experiment_inner(
     dry_run = ledger is None
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
+    recorded: dict[str, ledger_ops.RecordedCounts | None] = {}
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
@@ -747,7 +752,8 @@ def _run_experiment_inner(
             log.info("DRY RUN %s", sampler_capability_line(previewed))
             for warning in sampler_warnings(previewed):
                 log.warning("DRY RUN warning: %s", warning)
-        _preview_fixed_configuration_targets(experiment, from_phase=from_phase)
+        recorded = _read_recorded_counts_for_preview(experiment)
+        _preview_fixed_configuration_targets(experiment, recorded, from_phase=from_phase)
 
     # Only a dry run resumes without preloaded winners; it resolves the
     # publication once for every phase it skips.
@@ -810,6 +816,7 @@ def _run_experiment_inner(
             generation_id=generation_id,
             ledger=ledger,
             run_deadline=run_deadline,
+            recorded=recorded.get(phase.name),
         )
         if not dry_run:
             assert generation_id is not None

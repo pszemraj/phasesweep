@@ -86,10 +86,10 @@ The tree binding must name this ledger and every existing phase study must name 
 
 #### 6. Read paths construct and write nothing
 
-`read_status`, `read_winners`, `read_result`, `read_trial_tables`, CLI `status` (with or without `--trials`) and `show-winners`, and the MCP result snapshot build no file-backed storage, write no bytes, and report a phase whose format scan did not complete as unavailable rather than counting its trials.
+`read_status`, `read_winners`, `read_result`, `read_trial_tables`, CLI `status` (with or without `--trials`) and `show-winners`, the MCP result snapshot, and `run --dry-run` build no file-backed storage, write no bytes, and report a phase whose format scan did not complete as unavailable rather than counting its trials. A dry run counts the attempts a ledger already holds this way and renders its example command on an in-memory study with no storage; a phase it cannot count is previewed as fresh, with a warning.
 
-**Held by:** `engine.ledger.validate_ledger` and `engine.ledger.read_trial_stats` or `engine.ledger.read_phase_trials`, under `engine.read.read_status`, `engine.read.read_winners`, `engine.read.read_trial_tables` (and so CLI `status --trials`), and `mcp.snapshots.capture_result_snapshot`\
-**Tests:** `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`, `tests/test_format_cutover.py::test_inconclusive_scan_on_a_bound_tree_never_reports_unchecked_counts`
+**Held by:** `engine.ledger.validate_ledger` and `engine.ledger.read_trial_stats` or `engine.ledger.read_phase_trials`, under `engine.read.read_status`, `engine.read.read_winners`, `engine.read.read_trial_tables` (and so CLI `status --trials`), and `mcp.snapshots.capture_result_snapshot`; `engine.ledger.read_recorded_counts`, under `engine.run._read_recorded_counts_for_preview` for a dry run\
+**Tests:** `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`, `tests/test_format_cutover.py::test_inconclusive_scan_on_a_bound_tree_never_reports_unchecked_counts`, `tests/test_dry_run_recorded_trials.py::test_unreadable_trial_data_previews_a_fresh_phase_and_says_so`
 
 #### 7. Recovery validates before it opens
 

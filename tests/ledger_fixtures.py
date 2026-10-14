@@ -392,7 +392,9 @@ def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
     reanchor_summary_pointer(_last_successful_generation_path(experiment), summary_path)
 
 
-def forbid_file_backed_storage(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+def forbid_file_backed_storage(
+    monkeypatch: pytest.MonkeyPatch, *, allow_memory_studies: bool = False
+) -> list[str]:
     """Make any file-backed storage construction fail, and record every attempt.
 
     Durability invariant 6 ("Read paths construct and write nothing"): a read
@@ -412,7 +414,13 @@ def forbid_file_backed_storage(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     swallow broad exceptions to stay tolerant of a live writer; the returned
     list survives that, so an assertion on it cannot be silenced.
 
+    A dry run renders its example command on a throwaway in-memory study, which
+    is ``optuna.create_study`` without storage. ``allow_memory_studies`` lets
+    exactly that call through and still refuses one that names storage.
+
     :param pytest.MonkeyPatch monkeypatch: Fixture used to install the patches.
+    :param bool allow_memory_studies: Whether ``optuna.create_study`` may build a
+        study that has no storage.
     :return list[str]: Attempted constructions, appended to as they happen.
     """
     from optuna.storages._rdb.storage import RDBStorage
@@ -443,7 +451,20 @@ def forbid_file_backed_storage(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     import optuna
 
-    monkeypatch.setattr(optuna, "create_study", refuse("optuna.create_study"))
+    refused_create_study = refuse("optuna.create_study")
+    real_create_study = optuna.create_study
+
+    def guarded_create_study(*args: object, **kwargs: object) -> optuna.Study:
+        """Build only a storage-less study, when the caller allowed one.
+
+        :raises AssertionError: The study would be stored, or memory studies are not allowed.
+        """
+        storage = args[0] if args else kwargs.get("storage")
+        if allow_memory_studies and storage is None:
+            return real_create_study(*args, **kwargs)
+        return refused_create_study(*args, **kwargs)
+
+    monkeypatch.setattr(optuna, "create_study", guarded_create_study)
 
     real_connect = sqlite3.connect
 
