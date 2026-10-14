@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shlex
 import sys
 import traceback
@@ -166,38 +167,99 @@ def _load_cli_config(path: Path) -> Experiment:
         raise ConfigError(f"{path}: {exc}") from exc
 
 
+_DEFAULT_TEMPLATE = "starter"
+_TEMPLATE_PURPOSE_PREFIX = "# phasesweep template: "
+
+
+def _template_names() -> list[str]:
+    """List the packaged templates: the default first, then the rest by name.
+
+    The catalog is the ``templates`` directory listing, so a template is its file name
+    without ``.yaml``.
+
+    :return list[str]: Template names.
+    """
+    entries = resources.files("phasesweep").joinpath("templates").iterdir()
+    names = sorted(
+        entry.name.removesuffix(".yaml") for entry in entries if entry.name.endswith(".yaml")
+    )
+    return sorted(names, key=lambda name: name != _DEFAULT_TEMPLATE)
+
+
+def _template_text(name: str) -> str:
+    """Read one packaged template exactly as shipped.
+
+    :param str name: Template name from ``_template_names``.
+    :return str: The template's YAML text.
+    """
+    return (
+        resources.files("phasesweep")
+        .joinpath("templates", f"{name}.yaml")
+        .read_text(encoding="utf-8")
+    )
+
+
+def _template_purpose(name: str) -> str:
+    """Read a template's one-line purpose from its first line.
+
+    :param str name: Template name from ``_template_names``.
+    :raises ValueError: The template's first line is not the purpose header.
+    :return str: The purpose text after the header prefix.
+    """
+    first_line = _template_text(name).splitlines()[0]
+    if not first_line.startswith(_TEMPLATE_PURPOSE_PREFIX):
+        raise ValueError(f"Template {name!r} must start with {_TEMPLATE_PURPOSE_PREFIX!r}.")
+    return first_line.removeprefix(_TEMPLATE_PURPOSE_PREFIX).strip()
+
+
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
-    help="Write a runnable two-phase starter experiment without overwriting files.",
-    short_help="Create a starter experiment.",
+    help="Write a runnable template experiment without overwriting files.",
+    short_help="Create an experiment from a template.",
 )
+@click.option(
+    "--template",
+    type=click.Choice(_template_names()),
+    default=_DEFAULT_TEMPLATE,
+    show_default=True,
+    help="Template to write. Every one runs as written on the packaged toy trainer.",
+)
+@click.option("--list", "list_templates", is_flag=True, help="List the templates and exit.")
 @click.option(
     "-o",
     "--output",
-    type=click.Path(dir_okay=False, path_type=Path),
-    default=Path("experiment.yaml"),
-    show_default=True,
-    help="Starter YAML destination.",
+    type=click.Path(),
+    default=".",
+    show_default="the current directory",
+    help="Destination file, or a directory that receives TEMPLATE.yaml. A directory is an "
+    "existing one or a path ending in a separator, and is created if needed.",
 )
-def init(output: Path) -> None:
-    """Write an annotated starter experiment and print the review commands.
+def init(template: str, list_templates: bool, output: str) -> None:
+    """Write an annotated template experiment and print the review commands.
 
-    :param Path output: Destination YAML path; existing paths are never replaced.
-    :raises click.exceptions.Exit: With code 2 when ``output`` already exists as a
+    :param str template: Name of the packaged template to write.
+    :param bool list_templates: Print each template's name and purpose instead of writing.
+    :param str output: Destination file, or a directory that receives ``<template>.yaml``;
+        existing paths are never replaced.
+    :raises click.exceptions.Exit: With code 2 when the destination already exists as a
         file or symlink, including when it appears between the check and the
         atomic publication; with code 1 when staging or publishing fails with
         an ``OSError`` such as a permission, disk-space, or hard-link error.
     """
-    expanded = output.expanduser()
+    if list_templates:
+        names = _template_names()
+        width = max(len(name) for name in names)
+        for name in names:
+            click.echo(f"{name:<{width}}  {_template_purpose(name)}")
+        return
+    expanded = Path(output).expanduser()
+    if expanded.is_dir() or output.endswith(("/", os.sep)):
+        expanded = expanded / f"{template}.yaml"
     target = expanded.absolute()
     if target.exists() or target.is_symlink():
         click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
         raise click.exceptions.Exit(2)
-    text = (
-        resources.files("phasesweep")
-        .joinpath("templates", "starter_experiment.yaml")
-        .read_text(encoding="utf-8")
-    )
+    text = _template_text(template)
     try:
         if not atomic_create_text(target, text):
             click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
@@ -213,11 +275,15 @@ def init(output: Path) -> None:
     # suppresses "~" expansion, so a quoted raw "~/x.yaml" would name a
     # different (nonexistent) file than the one just written.
     config_arg = shlex.quote(str(expanded))
-    click.echo(f"Wrote starter experiment to {target}")
+    click.echo(f"Wrote the {template} template to {target}")
     click.echo("\nNext:")
     click.echo(f"  phasesweep validate {config_arg}")
     click.echo(f"  phasesweep run {config_arg} --dry-run")
+    click.echo(f"  phasesweep run {config_arg}")
+    click.echo(f"  phasesweep status {config_arg} --trials")
     click.echo(f"  phasesweep mcp init-catalog --from {config_arg}")
+    click.echo("\nphasesweep explain lists every config key; phasesweep explain KEY describes one.")
+    click.echo("phasesweep init --list describes the other templates.")
 
 
 @cli.command(

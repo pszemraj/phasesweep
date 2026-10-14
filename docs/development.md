@@ -169,7 +169,7 @@ flowchart TD
 - `tests/test_storage_urls.py`, `tests/test_locking.py`, `tests/test_filesystem_layout.py`, and `tests/test_format_cutover.py`: local storage, locks, format checks, and output layout.
 - `tests/test_ledger_contract.py`, `tests/test_ledger_read_paths.py`, `tests/test_error_routing.py`, and `tests/test_tier_guard.py`: the storage chokepoint, read paths and recovery inspection against the golden ledger fixture, operator-action routing, and the integration-marker guard.
 - `tests/test_mcp_*.py`: catalog validation, run state, frozen snapshots, detached launch, status, cancellation, and recovery.
-- `tests/test_init.py` and `tests/test_reporting.py`: starter creation, catalog scaffolding, and result rendering.
+- `tests/test_init.py`, `tests/test_fake_train.py` and `tests/test_reporting.py`: template creation and runs, the toy trainer's seed noise, catalog scaffolding, and result rendering.
 
 ## Tracked TODOs
 

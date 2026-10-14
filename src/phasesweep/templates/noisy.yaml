@@ -1,0 +1,76 @@
+# phasesweep template: a noisy objective, with a seed audit, repeats, a metric bound and observe
+# Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
+#
+# When one run's metric moves with the seed, a single trial cannot rank configurations whose true
+# gap is smaller than that movement. This template measures the movement, then ranks by the mean
+# over several seeds. Background: the "Noisy objectives and small budgets" section of
+# https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets
+#
+# It runs as written on the packaged toy trainer, which adds seed noise when given a seed. For
+# your own trainer, replace trial_command, the trainer_config keys, the metric extractor, the
+# observe entry and the bound, and make the trainer read the seed from the key repeats.key names.
+experiment: phasesweep_noisy
+storage: auto
+provenance:
+  revision: "phasesweep-noisy-v1"
+# Relative paths here resolve against this file's directory, not the shell's.
+workdir: ./runs
+execution:
+  # Pins the trainer's cwd to this file's directory: a run from another directory resumes
+  # the same study. Unset, the cwd follows the invocation directory and is fingerprinted.
+  cwd: .
+  # none: the trainer sees only a minimal environment. See phasesweep explain execution.inherit_env.
+  inherit_env: none
+
+trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
+
+trainer_config:
+  model:
+    n_layers: 8
+    dropout: 0.1
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.05
+
+metric:
+  name: eval_loss
+  goal: minimize
+  # Viability bound: a loss above this means the run diverged. A configuration ranks only if every
+  # one of its seeds is inside the bound, so one diverged seed disqualifies the configuration
+  # instead of being averaged into a mean that hides it. Set it from the seed audit's spread.
+  max: 0.6
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: eval_loss
+    split: validation
+    policy: synthetic
+    checkpoint: toy_formula
+    expected_step: 100
+
+# Report-only values: recorded per trial and in the winner, never used to rank. The toy trainer
+# writes param_bytes next to the objective in result.json. Read yours with a json extractor.
+observe:
+  - name: param_bytes
+    extractor: { type: json, path: result.json, key: param_bytes }
+
+phases:
+  - name: seed_audit
+    comment: "Run the unchanged baseline once per seed to measure how far the loss moves from the seed alone."
+    # An empty search_space is one fixed configuration, so n_trials equals the number of seeds.
+    # This phase's WINNER line in run.log, and the repeats block of its winner.yaml, give the
+    # mean, standard deviation and range over the seeds.
+    n_trials: 6
+    sampler: { type: grid }
+    search_space: {}
+    repeats: { key: seed, values: [1, 2, 3, 4, 5, 6] }
+
+  - name: learning_rate
+    comment: "Compare three close learning rates, each ranked by its mean over three seeds."
+    # Three learning rates times three seeds is nine trials. The trainer receives the seed as the
+    # top-level key seed. Choices closer than the seed spread can tie, and the run log says so.
+    n_trials: 9
+    sampler: { type: grid }
+    search_space:
+      optimizer.lr: { type: categorical, choices: [0.0002, 0.0003, 0.0004] }
+    repeats: { key: seed, values: [1, 2, 3], reduce: mean }

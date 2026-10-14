@@ -1,5 +1,10 @@
+# phasesweep template: two chained phases on the packaged toy trainer, the smallest complete setup
+# Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
+#
 # Runnable PhaseSweep starter. The human owns this file: review trainer commands,
 # paths, search spaces, and permissions before launching real workloads.
+# To use your own trainer, replace trial_command, the trainer_config keys and the
+# metric extractor.
 experiment: phasesweep_starter
 storage: auto
 provenance:
@@ -7,6 +12,9 @@ provenance:
 # Relative paths here resolve against this file's directory, not the shell's.
 workdir: ./runs
 execution:
+  # Pins the trainer's cwd to this file's directory: a run from another directory resumes
+  # the same study. Unset, the cwd follows the invocation directory and is fingerprinted.
+  cwd: .
   # none is the default: the trainer gets only PATH, HOME, LANG, LC_ALL, TMPDIR,
   # USER, LOGNAME and TZ, plus env. To pass a shell variable such as PYTHONPATH,
   # write inherit_env: [PYTHONPATH]; inherit_env: all passes the whole shell.

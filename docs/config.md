@@ -4,7 +4,7 @@ A PhaseSweep configuration is one operator-authored YAML document for one ordere
 
 Run `phasesweep validate <config>` before launching. The loader rejects duplicate YAML mapping keys and unsupported fields before it creates run artifacts. A top-level `suite` is rejected: write each component as its own complete experiment YAML file and review its defaults explicitly.
 
-Field types, defaults, and validation constraints are in [config_reference.yaml](../src/phasesweep/config_reference.yaml), which is too long to read whole: `phasesweep explain KEY` prints one key and everything below it, and the [reference index](#reference-index) lists where each top-level key lives. It is a signature reference, not runnable YAML; start with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Both CLI commands take an explicit config path. YAML values override built-in defaults; CLI execution flags and ambient environment do not form a general config-key overlay. Config is read once per invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal and `execution.cwd` paths resolve against the directory of the YAML file, so the same file writes the same artifact tree from any directory, through the CLI or MCP. An `Experiment` built in Python has no file and resolves them against the process working directory. MCP's separate catalog paths are documented in the [operator reference](mcp.md#the-catalog).
+Field types, defaults, and validation constraints are in [config_reference.yaml](../src/phasesweep/config_reference.yaml), which is too long to read whole: `phasesweep explain KEY` prints one key and everything below it, and the [reference index](#reference-index) lists where each top-level key lives. It is a signature reference, not runnable YAML; start with a [template](#templates) written by `phasesweep init`, or with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Both CLI commands take an explicit config path. YAML values override built-in defaults; CLI execution flags and ambient environment do not form a general config-key overlay. Config is read once per invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal and `execution.cwd` paths resolve against the directory of the YAML file, so the same file writes the same artifact tree from any directory, through the CLI or MCP. An `Experiment` built in Python has no file and resolves them against the process working directory. MCP's separate catalog paths are documented in the [operator reference](mcp.md#the-catalog).
 
 ## Reference index
 
@@ -21,6 +21,18 @@ Field types, defaults, and validation constraints are in [config_reference.yaml]
 | Execution environment | `env`, `execution`, `timeout_seconds_per_run` | `phasesweep explain execution` |
 
 `phases` and `metric` are the largest subtrees. Narrow them with a path such as `phasesweep explain 'phases[].sampler'`, and quote any key that contains brackets so the shell does not expand it.
+
+## Templates
+
+`phasesweep init --template NAME` writes a commented, runnable starting point. `phasesweep init --list` prints the names and purposes below, `-o PATH` names the output file or a directory that receives `NAME.yaml` (created if needed), and an existing file is never overwritten. Every template runs as written on the packaged toy trainer, so `phasesweep init --template NAME && phasesweep run NAME.yaml` finishes in seconds on a CPU-only machine. Comments in each file mark what to replace for a real trainer: the command, the `trainer_config` keys and the metric extractor. Each file opens with a pointer to `phasesweep explain`, and sets `execution.cwd: .` so a run from another directory resumes the same study.
+
+| Template | Purpose | Command |
+| --- | --- | --- |
+| `starter` | Two chained phases, depth then learning rate, on the toy trainer. The default. | `phasesweep init --template starter` |
+| `argparse` | A trainer that takes `--key=value` flags: `override_format: argparse`, `trainer_config` as the base, a seeded random learning-rate search. | `phasesweep init --template argparse` |
+| `architectures` | One phase per architecture, none inheriting another, each fixing its model keys and running a small learning-rate grid. | `phasesweep init --template architectures` |
+| `chained` | A seeded random learning-rate search, then a phase that inherits it and searches a key the first phase only fixed. | `phasesweep init --template chained` |
+| `noisy` | A noisy objective: a seed audit that measures the spread, a grid ranked by the mean over seeds with [repeats](#repeats), a `metric.max` viability bound and an `observe` entry. | `phasesweep init --template noisy` |
 
 ## Experiment YAML
 

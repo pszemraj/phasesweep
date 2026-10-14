@@ -16,12 +16,12 @@ Contributor and editable-install setup is in [development](development.md). Inst
 
 ### 2. Create and review the catalog
 
-If you do not have an experiment yet, `phasesweep init` creates an installed-package starter named `experiment.yaml` without overwriting files. The [configuration reference](../src/phasesweep/config_reference.yaml) describes the accepted experiment fields, including backend selection and environment composition.
+If you do not have an experiment yet, `phasesweep init` creates an installed-package starter named `starter.yaml` without overwriting files; `phasesweep init --list` names the other [templates](config.md#templates). The [configuration reference](../src/phasesweep/config_reference.yaml) describes the accepted experiment fields, including backend selection and environment composition.
 
 Before cataloging a source-checkout trainer, follow the [trainer environment preflight](config.md#source-checkout-preflight) to verify its imported library and supported arguments under the configured environment. Then create the catalog:
 
 ```bash
-phasesweep mcp init-catalog --from ./experiment.yaml
+phasesweep mcp init-catalog --from ./starter.yaml
 ```
 
 The command writes `catalog.yaml`, validates it, and provisions a fresh [private state layout](mcp.md#fresh-mcp-state). Add another `--from` for each experiment; use `-o` for another catalog filename. The scaffold never replaces an existing catalog.

@@ -1,0 +1,58 @@
+# phasesweep template: a trainer that takes --key=value flags, with a seeded random lr search
+# Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
+#
+# For a trainer built on argparse or HfArgumentParser. It runs as written on the packaged toy
+# trainer. For your own trainer, replace trial_command, the trainer_config keys and the metric
+# extractor; override_format and the phases can stay.
+experiment: phasesweep_argparse
+storage: auto
+provenance:
+  revision: "phasesweep-argparse-v1"
+# Relative paths here resolve against this file's directory, not the shell's.
+workdir: ./runs
+execution:
+  # Pins the trainer's cwd to this file's directory: a run from another directory resumes
+  # the same study. Unset, the cwd follows the invocation directory and is fingerprinted.
+  cwd: .
+  # none: the trainer sees only a minimal environment. See phasesweep explain execution.inherit_env.
+  inherit_env: none
+
+# {overrides} expands to every trainer_config leaf plus the phase's own values, shell-quoted:
+#   --model.n_layers=8 --model.dropout=0.1 --optimizer.lr=0.0003 --optimizer.weight_decay=0.05
+# For your own trainer, for example: "python train.py {overrides}".
+override_format: argparse
+trial_command: "python -m phasesweep.examples.fake_train {overrides}"
+
+# The trainer's base flags, written here as nested keys. Each leaf becomes one flag, and a phase
+# replaces a flag by its dotted key. Put what stays fixed across trials here: data, batch size,
+# step budget. For a Hugging Face script that includes keys such as output_dir: "{trial_dir}/out".
+trainer_config:
+  model:
+    n_layers: 8
+    dropout: 0.1
+  optimizer:
+    lr: 0.0003
+    weight_decay: 0.05
+
+metric:
+  name: eval_loss
+  goal: minimize
+  # The toy trainer reports through phasesweep.report_objective(). A trainer that writes plain JSON,
+  # a log line, W&B or MLflow uses another extractor: phasesweep explain metric.extractor.
+  extractor:
+    type: json_envelope
+    path: result.json
+    objective_name: eval_loss
+    split: validation
+    policy: synthetic
+    checkpoint: toy_formula
+    expected_step: 100
+
+phases:
+  - name: learning_rate
+    comment: "Search the learning rate on a log scale, with a fixed seed so the draws repeat."
+    n_trials: 4
+    # Each draw derives from this seed and the trial number, so an interrupted run resumes.
+    sampler: { type: random, seed: 0 }
+    search_space:
+      optimizer.lr: { type: float, low: 0.0001, high: 0.001, log: true }
