@@ -791,13 +791,18 @@ def _sampler_policy_experiment(
     :param str | None storage: Storage URL to declare, or ``None`` for in-memory.
     :param JsonObject | None sampler: Sampler mapping, or ``None`` to leave the default.
     :param int n_trials: Trial budget for the single phase.
-    :param JsonObject | None search_space: Search space; defaults to one float ``lr``.
+    :param JsonObject | None search_space: Search space; ``None`` means one float ``lr``,
+        and an empty mapping means a fixed configuration.
     :return Experiment: Validated experiment.
     """
     phase: JsonObject = {
         "name": "lr",
         "n_trials": n_trials,
-        "search_space": search_space or {"lr": {"type": "float", "low": 0.1, "high": 1.0}},
+        "search_space": (
+            {"lr": {"type": "float", "low": 0.1, "high": 1.0}}
+            if search_space is None
+            else search_space
+        ),
     }
     if sampler is not None:
         phase["sampler"] = sampler
@@ -877,6 +882,29 @@ def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_pat
         sampler={"type": "grid"},
         n_trials=3,
         search_space={"lr": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.5}},
+    )
+    assert experiment.phases[0].sampler.seed is None
+    assert experiment.phases[0].sampler.acknowledge_nonresumable is False
+
+
+@pytest.mark.parametrize(
+    "sampler",
+    [
+        pytest.param(None, id="default_tpe"),
+        pytest.param({"type": "tpe"}, id="tpe"),
+        pytest.param({"type": "cmaes"}, id="cmaes"),
+        pytest.param({"type": "random"}, id="random"),
+    ],
+)
+def test_empty_search_space_skips_seed_and_acknowledge_on_persistent_storage(
+    tmp_path: Path, sampler: JsonObject | None
+) -> None:
+    """A fixed configuration draws nothing, so no seed or acknowledgement is owed."""
+    experiment = _sampler_policy_experiment(
+        storage=f"journal:///{tmp_path}/phases.journal",
+        sampler=sampler,
+        n_trials=1,
+        search_space={},
     )
     assert experiment.phases[0].sampler.seed is None
     assert experiment.phases[0].sampler.acknowledge_nonresumable is False

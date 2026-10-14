@@ -261,7 +261,8 @@ phases: list[object] (required)
     # With storage null every invocation is a fresh in-memory study and runs the whole target again.
     # A persistent phase cannot lower its target below the one it already accepted.
     # Raising it is refused while a later phase that inherits from this one, directly or through other phases, already has trials. Use a new experiment name for that.
-    # With sampler.type tpe or cmaes, raising it on a study that has trials is refused. Run the whole target in one invocation, or use a new experiment name.
+    # With sampler.type tpe or cmaes and a nonempty phases[].search_space, raising it on a study that has trials is refused. Run the whole target in one invocation, or use a new experiment name. A phase with an empty search_space draws nothing and is not refused.
+    # A fixed configuration is a phase with an empty phases[].search_space and its values in phases[].fixed_overrides. A list of fixed runs is one such phase per configuration.
     # With random or grid, raising it also recovers a phase that stopped on a durable abort or on an accepted partial timeout. Repeating the same target preserves that decision.
     # Excluded from the study fingerprint.
     # Requires: with phases[].sampler.type grid, n_trials equals the grid size unless phases[].allow_partial_grid is true, and it never exceeds the grid size. Config load fails otherwise.
@@ -299,6 +300,7 @@ phases: list[object] (required)
     # Map from a dotted trainer-defined override key to the parameter that is sampled for it. optimizer.lr below is an example key; replace it with any valid dotted name.
     # The key rules are the same as for phases[].fixed_overrides, and the sampled value is passed to the trainer like a fixed value.
     # Float and int values reach the trainer as Python floats and ints, and categorical choices keep their YAML type.
+    # An empty search_space is a fixed configuration: the phase draws nothing from its sampler and runs phases[].fixed_overrides as they are. validate and the dry run say "fixed configuration, no sampler draws (resumable)".
     # Overrides: trainer_config (the sampled value replaces the base value at the same dotted path).
     # Overrides: phases[].inherits (a sampled value replaces an inherited value that was only fixed; a key an inherited phase sampled cannot be searched again, and config load fails).
     # Conflicts with: phases[].fixed_overrides (a key cannot be both fixed and sampled in one phase; config load fails).
@@ -429,14 +431,14 @@ phases: list[object] (required)
       # cmaes needs the cmaes package; config load fails with an install hint when it is missing.
       # Requires: with cmaes every phases[].search_space parameter is numeric.
       # Requires: with grid, the search space has no log parameter, every float has a step, there are at most 4096 distinct combinations, and phases[].n_trials equals the combination count unless phases[].allow_partial_grid is true.
-      # Requires: with persistent storage, random, tpe and cmaes need phases[].sampler.seed, and tpe and cmaes need phases[].sampler.acknowledge_nonresumable true.
-      # Warning: a tpe or cmaes target must finish in one invocation. An interrupted target cannot resume and cannot be enlarged. Grid and seeded random continue normally.
+      # Requires: with persistent storage and a nonempty phases[].search_space, random, tpe and cmaes need phases[].sampler.seed, and tpe and cmaes need phases[].sampler.acknowledge_nonresumable true. A phase with an empty search_space draws nothing and is exempt.
+      # Warning: a tpe or cmaes target with a nonempty search_space must finish in one invocation. An interrupted target cannot resume and cannot be enlarged. Grid and seeded random continue normally, and so does a phase with an empty search_space.
       type: "tpe" | "random" | "grid" | "cmaes" = "tpe"
 
       # Sampler random seed, an integer from 0 to 4294967295. It is independent of any trainer seed in trainer_config or phases[].fixed_overrides.
       # For grid the seed fixes the order in which Optuna visits the grid points, which also decides which points a partial grid runs.
-      # Unset: tpe, random and cmaes draw unseeded suggestions, and persistent storage rejects that.
-      # Requires: with persistent storage, random, tpe and cmaes need an explicit seed; grid is exempt.
+      # Unset: tpe, random and cmaes draw unseeded suggestions, and persistent storage rejects that unless phases[].search_space is empty.
+      # Requires: with persistent storage, random, tpe and cmaes need an explicit seed; grid is exempt, and so is a phase with an empty phases[].search_space, which draws nothing.
       seed: int | null = null
 
       # Number of random startup trials before the tpe surrogate model is fitted, an integer >= 0.
@@ -446,7 +448,7 @@ phases: list[object] (required)
 
       # Accept that tpe and cmaes cannot be resumed after an interruption.
       # Only used when: phases[].sampler.type is tpe or cmaes. true with random or grid fails config load.
-      # Requires: persistent storage with tpe or cmaes needs true.
+      # Requires: persistent storage with tpe or cmaes needs true, unless phases[].search_space is empty.
       # Warning: the acknowledgement permits the run. It does not make an interrupted run resumable.
       # Excluded from the study fingerprint.
       acknowledge_nonresumable: bool = false
@@ -697,7 +699,7 @@ override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 # Changing semantic inputs needs a new experiment name. Run-control changes do not waive a stored abort or partial-timeout decision.
 # Requires: a journal URL spells its scheme exactly as lowercase journal and names a nonempty path. JOURNAL:///x.journal, journal:/// and journal:// fail config load.
 # Requires: a journal URL carries no ? or #, because a query or fragment would silently cut the path, and neither does the config file's directory when the path is relative. Config load fails; use auto when a directory name contains one.
-# Requires: provenance is nonempty for auto or a journal; stochastic phases also need phases[].sampler.seed, and tpe and cmaes need phases[].sampler.acknowledge_nonresumable. Config load fails otherwise.
+# Requires: provenance is nonempty for auto or a journal; phases with a nonempty search_space also need phases[].sampler.seed when stochastic, and tpe and cmaes need phases[].sampler.acknowledge_nonresumable. Config load fails otherwise.
 # Requires: workdir and the experiment name keep pointing at the same ledger. An artifact root <workdir>/<experiment> remembers its storage identity, which includes null, so switching between null and a journal or between two journals is refused, and so is opening one journal under another workdir or experiment name.
 # Excluded from the study fingerprint.
 # Warning: null cannot resume or top up a later invocation.

@@ -8,7 +8,7 @@ from typing import Any, Literal, NamedTuple, TypedDict
 import optuna
 
 from phasesweep.config import Phase
-from phasesweep.config.search import NON_RESUMABLE_SAMPLERS
+from phasesweep.config.search import NON_RESUMABLE_SAMPLERS, phase_draws
 from phasesweep.engine.attempts import _parsed_trial_outcome
 from phasesweep.engine.errors import (
     OperatorAction,
@@ -441,16 +441,17 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
     already-evaluated startup suggestions and spend the remaining budget on
     duplicates. Until PhaseSweep persists real sampler continuation state, a
     stateful phase is restartable only before its first terminal trial or after
-    reaching its accepted target.
+    reaching its accepted target. A phase with an empty search space draws
+    nothing, so it has no sampler state to lose and resumes freely.
 
     :param optuna.Study study: Existing study whose finished-trial count is checked.
     :param Phase phase: Phase config supplying the sampler type and trial target.
-    :raises SamplerContinuationUnsupportedError: The phase uses a stateful sampler
-        (``tpe`` or ``cmaes``) and either raises its previously accepted trial
-        target or was interrupted before reaching it.
+    :raises SamplerContinuationUnsupportedError: The phase draws from a stateful
+        sampler (``tpe`` or ``cmaes``) and either raises its previously accepted
+        trial target or was interrupted before reaching it.
     """
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
-    if phase.sampler.type not in NON_RESUMABLE_SAMPLERS or finished == 0:
+    if phase.sampler.type not in NON_RESUMABLE_SAMPLERS or not phase_draws(phase) or finished == 0:
         return
 
     accepted_target = _accepted_trial_target(study)

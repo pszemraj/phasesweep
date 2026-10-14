@@ -223,8 +223,8 @@ SearchParam = Annotated[
 
 # Samplers whose suggestions depend on process-local RNG/optimizer state that
 # Optuna storage does not persist. `phasesweep.engine.study_policy.
-# _validate_sampler_continuation` refuses to resume one of these mid-target, so
-# each trial target must be run in a single invocation.
+# _validate_sampler_continuation` refuses to resume a phase that draws from one
+# of these mid-target, so each trial target must be run in a single invocation.
 NON_RESUMABLE_SAMPLERS = frozenset({"tpe", "cmaes"})
 # Samplers that draw randomly and therefore need an explicit seed to make a
 # durable study reproducible. `grid` is excluded: it enumerates a fixed matrix.
@@ -252,8 +252,8 @@ class Sampler(_Frozen):
             "invocation. TPE and CMA-ES suggestions depend on process-local "
             "state Optuna storage does not persist, so PhaseSweep refuses to "
             "resume such a phase mid-target. Required for sampler.type 'tpe' "
-            "or 'cmaes' on persistent storage; rejected for 'grid' and "
-            "'random', which resume safely."
+            "or 'cmaes' on persistent storage when the phase has a "
+            "search_space; rejected for 'grid' and 'random', which resume safely."
         ),
     )
 
@@ -299,6 +299,19 @@ class Sampler(_Frozen):
         return self
 
 
+def phase_draws(phase: Phase) -> bool:
+    """Say whether a phase asks its sampler for any values.
+
+    A phase with an empty search space is a fixed configuration: its sampler is
+    never consulted, so the seed and resumability requirements that guard
+    sampler draws do not apply to it.
+
+    :param Phase phase: Phase to inspect.
+    :return bool: ``True`` when the search space is nonempty.
+    """
+    return bool(phase.search_space)
+
+
 def sampler_capability_line(phase: Phase) -> str:
     """Render the one-line resume/reproduce contract disclosed for ``phase``.
 
@@ -306,8 +319,11 @@ def sampler_capability_line(phase: Phase) -> str:
     surfaces state the same contract in the same words before any trial runs.
 
     :param Phase phase: Phase whose sampler capability is described.
-    :return str: One line naming the phase, sampler type, seed, and capability.
+    :return str: One line naming the phase and either its sampler type, seed
+        and capability, or that it is a fixed configuration with no sampler draws.
     """
+    if not phase_draws(phase):
+        return f"phase {phase.name!r}: fixed configuration, no sampler draws (resumable)"
     sampler = phase.sampler
     seed = "" if sampler.seed is None else f" seed={sampler.seed}"
     if sampler.type in NON_RESUMABLE_SAMPLERS:

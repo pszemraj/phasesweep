@@ -539,6 +539,33 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     assert "phase 'wd': sampler=random seed=3 (resumable, reproducible)" in result.output
 
 
+def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path) -> None:
+    """A phase with no search_space needs no seed or acknowledgement and is reported as fixed."""
+    p = tmp_path / "exp.yaml"
+    p.write_text(
+        textwrap.dedent(f"""
+        experiment: t
+        storage: journal:///{tmp_path}/phases.journal
+        provenance: {{revision: test-fixture-v1}}
+        trial_command: "echo {{overrides}}"
+        override_format: argparse
+        metric:
+          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
+        phases:
+          - name: baseline
+            n_trials: 1
+            fixed_overrides: {{ lr: 0.1 }}
+        """)
+    )
+
+    result = CliRunner().invoke(cli_main, ["validate", str(p)])
+
+    assert result.exit_code == 0, result.output
+    assert "- baseline: n_trials=1 (fixed configuration)" in result.output
+    assert "phase 'baseline': fixed configuration, no sampler draws (resumable)" in result.output
+    assert "sampler=" not in result.output
+
+
 def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     """``show-winners`` prints comment before the winner block so the reader
     frames numerical results against intent. Also covers the no-winner-yet
@@ -691,6 +718,51 @@ def test_dry_run_previews_a_one_point_grid(tmp_path, caplog, search_space):
     winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"p"}
     assert any("DRY RUN example command" in r.message for r in caplog.records)
+
+
+def test_dry_run_discloses_each_phases_sampler_capability(tmp_path, caplog):
+    """``run --dry-run`` states every phase's resume/reproduce contract, as ``validate`` does.
+
+    The empty-search-space phase is the fixed configuration: it draws nothing, so
+    it owes no seed or acknowledgement on persistent storage and says so.
+    """
+    caplog.set_level(logging.INFO)
+    exp = make_experiment(
+        persistent=tmp_path,
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(
+                name="depth",
+                n_trials=2,
+                sampler=Sampler(type="grid"),
+                search_space={"d": CategoricalParam(type="categorical", choices=[4, 8])},
+            ),
+            Phase(
+                name="lr",
+                n_trials=2,
+                sampler=Sampler(type="tpe", seed=0, acknowledge_nonresumable=True),
+                search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
+            ),
+            Phase(
+                name="wd",
+                n_trials=2,
+                sampler=Sampler(type="random", seed=3),
+                search_space={"wd": FloatParam(type="float", low=0.0, high=0.3)},
+            ),
+            Phase(name="fixed", n_trials=1, fixed_overrides={"x": 1}),
+        ],
+    )
+
+    run_experiment(exp, dry_run=True)
+
+    assert [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN phase '")
+    ] == [
+        "DRY RUN phase 'depth': sampler=grid (resumable)",
+        "DRY RUN phase 'lr': sampler=tpe seed=0 (non-resumable: run each target in one invocation)",
+        "DRY RUN phase 'wd': sampler=random seed=3 (resumable, reproducible)",
+        "DRY RUN phase 'fixed': fixed configuration, no sampler draws (resumable)",
+    ]
 
 
 @pytest.mark.integration

@@ -15,7 +15,7 @@ import yaml
 
 from phasesweep.config import ConfigError, Experiment, load_experiment
 from phasesweep.config.models import experiment_contract_lines
-from phasesweep.config.search import sampler_capability_line
+from phasesweep.config.search import phase_draws, sampler_capability_line
 from phasesweep.engine import (
     PhaseSweepError,
     PublicationAccessError,
@@ -377,7 +377,8 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
         click.echo(f"{indent}{line}")
     for p in experiment.phases:
         deps = f" inherits={p.inherits}" if p.inherits else ""
-        click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} sampler={p.sampler.type}{deps}")
+        sampling = f"sampler={p.sampler.type}" if phase_draws(p) else "(fixed configuration)"
+        click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} {sampling}{deps}")
         # Capability disclosure (review v0.5.18 / finding F7): state the
         # resume/reproduce contract before a trial runs, not after an
         # interrupted operator hits the runtime continuation guard.

@@ -30,6 +30,7 @@ from phasesweep.config import (
 from phasesweep.engine import (
     PhaseSweepError,
     ProcessCleanupUncertainError,
+    SamplerContinuationUnsupportedError,
     StudyStorageUnavailableError,
     TerminalReport,
     read_status,
@@ -70,6 +71,7 @@ from phasesweep.engine.study_policy import (
     _consecutive_failure_threshold_tripped,
     _load_phase_policy_state,
     _record_recovery_boundary,
+    _validate_sampler_continuation,
 )
 from phasesweep.engine.trial import (
     ExecutedTrial,
@@ -877,6 +879,49 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     study = optuna.load_study(study_name="failtest::a", storage=_resolve_storage(storage))
     n = len(study.get_trials(deepcopy=False))
     assert n < 30, f"expected early abort, got {n} trials"
+
+
+def test_stateful_sampler_continuation_guard_ignores_a_phase_that_draws_nothing() -> None:
+    """The mid-target resume refusal protects sampler state, so a fixed configuration has none."""
+    study = optuna.create_study()
+    study.set_user_attr(TRIAL_TARGET_ATTR, 3)
+    study.add_trial(optuna.trial.create_trial(value=1.0))
+    sampler = Sampler(type="tpe", seed=0, acknowledge_nonresumable=True)
+    drawing = Phase(
+        name="p",
+        n_trials=3,
+        sampler=sampler,
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+    fixed = Phase(name="p", n_trials=3, sampler=sampler, fixed_overrides={"x": 1})
+
+    with pytest.raises(SamplerContinuationUnsupportedError, match="interrupted at 1/3"):
+        _validate_sampler_continuation(study, drawing)
+    _validate_sampler_continuation(study, fixed)
+    _validate_sampler_continuation(study, fixed.model_copy(update={"n_trials": 4}))
+
+
+@pytest.mark.integration
+def test_fixed_configuration_tpe_phase_resumes_mid_target(tmp_path: Path) -> None:
+    """A default, unseeded tpe phase with an empty search space loads and resumes mid-target."""
+    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
+    phase = Phase(name="p", n_trials=3, max_consecutive_failures=1, fixed_overrides={"x": 1})
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+    assert experiment.phases[0].sampler == Sampler()
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(experiment)
+
+    storage = _resolve_storage(experiment.storage)
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
+    assert len(study.trials) == 1
+
+    write_constant_trainer(tmp_path)
+    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
+    run_experiment(top_up)
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert len(study.trials) == 4
 
 
 def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch):

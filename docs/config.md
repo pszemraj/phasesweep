@@ -55,6 +55,8 @@ Every exported override key has an origin. A diamond is valid when both parent p
 
 `fixed_overrides` and `search_space` are local alternatives: one key cannot appear in both. Dotted keys use the same namespace everywhere, so a key and its prefix cannot coexist (for example, `optimizer` and `optimizer.lr`). Phase names must be unique and can inherit only from earlier declared phases.
 
+A list of fixed runs is one phase per configuration with `fixed_overrides` and no `search_space`. A phase with an empty `search_space` is a fixed configuration: it draws nothing from its sampler, so it needs no sampler seed and no `acknowledge_nonresumable` on persistent storage, and `validate` and the dry run report it as `fixed configuration, no sampler draws (resumable)`.
+
 ```yaml
 phases:
   - name: architecture
@@ -106,7 +108,7 @@ flowchart TD
 
 Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's trial target covers its concrete combinations unless `allow_partial_grid: true` is set; CMA-ES accepts numeric spaces only. Sampler-specific limits and fields are listed in the [reference](../src/phasesweep/config_reference.yaml).
 
-For persistent storage, `random`, `tpe`, and `cmaes` need a seed. TPE and CMA-ES also require `acknowledge_nonresumable: true`: their target must finish in one invocation rather than being resumed or enlarged across processes. See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation) for trial accounting, partial results, and sampler continuation, and [confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
+For persistent storage, a phase with a `search_space` that uses `random`, `tpe`, or `cmaes` needs a seed. TPE and CMA-ES also require `acknowledge_nonresumable: true`: their target must finish in one invocation rather than being resumed or enlarged across processes. A phase with an empty `search_space` draws nothing and is exempt from both. See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation) for trial accounting, partial results, and sampler continuation, and [confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
 
 ## Trainer inputs
 

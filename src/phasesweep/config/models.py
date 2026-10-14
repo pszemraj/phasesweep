@@ -28,6 +28,7 @@ from phasesweep.config.search import (
     SearchParam,
     _placeholder_values_for,
     _validate_sampler_search_space,
+    phase_draws,
 )
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
@@ -1186,18 +1187,20 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
        at config load instead.
 
     ``grid`` is exempt from both: it enumerates a fixed matrix and resumes from
-    stored grid assignments. In-memory storage (``storage: null``, the only
-    in-memory spelling) is exempt entirely — there is no durable study to
-    reproduce or resume, so the ``sampler`` block stays optional and the
+    stored grid assignments. A phase with an empty ``search_space`` is exempt
+    too, whatever its sampler: it draws nothing, so there is no sequence to
+    reproduce and no sampler state to lose. In-memory storage (``storage: null``,
+    the only in-memory spelling) is exempt entirely — there is no durable study
+    to reproduce or resume, so the ``sampler`` block stays optional and the
     ``tpe`` default remains fine.
 
     :param str | None storage: Experiment-level storage URL, or ``None``.
     :param Phase phase: Phase whose sampler contract is checked.
-    :raises ValueError: ``storage`` is persistent and the phase's sampler is
-        stochastic without an explicit ``seed``, or is non-resumable without
-        ``acknowledge_nonresumable: true``.
+    :raises ValueError: ``storage`` is persistent and the phase draws from a
+        stochastic sampler without an explicit ``seed``, or from a
+        non-resumable one without ``acknowledge_nonresumable: true``.
     """
-    if storage is None:
+    if storage is None or not phase_draws(phase):
         return
 
     sampler = phase.sampler
