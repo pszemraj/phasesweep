@@ -102,7 +102,7 @@ def test_seeded_random_repeats_share_draws_per_slot_across_batches_and_workers(
     assert expected[0][0] != expected[3][0]
     assert expected == sampled(tmp_path / "ones.journal", [1, 1, 4])
     assert expected == sampled(tmp_path / "pairs.journal", [2, 2, 2])
-    assert sorted(expected) == sorted(sampled(tmp_path / "parallel.journal", [6], n_jobs=3))
+    assert expected == sampled(tmp_path / "parallel.journal", [6], n_jobs=3)
 
 
 def _published_winner(experiment_root: Path, phase: str) -> dict[str, object]:
@@ -160,6 +160,66 @@ def test_repeats_phase_runs_children_without_the_repeat_key(tmp_path: Path) -> N
     resumed = run_experiment(experiment, from_phase="c")
     assert resumed["p"].repeats == parent.repeats
     assert read_status(experiment)["publication_integrity"] == "ok"
+
+
+def test_child_repeats_a_key_its_parent_searched(tmp_path: Path) -> None:
+    """A repeat value replaces the inherited value of a key an ancestor sampled, and is not exported."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_seed_trainer(tmp_path),
+        phases=[
+            Phase(
+                name="p",
+                n_trials=3,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"y": IntParam(type="int", low=0, high=3)},
+            ),
+            Phase(
+                name="c",
+                n_trials=2,
+                inherits=["p"],
+                sampler=Sampler(type="grid"),
+                repeats=Repeats(key="y", values=[10, 20]),
+            ),
+        ],
+    )
+
+    winners = run_experiment(experiment)
+
+    assert set(winners["p"].params) == {"y"}
+    child = winners["c"]
+    assert child.repeats is not None
+    # The trainer scores 0.01 * y, so a member that ran the parent's y would score at most 0.03.
+    assert {member["repeat"]: member["metric"] for member in child.repeats["members"]} == (
+        pytest.approx({10: 0.1, 20: 0.2})
+    )
+    assert child.params == {}
+    assert "y" not in child.effective_overrides
+
+
+def test_dry_run_placeholder_winner_drops_the_repeat_key(tmp_path: Path) -> None:
+    """A previewed repeats phase passes on neither its repeat values nor the value it replaced."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_seed_trainer(tmp_path),
+        phases=[
+            Phase(name="p", n_trials=1, fixed_overrides={"seed": 7, "x": 1}),
+            _repeats_phase(
+                name="c",
+                inherits=["p"],
+                n_trials=3,
+                search_space={"y": IntParam(type="int", low=0, high=3)},
+            ),
+            Phase(name="g", n_trials=1, inherits=["c"]),
+        ],
+    )
+
+    winners = run_experiment(experiment, dry_run=True)
+
+    assert winners["p"].effective_overrides == {"seed": 7, "x": 1}
+    assert set(winners["c"].params) == {"y"}
+    assert set(winners["c"].effective_overrides) == {"x", "y"}
+    assert set(winners["g"].effective_overrides) == {"x", "y"}
 
 
 def _repeats_publication(tmp_path: Path, **phase_overrides: object) -> tuple[Experiment, str]:
@@ -455,6 +515,9 @@ def test_seed_audit_runs_one_configuration_once_per_repeat_value(
     assert winner.metric == expected
     assert winner.params == {}
     assert winner.effective_overrides == {"x": 2}
+    # A grid phase has no slots, so its one configuration's three trials form one group.
+    with (_phase_dir(experiment, "p") / "trials.csv").open() as handle:
+        assert [row["repeat_group"] for row in csv.DictReader(handle)] == ["2", "2", "2"]
     assert winner.confound is not None
     assert winner.confound["checks"]["tie"] == {
         "verdict": "n/a",

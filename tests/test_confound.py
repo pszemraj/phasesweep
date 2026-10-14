@@ -28,7 +28,7 @@ from phasesweep.engine.evidence import _validate_objective_provenance
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.publication import _resolve_publication_pointer
-from phasesweep.engine.repeats import ranked_group
+from phasesweep.engine.repeats import ReduceName, ranked_group
 from phasesweep.engine.selection import select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -389,14 +389,15 @@ def _assess_groups(
     groups: list[list[int]],
     *,
     incomplete: tuple[int, ...] = (),
+    reduce: ReduceName = "mean",
 ) -> dict[str, object]:
-    """Assess complete repeat groups by mean, the lowest aggregate winning as minimize does."""
+    """Assess complete repeat groups by ``reduce``, the lowest aggregate winning as minimize does."""
     by_number = {trial.number: trial for trial in trials}
     ranked_groups = [
         ranked_group(
             [(number, float(by_number[number].value or 0.0)) for number in members],
             {"x": by_number[members[0]].params["x"]},
-            "mean",
+            reduce,
         )
         for members in groups
     ]
@@ -461,6 +462,25 @@ def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> No
         "verdict": "ok",
         "detail": {"tied_trials": [], "within_noise": []},
     }
+
+
+def test_repeats_median_reducer_ties_equal_medians_and_still_flags_by_standard_error() -> None:
+    """Equal medians are an exact tie under the median reducer, and the SD still sets within_noise."""
+    trials = _seeded_trials(
+        (_COMPLETE, 1.0, 1, 0),
+        (_COMPLETE, 1.0, 1, 1),
+        (_COMPLETE, 1.0, 1, 2),
+        (_COMPLETE, 1.0, 2, 0),
+        (_COMPLETE, 1.0, 2, 1),
+        (_COMPLETE, 3.0, 2, 2),
+    )
+    groups = [[0, 1, 2], [3, 4, 5]]
+
+    median = _assess_groups(trials, groups, reduce="median")
+    assert median["checks"]["tie"]["detail"] == {"tied_trials": [5], "within_noise": [5]}
+    assert _validate_confound_block(median, winner_trial=2) == median
+    mean = _assess_groups(trials, groups)
+    assert mean["checks"]["tie"]["detail"] == {"tied_trials": [], "within_noise": [5]}
 
 
 def test_repeats_single_group_leaves_tie_unchecked() -> None:

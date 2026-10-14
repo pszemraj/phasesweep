@@ -16,6 +16,7 @@ from phasesweep.engine.repeats import (
     _repeats_summary,
     _validate_repeats_block,
     group_key,
+    group_labels,
     observed_means,
     ranked_group,
     reduce_values,
@@ -104,6 +105,20 @@ def test_group_key_keeps_seeded_random_slots_apart_and_ignores_the_repeat_key() 
     assert group_key(1, params, grid_axis) == group_key(6, {"seed": 1, "lr": 0.1}, grid_axis)
     assert random_axis.index_of(1) == 1
     assert random_axis.index_of(7) is None
+
+
+def test_group_labels_name_each_grid_configuration_by_its_last_member() -> None:
+    """Grid groups have no slots, so interleaved configurations label by their params alone."""
+    axis = RepeatAxis(key="seed", values=(0, 1), reduce="mean", slot_size=None)
+    trials = [
+        (0, {"lr": 0.1, "seed": 0}),
+        (1, {"lr": 0.2, "seed": 1}),
+        (2, {"lr": 0.1, "seed": 1}),
+        (3, {"lr": 0.2, "seed": 0}),
+        (4, {"lr": 0.3}),
+    ]
+
+    assert group_labels(trials, axis) == {0: 2, 1: 3, 2: 2, 3: 3}
 
 
 def test_within_noise_compares_aggregates_against_two_standard_errors() -> None:

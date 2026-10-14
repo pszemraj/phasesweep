@@ -22,6 +22,7 @@ from phasesweep.config import (
     WandbExtractor,
     WandbSummaryRequiredGate,
 )
+from phasesweep.config.search import sampler_capability_line
 from phasesweep.runtime.json import JsonObject, JsonValue
 from tests.conftest import make_experiment, write_yaml
 
@@ -1131,7 +1132,11 @@ def test_repeats_requires_grid_or_seeded_random(sampler: JsonObject, spelled: st
 
     grid = make_experiment(phases=[_repeats_phase(sampler={"type": "grid"})])
     assert grid.phases[0].repeats is not None
-    assert make_experiment(phases=[_repeats_phase()]).phases[0].sampler.seed == 0
+    seeded = make_experiment(phases=[_repeats_phase()]).phases[0]
+    assert seeded.sampler.seed == 0
+    assert sampler_capability_line(seeded) == (
+        "phase 'p': sampler=random seed=0 (resumable, reproducible), repeats=seed×3 (mean)"
+    )
 
 
 @pytest.mark.parametrize(
