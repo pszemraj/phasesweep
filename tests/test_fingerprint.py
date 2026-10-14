@@ -542,6 +542,7 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
         "cwd": make_experiment(execution=ExecutionContext(cwd=str(tmp_path))),
         "inherit_all": make_experiment(execution=ExecutionContext(inherit_env="all")),
         "inherit_names": make_experiment(execution=ExecutionContext(inherit_env=["HF_TOKEN"])),
+        "digest_tmpdir": make_experiment(execution=ExecutionContext(passthrough_env=[])),
     }
     experiment_fps = {name: _experiment_semantic_fingerprint(exp) for name, exp in variants.items()}
     phase_fps = {name: _phase_fingerprint(exp, exp.phases[0], {}) for name, exp in variants.items()}
@@ -562,14 +563,18 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     assert _experiment_semantic_fingerprint(explicit_first) == experiment_fps["unbound"]
     assert _phase_fingerprint(explicit_first, explicit_first.phases[0], {}) == phase_fps["unbound"]
 
-    distinct = ["unbound", "cwd", "inherit_all", "inherit_names"]
+    distinct = ["unbound", "cwd", "inherit_all", "inherit_names", "digest_tmpdir"]
     assert len({experiment_fps[name] for name in distinct}) == len(distinct)
     assert len({phase_fps[name] for name in distinct}) == len(distinct)
 
     # The phase payload carries the same resolved contract as the experiment one.
     cwd_exp = variants["cwd"]
     payload = _phase_semantic_payload(cwd_exp, cwd_exp.phases[0], {})
-    assert payload["execution"] == {"cwd": str(tmp_path.resolve()), "inherit_env": "none"}
+    assert payload["execution"] == {
+        "cwd": str(tmp_path.resolve()),
+        "inherit_env": "none",
+        "passthrough_env": ["TMPDIR"],
+    }
 
     # Names are a set, not a sequence: reordering the list is not an edit.
     reordered = make_experiment(

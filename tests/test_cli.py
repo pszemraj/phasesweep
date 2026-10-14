@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 import signal
 import stat
@@ -31,6 +32,7 @@ from phasesweep.config import (
     Repeats,
     Sampler,
 )
+from phasesweep.config.models import _environment_contract_line
 from phasesweep.engine import (
     ArtifactRootConflictError,
     ExperimentLockBusyError,
@@ -203,14 +205,16 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
 
 
 _BASE_ENV_NAMES = "PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ"
+_BASE_ENV_NAMES_WITHOUT_TMPDIR = "PATH, HOME, LANG, LC_ALL, USER, LOGNAME, TZ"
 _REFUSES_TO_RESUME = (
     "a persistent study refuses to resume when any value outside passthrough_env changes"
 )
 _ENVIRONMENT_CONTRACT_CASES = [
     pytest.param(
         {},
-        f"environment: inherit_env=none (inherited when set, and digested: {_BASE_ENV_NAMES}); "
-        "env keys: none; passthrough_env: none",
+        "environment: inherit_env=none (inherited when set, and digested: "
+        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: none; "
+        "passthrough_env: TMPDIR (inherited when set, excluded from the digest)",
         id="default-in-memory",
     ),
     pytest.param(
@@ -220,15 +224,30 @@ _ENVIRONMENT_CONTRACT_CASES = [
             "persistent": True,
         },
         f"environment: inherit_env=[HF_HOME] (inherited when set, and digested: {_BASE_ENV_NAMES}, "
-        "HF_HOME); env keys: A_FLAG, B_FLAG; passthrough_env: HF_TOKEN (excluded from the digest); "
+        "HF_HOME); env keys: A_FLAG, B_FLAG; "
+        "passthrough_env: HF_TOKEN (inherited when set, excluded from the digest); "
         + _REFUSES_TO_RESUME,
         id="list-and-passthrough-persistent",
     ),
     pytest.param(
         {"execution": ExecutionContext(inherit_env="all")},
-        "environment: inherit_env=all (every ambient variable is inherited and digested); "
-        "env keys: none; passthrough_env: none",
+        "environment: inherit_env=all (every ambient variable is inherited and digested, "
+        "except the passthrough_env names); env keys: none; "
+        "passthrough_env: TMPDIR (inherited when set, excluded from the digest)",
         id="all",
+    ),
+    pytest.param(
+        {"execution": ExecutionContext(passthrough_env=[])},
+        f"environment: inherit_env=none (inherited when set, and digested: {_BASE_ENV_NAMES}); "
+        "env keys: none; passthrough_env: none",
+        id="empty-passthrough-digests-tmpdir",
+    ),
+    pytest.param(
+        {"env": {"TMPDIR": "/scratch"}},
+        "environment: inherit_env=none (inherited when set, and digested: "
+        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: TMPDIR; "
+        "passthrough_env: none (TMPDIR set under env, so the configured value is digested)",
+        id="configured-tmpdir-stays-digested",
     ),
 ]
 
@@ -280,6 +299,26 @@ def test_dry_run_logs_environment_contract(
         r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN environment:")
     ]
     assert lines == [f"DRY RUN {expected}"]
+
+
+@pytest.mark.parametrize(("case", "expected"), _ENVIRONMENT_CONTRACT_CASES)
+def test_environment_contract_line_lists_each_variable_once(
+    tmp_path: Path, case: dict, expected: str
+) -> None:
+    """A variable is digested, set under ``env``, or passed through, never two of them."""
+    line = _environment_contract_line(_environment_contract_experiment(tmp_path, case))
+    assert line == expected
+    digested = re.search(r"digested: ([^)]*)\)", line)
+    env_keys = re.search(r"env keys: ([^;]*)", line)
+    passed = re.search(r"passthrough_env: ([A-Z_, ]+?)(?: \(|;|$)", line)
+    names = [
+        name
+        for match in (digested, env_keys, passed)
+        if match is not None
+        for name in match.group(1).split(", ")
+        if name != "none"
+    ]
+    assert len(names) == len(set(names)), line
 
 
 @pytest.mark.parametrize("configured", [False, True])

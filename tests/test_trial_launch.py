@@ -899,7 +899,7 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert payload["digest"] == identity.digest
     assert payload["inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
-    assert payload["passthrough_env"] == []
+    assert payload["passthrough_env"] == ["TMPDIR"]
     assert payload["env"]["PHASESWEEP_TEST_TOKEN"] == "ambient-secret"
     assert payload["env"]["CONFIGURED"] == "value"
     assert sorted(payload["env"]) == list(identity.names)
@@ -919,6 +919,66 @@ def test_passthrough_value_rotation_preserves_semantic_environment_digest(
     assert first.digest == second.digest
     assert first.values["WANDB_API_KEY"] == "first-secret"
     assert second.values["WANDB_API_KEY"] == "rotated-secret"
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        pytest.param(ExecutionContext(), id="default"),
+        pytest.param(ExecutionContext(inherit_env="all"), id="all"),
+        pytest.param(ExecutionContext(inherit_env=["HF_HOME"]), id="list"),
+    ],
+)
+def test_default_environment_digest_ignores_tmpdir_only(
+    monkeypatch: pytest.MonkeyPatch, execution: ExecutionContext
+) -> None:
+    """``TMPDIR`` is passed through by default, so a sandbox's scratch path never splits a cohort."""
+    experiment = make_experiment(execution=execution)
+
+    monkeypatch.setenv("TMPDIR", "/sandbox/tmp")
+    first = _environment_identity(experiment, "p")
+    monkeypatch.setenv("TMPDIR", "/tmp")
+    second = _environment_identity(experiment, "p")
+    monkeypatch.setenv("PATH", "/another/bin")
+    third = _environment_identity(experiment, "p")
+
+    assert first.digest == second.digest
+    assert first.values["TMPDIR"] == "/sandbox/tmp"
+    assert second.values["TMPDIR"] == "/tmp"
+    assert "TMPDIR" in first.names
+    assert third.digest != second.digest
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        pytest.param(ExecutionContext(passthrough_env=[]), id="none"),
+        pytest.param(ExecutionContext(inherit_env="all", passthrough_env=[]), id="all"),
+        pytest.param(
+            ExecutionContext(inherit_env=["HF_HOME"], passthrough_env=["HF_TOKEN"]), id="replaced"
+        ),
+    ],
+)
+def test_emptied_or_replaced_passthrough_env_digests_tmpdir(
+    monkeypatch: pytest.MonkeyPatch, execution: ExecutionContext
+) -> None:
+    """A ``passthrough_env`` written in the config replaces the ``TMPDIR`` default."""
+    experiment = make_experiment(execution=execution)
+
+    monkeypatch.setenv("TMPDIR", "/sandbox/tmp")
+    first = _environment_identity(experiment, "p")
+    monkeypatch.setenv("TMPDIR", "/tmp")
+    second = _environment_identity(experiment, "p")
+
+    assert first.digest != second.digest
+
+
+def test_configured_tmpdir_stays_digested_under_the_default_passthrough() -> None:
+    """An ``env`` value for ``TMPDIR`` is semantic even though ``TMPDIR`` is passed through."""
+    first = _environment_identity(make_experiment(env={"TMPDIR": "/scratch/a"}), "p")
+    second = _environment_identity(make_experiment(env={"TMPDIR": "/scratch/b"}), "p")
+
+    assert first.digest != second.digest
 
 
 def test_skipped_phase_drift_uses_that_phases_remote_bindings(

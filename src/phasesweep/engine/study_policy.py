@@ -682,7 +682,8 @@ def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> No
             f"Study {study.study_name!r} contains trial(s) from semantic trainer "
             f"environment cohort(s) [{rendered}], but this invocation composes "
             f"{current_digest[:12]}. No trial was allocated. Restore the original "
-            "semantic environment, classify rotating credentials under "
+            "semantic environment (a different PATH counts), classify variables "
+            "that may differ, such as rotating credentials, under "
             "execution.passthrough_env, or use a new experiment name.",
             action=OperatorAction.FIX_CONFIG,
         )
