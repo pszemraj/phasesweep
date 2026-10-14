@@ -90,9 +90,35 @@ Save the `run_id` returned by launch. To reconnect from another chat or after a 
 }
 ```
 
-If it returns `found: false`, `run` is null and there is no run to resume. `await_run` is bounded server-side waiting; use it for monitoring rather than tight status polling. Never cancel a run or launch a replacement automatically.
+If it returns `found: false`, `run` is null and there is no run to resume. `await_run` is bounded server-side waiting; use it for monitoring rather than tight status polling. One call accepts at most 600 seconds in `timeout_seconds`; to keep waiting, call it again with the same `run_id`. Never cancel a run or launch a replacement automatically.
 
 `get_run_results` is run-specific. A plain `phasesweep run` can publish winners, but it does not create an MCP run record. Its results remain inspectable through `phasesweep status` and `phasesweep show-winners`; the server does not create handles for an arbitrary existing output tree.
+
+### Calling a tool from a shell
+
+`phasesweep mcp call` runs one tool of a catalog in the calling process, without an MCP client, for scripting or debugging a tool call:
+
+```bash
+phasesweep mcp call list_experiments --catalog /absolute/path/to/catalog.yaml
+phasesweep mcp call inspect_experiment --catalog /absolute/path/to/catalog.yaml '{"experiment_id": "tiny_lm"}'
+```
+
+The optional last argument is a JSON object of tool arguments and defaults to `{}`. The call goes through the server's own dispatch, so the strict input schema, redaction and audit log apply exactly as for a connected client, and the catalog's permissions are the only authority: `launch_run` here starts a real detached run. Exit code 0 prints the structured result as JSON on stdout. Exit code 1 prints the tool error on stderr, the same text a client receives in its `isError` result. Exit code 2 means an argument that is not a JSON object, a missing MCP extra, or a catalog that fails startup validation.
+
+A `launch_run` call from a shell outside the host's initial PID namespace, such as a sandboxed agent shell, prints a warning: the runner belongs to that namespace and ends when it does, so launch a run that must last from a shell outside any sandbox (see [PID namespaces](#pid-namespaces)).
+
+To wait on a run longer than one `await_run` call allows, repeat the call with the same `run_id` until the run stops running:
+
+```bash
+catalog=/absolute/path/to/catalog.yaml
+run_id=tiny_lm-0123456789abcdef0123456789abcdef
+while out=$(phasesweep mcp call await_run --catalog "$catalog" "{\"run_id\": \"$run_id\", \"timeout_seconds\": 600}"); do
+  echo "$out" | jq -e '.run.state == "running" and (.run.recovery_required | not)' > /dev/null || break
+done
+echo "$out" | jq '.run'
+```
+
+The loop ends when the run reaches a terminal state, requires recovery, or a call fails; in the last case the error is already on stderr and `$out` is empty.
 
 ## Reading status responses
 

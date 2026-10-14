@@ -56,6 +56,14 @@ codex mcp list
 
 Restart or reconnect the client as its documentation requires. Confirm the connection with the existing read-only `list_experiments` catalog operation; for example, ask the connected agent to list the available PhaseSweep experiments and permitted actions without launching anything. The response contains only catalog-approved IDs, descriptions, phase shape, metrics, and permitted actions.
 
+To check the same operation without a client, or to script or debug a single tool call from a shell, run it directly; it prints the structured result as JSON, or the tool error on stderr:
+
+```bash
+phasesweep mcp call list_experiments --catalog /absolute/path/to/catalog.yaml
+```
+
+See [calling a tool from a shell](mcp.md#calling-a-tool-from-a-shell) for arguments, exit codes, and a loop that waits on a run past the 600-second `await_run` limit.
+
 For an explicitly authorized run, follow the [tool workflow](mcp.md#tool-workflow) and [response shapes](mcp.md#reading-status-responses).
 
 ## Maintenance and troubleshooting

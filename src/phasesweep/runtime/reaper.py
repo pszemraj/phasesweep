@@ -127,6 +127,16 @@ def read_pid_namespace() -> str | None:
     return value if is_pid_namespace(value) else None
 
 
+def in_initial_pid_namespace() -> bool:
+    """Return whether this process runs in the host's initial PID namespace.
+
+    :return bool: Whether this process's namespace is the host's initial one;
+        ``False`` when the namespace is unreadable.
+    """
+    current = read_pid_namespace()
+    return current is not None and _pid_namespace_link(current) == INITIAL_PID_NAMESPACE_LINK
+
+
 def same_pid_namespace(pid_namespace: str) -> bool:
     """Return whether PIDs recorded in ``pid_namespace`` can be probed from this process.
 
@@ -168,8 +178,7 @@ def recorded_process_blocker(
     :return str | None: ``None`` when no candidate remains; otherwise a clause
         naming what blocked the proof, including every blocking host PID.
     """
-    current = read_pid_namespace()
-    if current is None or _pid_namespace_link(current) != INITIAL_PID_NAMESPACE_LINK:
+    if not in_initial_pid_namespace():
         return (
             "only the host's initial PID namespace can see another namespace's processes, "
             "so run this from there"

@@ -3,7 +3,7 @@
 PhaseSweepMCP (in :mod:`phasesweep.mcp.tools`) holds all logic and is SDK-free
 and unit-testable. build_server wraps each method as a FastMCP tool; _safe_tool
 guarantees tool errors are redacted. serve() loads the catalog, builds the
-store, and serves over stdio.
+store, and serves over stdio; call() runs one tool through the same server.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import asyncio
 import functools
 import importlib.util
 import inspect
+import json
 import logging
 import sys
 from collections.abc import Callable
@@ -52,6 +53,8 @@ from phasesweep.mcp.tools import (
     MAX_LIST_LIMIT,
     PhaseSweepMCP,
 )
+from phasesweep.runtime.json import JsonObject, json_object
+from phasesweep.runtime.reaper import in_initial_pid_namespace
 
 log = logging.getLogger("phasesweep.mcp.server")
 
@@ -215,7 +218,9 @@ AwaitTimeoutSeconds = Annotated[
     int,
     Field(
         description=(
-            "Seconds to block waiting for the run to change before returning its current status."
+            "Seconds to block waiting for the run to change before returning its current status. "
+            f"At most {AWAIT_MAX_TIMEOUT_SECONDS}; to keep waiting longer, call await_run again "
+            "with the same run_id."
         ),
         ge=AWAIT_MIN_TIMEOUT_SECONDS,
         le=AWAIT_MAX_TIMEOUT_SECONDS,
@@ -1051,6 +1056,64 @@ def serve(catalog: Path) -> int:
 
     app = PhaseSweepMCP(registry, RunStore(registry.state_dir))
     build_server(app).run(transport="stdio")
+    return 0
+
+
+def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
+    """Run one tool of the served catalog in this process and print its result.
+
+    The call goes through FastMCP's own ``call_tool``, so the strict input
+    schema, the redaction wrapper and the audit log run exactly as they do for a
+    connected client.
+
+    :param Path catalog: Operator-authored catalog file.
+    :param str tool: Registered tool name, such as ``list_experiments``.
+    :param JsonObject arguments: Tool arguments, validated by the tool's own schema.
+    :return int: Process exit code: 0 after the structured result is printed as
+        JSON on stdout, 1 after a tool error is printed on stderr, and 2 when a
+        startup prerequisite or the catalog failed before the tool could run.
+    """
+    logging.basicConfig(
+        level=logging.WARNING,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname).1s %(name)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    if importlib.util.find_spec("mcp") is None:
+        print(
+            f"phasesweep mcp: MCP support is not installed; install with "
+            f"`{MCP_EXTRA_INSTALL_COMMAND}`.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        registry = Registry.load(catalog)
+    except CatalogError as exc:
+        print(f"phasesweep mcp: {exc}", file=sys.stderr)
+        return 2
+
+    if tool == TOOL_LAUNCH_RUN and not in_initial_pid_namespace():
+        print(
+            "phasesweep mcp call: warning: this process is not in the host's initial PID "
+            "namespace, so a runner launched from it ends when that namespace does, such as "
+            "when a sandboxed command finishes; launch from a shell outside any sandbox for "
+            "a run that must outlive it.",
+            file=sys.stderr,
+        )
+
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    server = build_server(PhaseSweepMCP(registry, RunStore(registry.state_dir)))
+    try:
+        # Every tool declares structured output, so a result is (unstructured, structured).
+        _unstructured, structured = asyncio.run(server.call_tool(tool, arguments))
+    except ToolError as exc:
+        # The text a client receives in its ``isError`` result.
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(json_object(structured), indent=2))
     return 0
 
 

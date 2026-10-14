@@ -52,7 +52,7 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
-from phasesweep.runtime.json import JsonValue
+from phasesweep.runtime.json import JsonObject, JsonValue, json_object, strict_json_loads
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
@@ -909,6 +909,60 @@ def mcp_serve(ctx: click.Context, catalog: Path) -> None:
     from phasesweep.mcp.server import serve
 
     ctx.exit(serve(catalog))
+
+
+def _tool_arguments(ctx: click.Context, param: click.Parameter, value: str) -> JsonObject:
+    """Parse the ``mcp call`` argument text as one strict JSON object.
+
+    :param click.Context ctx: Active Click context, unused.
+    :param click.Parameter param: Parameter being parsed, unused.
+    :param str value: Argument text, ``{}`` when omitted.
+    :raises click.BadParameter: If the text is not strict JSON or not an object.
+    :return JsonObject: The decoded tool arguments.
+    """
+    del ctx, param
+    try:
+        return json_object(strict_json_loads(value))
+    except ValueError as exc:
+        raise click.BadParameter(f"expected a JSON object of tool arguments: {exc}") from exc
+
+
+@mcp.command(
+    name="call",
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Run one MCP tool against a catalog in this process and print its structured result as "
+        "JSON, through the same dispatch, validation, redaction and audit as `mcp serve`. "
+        "JSON_ARGS is a JSON object of tool arguments and defaults to {}. Exit code 0 prints the "
+        "result; 1 prints the tool's error on stderr; 2 means bad input or a catalog that does "
+        "not load. The call is real: launch_run starts a detached run."
+    ),
+    short_help="Call one MCP tool from the shell.",
+)
+@click.argument("tool")
+@click.argument("json_args", metavar="[JSON_ARGS]", default="{}", callback=_tool_arguments)
+@click.option(
+    "--catalog",
+    required=True,
+    metavar="PATH",
+    type=CONFIG_PATH,
+    help="MCP catalog that maps agent-visible experiment ids to config files.",
+)
+@click.pass_context
+def mcp_call(ctx: click.Context, tool: str, json_args: JsonObject, catalog: Path) -> None:
+    """Call one MCP tool without a client, for scripting or debugging.
+
+    The MCP SDK import stays behind this command so the base CLI still works
+    without installing the ``mcp`` optional dependency.
+
+    :param click.Context ctx: Active Click context used to exit with the call's return code.
+    :param str tool: Tool name, such as ``list_experiments``.
+    :param JsonObject json_args: Tool arguments, already parsed as a JSON object.
+    :param Path catalog: Operator-authored MCP catalog to load.
+    """
+    from phasesweep.mcp.server import call
+
+    ctx.exit(call(catalog, tool, json_args))
 
 
 @mcp.command(

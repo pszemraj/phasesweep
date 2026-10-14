@@ -2,7 +2,7 @@ Use PhaseSweep only through the operator-approved experiment catalog.
 
 1. Call `list_experiments`, following its cursor until it is null, and call `inspect_experiment` before proposing a run.
 2. Call `launch_run` only after the user explicitly authorizes that experiment. Save the returned `run_id`.
-3. Use `run_id` for every lifecycle read: `get_run_status`, `await_run`, `get_run_results`, and `cancel_run`. Use `await_run` for bounded monitoring and `get_run_status` for a single check only, never in a tight polling loop.
+3. Use `run_id` for every lifecycle read: `get_run_status`, `await_run`, `get_run_results`, and `cancel_run`. Use `await_run` for bounded monitoring and `get_run_status` for a single check only, never in a tight polling loop. One `await_run` call waits at most 600 seconds; to wait longer, call it again with the same `run_id`.
 4. After a client error or disconnect, call `get_latest_run(experiment_id)` only to recover the run ID. Launch returns top-level `run_id`; `get_latest_run` returns `found` and a nested `run`, so recover `run.run_id` when `found` is true. If `found` is false, `run` is null: stop; otherwise resume run-specific monitoring with that ID. Do not read an experiment's mutable current results as a substitute for a run snapshot.
 5. Never automatically cancel a run or launch a replacement run.
 6. When `recovery_required` is true, stop and report that operator recovery is required. If a run read says persistent study state is unavailable or incompatible, stop and report that operator intervention is required. Do not retry, launch a replacement, or substitute experiment-level results.

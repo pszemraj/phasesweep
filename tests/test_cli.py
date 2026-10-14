@@ -355,7 +355,7 @@ def test_help_registers_commands_and_options() -> None:
     assert mcp_help.exit_code == 0
     assert "Manage the optional MCP server, catalog, and operator recovery." in mcp_help.output
     assert "integrations" not in mcp_help.output
-    for command in ("check", "init-catalog", "recover-run", "serve"):
+    for command in ("call", "check", "init-catalog", "recover-run", "serve"):
         assert command in mcp_help.output
     for command in ("check-install", "install", "uninstall"):
         assert command not in mcp_help.output
@@ -364,6 +364,11 @@ def test_help_registers_commands_and_options() -> None:
     serve_help = runner.invoke(cli_main, ["mcp", "serve", "--help"], terminal_width=120)
     assert serve_help.exit_code == 0
     assert "--catalog PATH" in serve_help.output
+
+    call_help = runner.invoke(cli_main, ["mcp", "call", "--help"], terminal_width=120)
+    assert call_help.exit_code == 0
+    assert "call [OPTIONS] TOOL [JSON_ARGS]" in call_help.output
+    assert "--catalog PATH" in call_help.output
 
     check_help = runner.invoke(cli_main, ["mcp", "check", "--help"], terminal_width=120)
     assert check_help.exit_code == 0
