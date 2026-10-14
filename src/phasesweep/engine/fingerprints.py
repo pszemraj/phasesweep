@@ -38,17 +38,14 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_partial_grid",
     }
 )
-# v7 / v6: the metric's min/max viability bounds are part of its identity, and
-# a phase's repeats block is part of the phase's.
-# v6 / v5: the retained configuration surface changed. v5 / v4: the embedded
-# complete trainer_config is part of the core experiment and phase identity.
-# v4 / v3: an omitted execution.cwd contributes its effective
-# invocation directory instead of an unbound null, so identical
-# persistent-study identities cannot launch different relative commands from
-# two invocation directories. whole_node phases additionally fingerprint their
-# configured device-set size — the trainer's world size.
-# Existing populated studies from earlier schemas fail the fingerprint check
-# on resume, and the refusal names the operator's options.
+# Bump on any change to what a fingerprint covers. The covered inputs include
+# the complete trainer_config, the metric with its min/max viability bounds,
+# each phase's repeats block, and the effective execution.cwd: an omitted cwd
+# contributes the invocation directory, so one persistent study cannot launch
+# its relative commands from two directories. whole_node phases also cover
+# their configured device-set size, the trainer's world size. A populated study
+# stamped with another schema fails the fingerprint check on resume, and the
+# refusal names the operator's options.
 FINGERPRINT_SCHEMA_VERSION = 7
 EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 6
 
