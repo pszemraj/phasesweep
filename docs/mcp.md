@@ -215,7 +215,7 @@ When the launching sandbox has already ended, run `recover-run` from a host shel
 
 The server does not accept configuration YAML, paths, commands, storage URLs, environment values, search ranges, sampler settings, gates, or safety waivers as tool input. Only the operator-authored catalog maps an experiment ID to a config. A catalog permission is not a grant to alter its config.
 
-No tool returns raw trainer logs, result files, commands, storage locations, or unredacted fixed/inherited values. Keep secrets, private paths, and data identifiers out of searchable categorical choices unless exposing them is an intentional catalog decision.
+No tool returns raw trainer logs, a failed trial's reason (which quotes the last line of its `stderr.log`), result files, commands, storage locations, or unredacted fixed/inherited values. Keep secrets, private paths, and data identifiers out of searchable categorical choices unless exposing them is an intentional catalog decision.
 
 > [!NOTE]
 > Training still runs with the authority of the operator-authored command; MCP restricts agent inputs and outputs, not the trainer process itself.

@@ -10,12 +10,13 @@ from pathlib import Path
 import pytest
 
 from phasesweep.config import FloatParam, JsonEnvelopeExtractor, Metric
-from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine import NoFeasibleTrialError, PhaseWinnerView, read_status, run_experiment
+from phasesweep.engine.paths import _experiment_dir
 from phasesweep.engine.repeats import RepeatsSummary
 from phasesweep.engine.state import WinnerSource
-from phasesweep.mcp.redaction import intersect_visible_params, winners_payload
+from phasesweep.mcp.redaction import intersect_visible_params, status_payload, winners_payload
 from phasesweep.mcp.snapshots import capture_result_snapshot
-from tests.conftest import make_experiment
+from tests.conftest import make_experiment, write_trainer
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     _write_experiment_config,
@@ -397,6 +398,47 @@ def test_validate_reports_the_repeat_count_but_not_the_repeat_key(tmp_path: Path
     assert [phase["repeats"] for phase in structure["phases"]] == [3]
     assert structure["phases"][0]["search_space"] == ["lr"]
     assert_no_sensitive(structure, ["secret_repeat_key", "rv_beta"])
+
+
+def test_trial_failure_reasons_and_their_stderr_quote_never_reach_status_or_snapshots(
+    tmp_path: Path,
+) -> None:
+    """A failed trial's reason quotes trainer stderr, and no MCP status surface carries any reason.
+
+    The reason stays in ``run.log``, ``trials.csv`` and the ledger the operator owns. The
+    status payloads are built from trial counts and winner facts alone.
+    """
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import sys
+
+        print("RuntimeError: STDERR_SENTINEL leaked-credential-123", file=sys.stderr)
+        sys.exit(1)
+        """,
+    )
+    experiment = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=2)
+
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    run_log = (_experiment_dir(experiment) / "run.log").read_text()
+    assert "reason=non-zero exit code 1; stderr: RuntimeError: STDERR_SENTINEL" in run_log
+    status = read_status(experiment)
+    payloads = [
+        status,
+        status_payload(
+            "srv",
+            status,
+            {"run_id": "run-1"},
+            result_source="current_shared_study",
+            elapsed_seconds=None,
+        ),
+        capture_result_snapshot(experiment),
+    ]
+    assert status["phases"][0]["trials"]["FAIL"] == 2
+    for payload in payloads:
+        assert_no_sensitive(payload, ["STDERR_SENTINEL", "leaked-credential-123", "non-zero exit"])
 
 
 def test_winners_payload_defaults_claim_no_historical_provenance() -> None:

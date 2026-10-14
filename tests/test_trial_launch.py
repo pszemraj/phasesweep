@@ -37,6 +37,7 @@ from phasesweep.engine.trial import (
     TrialExecutionError,
     TrialResult,
     _environment_identity,
+    _stderr_last_line,
     extract_trial_result,
     launch_trial,
 )
@@ -521,20 +522,42 @@ def test_launch_trial_no_visibility_warning_when_a_device_is_leased(
     assert not [r for r in caplog.records if "ambient CUDA_VISIBLE_DEVICES" in r.message]
 
 
-def _exit_code_result(tmp_path: Path, experiment: Experiment, phase: str, code: int) -> TrialResult:
-    """Extract the result of a trainer that exited with ``code`` and wrote nothing.
+def _exit_code_result(
+    tmp_path: Path,
+    experiment: Experiment,
+    phase: str,
+    code: int,
+    *,
+    stderr: bytes | None = None,
+    trial_id: int = 0,
+) -> TrialResult:
+    """Extract the result of a trainer that exited with ``code`` after writing ``stderr``.
 
     :param Path tmp_path: Directory standing in for the trial directory.
     :param Experiment experiment: Experiment whose contract is under test.
     :param str phase: Phase name recorded in the trial context.
     :param int code: Trainer exit code.
+    :param bytes | None stderr: Content of ``stderr.log``, or ``None`` for no such file.
+    :param int trial_id: Trial number recorded in the trial context.
     :return TrialResult: The extracted (failed) result.
     """
+    if stderr is None:
+        (tmp_path / "stderr.log").unlink(missing_ok=True)
+    else:
+        (tmp_path / "stderr.log").write_bytes(stderr)
     executed = ExecutedTrial(
-        ctx=make_trial_context(tmp_path, phase=phase),
+        ctx=make_trial_context(tmp_path, phase=phase, trial_id=trial_id),
         process=ProcessResult(return_code=code, timed_out=False, pid=1, duration_seconds=0.1),
     )
     return extract_trial_result(experiment=experiment, executed=executed)
+
+
+def _environment_hints(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Return the narrowed-environment hints the captured log holds, in order."""
+    return [r.getMessage() for r in caplog.records if "execution.inherit_env" in r.getMessage()]
+
+
+OOM_LINE = "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB. GPU 0"
 
 
 @pytest.mark.parametrize(
@@ -589,6 +612,168 @@ def test_nonzero_exit_hint_is_silent_for_full_inheritance_and_for_success(
         _exit_code_result(tmp_path, make_experiment(), "p", 0)
 
     assert not [r for r in caplog.records if "execution.inherit_env" in r.getMessage()]
+
+
+def test_nonzero_exit_reason_quotes_the_last_stderr_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A trainer's own last error names the cause, and an out-of-memory error gets no environment hint."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    stderr = f"Traceback (most recent call last):\n  File 'train.py', line 9\n{OOM_LINE}\n\n"
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        result = _exit_code_result(tmp_path, make_experiment(), "p", 1, stderr=stderr.encode())
+
+    assert result.failure_reason == f"non-zero exit code 1; stderr: {OOM_LINE}"
+    assert _environment_hints(caplog) == []
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "ModuleNotFoundError: No module named 'x'",
+        "ImportError: cannot import name 'y' from 'x'",
+        "/usr/bin/python: No module named x",
+        "sh: 1: nvidia-smi: command not found",
+        "FileNotFoundError: [Errno 2] No such file or directory: 'data.csv'",
+        "KeyError: 'HF_HOME'",
+        "RuntimeError: the HF_HOME environment variable must be set",
+        "RuntimeError: WANDB_PROJECT is not set",
+    ],
+)
+def test_stderr_naming_a_missing_environment_input_keeps_the_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    line: str,
+) -> None:
+    """A last line that suggests a missing variable, tool or module logs the hint, quoting that line."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        result = _exit_code_result(tmp_path, make_experiment(), "p", 1, stderr=line.encode())
+
+    assert result.failure_reason == f"non-zero exit code 1; stderr: {line}"
+    (hint,) = _environment_hints(caplog)
+    assert f'Its last stderr line was "{line}".' in hint
+    assert "execution.inherit_env: all" in hint
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        OOM_LINE,
+        "KeyError: 'loss'",
+        "AssertionError: loss is nan",
+        "RuntimeError: CUDA error: device-side assert triggered",
+    ],
+)
+def test_stderr_naming_another_cause_gets_no_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    line: str,
+) -> None:
+    """A last line that names its own cause is reported alone."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        _exit_code_result(tmp_path, make_experiment(), "p", 1, stderr=line.encode())
+
+    assert _environment_hints(caplog) == []
+
+
+def test_a_failure_without_an_environment_cause_does_not_use_up_the_phase_hint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The once-per-phase hint waits for the first failure that suggests the environment."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    lines = [
+        OOM_LINE,
+        "ModuleNotFoundError: No module named 'x'",
+        "ModuleNotFoundError: No module named 'y'",
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        for trial_id, line in enumerate(lines):
+            _exit_code_result(
+                tmp_path, make_experiment(), "p", 1, stderr=line.encode(), trial_id=trial_id
+            )
+
+    (hint,) = _environment_hints(caplog)
+    assert hint.startswith("[p/trial_1] the trainer exited with code 1 under ")
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        pytest.param(None, id="no-file"),
+        pytest.param(b"", id="empty"),
+        pytest.param(b"\n  \n\t\n", id="blank"),
+        pytest.param(b"\x00\x01\xff\xfe\n\x1b[0m\n", id="binary-only"),
+    ],
+)
+def test_nonzero_exit_without_a_stderr_line_keeps_the_reason_and_the_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stderr: bytes | None,
+) -> None:
+    """With no line to quote the reason is the bare exit code, and nothing rules the environment out."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        result = _exit_code_result(tmp_path, make_experiment(), "p", 2, stderr=stderr)
+
+    assert result.failure_reason == "non-zero exit code 2"
+    (hint,) = _environment_hints(caplog)
+    assert "Its last stderr line" not in hint
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        pytest.param(
+            b"warn\n\x1b[1;31mError:\x1b[0m\tbad\x07  value\x00\n",
+            "Error: bad value",
+            id="escapes-controls-and-whitespace",
+        ),
+        pytest.param(
+            b"50%|#####     |\r100%|##########|\n", "100%|##########|", id="carriage-return"
+        ),
+        pytest.param(b"real error\n\xff\xfe\x00\x01\n\n", "real error", id="binary-last-line"),
+        pytest.param("ünïcode ✗ error\n".encode(), "ünïcode ✗ error", id="unicode"),
+        pytest.param(b"E" * 500, "E" * 197 + "...", id="long-line-is-cut"),
+        pytest.param(b"E" * 200 + b"\n", "E" * 200, id="exactly-at-the-cap"),
+        pytest.param(b"E" * 201 + b"\n", "E" * 197 + "...", id="one-over-the-cap"),
+        pytest.param(b"first\n" + b"x\n" * 20_000 + b"last\n", "last", id="large-file"),
+    ],
+)
+def test_stderr_quote_is_one_capped_printable_line(
+    tmp_path: Path, content: bytes, expected: str
+) -> None:
+    """The quote has no control characters, no line break and at most 200 characters."""
+    (tmp_path / "stderr.log").write_bytes(content)
+
+    quoted = _stderr_last_line(tmp_path)
+
+    assert quoted == expected
+    assert quoted is not None and len(quoted) <= 200 and quoted.isprintable()
+
+
+def test_stderr_quote_reads_only_the_tail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A line longer than the read window is quoted from the window, never read whole."""
+    monkeypatch.setattr("phasesweep.engine.trial._STDERR_TAIL_BYTES", 16)
+    (tmp_path / "stderr.log").write_bytes(b"A" * 100)
+
+    assert _stderr_last_line(tmp_path) == "A" * 16
+
+
+def test_stderr_quote_is_none_when_the_file_cannot_be_read(tmp_path: Path) -> None:
+    """A missing log, and a path that is not a file, quote nothing instead of raising."""
+    assert _stderr_last_line(tmp_path) is None
+    (tmp_path / "stderr.log").mkdir()
+    assert _stderr_last_line(tmp_path) is None
 
 
 def test_launch_trial_inherit_env_list_adds_exactly_named(

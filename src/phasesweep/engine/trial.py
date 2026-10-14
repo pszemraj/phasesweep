@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -128,6 +129,27 @@ _DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
 # Warn-once keys for :func:`_warn_narrowed_environment_exit`, with the same
 # once-per-phase-per-process scope.
 _NARROWED_ENV_EXIT_WARNED: set[tuple[str, str]] = set()
+
+# How far back from the end of ``stderr.log`` a failed trial's reason reads.
+_STDERR_TAIL_BYTES = 4096
+
+# Longest stderr quote in a failure reason, the ``...`` that marks a cut included.
+_STDERR_QUOTE_CHARS = 200
+
+# A terminal color or cursor sequence, which would otherwise leave its ``[31m`` residue.
+_ANSI_SEQUENCE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+# Last stderr lines that suggest the trainer lacked an environment input, so the
+# narrowed-environment hint applies: a failed import (``PYTHONPATH`` dropped), a
+# missing tool or file (``PATH`` dropped), an ``os.environ["NAME"]`` lookup, or
+# words naming an unset variable. Any other line names its own cause and the hint
+# stays out of its way.
+_MISSING_ENVIRONMENT_STDERR = re.compile(
+    r"ModuleNotFoundError|ImportError|No module named"
+    r"|command not found|No such file or directory"
+    r"|KeyError: ['\"][A-Z][A-Z0-9_]*['\"]"
+    r"|(?i:environment variable|is not set)"
+)
 
 
 def _trainer_environment(
@@ -378,28 +400,82 @@ def _warn_dropped_cuda_visibility(
     )
 
 
+def _printable_line(raw: str) -> str:
+    """Reduce one line of trainer output to plain single-line text.
+
+    :param str raw: One line, without its terminator.
+    :return str: The line without terminal escape sequences, control characters or
+        decoding replacements, with every whitespace run collapsed to one space.
+    """
+    text = _ANSI_SEQUENCE.sub("", raw)
+    kept = (
+        " " if ch.isspace() else ch
+        for ch in text
+        if ch.isspace() or (ch.isprintable() and ch != "\N{REPLACEMENT CHARACTER}")
+    )
+    return " ".join("".join(kept).split())
+
+
+def _stderr_last_line(trial_dir: Path) -> str | None:
+    """Return the last non-empty line of a trial's ``stderr.log``, ready to quote.
+
+    Reads at most :data:`_STDERR_TAIL_BYTES` from the end of the file in the
+    operator-trusted trial directory. A line cut by that window is quoted from
+    where the window starts. A line longer than :data:`_STDERR_QUOTE_CHARS` is cut
+    and ends in ``...``. A line with nothing printable left, such as binary
+    output, does not count, so the line before it is quoted.
+
+    :param Path trial_dir: Trial directory holding ``stderr.log``.
+    :return str | None: The line, or ``None`` when the file is missing, unreadable
+        or has no printable line.
+    """
+    try:
+        with (trial_dir / "stderr.log").open("rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, size - _STDERR_TAIL_BYTES))
+            tail = handle.read(_STDERR_TAIL_BYTES)
+    except OSError:
+        return None
+    for raw in reversed(tail.decode("utf-8", errors="replace").splitlines()):
+        line = _printable_line(raw)
+        if not line:
+            continue
+        if len(line) > _STDERR_QUOTE_CHARS:
+            return line[: _STDERR_QUOTE_CHARS - 3].rstrip() + "..."
+        return line
+    return None
+
+
 def _warn_narrowed_environment_exit(
     *,
     experiment: Experiment,
     phase_name: str,
     trial_id: int,
     return_code: int,
+    stderr_line: str | None,
 ) -> None:
     """Warn once per phase when a trainer exits nonzero under a narrowed environment.
 
     A trainer that was started without a variable it needs, such as ``PYTHONPATH``
-    or a cache path, usually fails with an error that never mentions the
-    environment. Name the contract and the three ways to widen it, once per
-    phase for the process, so the first failure carries the hint without
-    repeating it for every later trial.
+    or a cache path, can fail with an error that never mentions the environment.
+    Name the contract and the three ways to widen it, once per phase for the
+    process, so the first such failure carries the hint without repeating it for
+    every later trial. A failure whose stderr line names another cause, such as an
+    out-of-memory error, gets no hint and does not use up the phase's one warning.
+    Without a stderr line there is nothing to rule the environment out, so the hint
+    applies.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :param str phase_name: Phase whose trial failed, used for the warn-once key.
     :param int trial_id: Phase-local trial number of the failed trial.
     :param int return_code: The nonzero exit code the trainer returned.
+    :param str | None stderr_line: The trial's last stderr line from
+        :func:`_stderr_last_line`, or ``None`` when it has none.
     """
     admitted = experiment.execution.inherited_env_names()
     if admitted is None:
+        return
+    if stderr_line is not None and _MISSING_ENVIRONMENT_STDERR.search(stderr_line) is None:
         return
     key = (experiment.experiment, phase_name)
     if key in _NARROWED_ENV_EXIT_WARNED:
@@ -410,13 +486,14 @@ def _warn_narrowed_environment_exit(
         "so it received only %s plus env and passthrough_env values. If it needs another "
         "ambient variable (PYTHONPATH, a virtualenv or conda setting, a cache path, a "
         "credential), name it in execution.inherit_env: [NAME], set it under env:, or set "
-        "execution.inherit_env: all. The trainer's own error is in stderr.log in the "
+        "execution.inherit_env: all.%s The trainer's own error is in stderr.log in the "
         "trial directory. This hint is shown once per phase.",
         phase_name,
         trial_id,
         return_code,
         experiment.execution.inherit_env,
         ", ".join(admitted),
+        "" if stderr_line is None else f' Its last stderr line was "{stderr_line}".',
     )
 
 
@@ -775,7 +852,8 @@ def extract_trial_result(
 
     Failure modes that produce a `failure_reason` (and thus an Optuna FAIL via
     TrialExecutionError):
-      * non-zero return code from the subprocess
+      * non-zero return code from the subprocess; the reason quotes the last line
+        of the trial's ``stderr.log`` when it has one
       * metric extractor raised ExtractorError
       * metric extractor returned a non-finite value
       * any constraint extractor raised ExtractorError
@@ -845,12 +923,18 @@ def extract_trial_result(
         )
 
     if rc != 0 and failure_reason is None:
+        # The one place a nonzero exit's cause is composed, so trials.csv, the
+        # TRIAL line and the outcome record all carry the same stderr quote.
+        stderr_line = _stderr_last_line(executed.ctx.trial_dir)
         failure_reason = f"non-zero exit code {rc}"
+        if stderr_line is not None:
+            failure_reason += f"; stderr: {stderr_line}"
         _warn_narrowed_environment_exit(
             experiment=experiment,
             phase_name=executed.ctx.phase,
             trial_id=executed.ctx.trial_id,
             return_code=rc,
+            stderr_line=stderr_line,
         )
 
     if failure_reason is not None:
