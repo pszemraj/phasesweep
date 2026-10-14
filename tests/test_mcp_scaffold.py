@@ -189,6 +189,21 @@ def test_home_override_pins_scaffold_state(tmp_path: Path, monkeypatch: pytest.M
     assert (state / "origin").read_text() == str(output.resolve()) + "\n"
 
 
+def test_missing_home_override_is_created_owner_only_by_scaffold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "missing-root"
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
+    config = _write_config(tmp_path, "srv.yaml")
+    output = tmp_path / "catalog.yaml"
+    result = CliRunner().invoke(
+        cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
+    )
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert Registry.load(output).state_dir.parent == root / "mcp"
+
+
 def test_scaffold_rejects_invalid_home_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

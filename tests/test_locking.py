@@ -103,16 +103,15 @@ def test_default_lock_dir_requires_an_absolute_account_home(
     assert runtime_files.lock_dir() == override
 
 
-@pytest.mark.parametrize("invalid", ["missing", "mode", "symlink"])
-def test_home_override_requires_private_provisioned_root(
+@pytest.mark.parametrize("invalid", ["mode", "symlink"])
+def test_home_override_requires_private_existing_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, invalid: str
 ) -> None:
     root = tmp_path / "root"
-    if invalid in {"mode", "symlink"}:
-        root.mkdir(mode=0o700)
+    root.mkdir(mode=0o700)
     if invalid == "mode":
         root.chmod(0o755)
-    elif invalid == "symlink":
+    else:
         link = tmp_path / "link"
         link.symlink_to(root, target_is_directory=True)
         root = link
@@ -122,6 +121,49 @@ def test_home_override_requires_private_provisioned_root(
     assert not (root / "locks").exists()
     if invalid == "mode":
         assert stat.S_IMODE(root.stat().st_mode) == 0o755
+
+
+def test_home_override_creates_missing_root_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A missing root and its missing parents are created 0700, whatever the umask."""
+    root = tmp_path / "state" / "phasesweep-home"
+    monkeypatch.setenv("PHASESWEEP_HOME", str(root))
+    previous_umask = os.umask(0)
+    try:
+        assert runtime_files.phasesweep_home() == root
+    finally:
+        os.umask(previous_umask)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(root.parent.stat().st_mode) == 0o700
+    assert runtime_files.phasesweep_home() == root
+
+
+def test_home_override_refuses_relative_path_without_creating_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PHASESWEEP_HOME", "relative-home")
+
+    with pytest.raises(runtime_files.UnsafePrivatePathError, match="must be an absolute path"):
+        runtime_files.phasesweep_home()
+
+    assert not (tmp_path / "relative-home").exists()
+
+
+def test_home_override_refuses_symlinked_ancestor_without_creating_the_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv("PHASESWEEP_HOME", str(link / "phasesweep-home"))
+
+    with pytest.raises(runtime_files.UnsafePrivatePathError):
+        runtime_files.phasesweep_home()
+
+    assert list(target.iterdir()) == []
 
 
 def test_private_home_override_selects_state_root(

@@ -72,7 +72,9 @@ def scaffold_catalog_text(output: Path, configs: Sequence[Path]) -> str:
     :param Sequence[Path] configs: Experiment configs, one catalog entry each.
     :return str: Complete catalog YAML with explanatory comments.
     :raises CatalogError: Two configs derive the same experiment id, or
-        ``PHASESWEEP_HOME`` is not a usable private root.
+        ``PHASESWEEP_HOME`` is relative, has a symlinked component, or names an
+        existing directory that is not owner-only. A missing ``PHASESWEEP_HOME``
+        is created owner-only.
     """
     catalog_dir = output.parent.resolve()
     seen: dict[str, Path] = {}

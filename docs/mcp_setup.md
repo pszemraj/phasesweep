@@ -26,6 +26,8 @@ phasesweep mcp init-catalog --from ./experiment.yaml
 
 The command writes `catalog.yaml`, validates it, and provisions a fresh [private state layout](mcp.md#fresh-mcp-state). Add another `--from` for each experiment; use `-o` for another catalog filename. The scaffold never replaces an existing catalog.
 
+Run state lives in the catalog's `state_dir`, which the scaffold records as an absolute path under `PHASESWEEP_HOME/mcp/<catalog-digest>`, or under `${XDG_STATE_HOME:-~/.local/state}/phasesweep/mcp/<catalog-digest>` when `PHASESWEEP_HOME` is unset; later changes to those variables do not move it. A missing absolute `PHASESWEEP_HOME` is created owner-only (mode 0700), while a relative path, a symlink in the path, or an existing directory with another mode is refused. The directory must be writable from the shell an agent uses, including a sandboxed one, and every process that shares runs must use the same `state_dir`, so give the server, `phasesweep mcp call` and any sandboxed shell the same catalog, and `recover-run` the same `--state-dir`. To place the state elsewhere, set `state_dir` in the catalog.
+
 > [!IMPORTANT]
 > Review the generated file against [the catalog fields and permission model](mcp.md#the-catalog) before connecting a client. The catalog decides which experiments an agent can see, which sampled values it can read, and which side effects it may request.
 

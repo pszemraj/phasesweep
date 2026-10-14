@@ -31,7 +31,7 @@
 # CUDA_VISIBLE_DEVICES is read for GPU pool discovery, PATH to find the supervisor interpreter, and HOME for ~ expansion.
 # PHASESWEEP_LOCK_DIR selects the host-lock directory that every run uses. It must name an existing absolute directory that is safe to share. It is never created or changed. By default locks live under .cache/phasesweep/locks in the OS account home, independent of HOME and XDG variables.
 # XDG_CACHE_HOME affects only the W&B and MLflow worker processes. It must be absolute to be honored. Their scratch files go under <XDG_CACHE_HOME or ~/.cache>/phasesweep.
-# PHASESWEEP_HOME and XDG_STATE_HOME affect only the default state directory that phasesweep mcp init-catalog writes. PHASESWEEP_HOME must name an existing absolute directory with mode 0700.
+# PHASESWEEP_HOME and XDG_STATE_HOME affect only the default state directory that phasesweep mcp init-catalog writes. PHASESWEEP_HOME must be an absolute path with no symlink in it; a missing directory is created with mode 0700, and an existing one must already have mode 0700.
 # Trainer cache paths, model and data downloads, training cadence and hardware use are the external trainer's responsibility.
 # The MCP catalog is a separate configuration surface: see docs/mcp.md for its fields and examples/catalog.yaml for a starting catalog.
 # Publication, cleanup and recovery are engine behavior, not YAML blocks. State written by another format version is refused.

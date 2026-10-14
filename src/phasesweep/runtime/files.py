@@ -152,10 +152,15 @@ def xdg_home(variable: str, fallback: Path) -> Path:
 
 
 def phasesweep_home() -> Path | None:
-    """Return the validated private root override without creating it.
+    """Return the validated private root override, creating a missing one owner-only.
 
-    :return Path | None: Operator-provisioned root, or None when unset.
-    :raises UnsafePrivatePathError: The override is relative, missing, or unsafe.
+    A missing directory, and any missing parent of it, is created with mode
+    ``0700``. An existing directory must already be owner-only, and no
+    component of the path may be a symlink.
+
+    :return Path | None: Private root, or None when unset.
+    :raises UnsafePrivatePathError: The override is relative, has a symlinked
+        component, or names an existing directory that is not owner-only.
     """
     override = os.environ.get("PHASESWEEP_HOME")
     if not override:
@@ -165,12 +170,7 @@ def phasesweep_home() -> Path | None:
         raise UnsafePrivatePathError(
             f"PHASESWEEP_HOME must be an absolute path: {path}", action=OperatorAction.FIX_CONFIG
         )
-    try:
-        validate_private_dir(path)
-    except FileNotFoundError as exc:
-        raise UnsafePrivatePathError(
-            f"PHASESWEEP_HOME {path} does not exist; provision an owner-only 0700 directory first."
-        ) from exc
+    ensure_private_dir(path)
     return path
 
 
