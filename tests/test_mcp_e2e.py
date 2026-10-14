@@ -671,6 +671,8 @@ def test_fastmcp_explain_config_dispatch_returns_structured_entries(tmp_path: Pa
         "experiment",
         "trial_command",
     ]
+    assert "YAML scalars follow PyYAML" in top_level.structuredContent["notes"]
+    assert found.structuredContent["notes"] == ""
 
     missing = _call_tool(app, TOOL_EXPLAIN_CONFIG, {"key": "inherit_env"})
     assert missing.isError is False

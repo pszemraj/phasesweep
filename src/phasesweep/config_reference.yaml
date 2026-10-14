@@ -3,7 +3,8 @@
 # It ships inside the package as phasesweep/config_reference.yaml and is parsed by phasesweep.config.reference. It is maintained by hand. tests/test_config_reference.py compares every key path, variant, type and default with the schema.
 # That test also requires a description on every key, an Unset: line on every (optional) key, and a counterpart for every Conflicts with:, Overrides: and Overridden by: line.
 # It does not check the prose, so bounds, units and interactions are only as current as their last review against the code.
-# Conflicts with:, Overrides: and Overridden by: lines start with the full dotted paths of the other keys, separated by commas, and put any explanation after a parenthesis or a semicolon.
+# The comment block after the next blank line is the general notes that phasesweep explain --notes prints and the MCP explain_config tool returns without a key. Keep it to what someone writing a config needs, and put anything about this file itself in this block.
+
 # Config file: phasesweep run, validate, status, show-winners and sync-tracking each take the file as their CONFIG argument, and phasesweep mcp init-catalog reads one through --from. No default file is searched.
 # The path must name an existing file, not a directory.
 # Sources: the file is the only source of keys. No environment variable maps to a key and no command-line flag overrides one. Keys left out take the defaults below.
@@ -27,6 +28,7 @@
 # Each list or object variant below is an alternative selected by its type. Do not combine keys from two variants.
 # A block that appears more than once, such as the extractor variants under metric.extractor, constraints[].extractor and observe[].extractor, is documented in full each time.
 # <key> in a path stands for any valid dotted override name. optimizer.lr illustrates it under phases[].search_space.
+# Conflicts with:, Overrides: and Overridden by: lines start with the full dotted paths of the other keys, separated by commas, and put any explanation after a parenthesis or a semicolon.
 # Environment variables PhaseSweep itself reads outside the YAML, in a plain phasesweep run: the ambient environment (the base of the trainer environment, filtered by execution.inherit_env), PHASESWEEP_LOCK_DIR, HOME, PATH and CUDA_VISIBLE_DEVICES.
 # CUDA_VISIBLE_DEVICES is read for GPU pool discovery, PATH to find the supervisor interpreter, and HOME for ~ expansion.
 # PHASESWEEP_LOCK_DIR selects the host-lock directory that every run uses. It must name an existing absolute directory that is safe to share. It is never created or changed. By default locks live under .cache/phasesweep/locks in the OS account home, independent of HOME and XDG variables.

@@ -21,6 +21,7 @@ from phasesweep.config import (
     JsonEnvelopeExtractor,
     load_experiment,
 )
+from phasesweep.config.reference import reference_notes
 from phasesweep.engine import (
     PhaseWinnerView,
     read_winners,
@@ -999,7 +1000,9 @@ def test_explain_config_returns_entries_and_closest(tmp_path: Path) -> None:
         "found": False,
         "entries": [],
         "closest": ["execution.inherit_env"],
+        "notes": "",
     }
+    assert sampler["notes"] == ""
     assert app.explain_config("zzzzzz")["closest"] == []
     assert app.explain_config(".")["found"] is False
 
@@ -1018,6 +1021,9 @@ def test_explain_config_without_a_key_lists_top_level_keys_and_needs_no_catalog(
     assert all("." not in path for path in paths)
     assert all("\n" not in entry["description"] for entry in index["entries"])
     assert PhaseSweepMCP.explain_config("  ")["entries"] == index["entries"]
+    assert index["notes"] == "\n".join(reference_notes())
+    assert "Paths: a relative workdir" in index["notes"]
+    assert PhaseSweepMCP.explain_config("  ")["notes"] == index["notes"]
 
 
 def test_validate_rejects_config_changed_after_startup(tmp_path: Path) -> None:

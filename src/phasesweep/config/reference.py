@@ -3,8 +3,8 @@
 ``config_reference.yaml`` documents every key the experiment YAML accepts in
 signature form. This module parses it once into :class:`ReferenceEntry` rows and
 answers the lookups that CLI help and validation-error hints need: the entries
-below a key, the nearest documented keys to a typo, and the documented key that
-a validation error location points into.
+below a key, the nearest documented keys to a typo, the documented key that a
+validation error location points into, and the general notes of the file header.
 """
 
 from __future__ import annotations
@@ -132,12 +132,39 @@ def _reference_resource() -> Traversable:
     return importlib.resources.files("phasesweep").joinpath("config_reference.yaml")
 
 
-def reference_location() -> str:
-    """Name the packaged reference file, for pointing readers at its general notes.
+def _parse_notes(text: str) -> tuple[str, ...]:
+    """Return the general notes: the second comment block of the reference header.
 
-    :return str: Filesystem location of ``config_reference.yaml`` in the installed package.
+    The first block describes the file itself and is for its maintainers; the
+    block after the first blank line is what someone writing a config needs.
+
+    :param str text: Contents of ``config_reference.yaml``.
+    :raises ValueError: If the header holds fewer than two comment blocks.
+    :return tuple[str, ...]: The notes, one comment line each, without ``#``.
     """
-    return str(_reference_resource())
+    blocks: list[list[str]] = [[]]
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            blocks.append([])
+        elif stripped.startswith("#") and _SECTION.fullmatch(stripped) is None:
+            blocks[-1].append(stripped.removeprefix("#").strip())
+        else:
+            break
+    header = [block for block in blocks if block]
+    if len(header) < 2:
+        raise ValueError("The reference header has no general notes block.")
+    return tuple(header[1])
+
+
+@functools.cache
+def reference_notes() -> tuple[str, ...]:
+    """Return the packaged reference's general notes on paths, YAML typing and environment.
+
+    :raises ValueError: If the packaged reference header has no notes block.
+    :return tuple[str, ...]: The notes, one line each, in file order.
+    """
+    return _parse_notes(_reference_resource().read_text(encoding="utf-8"))
 
 
 @functools.cache

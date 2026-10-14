@@ -6,7 +6,7 @@ import pytest
 from click.testing import CliRunner
 
 from phasesweep.cli import cli as cli_main
-from phasesweep.config.reference import reference_entries, top_level_entries
+from phasesweep.config.reference import reference_entries, reference_notes, top_level_entries
 
 
 def _explain(*args: str) -> tuple[int, str, str]:
@@ -37,6 +37,29 @@ def test_explain_without_a_key_lists_each_section_and_top_level_key() -> None:
     storage = next(line for line in lines if line.startswith("  storage "))
     assert "sub-key" not in storage
     assert "phasesweep explain 'phases[].sampler'" in out
+    assert out.rstrip("\n").endswith("phasesweep explain --notes")
+    assert "config_reference.yaml" not in out
+
+
+def test_explain_notes_prints_the_general_notes_and_no_maintainer_lines() -> None:
+    """``--notes`` prints the header block that applies to every key, one line per note."""
+    code, out, err = _explain("--notes")
+    assert code == 0
+    assert err == ""
+    assert out.splitlines() == list(reference_notes())
+    assert "Paths: a relative workdir" in out
+    assert "YAML scalars follow PyYAML" in out
+    assert "PHASESWEEP_LOCK_DIR" in out
+    for maintainer_line in ("does not load as YAML", "maintained by hand", "parsed by", "tests/"):
+        assert maintainer_line not in out
+
+
+def test_explain_notes_refuses_a_key() -> None:
+    """``--notes`` and a KEY are different requests, so combining them is a usage error."""
+    code, out, err = _explain("--notes", "phases")
+    assert code == 2
+    assert out == ""
+    assert "--notes takes no KEY" in err
 
 
 def test_explain_listing_stays_within_one_screen_of_summary() -> None:

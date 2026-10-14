@@ -24,12 +24,14 @@ from phasesweep.config.io import describe_validation_error, load_experiment_byte
 from phasesweep.config.reference import (
     ReferenceEntry,
     _parse,
+    _parse_notes,
     closest,
     first_sentence,
     loc_to_path,
     lookup,
     plain_path,
     reference_entries,
+    reference_notes,
     sub_key_count,
     top_level_entries,
 )
@@ -381,6 +383,32 @@ def test_reference_parser_rejects_unrecognized_lines_and_duplicate_paths() -> No
         _parse("# one\nname: string (required)\n\n# two\nname: string (required)\n")
     parsed = _parse("# ---------- First ----------\n\n# one\nname: string (required)\n")
     assert parsed == (ReferenceEntry("name", "string (required)", ("one",), "First"),)
+
+
+def test_reference_notes_are_the_second_header_block_and_never_reach_an_entry() -> None:
+    """The first header block is for maintainers, the block after its blank line is the notes."""
+    text = (
+        "# about this file\n# parsed by x\n\n# note one\n# note two\n\n"
+        "# ---------- First ----------\n\n# one\nname: string (required)\n"
+    )
+    assert _parse_notes(text) == ("note one", "note two")
+    assert _parse(text) == (ReferenceEntry("name", "string (required)", ("one",), "First"),)
+    with pytest.raises(ValueError, match="no general notes"):
+        _parse_notes("# about this file\n\n# ---------- First ----------\n\n# one\nname: string\n")
+
+
+def test_packaged_reference_notes_hold_user_notes_and_no_maintainer_lines() -> None:
+    """The packaged notes cover paths, YAML typing and environment variables, not the file itself."""
+    notes = "\n".join(reference_notes())
+    for fragment in ("Config file:", "Paths:", "YAML scalars follow PyYAML", "PHASESWEEP_LOCK_DIR"):
+        assert fragment in notes
+    for maintainer in ("does not load as YAML", "maintained by hand", "parsed by", "tests/"):
+        assert maintainer not in notes
+    assert not any(
+        comment.startswith("Config file:")
+        for entry in reference_entries()
+        for comment in entry.comments
+    )
 
 
 @pytest.mark.parametrize(

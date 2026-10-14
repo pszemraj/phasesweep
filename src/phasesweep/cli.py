@@ -23,7 +23,7 @@ from phasesweep.config.reference import (
     first_sentence,
     lookup,
     plain_path,
-    reference_location,
+    reference_notes,
     sub_key_count,
     top_level_entries,
 )
@@ -491,18 +491,33 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
     help=(
         "Explain config keys from the packaged reference. Without KEY, list the top-level "
         "keys; with a KEY such as 'phases[].sampler', print that key and every key below it. "
-        "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent."
+        "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent. "
+        "With --notes, print the general notes on file paths, YAML typing and environment "
+        "variables instead."
     ),
     short_help="Explain config keys.",
 )
 @click.argument("key", metavar="[KEY]", required=False)
-def explain(key: str | None) -> None:
-    """Print the configuration reference for one key, or list the top-level keys.
+@click.option(
+    "--notes",
+    is_flag=True,
+    help="Print the general notes on file paths, YAML typing and environment variables.",
+)
+def explain(key: str | None, notes: bool) -> None:
+    """Print the configuration reference for one key, list the top-level keys, or print its notes.
 
     :param str | None key: Config key in any spelling the reference accepts, or None to list
         the top-level keys.
+    :param bool notes: Print the reference's general notes instead of keys.
+    :raises click.UsageError: ``notes`` is combined with a ``key``.
     :raises click.exceptions.Exit: With code 2 when ``key`` matches no documented key.
     """
+    if notes:
+        if key is not None:
+            raise click.UsageError("--notes takes no KEY.")
+        for line in reference_notes():
+            click.echo(line)
+        return
     if key is None:
         _render_reference_index()
         return
@@ -544,8 +559,8 @@ def _render_reference_index() -> None:
     click.echo()
     click.echo("Narrow with a key, for example: phasesweep explain 'phases[].sampler'")
     click.echo(
-        "General notes on file paths, YAML typing and environment variables open the "
-        f"header of {reference_location()}"
+        "General notes on file paths, YAML typing and environment variables: "
+        "phasesweep explain --notes"
     )
 
 

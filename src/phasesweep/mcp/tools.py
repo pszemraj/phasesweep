@@ -24,6 +24,7 @@ from phasesweep.config.reference import (
     first_sentence,
     lookup,
     plain_path,
+    reference_notes,
     top_level_entries,
 )
 from phasesweep.engine import (
@@ -226,14 +227,15 @@ class PhaseSweepMCP(RunControl):
         """Describe configuration keys from the packaged reference, independent of the catalog.
 
         With no key, or a blank one, the entries are the top-level keys with the first sentence
-        of their description. With a key, they are that key and every key below it with the full
-        description, one entry per discriminator variant. Nothing here touches the catalog,
+        of their description, and the notes are the reference's general notes. With a key, they
+        are that key and every key below it with the full description, one entry per
+        discriminator variant, and the notes are empty. Nothing here touches the catalog,
         a config file or the filesystem.
 
         :param str | None key: Config key as the reference spells it, such as ``phases[].sampler``,
             ``phases.sampler`` or ``phases.0.sampler``.
-        :return JsonObject: The echoed key, whether it matched, the entries, and the closest
-            documented keys when it did not.
+        :return JsonObject: The echoed key, whether it matched, the entries, the closest
+            documented keys when it did not, and the general notes when no key was given.
         """
         entries: list[JsonValue]
         if key is None or not key.strip():
@@ -241,11 +243,23 @@ class PhaseSweepMCP(RunControl):
                 _config_entry_payload(entry, first_sentence(entry, None))
                 for entry in top_level_entries()
             ]
-            return {"key": key, "found": True, "entries": entries, "closest": []}
+            return {
+                "key": key,
+                "found": True,
+                "entries": entries,
+                "closest": [],
+                "notes": "\n".join(reference_notes()),
+            }
         matches = lookup(key) if plain_path(key) else ()
         entries = [_config_entry_payload(entry, "\n".join(entry.comments)) for entry in matches]
         suggestions: list[JsonValue] = [] if matches else list(closest(key))
-        return {"key": key, "found": bool(matches), "entries": entries, "closest": suggestions}
+        return {
+            "key": key,
+            "found": bool(matches),
+            "entries": entries,
+            "closest": suggestions,
+            "notes": "",
+        }
 
     def validate(self, experiment_id: str) -> dict[str, Any]:
         """Report an experiment's phase structure (never the command/env/storage).
