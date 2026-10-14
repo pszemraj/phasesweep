@@ -1,7 +1,8 @@
-"""Trial launch environment and pipe behavior."""
+"""Trial launch environment, pipe behavior, and the pre-launch barrier."""
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import fcntl
 import hashlib
@@ -15,9 +16,11 @@ import stat
 from pathlib import Path
 from typing import Any
 
+import optuna
 import pytest
 import yaml
 
+from phasesweep import run_experiment
 from phasesweep.config import (
     ExecutionContext,
     Experiment,
@@ -26,6 +29,9 @@ from phasesweep.config import (
     WandbSummaryRequiredGate,
 )
 from phasesweep.engine.artifacts import _warn_environment_drift
+from phasesweep.engine.ledger import _resolve_storage
+from phasesweep.engine.selection import NoFeasibleTrialError
+from phasesweep.engine.state import TRIAL_DIR_ATTR
 from phasesweep.engine.trial import (
     ExecutedTrial,
     TrialExecutionError,
@@ -34,8 +40,16 @@ from phasesweep.engine.trial import (
     extract_trial_result,
     launch_trial,
 )
-from phasesweep.runtime.process import ProcessResult, fd_ready
+from phasesweep.runtime import supervisor
+from phasesweep.runtime.process import ProcessResult, fd_ready, read_attempt_lifecycle
 from tests.conftest import make_experiment, make_trial_context
+
+#: Every module ``runtime/supervisor.py`` may import. It runs before the trial's
+#: process identity exists, so anything else it loaded could start code that
+#: cleanup can never find.
+SUPERVISOR_IMPORT_ALLOWLIST = frozenset(
+    {"__future__", "contextlib", "json", "os", "signal", "sys", "time"}
+)
 
 
 def _capture_launch_env(
@@ -835,3 +849,59 @@ def test_launch_pipe_wait_outlasts_one_poll_call(monkeypatch: pytest.MonkeyPatch
     assert fd_ready(7, timeout=30 * 86400)
     assert len(waits) == 2
     assert max(waits) <= 2**31 - 1
+
+
+def test_supervisor_imports_only_its_stdlib_allowlist() -> None:
+    """The pre-identity supervisor imports nothing outside its stdlib allowlist.
+
+    It runs under ``python -I -S`` before the trial's process identity is
+    written, so a new import there, or a dynamic one, could execute code that
+    forks out of the process group cleanup later signals.
+    """
+    tree = ast.parse(Path(str(supervisor.__file__)).read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0, "the supervisor imports nothing relative to its package"
+            imported.add(str(node.module).split(".")[0])
+    dynamic = [
+        node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and node.id == "__import__"
+    ]
+
+    assert "os" in imported, "the parser found none of the supervisor's imports"
+    assert imported <= SUPERVISOR_IMPORT_ALLOWLIST, imported - SUPERVISOR_IMPORT_ALLOWLIST
+    assert dynamic == []
+
+
+def test_trial_directory_and_allocated_lifecycle_precede_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Before ``launch_trial`` runs, the trial carries its directory and its lifecycle reads ``allocated``.
+
+    Recovery reads a ``RUNNING`` trial without the directory attribute, and an
+    ``allocated`` lifecycle without a process identity, as proof that nothing
+    launched, so both must be durable before any process can start.
+    """
+    experiment = make_experiment(persistent=tmp_path, trial_command="true {overrides}", n_trials=1)
+    observed: dict[str, str | None] = {}
+
+    def inspect_before_launch(**kwargs: object) -> ExecutedTrial:
+        trial_dir = Path(str(kwargs["trial_dir"]))
+        study = optuna.load_study(
+            study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
+        )
+        trial = next(trial for trial in study.trials if trial.number == kwargs["trial_id"])
+        lifecycle = read_attempt_lifecycle(trial_dir, expected_attempt_id=str(kwargs["attempt_id"]))
+        observed["trial_dir"] = str(trial_dir)
+        observed["trial_dir_attr"] = trial.user_attrs.get(TRIAL_DIR_ATTR)
+        observed["lifecycle"] = None if lifecycle is None else lifecycle.state
+        raise TrialExecutionError("inspected before launch; no process started")
+
+    monkeypatch.setattr("phasesweep.engine.phase.launch_trial", inspect_before_launch)
+    with pytest.raises(NoFeasibleTrialError):
+        run_experiment(experiment)
+
+    assert observed["trial_dir_attr"] == observed["trial_dir"]
+    assert observed["lifecycle"] == "allocated"

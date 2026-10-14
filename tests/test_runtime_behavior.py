@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import threading
@@ -35,6 +36,7 @@ from phasesweep.engine import (
     read_status,
     read_winner,
 )
+from phasesweep.engine import phase as phase_module
 from phasesweep.engine.attempts import _fail_stale_running_trial
 from phasesweep.engine.ledger import (
     _resolve_storage,
@@ -79,6 +81,7 @@ from phasesweep.engine.trial import (
     _environment_identity,
     extract_trial_result,
 )
+from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence import TrialContext
 from phasesweep.runtime.process import ProcessResult, write_attempt_lifecycle
 from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
@@ -1357,6 +1360,38 @@ def test_unsafe_cleanup_blocks_topup_until_recovery(
     assert len(study.trials) == before + 1
     assert study.user_attrs[CLEANUP_RECOVERED_TRIALS_ATTR] == [unsafe_trial.number]
     assert list(_attempts_dir(_exp(3)).glob("*.json")) == []
+
+
+def test_unsafe_cleanup_is_never_an_ordinary_trial_failure() -> None:
+    """``UnsafeProcessCleanupError`` escapes the trial-failure handler and Optuna's ``catch``.
+
+    As a ``TrialExecutionError``, or under a ``catch`` entry that covers it, an
+    evidence or tracking worker's unconfirmed cleanup would be committed as an
+    ordinary failure while the phase kept launching past the leaked group.
+    """
+    assert not issubclass(UnsafeProcessCleanupError, TrialExecutionError)
+
+    tree = ast.parse(Path(str(phase_module.__file__)).read_text(encoding="utf-8"))
+    run_phase = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_phase"
+    )
+    catches = [
+        keyword.value
+        for node in ast.walk(run_phase)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "catch"
+    ]
+    assert len(catches) == 1
+    assert isinstance(catches[0], ast.Tuple)
+    caught = []
+    for element in catches[0].elts:
+        assert isinstance(element, ast.Name), ast.unparse(element)
+        caught.append(vars(phase_module)[element.id])
+    assert caught
+    assert not any(issubclass(UnsafeProcessCleanupError, base) for base in caught)
 
 
 @pytest.mark.integration
