@@ -155,10 +155,10 @@ def _environment_contract_line(experiment: Experiment) -> str:
     contract = execution.inherit_env
     admitted = execution.inherited_env_names()
     if admitted is None:
-        inherited = "inherit_env=all (every ambient variable enters the digest)"
+        inherited = "inherit_env=all (every ambient variable is inherited and digested)"
     else:
         label = f"[{', '.join(contract)}]" if isinstance(contract, list) else contract
-        inherited = f"inherit_env={label} (enter the digest when set: {', '.join(admitted)})"
+        inherited = f"inherit_env={label} (inherited when set, and digested: {', '.join(admitted)})"
     passthrough = (
         f"passthrough_env: {', '.join(sorted(execution.passthrough_env))} "
         "(excluded from the digest)"

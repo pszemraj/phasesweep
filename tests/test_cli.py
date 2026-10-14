@@ -204,7 +204,7 @@ _REFUSES_TO_RESUME = (
 _ENVIRONMENT_CONTRACT_CASES = [
     pytest.param(
         {},
-        f"environment: inherit_env=none (enter the digest when set: {_BASE_ENV_NAMES}); "
+        f"environment: inherit_env=none (inherited when set, and digested: {_BASE_ENV_NAMES}); "
         "env keys: none; passthrough_env: none",
         id="default-in-memory",
     ),
@@ -214,14 +214,14 @@ _ENVIRONMENT_CONTRACT_CASES = [
             "env": {"B_FLAG": "1", "A_FLAG": "2"},
             "persistent": True,
         },
-        f"environment: inherit_env=[HF_HOME] (enter the digest when set: {_BASE_ENV_NAMES}, "
+        f"environment: inherit_env=[HF_HOME] (inherited when set, and digested: {_BASE_ENV_NAMES}, "
         "HF_HOME); env keys: A_FLAG, B_FLAG; passthrough_env: HF_TOKEN (excluded from the digest); "
         + _REFUSES_TO_RESUME,
         id="list-and-passthrough-persistent",
     ),
     pytest.param(
         {"execution": ExecutionContext(inherit_env="all")},
-        "environment: inherit_env=all (every ambient variable enters the digest); "
+        "environment: inherit_env=all (every ambient variable is inherited and digested); "
         "env keys: none; passthrough_env: none",
         id="all",
     ),
