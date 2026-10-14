@@ -22,7 +22,7 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     WinnerIntegrityError,
 )
-from phasesweep.engine.optuna import _draw_positions
+from phasesweep.engine.optuna import _draw_positions, _trial_state_label
 from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.repeats import (
     RepeatAxis,
@@ -121,12 +121,15 @@ def _write_trials_csv(
 ) -> None:
     """Snapshot every trial in ``study`` to ``path`` as stdlib CSV.
 
+    The ``state`` column is the label run logs and status tables use, so an
+    interrupted trial reads ``INTERRUPTED`` and an infeasible one ``INFEASIBLE``.
     A repeats phase gets a ``repeat_group`` column: the highest trial number
     in the trial's group so far, grouped by the same key selection uses. An
     incomplete group's label moves as more members are allocated.
 
     Every user attribute is a column except the tracked trainer environment, which is
     ledger provenance: its ``PATH`` and ``HOME`` values are noise in a results table.
+    A rerun's source therefore shows as ``user_attr:phasesweep_rerun_of``.
 
     :param optuna.Study study: Study whose trials are serialized.
     :param Path path: Destination CSV path.
@@ -161,7 +164,7 @@ def _write_trials_csv(
         for t in trials:
             row: dict[str, Any] = {
                 "number": t.number,
-                "state": t.state.name,
+                "state": _trial_state_label(t),
                 "value": t.value,
                 "datetime_start": t.datetime_start,
                 "datetime_complete": t.datetime_complete,

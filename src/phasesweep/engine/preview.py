@@ -47,6 +47,7 @@ from phasesweep.engine.phase import (
 from phasesweep.engine.state import STUDY_SCHEMA_ATTR, Winner, _recovered_trial_state
 from phasesweep.engine.study_policy import (
     _load_phase_policy_state,
+    _pending_rerun_count,
     _validate_fixed_configuration_target,
     _validate_study_direction,
     _validate_study_schema,
@@ -69,6 +70,9 @@ class RecordedPhase:
     completed: int
     #: How many attempts are RUNNING, which a launch recovers before it checks anything.
     running: int
+    #: Reruns a launch would run before any new draw: interrupted trials without one,
+    #: WAITING reruns, and RUNNING attempts that recover as interrupted.
+    reruns: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
 
@@ -81,8 +85,21 @@ class PhasePreview:
     winner: Winner
     #: Trials a launch would run, the count the phase's "would launch" line prints.
     launches: int
+    #: How many of those launches rerun interrupted trials.
+    reruns: int
     #: Whether the phase would replay a recorded result and launch no trials.
     replays: bool
+
+
+def _reruns_phrase(reruns: int) -> str:
+    """Name a count of reruns of interrupted trials in the singular or plural.
+
+    :param int reruns: Reruns counted.
+    :return str: For example ``"1 rerun of an interrupted trial"``.
+    """
+    if reruns == 1:
+        return "1 rerun of an interrupted trial"
+    return f"{reruns} reruns of interrupted trials"
 
 
 def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
@@ -93,12 +110,13 @@ def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
     :return str: The line, without the ``DRY RUN`` prefix.
     """
     trials = sum(preview.launches for preview in previews)
+    reruns = sum(preview.reruns for preview in previews)
     launching = sum(1 for preview in previews if preview.launches)
     replaying = sum(1 for preview in previews if preview.replays)
-    line = (
-        f"total: would launch {trials} {'trial' if trials == 1 else 'trials'} "
-        f"across {launching} {'phase' if launching == 1 else 'phases'}"
-    )
+    line = f"total: would launch {trials} {'trial' if trials == 1 else 'trials'} "
+    if reruns:
+        line += f"({_reruns_phrase(reruns)}) "
+    line += f"across {launching} {'phase' if launching == 1 else 'phases'}"
     if replaying:
         line += f" ({replaying} other {'phase replays' if replaying == 1 else 'phases replay'})"
     return line
@@ -112,7 +130,7 @@ def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
     :return RecordedPhase: The counts and the study.
     """
     if study is None:
-        return RecordedPhase(finished=0, completed=0, running=0, study=None)
+        return RecordedPhase(finished=0, completed=0, running=0, reruns=0, study=None)
     trials = study.get_trials(deepcopy=False)
     running = [trial for trial in trials if trial.state == optuna.trial.TrialState.RUNNING]
     recovered_as_failed = sum(1 for trial in running if _recovered_trial_state(trial) == "FAIL")
@@ -120,6 +138,7 @@ def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
         finished=_finished_trial_count(trials) + recovered_as_failed,
         completed=_completed_trial_count(trials),
         running=len(running),
+        reruns=_pending_rerun_count(trials) + len(running) - recovered_as_failed,
         study=study,
     )
 
@@ -327,14 +346,16 @@ def _preview_phase(
     :return PhasePreview: The winner a replay would publish or a placeholder, the
         trials a launch would run, and whether the phase replays.
     """
-    completed = 0 if recorded is None else recorded.finished
-    remaining = max(0, phase.n_trials - completed)
+    finished = 0 if recorded is None else recorded.finished
+    reruns = 0 if recorded is None else recorded.reruns
+    remaining = max(0, phase.n_trials - finished)
     log.info(
-        "phase=%s study=%s completed=%d remaining=%d n_jobs=%d",
+        "phase=%s study=%s finished=%d remaining=%d reruns=%d n_jobs=%d",
         phase.name,
         _phase_study_name(experiment, phase),
-        completed,
+        finished,
         remaining,
+        reruns,
         phase.n_jobs,
     )
     study: optuna.Study | None = None
@@ -362,17 +383,17 @@ def _preview_phase(
                 "DRY RUN phase=%s accepted a partial result at %d of %d trials: would "
                 "replay it and launch no trials",
                 phase.name,
-                completed,
+                finished,
                 phase.n_trials,
             )
-            return PhasePreview(winner=resumed, launches=0, replays=True)
+            return PhasePreview(winner=resumed, launches=0, reruns=0, replays=True)
         resume = resumed
     if remaining == 0:
         log.info(
             "DRY RUN phase=%s target met (%d of %d trials recorded): would replay its "
             "existing result and launch no trials",
             phase.name,
-            completed,
+            finished,
             phase.n_trials,
         )
         if study is None or resume is None:
@@ -381,11 +402,16 @@ def _preview_phase(
             winner = _replay_met_target(
                 experiment, phase, inherited_winners, study, resume, verify_evidence=False
             )
-        return PhasePreview(winner=winner, launches=0, replays=True)
+        return PhasePreview(winner=winner, launches=0, reruns=0, replays=True)
     winner = _dry_run_phase(
-        experiment, phase, inherited_winners, open_preview_study(experiment, phase), remaining
+        experiment,
+        phase,
+        inherited_winners,
+        open_preview_study(experiment, phase),
+        remaining,
+        reruns=reruns,
     )
-    return PhasePreview(winner=winner, launches=remaining, replays=False)
+    return PhasePreview(winner=winner, launches=remaining, reruns=reruns, replays=False)
 
 
 def _dry_run_phase(
@@ -394,6 +420,8 @@ def _dry_run_phase(
     inherited_winners: dict[str, Winner],
     study: optuna.Study,
     remaining: int,
+    *,
+    reruns: int,
 ) -> Winner:
     """Render and log one example trial command for the phase without launching anything.
 
@@ -406,6 +434,7 @@ def _dry_run_phase(
         inherited_winners: Winners loaded for phases earlier in the chain.
         study: An in-memory Optuna study used to ``ask`` for one sample.
         remaining: Number of trials that *would* run; logged for the user.
+        reruns: How many of them rerun interrupted trials before any new draw.
 
     Returns:
         A :class:`Winner` placeholder built from the previewed sample, or from
@@ -413,11 +442,17 @@ def _dry_run_phase(
         previews see consistent inherited context.
 
     """
+    of_them = ""
+    if reruns == 1:
+        of_them = ", 1 of them a rerun of an interrupted trial"
+    elif reruns:
+        of_them = f", {reruns} of them reruns of interrupted trials"
     log.info(
-        "DRY RUN phase=%s would launch %d %s",
+        "DRY RUN phase=%s would launch %d %s%s",
         phase.name,
         remaining,
         "trial" if remaining == 1 else "trials",
+        of_them,
     )
     sampled: dict[str, object] | None = None
     if remaining > 0:

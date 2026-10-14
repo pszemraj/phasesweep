@@ -335,7 +335,8 @@ class PhaseValidationPayload(_ToolPayload):
     n_trials: int = Field(
         ge=1,
         description=(
-            "Target number of terminal attempts; COMPLETE, FAIL, and PRUNED trials all count."
+            "Target number of terminal attempts; COMPLETE, FAIL, and PRUNED trials all count. "
+            "INTERRUPTED trials never count: each reruns with its parameters before any new draw."
         ),
     )
     sampler: str = Field(description="Sampler type only; sampler internals stay in the config.")
@@ -404,7 +405,11 @@ class PhaseStatusPayload(_ToolPayload):
 
     phase: PhaseName
     trials: dict[TrialStateName, int] = Field(
-        description="Dense cumulative study counts; every state key is always present."
+        description=(
+            "Dense cumulative study counts; every state key is always present. INTERRUPTED "
+            "counts trials a deadline, shutdown or orchestrator death cut short; they are "
+            "not terminal, and WAITING counts their scheduled reruns."
+        )
     )
     running_trials_total: int = Field(ge=0, description="Cumulative RUNNING study rows.")
     target_terminal_trials: int = Field(ge=0, description="Configured terminal-trial target.")
@@ -422,7 +427,11 @@ class PhaseStatusPayload(_ToolPayload):
         ge=0, description="Terminal attempts owned by the represented generation."
     )
     remaining_trials: int = Field(
-        ge=0, description="Additional terminal trials needed to reach the configured target."
+        ge=0,
+        description=(
+            "Additional terminal trials needed to reach the configured target, reruns of "
+            "interrupted trials included."
+        ),
     )
     target_already_satisfied: bool = Field(
         description="Whether pre-run terminal history already met the configured target."

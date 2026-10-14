@@ -137,15 +137,16 @@ def _record(
     target: int,
     outcomes: bool = True,
     running_outcome: str | None = None,
+    fail_outcome: str = "failure",
 ) -> None:
     """Write a phase study as a prior run left it, one trial per state, with no trainer.
 
     It carries what a launch reads back: the format stamp, the artifact-root claim, the
     accepted target, the environment cohort, and a terminal outcome for every finished trial
-    (none with ``outcomes`` off, which is malformed failure-policy state). A RUNNING trial
-    carries ``running_outcome`` when given, as an objective that recorded its outcome just
-    before its orchestrator died. Its COMPLETE trials hold no objective evidence, so
-    selecting a winner from them fails.
+    (none with ``outcomes`` off, which is malformed failure-policy state). A FAIL trial
+    records ``fail_outcome``, and a RUNNING trial carries ``running_outcome`` when given,
+    as an objective that recorded its outcome just before its orchestrator died. Its
+    COMPLETE trials hold no objective evidence, so selecting a winner from them fails.
     """
     study = optuna.create_study(
         study_name=f"{experiment.experiment}::{phase}",
@@ -166,7 +167,9 @@ def _record(
             TRAINER_ENV_DIGEST_ATTR: identity.digest,
             TRAINER_ENV_ATTR: dict(identity.tracked),
         }
-        outcome = running_outcome if state == _STATE.RUNNING else _OUTCOME[state]
+        outcome = {_STATE.RUNNING: running_outcome, _STATE.FAIL: fail_outcome}.get(
+            state, _OUTCOME.get(state)
+        )
         if outcomes and outcome is not None:
             attrs[TRIAL_OUTCOME_ATTR] = {
                 "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
@@ -274,10 +277,10 @@ def test_finished_phase_previews_a_replay_and_hands_its_child_the_real_winner(
     assert finished["a"].params["a_x"] != 0
 
     assert _preview(appended, tmp_path, caplog) == [
-        "phase=a study=t::a completed=3 remaining=0 n_jobs=1",
+        "phase=a study=t::a finished=3 remaining=0 reruns=0 n_jobs=1",
         "DRY RUN phase=a target met (3 of 3 trials recorded): would replay its existing "
         "result and launch no trials",
-        "phase=b study=t::b completed=0 remaining=2 n_jobs=1",
+        "phase=b study=t::b finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=b would launch 2 trials",
     ]
     (command,) = _commands(caplog)
@@ -298,7 +301,7 @@ def test_raised_target_previews_only_the_trials_it_adds(
     raised = _persistent(tmp_path, _phase("a", 4))
 
     assert _preview(raised, tmp_path, caplog) == [
-        "phase=a study=t::a completed=2 remaining=2 n_jobs=1",
+        "phase=a study=t::a finished=2 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]
 
@@ -324,7 +327,7 @@ def test_aborted_phase_is_refused_at_its_target_and_previews_a_raised_one(
 
     raised = attempt(6)
     assert _preview(raised, tmp_path, caplog) == [
-        "phase=a study=t::a completed=2 remaining=4 n_jobs=1",
+        "phase=a study=t::a finished=2 remaining=4 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 4 trials",
     ]
     assert len(calls.read_text().splitlines()) == 2
@@ -367,7 +370,7 @@ def test_accepted_partial_timeout_previews_a_replay_and_launches_nothing(
     accepting, _winner = _accept_partial_timeout(tmp_path)
 
     assert _preview(accepting, tmp_path, caplog) == [
-        "phase=a study=t::a completed=2 remaining=2 n_jobs=1",
+        "phase=a study=t::a finished=2 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a accepted a partial result at 2 of 4 trials: would replay it and "
         "launch no trials",
     ]
@@ -422,7 +425,7 @@ def test_dry_run_counts_a_failed_attempt_as_spent(
     _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=4)
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a completed=2 remaining=2 n_jobs=1",
+        "phase=a study=t::a finished=2 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]
 
@@ -445,11 +448,11 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2, running_outcome="failure")
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a completed=2 remaining=0 n_jobs=1",
+        "phase=a study=t::a finished=2 remaining=0 reruns=0 n_jobs=1",
         _RUNNING_WARNING.format(name="a"),
         "DRY RUN phase=a target met (2 of 2 trials recorded): would replay its existing "
         "result and launch no trials",
-        "phase=b study=t::b completed=0 remaining=2 n_jobs=1",
+        "phase=b study=t::b finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=b would launch 2 trials",
     ]
     (command,) = _commands(caplog)
@@ -464,9 +467,22 @@ def test_running_attempt_without_a_recorded_failure_previews_as_a_rerun(
     _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2)
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a completed=1 remaining=1 n_jobs=1",
+        "phase=a study=t::a finished=1 remaining=1 reruns=1 n_jobs=1",
         _RUNNING_WARNING.format(name="a"),
-        "DRY RUN phase=a would launch 1 trial",
+        "DRY RUN phase=a would launch 1 trial, 1 of them a rerun of an interrupted trial",
+    ]
+
+
+def test_interrupted_trial_previews_as_a_rerun_among_the_launches(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An interrupted trial never counts toward the target, so its rerun is one of the launches."""
+    experiment = _persistent(tmp_path, _phase("a", 3))
+    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=3, fail_outcome="interrupted")
+
+    assert _preview(experiment, tmp_path, caplog) == [
+        "phase=a study=t::a finished=1 remaining=2 reruns=1 n_jobs=1",
+        "DRY RUN phase=a would launch 2 trials, 1 of them a rerun of an interrupted trial",
     ]
 
 
@@ -485,7 +501,9 @@ def test_total_line_sums_the_launches_the_phase_lines_print(
         ]
 
     _preview(experiment, tmp_path, caplog)
-    assert totals() == ["DRY RUN total: would launch 6 trials across 3 phases"]
+    assert totals() == [
+        "DRY RUN total: would launch 6 trials (1 rerun of an interrupted trial) across 3 phases"
+    ]
 
     caplog.clear()
     run_experiment(experiment, from_phase="b", dry_run=True)
@@ -565,9 +583,9 @@ def test_fresh_experiment_previews_every_phase_as_before(
     )
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a completed=0 remaining=3 n_jobs=1",
+        "phase=a study=t::a finished=0 remaining=3 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 3 trials",
-        "phase=b study=t::b completed=0 remaining=2 n_jobs=1",
+        "phase=b study=t::b finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=b would launch 2 trials",
     ]
     assert not (tmp_path / "studies.journal").exists()
@@ -596,10 +614,10 @@ def test_unreadable_trial_data_previews_a_fresh_phase_and_says_so(
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings[0].startswith(_LEDGER_REFUSED)
     assert _lines(caplog) == [
-        "phase=a study=t::a completed=0 remaining=2 n_jobs=1",
+        "phase=a study=t::a finished=0 remaining=2 reruns=0 n_jobs=1",
         _UNREADABLE.format(name="a"),
         "DRY RUN phase=a would launch 2 trials",
-        "phase=b study=t::b completed=0 remaining=2 n_jobs=1",
+        "phase=b study=t::b finished=0 remaining=2 reruns=0 n_jobs=1",
         _UNREADABLE.format(name="b"),
         "DRY RUN phase=b would launch 2 trials",
     ]
@@ -795,6 +813,6 @@ def test_empty_unstamped_study_previews_as_a_fresh_phase(
     )
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a completed=0 remaining=2 n_jobs=1",
+        "phase=a study=t::a finished=0 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a would launch 2 trials",
     ]

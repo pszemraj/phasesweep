@@ -296,8 +296,9 @@ def publish_unaccepted_trial(
     """Finish the managed run of a failed or pruned trial after confirmed cleanup.
 
     No evidence capture ran to finish that run, so it would otherwise stay
-    RUNNING. Trainer-owned runs and attempts that never created a run are
-    left alone.
+    RUNNING. A pruned or interrupted trial's run finishes ``KILLED``, a failed
+    one's ``FAILED``. Trainer-owned runs and attempts that never created a run
+    are left alone.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
@@ -306,14 +307,15 @@ def publish_unaccepted_trial(
     """
     from optuna.trial import TrialState
 
-    from phasesweep.engine.state import TRIAL_DIR_ATTR
+    from phasesweep.engine.state import TRIAL_DIR_ATTR, _trial_interrupted
 
     directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
     if not isinstance(directory, str) or not (Path(directory) / BINDING_FILE).is_file():
         return
     binding = read_binding(Path(directory))
     if binding["run_mode"] == "managed":
-        status = "KILLED" if trial.state == TrialState.PRUNED else "FAILED"
+        killed = trial.state == TrialState.PRUNED or _trial_interrupted(trial)
+        status = "KILLED" if killed else "FAILED"
         _finish_attempt(experiment, generation_id, binding, status, environment)
 
 
@@ -419,6 +421,7 @@ def _save_attempt_intents(
     from optuna.trial import TrialState
 
     from phasesweep.engine.attempts import _trial_requires_cleanup_recovery
+    from phasesweep.engine.state import _trial_interrupted
 
     paths: list[Path] = []
     for directory, binding in attempts:
@@ -436,7 +439,7 @@ def _save_attempt_intents(
         settled = trial.state.is_finished() and (
             found.cleanup_recovered or not _trial_requires_cleanup_recovery(trial)
         )
-        if settled and trial.state == TrialState.PRUNED:
+        if settled and (trial.state == TrialState.PRUNED or _trial_interrupted(trial)):
             status = "KILLED"
         elif ended is not None:
             status = ended

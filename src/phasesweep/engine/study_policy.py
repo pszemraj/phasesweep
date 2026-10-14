@@ -575,6 +575,20 @@ def _rerun_sources(trials: Sequence[optuna.trial.FrozenTrial]) -> list[optuna.tr
     )
 
 
+def _pending_rerun_count(trials: Sequence[optuna.trial.FrozenTrial]) -> int:
+    """Count the reruns a phase still owes: interrupted trials without one, and WAITING reruns.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :return int: Reruns the next run that reaches the phase launches before any new draw.
+    """
+    waiting = sum(
+        1
+        for trial in trials
+        if trial.state == optuna.trial.TrialState.WAITING and RERUN_OF_ATTR in trial.user_attrs
+    )
+    return len(_rerun_sources(trials)) + waiting
+
+
 def _record_reruns(study: optuna.Study) -> list[tuple[int, int]]:
     """Schedule one WAITING rerun for every interrupted trial that has none.
 

@@ -38,6 +38,8 @@ from phasesweep.engine.state import (
     OVERRIDES_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
     constraint_attr,
 )
 from phasesweep.errors import ProcessCleanupUncertainError, UnsafeProcessCleanupError
@@ -251,6 +253,41 @@ def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, m
     delivery = tracking_root(experiment) / generation / "delivery"
     assert [path.name for path in delivery.glob("attempt-*.json")] == [f"attempt-{'1' * 32}.json"]
     assert read_record(delivery / f"attempt-{'1' * 32}.json")["finish"] == "FAILED"
+
+
+def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypatch):
+    """An interrupted trial's managed run ends KILLED, as a pruned one's does; a failed one's ends FAILED."""
+    config, _uploads = _remote_example(tmp_path, monkeypatch)
+    config["storage"] = f"journal:///{tmp_path}/study.journal"
+    experiment = Experiment.model_validate(config)
+    phase = experiment.phases[0]
+    generation = "a" * 32
+    study = open_phase_study(claim_ledger(validate_ledger(experiment)), phase)
+    study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
+    for number, (digit, outcome) in enumerate((("1", "interrupted"), ("2", "failure"))):
+        attempt = digit * 32
+        directory = _trial_dir_for(
+            experiment, phase.name, number, generation_id=generation, attempt_id=attempt
+        )
+        write_record(
+            directory / BINDING_FILE,
+            {**_binding(), "phase": phase.name, "attempt_id": attempt, "run_mode": "managed"},
+        )
+        record = {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": outcome}
+        study.add_trial(
+            create_trial(
+                state=TrialState.FAIL,
+                user_attrs={
+                    ATTEMPT_ID_ATTR: attempt,
+                    GENERATION_ID_ATTR: generation,
+                    TRIAL_OUTCOME_ATTR: record,
+                },
+            )
+        )
+    publication._rebuild_attempt_intents(experiment, [generation])
+    delivery = tracking_root(experiment) / generation / "delivery"
+    assert read_record(delivery / f"attempt-{'1' * 32}.json")["finish"] == "KILLED"
+    assert read_record(delivery / f"attempt-{'2' * 32}.json")["finish"] == "FAILED"
 
 
 @pytest.mark.parametrize("storage", ["memory", "journal"])

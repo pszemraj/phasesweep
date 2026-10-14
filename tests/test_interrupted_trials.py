@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import logging
 from pathlib import Path
 
 import optuna
@@ -9,6 +11,7 @@ import pytest
 from optuna.distributions import IntDistribution
 
 from phasesweep import run_experiment
+from phasesweep.engine import read_trial_tables
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
@@ -16,7 +19,9 @@ from phasesweep.engine.optuna import (
     _draw_positions,
     _finished_trial_count,
     _trial_count_state,
+    _trial_state_label,
 )
+from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.state import (
     PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
@@ -217,6 +222,7 @@ def test_an_interrupted_trial_is_counted_apart_and_never_toward_the_target() -> 
     trials = study.get_trials(deepcopy=False)
 
     assert [_trial_count_state(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
+    assert [_trial_state_label(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
     assert _finished_trial_count(trials) == 1
     assert _draw_positions(trials) == {0: 0, 1: 1, 2: 1}
 
@@ -251,7 +257,9 @@ def test_an_interrupted_rerun_gets_its_own_rerun_and_its_source_is_not_reschedul
     assert _draw_positions(study.get_trials(deepcopy=False)) == {0: 0, 1: 0, 2: 0}
 
 
-def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(tmp_path: Path) -> None:
+def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A run after a crash reruns the dead trial's draw first and evaluates what an uninterrupted run would."""
     trainer = write_param_echo_trainer(tmp_path)
     control = make_experiment(persistent=tmp_path / "control", trainer=trainer, n_trials=3)
@@ -260,7 +268,9 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(tmp_path: Path) ->
     study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
     write_attempt_lifecycle(trial_dir, attempt_id="killed-attempt", state="allocated")
 
+    caplog.set_level(logging.INFO, logger="phasesweep")
     winner = run_experiment(exp)["p"]
+    lines = [record.getMessage() for record in caplog.records]
     expected = run_experiment(control)["p"]
 
     trials = optuna.load_study(
@@ -275,3 +285,20 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(tmp_path: Path) ->
     assert [t.params for t in trials[1:]] == [t.params for t in controls]
     assert (winner.params, winner.metric) == (expected.params, expected.metric)
     assert winner.completion["finished_trials"] == 3
+
+    assert "phase=p study=t::p finished=0 remaining=3 reruns=1 n_jobs=1" in lines
+    assert f"phase=p RERUN trial=1 of=0 reason={_STALE_CAUSE}" in lines
+    (rerun_line,) = (line for line in lines if line.startswith("phase=p TRIAL trial=1 "))
+    assert " rerun_of=0 (1/3 finished)" in rerun_line
+    with (_phase_dir(exp, "p") / "trials.csv").open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["state"] for row in rows] == ["INTERRUPTED", "COMPLETE", "COMPLETE", "COMPLETE"]
+    assert [row[f"user_attr:{RERUN_OF_ATTR}"] for row in rows] == ["", "0", "", ""]
+    (table,) = read_trial_tables(exp).phases
+    assert "rerun_of" in table.columns
+    assert [(row["state"], row["rerun_of"]) for row in table.rows] == [
+        ("INTERRUPTED", None),
+        ("COMPLETE", 0),
+        ("COMPLETE", None),
+        ("COMPLETE", None),
+    ]

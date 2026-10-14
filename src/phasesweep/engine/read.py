@@ -62,6 +62,7 @@ from phasesweep.engine.state import (
     DURATION_ATTR,
     GENERATION_SUMMARY_SCHEMA_VERSION,
     OBSERVED_PREFIX,
+    RERUN_OF_ATTR,
     PublicationState,
     WinnerSource,
     _parse_winner_source,
@@ -896,6 +897,7 @@ _CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonV
     ("duration_s", lambda trial: _recorded_number(trial.user_attrs.get(DURATION_ATTR))),
 )
 _REPEAT_GROUP_COLUMN = "repeat_group"
+_RERUN_OF_COLUMN = "rerun_of"
 _WINNER_COLUMN = "winner"
 
 
@@ -927,6 +929,9 @@ def _trial_table(
 ) -> TrialTable:
     """Build one phase's table from its trials and the winner the publication holds for it.
 
+    A ``rerun_of`` column, naming the interrupted trial each rerun reran, appears
+    once the phase holds a rerun.
+
     :param Phase phase: The configured phase the trials belong to.
     :param Sequence[optuna.trial.FrozenTrial] trials: The phase study's trials.
     :param PhaseWinnerView | None winner: The published winner for the phase, if any.
@@ -943,9 +948,11 @@ def _trial_table(
     observed = sorted(
         {name for t in trials for name in t.user_attrs if name.startswith(OBSERVED_PREFIX)}
     )
+    reruns = any(RERUN_OF_ATTR in t.user_attrs for t in trials)
     columns = (
         *(header for header, _ in _CORE_TRIAL_COLUMNS),
         *([] if axis is None else [_REPEAT_GROUP_COLUMN]),
+        *([_RERUN_OF_COLUMN] if reruns else []),
         *observed,
         _WINNER_COLUMN,
     )
@@ -955,6 +962,8 @@ def _trial_table(
         row: JsonObject = {header: getter(trial) for header, getter in _CORE_TRIAL_COLUMNS}
         if axis is not None:
             row[_REPEAT_GROUP_COLUMN] = groups.get(trial.number)
+        if reruns:
+            row[_RERUN_OF_COLUMN] = trial.user_attrs.get(RERUN_OF_ATTR)
         for name in observed:
             row[name] = _recorded_number(trial.user_attrs.get(name))
         attempt = standing.get(trial.number)

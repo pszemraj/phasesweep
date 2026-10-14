@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 from uuid import uuid4
@@ -56,6 +56,7 @@ from phasesweep.engine.state import (
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
+    RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
@@ -77,6 +78,7 @@ from phasesweep.engine.study_policy import (
     _load_accepted_partial_decision,
     _load_phase_policy_state,
     _next_consecutive_failures,
+    _pending_rerun_count,
     _PhasePolicyState,
     _record_allocation_context,
     _record_recovery_boundary,
@@ -1320,14 +1322,16 @@ def _log_finished_trial(
 
     A COMPLETE trial that is infeasible, whether by a constraint or by the
     metric's bounds, reports ``INFEASIBLE`` in place of its Optuna state, as
-    selection treats it. The reason is the first line of the recorded outcome
-    cause. A repeats phase adds the trial's repeat value so a reader can see
-    which seed ran. Params stay out of the line; the phase's WINNER line carries
-    the winner's.
+    selection treats it, and an interrupted trial reports ``INTERRUPTED``. The
+    reason is the first line of the recorded outcome cause. A repeats phase adds
+    the trial's repeat value so a reader can see which seed ran, and a rerun
+    names the interrupted trial it reran. Params stay out of the line; the
+    phase's WINNER line carries the winner's.
 
     :param _PhaseExecution run: The phase execution the trial belongs to.
     :param optuna.trial.FrozenTrial trial: The just-finished trial.
-    :param int finished: Terminal trials the phase's study holds, this one included.
+    :param int finished: Trials the phase's study holds that count toward its
+        target, this one included unless it was interrupted.
     """
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     value = "none" if trial.value is None else f"{trial.value:g}"
@@ -1336,9 +1340,11 @@ def _log_finished_trial(
     repeat = ""
     if axis is not None and axis.key in trial.params:
         repeat = f" repeat={axis.key}={trial.params[axis.key]}"
-    cause_lines = parsed.cause.strip().splitlines() if parsed and parsed.cause else []
+    source = trial.user_attrs.get(RERUN_OF_ATTR)
+    rerun = "" if source is None else f" rerun_of={source}"
+    reason = _first_cause_line(trial)
     log.info(
-        "phase=%s TRIAL trial=%d state=%s outcome=%s value=%s duration=%s%s (%d/%d finished)%s",
+        "phase=%s TRIAL trial=%d state=%s outcome=%s value=%s duration=%s%s%s (%d/%d finished)%s",
         run.phase.name,
         trial.number,
         _trial_state_label(trial),
@@ -1346,10 +1352,44 @@ def _log_finished_trial(
         value,
         duration,
         repeat,
+        rerun,
         finished,
         run.phase.n_trials,
-        f" reason={cause_lines[0]}" if cause_lines else "",
+        "" if reason is None else f" reason={reason}",
     )
+
+
+def _first_cause_line(trial: optuna.trial.FrozenTrial) -> str | None:
+    """Return the first line of a trial's recorded outcome cause.
+
+    :param optuna.trial.FrozenTrial trial: Trial whose outcome record is read.
+    :return str | None: The cause's first nonblank line, or None when it recorded none.
+    """
+    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    lines = parsed.cause.strip().splitlines() if parsed and parsed.cause else []
+    return lines[0] if lines else None
+
+
+def _log_reruns(phase: Phase, study: optuna.Study, reruns: Sequence[tuple[int, int]]) -> None:
+    """Log one INFO line per rerun scheduled, naming the interrupted trial and why it stopped.
+
+    :param Phase phase: The phase whose study scheduled the reruns.
+    :param optuna.Study study: That study.
+    :param Sequence[tuple[int, int]] reruns: ``(source, rerun)`` trial numbers, as
+        :func:`~phasesweep.engine.study_policy._record_reruns` returns them.
+    """
+    if not reruns:
+        return
+    trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
+    for source, rerun in reruns:
+        reason = _first_cause_line(trials[source])
+        log.info(
+            "phase=%s RERUN trial=%d of=%d%s",
+            phase.name,
+            rerun,
+            source,
+            "" if reason is None else f" reason={reason}",
+        )
 
 
 def _settle_finished_trial(
@@ -1600,14 +1640,16 @@ def _run_phase(
         return resumed
     resume = resumed
 
-    completed = _finished_trial_count(study.get_trials(deepcopy=False))
-    remaining = max(0, phase.n_trials - completed)
+    trials = study.get_trials(deepcopy=False)
+    finished = _finished_trial_count(trials)
+    remaining = max(0, phase.n_trials - finished)
     log.info(
-        "phase=%s study=%s completed=%d remaining=%d n_jobs=%d",
+        "phase=%s study=%s finished=%d remaining=%d reruns=%d n_jobs=%d",
         phase.name,
         study_name,
-        completed,
+        finished,
         remaining,
+        _pending_rerun_count(trials),
         phase.n_jobs,
     )
 
@@ -1695,7 +1737,7 @@ def _run_phase(
             # Optuna's ask pops WAITING trials before it creates new ones, so
             # every interrupted trial reruns with its own params before any new
             # draw, and the allocation context above covers the reruns.
-            _record_reruns(study)
+            _log_reruns(phase, study, _record_reruns(study))
             study.optimize(
                 functools.partial(_objective, run),
                 n_trials=remaining,
