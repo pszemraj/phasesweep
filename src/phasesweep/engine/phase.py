@@ -33,12 +33,7 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.evidence import _verify_winner_objective_evidence
 from phasesweep.engine.fingerprints import _verify_fingerprint
-from phasesweep.engine.ledger import (
-    ClaimedLedger,
-    RecordedCounts,
-    open_phase_study,
-    open_preview_study,
-)
+from phasesweep.engine.ledger import ClaimedLedger, open_phase_study
 from phasesweep.engine.optuna import (
     _completed_trial_count,
     _finished_trial_count,
@@ -101,7 +96,6 @@ from phasesweep.engine.trial import (
     prepare_trainer_input,
     trial_run_name,
 )
-from phasesweep.runtime.commands import render_command
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.shutdown import PhaseSweepShutdown
@@ -459,6 +453,53 @@ def _resume_phase(
     _reap_stale_trials(study, experiment, phase.name, confirm=True)
     policy_state = _load_phase_policy_state(study)
     phase_fingerprint = _verify_fingerprint(study, experiment, phase, inherited_winners)
+    return _judge_recorded_phase(
+        experiment,
+        phase,
+        inherited_winners,
+        study,
+        policy_state=policy_state,
+        phase_fingerprint=phase_fingerprint,
+        verify_evidence=True,
+    )
+
+
+def _judge_recorded_phase(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    study: optuna.Study,
+    *,
+    policy_state: _PhasePolicyState,
+    phase_fingerprint: str,
+    verify_evidence: bool,
+) -> _PhaseResume | Winner:
+    """Apply the trial-target, partial-decision and abort rules to a phase's recorded study.
+
+    The one place these rules live, shared by the live resume and the dry-run
+    preview. It only reads the study.
+
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: The phase being judged.
+    :param dict[str, Winner] inherited_winners: Winners for phases earlier in the chain.
+    :param optuna.Study study: The phase's study, live or a read-only snapshot.
+    :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
+    :param str phase_fingerprint: Fingerprint carried on a replayed winner.
+    :param bool verify_evidence: Whether a replayed winner's evidence is re-proved.
+    :raises TrialTargetRefusedError: ``phase.n_trials`` is below the accepted
+        target, or a fixed configuration asks for more attempts than it may retry.
+    :raises NoFeasibleTrialError: The phase aborted, or its streak meets the
+        current limit with work remaining, at an accepted target its current
+        ``n_trials`` does not exceed.
+    :raises WinnerIntegrityError: An accepted partial-timeout decision would
+        replay while the current config disables ``allow_incomplete_on_timeout``.
+    :raises TimeoutError: An accepted partial-timeout decision replays with no
+        feasible trial.
+    :raises StudySchemaMismatchError: Durable phase state is malformed or
+        contradicts the study's trials.
+    :return _PhaseResume | Winner: The validated state, or the winner an
+        accepted partial-timeout decision replays.
+    """
     _validate_trial_target(study, phase)
     partial_decision = _load_accepted_partial_decision(study)
     if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
@@ -492,6 +533,7 @@ def _resume_phase(
                 study,
                 phase_fingerprint=phase_fingerprint,
                 completion=completion,
+                verify_evidence=verify_evidence,
             )
         except NoFeasibleTrialError as exc:
             raise TimeoutError(
@@ -1460,10 +1502,9 @@ def _run_phase(
     phase: Phase,
     inherited_winners: dict[str, Winner],
     *,
-    generation_id: str | None,
-    ledger: ClaimedLedger | None,
+    generation_id: str,
+    ledger: ClaimedLedger,
     run_deadline: float | None = None,
-    recorded: RecordedCounts | None = None,
 ) -> Winner:
     """Execute one phase end-to-end (sampler, study.optimize, winner selection).
 
@@ -1476,16 +1517,11 @@ def _run_phase(
         experiment: Parsed experiment config.
         phase: The phase to execute.
         inherited_winners: Winners loaded for phases earlier in the chain.
-        generation_id: Identity of the current engine invocation, or ``None`` for dry-run.
+        generation_id: Identity of the current engine invocation.
         ledger: The claimed ledger, for ``experiment``, that this phase opens
-            its live study through. ``None`` is a dry run: render an example
-            trial command against an in-memory preview study and return a
-            placeholder winner instead of launching any subprocesses.
+            its live study through.
         run_deadline: Optional ``time.monotonic()`` deadline inherited from
             the experiment-level wallclock guard.
-        recorded: Dry runs only: the attempts the phase's study already holds,
-            or ``None`` when they could not be read and the preview treats the
-            phase as fresh. A live run reads its own study and ignores this.
 
     Returns:
         The selected phase :class:`Winner`.
@@ -1516,26 +1552,16 @@ def _run_phase(
             a timeout, abort, or exception, which violates the runner invariant.
 
     """
-    dry_run = ledger is None
     study_name = _phase_study_name(experiment, phase)
     # The live opener also claims a newly created study's publication root,
     # before any inspection, reaping, or trial work below can run against it.
-    study = (
-        open_preview_study(experiment, phase) if ledger is None else open_phase_study(ledger, phase)
-    )
-    resume: _PhaseResume | None = None
-    if not dry_run:
-        resumed = _resume_phase(experiment, phase, inherited_winners, study)
-        if isinstance(resumed, Winner):
-            return resumed
-        resume = resumed
+    study = open_phase_study(ledger, phase)
+    resumed = _resume_phase(experiment, phase, inherited_winners, study)
+    if isinstance(resumed, Winner):
+        return resumed
+    resume = resumed
 
-    if dry_run:
-        # The preview study is always empty; the attempts the ledger holds are
-        # what a launch would count.
-        completed = 0 if recorded is None else recorded.finished
-    else:
-        completed = _finished_trial_count(study.get_trials(deepcopy=False))
+    completed = _finished_trial_count(study.get_trials(deepcopy=False))
     remaining = max(0, phase.n_trials - completed)
     log.info(
         "phase=%s study=%s completed=%d remaining=%d n_jobs=%d",
@@ -1546,35 +1572,9 @@ def _run_phase(
         phase.n_jobs,
     )
 
-    if dry_run:
-        return _dry_run_phase(experiment, phase, inherited_winners, study, remaining, recorded)
-    assert resume is not None
-
     if remaining == 0:
-        # A no-op invocation republishes the existing result. It must neither
-        # require launch resources (GPU discovery on a CPU-only host) nor
-        # mutate the durable accepted target.
-        if resume.recovery_abort is not None:
-            raise StudySchemaMismatchError(
-                f"Phase {phase.name!r} accepted an abort recovery target but has no "
-                "remaining trial slots. Use a new experiment name rather than reusing "
-                "this inconsistent study."
-            )
-        trials_after = study.get_trials(deepcopy=False)
-        return _select_phase_winner(
-            experiment,
-            phase,
-            inherited_winners,
-            study,
-            phase_fingerprint=resume.phase_fingerprint,
-            completion=_winner_completion(
-                requested_trials=phase.n_trials,
-                finished_trials=_finished_trial_count(trials_after),
-                completed_trials=_completed_trial_count(trials_after),
-                incomplete=False,
-                reason=None,
-                timeout_scope=None,
-            ),
+        return _replay_met_target(
+            experiment, phase, inherited_winners, study, resume, verify_evidence=True
         )
 
     # Compose and validate the launch environment only after recovery proves
@@ -1602,7 +1602,6 @@ def _run_phase(
         cuda_visible_devices=experiment.env.get("CUDA_VISIBLE_DEVICES"),
     )
     budget = _phase_budget(phase, run_deadline)
-    assert generation_id is not None
     if experiment.mlflow is not None:
         from phasesweep.tracking.session import require_tracking_target
 
@@ -1694,6 +1693,60 @@ def _run_phase(
     return _finish_phase(run, phase_fingerprint=resume.phase_fingerprint)
 
 
+def _replay_met_target(
+    experiment: Experiment,
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    study: optuna.Study,
+    resume: _PhaseResume,
+    *,
+    verify_evidence: bool,
+) -> Winner:
+    """Select the winner of a phase whose trial target is already met, launching nothing.
+
+    A no-op invocation republishes the existing result. It must neither
+    require launch resources (GPU discovery on a CPU-only host) nor mutate the
+    durable accepted target.
+
+    :param Experiment experiment: Parsed experiment config.
+    :param Phase phase: The phase whose recorded trials meet its target.
+    :param dict[str, Winner] inherited_winners: Winners from earlier phases in the chain.
+    :param optuna.Study study: The phase's study, live or a read-only snapshot.
+    :param _PhaseResume resume: The phase's validated durable state.
+    :param bool verify_evidence: Whether the winner's evidence is re-proved.
+    :raises StudySchemaMismatchError: The study accepted an abort recovery target
+        but has no remaining trial slots.
+    :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
+        bounds, or with ``repeats`` no group is complete.
+    :raises TrialEvidenceMissingError: The selected winner's evidence is missing or
+        altered; only when ``verify_evidence`` is set.
+    :return Winner: The winner the recorded trials select.
+    """
+    if resume.recovery_abort is not None:
+        raise StudySchemaMismatchError(
+            f"Phase {phase.name!r} accepted an abort recovery target but has no "
+            "remaining trial slots. Use a new experiment name rather than reusing "
+            "this inconsistent study."
+        )
+    trials = study.get_trials(deepcopy=False)
+    return _select_phase_winner(
+        experiment,
+        phase,
+        inherited_winners,
+        study,
+        phase_fingerprint=resume.phase_fingerprint,
+        completion=_winner_completion(
+            requested_trials=phase.n_trials,
+            finished_trials=_finished_trial_count(trials),
+            completed_trials=_completed_trial_count(trials),
+            incomplete=False,
+            reason=None,
+            timeout_scope=None,
+        ),
+        verify_evidence=verify_evidence,
+    )
+
+
 def _select_phase_winner(
     experiment: Experiment,
     phase: Phase,
@@ -1702,6 +1755,7 @@ def _select_phase_winner(
     *,
     phase_fingerprint: str,
     completion: dict[str, Any],
+    verify_evidence: bool = True,
 ) -> Winner:
     """Select the phase winner and bind it to its verified execution identity.
 
@@ -1711,6 +1765,9 @@ def _select_phase_winner(
     :param optuna.Study study: Study whose terminal trials supply the winner.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
+    :param bool verify_evidence: Whether to re-prove the selected trial's evidence. A
+        dry run turns this off, because the proof reads the trial directories and may
+        query W&B or MLflow.
     :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
         bounds, or with ``repeats`` no group is complete.
     :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
@@ -1724,11 +1781,12 @@ def _select_phase_winner(
     # digest and all. Selection itself reads only Optuna, so nothing before
     # this point has looked at whether the winning trial's directory still
     # holds the bytes its metric came from.
-    _verify_winner_objective_evidence(experiment, phase.name, selected)
-    # A replay allocates nothing, so the cohort check never runs and the
-    # winning trial may come from an environment this process no longer
-    # composes. After fresh allocation the digests match and this is silent.
-    _warn_environment_drift(experiment, phase.name, selected.trainer_env_digest)
+    if verify_evidence:
+        _verify_winner_objective_evidence(experiment, phase.name, selected)
+        # A replay allocates nothing, so the cohort check never runs and the
+        # winning trial may come from an environment this process no longer
+        # composes. After fresh allocation the digests match and this is silent.
+        _warn_environment_drift(experiment, phase.name, selected.trainer_env_digest)
     effective = _winner_overrides(experiment, phase, selected.params, inherited_winners)
     return Winner(
         trial_number=selected.trial_number,
@@ -1759,88 +1817,6 @@ def _select_phase_winner(
         confound=selected.confound,
         observed=selected.observed,
         repeats=selected.repeats,
-    )
-
-
-def _dry_run_phase(
-    experiment: Experiment,
-    phase: Phase,
-    inherited_winners: dict[str, Winner],
-    study: optuna.Study,
-    remaining: int,
-    recorded: RecordedCounts | None,
-) -> Winner:
-    """Render and log one example trial command for the phase without launching anything.
-
-    Args:
-        experiment: Parsed experiment config.
-        phase: The phase being previewed.
-        inherited_winners: Winners loaded for phases earlier in the chain.
-        study: An in-memory Optuna study used to ``ask`` for one sample.
-        remaining: Number of trials that *would* run; logged for the user. Zero
-            is the live run's replay rule: nothing launches and the phase
-            republishes its existing result.
-        recorded: The attempts the phase's study already holds, or ``None``
-            when they could not be read, which is logged as a warning.
-
-    Returns:
-        A :class:`Winner` placeholder built from the previewed sample, or from
-        each parameter's low bound or first choice, so downstream dry-run
-        previews see consistent inherited context.
-
-    """
-    if recorded is None:
-        log.warning(
-            "DRY RUN warning: phase=%s recorded trial counts could not be read, so it is "
-            "previewed as a fresh phase and a real run may launch fewer trials",
-            phase.name,
-        )
-    if remaining == 0 and recorded is not None:
-        log.info(
-            "DRY RUN phase=%s target met (%d of %d trials recorded): would replay its "
-            "existing result and launch no trials",
-            phase.name,
-            recorded.finished,
-            phase.n_trials,
-        )
-    else:
-        log.info("DRY RUN phase=%s would launch %d trials", phase.name, remaining)
-    sampled: dict[str, Any] | None = None
-    if remaining > 0:
-        # The preview study is discarded unfinished: telling it would run
-        # GridSampler.after_trial, whose study.stop() is illegal outside
-        # optimize once a one-point grid is exhausted.
-        sample_trial = study.ask()
-        sampled = {
-            name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()
-        }
-        overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
-        preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
-        cmd = render_command(
-            experiment.trial_command,
-            overrides,
-            experiment.override_format,
-            trial_dir=preview_dir,
-            trial_id=-1,
-            phase=phase.name,
-            run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
-            trainer_config=experiment.trainer_config,
-        )
-        placeholders = [
-            name for name, winner in inherited_winners.items() if _is_placeholder_winner(winner)
-        ]
-        note = ""
-        if placeholders:
-            names = ", ".join(repr(name) for name in placeholders)
-            publishes = "publishes a winner" if len(placeholders) == 1 else "publish winners"
-            note = f" (inherited values are placeholders until {names} {publishes})"
-        log.info("DRY RUN example command%s:\n  %s", note, cmd)
-
-    return _placeholder_winner(
-        experiment,
-        phase,
-        inherited_winners,
-        sampled_params=sampled,
     )
 
 

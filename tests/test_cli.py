@@ -942,7 +942,7 @@ def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
         ],
     )
     monkeypatch.setattr(
-        "phasesweep.engine.phase._suggest",
+        "phasesweep.engine.preview._suggest",
         lambda _trial, _name, param: param.low,
     )
     winners = run_experiment(exp, dry_run=True)

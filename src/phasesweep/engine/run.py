@@ -38,6 +38,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
+from phasesweep.engine.preview import _preview_phase
 from phasesweep.engine.publication import _published_winner_path_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
@@ -84,9 +85,9 @@ def _preflight_missing_reached_phase_environments(
             _trainer_environment(experiment, phase.name)
 
 
-def _read_recorded_counts_for_preview(
+def _read_recorded_phases_for_preview(
     experiment: Experiment,
-) -> dict[str, ledger_ops.RecordedCounts | None]:
+) -> dict[str, ledger_ops.RecordedPhase | None]:
     """Read what every phase's study already holds, for a dry run to preview from.
 
     The read goes through the write-nothing door ``status`` uses, so it neither
@@ -97,7 +98,7 @@ def _read_recorded_counts_for_preview(
     :param Experiment experiment: Parsed experiment being previewed.
     :raises ArtifactRootConflictError: The tree is bound to a different owner.
     :raises StudySchemaMismatchError: A ledger study uses an unsupported schema.
-    :return dict[str, ledger_ops.RecordedCounts | None]: One entry per phase, by
+    :return dict[str, ledger_ops.RecordedPhase | None]: One entry per phase, by
         phase name; ``None`` for a phase whose trials could not be read.
     """
     try:
@@ -105,12 +106,12 @@ def _read_recorded_counts_for_preview(
     except StudyStorageUnavailableError as exc:
         log.warning("DRY RUN warning: the ledger could not be inspected: %s", exc)
         return {phase.name: None for phase in experiment.phases}
-    return ledger_ops.read_recorded_counts(ledger)
+    return ledger_ops.read_recorded_phases(ledger)
 
 
 def _preview_fixed_configuration_targets(
     experiment: Experiment,
-    recorded: Mapping[str, ledger_ops.RecordedCounts | None],
+    recorded: Mapping[str, ledger_ops.RecordedPhase | None],
     *,
     from_phase: str | None,
 ) -> None:
@@ -122,8 +123,8 @@ def _preview_fixed_configuration_targets(
     on its own.
 
     :param Experiment experiment: Parsed experiment being previewed.
-    :param Mapping[str, ledger_ops.RecordedCounts | None] recorded: Attempts each
-        phase's study holds, from :func:`_read_recorded_counts_for_preview`.
+    :param Mapping[str, ledger_ops.RecordedPhase | None] recorded: What the ledger
+        holds for each phase, from :func:`_read_recorded_phases_for_preview`.
     :param str | None from_phase: Optional first phase a launch would execute.
     :raises TrialTargetRefusedError: A reached fixed configuration asks for
         more attempts than it may retry given the trials recorded so far.
@@ -736,7 +737,7 @@ def _run_experiment_inner(
     dry_run = ledger is None
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
-    recorded: dict[str, ledger_ops.RecordedCounts | None] = {}
+    recorded: dict[str, ledger_ops.RecordedPhase | None] = {}
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
@@ -752,8 +753,17 @@ def _run_experiment_inner(
             log.info("DRY RUN %s", sampler_capability_line(previewed))
             for warning in sampler_warnings(previewed):
                 log.warning("DRY RUN warning: %s", warning)
-        recorded = _read_recorded_counts_for_preview(experiment)
+        recorded = _read_recorded_phases_for_preview(experiment)
         _preview_fixed_configuration_targets(experiment, recorded, from_phase=from_phase)
+        resume_ops._preview_recorded_refusals(
+            experiment,
+            {
+                name: record.study
+                for name, record in recorded.items()
+                if record is not None and record.study is not None and not record.running
+            },
+            from_phase=from_phase,
+        )
 
     # Only a dry run resumes without preloaded winners; it resolves the
     # publication once for every phase it skips.
@@ -809,15 +819,18 @@ def _run_experiment_inner(
         skip_until = False
 
         _warn_flagged_inheritance(phase.name, inherited)
-        winner = _run_phase(
-            experiment,
-            phase,
-            inherited,
-            generation_id=generation_id,
-            ledger=ledger,
-            run_deadline=run_deadline,
-            recorded=recorded.get(phase.name),
-        )
+        if ledger is None:
+            winner = _preview_phase(experiment, phase, inherited, recorded.get(phase.name))
+        else:
+            assert generation_id is not None
+            winner = _run_phase(
+                experiment,
+                phase,
+                inherited,
+                generation_id=generation_id,
+                ledger=ledger,
+                run_deadline=run_deadline,
+            )
         if not dry_run:
             assert generation_id is not None
             artifact_io._save_winner(
