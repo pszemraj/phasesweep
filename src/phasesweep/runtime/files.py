@@ -438,10 +438,9 @@ def fsync_directory(path: Path) -> None:
     create has already changed the destination, so a directory-durability
     failure here must not be reported as a failed commit: a caller reacting
     to the exception would wrongly reclassify an already-authoritative write
-    (e.g. a committed last-success pointer marked ``publication_failed``,
-    review v0.5.16 / blocker 1). The failure is logged as a durability
-    warning instead — the commit stands; only its crash-durability is
-    uncertain.
+    (e.g. a committed last-success pointer marked ``publication_failed``).
+    The failure is logged as a durability warning instead — the commit
+    stands; only its crash-durability is uncertain.
     """
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -708,13 +707,13 @@ def _walk_directory_fd(
                 )
             # Shutdown signals are deferred for the whole walk (see
             # ``open_directory_fd``), so ``PhaseSweepShutdown`` cannot land
-            # between these statements. Historically it could: closing before
-            # the store left ``current_fd`` naming a closed descriptor and
-            # turned a shutdown into ``OSError: [Errno 9] Bad file
-            # descriptor`` in the ``finally`` below, while storing before the
-            # close leaked ``previous_fd`` on the reverse boundary. The
-            # assign-first order stays so an exception raised by ``os.close``
-            # itself still cannot double-close.
+            # between these statements, which is what makes the assign-first
+            # order safe: an exception between a store and the close would
+            # strand ``previous_fd``. Closing first would instead leave
+            # ``current_fd`` naming a closed descriptor and turn a shutdown
+            # into ``OSError: [Errno 9] Bad file descriptor`` in the
+            # ``finally`` below. Assigning first also means an exception
+            # raised by ``os.close`` itself cannot double-close.
             previous_fd = current_fd
             current_fd = next_fd
             os.close(previous_fd)
@@ -1220,7 +1219,7 @@ def file_url_path(storage: str) -> str:
     This file-style URL grammar uses three slashes for relative paths and
     four for absolute POSIX paths (the fourth slash is the root ``/``). We
     must preserve that distinction; ``lstrip("/")`` would destroy absolute
-    paths (review v0.5.9 / blocker 1).
+    paths.
 
     Supported forms::
 

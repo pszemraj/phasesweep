@@ -8,7 +8,7 @@ Host locks key on a *canonical physical device identity*, not on the spelling of
 the configured token: at pool construction every numeric index is resolved to
 the GPU UUID ``nvidia-smi`` reports for it, so ``gpu_ids: [0]`` in one run and
 ``gpu_devices: ["GPU-<uuid of 0>"]`` in another contend for one lock file
-instead of double-booking the card (review v0.5.17 / blocker 6).
+instead of double-booking the card.
 
 MIG limitation: a ``MIG-...`` token locks on the MIG instance itself. phasesweep
 does not bind a MIG instance to its parent GPU, so a run holding a MIG instance
@@ -79,8 +79,7 @@ class GpuDevice:
         """Return a stable, path-safe lock identifier for this device's physical GPU.
 
         Derived from :attr:`lock_identity`, never from the visible token, so a
-        numeric index and the GPU UUID naming the same card share one lock file
-        (review v0.5.17 / blocker 6).
+        numeric index and the GPU UUID naming the same card share one lock file.
         """
         identity = self.lock_identity
         if identity.isdigit():
@@ -191,8 +190,7 @@ def _detect_gpu_inventory() -> tuple[list[int], dict[str, str]]:
         # Require a real device-identity shape. Restricted drivers (vGPU,
         # locked-down containers) report "[N/A]"/"[Not Supported]" for every
         # index; accepting those would map ALL indices to one identity and
-        # silently collapse a multi-GPU pool to a single lock (review
-        # v0.5.17 gap hunt).
+        # silently collapse a multi-GPU pool to a single lock.
         if index.isdigit() and uuid.startswith(("GPU-", "MIG-")):
             uuid_map[index] = uuid
     return ids, uuid_map
@@ -293,10 +291,9 @@ def _bind_lock_identities(
 
     Numeric indices resolve to the UUID ``nvidia-smi`` reports for them, so the
     same card configured as ``0`` in one run and ``GPU-<uuid>`` in another takes
-    one host lock instead of two (review v0.5.17 / blocker 6). Every ``GPU-``
-    token, including a full-length or lowercase spelling, resolves through the
-    readable inventory; abbreviated UUID prefixes resolve only when exactly one
-    card matches. ``MIG-`` tokens similarly resolve through ``nvidia-smi -L``.
+    one host lock instead of two. Every ``GPU-`` token, including a full-length
+    or lowercase spelling, resolves through the readable inventory; abbreviated
+    UUID prefixes resolve only when exactly one card matches. ``MIG-`` tokens similarly resolve through ``nvidia-smi -L``.
     This both canonicalizes case and rejects a UUID that CUDA would turn into an
     empty visibility set while phasesweep held no real-device lock.
 
@@ -419,10 +416,9 @@ def _require_distinct_whole_node_devices(requested: list[str], bound: list[GpuDe
     trainer's world size, and that declared count is what the phase fingerprint
     records (``whole_node_device_count``). Deduplication is therefore not a
     convenience here: dropping an aliased token would run a 1-GPU world under a
-    2-GPU study identity, and the two runs would be indistinguishable afterwards
-    (PR #5 review / reviewer 2, blocker 2). ``single_per_trial`` is unaffected —
-    there the list is a pool whose size is pure throughput, so dedupe with a
-    warning stays correct.
+    2-GPU study identity, and the two runs would be indistinguishable
+    afterwards. ``single_per_trial`` is unaffected — there the list is a pool
+    whose size is pure throughput, so dedupe with a warning stays correct.
 
     Only *actual* collapses are reported. A collapse is visible either as a
     token that :func:`_normalize_devices` removed (an exact repeat, or an empty
@@ -886,8 +882,10 @@ class GpuPool:
         Yields:
             A :class:`GpuAssignment` carrying the CUDA visibility token (the
             pinned disable sentinel for explicit CPU isolation, or ``None``
-            for an inactive pool) and the host-lock descriptors the trainer
-            must inherit so exclusion survives an orchestrator hard exit.
+            for an inactive pool) and the host-lock descriptors the supervisor
+            guardian inherits so exclusion survives an orchestrator hard exit.
+            The trainer does not inherit them: the supervisor closes every
+            descriptor above stderr before it execs the trainer.
 
         Raises:
             GpuLeaseTimeoutError: ``deadline`` expired before a GPU could be leased.

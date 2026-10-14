@@ -568,10 +568,9 @@ def _terminate_process_group(pgid: int, *, grace_seconds: float) -> bool:
 
     Returns ``True`` only when the process group is confirmed gone. Returns
     ``False`` when delivery fails (permission denied, OS error) or the group
-    is still alive after SIGKILL. Pre-v0.5.8 this function returned ``True``
-    even when the group survived SIGKILL — callers then marked the trial
-    ``FAIL`` and proceeded, potentially launching new trials onto a GPU still
-    held by the leaked process (review v0.5.7 / blocker 2).
+    is still alive after SIGKILL. Reporting ``True`` for a group that survived
+    SIGKILL would let callers mark the trial ``FAIL`` and proceed, potentially
+    launching new trials onto a GPU still held by the leaked process.
 
     ``ProcessLookupError`` from ``killpg`` means the group is already gone, so
     those branches return ``True``.
@@ -683,10 +682,10 @@ def _process_group_alive(pgid: int) -> bool:
     they still occupy the PID table. For our purposes a zombie is dead — it
     holds no GPU memory, no file descriptors, no shared resources. Skipping
     zombies stops the cleanup escalation from looping after SIGKILL when the
-    parent hasn't reaped its child yet (review v0.5.7 / blocker 2 follow-up).
+    parent hasn't reaped its child yet.
 
-    On non-Linux, ``/proc/<pid>/stat`` doesn't exist; we fall back to the
-    previous behavior (``killpg(0)`` semantics).
+    On non-Linux, ``/proc/<pid>/stat`` doesn't exist; we fall back to plain
+    ``killpg(0)`` semantics.
 
     Args:
         pgid: Process-group ID to probe.
@@ -860,16 +859,16 @@ def kill_stale_group(
     nothing was alive to clean up, or cleanup ran and the process group is
     confirmed gone. Returns ``False`` when cleanup is uncertain — PID/PGID
     identity was reused unsafely, permission was denied, or the group survived
-    SIGKILL. Callers must not advance state when this returns ``False``
-    (review v0.5.7 / blocker 2): a leaked training process can still hold a
-    GPU, scribble over W&B runs, or starve the host scheduler.
+    SIGKILL. Callers must not advance state when this returns ``False``: a
+    leaked training process can still hold a GPU, scribble over W&B runs, or
+    starve the host scheduler.
 
     Precondition: the caller has established that ``pid`` and ``pgid`` were
     recorded in this process's PID namespace (:func:`same_pid_namespace`), or
     that the identity is a child this process just spawned. In another
     namespace the same numbers name unrelated processes.
 
-    Recovery order (review v0.5.3 / blocker 2):
+    Recovery order:
 
     1. ``pid`` is alive AND saved starttime matches: derive PGID from the live
        PID and kill the group. Starttime check guards against PID reuse.
