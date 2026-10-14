@@ -103,9 +103,9 @@ class _Frozen(BaseModel):
 def _require_finite(label: str, value: float) -> None:
     """Raise ``ValueError`` if ``value`` is NaN or +/-inf.
 
-    Used at config-load to keep silently-broken bounds out of the runtime
-    (review v0.5.2 / blocker 3): a constraint with ``max: .nan`` would otherwise
-    be vacuous because ``x > nan`` is always ``False``.
+    Used at config-load to keep silently-broken bounds out of the runtime: a
+    constraint with ``max: .nan`` would otherwise be vacuous because
+    ``x > nan`` is always ``False``.
 
     Args:
         label: Human-readable name of the field (e.g. ``"constraint.max"``);
@@ -224,7 +224,7 @@ def _find_prefix_collisions(keys: set[str]) -> list[tuple[str, str]]:
           siblings, same depth).
         * ``a.b.c`` and ``a.b.c.d`` do collide.
 
-    Used in ``Experiment._validate_phase_graph`` (review v0.5.3 / blocker 5).
+    Used in ``Experiment._validate_phase_graph``.
 
     Args:
         keys: The combined fixed-overrides / search-space / inherited key set

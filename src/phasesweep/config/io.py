@@ -232,7 +232,7 @@ def load_experiment(path: str | Path) -> Experiment:
     Uses a strict loader that rejects duplicate mapping keys. PyYAML's default
     ``safe_load`` silently keeps the last value for a duplicate key, which can
     cause an experiment to silently use the wrong search range or fixed
-    override (review v0.5.6 / non-blocking hardening item).
+    override.
 
     Relative ``workdir``, journal ``storage`` and ``execution.cwd`` paths
     resolve against the directory of the file after symlinks are resolved, so

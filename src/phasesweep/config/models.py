@@ -465,11 +465,10 @@ class Phase(_Frozen):
             # The phase fingerprint records the DECLARED token count as the
             # trainer's world size, but the runtime pool normalizes and dedupes
             # tokens before leasing. A repeated token therefore promises a
-            # 2-GPU run and delivers a 1-GPU run under a 2-GPU study identity
-            # (PR #5 review / reviewer 2, blocker 2). Tokens are stripped
-            # defensively: ``_gpu_devices_non_empty_tokens`` already strips
-            # ``gpu_devices``, but this validator must not depend on that to
-            # see ``[' GPU-a ', 'GPU-a']`` as the duplicate pair it is.
+            # 2-GPU run and delivers a 1-GPU run under a 2-GPU study identity.
+            # Tokens are stripped defensively: ``_gpu_devices_non_empty_tokens``
+            # already strips ``gpu_devices``, but this validator must not depend
+            # on that to see ``[' GPU-a ', 'GPU-a']`` as the duplicate pair it is.
             declared = self.gpu_ids if self.gpu_ids is not None else self.gpu_devices
             tokens = [str(token).strip() for token in declared or []]
             duplicates = sorted({token for token in tokens if tokens.count(token) > 1})
@@ -578,8 +577,7 @@ class Phase(_Frozen):
         CLI override rendering quotes values shell-safely, but a malformed
         *key* like ``""``, ``"."``, ``"a..b"``, or ``" lr"`` would either
         produce broken commands (``-- 1``, ``=value``, ``..a=value``) or silently
-        treat surface noise (whitespace) as part of the key (review v0.5.6 /
-        non-blocking hardening item).
+        treat surface noise (whitespace) as part of the key.
 
         Permissible keys: dotted paths whose every segment is non-empty and
         matches ``[A-Za-z0-9_\-]+``. This covers ``lr``, ``model.depth``,
@@ -685,7 +683,7 @@ BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNA
 
 
 class ExecutionContext(_Frozen):
-    """Explicit trainer execution-context contract (review v0.5.17 / blocker 4).
+    """Explicit trainer execution-context contract.
 
     The ambient environment and the current working directory are two unbounded
     implicit semantic inputs that never contribute to study identity, so one
@@ -872,7 +870,7 @@ class Experiment(_Frozen):
         default_factory=ExecutionContext,
         description=(
             "Explicit trainer execution context: working directory and "
-            "environment-inheritance contract (review v0.5.17 / blocker 4)."
+            "environment-inheritance contract."
         ),
     )
     timeout_seconds_per_run: ConfigFloat | None = Field(default=None, ge=0)
@@ -1274,8 +1272,7 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
     """Require an explicit seed, and a non-resumable acknowledgement, on persistent storage.
 
     A persistent study outlives the process that created it, which makes two
-    sampler properties operator decisions rather than defaults (review v0.5.18 /
-    finding F7):
+    sampler properties operator decisions rather than defaults:
 
     1. Reproducibility. An unseeded ``tpe``/``random``/``cmaes`` phase draws a
        different sequence on every invocation, so the durable trials it

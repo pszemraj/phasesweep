@@ -157,9 +157,9 @@ class CategoricalParam(_Frozen):
 
         Optuna keeps a duplicated choice verbatim — ``CategoricalDistribution([1, 1, 2])``
         has three choices and ``GridSampler`` enumerates three points — so
-        ``[1, 1, 2]`` used to run three trials over two distinct assignments and
-        still report the grid complete (review v0.5.17 / finding C). Duplicates
-        also silently double a choice's sampling weight under TPE/random.
+        ``[1, 1, 2]`` would run three trials over two distinct assignments and
+        still report the grid complete. Duplicates also silently double a
+        choice's sampling weight under TPE/random.
 
         Uniqueness is by plain Python equality, across types, because that is
         the comparison Optuna itself uses. ``CategoricalDistribution.
@@ -172,8 +172,7 @@ class CategoricalParam(_Frozen):
         of every child phase, and TPE's own history are rebuilt from the
         collapsed ``params``: a phase that ran ``--x true`` publishes a winner
         claiming ``x: 1``. Rejecting equal choices at config load is what makes
-        every accepted choice round-trip identically (PR #5 review / reviewer 2,
-        blocker 1).
+        every accepted choice round-trip identically.
 
         Args:
             choices: The candidate choices list pre-validation.
@@ -506,7 +505,7 @@ def fixed_configuration_target_refusal(
 def _validate_sampler_search_space(phase: Phase) -> None:
     """Reject sampler/search-space combinations Optuna will not accept at runtime.
 
-    Run at config-load (review v0.5.2 / blocker 2). Catches:
+    Run at config-load. Catches:
 
     * ``allow_partial_grid: true`` with a sampler other than ``grid``; the
       switch is read only for grid, so any other sampler would silently ignore it.
@@ -526,7 +525,7 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     * Grid sampler with float param missing ``step``.
     * Grid sampler with a float param whose enumerated points collapse under the
       12-decimal canonical rounding, which would make the cardinality below
-      overcount the distinct configurations (review v0.5.17 / finding C).
+      overcount the distinct configurations.
 
     The cardinality is a product of the enumerated value-list lengths, so it is
     only truthful while those lists are duplicate-free. Categorical duplicates
@@ -728,11 +727,11 @@ def grid_search_space(
         else:
             assert param.step is not None
             values = [round(param.low + i * param.step, 12) for i in range(counts[name])]
-            # Post-canonicalization collapse (review v0.5.17 / finding C): the
-            # round(..., 12) above maps adjacent points onto the same float once
-            # the step drops below ~1e-12, so the grid would publish fewer unique
-            # configurations than the cardinality check counts — the same
-            # "complete grid" lie duplicate categorical choices produced.
+            # Post-canonicalization collapse: the round(..., 12) above maps
+            # adjacent points onto the same float once the step drops below
+            # ~1e-12, so the grid would publish fewer unique configurations
+            # than the cardinality check counts — the same "complete grid" lie
+            # duplicate categorical choices would produce.
             unique = len(set(values))
             if unique != len(values):
                 raise ValueError(
