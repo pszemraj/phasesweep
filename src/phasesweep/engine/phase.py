@@ -179,6 +179,17 @@ class _DeadlineTrialExecutionError(TrialExecutionError):
     """Raised when a trial fails specifically because a run deadline expired."""
 
 
+class _UnlaunchedAbortError(TrialExecutionError):
+    """Raised when a phase abort stops a trial before its trainer launched.
+
+    The trial has no trainer outcome to count, so it is recorded as
+    interrupted and reruns once the abort is recovered by raising ``n_trials``.
+    """
+
+
+_UNLAUNCHED_ABORT_CAUSE = "phase aborted before this trial's trainer launched"
+
+
 class _TrialOutcomeUnrecordedAbort(BaseException):
     """Control-flow abort for a trial whose outcome record could not be written.
 
@@ -679,7 +690,7 @@ class _PhaseExecution:
     consecutive_failures: int = 0
     recorded_outcomes: dict[int, str] = field(default_factory=dict)
     # Shared by the consecutive-failure and fatal-error paths. Queued
-    # objectives check it inside the GPU lease and prune before launching.
+    # objectives check it inside the GPU lease and stop, interrupted, before launching.
     aborted: bool = False
     # Set once an outcome carrying this execution's abort record is durable.
     abort_recorded: bool = False
@@ -780,7 +791,7 @@ class _PhaseExecution:
         """Record the first fatal objective or post-trial exception and stop peer launches.
 
         First-writer wins so the root failure is not replaced by secondary
-        peer-prune or persistence fallout. The original exception object keeps
+        peer-abort or persistence fallout. The original exception object keeps
         its worker traceback for the post-optimize re-raise.
 
         :param BaseException error: The fatal exception a worker observed.
@@ -949,8 +960,9 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         The extracted metric value (Optuna minimizes/maximizes per ``direction``).
 
     Raises:
-        optuna.TrialPruned: A peer trial tripped a soft abort
-            (max_consecutive_failures) and we should not start a new trial.
+        _UnlaunchedAbortError: A peer trial tripped a soft abort
+            (max_consecutive_failures) or a fatal error before this trial's
+            trainer launched, so it must not start.
         UnsafeProcessCleanupError: The subprocess's cleanup could not be
             confirmed; we hard-abort the phase before another trial can
             acquire the just-released GPU lease.
@@ -974,7 +986,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     trial.set_user_attr(TRAINER_ENV_ATTR, dict(run.environment_identity.tracked))
 
     if run.aborted:
-        raise optuna.TrialPruned("phase aborted")
+        raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE)
 
     sampled = {name: _suggest(trial, name, p) for name, p in sampler_search_space(phase).items()}
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
@@ -1080,7 +1092,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             # thread is between launch_trial() return and the
             # cleanup_confirmed check.
             if run.aborted:
-                raise optuna.TrialPruned("phase aborted")
+                raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE)
 
             _refuse_launch_after_deadline(run)
             executed = launch_trial(
@@ -1103,7 +1115,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             # lets a queued worker acquire the GPU and launch a new trial
             # onto the still-leaked process group. ``run.record_fatal`` sets
             # ``run.aborted`` while we still hold the lease, so the next
-            # thread to enter sees the flag and prunes before launch.
+            # thread to enter sees the flag and stops before launch.
             if not executed.process.cleanup_confirmed:
                 message = (
                     f"Trial {trial.number} cleanup could not be confirmed. "
@@ -1130,7 +1142,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         run.stop_for_deadline()
         raise _DeadlineTrialExecutionError(str(exc)) from exc
     except GpuLeaseCancelledError as exc:
-        raise optuna.TrialPruned("phase aborted") from exc
+        raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE) from exc
 
     # Extraction happens outside GPU lease but INSIDE the phase/run
     # wallclock budget: the configured timeouts bound the whole trial,
@@ -1228,7 +1240,7 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     except optuna.TrialPruned as exc:
         _record_outcome(run, trial, "pruned", cause=str(exc))
         raise
-    except _DeadlineTrialExecutionError as exc:
+    except (_DeadlineTrialExecutionError, _UnlaunchedAbortError) as exc:
         _record_outcome(run, trial, "interrupted", cause=str(exc))
         raise
     except TrialExecutionError as exc:

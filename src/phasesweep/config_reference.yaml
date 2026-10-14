@@ -271,7 +271,7 @@ phases: list[object] (required)
 
     # Target number of finished attempts in this phase, an integer >= 1. An attempt is finished once it has failed, been pruned or completed.
     # Failed and infeasible attempts consume the target, not only successes. If no feasible result is eligible the phase fails.
-    # An interrupted attempt (phase or run deadline, host shutdown, an attempt recovered after its orchestrator stopped) never consumes the target: on persistent storage the next run reruns it with its parameters before any new draw.
+    # An interrupted attempt (phase or run deadline, host shutdown, a phase abort before its trainer launched, an attempt recovered after its orchestrator stopped) never consumes the target: on persistent storage the next run reruns it with its parameters before any new draw.
     # Running the same config again on persistent storage re-ranks the stored trials and republishes when the target is already reached.
     # Raising the target on persistent storage runs the remaining attempts in the same study.
     # With storage null every invocation is a fresh in-memory study and runs the whole target again.
@@ -506,7 +506,8 @@ phases: list[object] (required)
 
     # Stop the phase after this many consecutive failed or infeasible attempts, an integer >= 1.
     # These count as failures: a nonzero trainer exit, a per-trial timeout, a failed extraction or gate, a violated constraint or metric bound, a failed MLflow run preparation, and a fatal error.
-    # A feasible success resets the count. Pruned and interrupted attempts (phase or run deadline, host shutdown, an attempt recovered after its orchestrator stopped) leave it unchanged.
+    # A feasible success resets the count. Pruned and interrupted attempts (phase or run deadline, host shutdown, a phase abort before the trainer launched, an attempt recovered after its orchestrator stopped) leave it unchanged.
+    # A trial the abort stops before its trainer launched is interrupted, so the raised phases[].n_trials that recovers the abort reruns it first.
     # Failed attempts still count toward phases[].n_trials.
     # The count and a recorded abort persist on durable storage in completion order.
     # Raising the limit does not undo a recorded abort. Continuing needs a larger phases[].n_trials or a new experiment name.

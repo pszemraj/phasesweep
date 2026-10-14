@@ -44,7 +44,7 @@ from phasesweep.engine.ledger import (
     open_phase_study,
     validate_ledger,
 )
-from phasesweep.engine.optuna import _build_sampler, _suggest
+from phasesweep.engine.optuna import _build_sampler, _suggest, _trial_state_label
 from phasesweep.engine.paths import (
     _attempts_dir,
     _generation_path,
@@ -69,6 +69,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
+    _parsed_trial_outcome,
 )
 from phasesweep.engine.study_policy import (
     _consecutive_failure_threshold_tripped,
@@ -912,8 +913,8 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     assert n < 30, f"expected early abort, got {n} trials"
 
 
-def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch):
-    """A scheduled worker entering after a peer abort still permits a later top-up."""
+def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_path, monkeypatch):
+    """A worker entering after a peer abort stops interrupted, and the raised target reruns it."""
     experiment = make_experiment(
         workdir=tmp_path / "work",
         storage=f"journal:///{tmp_path / 'study.journal'}",
@@ -956,7 +957,9 @@ def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch)
         study_name="t::p", storage=_resolve_storage(experiment.resolved_storage)
     )
     previous = study.trials
-    assert [trial.state.name for trial in previous] == ["FAIL", "PRUNED"]
+    assert [_trial_state_label(trial) for trial in previous] == ["FAIL", "INTERRUPTED"]
+    stopped = _parsed_trial_outcome(previous[1].user_attrs[TRIAL_OUTCOME_ATTR])
+    assert stopped is not None and "before this trial's trainer launched" in stopped.cause
     for trial in previous:
         assert trial.user_attrs[TRAINER_ENV_DIGEST_ATTR]
         assert TRAINER_ENV_ATTR in trial.user_attrs
@@ -964,11 +967,12 @@ def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch)
     updated = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 3})]}
     )
-    # The supported retry must reach new work, without a schema/migration error.
+    # The raised target reruns the stopped trial before any new draw, without a
+    # schema/migration error. Under two workers the new draw may launch too.
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(updated)
-    assert launched == [0, 2]
-    assert len(study.trials) == 3
+    assert launched[0] == 0 and 2 in launched and 1 not in launched
+    assert study.trials[2].user_attrs[RERUN_OF_ATTR] == 1
     assert [trial.user_attrs for trial in study.trials[:2]] == [
         trial.user_attrs for trial in previous
     ]
