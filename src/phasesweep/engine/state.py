@@ -161,6 +161,10 @@ class Winner:
     # group's highest-numbered member and ``metric`` is the reduced value.
     # ``None`` for a phase without repeats. Winner-only, like ``observed``.
     repeats: RepeatsRecord | None = None
+    # The keys of ``effective_overrides`` whose values are dry-run stand-ins:
+    # a placeholder's own searched keys plus those it carries from placeholder
+    # parents. Empty on every winner a run selects or loads, and never persisted.
+    placeholder_keys: frozenset[str] = frozenset()
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"

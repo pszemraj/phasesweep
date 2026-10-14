@@ -65,7 +65,7 @@ _LEDGER_REFUSED = (
     "cannot read: "
 )
 
-_PLACEHOLDERS = "inherited values are placeholders until 'a' publishes a winner"
+_PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 
 
 def _phase(

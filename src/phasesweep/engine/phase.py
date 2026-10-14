@@ -8,6 +8,7 @@ import json
 import logging
 import threading
 import time
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 from uuid import uuid4
@@ -296,6 +297,38 @@ def _winner_overrides(
     if phase.repeats is not None:
         effective.pop(phase.repeats.key, None)
     return effective
+
+
+def _inherited_placeholder_keys(
+    phase: Phase,
+    inherited_winners: dict[str, Winner],
+    *,
+    replaced: Collection[str],
+) -> dict[str, list[str]]:
+    """Name the inherited override keys whose values are dry-run stand-ins, by parent.
+
+    A key belongs to the last parent in ``inherits`` order that sets it, as in
+    :func:`_composed_overrides`, and drops out when ``replaced`` sets it afresh.
+
+    :param Phase phase: The phase whose inheritance order decides which parent supplies a key.
+    :param dict[str, Winner] inherited_winners: Parent-phase winners, or stand-ins for them.
+    :param Collection[str] replaced: Keys the phase sets itself, which replace any inherited value.
+    :return dict[str, list[str]]: Sorted stand-in keys per parent, in inheritance order, without
+        the parents that supply none.
+    """
+    supplier: dict[str, str] = {}
+    for parent in phase.inherits:
+        supplier.update(dict.fromkeys(inherited_winners[parent].effective_overrides, parent))
+    by_parent: dict[str, list[str]] = {}
+    for parent in phase.inherits:
+        keys = sorted(
+            key
+            for key in inherited_winners[parent].placeholder_keys
+            if supplier.get(key) == parent and key not in replaced
+        )
+        if keys:
+            by_parent[parent] = keys
+    return by_parent
 
 
 def _failure_policy_abort_record(
@@ -1851,7 +1884,9 @@ def _placeholder_winner(
     downstream previews inherit one coherent hypothetical chain. A skipped
     phase without a preview uses each parameter's low bound or first choice.
     Both paths include inherited effective overrides and, like a real winner,
-    drop the repeat key.
+    drop the repeat key. ``placeholder_keys`` names the overrides that hold
+    stand-in values: the phase's own searched keys and those it carries from
+    placeholder parents, unless its fixed overrides replace them.
 
     Args:
         experiment: Parsed experiment config; its phase graph names the keys an
@@ -1872,10 +1907,15 @@ def _placeholder_winner(
         else {name: value for name, value in sampled_params.items() if name in phase.search_space}
     )
     effective = _winner_overrides(experiment, phase, placeholder_params, inherited_winners)
+    carried = _inherited_placeholder_keys(
+        phase, inherited_winners, replaced=[*phase.fixed_overrides, *placeholder_params]
+    )
+    stand_ins = set(placeholder_params).union(*carried.values())
     return Winner(
         trial_number=-1,
         params=placeholder_params,
         effective_overrides=effective,
+        placeholder_keys=frozenset(stand_ins & effective.keys()),
         metric=float("nan"),
         constraints={},
         gates=[],

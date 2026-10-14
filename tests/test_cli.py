@@ -1069,12 +1069,102 @@ def test_dry_run_marks_inherited_values_as_placeholders(tmp_path, caplog):
     assert len(commands) == 2
     assert commands[0].startswith("DRY RUN example command:\n")
     assert commands[1].startswith(
-        "DRY RUN example command (inherited values are placeholders until 'a' publishes a winner):\n"
+        "DRY RUN example command (placeholders until 'a' publishes a winner: depth):\n"
     )
     assert "--depth=6" in commands[1]
     assert all(_is_placeholder_winner(winner) for winner in winners.values())
     published = Winner(trial_number=3, params={}, effective_overrides={}, metric=1.0)
     assert not _is_placeholder_winner(published)
+
+
+def test_dry_run_names_the_placeholder_keys_by_parent(tmp_path, caplog):
+    """The note names the inherited keys that are stand-ins, grouped by the parent that must publish.
+
+    ``c`` inherits a key from each of two placeholder parents. ``d`` inherits from ``c`` alone,
+    so it carries the key ``a`` and ``b`` gave ``c``, which stays a stand-in two phases down,
+    and it fixes ``depth`` itself, which is then a real value and goes unnamed. ``b``'s fixed
+    ``opt`` is real from the start.
+    """
+    caplog.set_level(logging.INFO)
+    exp = make_experiment(
+        persistent=tmp_path,
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(
+                name="a",
+                n_trials=1,
+                sampler=Sampler(type="grid"),
+                search_space={"depth": CategoricalParam(type="categorical", choices=[6])},
+            ),
+            Phase(
+                name="b",
+                n_trials=1,
+                sampler=Sampler(type="grid"),
+                fixed_overrides={"opt": "adam"},
+                search_space={"width": CategoricalParam(type="categorical", choices=[2])},
+            ),
+            Phase(
+                name="c",
+                inherits=["a", "b"],
+                n_trials=1,
+                sampler=Sampler(type="grid"),
+                search_space={"lr": CategoricalParam(type="categorical", choices=[0.1])},
+            ),
+            Phase(
+                name="d",
+                inherits=["c"],
+                n_trials=1,
+                sampler=Sampler(type="grid"),
+                fixed_overrides={"depth": 12},
+                search_space={"wd": CategoricalParam(type="categorical", choices=[0.01])},
+            ),
+        ],
+    )
+
+    run_experiment(exp, dry_run=True)
+
+    commands = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN example")
+    ]
+    assert [command.split(":\n")[0] for command in commands] == [
+        "DRY RUN example command",
+        "DRY RUN example command",
+        "DRY RUN example command (placeholders until 'a' publishes a winner: depth; "
+        "until 'b' publishes a winner: width)",
+        "DRY RUN example command (placeholders until 'c' publishes a winner: lr, width)",
+    ]
+    assert "--opt=adam" in commands[2]
+    assert "--depth=12" in commands[3]
+
+
+def test_dry_run_leaves_a_parent_that_only_fixes_values_unnamed(tmp_path, caplog):
+    """A parent that publishes nothing new supplies no stand-ins, so its child's command carries no note."""
+    caplog.set_level(logging.INFO)
+    exp = make_experiment(
+        persistent=tmp_path,
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(
+                name="a", n_trials=1, sampler=Sampler(type="grid"), fixed_overrides={"opt": "adam"}
+            ),
+            Phase(
+                name="b",
+                inherits=["a"],
+                n_trials=1,
+                sampler=Sampler(type="grid"),
+                search_space={"lr": CategoricalParam(type="categorical", choices=[0.1])},
+            ),
+        ],
+    )
+
+    run_experiment(exp, dry_run=True)
+
+    commands = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN example")
+    ]
+    assert len(commands) == 2
+    assert "placeholders" not in commands[1]
+    assert "--opt=adam" in commands[1]
 
 
 def test_dry_run_discloses_each_phases_sampler_capability(tmp_path, caplog):

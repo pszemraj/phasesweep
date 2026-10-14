@@ -38,7 +38,7 @@ from phasesweep.engine.optuna import (
 from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.phase import (
     _composed_overrides,
-    _is_placeholder_winner,
+    _inherited_placeholder_keys,
     _judge_recorded_phase,
     _PhaseResume,
     _placeholder_winner,
@@ -397,6 +397,9 @@ def _dry_run_phase(
 ) -> Winner:
     """Render and log one example trial command for the phase without launching anything.
 
+    The log line names, by parent, the inherited keys whose values are stand-ins
+    until that parent publishes a winner.
+
     Args:
         experiment: Parsed experiment config.
         phase: The phase being previewed.
@@ -437,14 +440,16 @@ def _dry_run_phase(
             run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
             trainer_config=experiment.trainer_config,
         )
-        placeholders = [
-            name for name, winner in inherited_winners.items() if _is_placeholder_winner(winner)
-        ]
+        stand_ins = _inherited_placeholder_keys(
+            phase, inherited_winners, replaced=[*phase.fixed_overrides, *sampled]
+        )
         note = ""
-        if placeholders:
-            names = ", ".join(repr(name) for name in placeholders)
-            publishes = "publishes a winner" if len(placeholders) == 1 else "publish winners"
-            note = f" (inherited values are placeholders until {names} {publishes})"
+        if stand_ins:
+            groups = "; ".join(
+                f"until {parent!r} publishes a winner: {', '.join(keys)}"
+                for parent, keys in stand_ins.items()
+            )
+            note = f" (placeholders {groups})"
         log.info("DRY RUN example command%s:\n  %s", note, cmd)
 
     return _placeholder_winner(
