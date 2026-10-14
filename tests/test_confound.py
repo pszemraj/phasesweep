@@ -39,6 +39,7 @@ from phasesweep.engine.state import (
     Winner,
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
+from phasesweep.runtime.json import JsonObject
 from tests.conftest import make_experiment, write_constant_trainer
 
 _COMPLETE = optuna.trial.TrialState.COMPLETE
@@ -137,6 +138,11 @@ def _log_regex() -> dict[str, Any]:
         "recorded_at": "2026-01-01T00:00:00+00:00",
         "source": {"kind": "file", "path": "stdout.log", "size_bytes": 0, "sha256": "0" * 64},
     }
+
+
+def _json() -> JsonObject:
+    """Return a current-format ``json`` objective provenance record."""
+    return {**_log_regex(), "extractor": {"kind": "json", "config_sha256": "0" * 64}}
 
 
 def _trials(*specs: tuple[optuna.trial.TrialState, float | None, int]) -> list[Any]:
@@ -248,10 +254,25 @@ def test_evaluation_point_disagreement_is_heterogeneous(
     assert f"2 distinct {axis} values ({values})" in _describe_flagged(block)[0]
 
 
+_BINDING_TEXT = (
+    "json_envelope (report_objective), wandb (evaluation_axis) or mlflow (selected step) "
+    "would bind one"
+)
+
+
 @pytest.mark.parametrize(
     ("records", "reason"),
     [
-        pytest.param(None, "log_regex objectives report no evaluation position", id="log_regex"),
+        pytest.param(
+            None,
+            f"log_regex objectives report no evaluation position; {_BINDING_TEXT}",
+            id="log_regex",
+        ),
+        pytest.param(
+            {number: _json() for number in range(3)},
+            f"json objectives report no evaluation position; {_BINDING_TEXT}",
+            id="json",
+        ),
         pytest.param(
             {0: _wandb(1000), 1: _wandb(None), 2: _wandb(None)},
             "trial(s) 1, 2 recorded no eval/step position",
@@ -268,6 +289,20 @@ def test_evaluation_point_is_not_checked_without_every_position(
     check = block["checks"]["evaluation_point"]
     assert check["verdict"] == "n/a"
     assert reason in check["reason"]
+
+
+def test_evaluation_point_heterogeneous_line_mentions_training_length() -> None:
+    """A flagged position is expected when the search space changes training length."""
+    trials = _trials((_COMPLETE, 0.5, 1), (_COMPLETE, 0.4, 2))
+    block = _assess(trials, trials, provenance={0: _envelope(step=400), 1: _envelope(step=1000)})
+
+    (line,) = _describe_flagged(block)
+
+    assert "2 distinct step values (400, 1000)" in line
+    assert line.endswith(
+        "Expected when this phase's search space changes training length "
+        "(for example epochs or max_steps); otherwise the trials were not trained to one budget"
+    )
 
 
 @pytest.mark.parametrize(

@@ -224,7 +224,12 @@ class MetricPayload(_ToolPayload):
 
     name: str = Field(description="Metric key extracted from trial output.")
     goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
-    objective_evidence: ObjectiveEvidencePayload
+    objective_evidence: ObjectiveEvidencePayload = Field(
+        description=(
+            "False flags mean the identity is not enforced, not that it failed. kind names the "
+            "extractor. Only json_envelope, wandb and mlflow bind an evaluation position."
+        )
+    )
 
 
 class CapabilitiesPayload(_ToolPayload):

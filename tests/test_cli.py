@@ -67,14 +67,34 @@ from tests.recovery_helpers import recover_run_cli
 @pytest.mark.parametrize(
     ("extractor", "details"),
     [
-        ({"type": "json", "path": "r.json", "key": "eval.loss"}, ["r.json", "eval.loss"]),
+        (
+            {"type": "json", "path": "r.json", "key": "eval.loss"},
+            [
+                "r.json",
+                "eval.loss",
+                "evaluation_point check: n/a (json objectives record no evaluation position; "
+                "json_envelope via report_objective, wandb with evaluation_axis, or mlflow would)",
+            ],
+        ),
         (
             {"type": "wandb", "entity": "e", "project": "p", "metric_key": "eval/loss"},
-            ["eval/loss", "api.wandb.ai"],
+            [
+                "eval/loss",
+                "api.wandb.ai",
+                "evaluation_point check: supported (axis '_step' located in W&B run history; "
+                "advisory, n/a when no position is found)",
+            ],
         ),
         (
             {"type": "log_regex", "pattern": "loss=(?P<value>[0-9.]+)"},
-            ["select", "last", "stdout.log"],
+            [
+                "select",
+                "last",
+                "stdout.log",
+                "evaluation_point check: n/a (log_regex objectives record no evaluation "
+                "position; json_envelope via report_objective, wandb with evaluation_axis, "
+                "or mlflow would)",
+            ],
         ),
         (
             {
@@ -84,7 +104,35 @@ from tests.recovery_helpers import recover_run_cli
                 "policy": "final",
                 "expected_step": 20,
             },
-            ["policy", "final", "expected_step", "20"],
+            [
+                "policy",
+                "final",
+                "expected_step",
+                "20",
+                "evaluation_point check: supported (axis 'step' from the envelope; any other "
+                "axis from evaluation.progress)",
+            ],
+        ),
+        (
+            {
+                "type": "json_envelope",
+                "objective_name": "loss",
+                "split": "validation",
+                "policy": "final",
+                "evaluation_axis": "tokens",
+            },
+            [
+                "evaluation_point check: supported (axis 'tokens' from the envelope's "
+                "evaluation.progress)",
+            ],
+        ),
+        (
+            {"type": "mlflow", "metric_key": "eval/loss", "select": "last"},
+            [
+                "eval/loss",
+                "evaluation_point check: supported (position is the step of the selected "
+                "observation)",
+            ],
         ),
     ],
 )
@@ -92,14 +140,24 @@ def test_validate_and_dry_run_explain_scoring_without_sdk(
     tmp_path, monkeypatch, caplog, extractor, details
 ):
     from phasesweep.config import Metric
+    from phasesweep.tracking.models import MlflowSettings
 
     monkeypatch.setitem(sys.modules, "wandb", None)
     monkeypatch.setitem(sys.modules, "wandb.apis.public", None)
-    experiment = make_experiment(
-        workdir=tmp_path / "runs",
-        n_trials=1,
-        metric=Metric(name="loss", goal="minimize", extractor=extractor),
-    )
+    monkeypatch.setitem(sys.modules, "mlflow", None)
+    metric = Metric(name="loss", goal="minimize", extractor=extractor)
+    if extractor["type"] == "mlflow":
+        # The mlflow reader needs the top-level target block, which make_experiment cannot set.
+        experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1).model_copy(
+            update={
+                "metric": metric,
+                "mlflow": MlflowSettings(
+                    tracking_uri="http://127.0.0.1:5000", experiment_name="phasesweep"
+                ),
+            }
+        )
+    else:
+        experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1, metric=metric)
     config = tmp_path / "experiment.yaml"
     config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
     result = CliRunner().invoke(cli_main, ["validate", str(config)])

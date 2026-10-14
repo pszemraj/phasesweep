@@ -24,6 +24,7 @@ from typing import Any, Literal, get_args
 
 import optuna
 
+from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
 from phasesweep.runtime.json import progress_position
 
 ConfoundVerdict = Literal["ok", "heterogeneous", "n/a"]
@@ -40,8 +41,6 @@ CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 
 CONFOUND_SCHEMA_VERSION = 1
 
-# Objective kinds whose provenance records a position on the evaluation axis.
-_POSITIONED_KINDS = frozenset({"json_envelope", "wandb", "mlflow"})
 _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "failed", "pruned")
 # Where a terminal trial that selection did not rank is counted. A COMPLETE
 # trial outside the ranked set violated a constraint; a trial that failed an
@@ -99,7 +98,8 @@ def _evaluation_point(
     The position is on the extractor's declared ``evaluation_axis`` -- the
     progress axis the sweep holds fixed: optimizer step, tokens for a
     fixed-token sweep, or a W&B step metric. ``json_envelope`` objectives
-    report it; ``wandb`` objectives locate it in run history. Comparing any
+    report it; ``wandb`` objectives locate it in run history; ``mlflow``
+    objectives use the step of the selected observation. Comparing any
     other axis would flag designed differences: a fixed-token batch-size sweep
     ends trials at different steps, and checkpoint labels usually embed the
     step. The axis is part of the fingerprinted extractor config, so every
@@ -121,8 +121,11 @@ def _evaluation_point(
         )
     records = [(trial.number, provenance[trial.number]) for trial in ranked]
     kinds = sorted({record["extractor"]["kind"] for _, record in records})
-    if len(kinds) != 1 or kinds[0] not in _POSITIONED_KINDS:
-        return _not_checked(f"{', '.join(kinds)} objectives report no evaluation position")
+    if len(kinds) != 1 or kinds[0] not in POSITIONED_EXTRACTOR_KINDS:
+        return _not_checked(
+            f"{', '.join(kinds)} objectives report no evaluation position; json_envelope "
+            "(report_objective), wandb (evaluation_axis) or mlflow (selected step) would bind one"
+        )
     positions = [(number, record["source"]["evaluation"]["progress"]) for number, record in records]
     axes = sorted({progress["axis"] for _, progress in positions})
     if len(axes) != 1:
@@ -444,7 +447,9 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
             lines.append(
                 f"evaluation_point: ranked objectives were measured at {len(groups)} distinct "
                 f"{detail['axis']} values ({_logged_values(groups)}), the lowest more than "
-                f"{_POSITION_TOLERANCE:.0%} short of the highest"
+                f"{_POSITION_TOLERANCE:.0%} short of the highest. Expected when this phase's "
+                "search space changes training length (for example epochs or max_steps); "
+                "otherwise the trials were not trained to one budget"
             )
         elif name == "survivorship":
             lines.append(

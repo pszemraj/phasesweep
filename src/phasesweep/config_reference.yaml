@@ -71,7 +71,9 @@ trial_command: string (required)
 # survivorship is flagged when failed plus pruned trials are at least max(1, ranked trials). Infeasible trials are counted but never flagged.
 # tie is flagged when another ranked trial has exactly the winner's value with different sampled parameters.
 # A verdict of n/a means not checked. evaluation_point and tie are n/a when fewer than two trials were ranked.
-# evaluation_point is also n/a for json and log_regex objectives, which report no position, when no position was recorded (for example a W&B history position that was unavailable), and when ranked trials have unreadable provenance.
+# evaluation_point needs a recorded position, and only json_envelope, wandb and mlflow objectives record one. It is always n/a for json and log_regex objectives; report through json_envelope (report_objective), wandb (evaluation_axis) or mlflow (the selected step) when the comparison needs it. phasesweep validate and run --dry-run print an evaluation_point check: line that says which case applies.
+# evaluation_point is also n/a when no position was recorded (for example a W&B history position that was unavailable), and when ranked trials have unreadable provenance.
+# A phase whose search space changes training length (for example epochs or max_steps) flags evaluation_point by design. Otherwise a flag means the trials were not trained to one budget.
 metric: object (required)
   # Name the objective is published under, for example validation_loss.
   # goal is reserved and rejected. No other restriction is validated.
@@ -92,6 +94,7 @@ metric: object (required)
     # Read one number from a JSON file in the attempt directory.
     # The file must be strict JSON. Duplicate member names, or NaN, Infinity or -Infinity tokens anywhere in the file, invalidate the whole file.
     # The value must be a JSON number: a boolean, string or container fails the trial, and so does a number that converts to a non-finite float, such as 1e999.
+    # It records no evaluation position, so the evaluation_point confound check is always n/a for it. Use json_envelope, wandb or mlflow when the comparison needs one.
     type: "json" (required)
 
     # Path of the JSON file relative to the attempt directory, for example result.json.
@@ -180,6 +183,7 @@ metric: object (required)
     # step takes the latest timestamp at the exact step given in metric.extractor.step.
     # The selected point must be finite. min and max reject a history that contains any non-finite value. Conflicting values at one step and timestamp fail the trial.
     # The step of the selected point is the objective's position for the evaluation_point confound check. MLflow has no evaluation_axis.
+    # Under Transformers load_best_model_at_end=True, a final evaluation scores the best checkpoint but is logged at the final step, so the position cannot tell which checkpoint was scored. Report through json_envelope with checkpoint and step when that matters.
     # metric.goal only ranks the selected values across trials and never supplies this selector.
     # Requires: metric.extractor.step is set exactly when select is step; any other pairing fails config load.
     select: "last" | "min" | "max" | "step" (required)
@@ -233,6 +237,7 @@ metric: object (required)
     # History key logged alongside metric_key that marks where the objective was measured, for example eval/step or tokens. Must be nonempty.
     # _step is W&B's own history step. Log the axis in the same log() call as the metric.
     # For an aggregate summary key the position is read at the end of the history series.
+    # Under Transformers load_best_model_at_end=True, a final evaluation scores the best checkpoint but is logged at the final step, so the position cannot tell which checkpoint was scored. Report through json_envelope with checkpoint and step when that matters.
     # Only used when: this is metric.extractor. A constraints[].extractor must leave it at _step or config load fails.
     # The position lookup is advisory after the objective is accepted. Missing or delayed history can leave no position while the scalar is kept, and the evaluation_point check is then n/a.
     # Requires: not equal to metric_key or to the text before its last dot; otherwise config load fails.

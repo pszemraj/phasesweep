@@ -168,7 +168,12 @@ class EvaluationPointSummary(_SnapshotModel):
     progress axis its sweep holds fixed, such as optimizer step or tokens.
     """
 
-    verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
+    verdict: ConfoundVerdict = Field(
+        description=(
+            f"{_VERDICT_DESCRIPTION} Always n/a for json and log_regex objectives, which "
+            "record no evaluation position; only json_envelope, wandb and mlflow bind one."
+        )
+    )
     distinct_values: NonNegativeInt | None = Field(
         description=(
             "Distinct positions on the configured evaluation axis the ranked objectives "

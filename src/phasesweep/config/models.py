@@ -29,6 +29,7 @@ from phasesweep.config.search import (
     _validate_sampler_search_space,
 )
 from phasesweep.evidence.models import (
+    POSITIONED_EXTRACTOR_KINDS,
     Extractor,
     Gate,
     JsonEnvelopeExtractor,
@@ -103,7 +104,42 @@ def experiment_contract_lines(experiment: Experiment) -> list[str]:
     :param Experiment experiment: Loaded experiment.
     :return list[str]: One line per experiment-wide contract, in print order.
     """
-    return [_metric_scoring_line(experiment.metric), _environment_contract_line(experiment)]
+    return [
+        _metric_scoring_line(experiment.metric),
+        _evaluation_point_line(experiment.metric),
+        _environment_contract_line(experiment),
+    ]
+
+
+def _evaluation_point_line(metric: Metric) -> str:
+    """Say whether selection can check that ranked objectives share an evaluation position.
+
+    The check runs only for extractors whose evidence names a position, so the
+    other kinds would otherwise report ``n/a`` on every winner without saying why.
+
+    :param Metric metric: Configured optimization metric.
+    :return str: One line naming the support, the axis and what binds the position.
+    """
+    extractor = metric.extractor
+    prefix = "evaluation_point check:"
+    if extractor.type not in POSITIONED_EXTRACTOR_KINDS:
+        return (
+            f"{prefix} n/a ({extractor.type} objectives record no evaluation position; "
+            "json_envelope via report_objective, wandb with evaluation_axis, or mlflow would)"
+        )
+    if isinstance(extractor, JsonEnvelopeExtractor):
+        source = (
+            "the envelope; any other axis from evaluation.progress"
+            if extractor.evaluation_axis == "step"
+            else "the envelope's evaluation.progress"
+        )
+        return f"{prefix} supported (axis {extractor.evaluation_axis!r} from {source})"
+    if isinstance(extractor, WandbExtractor):
+        return (
+            f"{prefix} supported (axis {extractor.evaluation_axis!r} located in W&B run history; "
+            "advisory, n/a when no position is found)"
+        )
+    return f"{prefix} supported (position is the step of the selected observation)"
 
 
 def _environment_contract_line(experiment: Experiment) -> str:

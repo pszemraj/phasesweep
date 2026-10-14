@@ -320,6 +320,13 @@ ExtractorKind = Literal["json", "json_envelope", "log_regex", "wandb", "mlflow"]
 EXTRACTOR_KINDS: frozenset[ExtractorKind] = frozenset(get_args(ExtractorKind))
 """:data:`ExtractorKind` as a set, for checking a ``kind`` read back from disk."""
 
+POSITIONED_EXTRACTOR_KINDS: frozenset[ExtractorKind] = frozenset(
+    {"json_envelope", "wandb", "mlflow"}
+)
+"""The kinds whose recorded evidence names where on the evaluation axis the objective was
+measured. ``json`` and ``log_regex`` objectives record no position, so selection's
+``evaluation_point`` check cannot run on them."""
+
 
 def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str | bool]:
     """Describe which objective-evidence identities the extractor genuinely enforces.
