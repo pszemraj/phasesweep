@@ -134,8 +134,8 @@ def report_objective(
         call ``.item()`` on a tensor.
     :param str name: Objective name declared by the metric extractor.
     :param str split: Evaluated data split.
-    :param str policy: Evaluation policy, such as ``best_checkpoint`` or
-        ``final_checkpoint``.
+    :param str policy: Evaluation policy, the exact string the metric extractor's
+        ``policy`` names, such as ``final`` or ``best``.
     :param str checkpoint: Nonempty checkpoint identity.
     :param int step: Non-negative evaluation step.
     :param Mapping[str, int | float] | None progress: Optional positions on other

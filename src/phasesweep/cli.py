@@ -294,7 +294,11 @@ def init(template: str, list_templates: bool, output: str) -> None:
 @click.argument("value", type=float)
 @click.option("--name", required=True, help="Objective name declared by the extractor.")
 @click.option("--split", required=True, help="Evaluated data split.")
-@click.option("--policy", required=True, help="Evaluation policy, such as final_checkpoint.")
+@click.option(
+    "--policy",
+    required=True,
+    help="Evaluation policy, the exact string the metric extractor's policy names, such as final or best.",
+)
 @click.option("--checkpoint", required=True, help="Checkpoint identity for this evaluation.")
 @click.option("--step", required=True, type=click.IntRange(min=0), help="Evaluation step.")
 @click.option(

@@ -1161,8 +1161,9 @@ execution: object = {}
   # Warning: true stores ambient and passed-through secrets in the file. Use it only when keeping the full environment is intended.
   record_env: bool = false
 
-# Wallclock budget for the whole run, in seconds, finite and >= 0. 0 expires immediately.
+# Wallclock budget for one invocation of phasesweep run, in seconds, finite and >= 0. 0 expires immediately.
 # The clock starts after the generation is claimed, before execution preflight and phase work. Initial locking and ledger setup are outside it.
+# The clock restarts at every invocation: a rerun, a --from-phase resume or an MCP launch gets a fresh budget, and the time earlier invocations spent does not count against it.
 # The earliest of this deadline and each phase's own deadlines limits the work. W&B evidence reads and MLflow resolution, run creation and capture are capped by the remaining budget too; MLflow result uploads are not.
 # An incomplete phase fails closed unless phases[].allow_incomplete_on_timeout permits a feasible partial winner.
 # Cleanup and publication can run past the deadline, and the deadline never waives process-cleanup requirements.
