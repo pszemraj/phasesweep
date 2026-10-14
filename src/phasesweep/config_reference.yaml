@@ -976,7 +976,8 @@ env: map[string, string] = {}
 execution: object = {}
   # Working directory of every trainer process. A leading ~ is expanded and a relative path resolves against the config file's directory, not the directory phasesweep is started from. Write . for the config file's directory.
   # The directory is not checked at config load or run start. It must exist when each trainer is launched; otherwise that attempt fails before the trainer starts and counts toward phases[].max_consecutive_failures.
-  # The effective absolute directory is part of the study fingerprint, so when it is unset two invocations from different directories do not share a study.
+  # The effective absolute directory is part of the study fingerprint, so when it is unset two invocations from different directories do not share a study. The refusal names this key and both directories.
+  # phasesweep validate and run --dry-run print the effective directory on a trainer cwd: line.
   # Requires: a nonempty string when set; the empty string fails config load.
   # Unset: the trainer runs in the directory phasesweep was started from, or the catalog entry's cwd under MCP.
   # Recommended: set it so script and data paths resolve the same way from every invocation. workdir and local evidence paths keep their own rules.

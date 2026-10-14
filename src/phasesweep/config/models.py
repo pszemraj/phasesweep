@@ -109,6 +109,7 @@ def experiment_contract_lines(experiment: Experiment) -> list[str]:
         _metric_scoring_line(experiment.metric),
         _evaluation_point_line(experiment.metric),
         _environment_contract_line(experiment),
+        _trainer_cwd_line(experiment),
     ]
 
 
@@ -172,6 +173,26 @@ def _environment_contract_line(experiment: Experiment) -> str:
             "a persistent study refuses to resume when any value outside passthrough_env changes"
         )
     return "environment: " + "; ".join(parts)
+
+
+def _trainer_cwd_line(experiment: Experiment) -> str:
+    """Describe the trainer's working directory, which is part of every study's identity.
+
+    An unset ``execution.cwd`` is the one input the config file does not pin:
+    the line says what it follows instead of printing a directory that
+    depends on the shell ``validate`` happened to run from.
+
+    :param Experiment experiment: Loaded experiment.
+    :return str: One line naming the resolved ``execution.cwd``, or what an unset one follows.
+    """
+    configured = experiment.execution.cwd
+    if configured is None:
+        return (
+            "trainer cwd: follows the directory phasesweep runs from (the catalog cwd under "
+            "MCP) and is part of the study identity; set execution.cwd to pin it"
+        )
+    resolved = Path(configured).expanduser().resolve()
+    return f"trainer cwd: {resolved} (execution.cwd; part of the study identity)"
 
 
 class Constraint(_Frozen):

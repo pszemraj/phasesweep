@@ -148,6 +148,8 @@ Persistent trial targets cannot decrease. Raising a resumable sampler's `n_trial
 
 Before a supported continuation, PhaseSweep first checks the artifact-root and ledger binding, then reconciles stale active attempts, and only then verifies recorded trial evidence and applies sampler continuation rules. `--from-phase` is valid only when the earlier phase winners remain valid; reused winners keep their original source provenance. TPE and CMA-ES persistent targets cannot resume mid-target, while grid and seeded random phases can top up their local study.
 
+A phase's study stores the canonical payload its fingerprint is the digest of, beside the digest. When a later run's config disagrees, the refusal lists up to ten changed keys as dotted paths with their old and new values, truncates long values, and counts the rest. A trainer working directory that changed because `execution.cwd` is unset is called out with the fix. A winner file records only the hash, so a skipped phase whose winner no longer matches reports the two hashes.
+
 An interrupted or failed generation leaves its immutable record for inspection but does not advance `last_successful_generation.yaml`. Signals are absorbed across the final publication commit so the authority pointer is never left ambiguous.
 
 ## Inspection commands

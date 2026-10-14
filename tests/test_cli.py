@@ -277,6 +277,37 @@ def test_dry_run_logs_environment_contract(
     assert lines == [f"DRY RUN {expected}"]
 
 
+@pytest.mark.parametrize("configured", [False, True])
+def test_validate_and_dry_run_disclose_the_trainer_cwd(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, configured: bool
+) -> None:
+    """The trainer cwd line says what pins the directory, since it is part of the study identity."""
+    trainer_dir = tmp_path / "trainer"
+    trainer_dir.mkdir()
+    execution = ExecutionContext(cwd=str(trainer_dir)) if configured else ExecutionContext()
+    expected = (
+        f"trainer cwd: {trainer_dir.resolve()} (execution.cwd; part of the study identity)"
+        if configured
+        else "trainer cwd: follows the directory phasesweep runs from (the catalog cwd under "
+        "MCP) and is part of the study identity; set execution.cwd to pin it"
+    )
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1, execution=execution)
+    config = tmp_path / "experiment.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+    with caplog.at_level(logging.INFO):
+        run_experiment(experiment, dry_run=True)
+
+    assert result.exit_code == 0, result.output
+    assert [line.strip() for line in result.output.splitlines() if "trainer cwd:" in line] == [
+        expected
+    ]
+    assert [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN trainer cwd:")
+    ] == [f"DRY RUN {expected}"]
+
+
 def test_help_registers_commands_and_options() -> None:
     runner = CliRunner()
     result = runner.invoke(cli_main, ["--help"], terminal_width=120)

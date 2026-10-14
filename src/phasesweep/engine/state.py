@@ -153,8 +153,11 @@ TRIAL_DIR_ATTR = "phasesweep_trial_dir"
 GENERATION_ID_ATTR = "phasesweep_generation_id"
 ATTEMPT_ID_ATTR = "phasesweep_attempt_id"
 PHASE_FINGERPRINT_ATTR = "phasesweep_fingerprint"
+# The canonical payload PHASE_FINGERPRINT_ATTR is the digest of, recorded beside
+# it so a refusal can name which keys changed instead of two opaque hashes.
+PHASE_FINGERPRINT_PAYLOAD_ATTR = "phasesweep_fingerprint_payload"
 STUDY_SCHEMA_ATTR = "phasesweep_study_schema_version"
-STUDY_SCHEMA_VERSION = 6
+STUDY_SCHEMA_VERSION = 7
 TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # Ordered terminal outcome used to reconstruct the failure circuit breaker
 # after a restart. Every terminal trial in a current-schema study has one. The
