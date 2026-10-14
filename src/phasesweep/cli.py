@@ -12,6 +12,7 @@ from importlib import resources
 from pathlib import Path
 
 import click
+import optuna
 import yaml
 
 from phasesweep.config import ConfigError, Experiment, load_experiment
@@ -91,8 +92,6 @@ def _configure_logging(verbose: bool) -> None:
     # Optuna's per-trial INFO output is essentially 1:1 with phasesweep's own
     # runner.info "[phase/trial_N] <cmd>" line and adds nothing. Quiet it down
     # by default; -v restores INFO for trial-level diagnostics.
-    import optuna  # local import: keeps `phasesweep --help` snappy
-
     optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
 
 
@@ -465,9 +464,9 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
         deps = f" inherits={p.inherits}" if p.inherits else ""
         sampling = f"sampler={p.sampler.type}" if phase_draws(p) else "(fixed configuration)"
         click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} {sampling}{deps}")
-        # Capability disclosure (review v0.5.18 / finding F7): state the
-        # resume/reproduce contract before a trial runs, not after an
-        # interrupted operator hits the runtime continuation guard.
+        # Capability disclosure: state the resume/reproduce contract before a
+        # trial runs, not after an interrupted operator hits the runtime
+        # continuation guard.
         click.echo(f"{indent}    {sampler_capability_line(p)}")
         for warning in sampler_warnings(p):
             click.echo(f"{indent}    warning: {warning}")
@@ -555,11 +554,11 @@ def _publication_integrity_error(
 ) -> PublicationIntegrityError:
     """Build the one diagnostic every corrupt-publication read surface reports.
 
-    Carries the validation failure *and* the reason not to re-run (review
-    v0.5.18 / finding F4): a successful re-run publishes a new generation, the
-    last-success pointer advances past the corrupt one, and nothing reports
-    the corruption afterwards. The immutable namespace is still on disk until
-    then, so inspecting or restoring it first is the whole remedy.
+    Carries the validation failure *and* the reason not to re-run: a
+    successful re-run publishes a new generation, the last-success pointer
+    advances past the corrupt one, and nothing reports the corruption
+    afterwards. The immutable namespace is still on disk until then, so
+    inspecting or restoring it first is the whole remedy.
 
     :param str subject: Experiment the corrupt publication belongs to.
     :param str detail: Validation error explaining why it no longer validates.
@@ -648,7 +647,7 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     :raises PublicationIntegrityError: The last-success pointer names a
         generation that no longer validates. Nothing is rendered in that case:
         printing "(no winner yet)" beside a corrupt publication reads as a
-        phase that simply has not run (review v0.5.18 / finding F4).
+        phase that simply has not run.
     """
     validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
@@ -810,8 +809,8 @@ def status(config_path: Path, show_trials: bool) -> None:
     The payload is printed first and in full even when it reports a corrupt
     publication: the operator needs the trial counts and generation identity
     to decide what to inspect, and the boundary's one-line diagnostic follows
-    on stderr (review v0.5.18 / finding F4). ``--trials`` prints the trial
-    tables in its place, from one publication resolution, and exits the same way.
+    on stderr. ``--trials`` prints the trial tables in its place, from one
+    publication resolution, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
     :param bool show_trials: Print per-phase trial tables instead of the YAML status.
@@ -912,7 +911,7 @@ def _catalog_error_text(exc: CatalogError) -> str:
     required=True,
     # RunStore.open_existing validates the normalized path without creating it.
     # Normalization happens inside the command because Click's resolve_path
-    # does not expand "~", unlike the catalog loader (review v0.5.17 gap hunt).
+    # does not expand "~", unlike the catalog loader.
     type=click.Path(file_okay=False, path_type=Path),
     help="MCP state_dir containing runs/ and logs/.",
 )
