@@ -9,9 +9,11 @@ from pathlib import Path
 import optuna
 import pytest
 import yaml
+from click.testing import CliRunner
 
 from phasesweep import run_experiment
-from phasesweep.config import JsonExtractor, LogRegexExtractor, Observation
+from phasesweep.cli import cli
+from phasesweep.config import JsonEnvelopeExtractor, JsonExtractor, LogRegexExtractor, Observation
 from phasesweep.engine import read_winner
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _generation_winner_path, _winner_path
@@ -86,6 +88,47 @@ def test_observe_failure_records_nothing_and_keeps_trial_complete(
         rows = list(csv.DictReader(handle))
     assert [row["user_attr:observed:mem"] for row in rows] == ["3.0", "", "5.0"]
     assert "user_attr:observed:absent" not in rows[0]
+
+
+def test_validate_and_dry_run_name_each_observation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Both previews print one line per observation, so a mistyped key shows before a run."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        n_trials=1,
+        observe=[
+            Observation(
+                name="heldout_f05",
+                extractor=JsonExtractor(type="json", path="result.json", key="heldout_f05"),
+            ),
+            _log_observation("mem", r"mem=(?P<value>[0-9.]+)"),
+            Observation(
+                name="envelope",
+                extractor=JsonEnvelopeExtractor(
+                    type="json_envelope", objective_name="loss", split="test", policy="final"
+                ),
+            ),
+        ],
+    )
+    config = tmp_path / "experiment.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    expected = [
+        "observe heldout_f05: json result.json key heldout_f05 (report-only)",
+        "observe mem: log_regex stdout.log pattern 'mem=(?P<value>[0-9.]+)' select last "
+        "(report-only)",
+        "observe envelope: json_envelope result.json objective loss split test policy final "
+        "(report-only)",
+    ]
+
+    result = CliRunner().invoke(cli, ["validate", str(config)])
+    assert result.exit_code == 0, result.output
+    assert all(f"  {line}\n" in result.output for line in expected)
+
+    with caplog.at_level(logging.INFO, logger="phasesweep"):
+        run_experiment(experiment, dry_run=True)
+    assert all(f"DRY RUN {line}" in caplog.text for line in expected)
+    assert not (tmp_path / "runs").exists()
 
 
 def test_winner_without_observations_publishes_an_empty_map(tmp_path: Path) -> None:

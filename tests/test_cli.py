@@ -51,6 +51,8 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _winner_path,
 )
+from phasesweep.engine.phase import _is_placeholder_winner
+from phasesweep.engine.state import Winner
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.mcp.errors import CatalogError
 from phasesweep.mcp.runs import RunStore
@@ -912,6 +914,45 @@ def test_dry_run_previews_a_one_point_grid(tmp_path, caplog, search_space):
     winners = run_experiment(exp, dry_run=True)
     assert set(winners) == {"p"}
     assert any("DRY RUN example command" in r.message for r in caplog.records)
+
+
+def test_dry_run_marks_inherited_values_as_placeholders(tmp_path, caplog):
+    """A preview command built from a previewed parent says its inherited values are placeholders."""
+    caplog.set_level(logging.INFO)
+    exp = make_experiment(
+        persistent=tmp_path,
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(
+                name="a",
+                n_trials=1,
+                sampler=Sampler(type="grid"),
+                search_space={"depth": CategoricalParam(type="categorical", choices=[6])},
+            ),
+            Phase(
+                name="b",
+                inherits=["a"],
+                n_trials=1,
+                sampler=Sampler(type="grid"),
+                search_space={"lr": CategoricalParam(type="categorical", choices=[0.1])},
+            ),
+        ],
+    )
+
+    winners = run_experiment(exp, dry_run=True)
+
+    commands = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN example")
+    ]
+    assert len(commands) == 2
+    assert commands[0].startswith("DRY RUN example command:\n")
+    assert commands[1].startswith(
+        "DRY RUN example command (inherited values are placeholders until 'a' publishes a winner):\n"
+    )
+    assert "--depth=6" in commands[1]
+    assert all(_is_placeholder_winner(winner) for winner in winners.values())
+    published = Winner(trial_number=3, params={}, effective_overrides={}, metric=1.0)
+    assert not _is_placeholder_winner(published)
 
 
 def test_dry_run_discloses_each_phases_sampler_capability(tmp_path, caplog):

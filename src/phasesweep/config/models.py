@@ -38,6 +38,7 @@ from phasesweep.evidence.models import (
     Extractor,
     Gate,
     JsonEnvelopeExtractor,
+    JsonExtractor,
     LocalExtractor,
     ObjectiveExtractor,
     WandbExtractor,
@@ -142,9 +143,34 @@ def experiment_contract_lines(experiment: Experiment) -> list[str]:
     return [
         _metric_scoring_line(experiment.metric),
         _evaluation_point_line(experiment.metric),
+        *(_observation_line(observation) for observation in experiment.observe),
         _environment_contract_line(experiment),
         _trainer_cwd_line(experiment),
     ]
+
+
+def _observation_line(observation: Observation) -> str:
+    """Name one report-only observation and what its extractor reads.
+
+    The line lets a mistyped path or key show before a run, since a value the
+    trainer never wrote is only logged as a warning once a trial finishes.
+
+    :param Observation observation: One configured ``observe`` entry.
+    :return str: One line with the observation's name, its source and a report-only marker.
+    """
+    extractor = observation.extractor
+    if isinstance(extractor, JsonExtractor):
+        source = f"json {extractor.path} key {extractor.key}"
+    elif isinstance(extractor, JsonEnvelopeExtractor):
+        source = (
+            f"json_envelope {extractor.path} objective {extractor.objective_name} "
+            f"split {extractor.split} policy {extractor.policy}"
+        )
+    else:
+        source = (
+            f"log_regex {extractor.file} pattern {extractor.pattern!r} select {extractor.select}"
+        )
+    return f"observe {observation.name}: {source} (report-only)"
 
 
 def _evaluation_point_line(metric: Metric) -> str:

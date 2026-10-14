@@ -129,7 +129,7 @@ Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/
 | Nested JSON, base plus overrides (`json_file`) | `--overrides {overrides_path}` |
 
 > [!TIP]
-> `phasesweep run starter.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects.
+> `phasesweep run starter.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects. A phase that inherits another previews with stand-in values for the parent's winner, and its line says so.
 
 The trainer runs in `execution.cwd`, or in the directory you started PhaseSweep from when that is unset, with a minimal environment: `PATH`, `HOME`, `TMPDIR` and a few more, not the shell's `PYTHONPATH`, conda settings, caches or credentials. Name what it needs under `env` or `execution.inherit_env`; `validate` and `--dry-run` print the `environment:` and `trainer cwd:` lines, and a relative path in the config resolves against the config file's directory. The [trainer contract](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract) has the details.
 

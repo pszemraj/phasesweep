@@ -1792,7 +1792,15 @@ def _dry_run_phase(
             run_name=f"{experiment.experiment}-{phase.name}-DRYRUN",
             trainer_config=experiment.trainer_config,
         )
-        log.info("DRY RUN example command:\n  %s", cmd)
+        placeholders = [
+            name for name, winner in inherited_winners.items() if _is_placeholder_winner(winner)
+        ]
+        note = ""
+        if placeholders:
+            names = ", ".join(repr(name) for name in placeholders)
+            publishes = "publishes a winner" if len(placeholders) == 1 else "publish winners"
+            note = f" (inherited values are placeholders until {names} {publishes})"
+        log.info("DRY RUN example command%s:\n  %s", note, cmd)
 
     return _placeholder_winner(
         experiment,
@@ -1800,6 +1808,16 @@ def _dry_run_phase(
         inherited_winners,
         sampled_params=sampled,
     )
+
+
+def _is_placeholder_winner(winner: Winner) -> bool:
+    """Say whether a winner was synthesized for a dry-run preview.
+
+    :param Winner winner: A winner a dry run inherits from.
+    :return bool: ``True`` for the placeholder :func:`_placeholder_winner` builds, ``False``
+        for one loaded from a published result.
+    """
+    return winner.trial_number == -1
 
 
 def _placeholder_winner(
