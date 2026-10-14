@@ -23,7 +23,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 from phasesweep.config import Experiment
 from phasesweep.config.common import SAFE_NAME_PATTERN, ConfigInt
-from phasesweep.config.io import _load_yaml_mapping_from_text, load_experiment_bytes
+from phasesweep.config.io import (
+    _load_yaml_mapping_from_text,
+    describe_validation_error,
+    load_experiment_bytes,
+)
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.paths import _experiment_dir
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
@@ -330,6 +334,9 @@ def _load_entry(base: Path, entry: _Entry) -> RegisteredExperiment:
     try:
         config_bytes = cfg_path.read_bytes()
         config = load_experiment_bytes(config_bytes, source=cfg_path, config_dir=cfg_path.parent)
+    except ValidationError as exc:
+        detail = describe_validation_error(exc)
+        raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {detail}") from exc
     except (ValueError, OSError) as exc:
         raise CatalogError(f"{entry.id!r}: invalid config {cfg_path}: {exc}") from exc
     _require_persistent_storage(entry.id, config)

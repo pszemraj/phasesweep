@@ -449,6 +449,17 @@ def test_invalid_config_raises_catalog_error(tmp_path: Path, old: str, new: str)
         Registry.load(_catalog(tmp_path, config))
 
 
+def test_invalid_config_error_points_at_the_reference(tmp_path: Path) -> None:
+    """An operator authoring a catalog config is told which key to explain."""
+    bad = _experiment_yaml(tmp_path).replace(
+        "sampler: { type: random, seed: 0 }", "sampler: { type: nope }", 1
+    )
+    config = _write(tmp_path / "exp.yaml", bad)
+    with pytest.raises(CatalogError, match="invalid config") as caught:
+        Registry.load(_catalog(tmp_path, config))
+    assert str(caught.value).endswith("see: phasesweep explain 'phases[].sampler.type'")
+
+
 def test_malformed_config_yaml_raises_catalog_error(tmp_path: Path) -> None:
     config = _write(tmp_path / "broken.yaml", "experiment: [\n")
     with pytest.raises(CatalogError, match="invalid config"):

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import ValidationError
 
 from phasesweep.config.common import CONFIG_DIR_CONTEXT
 from phasesweep.config.models import Experiment
+from phasesweep.config.reference import loc_to_path
+
+# Hint lines after a validation error; the first errors are the likeliest root causes.
+_MAX_HINTS = 3
 
 
 class ConfigError(ValueError):
@@ -161,6 +167,27 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     if not isinstance(data, dict):
         raise ConfigError(f"{source}: top level must be a mapping.")
     return data
+
+
+def describe_validation_error(exc: ValidationError) -> str:
+    """Render a validation error followed by pointers into the configuration reference.
+
+    Each error location maps to the deepest documented key it points into. The first
+    distinct keys, in error order, become ``see: phasesweep explain <key>`` lines, quoted
+    for a shell because reference paths contain ``[]`` and ``<>``. Errors without a
+    location, such as the experiment-level validators', and locations the reference does
+    not document add no line.
+
+    :param ValidationError exc: Validation failure of an :class:`Experiment`.
+    :return str: ``str(exc)`` plus up to three hint lines.
+    """
+    paths: list[str] = []
+    for error in exc.errors(include_input=False):
+        path = loc_to_path(error["loc"])
+        if path is not None and path not in paths:
+            paths.append(path)
+    hints = [f"see: phasesweep explain {shlex.quote(path)}" for path in paths[:_MAX_HINTS]]
+    return "\n".join([str(exc), *hints])
 
 
 def load_experiment_bytes(

@@ -20,7 +20,7 @@ from pydantic import ValidationError
 
 import phasesweep.config as config_models
 from phasesweep.config import Experiment, load_experiment
-from phasesweep.config.io import load_experiment_bytes
+from phasesweep.config.io import describe_validation_error, load_experiment_bytes
 from phasesweep.config.reference import (
     ReferenceEntry,
     _parse,
@@ -496,6 +496,30 @@ def test_loc_to_path_maps_variant_and_search_key_segments() -> None:
     for change, expected in cases:
         locs = _error_locs(change)
         assert {loc_to_path(loc) for loc in locs} == {expected}, locs
+
+
+def test_describe_validation_error_adds_distinct_quoted_hints() -> None:
+    """Errors under one key give one hint, and a path with brackets is shell-quoted."""
+    data = yaml.safe_load((REPO / "examples/example.yaml").read_text())
+    data["env"] = {"A": 1, "B": 2}
+    data["phases"][0]["sampler"] = {"type": "bogus"}
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(data)
+    assert len(caught.value.errors()) == 3
+    assert describe_validation_error(caught.value) == (
+        f"{caught.value}\nsee: phasesweep explain 'phases[].sampler.type'"
+        "\nsee: phasesweep explain env"
+    )
+
+
+def test_describe_validation_error_adds_no_hint_without_a_location() -> None:
+    """An experiment-level validator reports an empty location, so there is no key to explain."""
+    data = yaml.safe_load((REPO / "examples/example.yaml").read_text())
+    data["phases"][0]["inherits"] = ["baseline"]
+    with pytest.raises(ValidationError) as caught:
+        Experiment.model_validate(data)
+    assert [error["loc"] for error in caught.value.errors()] == [()]
+    assert describe_validation_error(caught.value) == str(caught.value)
 
 
 def test_loc_to_path_has_no_key_for_unknown_or_model_level_locations() -> None:

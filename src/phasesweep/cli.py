@@ -14,6 +14,7 @@ import click
 import yaml
 
 from phasesweep.config import ConfigError, Experiment, load_experiment
+from phasesweep.config.io import describe_validation_error
 from phasesweep.config.models import experiment_contract_lines
 from phasesweep.config.reference import (
     closest,
@@ -159,7 +160,9 @@ def _load_cli_config(path: Path) -> Experiment:
         return load_experiment(path)
     except ConfigError:
         raise
-    except (ValidationError, ValueError) as exc:
+    except ValidationError as exc:
+        raise ConfigError(f"{path}: {describe_validation_error(exc)}") from exc
+    except ValueError as exc:
         raise ConfigError(f"{path}: {exc}") from exc
 
 

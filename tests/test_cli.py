@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import shlex
 import signal
 import stat
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -1322,6 +1324,81 @@ def test_cli_boundary_reports_config_error_without_traceback(
     assert str(config_path) in captured.err
     assert "Traceback" not in captured.err
     assert "Traceback" not in captured.out
+
+
+def _example_config_text(change: Callable[[dict], None]) -> str:
+    """Return the minimal starting example as YAML after a change to its mapping.
+
+    :param Callable[[dict], None] change: Edit applied to the loaded example mapping.
+    :return str: YAML text of the changed mapping.
+    """
+    example = Path(__file__).resolve().parent.parent / "examples" / "example.yaml"
+    data = yaml.safe_load(example.read_text())
+    change(data)
+    return yaml.safe_dump(data)
+
+
+def test_config_error_appends_explain_hint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A validation error names the reference key it points into, as a runnable command."""
+
+    def bad_sampler(data: dict) -> None:
+        data["phases"][0]["sampler"] = {"type": "bogus"}
+
+    config_path = tmp_path / "bad_sampler.yaml"
+    config_path.write_text(_example_config_text(bad_sampler))
+
+    exit_code = invoke_cli_boundary(["validate", str(config_path)], monkeypatch)
+
+    err = capsys.readouterr().err
+    assert exit_code == 2
+    assert str(config_path) in err
+    assert "Traceback" not in err
+    hint = "see: phasesweep explain 'phases[].sampler.type'"
+    assert err.rstrip().splitlines()[-1] == hint
+    # The hint is a command the operator can paste.
+    explained = CliRunner().invoke(cli_main, shlex.split(hint.removeprefix("see: phasesweep ")))
+    assert explained.exit_code == 0
+    assert explained.output.startswith("phases[].sampler.type: ")
+
+
+def test_config_error_hints_stay_few_and_distinct(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Five errors under five keys give the first three hints; an error with no location gives none."""
+
+    def many_errors(data: dict) -> None:
+        data["trial_command"] = 3
+        data["metric"]["extractor"]["path"] = 3
+        data["phases"][0]["n_trials"] = "many"
+        data["phases"][0]["gpu_policy"] = "bogus"
+        data["env"] = {"A": 1}
+
+    config_path = tmp_path / "many.yaml"
+    config_path.write_text(_example_config_text(many_errors))
+    assert invoke_cli_boundary(["validate", str(config_path)], monkeypatch) == 2
+    hints = [
+        line for line in capsys.readouterr().err.splitlines() if line.startswith("see: phasesweep")
+    ]
+    assert hints == [
+        "see: phasesweep explain trial_command",
+        "see: phasesweep explain metric.extractor.path",
+        "see: phasesweep explain 'phases[].n_trials'",
+    ]
+
+    def model_level_only(data: dict) -> None:
+        data["phases"][0]["inherits"] = ["baseline"]
+
+    config_path.write_text(_example_config_text(model_level_only))
+    assert invoke_cli_boundary(["validate", str(config_path)], monkeypatch) == 2
+    err = capsys.readouterr().err
+    assert "is not a prior phase" in err
+    assert "see:" not in err
 
 
 @pytest.mark.parametrize(
