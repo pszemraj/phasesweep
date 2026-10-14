@@ -111,11 +111,11 @@ class Winner:
     """Phase winner: sampled params, full effective overrides, and metric value.
 
     ``phase_fingerprint`` is the SHA-256 of the phase's semantic execution
-    context at the time the winner was selected (review v0.5.6 / blocker 3).
-    Persisted into ``winner.yaml`` and re-checked when ``--from-phase`` skips
-    earlier phases — without that check, editing a parent phase's search
-    space, fixed overrides, env, metric, or trial command and then resuming
-    would silently inherit the *old* winner against the *new* parent config.
+    context at the time the winner was selected. Persisted into ``winner.yaml``
+    and re-checked when ``--from-phase`` skips earlier phases — without that
+    check, editing a parent phase's search space, fixed overrides, env, metric,
+    or trial command and then resuming would silently inherit the *old* winner
+    against the *new* parent config.
 
     Every optional field is ``None`` only on placeholder winners produced for
     the dry-run skip path, which never get persisted.
@@ -134,7 +134,7 @@ class Winner:
     source: WinnerSource | None = None
     # Frozen evidence provenance captured when the winning objective was
     # extracted: extractor config fingerprint plus source digest / frozen
-    # remote summary subset (review v0.5.17 / finding F).
+    # remote summary subset.
     objective_provenance: dict[str, Any] | None = None
     # Versioned identity of the generated input consumed by the source trial.
     # Persisted with the winner so --from-phase can verify carried evidence
@@ -193,8 +193,8 @@ PHASE_DECISION_ATTR = "phasesweep_phase_decision"
 PHASE_DECISION_SCHEMA_VERSION = 1
 FEASIBLE_ATTR = "phasesweep_feasible"
 GATES_ATTR = "phasesweep_gates"
-# JSON-encoded frozen objective evidence provenance (review v0.5.17 /
-# finding F); written when metric extraction succeeds.
+# JSON-encoded frozen objective evidence provenance; written when metric
+# extraction succeeds.
 OBJECTIVE_PROVENANCE_ATTR = "phasesweep_objective_provenance"
 # Versioned identity of the exact generated input consumed by the trainer.
 # The record stores only format, trial-relative filename, byte length, and
@@ -270,17 +270,17 @@ def _validate_observed_block(value: object) -> dict[str, float]:
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 3
 PUBLICATION_POINTER_SCHEMA_VERSION = 2
-# Provenance files frozen into every generation namespace at claim time
-# (review v0.5.18 / finding F6). The summary used to keep only the config
-# *fingerprint*, so once the operator edited or lost the YAML the digest could
-# prove a mismatch but could not reconstruct the search spaces, fixed
-# overrides, execution context, env, or trial command behind a published winner.
+# Provenance files frozen into every generation namespace at claim time. The
+# summary keeps only the config *fingerprint*: once the operator edits or loses
+# the YAML, the digest can prove a mismatch but cannot reconstruct the search
+# spaces, fixed overrides, execution context, env, or trial command behind a
+# published winner. These files keep that.
 GENERATION_CONFIG_SNAPSHOT_FILENAME = "config.snapshot.yaml"
 GENERATION_REPRODUCIBILITY_FILENAME = "reproducibility.json"
-# Version 2 added ``generation_id_source`` (PR #5 review / P2 missing-handle
-# authority): "caller" marks a generation whose identity -- and therefore
-# launch authority -- was granted by an external launcher, durably enough to
-# survive the loss of that launcher's own state directory.
+# The reproducibility record carries ``generation_id_source``: "caller" marks a
+# generation whose identity -- and therefore launch authority -- was granted by
+# an external launcher, durably enough to survive the loss of that launcher's
+# own state directory.
 REPRODUCIBILITY_SCHEMA_VERSION = 2
 
 WINNER_FILENAME = "winner.yaml"

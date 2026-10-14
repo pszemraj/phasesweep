@@ -34,6 +34,7 @@ from phasesweep.engine.state import (
     _parse_winner_source,
     _validate_observed_block,
 )
+from phasesweep.engine.trial import _environment_identity
 from phasesweep.runtime.files import atomic_create_text, atomic_text_writer
 
 log = logging.getLogger(__name__)
@@ -67,11 +68,11 @@ def _write_yaml_exclusive(path: Path, payload: Any) -> bool:
 
     Unlike :func:`_write_yaml_atomic` (always-overwrite, used for mutable
     pointers), this is the create-exclusive primitive backing truly immutable
-    per-generation lifecycle records (review v0.5.15 / blocker 3): a second
-    call for an already-written path can never clobber the first write, even
-    a same-content rewrite. Delegates to :func:`atomic_create_text`, so
-    ``path`` is staged and fsynced beside itself and only hard-linked into
-    place once complete -- no reader can ever observe a partial write.
+    per-generation lifecycle records: a second call for an already-written
+    path can never clobber the first write, even a same-content rewrite.
+    Delegates to :func:`atomic_create_text`, so ``path`` is staged and fsynced
+    beside itself and only hard-linked into place once complete -- no reader
+    can ever observe a partial write.
 
     :param Path path: Destination path to create; the parent directory is
         created if missing.
@@ -177,13 +178,12 @@ def _save_winner(
     """Persist a phase winner into its immutable generation namespace.
 
     The phase fingerprint is included so ``_load_winner`` can refuse stale
-    winners on ``--from-phase`` resume (review v0.5.6 / blocker 3). Real
-    winners always carry a fingerprint by construction in ``_run_phase``;
-    placeholder winners (dry-run skip) are never saved.
+    winners on ``--from-phase`` resume. Real winners always carry a
+    fingerprint by construction in ``_run_phase``; placeholder winners
+    (dry-run skip) are never saved.
 
     ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
-    produced the winning trial (review v0.5.18 / finding F3). Neither ever
-    carries ambient variable values. ``confound`` records the advisory
+    produced the winning trial. Neither ever carries ambient variable values. ``confound`` records the advisory
     verdicts on the population the source selection ranked, ``observed`` the
     report-only values the winning trial recorded, and ``repeats`` the winning
     repeat group; like the provenance fields they are winner-only and never
@@ -278,10 +278,6 @@ def _warn_environment_drift(
     :param str phase_name: Phase whose winner was reused, used in the warn-once key.
     :param str stored_digest: Digest recorded on the reused winner or its trial.
     """
-    # Deferred: ``engine.trial`` pulls in the evidence/W&B stack, which the
-    # read-only paths that import this module never need.
-    from phasesweep.engine.trial import _environment_identity
-
     current_digest = _environment_identity(
         experiment,
         phase_name,
@@ -321,7 +317,7 @@ def _load_winner(
 
     We re-compute the fingerprint of the current parent ``phase`` against the
     currently-resolved ``inherited_winners`` and refuse the load if the
-    fingerprints disagree (review v0.5.6 / blocker 3).
+    fingerprints disagree.
 
     A recorded semantic environment digest that disagrees with this process is
     a warning on this explicit skipped-phase path; ordinary study top-ups are

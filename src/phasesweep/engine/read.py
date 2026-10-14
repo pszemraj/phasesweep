@@ -101,10 +101,10 @@ class PhaseWinnerView:
     generation_id: str | None = None
     attempt_id: str | None = None
     source: WinnerSource | None = None
-    # The metric semantics the winner itself recorded (review v0.5.16 /
-    # blocker 4): a persisted winner is historical evidence, so its value is
-    # reported under the name and goal it was optimized for, never relabeled
-    # by whatever metric the current config declares.
+    # The metric semantics the winner itself recorded: a persisted winner is
+    # historical evidence, so its value is reported under the name and goal it
+    # was optimized for, never relabeled by whatever metric the current config
+    # declares.
     metric_name: str | None = None
     metric_goal: str | None = None
     # Path-free projection of the winner's confound block: verdicts, check
@@ -136,8 +136,7 @@ def _phase_status_payloads(
 
     ``winners_present`` must come from the caller's single resolution of the
     represented generation, so one status object spanning several phases can
-    never mix identities from two different pointer resolutions (review
-    v0.5.15 / blocker 3).
+    never mix identities from two different pointer resolutions.
 
     :param Experiment experiment: Parsed experiment whose phase study counts are reported.
     :param Mapping[str, dict[str, int]] trial_counts: Pre-read counts keyed by phase name.
@@ -150,8 +149,7 @@ def _phase_status_payloads(
         storage snapshot as ``trial_counts`` -- ``None`` for a phase whose
         trial data was unreadable. Included only in the path-free status view
         consumed by MCP, whose terminal snapshot must not reread studies to
-        learn which rows the RUNNING count refers to (PR #5 review /
-        reviewer 2, blocker 6).
+        learn which rows the RUNNING count refers to.
     :param set[str] unavailable_published_phases: Published phases whose local
         trial identity could not be matched in the storage snapshot.
     :param set[str] winners_present: Phases whose winner the represented
@@ -189,8 +187,8 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
         # winner.yaml stores metric as {<metric_name>: value, "goal": ...}. The
         # winner is historical evidence: pull the value by the name the file
         # itself recorded, NOT the currently configured metric name — reading
-        # a published x/minimize result through a config renamed to y used to
-        # silently drop the winner entirely (review v0.5.16 / blocker 4).
+        # a published x/minimize result through a config renamed to y would
+        # silently drop the winner entirely.
         metric_block = data.get("metric") or {}
         if not isinstance(metric_block, Mapping):
             return None
@@ -321,8 +319,7 @@ def read_winner(
         experiment: Parsed experiment config; supplies the artifact roots.
             The metric value is extracted under the name the winner file
             itself recorded, so a historical winner is never reinterpreted
-            through the currently configured metric (review v0.5.16 /
-            blocker 4).
+            through the currently configured metric.
         phase_name: Phase whose ``winner.yaml`` to read.
         generation_id: Optional generation whose immutable winner should be read.
 
@@ -364,9 +361,9 @@ def read_winners(
             *historical* generation passes that generation's own recorded plan
             (see :func:`_summary_phase_plan`), so a phase renamed in the config
             since publication neither hides the published winner nor reports
-            the new name as missing (review v0.5.16 / blocker 4). Names are
-            path components, so each is validated; the default keeps the
-            declared-phase behavior every existing caller relies on.
+            the new name as missing. Names are path components, so each is
+            validated; the default keeps the declared-phase behavior every
+            existing caller relies on.
 
     Returns:
         One :class:`PhaseWinnerView` per named phase that has a winner on disk.
@@ -510,15 +507,14 @@ def read_status(
     identities of the RUNNING trials those same counts describe, from the same
     snapshot, or ``None`` when ``trial_data_available`` is ``False``. It exists
     so a caller that must reconcile RUNNING rows -- the MCP terminal snapshot
-    -- never needs a second, intolerant storage read after this one (PR #5
-    review / reviewer 2, blocker 6).
+    -- never needs a second, intolerant storage read after this one.
 
     This resolves the current pointer and the last-success pointer *exactly
     once each* and reuses those two captured ids for every downstream fact in
     this call -- no helper reached from here re-resolves either pointer, so
     one status object can never mix identities from two different pointer
-    reads (review v0.5.15 / blocker 3). Four identities are always reported,
-    and each is truthful independent of ``generation_id``:
+    reads. Four identities are always reported, and each is truthful
+    independent of ``generation_id``:
 
     - ``current_generation_id``: always the actual mutable current pointer
       (the most recent invocation's own claim, whether failed, in-progress,
@@ -538,18 +534,18 @@ def read_status(
       generation identity, status is unpublished.
     - ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"`` --
-      *why* ``published_generation_id`` is what it is (review v0.5.18 /
-      finding F4). ``"absent"`` means nothing was ever published, a healthy
-      state for a fresh tree; ``"failed"`` means a last-success pointer exists
-      but its target no longer validates; ``"permission_denied"`` means this
-      user cannot complete validation without implying corruption. Both are
-      accompanied by a short, path-free ``publication_error``. These states
-      used to be indistinguishable,
-      which invited a re-run over corrupt evidence. A ``"failed"`` payload
-      reports exactly the no-publication facts it always did -- nothing is
-      fabricated from an unvalidated generation -- so ``published_generation_id``
-      is ``None``, ``is_published`` is ``False``, and no winner reads as
-      present.
+      *why* ``published_generation_id`` is what it is. ``"absent"`` means
+      nothing was ever published, a healthy state for a fresh tree;
+      ``"failed"`` means a last-success pointer exists but its target no
+      longer validates; ``"permission_denied"`` means this user cannot
+      complete validation without implying corruption. Both are accompanied by
+      a short, path-free ``publication_error``. Keeping the states distinct
+      stops a fresh tree and corrupt evidence from both reading as nothing
+      published, which would invite a re-run over the corrupt evidence. A
+      ``"failed"`` payload reports exactly the no-publication facts --
+      nothing is fabricated from an unvalidated generation -- so
+      ``published_generation_id`` is ``None``, ``is_published`` is ``False``,
+      and no winner reads as present.
 
     Two views coexist in this payload and must not be confused. The
     *config-progress* view -- the ``phases`` list, with its trial counts,
@@ -560,7 +556,7 @@ def read_status(
     own terms. Under a config edited since publication the two legitimately
     disagree, and ``result_context`` / ``published_config_matches_current``
     say so explicitly rather than leaving a reader to conclude the publication
-    is empty (review v0.5.16 / blocker 4).
+    is empty.
 
     Winner/summary facts (``winner_present``, top-level ``summary_present``)
     scope to ``represented_generation_id``. ``generation_trials`` scopes to
@@ -609,13 +605,12 @@ def read_status(
         (``result_context: "represented_generation"``), falling back to the
         current config only when no summary semantics exist
         (``result_context: "current_config"``) — a published x/minimize
-        result is never relabeled by a config edited to y/maximize (review
-        v0.5.16 / blocker 4). ``result_phase_plan`` is likewise the represented
-        generation's own recorded phase plan, falling back to the current
-        config's phase names when no represented summary exists — it is the
-        plan the publication's winners must be enumerated under, and equals
-        the ``phases`` list's names whenever the config has not been edited
-        since.
+        result is never relabeled by a config edited to y/maximize.
+        ``result_phase_plan`` is likewise the represented generation's own
+        recorded phase plan, falling back to the current config's phase names
+        when no represented summary exists — it is the plan the publication's
+        winners must be enumerated under, and equals the ``phases`` list's
+        names whenever the config has not been edited since.
         ``published_config_matches_current`` compares the summary's recorded
         config fingerprint against the current config's semantic fingerprint;
         ``None`` when the represented summary records no fingerprint.
@@ -640,9 +635,9 @@ def read_result(
     separate :func:`read_winners`: two pointer resolutions could describe two
     different publications. Winners are enumerated under the status payload's
     ``result_phase_plan``, so a phase renamed since publication neither hides
-    its published winner nor reports the new name as missing (review v0.5.16 /
-    blocker 4). A published generation's winners are the bytes publication
-    validation read; any other represented generation is read permissively.
+    its published winner nor reports the new name as missing. A published
+    generation's winners are the bytes publication validation read; any other
+    represented generation is read permissively.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
     :param str | None generation_id: Optional generation to represent, as for
@@ -724,9 +719,9 @@ def _read_status(
     # The represented generation's winner/summary facts are historical
     # evidence, so the metric they are reported under must be the one that
     # generation actually optimized — never the metric the config supplied
-    # today (review v0.5.16 / blocker 4). The generation's own summary is the
-    # source of that interpretation; only when it records none does the
-    # current config describe the result.
+    # today. The generation's own summary is the source of that
+    # interpretation; only when it records none does the current config
+    # describe the result.
     comparison = comparison_experiment or experiment
     metric_payload = _metric_semantics_payload(comparison.metric)
     result_phase_plan = [phase.name for phase in experiment.phases]

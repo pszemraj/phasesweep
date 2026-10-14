@@ -65,7 +65,7 @@ _TRIAL_EVIDENCE_REMEDY = (
 
 # Audit artifacts every launched attempt writes into its own trial directory
 # before the trainer starts, so their absence is proof the directory is no
-# longer the one that attempt produced (PR #5 review / reviewer 2, blocker 7).
+# longer the one that attempt produced.
 _REQUIRED_TRIAL_EVIDENCE_FILES = ("overrides_resolved.json", "command.txt")
 
 
@@ -615,11 +615,11 @@ def _validate_selection_evidence(
 
     Winner selection consults Optuna alone - state, value, feasibility,
     execution ids, constraint readings - and never touches the filesystem, so
-    an experiment whose winning trial directory was deleted happily reselects
-    that trial and republishes its number, metric, and provenance from a tree
-    holding nothing behind them (PR #5 review / reviewer 2, blocker 7). This
-    runs on the launch path before any generation claim or trial work, so a
-    tree that cannot honestly be ranked is refused before it is added to.
+    an experiment whose winning trial directory was deleted would reselect
+    that trial and republish its number, metric, and provenance from a tree
+    holding nothing behind them. This runs on the launch path before any
+    generation claim or trial work, so a tree that cannot honestly be ranked
+    is refused before it is added to.
 
     Only selection-eligible trials are candidates
     (:func:`_selection_candidate_identity`); the rest can never win, so passing
@@ -715,7 +715,7 @@ def _verify_winner_objective_evidence(
     O(total trainer log bytes) per resume - potentially tens of gigabytes -
     while hashing only the published winner is bounded by one trial's log and
     still catches every deletion and every result-affecting edit, including a
-    tamper that preserves byte length (PR #5 review / reviewer 2, blocker 7).
+    tamper that preserves byte length.
 
     It runs on every selection, so a deadline-truncated partial publication is
     covered on the same terms as a complete one. A repeats winner stands on

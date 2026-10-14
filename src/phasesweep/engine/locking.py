@@ -42,7 +42,7 @@ def _lock_path_from_material(name: str, material: dict[str, str], label: str) ->
     hashes identically still miss each other unless their name components
     match too. Callers must therefore derive it from the same identity the
     material keys on — the resolved output namespace for the output lock —
-    not from an arbitrary spelling of it (review v0.5.17 gap hunt).
+    not from an arbitrary spelling of it.
 
     :param str name: Human-readable prefix derived from the lock identity.
     :param dict[str, str] material: Identity material hashed into the filename.
@@ -58,8 +58,8 @@ def _output_lock_material(experiment: Experiment) -> dict[str, str]:
     Catches the case where two configs share a workdir + experiment name but
     point at different storage backends — without an output lock those would
     silently overwrite each other's ``trial_*/``, ``winner.yaml``, and
-    ``summary.yaml`` (review v0.5.6 / blocker 1). Always taken regardless of
-    storage backend, including in-memory storage.
+    ``summary.yaml``. Always taken regardless of storage backend, including
+    in-memory storage.
 
     :param Experiment experiment: Experiment supplying the output namespace.
     :return dict[str, str]: Lock material keyed on the resolved experiment directory.
@@ -68,8 +68,8 @@ def _output_lock_material(experiment: Experiment) -> dict[str, str]:
     # the workdir prefix before appending the experiment name, so a symlinked
     # experiment leaf (runs/expA -> runs/expB) would otherwise mint a second
     # lock identity for one physical namespace — and the second orchestrator's
-    # preflight would reap the first one's live trials (review v0.5.17 gap
-    # hunt). A leaf that does not exist yet resolves to itself.
+    # preflight would reap the first one's live trials. A leaf that does not
+    # exist yet resolves to itself.
     return {"kind": "output", "experiment_dir": str(_experiment_dir(experiment).resolve())}
 
 
@@ -89,7 +89,7 @@ def _storage_run_lock_material(experiment: Experiment) -> dict[str, str] | None:
         # In-memory storage (``storage: null``) has no shared backend to
         # guard; locking its canonical identity would make two unrelated
         # in-memory runs that share an experiment name contend on a lock
-        # naming a backend that does not exist (review v0.5.17 gap hunt).
+        # naming a backend that does not exist.
         return None
     return {
         "kind": "persistent_storage",
@@ -114,8 +114,7 @@ def _run_lock_paths(experiment: Experiment) -> list[Path]:
     # The output lock's filename prefix comes from the RESOLVED namespace
     # leaf, not the configured experiment name: a symlinked experiment leaf
     # spells the same physical directory differently, and a prefix mismatch
-    # alone would split the lock even with identical material (review
-    # v0.5.17 gap hunt).
+    # alone would split the lock even with identical material.
     paths = [
         _lock_path_from_material(
             _experiment_dir(experiment).resolve().name,
@@ -135,10 +134,9 @@ def _experiment_lock(experiment: Experiment) -> Iterator[None]:
 
     The phase-chained pipeline has cross-phase state — parent ``winner.yaml``,
     child fingerprints, ``summary.yaml``, ``--from-phase`` semantics — so the
-    consistency domain is the entire run, not a single phase study. v0.5.7
-    extends this further: the consistency domain spans both the *output
-    namespace* (filesystem artifacts under ``<workdir>/<experiment>/``) and
-    the *Optuna storage namespace* (review v0.5.6 / blocker 1).
+    consistency domain is the entire run, not a single phase study. It spans
+    both the *output namespace* (filesystem artifacts under
+    ``<workdir>/<experiment>/``) and the *Optuna storage namespace*.
 
     Two configs can disagree on storage but share output paths, or vice
     versa; either case can corrupt skipped-phase reuse and trial logs. We

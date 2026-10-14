@@ -11,12 +11,16 @@ invariants checkable: every path that touches a ledger goes through this
 module's handles, in one fixed order.
 
 1. Only mutating callers take the experiment lock, and they take it first.
-   There are two: a run (:func:`phasesweep.engine.run.run_experiment`, from
-   the CLI or the MCP runner, including its post-run reconciliation) and a
-   ``recover-run`` the operator confirms. ``status``, ``show-winners``, live
-   MCP reads, and ``recover-run`` inspection hold no lock, which is why
-   everything they reach writes nothing. A dry run reads no ledger at all: it
-   previews on an in-memory study (:func:`open_preview_study`).
+   There are three: a run (:func:`phasesweep.engine.run.run_experiment`, from
+   the CLI or the MCP runner, including its post-run reconciliation), a
+   ``recover-run`` the operator confirms, and
+   :func:`phasesweep.tracking.publication.sync_tracking`, which retires
+   tracking attempts and writes the tracking tree. ``sync_tracking`` never
+   claims the ledger: it reads it only through :func:`validate_ledger` and
+   :func:`read_phase_trials`. ``status``, ``show-winners``, live MCP reads,
+   and ``recover-run`` inspection hold no lock, which is why everything they
+   reach writes nothing. A dry run reads no ledger at all: it previews on an
+   in-memory study (:func:`open_preview_study`).
 2. :func:`validate_ledger` checks the artifact-root binding, then scans the
    ledger's format, writing nothing and constructing no file-backed storage.
    On a bound tree an unreadable scan is tolerated and recorded on the
@@ -1189,26 +1193,26 @@ def claim_ledger(ledger: ValidatedLedger, *, from_phase: str | None = None) -> C
     """Discover every existing phase study once, then bind the tree and claim them.
 
     This performs the fixed order's writes, and only after both ownership
-    directions are known to agree. Discovery is strict and tri-state (PR #5
-    review / reviewer 2, issue 1): a phase's study is *absent* (storage read
-    fine, no such study), *present* (loaded and kept), or *unavailable* -- and
-    unavailable raises before any claim, reaping, or registry recovery runs.
-    Swallowing a read failure and letting preflight read again would be unsafe:
-    a transient failure (for example, a brief journal-ledger lock) could
-    succeed on the second read and hand stale-trial reaping a study whose artifact-root
-    binding was never checked. The returned handle's ``studies`` is therefore
-    the *only* discovery pass: the objects that passed the root check here are
-    the exact objects preflight goes on to reap and validate.
+    directions are known to agree. Discovery is strict and tri-state: a
+    phase's study is *absent* (storage read fine, no such study), *present*
+    (loaded and kept), or *unavailable* -- and unavailable raises before any
+    claim, reaping, or registry recovery runs. Swallowing a read failure and
+    letting preflight read again would be unsafe: a transient failure (for
+    example, a brief journal-ledger lock) could succeed on the second read and
+    hand stale-trial reaping a study whose artifact-root binding was never
+    checked. The returned handle's ``studies`` is therefore the *only*
+    discovery pass: the objects that passed the root check here are the exact
+    objects preflight goes on to reap and validate.
 
-    Every declared phase is checked before anything is written (re-review
-    v0.5.19 / blocker B3), so a refused multi-phase run leaves neither the tree
-    nor any study bound to the rejected root. Phases whose study does not exist
-    yet are bound by :func:`open_phase_study` when the phase creates them. The
-    exception is a phase with a winner in the current published generation:
-    that publication proves the phase previously had trial rows with a specific
-    generation and attempt identity, so missing or replaced published trials
-    mean durable evidence was lost rather than that the phase is new. Skipped
-    phases load their saved winners instead.
+    Every declared phase is checked before anything is written, so a refused
+    multi-phase run leaves neither the tree nor any study bound to the
+    rejected root. Phases whose study does not exist yet are bound by
+    :func:`open_phase_study` when the phase creates them. The exception is a
+    phase with a winner in the current published generation: that publication
+    proves the phase previously had trial rows with a specific generation and
+    attempt identity, so missing or replaced published trials mean durable
+    evidence was lost rather than that the phase is new. Skipped phases load
+    their saved winners instead.
 
     The caller holds :func:`phasesweep.engine.locking._experiment_lock` across
     :func:`validate_ledger` and this call, so no cooperating process can bind
@@ -1319,8 +1323,8 @@ def open_phase_study(ledger: ClaimedLedger, phase: Phase) -> optuna.Study:
 
     A study this call creates was invisible to :func:`claim_ledger`'s
     discovery, so it claims its publication root here, before any inspection,
-    reaping, or trial work can run against it (review v0.5.19 / finding F5);
-    a study that already existed only re-confirms the root it was claimed for.
+    reaping, or trial work can run against it; a study that already existed
+    only re-confirms the root it was claimed for.
 
     :param ClaimedLedger ledger: Handle from :func:`claim_ledger`.
     :param Phase phase: Phase whose sampler, search space, and study name are used.

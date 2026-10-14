@@ -260,8 +260,7 @@ def _artifact_root_claim_needed(study: optuna.Study, experiment: Experiment) -> 
     """Decide, without writing anything, whether a study may claim the offered root.
 
     The read-only half of the binding, split out so a multi-phase run can
-    check every declared phase before it claims any of them (re-review v0.5.19
-    / blocker B3).
+    check every declared phase before it claims any of them.
 
     :param optuna.Study study: Phase study whose recorded binding is inspected.
     :param Experiment experiment: Parsed experiment supplying the artifact root.
