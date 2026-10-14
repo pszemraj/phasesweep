@@ -33,8 +33,10 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
+    _outcome_sequence_counts,
     _parsed_trial_outcome,
     _stale_recovery_outcome,
+    _unduplicated_outcome,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.errors import RERUN_CLEANUP_RECOVERY
@@ -629,21 +631,14 @@ def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenT
         dropping a recorded failure from ``max_consecutive_failures``.
     """
     trials = study.get_trials(deepcopy=False)
-    parsed_by_trial = {
-        candidate.number: parsed
-        for candidate in trials
-        if (parsed := _parsed_trial_outcome(candidate.user_attrs.get(TRIAL_OUTCOME_ATTR)))
-        is not None
-    }
-    used_sequences = [parsed.sequence for parsed in parsed_by_trial.values()]
-    existing = parsed_by_trial.get(trial.number)
-    if existing is not None and used_sequences.count(existing.sequence) != 1:
-        existing = None
+    sequence_counts = _outcome_sequence_counts(trials)
+    current = next((candidate for candidate in trials if candidate.number == trial.number), trial)
+    existing = _unduplicated_outcome(current, sequence_counts)
     outcome = _stale_recovery_outcome(existing)
     policy: str | None = None
     abort: JsonObject | None = None
     if existing is None:
-        sequence = max(used_sequences, default=0) + 1
+        sequence = max(sequence_counts, default=0) + 1
         cause: str | None = "stale RUNNING trial recovered after its orchestrator stopped"
     elif existing.outcome == outcome:
         sequence = existing.sequence

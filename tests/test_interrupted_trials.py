@@ -35,7 +35,9 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
+    _outcome_sequence_counts,
     _parsed_trial_outcome,
+    _recovered_trial_state,
     _stale_recovery_outcome,
     _trial_interrupted,
 )
@@ -176,18 +178,25 @@ def _finished(study: optuna.Study, sequence: int, outcome: str) -> None:
             _outcome(3, "interrupted", cause=_STALE_CAUSE),
             id="duplicate-sequence",
         ),
+        pytest.param(
+            _outcome(2, "failure", cause="exit 1"),
+            _outcome(3, "interrupted", cause=_STALE_CAUSE),
+            id="duplicate-sequence-failure",
+        ),
     ],
 )
 def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_failure(
     recorded: JsonObject | None, expected: JsonObject
 ) -> None:
-    """A stale trial is recorded as interrupted, and an interruption never extends the streak."""
+    """A stale trial is recorded as interrupted, as the dry run and status predict, and an interruption never extends the streak."""
     study = optuna.create_study()
     _finished(study, 1, "failure")
     _finished(study, 2, "failure")
     trial = _running_trial(study, recorded)
+    predicted = _recovered_trial_state(trial, _outcome_sequence_counts(study.get_trials()))
 
     _record_stale_trial_outcome(study, trial)
+    assert predicted == ("INTERRUPTED" if expected["outcome"] == "interrupted" else "FAIL")
     study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
 
     recovered = study.trials[trial.number]

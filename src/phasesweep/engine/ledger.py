@@ -108,6 +108,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    _outcome_sequence_counts,
     _recovered_trial_state,
 )
 from phasesweep.runtime.files import fsync_directory, journal_file_path
@@ -891,6 +892,7 @@ def _phase_trial_stats(
     generation_counts: dict[str, dict[str, int]] = {}
     running_attempts: list[_TrialRef] = []
     published_trial_available = False
+    sequence_counts = _outcome_sequence_counts(trials)
     for trial in trials:
         if published_trial is not None and _published_trial_matches(trial, published_trial):
             published_trial_available = True
@@ -908,7 +910,7 @@ def _phase_trial_stats(
                 trial_number=trial.number,
                 generation_id=generation_id if isinstance(generation_id, str) else None,
                 attempt_id=attempt_id if isinstance(attempt_id, str) else None,
-                recovers_as=_recovered_trial_state(trial),
+                recovers_as=_recovered_trial_state(trial, sequence_counts),
             )
         )
     return _PhaseTrialStats(

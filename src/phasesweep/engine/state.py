@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
@@ -399,7 +400,42 @@ def _stale_recovery_outcome(parsed: _ParsedTrialOutcome | None) -> str:
     return "interrupted"
 
 
-def _recovered_trial_state(trial: FrozenTrial) -> RecoveredTrialState:
+def _outcome_sequence_counts(trials: Iterable[FrozenTrial]) -> Counter[int]:
+    """Count how many trials' valid outcome records carry each sequence.
+
+    :param Iterable[FrozenTrial] trials: Every trial of one study.
+    :return Counter[int]: Records per sequence number.
+    """
+    return Counter(
+        parsed.sequence
+        for trial in trials
+        if (parsed := _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))) is not None
+    )
+
+
+def _unduplicated_outcome(
+    trial: FrozenTrial, sequence_counts: Counter[int]
+) -> _ParsedTrialOutcome | None:
+    """Return a trial's recorded outcome unless another record shares its sequence.
+
+    Stale recovery discards a duplicated record and records ``interrupted`` with a
+    fresh sequence, so its prediction must discard the same records.
+
+    :param FrozenTrial trial: Trial whose record is read.
+    :param Counter[int] sequence_counts: The study's
+        :func:`_outcome_sequence_counts`.
+    :return _ParsedTrialOutcome | None: The valid record, or ``None`` when it is
+        missing, malformed or duplicated.
+    """
+    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    if parsed is None or sequence_counts[parsed.sequence] != 1:
+        return None
+    return parsed
+
+
+def _recovered_trial_state(
+    trial: FrozenTrial, sequence_counts: Counter[int]
+) -> RecoveredTrialState:
     """Predict the counted state stale recovery leaves a RUNNING trial in.
 
     Read from the outcome the trial's objective recorded, which nothing changes
@@ -407,11 +443,14 @@ def _recovered_trial_state(trial: FrozenTrial) -> RecoveredTrialState:
     count the trial as recovery will.
 
     :param FrozenTrial trial: RUNNING trial to predict for.
+    :param Counter[int] sequence_counts: The study's
+        :func:`_outcome_sequence_counts`, so a duplicated record is discarded
+        as recovery discards it.
     :return RecoveredTrialState: ``FAIL`` when recovery keeps a recorded failure
         or fatal error, otherwise ``INTERRUPTED``.
     """
-    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    return "INTERRUPTED" if _stale_recovery_outcome(parsed) == "interrupted" else "FAIL"
+    outcome = _stale_recovery_outcome(_unduplicated_outcome(trial, sequence_counts))
+    return "INTERRUPTED" if outcome == "interrupted" else "FAIL"
 
 
 def _trial_interrupted(trial: FrozenTrial) -> bool:

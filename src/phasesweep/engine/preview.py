@@ -44,7 +44,12 @@ from phasesweep.engine.phase import (
     _placeholder_winner,
     _replay_met_target,
 )
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, Winner, _recovered_trial_state
+from phasesweep.engine.state import (
+    STUDY_SCHEMA_ATTR,
+    Winner,
+    _outcome_sequence_counts,
+    _recovered_trial_state,
+)
 from phasesweep.engine.study_policy import (
     _load_phase_policy_state,
     _pending_rerun_count,
@@ -133,7 +138,10 @@ def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
         return RecordedPhase(finished=0, completed=0, running=0, reruns=0, study=None)
     trials = study.get_trials(deepcopy=False)
     running = [trial for trial in trials if trial.state == optuna.trial.TrialState.RUNNING]
-    recovered_as_failed = sum(1 for trial in running if _recovered_trial_state(trial) == "FAIL")
+    sequence_counts = _outcome_sequence_counts(trials)
+    recovered_as_failed = sum(
+        1 for trial in running if _recovered_trial_state(trial, sequence_counts) == "FAIL"
+    )
     return RecordedPhase(
         finished=_finished_trial_count(trials) + recovered_as_failed,
         completed=_completed_trial_count(trials),
