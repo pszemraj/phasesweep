@@ -51,6 +51,13 @@ repos:
         language: system
         files: ^(src|tests)/.*\.py$
         pass_filenames: false
+      # Review provenance ("review vX / blocker N", "PR #N", "Pre-vX") belongs
+      # in git history; a comment states its reason in place.
+      - id: no-review-tags
+        name: no review provenance tags
+        entry: '(?i:review v[0-9]|\bPR #[0-9]+|reviewer [0-9]|\bblocker [0-9]|gap hunt|\bpre-v[0-9])|\bfinding [A-Z][0-9]+\b'
+        language: pygrep
+        files: ^(src|tests)/.*\.py$
       # Runs on every commit: the contracts span all of src/ and the pytest
       # configuration.
       - id: contract-tests
