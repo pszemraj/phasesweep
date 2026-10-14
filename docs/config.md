@@ -229,7 +229,7 @@ The metric is a finite scalar extracted after the trainer exits successfully. Us
 - `json` reads a finite JSON number at a saved trial-relative path and dotted key, for example `{type: json, path: result.json, key: eval.loss}`. It records no evaluation position, so selection's `evaluation_point` check is always `n/a` for it (as for `log_regex`).
 - `wandb` reads an exact scalar key such as `eval/loss` from the finished run whose ID is the immutable trial attempt ID. It requires the optional `wandb` extra and an authorized entity/project.
 - `mlflow` reads native metric history from the bound finished run. It requires the optional `mlflow` extra, an existing experiment in the top-level `mlflow` block, and an explicit `select: last | min | max | step`. See the [MLflow guide](mlflow.md) for ownership, selection, and result delivery.
-- `json_envelope` reads an attempt-bound versioned envelope from a trial-relative path. Python trainers can call `phasesweep.report_objective` to write it to the managed `PHASESWEEP_OBJECTIVE_PATH`. It is the extractor that binds the evaluation policy, checkpoint and step, so use it when the checkpoint behind a value matters, as with Transformers `load_best_model_at_end` (see the `evaluation_point` note below). `report_objective(..., extra=...)` also writes report-only values for [`observe`](#objective-evidence-constraints-and-gates) to read.
+- `json_envelope` reads an attempt-bound versioned envelope from a trial-relative path. Python trainers can call `phasesweep.report_objective` to write it to the managed `PHASESWEEP_OBJECTIVE_PATH` (the [call, its file and its behavior outside a trial](#reporting-an-objective)). It is the extractor that binds the evaluation policy, checkpoint and step, so use it when the checkpoint behind a value matters, as with Transformers `load_best_model_at_end` (see the `evaluation_point` note below). `report_objective(..., extra=...)` also writes report-only values for [`observe`](#objective-evidence-constraints-and-gates) to read.
 - `log_regex` reads a trial-relative log file and selects a numeric named `(?P<value>...)` match; `select: last` remains the default.
 
 `constraints` use the same scalar readers. A valid measured constraint violation is a completed but infeasible trial; missing or invalid evidence fails the trial. Phase `gates` include `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, `wandb_summary_required`, and `mlflow_required`. `mlflow_required` separately names `metrics`, `params`, and `tags` from the same bound run. A failed gate fails the trial. There is no advisory gate mode or baseline substitution.
@@ -305,23 +305,66 @@ See [GPU isolation](runtime.md#gpu-isolation) for discovery precedence and how d
 
 When no W&B evidence consumer is configured, trainer-owned `WANDB_*` settings are preserved except for an ambient/inherited `WANDB_RUN_ID`, which is removed. An ID explicitly configured in top-level `env.WANDB_RUN_ID` remains trainer-owned in this case.
 
-For a trainer that chooses the optional envelope contract:
+### Reporting an objective
+
+A trainer that chooses the optional `json_envelope` extractor reports its objective once, after its final evaluation, with `phasesweep.report_objective`. With `validation_loss` equal to 0.4217, this call:
 
 ```python
 from phasesweep import report_objective
 
 # Train and evaluate using the YAML received at --config, then:
 report_objective(
-    value=validation_loss,
+    validation_loss,
     name="validation_loss",
     split="validation",
     policy="final",
     checkpoint="final.pt",
     step=1000,
+    progress={"tokens": 2_048_000},
+    extra={"peak_memory_gb": 21.4},
 )
 ```
 
-`report_objective` obtains the attempt identity and output path from the managed environment. Do not construct those values yourself. `value`, `step`, and any `progress={"tokens": total_tokens}` positions, which a declared `evaluation_axis` reads, may be Python or NumPy numbers.
+writes this file and returns its path:
+
+```json
+{
+  "attempt_id": "0697c579bd1e40b4b03adce95562457e",
+  "evaluation": {
+    "checkpoint": "final.pt",
+    "policy": "final",
+    "progress": {
+      "tokens": 2048000
+    },
+    "step": 1000
+  },
+  "generation_id": "4afce4b915ee48da8e6da730d0928096",
+  "objective": {
+    "name": "validation_loss",
+    "split": "validation",
+    "value": 0.4217
+  },
+  "overrides_sha256": "5d6392dac385a6306df6a16e52a6491bdc86bacab5f79c2f8667bf7d6a09be03",
+  "peak_memory_gb": 21.4,
+  "schema_version": 1,
+  "status": "complete"
+}
+```
+
+The arguments:
+
+- `value` is required: the finite objective, a Python or NumPy number (call `.item()` on a tensor).
+- `name`, `split` and `policy` are required keywords. They must equal the extractor's `objective_name`, `split` and `policy`; a mismatch fails the trial.
+- `checkpoint` is a required nonempty string naming the evaluated checkpoint. It must equal the extractor's `checkpoint` when that is set, and PhaseSweep never loads it.
+- `step` is a required non-negative integer, equal to the extractor's `expected_step` when that is set.
+- `progress` is optional: a mapping from an axis name such as `tokens` to a finite non-negative number, never named `step`. A declared `evaluation_axis` of that name makes it required.
+- `extra` is optional: more top-level fields for the file, as described below.
+
+It reads four variables that PhaseSweep sets for each attempt, so a trainer must not construct them. `PHASESWEEP_OBJECTIVE_PATH` is the absolute path it writes: the extractor's `path` (default `result.json`) inside the attempt directory, set only when the metric extractor is `json_envelope`. `PHASESWEEP_GENERATION_ID`, `PHASESWEEP_ATTEMPT_ID` and `PHASESWEEP_OVERRIDES_SHA256` are copied into the file, which is how the reader ties it to this attempt. The write is atomic, and a later call in the same attempt replaces the file.
+
+The keys of `extra` become top-level fields of that same file, beside the envelope's own. These are reserved and raise `ValueError` when passed: `schema_version`, `status`, `generation_id`, `attempt_id`, `overrides_sha256`, `objective` and `evaluation`. Values must be finite JSON, and a nested mapping is addressed by a dotted key. `observe`, `constraints` and gates read them like any local JSON file, for example `{type: json, path: result.json, key: peak_memory_gb}` ([report-only observations](#objective-evidence-constraints-and-gates)).
+
+Outside a trial, or in a trial whose metric extractor is not `json_envelope`, `PHASESWEEP_OBJECTIVE_PATH` is unset. The call checks its arguments first, so a bad argument raises `ValueError`. It then raises `RuntimeError: report_objective() requires PHASESWEEP_OBJECTIVE_PATH; call it from a PhaseSweep trial using a json_envelope metric extractor.` and writes nothing: it neither skips silently nor writes a file of its own, and an unset identity variable raises the same error naming that variable. A trainer that is also run by hand guards the call with `if os.environ.get("PHASESWEEP_OBJECTIVE_PATH"):`.
 
 Trainers that cannot import the Python helper can publish the same envelope from the managed trial environment:
 
@@ -330,7 +373,29 @@ phasesweep report-objective 0.123 --name validation_loss --split validation \
   --policy final --checkpoint final.pt --step 1000
 ```
 
-A repeatable `--progress tokens=2048000` reports what `progress=` does from Python.
+A repeatable `--progress tokens=2048000` reports what `progress=` does from Python. The command has no equivalent of `extra`, and outside a trial it exits 1 with the same message.
+
+### Check the trainer contract with one trial
+
+Before a long sweep, run the trainer once under the real contract. Copy the config, change `experiment` to `contract_check` so the copy leaves the sweep's artifact tree alone, set `storage: null`, and replace `phases` with one fixed-configuration phase. Leave `trial_command`, `trainer_config`, `metric`, `observe`, `execution` and `env` as they are, and keep the sweep's `gpu_policy` on the phase if it sets one:
+
+```yaml
+storage: null
+phases:
+  - name: contract_check
+    n_trials: 1
+    search_space: {}
+```
+
+Run it and read what the trial produced:
+
+```bash
+phasesweep run contract_check.yaml
+phasesweep show-winners contract_check.yaml
+cat <workdir>/contract_check/contract_check/trial_00000__*/result.json
+```
+
+A trial that does not report what the extractor expects fails with the reason on its `TRIAL` line, for example `JSON envelope at ... does not report objective 'eval_loss_typo'`, and the trainer's own output is in that trial directory's `stdout.log` and `stderr.log`. On success `show-winners` prints the metric and every `observed` value, and `result.json` is the file the sweep will read from each trial. `phasesweep status CONFIG --trials` lists nothing here, because `storage: null` keeps no ledger.
 
 ### Source-checkout preflight
 
