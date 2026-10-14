@@ -10,8 +10,8 @@ import optuna
 import pytest
 
 from phasesweep import run_experiment
-from phasesweep.config import Experiment, IntParam, Metric, Phase, Sampler
-from phasesweep.engine import PhaseSweepError
+from phasesweep.config import Experiment, IntParam, Metric, Phase, Repeats, Sampler
+from phasesweep.engine import PhaseSweepError, read_status
 from phasesweep.engine.artifacts import _load_winner
 from phasesweep.engine.errors import WinnerIntegrityError
 from phasesweep.engine.ledger import _resolve_storage
@@ -418,6 +418,89 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
     assert replayed["p"].trial_number == winners["p"].trial_number
     assert replayed["child"].trial_number == winners["child"].trial_number
     assert len(launched_trials) == launch_count
+
+
+@pytest.mark.integration
+def test_group_completed_after_partial_timeout_publishes_from_completing_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group split across generations names the generation that ran its last member.
+
+    The first run stops on its phase deadline after trial 4, so it publishes the
+    only complete group, [0, 1, 2], while [3, 4, 5] still lacks trial 5. The
+    enlarged rerun runs trial 5 in a new generation, and that group wins. Its
+    winner cites trial 5, whose generation published this same winner, so the
+    carried-winner check passes although two of its members ran a generation
+    earlier.
+    """
+    import types
+
+    import phasesweep.engine.phase as phase_mod
+
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os
+        trial = int(os.environ["PHASESWEEP_TRIAL_ID"])
+        print(f"x={1.0 if trial < 3 else 0.5 if trial < 6 else 2.0}")
+        """,
+    )
+    phase = Phase(
+        name="p",
+        n_trials=6,
+        timeout_seconds_per_phase=600.0,
+        allow_incomplete_on_timeout=True,
+        gpu_policy="none",
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=9)},
+        repeats=Repeats(key="seed", values=[0, 1, 2]),
+    )
+    exp = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
+
+    offset = {"seconds": 0.0}
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(
+        phase_mod,
+        "time",
+        types.SimpleNamespace(
+            monotonic=lambda: real_monotonic() + offset["seconds"],
+            sleep=lambda _seconds: None,
+        ),
+    )
+    real_after_trial = phase_mod._after_trial
+
+    def deadline_between_trials_four_and_five(
+        run: phase_mod._PhaseExecution, study: optuna.Study, trial: optuna.trial.FrozenTrial
+    ) -> None:
+        real_after_trial(run, study, trial)
+        if trial.number == 4 and not offset["seconds"]:
+            # The deadline passes before Optuna creates trial 5, which is where
+            # its own timeout check stops the loop.
+            offset["seconds"] = 10_000.0
+            study.stop()
+
+    monkeypatch.setattr(phase_mod, "_after_trial", deadline_between_trials_four_and_five)
+
+    first = run_experiment(exp)["p"]
+    assert first.completion["incomplete"] is True
+    assert first.completion["finished_trials"] == 5
+    assert first.trial_number == 2
+    assert first.confound["ranked_groups"] == [[0, 1, 2]]
+
+    enlarged = exp.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 9})]})
+    second = run_experiment(enlarged)["p"]
+
+    assert second.trial_number == 5
+    assert second.metric == 0.5
+    assert second.completion["incomplete"] is False
+    assert second.confound["ranked_groups"] == [[0, 1, 2], [3, 4, 5], [6, 7, 8]]
+    assert second.repeats is not None
+    members = second.repeats["members"]
+    assert [member["trial_number"] for member in members] == [3, 4, 5]
+    assert members[0]["generation_id"] == members[1]["generation_id"] == first.generation_id
+    assert members[2]["generation_id"] == second.generation_id != first.generation_id
+    assert read_status(enlarged)["publication_integrity"] == "ok"
+    assert run_experiment(enlarged)["p"].repeats == second.repeats
 
 
 @pytest.mark.integration

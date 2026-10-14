@@ -17,6 +17,14 @@ from phasesweep.engine.artifacts import _winner_common_payload
 from phasesweep.engine.confound import _assess_population, _describe_flagged
 from phasesweep.engine.errors import OperatorAction, PhaseSweepError, TrialEvidenceMissingError
 from phasesweep.engine.evidence import _selection_candidate_identity, _trial_objective_provenance
+from phasesweep.engine.repeats import (
+    RankedGroup,
+    RepeatAxis,
+    RepeatsRecord,
+    group_key,
+    observed_means,
+    ranked_group,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GATES_ATTR,
@@ -57,8 +65,13 @@ class SelectedTrial:
     confound: dict[str, Any]
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
-    # Report-only values the selected trial recorded, by observation name.
+    # Report-only values the selected trial recorded, by observation name; for
+    # a repeats phase, the mean over the members that recorded each name.
     observed: dict[str, float] = field(default_factory=dict)
+    # The winning repeat group, or ``None`` for a phase without repeats. With
+    # repeats, the scalar fields describe the group's highest-numbered member,
+    # ``params`` omits the repeat key, and ``metric`` is the reduced value.
+    repeats: RepeatsRecord | None = None
 
 
 class NoFeasibleTrialError(PhaseSweepError):
@@ -67,11 +80,22 @@ class NoFeasibleTrialError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.INSPECT_LOGS
 
 
+@dataclass(frozen=True)
+class _GroupRanking:
+    """The complete repeat groups of one phase study and what selection left out."""
+
+    groups: list[RankedGroup]
+    members: dict[int, list[optuna.trial.FrozenTrial]]
+    incomplete_group: list[int]
+    incomplete_groups: int
+
+
 def select_winner(
     study: optuna.Study,
     experiment: Experiment,
     *,
     phase_name: str | None = None,
+    repeats: RepeatAxis | None = None,
 ) -> SelectedTrial:
     """Pick the best feasible completed trial from a phase study.
 
@@ -83,6 +107,12 @@ def select_winner(
          and all constraint values (read from user_attrs) must satisfy theirs.
       3. Among survivors, argmin/argmax on metric.
       4. Ties — exact float equality only — broken by lower trial_number.
+
+    With ``repeats``, the ranked units are complete repeat groups: a
+    configuration ranks only when it has one trial per repeat value and every
+    one of them passes rules 1 and 2. Groups rank by the reducer over their
+    member metrics, exact ties go to the group with the lowest member trial
+    number, and the group's highest-numbered member names the winner.
 
     Ordering is exact, never approximate. An earlier absolute epsilon (1e-12)
     folded everything within that distance of the optimum into one "tie" band,
@@ -103,6 +133,9 @@ def select_winner(
             trials.
         phase_name: Phase label used in log messages; defaults to the study
             name when the caller has no phase context.
+        repeats: The phase's repeat axis
+            (:func:`phasesweep.engine.repeats.repeat_axis`), or ``None`` for a
+            phase without repeats.
 
     Returns:
         The winning trial as :class:`SelectedTrial` (number, params, metric,
@@ -111,16 +144,30 @@ def select_winner(
 
     Raises:
         NoFeasibleTrialError: If no trial in the study is both COMPLETE and
-            satisfies every constraint and the metric's bounds. When the metric
-            has bounds, the message names them and the best COMPLETE value seen.
+            satisfies every constraint and the metric's bounds, or with
+            ``repeats`` if no group is complete. When the metric has bounds,
+            the message names them and the best COMPLETE value seen.
 
     """
     minimize = experiment.metric.goal == "minimize"
     constraints_by_name = {c.name: c for c in experiment.constraints}
 
     trials = study.get_trials(deepcopy=False)
-    survivors = [t for t in trials if _eligible(t, experiment)]
+    ranking = None if repeats is None else _rank_groups(trials, experiment, repeats)
+    survivors = (
+        [t for t in trials if _eligible(t, experiment)]
+        if ranking is None
+        else [t for group in ranking.groups for t in ranking.members[group.representative]]
+    )
 
+    if repeats is not None and ranking is not None and not ranking.groups:
+        raise NoFeasibleTrialError(
+            f"No complete repeat group: a configuration ranks only when all "
+            f"{len(repeats.values)} trials (one per repeats.values of {repeats.key!r}) are "
+            f"COMPLETE, feasible and within bounds; {ranking.incomplete_groups} group(s) were "
+            "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
+            "each failed trial's reason." + _metric_bounds_note(trials, experiment)
+        )
     if not survivors:
         raise NoFeasibleTrialError(
             "No feasible completed trials in phase. The phase's trials.csv records each "
@@ -128,14 +175,20 @@ def select_winner(
             + _metric_bounds_note(trials, experiment)
         )
 
-    best_value = (
-        min(_trial_value(t) for t in survivors)
-        if minimize
-        else max(_trial_value(t) for t in survivors)
-    )
-    # Exact equality, not a tolerance band (review v0.5.17 / finding H).
-    tied = [t for t in survivors if _trial_value(t) == best_value]
-    best = min(tied, key=lambda t: t.number)
+    winning: RankedGroup | None = None
+    if ranking is None:
+        best_value = (
+            min(_trial_value(t) for t in survivors)
+            if minimize
+            else max(_trial_value(t) for t in survivors)
+        )
+        # Exact equality, not a tolerance band.
+        tied = [t for t in survivors if _trial_value(t) == best_value]
+        best = min(tied, key=lambda t: t.number)
+    else:
+        sign = 1.0 if minimize else -1.0
+        winning = min(ranking.groups, key=lambda group: (sign * group.aggregate, group.numbers[0]))
+        best = ranking.members[winning.representative][-1]
 
     constraint_vals = {
         name: float(best.user_attrs[constraint_attr(name)]) for name in constraints_by_name
@@ -173,7 +226,14 @@ def select_winner(
         if t is not best:
             with contextlib.suppress(TrialEvidenceMissingError):
                 provenance[t.number] = _trial_objective_provenance(t)
-    confound = _assess_population(trials, survivors, best, provenance=provenance)
+    confound = _assess_population(
+        trials,
+        survivors,
+        best,
+        provenance=provenance,
+        groups=None if ranking is None else ranking.groups,
+        incomplete_group=() if ranking is None else ranking.incomplete_group,
+    )
     flagged = _describe_flagged(confound)
     if flagged:
         log.warning(
@@ -184,10 +244,19 @@ def select_winner(
             "; ".join(flagged),
         )
 
+    record = (
+        None
+        if repeats is None or ranking is None or winning is None
+        else _repeats_record(ranking.members[winning.representative], winning, repeats, experiment)
+    )
     return SelectedTrial(
         trial_number=best.number,
-        params=dict(best.params),
-        metric=float(selected_value),
+        params={
+            name: value
+            for name, value in best.params.items()
+            if record is None or name != record["key"]
+        },
+        metric=float(selected_value) if winning is None else winning.aggregate,
         constraints=constraint_vals,
         gates=gates,
         generation_id=str(best.user_attrs[GENERATION_ID_ATTR]),
@@ -198,8 +267,102 @@ def select_winner(
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
         confound=confound,
-        observed=_observed_values(best),
+        observed=(
+            _observed_values(best)
+            if record is None
+            else observed_means([member["observed"] for member in record["members"]])
+        ),
+        repeats=record,
     )
+
+
+def _rank_groups(
+    trials: Sequence[optuna.trial.FrozenTrial],
+    experiment: Experiment,
+    axis: RepeatAxis,
+) -> _GroupRanking:
+    """Group a repeats phase's trials by configuration and keep the complete groups.
+
+    A group is complete when it holds one trial per repeat value and every one
+    of them is eligible (:func:`_eligible`). Trials that never recorded the
+    repeat param were pruned before their first suggestion and belong to no group.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase study.
+    :param Experiment experiment: Parsed experiment; supplies the eligibility bounds.
+    :param RepeatAxis axis: The phase's repeat axis.
+    :return _GroupRanking: The complete groups with their member trials, the
+        eligible trials left in incomplete groups, and how many groups were incomplete.
+    """
+    by_key: dict[str, list[optuna.trial.FrozenTrial]] = {}
+    for trial in trials:
+        if axis.key in trial.params:
+            by_key.setdefault(group_key(trial.number, trial.params, axis), []).append(trial)
+    groups: list[RankedGroup] = []
+    members: dict[int, list[optuna.trial.FrozenTrial]] = {}
+    for found in by_key.values():
+        ordered = sorted(found, key=lambda t: t.number)
+        positions = {axis.index_of(t.params[axis.key]) for t in ordered}
+        if (
+            len(ordered) == len(axis.values)
+            and positions == set(range(len(axis.values)))
+            and all(_eligible(t, experiment) for t in ordered)
+        ):
+            group = ranked_group(
+                [(t.number, _trial_value(t)) for t in ordered],
+                {name: value for name, value in ordered[-1].params.items() if name != axis.key},
+                axis.reduce,
+            )
+            groups.append(group)
+            members[group.representative] = ordered
+    ranked = {number for group in groups for number in group.numbers}
+    return _GroupRanking(
+        groups=groups,
+        members=members,
+        incomplete_group=[
+            t.number for t in trials if t.number not in ranked and _eligible(t, experiment)
+        ],
+        incomplete_groups=len(by_key) - len(groups),
+    )
+
+
+def _repeats_record(
+    members: Sequence[optuna.trial.FrozenTrial],
+    group: RankedGroup,
+    axis: RepeatAxis,
+    experiment: Experiment,
+) -> RepeatsRecord:
+    """Build the winner's ``repeats`` block from the winning group's members.
+
+    :param Sequence[optuna.trial.FrozenTrial] members: The group's trials, ascending.
+    :param RankedGroup group: The winning group.
+    :param RepeatAxis axis: The phase's repeat axis.
+    :param Experiment experiment: Parsed experiment; names the constraints each member recorded.
+    :raises TrialEvidenceMissingError: A member's objective provenance or observed values
+        cannot be read.
+    :return RepeatsRecord: Key, reducer, spread, and every member's evidence identity.
+    """
+    return {
+        "key": axis.key,
+        "reduce": axis.reduce,
+        "spread": group.spread,
+        "members": [
+            {
+                "trial_number": t.number,
+                "repeat": t.params[axis.key],
+                "metric": _trial_value(t),
+                "generation_id": str(t.user_attrs[GENERATION_ID_ATTR]),
+                "attempt_id": str(t.user_attrs[ATTEMPT_ID_ATTR]),
+                "objective_provenance": _trial_objective_provenance(t),
+                "trainer_input": dict(t.user_attrs[TRAINER_INPUT_ATTR]),
+                "constraints": {
+                    c.name: float(t.user_attrs[constraint_attr(c.name)])
+                    for c in experiment.constraints
+                },
+                "observed": _observed_values(t),
+            }
+            for t in members
+        ],
+    }
 
 
 def _observed_values(trial: optuna.trial.FrozenTrial) -> dict[str, float]:

@@ -69,7 +69,7 @@ import optuna
 from optuna.storages import JournalStorage
 from optuna.storages.journal import BaseJournalBackend, JournalFileSymlinkLock
 
-from phasesweep.config import Experiment, Phase
+from phasesweep.config import Experiment, Phase, sampler_search_space
 from phasesweep.engine.artifact_roots import (
     BindingState,
     _artifact_root_binding_applies,
@@ -254,7 +254,12 @@ def _build_phase_study(experiment: Experiment, phase: Phase, storage: Any) -> op
     return optuna.create_study(
         study_name=_phase_study_name(experiment, phase),
         storage=storage,
-        sampler=_build_sampler(phase.sampler, phase.search_space, n_jobs=phase.n_jobs),
+        sampler=_build_sampler(
+            phase.sampler,
+            sampler_search_space(phase),
+            n_jobs=phase.n_jobs,
+            repeats=phase.repeats,
+        ),
         pruner=optuna.pruners.NopPruner(),
         direction=experiment.metric.goal,
         load_if_exists=True,

@@ -36,10 +36,10 @@ _RUN_CONTROL_KEYS = frozenset(
         "timeout_seconds_per_phase",
         "allow_incomplete_on_timeout",
         "allow_partial_grid",
-        "allow_seed_search",
     }
 )
-# v7 / v6: the metric's min/max viability bounds are part of its identity.
+# v7 / v6: the metric's min/max viability bounds are part of its identity, and
+# a phase's repeats block is part of the phase's.
 # v6 / v5: the retained configuration surface changed. v5 / v4: the embedded
 # complete trainer_config is part of the core experiment and phase identity.
 # v4 / v3: an omitted execution.cwd contributes its effective

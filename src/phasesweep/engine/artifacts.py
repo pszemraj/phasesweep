@@ -23,6 +23,7 @@ from phasesweep.engine.errors import (
     WinnerIntegrityError,
 )
 from phasesweep.engine.publication_validation import ValidatedPublication
+from phasesweep.engine.repeats import RepeatAxis, _validate_repeats_block, group_key
 from phasesweep.engine.state import (
     Winner,
     _parse_winner_source,
@@ -107,17 +108,35 @@ def _file_log_handler(path: Path) -> Iterator[None]:
         logger.setLevel(old_level)
 
 
-def _write_trials_csv(study: optuna.Study, path: Path) -> None:
+def _write_trials_csv(
+    study: optuna.Study, path: Path, *, repeats: RepeatAxis | None = None
+) -> None:
     """Snapshot every trial in ``study`` to ``path`` as stdlib CSV.
+
+    A repeats phase gets a ``repeat_group`` column: the highest trial number
+    in the trial's group so far, grouped by the same key selection uses. An
+    incomplete group's label moves as more members are allocated.
 
     :param optuna.Study study: Study whose trials are serialized.
     :param Path path: Destination CSV path.
+    :param RepeatAxis | None repeats: The phase's repeat axis, or ``None`` without repeats.
     """
     trials = study.get_trials(deepcopy=False)
     if not trials:
         return
     param_names = sorted({n for t in trials for n in t.params})
     attr_names = sorted({n for t in trials for n in t.user_attrs})
+    labels: dict[int, int] = {}
+    if repeats is not None:
+        keyed = {
+            t.number: group_key(t.number, t.params, repeats)
+            for t in trials
+            if repeats.key in t.params
+        }
+        last: dict[str, int] = {}
+        for number, key in keyed.items():
+            last[key] = max(last.get(key, number), number)
+        labels = {number: last[key] for number, key in keyed.items()}
     fieldnames = [
         "number",
         "state",
@@ -125,6 +144,7 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
         "datetime_start",
         "datetime_complete",
         "duration",
+        *(["repeat_group"] if repeats is not None else []),
         *[f"param:{n}" for n in param_names],
         *[f"user_attr:{n}" for n in attr_names],
     ]
@@ -141,6 +161,8 @@ def _write_trials_csv(study: optuna.Study, path: Path) -> None:
                 "datetime_complete": t.datetime_complete,
                 "duration": t.duration,
             }
+            if repeats is not None:
+                row["repeat_group"] = labels.get(t.number)
             for n in param_names:
                 row[f"param:{n}"] = t.params.get(n)
             for n in attr_names:
@@ -165,9 +187,10 @@ def _save_winner(
     ``trainer_env_digest`` / ``trainer_inherit_env`` record which environment
     produced the winning trial (review v0.5.18 / finding F3). Neither ever
     carries ambient variable values. ``confound`` records the advisory
-    verdicts on the population the source selection ranked, and ``observed``
-    the report-only values the winning trial recorded; like the provenance
-    fields both are winner-only and never enter ``summary.yaml``.
+    verdicts on the population the source selection ranked, ``observed`` the
+    report-only values the winning trial recorded, and ``repeats`` the winning
+    repeat group; like the provenance fields they are winner-only and never
+    enter ``summary.yaml``.
 
     Args:
         experiment: Parsed experiment config; supplies the metric name used
@@ -189,6 +212,7 @@ def _save_winner(
         "trainer_inherit_env": winner.trainer_inherit_env,
         "confound": winner.confound,
         "observed": winner.observed,
+        "repeats": winner.repeats,
     }
     _write_yaml_atomic(path, payload)
 
@@ -366,11 +390,15 @@ def _load_winner(
         source = _parse_winner_source(data["winner_source"], expected_phase=phase.name)
         stored_env_digest = data["trainer_env_digest"]
         stored_inherit_env = data["trainer_inherit_env"]
+        metric = float(data["metric"][experiment.metric.name])
+        confound = _validate_confound_block(
+            data["confound"], winner_trial=int(data["trial_number"])
+        )
         winner = Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),
             effective_overrides=dict(data["effective_overrides"]),
-            metric=float(data["metric"][experiment.metric.name]),
+            metric=metric,
             constraints={k: float(v) for k, v in (data.get("constraints") or {}).items()},
             gates=[item for item in (data.get("gates") or []) if isinstance(item, dict)],
             completion=dict(completion),
@@ -386,10 +414,11 @@ def _load_winner(
                 if isinstance(stored_inherit_env, list)
                 else stored_inherit_env
             ),
-            confound=_validate_confound_block(
-                data["confound"], winner_trial=int(data["trial_number"])
-            ),
+            confound=confound,
             observed=_validate_observed_block(data["observed"]),
+            repeats=_validate_repeats_block(
+                data, metric_value=metric, ranked_groups=confound["ranked_groups"]
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise WinnerIntegrityError(

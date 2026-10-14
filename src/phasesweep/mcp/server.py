@@ -32,7 +32,7 @@ from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import RunState, RunStore
-from phasesweep.mcp.snapshots import ConfoundSummary, McpPublicationState
+from phasesweep.mcp.snapshots import ConfoundSummary, McpPublicationState, RepeatsSpread
 from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
@@ -276,6 +276,14 @@ class PhaseValidationPayload(_ToolPayload):
     sampler: str = Field(description="Sampler type only; sampler internals stay in the config.")
     inherits: list[PhaseName] = Field(description="Parent phases inherited by this phase.")
     search_space: list[str] = Field(description="Search-space keys only, never ranges or values.")
+    repeats: int | None = Field(
+        ge=2,
+        description=(
+            "How many times each configuration runs, once per repeat value, with the winner "
+            "ranked by a reducer over them; null without repeats. The repeat key and values "
+            "stay in the config."
+        ),
+    )
 
 
 class InspectExperimentResult(_ToolPayload):
@@ -493,7 +501,12 @@ class WinnerPhasePayload(_ToolPayload):
             "earlier generation, or has no recorded generation provenance."
         )
     )
-    metric: float
+    metric: float = Field(
+        description=(
+            "The winner's metric. For a phase with repeats it is the reducer (repeats.reduce) "
+            "over every member of the winning group, not any single trial's value."
+        )
+    )
     params: dict[str, Any] = Field(
         description=(
             "Sampled winning hyperparameters only; fixed/inherited overrides are omitted. "
@@ -521,7 +534,16 @@ class WinnerPhasePayload(_ToolPayload):
         description=(
             "Report-only values the winning trial recorded, by observation name. They never "
             "influenced selection; the metric did. A name whose read failed on that trial is "
-            "absent, and the map is empty when the experiment declares no observations."
+            "absent, and the map is empty when the experiment declares no observations. For a "
+            "phase with repeats, each value is the mean over the members that recorded it."
+        )
+    )
+    repeats: RepeatsSpread | None = Field(
+        description=(
+            "For a phase with repeats: the reducer, the spread of the member metrics and the "
+            "member trial numbers of the winning group, whose last member is "
+            "winner_source.trial_number. Report the spread with the metric. Null for a phase "
+            "without repeats."
         )
     )
 

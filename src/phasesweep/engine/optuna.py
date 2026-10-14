@@ -22,6 +22,7 @@ from phasesweep.config import (
     FloatParam,
     IntParam,
     Phase,
+    Repeats,
     Sampler,
     SearchParam,
     grid_search_space,
@@ -185,7 +186,7 @@ def _published_trial_matches(trial: optuna.trial.FrozenTrial, expected: _TrialRe
 class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
     """Seeded random sampler whose draws survive process-local RNG restarts."""
 
-    def __init__(self, *, seed: int) -> None:
+    def __init__(self, *, seed: int, repeats: Repeats | None = None) -> None:
         """Store the caller's seed without handing it to the base sampler.
 
         The base ``RandomSampler`` is constructed with ``seed=None`` because
@@ -195,10 +196,13 @@ class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
 
         Args:
             seed: Base seed supplied by the phase's sampler config.
+            repeats: The phase's repeat axis, whose values cycle through each
+                configuration slot of ``len(values)`` consecutive trials.
 
         """
         super().__init__(seed=None)
         self._base_seed = seed
+        self._repeats = repeats
 
     def sample_independent(
         self,
@@ -210,24 +214,35 @@ class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
         """Sample from a deterministic stream position owned by the durable trial.
 
         Derives a fresh per-parameter seed from the base seed, study name,
-        trial number, and parameter name, so the same (trial, param) pair
+        draw position, and parameter name, so the same (position, param) pair
         always draws the same value regardless of process restarts or call
-        ordering.
+        ordering. The position is the trial number, or under repeats the
+        configuration slot ``trial.number // len(values)``, so every trial of
+        a slot draws one configuration; its repeat value is
+        ``values[trial.number % len(values)]``.
 
         Args:
             study: The active Optuna study (contributes ``study_name`` to the
                 derived seed).
-            trial: The trial being sampled for (contributes ``trial.number``).
+            trial: The trial being sampled for (its number gives the position).
             param_name: Name of the parameter being sampled.
             param_distribution: The parameter's Optuna distribution.
 
         Returns:
-            The sampled value, drawn from a fresh :class:`optuna.samplers.RandomSampler`
-            seeded deterministically from ``(base_seed, study_name, trial.number, param_name)``.
+            The repeat value for the repeat key, otherwise the value drawn from
+            a fresh :class:`optuna.samplers.RandomSampler` seeded
+            deterministically from ``(base_seed, study_name, position, param_name)``.
 
         """
+        if self._repeats is None:
+            position = trial.number
+        else:
+            count = len(self._repeats.values)
+            if param_name == self._repeats.key:
+                return self._repeats.values[trial.number % count]
+            position = trial.number // count
         material = json.dumps(
-            [self._base_seed, study.study_name, trial.number, param_name],
+            [self._base_seed, study.study_name, position, param_name],
             separators=(",", ":"),
         ).encode()
         derived_seed = int.from_bytes(hashlib.sha256(material).digest()[:4], "big")
@@ -236,16 +251,23 @@ class _TrialNumberRandomSampler(optuna.samplers.RandomSampler):
 
 
 def _build_sampler(
-    cfg: Sampler, search_space: dict[str, SearchParam], n_jobs: int = 1
+    cfg: Sampler,
+    search_space: dict[str, SearchParam],
+    n_jobs: int = 1,
+    *,
+    repeats: Repeats | None = None,
 ) -> optuna.samplers.BaseSampler:
     """Construct the Optuna sampler for a phase from its YAML ``sampler`` block.
 
     Args:
         cfg: Parsed sampler config (type, seed, startup-trials, etc.).
-        search_space: The phase's validated search space, used to build the
-            ``GridSampler`` grid.
+        search_space: The phase's validated sampler search space
+            (:func:`phasesweep.config.sampler_search_space`), used to build the
+            ``GridSampler`` grid; it includes the repeat axis.
         n_jobs: Phase parallelism; enables TPE's ``constant_liar`` heuristic
             when ``n_jobs > 1``.
+        repeats: The phase's repeats block, which seeded random draws by
+            configuration slot.
 
     Returns:
         A configured :class:`optuna.samplers.BaseSampler` subclass instance.
@@ -269,7 +291,7 @@ def _build_sampler(
     if cfg.type == "random":
         if cfg.seed is None:
             return optuna.samplers.RandomSampler()
-        return _TrialNumberRandomSampler(seed=cfg.seed)
+        return _TrialNumberRandomSampler(seed=cfg.seed, repeats=repeats)
     if cfg.type == "grid":
         return optuna.samplers.GridSampler(grid_search_space(search_space), seed=cfg.seed)
     if cfg.type == "cmaes":

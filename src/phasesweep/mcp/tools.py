@@ -214,6 +214,8 @@ class PhaseSweepMCP(RunControl):
                 "sampler": p.sampler.type,
                 "inherits": p.inherits,
                 "search_space": sorted(p.search_space),  # keys only, not ranges
+                # The count only: the repeat key and values are config-authored.
+                "repeats": None if p.repeats is None else len(p.repeats.values),
             }
             for p in exp.phases
         ]

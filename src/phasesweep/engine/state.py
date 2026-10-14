@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, cast, get_args
+from typing import TYPE_CHECKING, Any, Literal, cast, get_args
+
+if TYPE_CHECKING:
+    from phasesweep.engine.repeats import RepeatsRecord
 
 WinnerSourceKind = Literal["phase_trial"]
 
@@ -148,9 +151,15 @@ class Winner:
     # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
     # keeps them verbatim; no fingerprint reads them.
     confound: dict[str, Any] | None = None
-    # Report-only values the selected trial recorded, by observation name.
+    # Report-only values the selected trial recorded, by observation name; for
+    # a repeats phase, the mean over the members that recorded each name.
     # Winner-only: they never enter summary.yaml, a fingerprint, or selection.
     observed: dict[str, float] = field(default_factory=dict)
+    # The winning repeat group (:mod:`phasesweep.engine.repeats`): reducer,
+    # spread and every member. The scalar fields above then describe the
+    # group's highest-numbered member and ``metric`` is the reduced value.
+    # ``None`` for a phase without repeats. Winner-only, like ``observed``.
+    repeats: RepeatsRecord | None = None
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"

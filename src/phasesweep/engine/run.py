@@ -757,12 +757,21 @@ def _run_experiment_inner(
                 winner,
                 generation_id=generation_id,
             )
+            group = winner.repeats
             log.info(
-                "phase=%s WINNER trial=%d metric=%g params=%s",
+                "phase=%s WINNER trial=%d metric=%g params=%s%s",
                 phase.name,
                 winner.trial_number,
                 winner.metric,
                 winner.params,
+                ""
+                if group is None
+                else (
+                    f" ({group['reduce']} over {group['spread']['n']} repeats of "
+                    f"{group['key']!r}: sd={group['spread']['sd']:g}, "
+                    f"range {group['spread']['min']:g}..{group['spread']['max']:g}, "
+                    f"members {[member['trial_number'] for member in group['members']]})"
+                ),
             )
         winners[phase.name] = winner
 

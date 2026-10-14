@@ -151,6 +151,7 @@ def winners_payload(
                 "incomplete": view.incomplete,
                 "confound": view.confound,
                 "observed": view.observed,
+                "repeats": view.repeats,
             }
         )
     return {

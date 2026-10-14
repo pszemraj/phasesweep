@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from fractions import Fraction
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
-from phasesweep.config.common import ConfigFloat, ConfigInt, _Frozen, _require_finite
+from phasesweep.config.common import (
+    ConfigFloat,
+    ConfigInt,
+    StrictJsonScalar,
+    _Frozen,
+    _require_finite,
+)
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Phase
@@ -181,44 +187,112 @@ class CategoricalParam(_Frozen):
                 float, or compares equal to an earlier choice.
 
         """
-        # Optuna only accepts None|bool|int|float|str as categorical choices.
-        # Anything else (lists, dicts, custom objects) fails at suggest time.
-        allowed = (str, int, float, bool, type(None))
-        for index, c in enumerate(choices):
-            if not isinstance(c, allowed):
-                raise ValueError(
-                    "categorical choices must be Optuna-compatible scalars "
-                    "(None, bool, int, float, or str); "
-                    f"got {type(c).__name__}: {c!r}"
-                )
-            if isinstance(c, float) and not math.isfinite(c):
-                raise ValueError(f"categorical float choices must be finite; got {c!r}")
-            # Pairwise ``==`` rather than a hash/identity key: equal objects of
-            # different types (1 vs 1.0 vs True) are exactly the collision
-            # Optuna's index lookup cannot distinguish, and this also holds if
-            # a choice type ever stops being hashable.
-            for earlier_index in range(index):
-                earlier = choices[earlier_index]
-                if c == earlier:
-                    raise ValueError(
-                        "categorical choices must remain distinguishable after "
-                        f"Optuna persistence; {c!r} at index {index} compares equal "
-                        f"to {earlier!r} at index {earlier_index}. Optuna records a "
-                        "sampled value as its `==` index into choices, so equal "
-                        "choices collapse onto the first of them in "
-                        "FrozenTrial.params, the published winner, and every "
-                        "inherited override. A repeat also inflates grid "
-                        "cardinality (the phase runs an extra trial on an "
-                        "assignment it already evaluated, yet still reports a "
-                        "complete grid) and doubles that value's sampling weight."
-                    )
+        _validate_optuna_choices(choices, label="categorical choices")
         return choices
+
+
+def _validate_optuna_choices(choices: Sequence[object], *, label: str) -> None:
+    """Require Optuna-storable scalars that stay distinct after Optuna persistence.
+
+    Shared by categorical choices and repeat values, which both become an
+    Optuna ``CategoricalDistribution``.
+
+    :param Sequence[object] choices: Candidate choices in configured order.
+    :param str label: Field name that starts each diagnostic.
+    :raises ValueError: An element is not an Optuna-compatible scalar
+        (``None``/``bool``/``int``/``float``/``str``), is a non-finite float,
+        or compares equal to an earlier element.
+    """
+    # Optuna only accepts None|bool|int|float|str as categorical choices.
+    # Anything else (lists, dicts, custom objects) fails at suggest time.
+    allowed = (str, int, float, bool, type(None))
+    for index, c in enumerate(choices):
+        if not isinstance(c, allowed):
+            raise ValueError(
+                f"{label} must be Optuna-compatible scalars "
+                "(None, bool, int, float, or str); "
+                f"got {type(c).__name__}: {c!r}"
+            )
+        if isinstance(c, float) and not math.isfinite(c):
+            raise ValueError(f"{label} must be finite floats; got {c!r}")
+        # Pairwise ``==`` rather than a hash/identity key: equal objects of
+        # different types (1 vs 1.0 vs True) are exactly the collision
+        # Optuna's index lookup cannot distinguish, and this also holds if
+        # a choice type ever stops being hashable.
+        for earlier_index in range(index):
+            earlier = choices[earlier_index]
+            if c == earlier:
+                raise ValueError(
+                    f"{label} must remain distinguishable after "
+                    f"Optuna persistence; {c!r} at index {index} compares equal "
+                    f"to {earlier!r} at index {earlier_index}. Optuna records a "
+                    "sampled value as its `==` index into choices, so equal "
+                    "choices collapse onto the first of them in "
+                    "FrozenTrial.params, the published winner, and every "
+                    "inherited override. A repeat also inflates grid "
+                    "cardinality (the phase runs an extra trial on an "
+                    "assignment it already evaluated, yet still reports a "
+                    "complete grid) and doubles that value's sampling weight."
+                )
 
 
 SearchParam = Annotated[
     FloatParam | IntParam | CategoricalParam,
     Field(discriminator="type"),
 ]
+
+
+class Repeats(_Frozen):
+    """Run every configuration once per repeat value and rank it by a reducer over them."""
+
+    key: str = Field(description="Override key that receives each repeat value, such as seed.")
+    values: list[StrictJsonScalar] = Field(
+        min_length=2,
+        description="Repeat values, at least two; every configuration runs once per value.",
+    )
+    reduce: Literal["mean", "median"] = Field(
+        default="mean",
+        description="How a configuration's member metrics combine into the value it ranks by.",
+    )
+
+    @field_validator("values")
+    @classmethod
+    def _values_are_distinct_optuna_scalars(
+        cls, values: list[StrictJsonScalar]
+    ) -> list[StrictJsonScalar]:
+        """Apply the categorical choice rules: the repeat axis is a categorical axis.
+
+        :param list[StrictJsonScalar] values: Configured repeat values.
+        :raises ValueError: A value is a non-finite float or equals an earlier value.
+        :return list[StrictJsonScalar]: The values, unchanged.
+        """
+        _validate_optuna_choices(values, label="repeats.values")
+        return values
+
+
+def repeat_param(repeats: Repeats) -> CategoricalParam:
+    """Return the categorical axis the sampler draws repeat values from.
+
+    :param Repeats repeats: The phase's repeats block.
+    :return CategoricalParam: One choice per repeat value, in configured order.
+    """
+    return CategoricalParam(type="categorical", choices=list(repeats.values))
+
+
+def sampler_search_space(phase: Phase) -> dict[str, SearchParam]:
+    """Return every axis the phase's sampler draws: the search space plus the repeat axis.
+
+    The only way to get a sampler's search space, so suggestion, grid
+    enumeration, cardinality, wire-form checks and command preflight all see
+    the repeat axis.
+
+    :param Phase phase: Phase whose axes are listed.
+    :return dict[str, SearchParam]: ``search_space`` with ``repeats.key`` appended when set.
+    """
+    space: dict[str, SearchParam] = dict(phase.search_space)
+    if phase.repeats is not None:
+        space[phase.repeats.key] = repeat_param(phase.repeats)
+    return space
 
 
 # Samplers whose suggestions depend on process-local RNG/optimizer state that
@@ -302,14 +376,15 @@ class Sampler(_Frozen):
 def phase_draws(phase: Phase) -> bool:
     """Say whether a phase asks its sampler for any values.
 
-    A phase with an empty search space is a fixed configuration: its sampler is
-    never consulted, so the seed and resumability requirements that guard
-    sampler draws do not apply to it.
+    A phase with an empty search space and no repeats is a fixed
+    configuration: its sampler is never consulted, so the seed and
+    resumability requirements that guard sampler draws do not apply to it. A
+    repeats phase always draws its repeat values, from grid or seeded random.
 
     :param Phase phase: Phase to inspect.
-    :return bool: ``True`` when the search space is nonempty.
+    :return bool: ``True`` when the sampler has any axis to draw.
     """
-    return bool(phase.search_space)
+    return bool(sampler_search_space(phase))
 
 
 def sampler_capability_line(phase: Phase) -> str:
@@ -319,8 +394,9 @@ def sampler_capability_line(phase: Phase) -> str:
     surfaces state the same contract in the same words before any trial runs.
 
     :param Phase phase: Phase whose sampler capability is described.
-    :return str: One line naming the phase and either its sampler type, seed
-        and capability, or that it is a fixed configuration with no sampler draws.
+    :return str: One line naming the phase and either its sampler type, seed,
+        capability and repeat axis, or that it is a fixed configuration with no
+        sampler draws.
     """
     if not phase_draws(phase):
         return f"phase {phase.name!r}: fixed configuration, no sampler draws (resumable)"
@@ -332,7 +408,13 @@ def sampler_capability_line(phase: Phase) -> str:
         capability = "resumable"
     else:
         capability = "resumable, reproducible"
-    return f"phase {phase.name!r}: sampler={sampler.type}{seed} ({capability})"
+    repeats = phase.repeats
+    axis = (
+        ""
+        if repeats is None
+        else f", repeats={repeats.key}×{len(repeats.values)} ({repeats.reduce})"
+    )
+    return f"phase {phase.name!r}: sampler={sampler.type}{seed} ({capability}){axis}"
 
 
 def sampler_warnings(phase: Phase) -> list[str]:
@@ -384,15 +466,17 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     The cardinality is a product of the enumerated value-list lengths, so it is
     only truthful while those lists are duplicate-free. Categorical duplicates
     are rejected by :class:`CategoricalParam` and float collapse by
-    :func:`grid_search_space`, both before this product is taken.
+    :func:`grid_search_space`, both before this product is taken. The repeat
+    axis is part of the grid, so it counts toward the cardinality and its cap.
 
     :param Phase phase: Phase whose sampler and search space are checked together.
-    :raises ValueError: If ``allow_partial_grid`` is set with a non-grid sampler,
-        if the CMA-ES sampler is paired with categorical params or
-        the ``cmaes`` package is not importable, if the grid sampler cannot
-        enumerate a parameter (raised by :func:`grid_search_space`), or if
-        ``n_trials`` exceeds the grid cardinality or does not equal it without
-        ``allow_partial_grid``.
+    :raises ValueError: If ``allow_partial_grid`` is set with a non-grid sampler
+        or with ``repeats``, if ``repeats`` is set without grid or seeded random
+        or with a trial count that does not cover every repeat, if the CMA-ES
+        sampler is paired with categorical params or the ``cmaes`` package is
+        not importable, if the grid sampler cannot enumerate a parameter
+        (raised by :func:`grid_search_space`), or if ``n_trials`` exceeds the
+        grid cardinality or does not equal it without ``allow_partial_grid``.
     """
     sampler_type = phase.sampler.type
     space = phase.search_space
@@ -404,6 +488,8 @@ def _validate_sampler_search_space(phase: Phase) -> None:
             "which would silently ignore it. Remove allow_partial_grid or set "
             "sampler.type: grid."
         )
+    if phase.repeats is not None:
+        _validate_repeat_sampling(phase, phase.repeats)
 
     if sampler_type == "cmaes":
         cats = [name for name, p in space.items() if isinstance(p, CategoricalParam)]
@@ -425,19 +511,85 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     if sampler_type == "grid":
         cardinality = math.prod(
             len(values)
-            for values in grid_search_space(phase.search_space, phase_name=phase.name).values()
+            for values in grid_search_space(
+                sampler_search_space(phase), phase_name=phase.name
+            ).values()
+        )
+        repeat_note = (
+            ""
+            if phase.repeats is None
+            else f" ({cardinality // len(phase.repeats.values)} configurations x "
+            f"{len(phase.repeats.values)} repeats)"
         )
         if phase.n_trials > cardinality:
             raise ValueError(
                 f"Phase {phase.name!r}: n_trials={phase.n_trials} exceeds the grid "
-                f"cardinality {cardinality}."
+                f"cardinality {cardinality}{repeat_note}."
             )
         if not phase.allow_partial_grid and phase.n_trials != cardinality:
-            raise ValueError(
-                f"Phase {phase.name!r}: grid sampler has {cardinality} combinations "
-                f"but n_trials={phase.n_trials}. Grid phases run the full matrix by "
-                "default; increase n_trials or set allow_partial_grid: true."
+            remedy = (
+                "increase n_trials or set allow_partial_grid: true."
+                if phase.repeats is None
+                else f"a grid with repeats always runs the full matrix, so set n_trials: "
+                f"{cardinality}."
             )
+            raise ValueError(
+                f"Phase {phase.name!r}: grid sampler has {cardinality} combinations"
+                f"{repeat_note} but n_trials={phase.n_trials}. Grid phases run the full "
+                f"matrix by default; {remedy}"
+            )
+
+
+def _validate_repeat_sampling(phase: Phase, repeats: Repeats) -> None:
+    """Require a sampler and trial count that run every configuration once per repeat value.
+
+    Only grid, whose cells each hold one configuration and one repeat value,
+    and seeded random, whose draws are keyed by configuration slot, keep a
+    configuration's repeats together. A partial grid would visit the shuffled
+    configuration x repeat matrix in part and leave most groups incomplete.
+
+    :param Phase phase: Phase whose sampler and trial target are checked.
+    :param Repeats repeats: The phase's repeats block.
+    :raises ValueError: The sampler is neither grid nor seeded random,
+        ``allow_partial_grid`` is set, an empty search space has ``n_trials``
+        other than the repeat count, or seeded random has ``n_trials`` that is
+        not a multiple of it.
+    """
+    sampler = phase.sampler
+    count = len(repeats.values)
+    if sampler.type not in ("grid", "random") or (
+        sampler.type == "random" and sampler.seed is None
+    ):
+        spelled = f"sampler.type={sampler.type!r}" + (
+            " without a seed" if sampler.type == "random" else ""
+        )
+        raise ValueError(
+            f"Phase {phase.name!r}: repeats needs sampler.type grid, or sampler.type random "
+            f"with a seed, and this phase uses {spelled}. Only those two keep every "
+            "configuration's repeats together: grid runs each configuration once per repeat "
+            "value, and seeded random draws each configuration once and runs it once per "
+            "repeat value."
+        )
+    if phase.allow_partial_grid:
+        raise ValueError(
+            f"Phase {phase.name!r}: allow_partial_grid cannot be combined with repeats. A grid "
+            "visits the configuration x repeat matrix in a shuffled order, so a partial grid "
+            "leaves most configurations without all their repeats, and selection ranks only "
+            "complete groups. To run a subset of configurations with all their repeats, use "
+            "sampler.type random with a seed."
+        )
+    if not phase.search_space and phase.n_trials != count:
+        raise ValueError(
+            f"Phase {phase.name!r}: repeats over an empty search_space runs one configuration "
+            f"once per repeat value, so n_trials must be {count} (the number of "
+            f"repeats.values), not {phase.n_trials}."
+        )
+    if sampler.type == "random" and phase.n_trials % count:
+        raise ValueError(
+            f"Phase {phase.name!r}: seeded random with repeats runs each configuration "
+            f"{count} times, once per repeats.values entry, so n_trials must be a multiple "
+            f"of {count}; got {phase.n_trials}."
+        )
 
 
 def _grid_value_counts(

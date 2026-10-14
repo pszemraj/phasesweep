@@ -101,14 +101,50 @@ flowchart TD
 
 ## Search spaces and samplers
 
-`search_space` maps dotted trainer-config paths to `float`, `int`, or `categorical` parameter objects. To audit seed variance deliberately, set `allow_seed_search: true`; ordinary sweeps reject seed keys.
+`search_space` maps dotted trainer-config paths to `float`, `int`, or `categorical` parameter objects. A key that is exactly `seed` or ends in `.seed` is refused: a searched seed lets seed noise win as if it were a configuration. Fix the seed in `fixed_overrides`, or measure its noise with [repeats](#repeats).
 
 > [!IMPORTANT]
 > YAML decides scalar types before PhaseSweep reads fixed overrides or categorical choices. In this loader, bare `1e-3` is a string, while `1.0e-3` and `0.001` are floats. PhaseSweep preserves that distinction so string categories remain usable. Write a decimal value (or an exponent with a decimal mantissa) for a numeric override, and quote a value when you intend a string category.
 
 Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's trial target covers its concrete combinations unless `allow_partial_grid: true` is set; CMA-ES accepts numeric spaces only. `validate` and `run --dry-run` warn when a `tpe` phase's `n_trials` does not exceed `sampler.n_startup_trials` (default 10), because then every trial is sampled at random. Sampler-specific limits and fields are listed in the [reference](../src/phasesweep/config_reference.yaml).
 
-For persistent storage, a phase with a `search_space` that uses `random`, `tpe`, or `cmaes` needs a seed. TPE and CMA-ES also require `acknowledge_nonresumable: true`: their target must finish in one invocation rather than being resumed or enlarged across processes. A phase with an empty `search_space` draws nothing and is exempt from both. See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation) for trial accounting, partial results, and sampler continuation, and [confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
+For persistent storage, a phase with a `search_space` that uses `random`, `tpe`, or `cmaes` needs a seed. TPE and CMA-ES also require `acknowledge_nonresumable: true`: their target must finish in one invocation rather than being resumed or enlarged across processes. A phase with an empty `search_space` and no `repeats` draws nothing and is exempt from both. See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation) for trial accounting, partial results, and sampler continuation, and [confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
+
+### Repeats
+
+`repeats` runs every configuration once per value of one key, typically the trainer seed, and ranks configurations by the mean or median of their members instead of by a single lucky trial. The sampler draws the repeat value as one more axis, so `N` configurations with `R` values cost `N x R` trials, and `n_trials` must cover every repeat: the number of values for an empty `search_space`, a multiple of it under seeded random, and configurations times values under grid. Only `grid` and seeded `random` support it, and `allow_partial_grid` is refused with it.
+
+```yaml
+experiment: lr_with_seeds
+storage: auto
+workdir: ./runs
+provenance:
+  trainer: trainer-revision-42
+trial_command: "python train.py --config {config_path}"
+metric:
+  name: validation_loss
+  goal: minimize
+  min: 0.0001
+  extractor: {type: json, path: result.json, key: validation_loss}
+phases:
+  - name: learning_rate
+    n_trials: 12
+    sampler: {type: random, seed: 7}
+    search_space:
+      optimizer.lr: {type: float, low: 0.00001, high: 0.001, log: true}
+    repeats: {key: seed, values: [0, 1, 2], reduce: mean}
+  - name: batch_size
+    inherits: [learning_rate]
+    n_trials: 9
+    sampler: {type: grid}
+    search_space:
+      data.batch_size: {type: categorical, choices: [16, 32, 64]}
+    repeats: {key: seed, values: [0, 1, 2]}
+```
+
+Choose the sampler by what you can afford. Grid runs every configuration with every value and is the honest choice for a small discrete space. Seeded random runs `n_trials / R` configurations, each drawn once and run with every value in `R` consecutive trial numbers, so a time-limited phase or one enlarged later never leaves more than one group half-run. An empty `search_space` with `repeats` is a seed audit: one fixed configuration run once per value, which reports the seed spread of a baseline before you search around it.
+
+A configuration ranks only when every member completed, is feasible, and lies inside `metric.min` and `metric.max`; one failed or out-of-bounds member keeps the whole group out, and a failed member is not retried. Use `metric.min` or `metric.max` so a collapsed seed cannot drag a configuration's mean, and size `max_consecutive_failures` above the number of values, or one configuration that fails every repeat aborts the phase. Report-only `observe` values are averaged over the members that recorded them. The winner names its group by the group's last member and publishes the reduced metric with the spread and every member under `repeats` in `winner.yaml` (see [runtime behavior](runtime.md#repeat-groups)). Its params and effective overrides never carry the repeat key, so a later phase that inherits it runs its own repeats, a fixed seed, or the trainer's default.
 
 ## Trainer inputs
 

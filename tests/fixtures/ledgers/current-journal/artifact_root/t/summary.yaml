@@ -1,8 +1,8 @@
 schema_version: 3
 experiment: t
-generation_id: 2ce8daf6002c4c8f874391ba921712c3
+generation_id: dabf63b3fc6a4b029c5b17fbb28365f3
 phasesweep_version: 0.3.7
-config_fingerprint: 73fc9f38da1e0decf50f990d79c1afc9d7b454edbffff0d6f39c04858b1257ec
+config_fingerprint: d19e1143a26dada0e2bf39fd6b9c1a3b3798871a07a9357935744d99d6408ebe
 metric:
   name: objective
   goal: minimize
@@ -38,14 +38,14 @@ phases:
     incomplete: false
     reason: null
     timeout_scope: null
-  generation_id: 2ce8daf6002c4c8f874391ba921712c3
-  attempt_id: d91680465f9b4d1397db44f2da3d3be4
+  generation_id: dabf63b3fc6a4b029c5b17fbb28365f3
+  attempt_id: 1eb838f847204bcfb7a79d29b771b92b
   winner_source:
     kind: phase_trial
     phase: p
     trial_number: 0
-    generation_id: 2ce8daf6002c4c8f874391ba921712c3
-    attempt_id: d91680465f9b4d1397db44f2da3d3be4
+    generation_id: dabf63b3fc6a4b029c5b17fbb28365f3
+    attempt_id: 1eb838f847204bcfb7a79d29b771b92b
   trainer_input:
     schema_version: 1
     format: argparse
@@ -55,10 +55,10 @@ phases:
 artifacts:
 - kind: config_snapshot
   path: config.snapshot.yaml
-  sha256: f59664c3566ad79a72fcf7a209367abf171cda1663be9d0c94cd1417788da13e
+  sha256: e5e149168b8f6b4919257d5b6af6d5c5bf7fb59d0e98f771ada62312dfe20d60
 - kind: reproducibility
   path: reproducibility.json
-  sha256: e704714c7ff20816c6c3e5e32221cc48822b53d32948d92fc845112d1a1c4a71
+  sha256: bd2c522705d03513408aaecadda5aebc75c0a4a517635924de37ae3eec40a56c
 - kind: winner
   phase: p
-  sha256: 4682409fe61cb3bd709bacf496b8903e0560cbedc1bb9113bad5f8e6fc19251d
+  sha256: 2051e08fb148b6a8fdec6d1b647bd494ae9e20a60186199872e0ffcc1ceeb574

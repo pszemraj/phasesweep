@@ -1061,3 +1061,198 @@ def test_observe_rejects_evaluation_axis() -> None:
         Observation.model_validate(
             {"name": "peak", "extractor": {**envelope, "evaluation_axis": "tokens"}}
         )
+
+
+_SEEDS: JsonObject = {"key": "seed", "values": [0, 1, 2]}
+
+
+def _repeats_phase(name: str = "p", **fields: JsonValue) -> Phase:
+    """Return a seeded random phase over two configurations x three seeds, with ``fields`` applied."""
+    spec: JsonObject = {
+        "name": name,
+        "n_trials": 6,
+        "sampler": {"type": "random", "seed": 0},
+        "search_space": {"lr": {"type": "categorical", "choices": [0.1, 0.2]}},
+        "repeats": _SEEDS,
+    }
+    spec.update(fields)
+    return Phase.model_validate(spec)
+
+
+@pytest.mark.parametrize(
+    ("sampler", "spelled"),
+    [
+        ({"type": "tpe", "seed": 0}, "sampler.type='tpe'"),
+        ({"type": "cmaes", "seed": 0}, "sampler.type='cmaes'"),
+        ({"type": "random"}, "sampler.type='random' without a seed"),
+    ],
+)
+def test_repeats_requires_grid_or_seeded_random(sampler: JsonObject, spelled: str) -> None:
+    numeric: JsonObject = {"lr": {"type": "float", "low": 0.1, "high": 0.2}}
+    with pytest.raises(
+        ValidationError,
+        match=f"Phase 'p': repeats needs sampler.type grid, or sampler.type random with a "
+        f"seed, and this phase uses {spelled}. Only those two keep",
+    ):
+        make_experiment(phases=[_repeats_phase(sampler=sampler, search_space=numeric)])
+
+    grid = make_experiment(phases=[_repeats_phase(sampler={"type": "grid"})])
+    assert grid.phases[0].repeats is not None
+    assert make_experiment(phases=[_repeats_phase()]).phases[0].sampler.seed == 0
+
+
+@pytest.mark.parametrize(
+    ("build", "match"),
+    [
+        pytest.param(
+            lambda: [
+                _repeats_phase(
+                    repeats={"key": "data.shard", "values": [0, 1, 2]},
+                    search_space={"data.shard": {"type": "int", "low": 0, "high": 1}},
+                )
+            ],
+            "repeats.key 'data.shard' is also a search_space key",
+            id="searched",
+        ),
+        pytest.param(
+            lambda: [
+                _repeats_phase(
+                    repeats={"key": "data.shard", "values": [0, 1, 2]},
+                    fixed_overrides={"data.shard": 4},
+                )
+            ],
+            "repeats.key 'data.shard' is also a fixed_overrides key",
+            id="fixed",
+        ),
+        pytest.param(
+            lambda: [
+                _repeats_phase(
+                    repeats={"key": "data", "values": [0, 1, 2]},
+                    fixed_overrides={"data.shard": 4},
+                )
+            ],
+            "dotted-key namespace collision",
+            id="local-prefix",
+        ),
+        pytest.param(
+            lambda: [
+                Phase(name="base", n_trials=1, fixed_overrides={"optim.lr": 0.1}),
+                _repeats_phase(
+                    "child", inherits=["base"], repeats={"key": "optim", "values": [0, 1, 2]}
+                ),
+            ],
+            "dotted-key namespace collision",
+            id="inherited-prefix",
+        ),
+        pytest.param(
+            lambda: [_repeats_phase(repeats={"key": "data..shard", "values": [0, 1]})],
+            "phase 'p' repeats.key: override key 'data..shard' has an empty dotted segment",
+            id="syntax",
+        ),
+    ],
+)
+def test_repeats_key_is_free_of_search_space_fixed_overrides_and_prefixes(
+    build: Callable[[], list[Phase]], match: str
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        make_experiment(phases=build())
+
+
+@pytest.mark.parametrize(
+    ("values", "match"),
+    [
+        ([0], "at least 2 items"),
+        ([1, 1.0], "repeats.values must remain distinguishable"),
+        ([0, False], "repeats.values must remain distinguishable"),
+        ([0.0, float("nan")], "repeats.values must be finite floats"),
+        ([[0], [1]], "repeats.values"),
+        ([{"a": 1}, {"a": 2}], "repeats.values"),
+    ],
+)
+def test_repeats_values_follow_categorical_choice_rules(values: JsonValue, match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        Phase.model_validate(
+            {"name": "p", "n_trials": 2, "repeats": {"key": "seed", "values": values}}
+        )
+    accepted = Phase.model_validate(
+        {"name": "p", "n_trials": 4, "repeats": {"key": "seed", "values": [None, True, 2, "s"]}}
+    )
+    assert accepted.repeats is not None
+    assert accepted.repeats.values == [None, True, 2, "s"]
+    assert accepted.repeats.reduce == "mean"
+
+
+@pytest.mark.parametrize(
+    ("fields", "match"),
+    [
+        pytest.param(
+            {"sampler": {"type": "grid"}, "n_trials": 3},
+            r"grid sampler has 6 combinations \(2 configurations x 3 repeats\) but n_trials=3\. "
+            r"Grid phases run the full matrix by default; a grid with repeats always runs the "
+            r"full matrix, so set n_trials: 6\.",
+            id="grid-short",
+        ),
+        pytest.param(
+            {"sampler": {"type": "grid"}, "n_trials": 9},
+            r"n_trials=9 exceeds the grid cardinality 6 \(2 configurations x 3 repeats\)",
+            id="grid-over",
+        ),
+        pytest.param(
+            {"n_trials": 7},
+            "seeded random with repeats runs each configuration 3 times, once per "
+            "repeats.values entry, so n_trials must be a multiple of 3; got 7.",
+            id="random-multiple",
+        ),
+        pytest.param(
+            {"sampler": {"type": "grid"}, "search_space": {}, "n_trials": 6},
+            r"repeats over an empty search_space runs one configuration once per repeat value, "
+            r"so n_trials must be 3 \(the number of repeats.values\), not 6\.",
+            id="empty-space",
+        ),
+        pytest.param(
+            {"sampler": {"type": "grid"}, "n_trials": 3, "allow_partial_grid": True},
+            "allow_partial_grid cannot be combined with repeats",
+            id="partial-grid",
+        ),
+    ],
+)
+def test_repeats_trial_count_covers_every_repeat(fields: JsonObject, match: str) -> None:
+    with pytest.raises(ValidationError, match=match):
+        make_experiment(phases=[_repeats_phase(**fields)])
+    assert make_experiment(phases=[_repeats_phase(n_trials=12)]).phases[0].n_trials == 12
+
+
+def test_repeats_key_overrides_inherited_value_and_is_never_exported() -> None:
+    """The repeat key settles conflicting parents, and descendants never inherit it."""
+    parents = [
+        Phase(name="a", n_trials=1, fixed_overrides={"data.shard": 1}),
+        Phase(name="b", n_trials=1, fixed_overrides={"data.shard": 2}),
+    ]
+    with pytest.raises(ValidationError, match="inherits conflicting key"):
+        make_experiment(phases=[*parents, Phase(name="c", n_trials=1, inherits=["a", "b"])])
+    repeats: JsonObject = {"key": "data.shard", "values": [0, 1, 2]}
+    child = _repeats_phase("c", inherits=["a", "b"], repeats=repeats)
+    # data.shard is not exported, so its prefix is free below the repeats phase.
+    grandchild = Phase(name="d", n_trials=1, inherits=["c"], fixed_overrides={"data": "full"})
+    experiment = make_experiment(phases=[*parents, child, grandchild])
+    assert [phase.name for phase in experiment.phases] == ["a", "b", "c", "d"]
+    with pytest.raises(ValidationError, match="dotted-key namespace collision"):
+        make_experiment(
+            phases=[*parents, grandchild.model_copy(update={"inherits": ["a"]})],
+        )
+
+
+@pytest.mark.parametrize("key", ["seed", "trainer.seed"])
+def test_seed_search_keys_point_at_repeats(key: str) -> None:
+    with pytest.raises(ValidationError) as excinfo:
+        Phase(name="p", n_trials=2, search_space={key: {"type": "int", "low": 0, "high": 9}})
+    assert (
+        f"Phase 'p': seed keys cannot be searched: ['{key}']. A searched seed lets seed noise "
+        "win as if it were a configuration. Move the seed to fixed_overrides, or measure seed "
+        f"noise with repeats: {{key: {key}, values: [0, 1, 2]}}."
+    ) in str(excinfo.value)
+    assert Phase(
+        name="p", n_trials=2, search_space={"seedling": {"type": "int", "low": 0, "high": 9}}
+    )
+    with pytest.raises(ValidationError, match="allow_seed_search"):
+        Phase.model_validate({"name": "p", "n_trials": 1, "allow_seed_search": True})

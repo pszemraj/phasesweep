@@ -16,10 +16,13 @@ import math
 import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypeAlias, TypedDict, get_args
+from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, get_args
 
 from phasesweep.engine.state import _validate_observed_block
 from phasesweep.runtime.json import JsonObject, json_object
+
+if TYPE_CHECKING:
+    from phasesweep.config import Phase
 
 ReduceName = Literal["mean", "median"]
 """How a group's member metrics combine into the value that ranks it."""
@@ -188,6 +191,23 @@ class EvidenceSource(Protocol):
     def repeats(self) -> RepeatsRecord | None:
         """The ``repeats`` block, or ``None`` for a phase without repeats."""
         ...
+
+
+def repeat_axis(phase: Phase) -> RepeatAxis | None:
+    """Return a phase's repeat axis, or ``None`` for a phase without repeats.
+
+    :param Phase phase: The phase.
+    :return RepeatAxis | None: The axis, slotted by repeat count under seeded random.
+    """
+    repeats = phase.repeats
+    if repeats is None:
+        return None
+    return RepeatAxis(
+        key=repeats.key,
+        values=tuple(repeats.values),
+        reduce=repeats.reduce,
+        slot_size=len(repeats.values) if phase.sampler.type == "random" else None,
+    )
 
 
 def group_key(trial_number: int, params: Mapping[str, object], axis: RepeatAxis) -> str:
@@ -401,7 +421,10 @@ def _validate_spread(data: object) -> RepeatSpread:
 
 
 def _validate_repeats_block(
-    payload: Mapping[str, object], *, metric_value: float
+    payload: Mapping[str, object],
+    *,
+    metric_value: float,
+    ranked_groups: Sequence[Sequence[int]] | None,
 ) -> RepeatsRecord | None:
     """Validate a winner payload's ``repeats`` block against the winner beside it.
 
@@ -409,14 +432,19 @@ def _validate_repeats_block(
     winner loader, and the winner read paths, which differ only in how they
     wrap the ``ValueError``. The scalar winner fields describe the group's
     highest-numbered member, so they must equal the last member; the metric,
-    the spread, and the observed values must be what the members recompute to.
+    the spread, and the observed values must be what the members recompute
+    to; and the members must be one of the groups the winner's validated
+    confound block ranked.
 
     :param Mapping[str, object] payload: Decoded winner payload holding ``repeats``.
     :param float metric_value: The winner's published metric value.
+    :param Sequence[Sequence[int]] | None ranked_groups: ``ranked_groups`` of the
+        winner's validated confound block.
     :raises ValueError: The block is absent or malformed, its members are not
         ascending with distinct repeat values, the last member disagrees with
         the scalar winner fields, a recomputed value differs from the recorded
-        one, or the repeat key appears in the winner's params or overrides.
+        one, the repeat key appears in the winner's params or overrides, or the
+        block and the confound block disagree on whether and which group ranked.
     :return RepeatsRecord | None: The validated block, or ``None`` for a phase
         without repeats.
     """
@@ -424,6 +452,8 @@ def _validate_repeats_block(
         raise ValueError("repeats block is missing")
     data = payload["repeats"]
     if data is None:
+        if ranked_groups is not None:
+            raise ValueError("repeats block is null though the confound block ranked repeat groups")
         return None
     if not isinstance(data, Mapping) or set(data) != _REPEATS_KEYS:
         raise ValueError("repeats block must have exactly key, reduce, spread and members")
@@ -438,6 +468,8 @@ def _validate_repeats_block(
     numbers = [member["trial_number"] for member in members]
     if numbers != sorted(set(numbers)):
         raise ValueError("repeats members are not ascending and distinct")
+    if ranked_groups is None or numbers not in [list(group) for group in ranked_groups]:
+        raise ValueError("repeats members are not one of the confound block's ranked groups")
     for index, member in enumerate(members):
         if any(member["repeat"] == earlier["repeat"] for earlier in members[:index]):
             raise ValueError("repeats members repeat a repeat value")

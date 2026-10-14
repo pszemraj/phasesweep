@@ -1,8 +1,8 @@
-"""Which metric-adjacent config fields enter the phase and experiment fingerprints."""
+"""Which selection-adjacent config fields enter the phase and experiment fingerprints."""
 
 from __future__ import annotations
 
-from phasesweep.config import LogRegexExtractor, Metric, Observation
+from phasesweep.config import LogRegexExtractor, Metric, Observation, Phase, Repeats, Sampler
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from tests.conftest import make_experiment
 
@@ -54,3 +54,31 @@ def test_observe_is_not_semantic() -> None:
 
     assert len({_phase_fingerprint(e, e.phases[0], {}) for e in variants}) == 1
     assert len({_experiment_semantic_fingerprint(e) for e in variants}) == 1
+
+
+def test_repeats_block_is_semantic() -> None:
+    """Selection groups and reduces by the repeats block, so every field of it moves identity."""
+
+    def phase(repeats: Repeats | None) -> Phase:
+        return Phase(
+            name="p",
+            n_trials=6,
+            sampler=Sampler(type="random", seed=0),
+            search_space={"x": {"type": "int", "low": 0, "high": 9}},
+            repeats=repeats,
+        )
+
+    variants = {
+        "none": phase(None),
+        "seeds": phase(Repeats(key="seed", values=[0, 1, 2])),
+        "values": phase(Repeats(key="seed", values=[3, 4, 5])),
+        "key": phase(Repeats(key="data.seed", values=[0, 1, 2])),
+        "median": phase(Repeats(key="seed", values=[0, 1, 2], reduce="median")),
+    }
+    experiments = {name: make_experiment(phases=[p]) for name, p in variants.items()}
+
+    phase_fps = {_phase_fingerprint(e, e.phases[0], {}) for e in experiments.values()}
+    experiment_fps = {_experiment_semantic_fingerprint(e) for e in experiments.values()}
+
+    assert len(phase_fps) == len(variants)
+    assert len(experiment_fps) == len(variants)

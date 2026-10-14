@@ -14,9 +14,11 @@ from phasesweep.config.search import (
     CategoricalParam,
     FloatParam,
     IntParam,
+    Repeats,
     Sampler,
     SearchParam,
     grid_search_space,
+    sampler_search_space,
 )
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
@@ -60,6 +62,7 @@ __all__ = [
     "ObjectiveExtractor",
     "Observation",
     "Phase",
+    "Repeats",
     "RequiredFileGate",
     "Sampler",
     "SearchParam",
@@ -69,4 +72,5 @@ __all__ = [
     "check_bounds",
     "grid_search_space",
     "load_experiment",
+    "sampler_search_space",
 ]

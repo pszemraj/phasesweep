@@ -34,6 +34,7 @@ from phasesweep.config import (
     JsonExtractor,
     Metric,
     Phase,
+    Repeats,
     Sampler,
     WandbExtractor,
     WandbSummaryRequiredGate,
@@ -831,6 +832,61 @@ def test_from_phase_refuses_damaged_skipped_winner_before_downstream_launch(
     assert _phase_trial_count(resumed, "q") == 1
     assert not marker.exists()
     assert _pointer_bytes(resumed) == pointer_before
+
+
+def test_group_winner_verifies_every_member_evidence(tmp_path: Path) -> None:
+    """A repeat group's winner stands on every member, not only the one that names it."""
+    marker = tmp_path / "resumed-trainer-ran"
+    trainer = write_trainer(tmp_path / "from_phase_trainer.py", _MARKED_TRAINER)
+
+    def experiment(resumed_trials: int) -> Experiment:
+        return make_experiment(
+            persistent=tmp_path,
+            trainer=trainer,
+            phases=[
+                Phase(
+                    name="p",
+                    n_trials=3,
+                    sampler=Sampler(type="grid"),
+                    repeats=Repeats(key="seed", values=[0, 1, 2]),
+                ),
+                Phase(
+                    name="q",
+                    n_trials=resumed_trials,
+                    inherits=["p"],
+                    sampler=Sampler(type="random", seed=1),
+                    fixed_overrides={"phase_marker": str(marker)},
+                    search_space={"lr": {"type": "int", "low": 1, "high": 9}},
+                ),
+            ],
+        )
+
+    original = experiment(1)
+    winner = run_experiment(original)["p"]
+    assert winner.trial_number == 2
+    marker.unlink()
+    first_member = next(_phase_dir(original, "p").glob("trial_00000__*"))
+    source = first_member / "stdout.log"
+    original_bytes = source.read_bytes()
+    source.write_bytes(b"y" + original_bytes[1:])
+    pointer_before = _pointer_bytes(original)
+
+    with pytest.raises(
+        TrialEvidenceMissingError,
+        match=r"Skipped phase 'p' winner source phase 'p' trial 0 .*bytes behind the published",
+    ):
+        run_experiment(experiment(2), from_phase="q")
+    assert _phase_trial_count(original, "q") == 1
+    assert not marker.exists()
+    with pytest.raises(
+        TrialEvidenceMissingError,
+        match=r"Phase 'p' winner group member trial 0 .*bytes behind the published",
+    ):
+        run_experiment(original)
+    assert _pointer_bytes(original) == pointer_before
+
+    source.write_bytes(original_bytes)
+    assert run_experiment(experiment(2), from_phase="q")["p"].repeats == winner.repeats
 
 
 def test_from_phase_keeps_a_skipped_winner_when_its_ledger_is_unavailable(

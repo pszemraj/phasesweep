@@ -20,6 +20,7 @@ from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.paths import GENERATION_SUMMARY_FILENAME
+from phasesweep.engine.repeats import _validate_repeats_block
 from phasesweep.engine.state import (
     _GENERATION_FILE_FILENAMES,
     _MANIFEST_GENERATION_FILE_KINDS,
@@ -434,7 +435,9 @@ def _validate_generation_manifest(
             if not isinstance(payload.get("completion"), Mapping):
                 raise _fail(f"winner for phase {name!r} has no completion metadata")
             try:
-                _validate_confound_block(payload.get("confound"), winner_trial=source_trial)
+                confound = _validate_confound_block(
+                    payload.get("confound"), winner_trial=source_trial
+                )
             except ValueError as exc:
                 raise _fail(
                     f"winner for phase {name!r} has no valid confound block ({exc})"
@@ -444,6 +447,14 @@ def _validate_generation_manifest(
             except ValueError as exc:
                 raise _fail(
                     f"winner for phase {name!r} has no valid observed block ({exc})"
+                ) from exc
+            try:
+                _validate_repeats_block(
+                    payload, metric_value=float(value), ranked_groups=confound["ranked_groups"]
+                )
+            except ValueError as exc:
+                raise _fail(
+                    f"winner for phase {name!r} has no valid repeats block ({exc})"
                 ) from exc
             winners[name] = ValidatedWinner(content=content, payload=payload)
     phases_dir = generation_dir / "phases"
@@ -649,7 +660,8 @@ def _validate_winner_source_generation(
             )
     # Completion, phase fingerprint, and confound verdicts belong to the
     # exposing selection -- a top-up re-selecting this trial ranks a larger
-    # population -- while the fields below come from the cited source trial.
+    # population -- while the fields below come from the cited source trial,
+    # or for a repeats winner from its group, which never changes once complete.
     for field_name in (
         "metric",
         "params",
@@ -661,6 +673,7 @@ def _validate_winner_source_generation(
         "trainer_env_digest",
         "trainer_inherit_env",
         "observed",
+        "repeats",
     ):
         if source_payload.get(field_name) != payload.get(field_name):
             raise fail(

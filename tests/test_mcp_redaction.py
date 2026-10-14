@@ -11,6 +11,7 @@ import pytest
 
 from phasesweep.config import FloatParam, JsonEnvelopeExtractor, Metric
 from phasesweep.engine import PhaseWinnerView
+from phasesweep.engine.repeats import RepeatsSummary
 from phasesweep.engine.state import WinnerSource
 from phasesweep.mcp.redaction import intersect_visible_params, winners_payload
 from phasesweep.mcp.snapshots import capture_result_snapshot
@@ -20,8 +21,10 @@ from tests.mcp_helpers import (
     _write_experiment_config,
     assert_no_sensitive,
     make_mcp_app,
+    mcp_experiment_config_text,
     patch_popen_capture,
     write_mcp_catalog,
+    write_mcp_config_catalog,
     write_run_status,
 )
 
@@ -332,6 +335,68 @@ def test_winners_payload_exposes_observed_values() -> None:
     )
 
     assert [phase["observed"] for phase in payload["phases"]] == [{"peak": 7.5}, {}]
+    assert [phase["repeats"] for phase in payload["phases"]] == [None, None]
+
+
+def test_winner_payload_exposes_repeats_spread_but_not_repeat_key() -> None:
+    """An agent sees that metric is a reduction over members, never the repeat key or values."""
+    source = WinnerSource(
+        kind="phase_trial",
+        phase="p1",
+        trial_number=5,
+        generation_id="generation-1",
+        attempt_id="attempt-5",
+    )
+    summary: RepeatsSummary = {
+        "reduce": "mean",
+        "n": 3,
+        "mean": 0.3,
+        "sd": 0.1,
+        "min": 0.2,
+        "max": 0.4,
+        "member_trials": [3, 4, 5],
+    }
+    payload = winners_payload(
+        "exp",
+        [
+            PhaseWinnerView(
+                "p1", 5, 0.3, {"lr": 0.1}, {"lr": 0.1}, None, False, source=source, repeats=summary
+            )
+        ],
+        metric={"name": "loss", "goal": "minimize"},
+        declared_phases=["p1"],
+        result_source="frozen_run_snapshot",
+        publication_integrity="ok",
+        run_id="exp-run",
+        represented_generation_id="generation-1",
+    )
+
+    (phase,) = payload["phases"]
+    assert phase["repeats"] == summary
+    assert phase["metric"] == summary["mean"]
+    assert set(phase["params"]) == {"lr"}
+    assert "key" not in phase["repeats"]
+
+
+def test_validate_reports_the_repeat_count_but_not_the_repeat_key(tmp_path: Path) -> None:
+    phases = """\
+  - name: p
+    n_trials: 6
+    sampler: { type: random, seed: 0 }
+    search_space:
+      lr: { type: float, low: 1.0e-5, high: 1.0e-2, log: true }
+    repeats: { key: trainer.secret_repeat_key, values: [rv_alpha, rv_beta, rv_gamma] }
+"""
+    catalog = write_mcp_config_catalog(
+        tmp_path, {"srv": mcp_experiment_config_text(tmp_path, phases=phases)}
+    )
+    app, _registry, _store = make_mcp_app(catalog)
+
+    structure = app.validate("srv")
+
+    assert [phase["repeats"] for phase in structure["phases"]] == [3]
+    assert structure["phases"][0]["search_space"] == ["lr"]
+    assert_no_sensitive(structure, ["secret_repeat_key", "rv_beta"])
 
 
 def test_winners_payload_defaults_claim_no_historical_provenance() -> None:

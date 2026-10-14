@@ -66,6 +66,10 @@ def _payload(reduce: str = "mean") -> JsonObject:
     }
 
 
+# The confound block's ranked groups for the payload above: its own and one other.
+_GROUPS = [[0, 2, 4], [1, 3, 5]]
+
+
 def _metric(payload: JsonObject) -> float:
     """Return the aggregate a payload's members reduce to."""
     repeats = payload["repeats"]
@@ -123,8 +127,9 @@ def test_observed_means_average_only_the_members_that_recorded_a_name() -> None:
 @pytest.mark.parametrize("reduce", ["mean", "median"])
 def test_repeats_block_survives_yaml_and_validation(reduce: str) -> None:
     payload = yaml.safe_load(yaml.safe_dump(_payload(reduce)))
-    record = _validate_repeats_block(payload, metric_value=_metric(payload))
+    record = _validate_repeats_block(payload, metric_value=_metric(payload), ranked_groups=_GROUPS)
 
+    assert record is not None
     assert record == payload["repeats"]
     assert _repeats_summary(record) == {
         "reduce": reduce,
@@ -138,9 +143,20 @@ def test_repeats_block_survives_yaml_and_validation(reduce: str) -> None:
 
 
 def test_repeats_block_is_null_without_repeats_and_required_as_a_key() -> None:
-    assert _validate_repeats_block({"repeats": None}, metric_value=0.5) is None
+    assert _validate_repeats_block({"repeats": None}, metric_value=0.5, ranked_groups=None) is None
     with pytest.raises(ValueError, match="repeats block is missing"):
-        _validate_repeats_block({}, metric_value=0.5)
+        _validate_repeats_block({}, metric_value=0.5, ranked_groups=None)
+
+
+def test_repeats_block_and_confound_groups_agree_on_the_winning_group() -> None:
+    """The members must be one of the groups the winner's confound block ranked."""
+    with pytest.raises(ValueError, match="null though the confound block ranked repeat groups"):
+        _validate_repeats_block({"repeats": None}, metric_value=0.5, ranked_groups=_GROUPS)
+    for groups in (None, [[0, 2, 4], [6, 7, 8]], [[1, 3], [5, 6]]):
+        with pytest.raises(ValueError, match="not one of the confound block's ranked groups"):
+            _validate_repeats_block(
+                _payload(), metric_value=_metric(_payload()), ranked_groups=groups
+            )
 
 
 def _tampered(edit: str) -> JsonObject:
@@ -198,4 +214,4 @@ def _tampered(edit: str) -> JsonObject:
 def test_repeats_block_refuses_every_tamper(edit: str, error: str) -> None:
     payload = _tampered(edit)
     with pytest.raises(ValueError, match=error):
-        _validate_repeats_block(payload, metric_value=_metric(_payload()))
+        _validate_repeats_block(payload, metric_value=_metric(_payload()), ranked_groups=_GROUPS)

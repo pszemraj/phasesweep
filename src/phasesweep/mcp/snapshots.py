@@ -22,6 +22,7 @@ from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
 from phasesweep.engine.read import ResultContext
+from phasesweep.engine.repeats import RepeatsSummary, _repeats_summary
 from phasesweep.engine.state import (
     TRIAL_STATE_NAMES,
     PublicationState,
@@ -247,6 +248,40 @@ class ConfoundSummary(_SnapshotModel):
     tie: TieSummary
 
 
+class RepeatsSpread(_SnapshotModel):
+    """How a repeats winner's members spread around the value it ranked by.
+
+    The repeat key and its values are config-authored and never appear here.
+    """
+
+    reduce: Literal["mean", "median"] = Field(
+        description="Reducer that turned the member metrics into the winner's metric."
+    )
+    n: NonNegativeInt = Field(description="Members in the winning group, one per repeat value.")
+    mean: float
+    sd: float = Field(description="Sample standard deviation of the member metrics.")
+    min: float
+    max: float
+    member_trials: list[NonNegativeInt] = Field(
+        description="Trial numbers of the members, ascending; the last one is trial_number."
+    )
+
+    def view(self) -> RepeatsSummary:
+        """Return the summary in the engine's read-view shape.
+
+        :return RepeatsSummary: The same reducer, spread and member trial numbers.
+        """
+        return {
+            "reduce": self.reduce,
+            "n": self.n,
+            "mean": self.mean,
+            "sd": self.sd,
+            "min": self.min,
+            "max": self.max,
+            "member_trials": list(self.member_trials),
+        }
+
+
 class WinnerSnapshot(_SnapshotModel):
     """One sampled phase winner captured without effective overrides."""
 
@@ -261,6 +296,7 @@ class WinnerSnapshot(_SnapshotModel):
     source: WinnerSourceSnapshot
     confound: ConfoundSummary
     observed: dict[str, float]
+    repeats: RepeatsSpread | None
 
 
 def _winner_source_snapshot(
@@ -306,12 +342,14 @@ def _winner_snapshot(
             _validate_confound_block(winner.confound, winner_trial=winner.trial_number),
             winner_trial=winner.trial_number,
         )
+        repeats = None if winner.repeats is None else _repeats_summary(winner.repeats)
     else:
         gates_passed = winner.gates_passed
         incomplete = winner.incomplete
         if winner.confound is None:
             raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = winner.confound
+        repeats = winner.repeats
     return WinnerSnapshot(
         phase=phase,
         trial_number=winner.trial_number,
@@ -324,6 +362,7 @@ def _winner_snapshot(
         source=_winner_source_snapshot(winner),
         confound=ConfoundSummary.model_validate(confound),
         observed=dict(winner.observed),
+        repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
     )
 
 
@@ -377,6 +416,7 @@ class RunResultSnapshot(_SnapshotModel):
                 ),
                 confound=winner.confound.model_dump(mode="json"),
                 observed=dict(winner.observed),
+                repeats=None if winner.repeats is None else winner.repeats.view(),
             )
             for winner in self.winners
         ]

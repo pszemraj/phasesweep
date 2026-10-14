@@ -14,10 +14,6 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import (
     BaseModel,
     Field,
-    StrictBool,
-    StrictFloat,
-    StrictInt,
-    StrictStr,
     field_validator,
     model_validator,
 )
@@ -25,20 +21,11 @@ from pydantic import (
 from phasesweep.config.common import (
     ConfigFloat,
     ConfigInt,
+    StrictJsonScalar,
     _Frozen,
     _require_finite,
     _validate_optional_bounds,
 )
-
-StrictJsonScalar = StrictBool | StrictInt | StrictFloat | StrictStr | None
-"""The exact set of values a JSON document can hold at a leaf position.
-
-Strict (non-coercing) members on purpose: ``StrictInt`` rejects ``bool`` and
-``StrictStr`` rejects a YAML ``date``, so nothing is silently widened into a
-neighbouring type. Anything outside this union — a mapping, a sequence, a
-``datetime.date`` — is not representable in parsed JSON and is rejected at
-config load rather than normalized later.
-"""
 
 
 def _validate_trial_path(value: str) -> str:

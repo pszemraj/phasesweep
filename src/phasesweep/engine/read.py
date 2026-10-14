@@ -45,6 +45,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import _parse_phase_plan
+from phasesweep.engine.repeats import RepeatsSummary, _repeats_summary, _validate_repeats_block
 from phasesweep.engine.state import (
     GENERATION_SUMMARY_SCHEMA_VERSION,
     PublicationState,
@@ -95,6 +96,10 @@ class PhaseWinnerView:
     confound: dict[str, Any] | None = None
     # Report-only values the winning trial recorded, by observation name.
     observed: dict[str, float] = field(default_factory=dict)
+    # String-free projection of the winner's repeats block: reducer, spread
+    # and member trial numbers, never the repeat key or values
+    # (:func:`phasesweep.engine.repeats._repeats_summary`).
+    repeats: RepeatsSummary | None = None
 
 
 def _phase_status_payloads(
@@ -190,14 +195,16 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
             return None
         source = _parse_winner_source(data.get("winner_source"), expected_phase=phase_name)
         trial_number = int(data["trial_number"])
-        confound = _confound_summary(
-            _validate_confound_block(data.get("confound"), winner_trial=trial_number),
-            winner_trial=trial_number,
+        confound_block = _validate_confound_block(data.get("confound"), winner_trial=trial_number)
+        confound = _confound_summary(confound_block, winner_trial=trial_number)
+        metric = float(metric_block[stored_metric_name])
+        repeats = _validate_repeats_block(
+            data, metric_value=metric, ranked_groups=confound_block["ranked_groups"]
         )
         return PhaseWinnerView(
             phase=phase_name,
             trial_number=trial_number,
-            metric=float(metric_block[stored_metric_name]),
+            metric=metric,
             metric_name=stored_metric_name,
             metric_goal=str(stored_goal) if isinstance(stored_goal, str) else None,
             params=dict(params),
@@ -217,6 +224,7 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
             source=source,
             confound=confound,
             observed=_validate_observed_block(data.get("observed")),
+            repeats=None if repeats is None else _repeats_summary(repeats),
         )
     except (KeyError, ValueError, TypeError):
         return None

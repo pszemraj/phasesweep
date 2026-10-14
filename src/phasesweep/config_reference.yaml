@@ -15,7 +15,7 @@
 # A string whose escapes produce text that is not valid UTF-8, such as "\ud800", fails config load.
 # Unknown keys are rejected at every level, and a duplicate key anywhere in the YAML is rejected.
 # trainer_config, fixed_overrides, search_space, provenance and env are maps with user-chosen keys.
-# fixed_overrides and search_space keys must be dotted paths, provenance keys and values must be nonblank, and env keys must be valid variable names.
+# fixed_overrides and search_space keys and phases[].repeats.key must be dotted paths, provenance keys and values must be nonblank, and env keys must be valid variable names.
 # Paths: a relative workdir, journal path in storage, or execution.cwd resolves against the directory of this config file (after symlinks to the file are resolved), not the directory phasesweep is started from, so the CLI and MCP resolve it identically. A leading ~ is expanded in all three, and symlinks are resolved.
 # Under MCP an omitted execution.cwd becomes the catalog entry's cwd, which defaults to the config file's directory.
 # Trial-relative paths (extractor and gate path and file values) resolve inside the attempt directory.
@@ -68,9 +68,9 @@ trial_command: string (required)
 # Requires: metric.name, constraints[].name and observe[].name must all be distinct; duplicate names fail config load.
 # Selection records three advisory confound verdicts on the winner: evaluation_point, survivorship and tie. They cannot be disabled or tuned and never block selection or publication.
 # evaluation_point is flagged when the lowest ranked position on the evaluation axis is more than 1% short of the furthest.
-# survivorship is flagged when failed plus pruned trials are at least max(1, ranked trials). Infeasible trials are counted but never flagged.
-# tie is flagged when another ranked trial has exactly the winner's value with different sampled parameters.
-# A verdict of n/a means not checked. evaluation_point and tie are n/a when fewer than two trials were ranked.
+# survivorship is flagged when failed plus pruned trials are at least max(1, ranked trials). Infeasible trials, including those outside metric.min or metric.max, are counted but never flagged, and so are feasible trials of a phases[].repeats group that never completed (incomplete_group).
+# tie is flagged when another ranked trial has exactly the winner's value with different sampled parameters. With phases[].repeats it compares complete groups: it is also flagged when another group's reduced value lies within two standard errors of the winning group's (within_noise), a heuristic rather than a significance test.
+# A verdict of n/a means not checked. evaluation_point is n/a when fewer than two trials were ranked, and tie when fewer than two trials, or with repeats fewer than two groups, were ranked.
 # evaluation_point needs a recorded position, and only json_envelope, wandb and mlflow objectives record one. It is always n/a for json and log_regex objectives; report through json_envelope (report_objective), wandb (evaluation_axis) or mlflow (the selected step) when the comparison needs it. phasesweep validate and run --dry-run print an evaluation_point check: line that says which case applies.
 # evaluation_point is also n/a when no position was recorded (for example a W&B history position that was unavailable), and when ranked trials have unreadable provenance.
 # A phase whose search space changes training length (for example epochs or max_steps) flags evaluation_point by design. Otherwise a flag means the trials were not trained to one budget.
@@ -275,10 +275,11 @@ phases: list[object] (required)
     # A persistent phase cannot lower its target below the one it already accepted.
     # Raising it is refused while a later phase that inherits from this one, directly or through other phases, already has trials. Use a new experiment name for that.
     # With sampler.type tpe or cmaes and a nonempty phases[].search_space, raising it on a study that has trials is refused. Run the whole target in one invocation, or use a new experiment name. A phase with an empty search_space draws nothing and is not refused.
-    # A fixed configuration is a phase with an empty phases[].search_space and its values in phases[].fixed_overrides. A list of fixed runs is one such phase per configuration.
+    # A fixed configuration is a phase with an empty phases[].search_space, no phases[].repeats, and its values in phases[].fixed_overrides. A list of fixed runs is one such phase per configuration.
     # With random or grid, raising it also recovers a phase that stopped on a durable abort or on an accepted partial timeout. Repeating the same target preserves that decision.
     # Excluded from the study fingerprint.
     # Requires: with phases[].sampler.type grid, n_trials equals the grid size unless phases[].allow_partial_grid is true, and it never exceeds the grid size. Config load fails otherwise.
+    # Requires: with phases[].repeats, n_trials covers every repeat of every configuration: the number of values for an empty search_space, a multiple of it under seeded random, and the grid size (configurations times values) under grid. Config load fails otherwise.
     n_trials: int (required)
 
     # Free-text design note for the phase, for example why this search space and what is being tested.
@@ -294,8 +295,9 @@ phases: list[object] (required)
     # Overrides: trainer_config (an inherited value replaces the base value at the same dotted path).
     # Overridden by: phases[].fixed_overrides (a key fixed in this phase replaces the inherited value and becomes the key's new origin).
     # Overridden by: phases[].search_space (a key that every inherited origin only fixed may be searched here, and the sampled value replaces the inherited one; a key an inherited phase sampled cannot be searched again, and config load fails).
-    # Requires: one key inherited from parents with different origins must be fixed explicitly in phases[].fixed_overrides; several parents with the same origin are accepted. Config load fails otherwise.
-    # Requires: an inherited key and another key that is its prefix or extension cannot coexist across the inherited, fixed and sampled keys; config load fails.
+    # Overridden by: phases[].repeats.key (the repeat value replaces any inherited value at that key, sampled or fixed, and this phase's winner exports neither).
+    # Requires: one key inherited from parents with different origins must be fixed explicitly in phases[].fixed_overrides, unless it is the repeat key; several parents with the same origin are accepted. Config load fails otherwise.
+    # Requires: an inherited key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
     # Warning: weights and checkpoints are never inherited. Configure checkpoint inputs in trainer_config or phases[].fixed_overrides.
     inherits: list[string] = []
 
@@ -306,20 +308,23 @@ phases: list[object] (required)
     # String values here do not expand the {trial_dir}, {phase} style placeholders.
     # Overrides: trainer_config, phases[].inherits (the value replaces the base value and an inherited value at the same key, and resolves a key inherited from parents with different origins; the phase then becomes the key's origin).
     # Conflicts with: phases[].search_space (the same key cannot be both fixed and sampled in one phase; config load fails).
-    # Requires: a fixed key and another key that is its prefix or extension cannot coexist across the inherited, fixed and sampled keys; config load fails.
-    # Recommended: fix batch size, seed, data split and the training and evaluation budget here when comparing hyperparameters. PhaseSweep does not equalize training between trials.
+    # Conflicts with: phases[].repeats.key (the repeat key cannot also be fixed; config load fails).
+    # Requires: a fixed key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
+    # Recommended: fix batch size, seed, data split and the training and evaluation budget here when comparing hyperparameters, or put the seed in phases[].repeats to rank by its mean. PhaseSweep does not equalize training between trials.
     fixed_overrides: map[string, any] = {}
 
     # Map from a dotted trainer-defined override key to the parameter that is sampled for it. optimizer.lr below is an example key; replace it with any valid dotted name.
     # The key rules are the same as for phases[].fixed_overrides, and the sampled value is passed to the trainer like a fixed value.
     # Float and int values reach the trainer as Python floats and ints, and categorical choices keep their YAML type.
-    # An empty search_space is a fixed configuration: the phase draws nothing from its sampler and runs phases[].fixed_overrides as they are. validate and the dry run say "fixed configuration, no sampler draws (resumable)".
+    # An empty search_space without phases[].repeats is a fixed configuration: the phase draws nothing from its sampler and runs phases[].fixed_overrides as they are. validate and the dry run say "fixed configuration, no sampler draws (resumable)".
+    # An empty search_space with phases[].repeats is a seed audit: one configuration run once per repeat value.
+    # A key that is exactly seed or ends in .seed fails config load, because a searched seed lets seed noise win as if it were a configuration. Fix the seed in phases[].fixed_overrides, or measure seed noise with phases[].repeats. The match is case sensitive.
     # Overrides: trainer_config (the sampled value replaces the base value at the same dotted path).
     # Overrides: phases[].inherits (a sampled value replaces an inherited value that was only fixed; a key an inherited phase sampled cannot be searched again, and config load fails).
     # Conflicts with: phases[].fixed_overrides (a key cannot be both fixed and sampled in one phase; config load fails).
-    # Requires: a sampled key and another key that is its prefix or extension cannot coexist across the inherited, fixed and sampled keys; config load fails.
-    # Requires: phases[].allow_seed_search true for a key that is exactly seed or ends in .seed; config load fails otherwise.
-    # Requires: with phases[].sampler.type cmaes every parameter is a float or int; with grid no parameter uses log, every float has a step, and the matrix has at most 4096 combinations.
+    # Conflicts with: phases[].repeats.key (the repeat key cannot also be searched; config load fails).
+    # Requires: a sampled key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
+    # Requires: with phases[].sampler.type cmaes every parameter is a float or int; with grid no parameter uses log, every float has a step, and the matrix, repeat axis included, has at most 4096 combinations.
     search_space: map[string, categorical | float | int] = {}
       # Example dotted trainer key; replace optimizer.lr with your parameter name.
       optimizer.lr: categorical | float | int (required)
@@ -379,6 +384,35 @@ phases: list[object] (required)
         # Spacing between allowed values, an integer greater than 0, in trainer-defined units.
         # Requires: step divides high - low exactly, and log true requires step 1; config load fails otherwise.
         step: int = 1
+
+    # Run every configuration once per repeat value, typically seeds, and rank configurations by a reducer over their members instead of by any single trial.
+    # The sampler draws the repeat value as one more axis, so a phase of N configurations with R values runs N x R trials.
+    # Under grid every cell is one configuration with one repeat value. Under seeded random each slot of R consecutive trial numbers draws one configuration and runs it once per value, value number trial_number mod R.
+    # A configuration ranks only as a complete group: one trial per repeat value, every one COMPLETE, feasible, inside metric.min and metric.max and every constraint. A group with a failed or infeasible member never ranks, and a failed member is not retried.
+    # Groups rank by phases[].repeats.reduce over their member metrics. Exact ties go to the group with the lowest trial number, and the group's highest trial number names the winner.
+    # winner.yaml records the reduced metric, observed values averaged over the members that recorded them, and a repeats block with the spread and every member. The scalar winner fields describe the last member.
+    # The winner's params and effective overrides never carry the repeat key, so a phase that inherits this one runs with its own value of that key or none.
+    # trials.csv gains a repeat_group column: the highest trial number of each trial's group so far.
+    # The block is part of the study fingerprint.
+    # Conflicts with: phases[].allow_partial_grid (a partial grid would leave most groups incomplete; config load fails).
+    # Requires: phases[].sampler.type grid, or random with phases[].sampler.seed; any other sampler fails config load.
+    # Requires: with an empty phases[].search_space, phases[].n_trials equals the number of values; with random it is a multiple of it; with grid it equals the number of configurations times the number of values.
+    # Unset: every trial ranks on its own.
+    repeats: object | null = null
+      # Dotted override key that receives the repeat value on every trial, for example seed or data.shard. The key rules are the same as for phases[].fixed_overrides.
+      # The value reaches the trainer like a sampled value and is recorded as a param, so trials.csv has a param column for it.
+      # Overrides: trainer_config, phases[].inherits (the repeat value replaces the base value and any inherited value at that key; the winner exports neither).
+      # Conflicts with: phases[].search_space, phases[].fixed_overrides (the repeat key cannot also be searched or fixed; config load fails).
+      # Requires: the key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
+      key: string (required)
+
+      # Repeat values, at least two. Each is null, a boolean, an integer, a finite float or a string, and they follow the categorical choice rules: distinct under Python equality, and under argparse and hydra distinct as command-line values.
+      # Under argparse, hydra and json_file each value reaches the trainer through the format's placeholder, so the command must carry it.
+      values: list[bool | int | float | string | null] (required)
+
+      # How a group's member metrics combine into the value it ranks by: mean or median.
+      # The selection-time tie check flags groups whose reduced value lies within two standard errors of the winner's, with the sample standard deviation for either reducer. It is a heuristic, not a significance test.
+      reduce: "mean" | "median" = "mean"
 
     # Number of trials run at the same time in this phase, an integer >= 1.
     # Optuna starts this many worker threads. Each takes its own device lease, so when the GPU pool is smaller than n_jobs the extra workers wait for a free device and a warning is logged.
@@ -440,18 +474,20 @@ phases: list[object] (required)
     sampler: object = {}
       # Optuna strategy. tpe fits a surrogate model after its random startup trials, random samples independently, grid enumerates a concrete matrix, and cmaes runs CMA-ES on numeric spaces.
       # tpe and cmaes are non-resumable: their state lives in the process, so a persistent phase must finish its target in one invocation.
-      # Seeded random derives each draw from the seed, study name, trial number and parameter name, so it is independent of n_jobs and restarts.
+      # Seeded random derives each draw from the seed, study name, trial number and parameter name, so it is independent of n_jobs and restarts. With phases[].repeats the configuration slot, trial_number divided by the number of repeat values, takes the place of the trial number.
       # cmaes needs the cmaes package; config load fails with an install hint when it is missing.
       # Requires: with cmaes every phases[].search_space parameter is numeric.
-      # Requires: with grid, the search space has no log parameter, every float has a step, there are at most 4096 distinct combinations, and phases[].n_trials equals the combination count unless phases[].allow_partial_grid is true.
-      # Requires: with persistent storage and a nonempty phases[].search_space, random, tpe and cmaes need phases[].sampler.seed, and tpe and cmaes need phases[].sampler.acknowledge_nonresumable true. A phase with an empty search_space draws nothing and is exempt.
+      # Requires: with grid, the search space has no log parameter, every float has a step, there are at most 4096 distinct combinations, and phases[].n_trials equals the combination count unless phases[].allow_partial_grid is true. The repeat axis of phases[].repeats counts toward the combinations.
+      # Requires: phases[].repeats needs grid, or random with phases[].sampler.seed; config load fails otherwise.
+      # Requires: with persistent storage and a nonempty phases[].search_space, random, tpe and cmaes need phases[].sampler.seed, and tpe and cmaes need phases[].sampler.acknowledge_nonresumable true. A phase with an empty search_space and no phases[].repeats draws nothing and is exempt.
       # Warning: a tpe or cmaes target with a nonempty search_space must finish in one invocation. An interrupted target cannot resume and cannot be enlarged. Grid and seeded random continue normally, and so does a phase with an empty search_space.
       type: "tpe" | "random" | "grid" | "cmaes" = "tpe"
 
       # Sampler random seed, an integer from 0 to 4294967295. It is independent of any trainer seed in trainer_config or phases[].fixed_overrides.
       # For grid the seed fixes the order in which Optuna visits the grid points, which also decides which points a partial grid runs.
-      # Unset: tpe, random and cmaes draw unseeded suggestions, and persistent storage rejects that unless phases[].search_space is empty.
-      # Requires: with persistent storage, random, tpe and cmaes need an explicit seed; grid is exempt, and so is a phase with an empty phases[].search_space, which draws nothing.
+      # Unset: tpe, random and cmaes draw unseeded suggestions, and persistent storage rejects that unless the phase draws nothing (an empty phases[].search_space without phases[].repeats).
+      # Requires: with persistent storage, random, tpe and cmaes need an explicit seed; grid is exempt, and so is a phase with an empty phases[].search_space and no phases[].repeats, which draws nothing.
+      # Requires: phases[].repeats with random needs a seed on any storage, because the seed keys each configuration slot.
       seed: int | null = null
 
       # Number of random startup trials before the tpe surrogate model is fitted, an integer >= 0.
@@ -512,14 +548,9 @@ phases: list[object] (required)
     # Allow phases[].n_trials smaller than the number of grid combinations. false requires the full matrix.
     # Only used when: phases[].sampler.type is grid. true with tpe, random or cmaes fails config load.
     # phases[].n_trials must still not exceed the combination count; config load fails otherwise.
+    # Conflicts with: phases[].repeats (the grid visits the configuration x repeat matrix in a shuffled order, so a partial grid leaves most groups incomplete; use seeded random to run a subset of configurations with all their repeats).
     # Excluded from the study fingerprint.
     allow_partial_grid: bool = false
-
-    # Permit search_space keys that are exactly seed or end in .seed, for an explicit audit of stochastic variance. The match is case sensitive and applies to phases[].search_space only.
-    # Requires: a phases[].search_space containing such a key needs true; false rejects it at config load. Fixed seeds in phases[].fixed_overrides are always allowed.
-    # Warning: searching seeds selects stochastic variation, not a model or configuration improvement.
-    # Excluded from the study fingerprint.
-    allow_seed_search: bool = false
 
     # Hard checks run after the trainer exits, selected by type. Each variant below describes one list item.
     # Gates run only when the trainer exited 0 and the objective and every constraint were extracted finite, in the order objective, constraints, then gates.
@@ -684,7 +715,7 @@ phases: list[object] (required)
 # trainer_config.yaml is written with keys sorted at every level.
 # No model download, optimizer setting, batch size or step budget is supplied automatically.
 # Requires: a nonempty trainer_config makes the placeholder that matches override_format required in trial_command, because the base must reach the trainer; config load fails otherwise.
-# Overridden by: phases[].inherits, phases[].fixed_overrides, phases[].search_space (at their exact dotted paths; an override that must descend through an existing non-mapping value, meaning a scalar, null or list, fails config load).
+# Overridden by: phases[].inherits, phases[].fixed_overrides, phases[].search_space, phases[].repeats.key (at their exact dotted paths; an override that must descend through an existing non-mapping value, meaning a scalar, null or list, fails config load).
 trainer_config: map[string, any] = {}
 
 # How the trainer receives its inputs.
@@ -904,7 +935,7 @@ constraints: list[object] = []
 # Report-only scalars read from each accepted trial, separate from metric ranking and constraints. Values below describe one item.
 # Each observation is read with a local extractor after the trial is accepted and its objective position located, so reading one can never spend the budget acceptance needed.
 # A read that fails, or yields a non-finite value, logs a warning and records nothing for that name on that trial. It never fails the trial or changes feasibility, ranking or selection.
-# A recorded value is stored on the trial as the user attribute observed:<name>, which trials.csv carries as user_attr:observed:<name>. The selected winner's values are published as observed in winner.yaml, and a winner whose trial recorded none publishes an empty map.
+# A recorded value is stored on the trial as the user attribute observed:<name>, which trials.csv carries as user_attr:observed:<name>. The selected winner's values are published as observed in winner.yaml, and a winner whose trial recorded none publishes an empty map. A phases[].repeats winner publishes each name's mean over the members that recorded it, and each member's own values under repeats.members[].observed.
 # An MLflow attempt run receives each recorded value as the metric phasesweep.observed.<name>, and the MCP results view returns the winner's values as observed.
 # Excluded from the study fingerprint: adding, removing or changing an observation never invalidates a populated study, and trials that ran before it was added report nothing for it.
 # Only local extractors are accepted. wandb and mlflow extractors wait for every requested key, so a key the trainer never wrote would stall the trial until the poll timeout, and they fail config load. Write the value with report_objective(..., extra=...) and read it with a json extractor.

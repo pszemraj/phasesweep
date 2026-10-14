@@ -7,7 +7,16 @@ import re
 from pathlib import Path
 from typing import Annotated, TypeAlias, TypeGuard
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, ValidationInfo
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    StrictBool,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    ValidationInfo,
+)
 
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
@@ -65,6 +74,16 @@ def _reject_boolean_number(value: object) -> object:
 
 ConfigInt: TypeAlias = Annotated[int, BeforeValidator(_reject_boolean_number)]
 ConfigFloat: TypeAlias = Annotated[float, BeforeValidator(_reject_boolean_number)]
+
+StrictJsonScalar: TypeAlias = StrictBool | StrictInt | StrictFloat | StrictStr | None
+"""The exact set of values a JSON document can hold at a leaf position.
+
+Strict (non-coercing) members on purpose: ``StrictInt`` rejects ``bool`` and
+``StrictStr`` rejects a YAML ``date``, so nothing is silently widened into a
+neighbouring type. Anything outside this union — a mapping, a sequence, a
+``datetime.date`` — is not representable in parsed JSON and is rejected at
+config load rather than normalized later.
+"""
 
 
 class _Frozen(BaseModel):

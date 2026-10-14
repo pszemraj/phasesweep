@@ -7,6 +7,7 @@ import pytest
 
 from phasesweep.config import Constraint, JsonExtractor, Phase
 from phasesweep.engine.errors import TrialEvidenceMissingError
+from phasesweep.engine.repeats import RepeatAxis
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -305,3 +306,156 @@ def test_metric_bounds_note_without_a_completed_value() -> None:
 
     with pytest.raises(NoFeasibleTrialError, match=r"metric\.min=1\.0, metric\.max=2\.0.*finite"):
         select_winner(study, _with_bounds(_make_exp(), min=1.0, max=2.0))
+
+
+def _axis(reduce: str = "mean", *, slot_size: int | None = None) -> RepeatAxis:
+    """Return a ``seed`` repeat axis over three values, slotted for seeded random."""
+    assert reduce in ("mean", "median")
+    return RepeatAxis(key="seed", values=(0, 1, 2), reduce=reduce, slot_size=slot_size)
+
+
+def _add_group(study, x: int, values: list[float], **kwargs) -> None:  # noqa: ANN001
+    """Add one configuration's trials, one per seed in order."""
+    for seed, value in enumerate(values):
+        _add_trial(study, value, params={"x": x, "seed": seed}, **kwargs)
+
+
+def _add_failed(study, x: int, seed: int) -> None:  # noqa: ANN001
+    """Add a FAIL trial that recorded its params before failing."""
+    study.add_trial(
+        optuna.trial.create_trial(
+            params={"x": x, "seed": seed},
+            distributions={
+                "x": optuna.distributions.IntDistribution(low=x, high=x),
+                "seed": optuna.distributions.IntDistribution(low=seed, high=seed),
+            },
+            state=optuna.trial.TrialState.FAIL,
+        )
+    )
+
+
+@pytest.mark.parametrize(("reduce", "winner_x"), [("mean", 2), ("median", 1)])
+def test_repeats_rank_complete_groups_by_reducer(reduce: str, winner_x: int) -> None:
+    study = _make_study()
+    _add_group(study, 1, [0.1, 0.2, 0.9])  # mean 0.4, median 0.2
+    _add_group(study, 2, [0.3, 0.3, 0.3])  # mean 0.3, median 0.3
+
+    winner = select_winner(study, _make_exp(), repeats=_axis(reduce))
+
+    assert winner.params == {"x": winner_x}
+    assert winner.metric == pytest.approx(0.2 if reduce == "median" else 0.3)
+    assert winner.trial_number == (2 if winner_x == 1 else 5)
+    assert winner.repeats is not None
+    assert [member["trial_number"] for member in winner.repeats["members"]] == (
+        [0, 1, 2] if winner_x == 1 else [3, 4, 5]
+    )
+    assert winner.confound["ranked_groups"] == [[0, 1, 2], [3, 4, 5]]
+
+
+@pytest.mark.parametrize("member", ["failed", "infeasible", "missing"])
+def test_repeats_group_with_failed_or_infeasible_member_cannot_rank(member: str) -> None:
+    """A configuration whose best members look unbeatable still loses without all of them."""
+    study = _make_study()
+    _add_trial(study, 0.01, params={"x": 1, "seed": 0})
+    _add_trial(study, 0.01, params={"x": 1, "seed": 1})
+    if member == "failed":
+        _add_failed(study, 1, 2)
+    elif member == "infeasible":
+        _add_trial(study, 0.01, feasible=False, params={"x": 1, "seed": 2})
+    _add_group(study, 2, [0.5, 0.5, 0.5])
+
+    winner = select_winner(study, _make_exp(), repeats=_axis())
+
+    assert winner.params == {"x": 2}
+    assert winner.metric == pytest.approx(0.5)
+    survivorship = winner.confound["checks"]["survivorship"]["detail"]
+    assert survivorship["ranked"] == 3
+    assert survivorship["incomplete_group"] == 2
+    assert winner.confound["checks"]["tie"] == {
+        "verdict": "n/a",
+        "reason": "only one repeat group was ranked",
+    }
+
+
+def test_repeats_collapsed_member_outside_metric_bounds_excludes_its_configuration() -> None:
+    """One collapsed seed cannot drag a configuration's mean into first place."""
+    study = _make_study()
+    _add_group(study, 1, [0.0, 0.3, 0.3])  # a leaked or collapsed seed scores exactly 0
+    _add_group(study, 2, [0.25, 0.25, 0.25])
+
+    unbounded = select_winner(study, _make_exp(), repeats=_axis())
+    bounded = select_winner(study, _with_bounds(_make_exp(), min=0.01), repeats=_axis())
+
+    assert unbounded.params == {"x": 1}
+    assert bounded.params == {"x": 2}
+    survivorship = bounded.confound["checks"]["survivorship"]["detail"]
+    assert (survivorship["infeasible"], survivorship["incomplete_group"]) == (1, 2)
+
+
+def test_repeats_without_complete_group_names_incomplete_groups() -> None:
+    study = _make_study()
+    _add_trial(study, 0.1, params={"x": 1, "seed": 0})
+    _add_trial(study, 0.1, params={"x": 1, "seed": 1})
+    _add_trial(study, 0.0, params={"x": 2, "seed": 0})
+    _add_trial(study, 0.2, params={"x": 2, "seed": 1})
+    _add_trial(study, 0.2, params={"x": 2, "seed": 2})
+
+    with pytest.raises(NoFeasibleTrialError) as excinfo:
+        select_winner(study, _with_bounds(_make_exp(), min=0.01), repeats=_axis())
+
+    assert str(excinfo.value).startswith(
+        "No complete repeat group: a configuration ranks only when all 3 trials (one per "
+        "repeats.values of 'seed') are COMPLETE, feasible and within bounds; 2 group(s) were "
+        "incomplete. The phase's trials.csv labels each trial's repeat_group and records "
+        "each failed trial's reason. Metric bounds: metric.min=0.01."
+    )
+
+
+def test_repeats_tie_goes_to_lowest_group_and_highest_member_names_it() -> None:
+    """Exact aggregate ties go to the group whose first member ran first."""
+    study = _make_study()
+    for x, seed, value in [(1, 0, 0.2), (2, 0, 0.3), (1, 1, 0.4), (2, 1, 0.3), (2, 2, 0.3)]:
+        _add_trial(study, value, params={"x": x, "seed": seed})
+    _add_trial(study, 0.3, params={"x": 1, "seed": 2})
+
+    winner = select_winner(study, _make_exp(), repeats=_axis())
+
+    assert winner.params == {"x": 1}
+    assert winner.trial_number == 5
+    assert winner.attempt_id == "attempt-5"
+    assert winner.confound["ranked_groups"] == [[0, 2, 5], [1, 3, 4]]
+    tie = winner.confound["checks"]["tie"]
+    assert tie["verdict"] == "heterogeneous"
+    assert tie["detail"] == {"tied_trials": [4], "within_noise": [4]}
+
+
+def test_repeats_within_noise_flags_a_close_runner_up_and_clears_a_distant_one() -> None:
+    study = _make_study()
+    _add_group(study, 1, [0.50, 0.60, 0.55])
+    _add_group(study, 2, [0.52, 0.62, 0.57])
+    _add_group(study, 3, [0.90, 0.91, 0.92])
+
+    winner = select_winner(study, _make_exp(), repeats=_axis())
+
+    assert winner.params == {"x": 1}
+    assert winner.confound["checks"]["tie"] == {
+        "verdict": "heterogeneous",
+        "detail": {"tied_trials": [], "within_noise": [5]},
+    }
+
+
+def test_seeded_random_duplicate_configs_rank_as_separate_slots() -> None:
+    """Two slots that drew the same params are two groups, never one oversized group."""
+    study = _make_study()
+    _add_group(study, 1, [0.4, 0.4, 0.4])
+    _add_group(study, 1, [0.3, 0.3, 0.3])
+
+    slotted = select_winner(study, _make_exp(), repeats=_axis(slot_size=3))
+
+    assert slotted.trial_number == 5
+    assert slotted.metric == pytest.approx(0.3)
+    assert slotted.confound["ranked_groups"] == [[0, 1, 2], [3, 4, 5]]
+    # The other slot repeats the winner's configuration, so it is not a tie candidate.
+    assert slotted.confound["checks"]["tie"]["detail"] == {"tied_trials": [], "within_noise": []}
+    with pytest.raises(NoFeasibleTrialError, match="1 group\\(s\\) were incomplete"):
+        select_winner(study, _make_exp(), repeats=_axis())

@@ -24,11 +24,13 @@ from phasesweep.config.search import (
     NON_RESUMABLE_SAMPLERS,
     STOCHASTIC_SAMPLERS,
     CategoricalParam,
+    Repeats,
     Sampler,
     SearchParam,
     _placeholder_values_for,
     _validate_sampler_search_space,
     phase_draws,
+    sampler_search_space,
 )
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
@@ -336,6 +338,13 @@ class Phase(_Frozen):
         default_factory=dict,
         description="Map of override-key -> sampling spec. Supports dotted keys.",
     )
+    repeats: Repeats | None = Field(
+        default=None,
+        description=(
+            "Run every configuration once per repeat value (typically seeds) and rank "
+            "configurations by a reducer over their complete groups."
+        ),
+    )
     n_trials: ConfigInt = Field(ge=1)
     n_jobs: ConfigInt = Field(
         default=1,
@@ -532,13 +541,6 @@ class Phase(_Frozen):
             "n_trials smaller than the grid cardinality. Valid only with sampler.type grid."
         ),
     )
-    allow_seed_search: bool = Field(
-        default=False,
-        description=(
-            "By default, search-space keys named seed or ending in .seed are rejected "
-            "so stochastic variance is not mistaken for a model/config improvement."
-        ),
-    )
     gates: list[Gate] = Field(default_factory=list)
 
     @field_validator("name")
@@ -590,13 +592,37 @@ class Phase(_Frozen):
             _validate_override_key(key, label=f"phase {self.name!r} fixed_overrides")
         for key in self.search_space:
             _validate_override_key(key, label=f"phase {self.name!r} search_space")
+        if self.repeats is not None:
+            _validate_override_key(self.repeats.key, label=f"phase {self.name!r} repeats.key")
         return self
 
     @model_validator(mode="after")
-    def _validate_timeouts_and_seed_policy(self) -> Phase:
-        """Require bounded trials unless explicitly waived and reject seed sweeps.
+    def _validate_repeat_key_is_its_own(self) -> Phase:
+        """Keep the repeat key out of the keys the phase fixes or searches.
 
-        :raises ValueError: If timeout or seed-search policy validation fails.
+        :raises ValueError: ``repeats.key`` is also a ``search_space`` or ``fixed_overrides`` key.
+        :return Phase: Self, unchanged.
+        """
+        if self.repeats is None:
+            return self
+        key = self.repeats.key
+        for field, keys in (
+            ("search_space", self.search_space),
+            ("fixed_overrides", self.fixed_overrides),
+        ):
+            if key in keys:
+                raise ValueError(
+                    f"Phase {self.name!r}: repeats.key {key!r} is also a {field} key. The "
+                    "repeat axis supplies that key's value on every trial; remove it from "
+                    f"{field}."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_timeouts_and_seed_keys(self) -> Phase:
+        """Require bounded trials unless explicitly waived and refuse searched seeds.
+
+        :raises ValueError: If a timeout is invalid, or a search-space key is a seed.
         :return Phase: Self, unchanged.
         """
         if self.timeout_seconds_per_trial is None:
@@ -615,14 +641,15 @@ class Phase(_Frozen):
                 f"Phase {self.name!r}: timeout_seconds_per_phase",
                 self.timeout_seconds_per_phase,
             )
-        if not self.allow_seed_search:
-            seed_keys = [key for key in self.search_space if key == "seed" or key.endswith(".seed")]
-            if seed_keys:
-                raise ValueError(
-                    f"Phase {self.name!r}: trainer seed keys cannot be in search_space "
-                    f"by default: {seed_keys}. Move seeds to fixed_overrides or set "
-                    "allow_seed_search: true for an explicit variance audit."
-                )
+        seed_keys = [key for key in self.search_space if key == "seed" or key.endswith(".seed")]
+        if seed_keys:
+            example = seed_keys[0]
+            raise ValueError(
+                f"Phase {self.name!r}: seed keys cannot be searched: {seed_keys}. A searched "
+                "seed lets seed noise win as if it were a configuration. Move the seed to "
+                f"fixed_overrides, or measure seed noise with repeats: {{key: {example}, "
+                "values: [0, 1, 2]}."
+            )
         return self
 
 
@@ -1116,11 +1143,13 @@ class Experiment(_Frozen):
                 )
 
             inherited_origins = _inherited_origins(phase, origins_by_phase)
+            repeat_keys = set() if phase.repeats is None else {phase.repeats.key}
 
+            # A repeat value replaces whatever the parents agreed or disagreed on.
             unresolved = {
                 key: origins
                 for key, origins in inherited_origins.items()
-                if len(origins) > 1 and key not in phase.fixed_overrides
+                if len(origins) > 1 and key not in phase.fixed_overrides and key not in repeat_keys
             }
             if unresolved:
                 details = ", ".join(
@@ -1147,7 +1176,7 @@ class Experiment(_Frozen):
                 )
 
             resolved_origins = _resolved_origins(phase, inherited_origins)
-            prefix_collisions = _find_prefix_collisions(set(resolved_origins))
+            prefix_collisions = _find_prefix_collisions(set(resolved_origins) | repeat_keys)
             if prefix_collisions:
                 pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
                 raise ValueError(
@@ -1203,16 +1232,19 @@ def _resolved_origins(phase: Phase, inherited: Mapping[str, set[str]]) -> dict[s
     """Resolve the origin of every override key a phase exports.
 
     A key the phase fixes or searches takes the phase as its new origin; any
-    other inherited key keeps its single origin.
+    other inherited key keeps its single origin. The repeat key is never
+    exported: its value differs across the members a winner stands on, so the
+    winner's overrides drop it, together with any inherited value it replaced.
 
-    :param Phase phase: Phase whose fixed and sampled keys apply.
+    :param Phase phase: Phase whose fixed, sampled and repeat keys apply.
     :param Mapping[str, set[str]] inherited: Origins per inherited key.
     :return dict[str, str]: Origin per exported key.
     """
+    repeat_key = None if phase.repeats is None else phase.repeats.key
     resolved = {
         key: next(iter(origins))
         for key, origins in inherited.items()
-        if key not in phase.fixed_overrides
+        if key not in phase.fixed_overrides and key != repeat_key
     }
     resolved.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
     resolved.update({key: f"{phase.name}:sampled" for key in phase.search_space})
@@ -1313,7 +1345,7 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
                 dump_overrides_json(value)
             except (ValueError, TypeError) as exc:
                 raise ValueError(f"Phase {phase.name!r}: fixed_overrides {key!r}: {exc}") from exc
-        for param in phase.search_space.values():
+        for param in sampler_search_space(phase).values():
             if isinstance(param, CategoricalParam):
                 for choice in param.choices:
                     dump_overrides_json(choice)
@@ -1373,22 +1405,24 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
             f"integers, finite floats, strings, and lists of those. {hint}"
         )
 
-    for key, param in phase.search_space.items():
+    repeat_key = None if phase.repeats is None else phase.repeats.key
+    for key, param in sampler_search_space(phase).items():
         if not isinstance(param, CategoricalParam):
             continue
+        axis = (
+            f"repeats.key {key!r}" if key == repeat_key else f"categorical search_space key {key!r}"
+        )
         rendered: dict[str, tuple[int, Any]] = {}
         for index, choice in enumerate(param.choices):
             try:
                 wire = _render_override_value(choice, override_format)
             except _OverrideValueError as exc:
-                raise validation_error(
-                    f"categorical search_space key {key!r} choice at index {index}", exc
-                ) from exc
+                raise validation_error(f"{axis} choice at index {index}", exc) from exc
             earlier = rendered.get(wire)
             if earlier is not None:
                 earlier_index, earlier_choice = earlier
                 raise ValueError(
-                    f"Phase {phase.name!r}: categorical search_space key {key!r} has "
+                    f"Phase {phase.name!r}: {axis} has "
                     f"choices {earlier_choice!r} at index {earlier_index} and {choice!r} "
                     f"at index {index}, which both render as {wire!r} under "
                     f"override_format={override_format!r}. Distinct search choices must "
@@ -1478,7 +1512,7 @@ def _validate_trial_command_template(
     # could miss a key the trainer expects.
     overrides: dict[str, Any] = {k: "<inherited>" for k in inherited_keys}
     overrides.update(phase.fixed_overrides)
-    overrides.update(_placeholder_values_for(phase.search_space))
+    overrides.update(_placeholder_values_for(sampler_search_space(phase)))
 
     # Every format delivers the base trainer_config, so a nonempty one needs the
     # format's placeholder just as an override does.

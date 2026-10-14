@@ -15,7 +15,7 @@ from uuid import uuid4
 import optuna
 
 from phasesweep.config import Experiment, Phase
-from phasesweep.config.search import _placeholder_values_for
+from phasesweep.config.search import _placeholder_values_for, sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
     _register_active_attempt,
@@ -40,6 +40,7 @@ from phasesweep.engine.optuna import (
     _suggest,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
+from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -250,13 +251,15 @@ def _composed_overrides(
     :param dict[str, Winner] inherited_winners: Parent-phase winners supplying
         the lowest-priority override layer.
     :raises ValueError: If the sampled parameters try to replace a value that
-        an ancestor phase sampled. A sampled value replaces an inherited fixed one.
+        an ancestor phase sampled. A sampled value replaces an inherited fixed
+        one, and a repeat value replaces any inherited one.
     :return dict[str, Any]: Fully composed overrides for the trainer command.
     """
     inherited_overrides: dict[str, Any] = {}
     for parent in phase.inherits:
         inherited_overrides.update(inherited_winners[parent].effective_overrides)
-    resampled = experiment.sampled_locked_keys(phase.name) & set(sampled)
+    repeat_keys = set() if phase.repeats is None else {phase.repeats.key}
+    resampled = experiment.sampled_locked_keys(phase.name) & (set(sampled) - repeat_keys)
     if resampled:
         raise ValueError(
             f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)} "
@@ -266,6 +269,32 @@ def _composed_overrides(
     out.update(phase.fixed_overrides)
     out.update(sampled)
     return out
+
+
+def _winner_overrides(
+    experiment: Experiment,
+    phase: Phase,
+    params: dict[str, object],
+    inherited_winners: dict[str, Winner],
+) -> dict[str, object]:
+    """Compose a winner's effective overrides, which never carry the repeat key.
+
+    A repeats winner stands on members that each ran a different repeat value,
+    so no single value of that key, and no inherited value it replaced, describes
+    the winner; children never inherit it.
+
+    :param Experiment experiment: The experiment owning the phase graph.
+    :param Phase phase: The phase whose winner is composed.
+    :param dict[str, object] params: The winner's params, without the repeat key.
+    :param dict[str, Winner] inherited_winners: Parent-phase winners.
+    :return dict[str, object]: Composed overrides without the repeat key.
+    """
+    effective: dict[str, object] = _composed_overrides(
+        experiment, phase, dict(params), inherited_winners
+    )
+    if phase.repeats is not None:
+        effective.pop(phase.repeats.key, None)
+    return effective
 
 
 def _failure_policy_abort_record(
@@ -857,7 +886,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     if run.aborted:
         raise optuna.TrialPruned("phase aborted")
 
-    sampled = {name: _suggest(trial, name, p) for name, p in phase.search_space.items()}
+    sampled = {name: _suggest(trial, name, p) for name, p in sampler_search_space(phase).items()}
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     # Persist the resolved trial directory BEFORE launching the subprocess
@@ -1249,7 +1278,11 @@ def _settle_finished_trial(
     now = time.monotonic()
     if run.csv_throttle.should_write(finished, now):
         with contextlib.suppress(Exception):
-            _write_trials_csv(study, _phase_dir(run.experiment, run.phase.name) / "trials.csv")
+            _write_trials_csv(
+                study,
+                _phase_dir(run.experiment, run.phase.name) / "trials.csv",
+                repeats=repeat_axis(run.phase),
+            )
             run.csv_throttle.mark_written(finished, now)
 
 
@@ -1584,7 +1617,11 @@ def _run_phase(
             # Best-effort: a write failure here must not mask the actual
             # exception from ``study.optimize``.
             with contextlib.suppress(Exception):
-                _write_trials_csv(study, _phase_dir(experiment, phase.name) / "trials.csv")
+                _write_trials_csv(
+                    study,
+                    _phase_dir(experiment, phase.name) / "trials.csv",
+                    repeats=repeat_axis(phase),
+                )
 
         # Optuna's threaded path can absorb any uncaught objective exception
         # after marking that trial FAIL, and any callback exception in its
@@ -1628,7 +1665,7 @@ def _select_phase_winner(
         provenance frozen when its metric was extracted.
     :return Winner: The selected winner with composed overrides and source identity.
     """
-    selected = select_winner(study, experiment, phase_name=phase.name)
+    selected = select_winner(study, experiment, phase_name=phase.name, repeats=repeat_axis(phase))
     # The evidence behind the number about to be published is re-proved here,
     # digest and all (PR #5 review / reviewer 2, blocker 7). Selection itself
     # reads only Optuna, so nothing before this point has looked at whether the
@@ -1638,7 +1675,7 @@ def _select_phase_winner(
     # winning trial may come from an environment this process no longer
     # composes. After fresh allocation the digests match and this is silent.
     _warn_environment_drift(experiment, phase.name, selected.trainer_env_digest)
-    effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
+    effective = _winner_overrides(experiment, phase, selected.params, inherited_winners)
     return Winner(
         trial_number=selected.trial_number,
         params=selected.params,
@@ -1667,6 +1704,7 @@ def _select_phase_winner(
         trainer_inherit_env=_inherit_env_contract(experiment),
         confound=selected.confound,
         observed=selected.observed,
+        repeats=selected.repeats,
     )
 
 
@@ -1699,7 +1737,9 @@ def _dry_run_phase(
         # GridSampler.after_trial, whose study.stop() is illegal outside
         # optimize once a one-point grid is exhausted.
         sample_trial = study.ask()
-        sampled = {name: _suggest(sample_trial, name, p) for name, p in phase.search_space.items()}
+        sampled = {
+            name: _suggest(sample_trial, name, p) for name, p in sampler_search_space(phase).items()
+        }
         overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
         preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
         cmd = render_command(
@@ -1734,7 +1774,8 @@ def _placeholder_winner(
     A phase whose command was previewed reuses that command's sampled values so
     downstream previews inherit one coherent hypothetical chain. A skipped
     phase without a preview uses each parameter's low bound or first choice.
-    Both paths include inherited effective overrides.
+    Both paths include inherited effective overrides and, like a real winner,
+    drop the repeat key.
 
     Args:
         experiment: Parsed experiment config; its phase graph names the keys an
@@ -1752,9 +1793,9 @@ def _placeholder_winner(
     placeholder_params = (
         _placeholder_values_for(phase.search_space)
         if sampled_params is None
-        else dict(sampled_params)
+        else {name: value for name, value in sampled_params.items() if name in phase.search_space}
     )
-    effective = _composed_overrides(experiment, phase, placeholder_params, inherited_winners)
+    effective = _winner_overrides(experiment, phase, placeholder_params, inherited_winners)
     return Winner(
         trial_number=-1,
         params=placeholder_params,
