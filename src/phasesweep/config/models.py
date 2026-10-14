@@ -800,6 +800,24 @@ class Experiment(_Frozen):
             if reached:
                 yield index, phase
 
+    def sampled_locked_keys(self, phase_name: str) -> frozenset[str]:
+        """Return the inherited keys a phase may not search.
+
+        A key is locked when any inherited origin sampled it; a key every
+        inherited origin only fixed may be searched.
+
+        :param str phase_name: Name of a phase of this experiment.
+        :raises KeyError: ``phase_name`` names no phase.
+        :return frozenset[str]: Override keys that an inherited phase sampled.
+        """
+        origins_by_phase: dict[str, dict[str, str]] = {}
+        for phase in self.phases:
+            inherited = _inherited_origins(phase, origins_by_phase)
+            if phase.name == phase_name:
+                return frozenset(_sampled_locked_origins(inherited))
+            origins_by_phase[phase.name] = _resolved_origins(phase, inherited)
+        raise KeyError(phase_name)
+
     @field_validator("storage")
     @classmethod
     def _storage_is_local(cls, value: str | None, info: ValidationInfo) -> str | None:
@@ -964,7 +982,9 @@ class Experiment(_Frozen):
         Each exported override key carries its producing phase as its origin.
         Re-exporting preserves that origin, making a same-origin diamond valid.
         Different origins for one inherited key require a child fixed override;
-        a fixed child key deliberately establishes a new origin.
+        a fixed child key deliberately establishes a new origin. A key is locked
+        for a child only when some inherited origin sampled it; keys the
+        inherited phases only fixed may be searched.
 
         :raises ValueError: A phase graph, override composition, sampler,
             storage, value-wire contract, or trial command is invalid.
@@ -998,10 +1018,7 @@ class Experiment(_Frozen):
                     "fixed or sampled, not both."
                 )
 
-            inherited_origins: dict[str, set[str]] = {}
-            for parent in phase.inherits:
-                for key, origin in origins_by_phase[parent].items():
-                    inherited_origins.setdefault(key, set()).add(origin)
+            inherited_origins = _inherited_origins(phase, origins_by_phase)
 
             unresolved = {
                 key: origins
@@ -1017,22 +1034,22 @@ class Experiment(_Frozen):
                     f"{details}. Resolve explicitly with phase.fixed_overrides or remove one inherit."
                 )
 
-            inherited_collisions = set(inherited_origins) & set(phase.search_space)
+            locked = _sampled_locked_origins(inherited_origins)
+            inherited_collisions = set(locked) & set(phase.search_space)
             if inherited_collisions:
+                details = ", ".join(
+                    f"{key} from {', '.join(repr(name) for name in sorted(locked[key]))}"
+                    for key in sorted(inherited_collisions)
+                )
                 raise ValueError(
                     f"Phase {phase.name!r} re-samples key(s) {sorted(inherited_collisions)} "
-                    f"that are locked by inherited phase(s) {phase.inherits!r} "
-                    f"(possibly transitively). Either remove the key from search_space, "
-                    "or drop the inherit."
+                    f"that an inherited phase already sampled ({details}, possibly "
+                    "transitively). A winner's sampled value cannot be searched again; "
+                    "remove the key from search_space or drop the inherit. Keys a parent "
+                    "only fixed may be searched."
                 )
 
-            resolved_origins = {
-                key: next(iter(origins))
-                for key, origins in inherited_origins.items()
-                if key not in phase.fixed_overrides
-            }
-            resolved_origins.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
-            resolved_origins.update({key: f"{phase.name}:sampled" for key in phase.search_space})
+            resolved_origins = _resolved_origins(phase, inherited_origins)
             prefix_collisions = _find_prefix_collisions(set(resolved_origins))
             if prefix_collisions:
                 pairs = ", ".join(f"{a!r} ⊏ {b!r}" for a, b in prefix_collisions)
@@ -1061,6 +1078,61 @@ class Experiment(_Frozen):
         if len(names) != 1 + len(self.constraints):
             raise ValueError("Metric and constraint names must all be distinct.")
         return self
+
+
+def _inherited_origins(
+    phase: Phase, origins_by_phase: Mapping[str, Mapping[str, str]]
+) -> dict[str, set[str]]:
+    """Collect the origins of every override key a phase inherits.
+
+    :param Phase phase: Phase whose ``inherits`` list names the parents.
+    :param Mapping[str, Mapping[str, str]] origins_by_phase: Resolved key origins
+        (``<phase>:fixed`` or ``<phase>:sampled``) of each earlier phase.
+    :return dict[str, set[str]]: Origins per inherited key, one entry per
+        distinct producing phase.
+    """
+    inherited: dict[str, set[str]] = {}
+    for parent in phase.inherits:
+        for key, origin in origins_by_phase[parent].items():
+            inherited.setdefault(key, set()).add(origin)
+    return inherited
+
+
+def _resolved_origins(phase: Phase, inherited: Mapping[str, set[str]]) -> dict[str, str]:
+    """Resolve the origin of every override key a phase exports.
+
+    A key the phase fixes or searches takes the phase as its new origin; any
+    other inherited key keeps its single origin.
+
+    :param Phase phase: Phase whose fixed and sampled keys apply.
+    :param Mapping[str, set[str]] inherited: Origins per inherited key.
+    :return dict[str, str]: Origin per exported key.
+    """
+    resolved = {
+        key: next(iter(origins))
+        for key, origins in inherited.items()
+        if key not in phase.fixed_overrides
+    }
+    resolved.update({key: f"{phase.name}:fixed" for key in phase.fixed_overrides})
+    resolved.update({key: f"{phase.name}:sampled" for key in phase.search_space})
+    return resolved
+
+
+def _sampled_locked_origins(inherited: Mapping[str, set[str]]) -> dict[str, set[str]]:
+    """Pick the inherited keys that some origin sampled.
+
+    :param Mapping[str, set[str]] inherited: Origins per inherited key.
+    :return dict[str, set[str]]: For each locked key, the names of the phases
+        that sampled it.
+    """
+    locked: dict[str, set[str]] = {}
+    for key, origins in inherited.items():
+        sampled_by = {
+            origin.rpartition(":")[0] for origin in origins if origin.endswith(":sampled")
+        }
+        if sampled_by:
+            locked[key] = sampled_by
+    return locked
 
 
 def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:

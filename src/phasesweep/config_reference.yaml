@@ -279,7 +279,7 @@ phases: list[object] (required)
     # The parent winners are part of this phase's study fingerprint, so a changed parent winner stops a populated child study from being reused.
     # Overrides: trainer_config (an inherited value replaces the base value at the same dotted path).
     # Overridden by: phases[].fixed_overrides (a key fixed in this phase replaces the inherited value and becomes the key's new origin).
-    # Conflicts with: phases[].search_space (an inherited key cannot be sampled in this phase; config load fails).
+    # Overridden by: phases[].search_space (a key that every inherited origin only fixed may be searched here, and the sampled value replaces the inherited one; a key an inherited phase sampled cannot be searched again, and config load fails).
     # Requires: one key inherited from parents with different origins must be fixed explicitly in phases[].fixed_overrides; several parents with the same origin are accepted. Config load fails otherwise.
     # Requires: an inherited key and another key that is its prefix or extension cannot coexist across the inherited, fixed and sampled keys; config load fails.
     # Warning: weights and checkpoints are never inherited. Configure checkpoint inputs in trainer_config or phases[].fixed_overrides.
@@ -300,7 +300,8 @@ phases: list[object] (required)
     # The key rules are the same as for phases[].fixed_overrides, and the sampled value is passed to the trainer like a fixed value.
     # Float and int values reach the trainer as Python floats and ints, and categorical choices keep their YAML type.
     # Overrides: trainer_config (the sampled value replaces the base value at the same dotted path).
-    # Conflicts with: phases[].fixed_overrides, phases[].inherits (a key cannot be both fixed or inherited and sampled; config load fails).
+    # Overrides: phases[].inherits (a sampled value replaces an inherited value that was only fixed; a key an inherited phase sampled cannot be searched again, and config load fails).
+    # Conflicts with: phases[].fixed_overrides (a key cannot be both fixed and sampled in one phase; config load fails).
     # Requires: a sampled key and another key that is its prefix or extension cannot coexist across the inherited, fixed and sampled keys; config load fails.
     # Requires: phases[].allow_seed_search true for a key that is exactly seed or ends in .seed; config load fails otherwise.
     # Requires: with phases[].sampler.type cmaes every parameter is a float or int; with grid no parameter uses log, every float has a step, and the matrix has at most 4096 combinations.

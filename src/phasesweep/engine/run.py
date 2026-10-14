@@ -733,7 +733,7 @@ def _run_experiment_inner(
                     )
                     log.info("phase=%s SKIPPED (loaded compatible winner from disk)", phase.name)
                 except FileNotFoundError:
-                    winners[phase.name] = _placeholder_winner(phase, inherited)
+                    winners[phase.name] = _placeholder_winner(experiment, phase, inherited)
                     log.info("phase=%s SKIPPED (DRY RUN placeholder)", phase.name)
             continue
         skip_until = False

@@ -261,6 +261,23 @@ def test_phase_composition_accepts_child_fixed_resolution_as_new_origin() -> Non
     assert experiment.phases[2].fixed_overrides == {"learning_rate": 5e-4}
 
 
+def test_resampling_a_parent_fixed_key_is_valid() -> None:
+    """A key every inherited origin only fixed may be searched by the child."""
+    experiment = make_experiment(
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"lr": 1e-4}),
+            Phase(
+                name="child",
+                n_trials=1,
+                inherits=["base"],
+                search_space={"lr": {"type": "float", "low": 1e-5, "high": 1e-3}},
+            ),
+        ]
+    )
+
+    assert experiment.sampled_locked_keys("child") == frozenset()
+
+
 @pytest.mark.parametrize(
     ("phases", "match"),
     [
@@ -275,7 +292,11 @@ def test_phase_composition_accepts_child_fixed_resolution_as_new_origin() -> Non
         ),
         pytest.param(
             [
-                Phase(name="base", n_trials=1, fixed_overrides={"lr": 1e-4}),
+                Phase(
+                    name="base",
+                    n_trials=1,
+                    search_space={"lr": {"type": "float", "low": 1e-5, "high": 1e-3}},
+                ),
                 Phase(
                     name="child",
                     n_trials=1,

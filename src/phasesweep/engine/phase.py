@@ -235,27 +235,31 @@ class CsvSnapshotThrottle:
 
 
 def _composed_overrides(
+    experiment: Experiment,
     phase: Phase,
     sampled: dict[str, Any],
     inherited_winners: dict[str, Winner],
 ) -> dict[str, Any]:
     """Merge inherited winners, fixed overrides, and sampled params.
 
+    :param Experiment experiment: The experiment whose phase graph says which
+        inherited keys an ancestor sampled.
     :param Phase phase: The phase whose ``fixed_overrides`` and inheritance list apply.
     :param dict[str, Any] sampled: Values Optuna suggested for this trial.
     :param dict[str, Winner] inherited_winners: Parent-phase winners supplying
         the lowest-priority override layer.
-    :raises ValueError: If the sampled parameters try to replace an inherited
-        winner value.
+    :raises ValueError: If the sampled parameters try to replace a value that
+        an ancestor phase sampled. A sampled value replaces an inherited fixed one.
     :return dict[str, Any]: Fully composed overrides for the trainer command.
     """
     inherited_overrides: dict[str, Any] = {}
     for parent in phase.inherits:
         inherited_overrides.update(inherited_winners[parent].effective_overrides)
-    resampled = set(inherited_overrides) & set(sampled)
+    resampled = experiment.sampled_locked_keys(phase.name) & set(sampled)
     if resampled:
         raise ValueError(
-            f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)}."
+            f"Phase {phase.name!r} re-samples inherited winner key(s) {sorted(resampled)} "
+            "that an ancestor sampled."
         )
     out = dict(inherited_overrides)
     out.update(phase.fixed_overrides)
@@ -853,7 +857,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         raise optuna.TrialPruned("phase aborted")
 
     sampled = {name: _suggest(trial, name, p) for name, p in phase.search_space.items()}
-    overrides = _composed_overrides(phase, sampled, run.inherited_winners)
+    overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
 
     # Persist the resolved trial directory BEFORE launching the subprocess
     # so a later reaper can locate identity files even if the user moved
@@ -1631,7 +1635,7 @@ def _select_phase_winner(
     # winning trial may come from an environment this process no longer
     # composes. After fresh allocation the digests match and this is silent.
     _warn_environment_drift(experiment, phase.name, selected.trainer_env_digest)
-    effective = _composed_overrides(phase, selected.params, inherited_winners)
+    effective = _composed_overrides(experiment, phase, selected.params, inherited_winners)
     return Winner(
         trial_number=selected.trial_number,
         params=selected.params,
@@ -1692,7 +1696,7 @@ def _dry_run_phase(
         # optimize once a one-point grid is exhausted.
         sample_trial = study.ask()
         sampled = {name: _suggest(sample_trial, name, p) for name, p in phase.search_space.items()}
-        overrides = _composed_overrides(phase, sampled, inherited_winners)
+        overrides = _composed_overrides(experiment, phase, sampled, inherited_winners)
         preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
         cmd = render_command(
             experiment.trial_command,
@@ -1707,6 +1711,7 @@ def _dry_run_phase(
         log.info("DRY RUN example command:\n  %s", cmd)
 
     return _placeholder_winner(
+        experiment,
         phase,
         inherited_winners,
         sampled_params=sampled,
@@ -1714,6 +1719,7 @@ def _dry_run_phase(
 
 
 def _placeholder_winner(
+    experiment: Experiment,
     phase: Phase,
     inherited_winners: dict[str, Winner],
     *,
@@ -1727,6 +1733,8 @@ def _placeholder_winner(
     Both paths include inherited effective overrides.
 
     Args:
+        experiment: Parsed experiment config; its phase graph names the keys an
+            ancestor sampled.
         phase: The phase whose placeholder winner is needed.
         inherited_winners: Winners from earlier phases in the chain.
         sampled_params: Values used in the displayed preview command, or
@@ -1742,7 +1750,7 @@ def _placeholder_winner(
         if sampled_params is None
         else dict(sampled_params)
     )
-    effective = _composed_overrides(phase, placeholder_params, inherited_winners)
+    effective = _composed_overrides(experiment, phase, placeholder_params, inherited_winners)
     return Winner(
         trial_number=-1,
         params=placeholder_params,

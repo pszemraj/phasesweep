@@ -662,7 +662,15 @@ def test_effective_overrides_include_fixed(tmp_path, override_format):
 
 def test_transitive_inherited_search_key_cannot_be_resampled() -> None:
     """A grandchild may not re-sample a key locked two levels up."""
-    with pytest.raises(ValidationError, match="re-samples key"):
+    with pytest.raises(
+        ValidationError,
+        match=(
+            r"Phase 'reg' re-samples key\(s\) \['n_layers'\] that an inherited phase already "
+            r"sampled \(n_layers from 'arch', possibly transitively\)\..*"
+            r"remove the key from search_space or drop the inherit\..*"
+            r"Keys a parent only fixed may be searched\."
+        ),
+    ):
         make_experiment(
             phases=[
                 Phase(
@@ -696,7 +704,11 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
     experiment = make_experiment(
         trial_command="echo {overrides}",
         phases=[
-            Phase(name="base", n_trials=1),
+            Phase(
+                name="base",
+                n_trials=1,
+                search_space={"depth": CategoricalParam(type="categorical", choices=[8, 16])},
+            ),
             Phase(name="child", n_trials=1, inherits=["base"]),
         ],
     )
@@ -710,5 +722,91 @@ def test_runtime_refuses_sampling_an_inherited_winner_key() -> None:
         )
     }
 
-    with pytest.raises(ValueError, match="re-samples inherited winner key"):
-        _composed_overrides(stale_child, {"depth": 16}, inherited)
+    with pytest.raises(
+        ValueError, match="re-samples inherited winner key.*that an ancestor sampled"
+    ):
+        _composed_overrides(experiment, stale_child, {"depth": 16}, inherited)
+
+
+def test_runtime_allows_resampling_a_key_the_parent_only_fixed() -> None:
+    """A sampled value replaces an inherited value the parent only fixed."""
+    from phasesweep.engine.phase import _composed_overrides
+    from phasesweep.engine.state import Winner
+
+    experiment = make_experiment(
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(name="base", n_trials=1, fixed_overrides={"epochs": 1}),
+            Phase(
+                name="child",
+                n_trials=1,
+                inherits=["base"],
+                search_space={"epochs": CategoricalParam(type="categorical", choices=[2, 4])},
+            ),
+        ],
+    )
+    inherited = {
+        "base": Winner(
+            trial_number=0,
+            params={},
+            effective_overrides={"epochs": 1},
+            metric=1.0,
+        )
+    }
+
+    composed = _composed_overrides(experiment, experiment.phases[1], {"epochs": 4}, inherited)
+
+    assert composed == {"epochs": 4}
+
+
+def test_grandparent_sampled_then_parent_fixed_key_may_be_searched() -> None:
+    """A parent that re-fixes a key takes over its origin, which unlocks the key."""
+    experiment = make_experiment(
+        phases=[
+            Phase(
+                name="arch",
+                n_trials=1,
+                search_space={"n_layers": CategoricalParam(type="categorical", choices=[4, 8])},
+            ),
+            Phase(name="pin", n_trials=1, inherits=["arch"], fixed_overrides={"n_layers": 6}),
+            Phase(
+                name="reg",
+                n_trials=1,
+                inherits=["pin"],
+                search_space={"n_layers": CategoricalParam(type="categorical", choices=[12, 16])},
+            ),
+            Phase(name="final", n_trials=1, inherits=["reg"]),
+        ]
+    )
+
+    assert experiment.sampled_locked_keys("pin") == {"n_layers"}
+    assert experiment.sampled_locked_keys("reg") == frozenset()
+    assert experiment.sampled_locked_keys("final") == {"n_layers"}
+
+
+def test_diamond_after_resample_requires_explicit_fix() -> None:
+    """Two parents with different origins for a key need a child fix, which stays unsearchable."""
+    base = Phase(name="base", n_trials=1, fixed_overrides={"epochs": 1})
+    resampled = Phase(
+        name="resampled",
+        n_trials=1,
+        inherits=["base"],
+        search_space={"epochs": CategoricalParam(type="categorical", choices=[2, 4])},
+    )
+    join = Phase(name="join", n_trials=1, inherits=["base", "resampled"])
+
+    with pytest.raises(ValidationError, match=r"inherits conflicting key.*'epochs'"):
+        make_experiment(phases=[base, resampled, join])
+
+    fixed_join = join.model_copy(update={"fixed_overrides": {"epochs": 3}})
+    experiment = make_experiment(phases=[base, resampled, fixed_join])
+
+    assert experiment.sampled_locked_keys("join") == {"epochs"}
+    assert experiment.sampled_locked_keys("resampled") == frozenset()
+
+
+def test_sampled_locked_keys_rejects_an_unknown_phase() -> None:
+    experiment = make_experiment()
+
+    with pytest.raises(KeyError):
+        experiment.sampled_locked_keys("missing")
