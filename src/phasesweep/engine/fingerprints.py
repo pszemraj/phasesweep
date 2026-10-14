@@ -43,10 +43,9 @@ _RUN_CONTROL_KEYS = frozenset(
 # v6 / v5: the retained configuration surface changed. v5 / v4: the embedded
 # complete trainer_config is part of the core experiment and phase identity.
 # v4 / v3: an omitted execution.cwd contributes its effective
-# invocation directory instead of an unbound null. The earlier execution
-# contract work covered only configured cwd values, which still let identical
-# persistent-study identities launch different relative commands from two
-# invocation directories. whole_node phases additionally fingerprint their
+# invocation directory instead of an unbound null, so identical
+# persistent-study identities cannot launch different relative commands from
+# two invocation directories. whole_node phases additionally fingerprint their
 # configured device-set size — the trainer's world size.
 # Existing populated studies from earlier schemas fail the fingerprint check
 # on resume, and the refusal names the operator's options.
@@ -59,15 +58,15 @@ def _execution_identity(experiment: Experiment) -> dict[str, Any]:
 
     The trainer's working directory and ambient-environment inheritance are
     semantic inputs: two invocations differing in either can evaluate
-    different code or data under one study (review v0.5.17 / blocker 4). A
-    configured cwd contributes its RESOLVED path — a relative cwd invoked
-    from two directories is two different execution contexts and must not
-    share a study. An unconfigured cwd contributes the resolved invocation
-    directory because that is where the trainer actually runs. Ambient
-    Ambient variable *values* are enforced through the trial environment
-    cohort rather than embedded in this config digest. Pass-through names and
-    their classification are config semantics, but their credential values
-    may rotate. Put fixed semantic values in ``env``, which is fingerprinted.
+    different code or data under one study. A configured cwd contributes its
+    RESOLVED path — a relative cwd invoked from two directories is two
+    different execution contexts and must not share a study. An unconfigured
+    cwd contributes the resolved invocation directory because that is where
+    the trainer actually runs. Ambient variable *values* are enforced through
+    the trial environment cohort rather than embedded in this config digest.
+    Pass-through names and their classification are config semantics, but
+    their credential values may rotate. Put fixed semantic values in ``env``,
+    which is fingerprinted.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, Any]: JSON-serialisable execution-identity payload.
@@ -125,9 +124,9 @@ def _experiment_semantic_fingerprint(experiment: Experiment) -> str:
 
     Stamped into each generation's summary manifest so reads can tell
     whether the config supplied *today* still matches the config that
-    produced a published result (review v0.5.16 / blocker 4) — metric
-    name/goal/extractor, constraints, trial command, env, provenance, and
-    every phase's ordered semantic identity all contribute. Run-control
+    produced a published result — metric name/goal/extractor, constraints,
+    trial command, env, provenance, and every phase's ordered semantic
+    identity all contribute. Run-control
     fields (``n_trials`` top-ups, throughput knobs, comments) are excluded
     for the same reason :data:`_RUN_CONTROL_KEYS` excludes them from phase
     fingerprints: they never change what the published numbers mean, so they
@@ -155,9 +154,8 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     not change its meaning) — except under ``whole_node``, where the configured
     device-set SIZE is the trainer's world size and therefore semantic: a
     4-GPU DDP evaluation and a 1-GPU evaluation of the same phase must not
-    share a study (review v0.5.17 gap hunt). Only the count joins the
-    fingerprint, so respelling the same set (indices vs UUIDs) or moving
-    hosts does not invalidate a study.
+    share a study. Only the count joins the fingerprint, so respelling the
+    same set (indices vs UUIDs) or moving hosts does not invalidate a study.
 
     :param Phase phase: Phase whose semantic payload is being built.
     :return dict[str, Any]: JSON-serializable semantic phase payload.
@@ -180,10 +178,10 @@ def _phase_semantic_payload(
 ) -> dict[str, Any]:
     """Return a dict capturing only fields that change *trial meaning*.
 
-    Excludes run-control fields (review v0.5.2 / blocker 1) so that bumping
-    ``n_trials`` to top up a study is a compatible operation. Includes
-    ``experiment.env`` which v0.5.1 missed: env vars like ``CUBLAS_WORKSPACE_CONFIG``
-    or ``MY_TRAINER_SEED`` change training behavior and must invalidate reuse.
+    Excludes run-control fields so that bumping ``n_trials`` to top up a study
+    is a compatible operation. Includes ``experiment.env``: env vars like
+    ``CUBLAS_WORKSPACE_CONFIG`` or ``MY_TRAINER_SEED`` change training
+    behavior and must invalidate reuse.
 
     :param Experiment experiment: Experiment supplying command, input format,
         environment, metric, constraints, and provenance.
@@ -211,9 +209,9 @@ def _phase_fingerprint(
 ) -> str:
     """Hash the semantic execution context for resume-compatibility checks.
 
-    Uses the full SHA-256 hex digest. Earlier versions truncated to 16 hex
-    chars (64 bits) — defensible against accidental collision but no reason
-    to leave the door open in scientific-workflow metadata.
+    Uses the full SHA-256 hex digest. Truncating to 16 hex chars (64 bits)
+    would be defensible against accidental collision but is no reason to
+    leave the door open in scientific-workflow metadata.
 
     :param Experiment experiment: Experiment forwarded to
         :func:`_phase_fingerprint_payload`.

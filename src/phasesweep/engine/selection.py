@@ -53,10 +53,9 @@ class SelectedTrial:
     generation_id: str
     attempt_id: str
     # Frozen evidence provenance recorded when the trial's objective was
-    # extracted (review v0.5.17 / finding F).
+    # extracted.
     objective_provenance: dict[str, Any]
-    # Digest of the trainer environment this trial ran under (review v0.5.18 /
-    # finding F3).
+    # Digest of the trainer environment this trial ran under.
     trainer_env_digest: str
     # Versioned identity of the exact generated input consumed by the trainer.
     trainer_input: dict[str, Any]
@@ -114,12 +113,12 @@ def select_winner(
     member metrics, exact ties go to the group with the lowest member trial
     number, and the group's highest-numbered member names the winner.
 
-    Ordering is exact, never approximate. An earlier absolute epsilon (1e-12)
-    folded everything within that distance of the optimum into one "tie" band,
-    which silently reordered any objective whose natural scale sits at or below
-    1e-12: two genuinely different results at 1e-13 and 3e-13 ranked by trial
-    number rather than by value (review v0.5.17 / finding H). PhaseSweep has no
-    way to know a config's meaningful resolution, so it does not guess one.
+    Ordering is exact, never approximate. An absolute epsilon (say 1e-12)
+    would fold everything within that distance of the optimum into one "tie"
+    band, which silently reorders any objective whose natural scale sits at or
+    below it: two genuinely different results at 1e-13 and 3e-13 would rank by
+    trial number rather than by value. PhaseSweep has no way to know a
+    config's meaningful resolution, so it does not guess one.
 
     The ranked population is also classified for confounds
     (:func:`phasesweep.engine.confound._assess_population`) and any flagged

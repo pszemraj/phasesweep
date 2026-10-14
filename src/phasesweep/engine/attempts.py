@@ -340,19 +340,18 @@ def _register_active_attempt(
     """Durably register a newly allocated attempt before anything is launched.
 
     The entry binds the attempt to the *producing* phase name, study name,
-    and a frozen storage locator, so preflight can find and resolve it even after the
-    phase was renamed or removed, or the storage URL changed (review
-    v0.5.17 / blocker 3).
+    and a frozen storage locator, so preflight can find and resolve it even
+    after the phase was renamed or removed, or the storage URL changed.
 
-    Creation is fail-closed. The write used to be swallowed on the theory
-    that "the per-phase reaper still recovers it under the same config", but
-    that is exactly wrong for the case this registry exists to cover: the
-    reaper walks only the phases the *current* config declares, so a rename,
-    a removal, or a changed storage URL is precisely when the lost entry was
-    the sole record of a trainer that may still be alive. Refusing to launch
-    an attempt PhaseSweep could not record keeps that unreachable state from
-    ever existing, and costs nothing to undo because this runs before the GPU
-    lease and the trainer (PR #5 review / reviewer 2 pass 2, blocker 5).
+    Creation is fail-closed. Swallowing a failed write on the theory that
+    "the per-phase reaper still recovers it under the same config" would be
+    exactly wrong for the case this registry exists to cover: the reaper
+    walks only the phases the *current* config declares, so a rename, a
+    removal, or a changed storage URL is precisely when the lost entry would
+    be the sole record of a trainer that may still be alive. Refusing to
+    launch an attempt PhaseSweep could not record keeps that unreachable
+    state from ever existing, and costs nothing to undo because this runs
+    before the GPU lease and the trainer.
 
     :param Experiment experiment: Experiment supplying the registry root.
     :param str attempt_id: Immutable attempt identity and entry filename.
@@ -400,7 +399,7 @@ def _retire_active_attempt(experiment: Experiment, attempt_id: str) -> None:
     entry is safe by construction. It names an already-terminal trial, so
     preflight resolves it against a durable ``exited`` lifecycle, changes
     nothing in the study, and garbage-collects the file. Only a *missing*
-    entry loses information (PR #5 review / reviewer 2 pass 2, blocker 5).
+    entry loses information.
 
     :param Experiment experiment: Experiment supplying the registry root.
     :param str attempt_id: Attempt whose trial reached a terminal state.
@@ -905,10 +904,10 @@ def _preflight_active_attempts(
     Runs before the per-phase study loop and is deliberately independent of
     the current phase graph: a stale attempt whose phase was renamed or
     removed, or whose storage URL changed, is still discovered, its process
-    group verified/cleaned, and its recorded study repaired (review v0.5.17 /
-    blocker 3). Inspection, the observational half of ``mcp recover-run``,
-    scans the same registry, so renamed phases and unavailable current
-    storage cannot hide a trainer from the dry run either.
+    group verified/cleaned, and its recorded study repaired. Inspection, the
+    observational half of ``mcp recover-run``, scans the same registry, so
+    renamed phases and unavailable current storage cannot hide a trainer from
+    the dry run either.
 
     :param Experiment experiment: Parsed experiment whose registry is scanned.
     :param _PreflightCleanupReport report: Shared cleanup-evidence collector.
@@ -1277,8 +1276,7 @@ def _resolve_attempt(record: _AttemptRecord, discovery: _Discovery, *, confirm: 
     """Prove that no live process can remain from one discovered attempt.
 
     Every discovered attempt resolves here, and this is the only place
-    PhaseSweep signals a stale process group. Resolution order (review
-    v0.5.17 / blocker 2):
+    PhaseSweep signals a stale process group. Resolution order:
 
     1. A durable ``exited`` lifecycle with confirmed cleanup means the
        supervised group was already proven gone by the launching orchestrator:

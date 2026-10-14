@@ -111,17 +111,15 @@ def _preflight_existing_studies(
     # Discovery, root checks, and claims already happened in ONE strict pass
     # (claim_ledger), and its study objects are the ones every later step
     # operates on: an invocation offering a second publication root must not
-    # reap, inspect, or claim anything in either tree (review v0.5.19 /
-    # finding F5), and a storage read that fails must abort rather than let a
-    # second, luckier read hand recovery a study whose root was never checked
-    # (PR #5 review / reviewer 2, issue 1).
+    # reap, inspect, or claim anything in either tree, and a storage read that
+    # fails must abort rather than let a second, luckier read hand recovery a
+    # study whose root was never checked.
     loaded = ledger.studies
     studies: dict[str, optuna.Study] = {}
     errors: list[Exception] = []
     # The registry scan runs FIRST and is independent of the declared phase
     # list, so attempts from renamed/removed phases or changed storage URLs
-    # are recovered before any current-config validation or launch (review
-    # v0.5.17 / blocker 3).
+    # are recovered before any current-config validation or launch.
     try:
         _preflight_active_attempts(experiment, report, confirm=True)
     except Exception as exc:

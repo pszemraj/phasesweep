@@ -138,12 +138,12 @@ class TerminalReport:
     """One engine invocation's primary outcome and independent cleanup evidence.
 
     ``winners`` is the engine's own authoritative winner mapping, populated on
-    the success path while the experiment lock is still held (review v0.5.16 /
-    blocker 2): a terminal-result consumer (the MCP runner's snapshot capture)
-    must be able to freeze the published outcome from the exact in-memory
-    state the engine just returned, instead of re-deriving it from mutable
-    storage or optional diagnostic files whose absence would then contradict
-    an engine-defined success. ``None`` on every failure path.
+    the success path while the experiment lock is still held: a
+    terminal-result consumer (the MCP runner's snapshot capture) must be able
+    to freeze the published outcome from the exact in-memory state the engine
+    just returned, instead of re-deriving it from mutable storage or optional
+    diagnostic files whose absence would then contradict an engine-defined
+    success. ``None`` on every failure path.
     """
 
     generation_id: str
@@ -240,14 +240,13 @@ def run_experiment(
 
     For non-dry-run invocations this acquires an
     :func:`phasesweep.engine.locking._experiment_lock` for
-    the entire phase sequence (review v0.5.6 / blocker 1). Phase-level state
-    on disk (``winner.yaml``, fingerprints, ``summary.yaml``) is consistent
-    only at run granularity, so two same-experiment processes must not
-    interleave across phases.
+    the entire phase sequence. Phase-level state on disk (``winner.yaml``,
+    fingerprints, ``summary.yaml``) is consistent only at run granularity, so
+    two same-experiment processes must not interleave across phases.
 
-    Signal handlers are installed here (review v0.5.7 / blocker 3) so library
-    callers using the public API get the same cleanup guarantees as CLI
-    callers. Skipped on dry-run because no children will launch.
+    Signal handlers are installed here so library callers using the public
+    API get the same cleanup guarantees as CLI callers. Skipped on dry-run
+    because no children will launch.
 
     Args:
         experiment: Parsed experiment config (result of
@@ -273,7 +272,7 @@ def run_experiment(
         NoFeasibleTrialError: A phase exhausted ``max_consecutive_failures``
             with no feasible trial.
         UnsafeProcessCleanupError: A phase hard-aborted because a trial's
-            process group could not be confirmed dead (review v0.5.11).
+            process group could not be confirmed dead.
         TrialEvidenceMissingError: A trial eligible to win no longer has the
             on-disk evidence its study records, or the selected winner's
             objective source no longer matches its frozen provenance.
@@ -371,8 +370,7 @@ def _run_experiment_outcome(
     )
     # signal_handler_scope() is the outermost context manager so shutdown-signal
     # ownership is scoped to this call tree and restored on every exit path,
-    # not left installed on the host process forever (review v0.5.14 /
-    # blocker 6).
+    # not left installed on the host process forever.
     with (
         signal_handler_scope(),
         locking_ops._experiment_lock(experiment),
@@ -438,15 +436,14 @@ def _run_experiment_outcome(
                 from_phase=from_phase,
             )
             # Selection reads Optuna alone, so a tree whose candidate evidence
-            # was deleted would silently reselect and republish those trials
-            # (PR #5 review / reviewer 2, blocker 7). Refuse here - after
-            # recovery has resolved every stale attempt, before the generation
-            # is marked running and before any trial launches - so nothing is
-            # added to a tree that cannot honestly be ranked. Deliberately not
-            # repeated on the post-failure reconciliation call below: an
-            # evidence gap found while cleaning up must never displace the
-            # primary error, and publication on that path is covered by the
-            # selection-time winner check.
+            # was deleted would silently reselect and republish those trials.
+            # Refuse here - after recovery has resolved every stale attempt,
+            # before the generation is marked running and before any trial
+            # launches - so nothing is added to a tree that cannot honestly be
+            # ranked. Deliberately not repeated on the post-failure
+            # reconciliation call below: an evidence gap found while cleaning
+            # up must never displace the primary error, and publication on
+            # that path is covered by the selection-time winner check.
             evidence_ops._validate_selection_evidence(experiment, existing_studies)
             resume_ops._reject_bound_descendant_topups(
                 experiment,
@@ -539,7 +536,7 @@ def _run_experiment_outcome(
             # the current pointer to that more specific state; a second generic
             # "failed" write here would be refused for the record (write-once)
             # but would silently clobber the current pointer, which has no
-            # monotonic guard within one invocation (review v0.5.15 / blocker 3).
+            # monotonic guard within one invocation.
             generation_ops._persist_failed_state_unless_recorded(
                 path_ops._generation_record_path(experiment, failed_generation_id),
                 lambda: generation_ops._write_generation_state(
@@ -634,12 +631,11 @@ def _run_experiment_outcome(
                     # successful result, so raising here would present a
                     # committed success as a caller-visible failure; on the
                     # failure path it would replace the engine's original
-                    # error (review v0.5.14 / item C). BaseException on
-                    # purpose (review v0.5.16 / blocker 1): a
-                    # KeyboardInterrupt/SystemExit escaping the callback must
-                    # not rewrite the engine outcome either — real shutdown
-                    # signals are honored separately by the signal handler,
-                    # not by exceptions leaking out of a diagnostic consumer.
+                    # error. BaseException on purpose: a KeyboardInterrupt/
+                    # SystemExit escaping the callback must not rewrite the
+                    # engine outcome either — real shutdown signals are
+                    # honored separately by the signal handler, not by
+                    # exceptions leaking out of a diagnostic consumer.
                     log.exception("terminal callback failed; the engine outcome is unchanged")
 
 
@@ -736,9 +732,9 @@ def _run_experiment_inner(
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
     if dry_run:
-        # Capability disclosure (review v0.5.18 / finding F7): restate the same
-        # per-phase resume/reproduce contract `phasesweep validate` prints, in
-        # the preview an operator reads immediately before committing to a run.
+        # Capability disclosure: restate the same per-phase resume/reproduce
+        # contract `phasesweep validate` prints, in the preview an operator
+        # reads immediately before committing to a run.
         for line in experiment_contract_lines(experiment):
             log.info("DRY RUN %s", line)
         for previewed in experiment.phases:
@@ -842,12 +838,12 @@ def _run_experiment_inner(
     assert generation_id is not None
     summary_path = path_ops._generation_summary_path(experiment, generation_id)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    # The summary is the generation's versioned result manifest (review
-    # v0.5.16 / blockers 3+4): it lists every artifact with its content hash
-    # so publication can validate the complete result graph, and it freezes
-    # the config semantics (metric, phase plan, config fingerprint) that give
-    # those numbers meaning so later reads never reinterpret them through
-    # whatever config happens to be loaded.
+    # The summary is the generation's versioned result manifest: it lists
+    # every artifact with its content hash so publication can validate the
+    # complete result graph, and it freezes the config semantics (metric,
+    # phase plan, config fingerprint) that give those numbers meaning so later
+    # reads never reinterpret them through whatever config happens to be
+    # loaded.
     summary = {
         "schema_version": GENERATION_SUMMARY_SCHEMA_VERSION,
         "experiment": experiment.experiment,
@@ -943,8 +939,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     resolves the current pointer and the last-success pointer exactly once
     each. Every phase's winner path is then resolved by :func:`_cli_phase_payloads`
     from that same captured published-generation id, so one status object can
-    never mix generation A's identity with generation B's artifacts (review
-    v0.5.15 / blocker 3).
+    never mix generation A's identity with generation B's artifacts.
 
     The returned mapping is the single experiment status snapshot shared by
     every caller, including ``phasesweep status <experiment>``. Its keys are
@@ -964,10 +959,9 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
       projections never establish publication authority.
     * ``publication_integrity``: ``"ok"`` / ``"absent"`` / ``"failed"`` /
       ``"permission_denied"``, and ``publication_error`` beside either failure
-      verdict -- conditional on that verdict (review v0.5.18 / finding F4). Published
-      results that no longer validate are reported as corrupt rather than as
-      an experiment that never published. After printing this payload, the CLI
-      turns ``"failed"`` into
+      verdict -- conditional on that verdict. Published results that no longer
+      validate are reported as corrupt rather than as an experiment that never
+      published. After printing this payload, the CLI turns ``"failed"`` into
       :class:`~phasesweep.engine.PublicationIntegrityError` and
       ``"permission_denied"`` into
       :class:`~phasesweep.engine.PublicationAccessError`; both exit non-zero.
@@ -988,7 +982,7 @@ def experiment_status(experiment: Experiment) -> dict[str, Any]:
     per-study cost of computing them here is one small YAML read plus a config
     fingerprint, negligible beside the per-phase Optuna storage reads this call
     already performs. ``tests/test_engine_status_shape.py`` pins both key sets
-    so neither can drift silently again.
+    so neither can drift silently.
 
     :param Experiment experiment: Parsed experiment config to inspect.
     :return dict[str, Any]: Status payload with generation identity plus per-phase

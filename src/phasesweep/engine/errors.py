@@ -107,8 +107,7 @@ class TrialEvidenceMissingError(PhaseSweepError):
     Fails the run closed rather than either silently selecting such a trial
     or silently skipping it: skipping is not the safe fallback here, because
     dropping the trials whose evidence happens to be missing changes which
-    trial wins and therefore biases the published result (PR #5 review /
-    reviewer 2, blocker 7).
+    trial wins and therefore biases the published result.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.RESTORE_TREE

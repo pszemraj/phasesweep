@@ -99,7 +99,7 @@ class TrialResult:
     gate_results: list[GateResult] | None = None
     # Frozen evidence provenance captured when the objective was extracted:
     # extractor config fingerprint plus source digest / remote summary subset
-    # (review v0.5.17 / finding F). None when metric extraction failed.
+    # None when metric extraction failed.
     objective_provenance: dict[str, Any] | None = None
     # True only when the phase/run deadline directly caused this result to
     # fail, rather than merely having elapsed by the time another failure was
@@ -587,7 +587,7 @@ def launch_trial(
     resolved absolute path as an Optuna user attribute *before* the subprocess
     starts. The stale-trial reaper then reads back that exact path on a later
     run, even if the user changed ``experiment.workdir`` or invoked phasesweep
-    from a different cwd (review v0.5.3 / blocker 4).
+    from a different cwd.
 
     Args:
         experiment: Parsed experiment config; provides ``trial_command``,
@@ -665,11 +665,10 @@ def launch_trial(
     (workdir / "command.txt").write_text(cmd + "\n", encoding="utf-8")
 
     # Environment and working directory follow the explicit execution
-    # contract instead of unbounded ambient inheritance (review v0.5.17 /
-    # blocker 4). The identity is computed from the same composition the
-    # subprocess receives, and the opt-in raw record is written before any
-    # per-trial binding is layered on, so the file stays the digest's exact
-    # preimage (review v0.5.18 / finding F3).
+    # contract instead of unbounded ambient inheritance. The identity is
+    # computed from the same composition the subprocess receives, and the
+    # opt-in raw record is written before any per-trial binding is layered
+    # on, so the file stays the digest's exact preimage.
     identity = _environment_identity(experiment, phase_name)
     _record_trainer_environment(experiment, identity, workdir)
     env = dict(identity.values)
@@ -779,10 +778,9 @@ def extract_trial_result(
       * non-zero return code from the subprocess
       * metric extractor raised ExtractorError
       * metric extractor returned a non-finite value
-      * any constraint extractor raised ExtractorError (review v0.5.2 / item 2)
-      * any constraint extractor returned a non-finite value (review v0.5.2 / item 3)
+      * any constraint extractor raised ExtractorError
+      * any constraint extractor returned a non-finite value
       * the phase/run wallclock deadline expired before extraction completed
-        (review v0.5.17 / blocker 8)
 
     A trial that produced a finite metric and finite constraint values but violated
     a bound (a constraint's, or the metric's own ``min``/``max``) is COMPLETE+infeasible
@@ -997,8 +995,8 @@ def extract_trial_result(
         )
 
     # Final boundary check: a slow last stage must not let a trial publish a
-    # "complete" evaluation past the configured wallclock bound (review
-    # v0.5.17 / blocker 8 — the field names promise an end-to-end limit).
+    # "complete" evaluation past the configured wallclock bound — the field
+    # names promise an end-to-end limit.
     expired = _deadline_failure("the trial result could be accepted")
     if expired is not None:
         expired.constraints.update(constraint_values)
