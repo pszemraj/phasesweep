@@ -1171,6 +1171,71 @@ def test_tracking_registry_recovery_cannot_fail_optuna_trial(tmp_path):
     assert not list(_attempts_dir(experiment).glob("*.json"))
 
 
+@pytest.mark.parametrize(
+    "state,cleanup_confirmed,retired",
+    [
+        ("allocated", None, True),
+        ("exited", True, True),
+        ("exited", False, False),
+        ("launching", None, False),
+    ],
+)
+def test_tracking_operation_retires_its_entry_only_on_proven_cleanup(
+    tmp_path, state, cleanup_confirmed, retired
+):
+    """The registry entry outlives a worker whose cleanup the lifecycle record does not prove."""
+    from phasesweep.engine.paths import _attempts_dir
+    from phasesweep.runtime.process import write_attempt_lifecycle
+    from phasesweep.tracking.session import tracking_operation
+
+    experiment = native_experiment(tmp_path)
+    with tracking_operation(experiment, "a" * 32) as (operation_id, directory):
+        assert len(list(_attempts_dir(experiment).glob("*.json"))) == 1
+        write_attempt_lifecycle(
+            directory,
+            attempt_id=operation_id,
+            state=state,
+            cleanup_confirmed=cleanup_confirmed,
+        )
+    assert bool(list(_attempts_dir(experiment).glob("*.json"))) is not retired
+
+
+def test_tracking_operation_keeps_the_body_cleanup_error_over_an_unreadable_record(tmp_path):
+    """An unresolved worker the body reported is not replaced by the record read failing."""
+    from phasesweep.engine.paths import _attempts_dir
+    from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE
+    from phasesweep.tracking.session import tracking_operation
+
+    experiment = native_experiment(tmp_path)
+    error = UnsafeProcessCleanupError("worker still unresolved")
+    with (
+        pytest.raises(UnsafeProcessCleanupError) as caught,
+        tracking_operation(experiment, "a" * 32) as (_, directory),
+    ):
+        (directory / ATTEMPT_LIFECYCLE_FILE).write_text("{")
+        raise error
+    assert caught.value is error
+    assert len(list(_attempts_dir(experiment).glob("*.json"))) == 1
+
+
+def test_tracking_operation_treats_an_unreadable_record_as_cleanup_uncertainty(tmp_path):
+    """A record that cannot be read never reads as proof the worker is gone."""
+    from phasesweep.engine.paths import _attempts_dir
+    from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
+    from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE
+    from phasesweep.tracking.session import tracking_operation
+
+    experiment = native_experiment(tmp_path)
+    with (
+        pytest.raises(ProcessCleanupUncertainError, match="may still be running") as caught,
+        tracking_operation(experiment, "a" * 32) as (_, directory),
+    ):
+        (directory / ATTEMPT_LIFECYCLE_FILE).write_text("{")
+    assert isinstance(caught.value.__cause__, ValueError)
+    assert caught.value.action is OperatorAction.RESTORE_TREE
+    assert len(list(_attempts_dir(experiment).glob("*.json"))) == 1
+
+
 def test_cache_uses_home_and_xdg(tmp_path, monkeypatch):
     from pathlib import Path
 

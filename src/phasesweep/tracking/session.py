@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from phasesweep.errors import OperatorAction, ProcessCleanupUncertainError
 from phasesweep.runtime.files import private_atomic_write_text
 from phasesweep.runtime.json import (
     JsonObject,
@@ -126,8 +127,14 @@ def operation_deadline(experiment: Experiment, deadline: float | None = None) ->
 def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[tuple[str, Path]]:
     """Register a controller worker that owns no Optuna trial.
 
+    The registry entry is retired only when the lifecycle record proves the
+    worker never launched or its cleanup was confirmed. A record that cannot be
+    read leaves the entry in place, since the worker may still be alive.
+
     :param Experiment experiment: Registry owner.
     :param str generation_id: Producing generation.
+    :raises ProcessCleanupUncertainError: The lifecycle record is unreadable and
+        the body raised nothing; an exception the body raised propagates instead.
     :return Iterator[tuple[str, Path]]: Operation identity and process directory.
     """
     from phasesweep.engine.attempts import _register_tracking_operation, _retire_active_attempt
@@ -140,15 +147,38 @@ def tracking_operation(experiment: Experiment, generation_id: str) -> Iterator[t
     _register_tracking_operation(
         experiment, operation_id=operation_id, generation_id=generation_id, directory=directory
     )
+    body_raised = False
     try:
         yield operation_id, directory
+    except BaseException:
+        body_raised = True
+        raise
     finally:
-        lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=operation_id)
-        if lifecycle is not None and (
-            lifecycle.state == "allocated"
-            or (lifecycle.state == "exited" and lifecycle.cleanup_confirmed)
-        ):
-            _retire_active_attempt(experiment, operation_id)
+        try:
+            lifecycle = read_attempt_lifecycle(directory, expected_attempt_id=operation_id)
+        except ValueError as exc:
+            # The body's own failure may already say the worker is unresolved, so it wins.
+            if not body_raised:
+                raise ProcessCleanupUncertainError(
+                    f"Tracking operation {operation_id} has an unreadable lifecycle record in "
+                    f"{directory} ({exc}), so its worker may still be running. Its attempt "
+                    "registry entry is kept. Delete the entry file only if you are certain "
+                    "nothing is running.",
+                    action=OperatorAction.RESTORE_TREE,
+                ) from exc
+            log.warning(
+                "Tracking operation %s has an unreadable lifecycle record in %s (%s); "
+                "its attempt registry entry is kept.",
+                operation_id,
+                directory,
+                exc,
+            )
+        else:
+            if lifecycle is not None and (
+                lifecycle.state == "allocated"
+                or (lifecycle.state == "exited" and lifecycle.cleanup_confirmed)
+            ):
+                _retire_active_attempt(experiment, operation_id)
 
 
 def call_tracking(
