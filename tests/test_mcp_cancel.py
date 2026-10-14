@@ -76,11 +76,9 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
     original_state = store.state
     first_read = True
 
-    def complete_launch_after_state_read(
-        saved: RunHandle, *, transition_locked: bool = False
-    ) -> RunState:
+    def complete_launch_after_state_read(saved: RunHandle) -> RunState:
         nonlocal first_read
-        state = original_state(saved, transition_locked=transition_locked)
+        state = original_state(saved)
         if first_read:
             first_read = False
             store.update(spawned)
@@ -418,9 +416,9 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
     original_state = store.state
     first_cancel_read = True
 
-    def pause_cancel_state(saved: RunHandle, *, transition_locked: bool = False) -> RunState:
+    def pause_cancel_state(saved: RunHandle) -> RunState:
         nonlocal first_cancel_read
-        state = original_state(saved, transition_locked=transition_locked)
+        state = original_state(saved)
         if threading.current_thread() is not threading.main_thread() and first_cancel_read:
             first_cancel_read = False
             read_running.set()

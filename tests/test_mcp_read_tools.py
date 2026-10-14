@@ -60,6 +60,7 @@ from phasesweep.mcp.tools import PhaseSweepMCP
 from tests.conftest import (
     write_constant_trainer,
 )
+from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
     ALLOW_SIDE_EFFECTS,
     _catalog,
@@ -259,7 +260,7 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: True)
 
     experiment = registry.get("srv").experiment
     study = optuna.load_study(
@@ -306,7 +307,7 @@ def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_rea
     # progress. The second branch must apply the same winner suppression to
     # the snapshot that replaced that temporary live view.
     write_run_status(store, **{**unusable, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: True)
     original_live_result = app._live_result
     finalized = False
 
@@ -343,7 +344,7 @@ def test_mcp_winners_hide_unusable_live_publications(
     app, _registry, store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
     store.status_path(run_id).unlink()
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: True)
     if integrity == "failed":
         _generation_summary_path(experiment, run_id).unlink()
     else:
@@ -575,6 +576,7 @@ def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     assert terminal is not None
     write_run_status(store, **{**terminal, "cleanup_confirmed": False})
     store.mark_cleanup_uncertain(handle)
+    logs_before = tree_snapshot(store.log_path(run_id).parent)
 
     payload: GetRunResultsResult | GetRunStatusResult | AwaitRunResult
     if read_tool == "winners":
@@ -594,6 +596,7 @@ def test_run_scoped_read_keeps_complete_snapshot_under_cleanup_reservation(
     assert payload.result_source == "frozen_run_snapshot"
     assert payload.publication_integrity == "ok"
     assert payload.represented_generation_id == run_id
+    assert tree_snapshot(store.log_path(run_id).parent) == logs_before
 
 
 @pytest.mark.parametrize("read_tool", ["status", "await_run"])
@@ -609,7 +612,7 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: True)
     original_run_payload = app._run_payload
     finalized = False
 
@@ -662,7 +665,7 @@ def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
         write_run_status(store, **complete)
         return False
 
-    monkeypatch.setattr(store, "_runner_is_live", finish_before_reporting_exit)
+    monkeypatch.setattr(store, "runner_may_be_alive", finish_before_reporting_exit)
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     payload = (
@@ -719,7 +722,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     else:
         write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
     runner_live = True
-    monkeypatch.setattr(store, "_runner_is_live", lambda _handle: runner_live)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: runner_live)
     monkeypatch.setattr(
         "phasesweep.mcp.runs.is_same_live_process", lambda _pid, _starttime: runner_live
     )

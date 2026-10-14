@@ -557,35 +557,26 @@ class RunStore:
                 unlock_file(handle)
 
     @contextlib.contextmanager
-    def transition_lock(
-        self,
-        handle: RunHandle | str,
-        *,
-        blocking: bool = True,
-    ) -> Iterator[bool]:
+    def transition_lock(self, handle: RunHandle | str) -> Iterator[None]:
         """Serialize cancellation markers with confirmed recovery for one run.
 
         The lock is shared across MCP servers and the operator CLI. Cancellation
         holds it only while rereading state and writing its marker; recovery
         holds it until cleanup evidence, terminal results, and marker removal
-        have all been persisted.
+        have all been persisted. Only writers take it: deriving state never does.
 
         :param RunHandle | str handle: Run or run id whose cleanup transition is protected.
-        :param bool blocking: Wait for the lock, or return without acquiring it.
-        :return Iterator[bool]: Whether the transition lock was acquired.
+        :return Iterator[None]: Context manager holding the lock until exit.
         """
-        run_id = handle if isinstance(handle, str) else handle.run_id
-        lock_path = self._logs_dir / f"{run_id}.transition.lock"
-        lock_handle = open_lock_file(lock_path) if blocking else try_lock_file(lock_path)
-        try:
-            if lock_handle is not None and blocking:
-                import fcntl
+        import fcntl
 
-                fcntl.flock(lock_handle, fcntl.LOCK_EX)
-            yield lock_handle is not None
+        run_id = handle if isinstance(handle, str) else handle.run_id
+        lock_handle = open_lock_file(self._logs_dir / f"{run_id}.transition.lock")
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            yield
         finally:
-            if lock_handle is not None:
-                unlock_file(lock_handle)
+            unlock_file(lock_handle)
 
     def new_run_id(self, experiment_id: str) -> str:
         """Mint a fresh, collision-resistant run id prefixed with the experiment id.
@@ -1034,7 +1025,7 @@ class RunStore:
                 return None
         return handle
 
-    def state(self, handle: RunHandle, *, transition_locked: bool = False) -> RunState:
+    def state(self, handle: RunHandle) -> RunState:
         """Derive the current state from status.json and a live PID check.
 
         A finalized status.json (written by the runner on every exit) is
@@ -1049,7 +1040,7 @@ class RunStore:
         before the snapshot is frozen. With no status.json, a live
         (non-zombie) PID means running. A dead or unverifiable spawned runner with no status
         cannot prove that its separately-sessioned trial descendants are gone,
-        so it is marked cleanup-uncertain and remains ``running`` until
+        so it remains ``running`` (``recovery_required`` reports it) until
         operator recovery records cleanup evidence - unless its recorded boot
         id differs from the current boot, which proves no process from that
         boot survived and settles cleanup without signalling anything. An
@@ -1057,13 +1048,13 @@ class RunStore:
         restart cannot know whether ``Popen`` completed before the crash; known
         launch failures write terminal status explicitly.
 
-        Args:
-            handle: The run handle to evaluate.
-            transition_locked: The caller already holds this run's transition lock.
+        Deriving state writes nothing: every writer that must reserve cleanup
+        (cancel, failed-spawn cleanup, operator recovery) persists its own
+        marker, and a marker that a later status or boot supersedes is read as
+        inert rather than deleted.
 
-        Returns:
-            One of ``running`` / ``succeeded`` / ``failed`` / ``cancelled``.
-
+        :param RunHandle handle: The run handle to evaluate.
+        :return RunState: One of ``running`` / ``succeeded`` / ``failed`` / ``cancelled``.
         """
         # Reap the runner if it has exited. The runner is our child; without
         # this it lingers as a zombie until the server dies, and every state
@@ -1071,17 +1062,9 @@ class RunStore:
         if handle.pid is not None:
             reap_child(handle.pid)
         status = self._read_status(handle)
-        # Read the boot verdict before the marker can be cleared below: the
-        # marker is part of the strongest identity this run has.
         earlier_boot = self.from_earlier_boot(handle)
-        if self.cleanup_uncertain(handle):
-            if (status is not None and status.get("cleanup_confirmed") is True) or (
-                earlier_boot and (status is None or status.get("cleanup_confirmed") is not False)
-            ):
-                with contextlib.suppress(OSError):
-                    self.clear_cleanup_uncertain(handle)
-            elif not earlier_boot:
-                return "running"
+        if not earlier_boot and self._marker_reserves(handle, status, gone=False):
+            return "running"
         if status is not None:
             return self._state_from_status(handle, status)
         if handle.launch_state == "launching" or handle.pid is None:
@@ -1096,57 +1079,48 @@ class RunStore:
             # cleanup is confirmed with no signal sent and the run derives
             # terminal instead of parking in cleanup-uncertain recovery.
             return "failed"
-        if handle.pid_starttime is None:
-            if self._cleanup_recovered(handle):
-                return "failed"
-            return self._settle_dead_runner(handle, transition_locked=transition_locked)
         # No status.json: the run is live only if its process is genuinely alive.
         # A zombie (exited without recording a cause - SIGKILL/OOM, or an early
         # SIGTERM before the engine installed its handlers) still answers
-        # kill(pid, 0), so filter it out of the genuinely-live path and enter
-        # cleanup-uncertain recovery below.
-        if is_same_live_process(handle.pid, handle.pid_starttime):
+        # kill(pid, 0), so it is filtered out of the live path below.
+        if self.runner_may_be_alive(handle):
             return "running"
         # A runner can publish its terminal status while the liveness probe
-        # observes its exit. Do not reserve recovery from the stale first read.
+        # observes its exit, so re-read before treating it as dead.
         status = self._read_status(handle)
         if status is not None:
             return self._state_from_status(handle, status)
         if self._cleanup_recovered(handle):
             return "failed"
-        return self._settle_dead_runner(handle, transition_locked=transition_locked)
+        # Dead without a status or recovery evidence: its trial descendants may
+        # live on, so the run holds its capacity until recovery settles it.
+        return "running"
 
-    def _settle_dead_runner(self, handle: RunHandle, *, transition_locked: bool) -> RunState:
-        """Reserve uncertain cleanup only after rechecking under the recovery transition lock.
+    def _marker_reserves(
+        self,
+        handle: RunHandle,
+        status: Mapping[str, object] | None,
+        *,
+        gone: bool,
+    ) -> bool:
+        """Return whether a cleanup marker still reserves the run.
 
-        :param RunHandle handle: Dead runner whose status and cleanup evidence may change.
-        :param bool transition_locked: Whether the caller already holds the transition lock.
-        :return RunState: Latest terminal state or a reserved running state.
+        A marker is evidence that cleanup was never confirmed. It stops
+        counting once a confirmed terminal status says otherwise, or once the
+        runner is provably gone and no status reports unconfirmed cleanup. The
+        marker file is not deleted: a superseded marker is simply inert.
+
+        :param RunHandle handle: Run whose marker is checked.
+        :param Mapping[str, object] | None status: Validated terminal status, if any.
+        :param bool gone: Whether the runner is conclusively gone.
+        :return bool: Whether a valid, unsuperseded marker reserves the run.
         """
-        lock = (
-            contextlib.nullcontext(True)
-            if transition_locked
-            else self.transition_lock(handle, blocking=False)
-        )
-        with lock as acquired:
-            if not acquired:
-                # Recovery already owns the transition; it will publish the
-                # terminal state or cleanup marker before releasing the lock.
-                return "running"
-            status = self._read_status(handle)
-            if self.cleanup_uncertain(handle):
-                if (
-                    status is not None and status.get("cleanup_confirmed") is True
-                ) or self.from_earlier_boot(handle):
-                    self.clear_cleanup_uncertain(handle)
-                else:
-                    return "running"
-            if status is not None:
-                return self._state_from_status(handle, status)
-            if self._cleanup_recovered(handle):
-                return "failed"
-            self.mark_cleanup_uncertain(handle)
-            return "running"
+        if not self.cleanup_uncertain(handle):
+            return False
+        cleanup_confirmed = None if status is None else status.get("cleanup_confirmed")
+        if cleanup_confirmed is True:
+            return False
+        return not (gone and cleanup_confirmed is not False)
 
     def _state_from_status(self, handle: RunHandle, status: Mapping[str, object]) -> RunState:
         """Classify a recorded status after the run's cleanup marker is considered.
@@ -1293,7 +1267,7 @@ class RunStore:
             handle.launch_state == "spawned"
             and status is None
             and not self.from_earlier_boot(handle)
-            and not self._runner_is_live(handle)
+            and not self.runner_may_be_alive(handle)
             and self._read_status(handle) is None
         )
         return (
@@ -1307,15 +1281,15 @@ class RunStore:
         """Return whether cleanup evidence still requires operator recovery.
 
         :param RunHandle handle: Persisted run whose cleanup evidence is checked.
-        :return bool: True when a server marker still reserves same-boot process
+        :return bool: True when a server marker still reserves process
             cleanup or terminal runner status still needs trial reconciliation.
             A prior boot proves processes dead but does not update their durable
             trial rows or an already-frozen result snapshot.
         """
         status = self._read_status(handle)
+        if self._marker_reserves(handle, status, gone=self.from_earlier_boot(handle)):
+            return True
         terminal_cleanup_uncertain = status is not None and status.get("cleanup_confirmed") is False
-        if self.cleanup_uncertain(handle):
-            return not self.from_earlier_boot(handle) or terminal_cleanup_uncertain
         return terminal_cleanup_uncertain and not self._cleanup_recovered(handle)
 
     def cleanup_recovered_attempt_evidence(
@@ -1393,12 +1367,12 @@ class RunStore:
         return (
             status is not None
             and status.get("result_snapshot_state") == "pending"
-            and not self._runner_is_live(handle)
+            and not self.runner_may_be_alive(handle)
         )
 
     @staticmethod
-    def _runner_is_live(handle: RunHandle) -> bool:
-        """Return whether a spawned handle still identifies a live runner.
+    def runner_may_be_alive(handle: RunHandle) -> bool:
+        """Return whether a spawned handle may still identify a live runner.
 
         :param RunHandle handle: Persisted runner identity.
         :return bool: True when PID and starttime still identify a non-zombie

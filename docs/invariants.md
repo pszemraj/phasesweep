@@ -160,13 +160,13 @@ Validation reads every published artifact once, refusing symlinks and paths outs
 A process is identified by PID, start time, and boot id together, and a differing boot id settles a reboot without signalling anything. A stale attempt is signalled through one procedure, whichever source found it: the attempt registry, a stale `RUNNING` trial, or a terminal trial that recorded cleanup uncertainty.
 
 **Held by:** `runtime.reaper.identity_from_earlier_boot`, `mcp.runs.RunStore.from_earlier_boot`, `runtime.reaper.is_same_live_process`, `runtime.reaper.cleanup_stale_trial_process`, whose only caller is `engine.attempts._resolve_attempt`\
-**Tests:** `tests/test_mcp_runs.py::test_state_cleanup_uncertain_on_pid_reuse_mismatch`, `tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`, `tests/test_attempt_resolution.py::test_only_resolve_attempt_signals_a_stale_process_group`
+**Tests:** `tests/test_mcp_runs.py::test_state_reserves_recovery_on_pid_reuse_mismatch`, `tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`, `tests/test_attempt_resolution.py::test_only_resolve_attempt_signals_a_stale_process_group`
 
 #### 16. A dead runner stays live until recovery decides
 
-A dead runner with no terminal status stays in the live set until `recover-run` decides; liveness alone never concludes a run.
+A dead runner with no terminal status stays in the live set until `recover-run` decides; liveness alone never concludes a run. Deriving state writes nothing, so a read tool never creates or removes a marker: the writers that must reserve cleanup (cancel, failed-spawn cleanup, `recover-run`) persist their own marker, and a marker that a later status or boot supersedes is read as inert.
 
-**Held by:** `mcp.runs.RunStore.state`, `RunStore._settle_dead_runner`, and `RunStore.recovery_required`, resolved only by `mcp.recovery.recover_run`\
+**Held by:** `mcp.runs.RunStore.state`, `RunStore._marker_reserves`, and `RunStore.recovery_required`, resolved only by `mcp.recovery.recover_run`\
 **Test:** `tests/test_mcp_runs.py::test_dead_runner_without_status_stays_live_until_recovery_evidence`
 
 ### Errors and fixtures

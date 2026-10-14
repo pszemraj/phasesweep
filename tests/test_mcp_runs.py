@@ -1086,10 +1086,13 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
     store = RunStore(tmp_path / "state")
     handle = make_dead_run_handle(run_id="exp-1")
     store.create(handle)
+    before = tree_snapshot(tmp_path / "state")
 
     assert store.state(handle) == "running"
-    assert store.cleanup_uncertain(handle)
+    assert store.recovery_required(handle)
     assert live_runs(store) == [handle]
+    assert not store.cleanup_uncertain(handle)
+    assert tree_snapshot(tmp_path / "state") == before
 
     private_atomic_write_text(
         store.cleanup_recovery_path("exp-1"),
@@ -1103,7 +1106,6 @@ def test_dead_runner_without_status_stays_live_until_recovery_evidence(tmp_path:
             }
         ),
     )
-    store.clear_cleanup_uncertain(handle)
 
     assert store.state(handle) == "failed"
 
@@ -1132,44 +1134,6 @@ def test_clear_cleanup_uncertain_uses_durable_idempotent_unlink(
     assert not marker.exists()
 
 
-def test_state_does_not_restore_cleanup_marker_after_recovery(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    store = RunStore(tmp_path / "state")
-    handle = make_dead_run_handle(run_id="exp-1")
-    store.create(handle)
-    original_recovered = store._cleanup_recovered
-    first_read = True
-
-    def recovery_between_check_and_marker(saved: object) -> bool:
-        nonlocal first_read
-        if first_read:
-            first_read = False
-            with store.transition_lock(handle):
-                write_unsafe_cleanup_status(store, handle.run_id)
-                private_atomic_write_text(
-                    store.cleanup_recovery_path(handle.run_id),
-                    json.dumps(
-                        {
-                            "run_id": handle.run_id,
-                            "config_sha256": handle.config_sha256,
-                            "cleanup_confirmed": True,
-                            "reaped_attempt_ids": [],
-                            "reaped_attempt_locations": {},
-                        }
-                    ),
-                )
-                store.clear_cleanup_uncertain(handle)
-            return False  # The state read already saw the old, unrecovered evidence.
-        return original_recovered(saved)
-
-    monkeypatch.setattr(store, "_cleanup_recovered", recovery_between_check_and_marker)
-
-    assert store.state(handle) == "failed"
-    assert not store.cleanup_uncertain(handle)
-    assert not store.cleanup_recovery_required(handle)
-
-
 def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_dead_run_handle(run_id="exp-1")
@@ -1184,6 +1148,7 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
         finished.set()
 
     with store.transition_lock(handle):
+        before = tree_snapshot(tmp_path / "state")
         reader = Thread(target=read_state)
         reader.start()
         assert started.wait(1)
@@ -1192,7 +1157,7 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
 
     assert completed_while_locked
     assert observed == ["running"]
-    assert not store.cleanup_uncertain(handle)
+    assert tree_snapshot(tmp_path / "state") == before
 
 
 @pytest.mark.parametrize(
@@ -1261,10 +1226,13 @@ def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: ob
     handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
     store.create(handle)
     private_atomic_write_text(store.cleanup_uncertain_path("exp-1"), json.dumps(payload))
+    before = tree_snapshot(tmp_path / "state")
 
     assert not store.cleanup_uncertain(handle)
     assert store.state(handle) == "running"
-    assert store.cleanup_uncertain(handle)
+    assert not store.cleanup_uncertain(handle)
+    assert store.recovery_required(handle)
+    assert tree_snapshot(tmp_path / "state") == before
 
 
 def test_cleanup_uncertain_marker_preserves_spawned_identity_for_pending_handle(
@@ -1333,7 +1301,7 @@ def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) ->
         ),
     )
 
-    assert store._runner_is_live(handle)
+    assert store.runner_may_be_alive(handle)
     assert not store.cleanup_uncertain(handle)
     assert store.cleanup_identity(handle).boot_id == handle.boot_id
     assert store.state(handle) == "running"
@@ -1370,7 +1338,7 @@ def test_handle_without_boot_id_keeps_conservative_cleanup_uncertainty(tmp_path:
     store.create(handle)
 
     assert store.state(handle) == "running"
-    assert store.cleanup_uncertain(handle)
+    assert not store.cleanup_uncertain_path(handle.run_id).exists()
     assert store.recovery_required(handle)
 
 
@@ -1397,15 +1365,18 @@ def test_terminal_status_written_during_liveness_check_does_not_require_recovery
     assert not store.cleanup_uncertain_path(handle.run_id).exists()
 
 
-def test_earlier_boot_clears_a_persisted_cleanup_uncertainty_marker(tmp_path: Path) -> None:
+def test_earlier_boot_supersedes_a_persisted_cleanup_uncertainty_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_dead_run_handle(run_id="exp-1", boot_id=earlier_boot_id())
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
+    before = tree_snapshot(tmp_path / "state")
 
     assert store.cleanup_uncertain(handle)
     assert store.state(handle) == "failed"
-    assert not store.cleanup_uncertain_path("exp-1").exists()
+    assert not store.cleanup_recovery_required(handle)
+    assert not store.recovery_required(handle)
+    assert tree_snapshot(tmp_path / "state") == before
 
 
 def test_earlier_boot_settles_liveness_but_requires_trial_reconciliation(
@@ -1438,7 +1409,7 @@ def test_earlier_boot_orphans_a_pending_terminal_snapshot(tmp_path: Path) -> Non
     assert not store.snapshot_recovery_required(replace(handle, boot_id=None))
 
 
-def test_confirmed_terminal_status_overrides_stale_cleanup_marker(tmp_path: Path) -> None:
+def test_confirmed_terminal_status_supersedes_stale_cleanup_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     handle = make_dead_run_handle(run_id="exp-1")
     store.create(handle)
@@ -1450,14 +1421,13 @@ def test_confirmed_terminal_status_overrides_stale_cleanup_marker(tmp_path: Path
         error_class="cancelled",
         cleanup_confirmed=True,
     )
+    before = tree_snapshot(tmp_path / "state")
 
     assert store.state(handle) == "cancelled"
-    assert not store.cleanup_uncertain_path("exp-1").exists()
-
-    store.mark_cleanup_uncertain(handle)
-
-    assert store.state(handle) == "cancelled"
-    assert not store.cleanup_uncertain_path("exp-1").exists()
+    assert store.cleanup_uncertain_path("exp-1").exists()
+    assert not store.cleanup_recovery_required(handle)
+    assert not store.recovery_required(handle)
+    assert tree_snapshot(tmp_path / "state") == before
 
 
 def test_terminal_cleanup_uncertain_status_keeps_run_live_until_recovered(
@@ -1585,7 +1555,7 @@ def test_cleanup_recovered_attempt_evidence_uses_one_authorized_snapshot(
     assert locations == {"operator-match": ("p", 3, handle.run_id)}
 
 
-def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
+def test_state_reserves_recovery_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     live_starttime = read_proc_starttime(os.getpid())
     if live_starttime is None:
@@ -1595,11 +1565,12 @@ def test_state_cleanup_uncertain_on_pid_reuse_mismatch(tmp_path: Path) -> None:
     # separately-sessioned descendants are not proven gone, so fail closed.
     handle = make_run_handle(run_id="exp-x", pid=os.getpid(), starttime=live_starttime + 99_999)
     assert store.state(handle) == "running"
-    assert store.cleanup_uncertain(handle)
+    assert store.recovery_required(handle)
+    assert not store.cleanup_uncertain_path(handle.run_id).exists()
 
 
 @pytest.mark.integration
-def test_state_cleanup_uncertain_for_zombie_runner_without_status(tmp_path: Path) -> None:
+def test_state_reserves_recovery_for_zombie_runner_without_status(tmp_path: Path) -> None:
     if not sys.platform.startswith("linux"):
         pytest.skip("zombie detection relies on /proc")
     store = RunStore(tmp_path / "state")
@@ -1616,7 +1587,8 @@ def test_state_cleanup_uncertain_for_zombie_runner_without_status(tmp_path: Path
         assert is_pid_zombie(proc.pid)
         handle = make_run_handle(run_id="zomb", pid=proc.pid, starttime=starttime)
         assert store.state(handle) == "running"
-        assert store.cleanup_uncertain(handle)
+        assert store.recovery_required(handle)
+        assert not store.cleanup_uncertain_path(handle.run_id).exists()
         # state() reaped the child, so the zombie is gone, not merely filtered.
         assert not is_pid_zombie(proc.pid)
     finally:

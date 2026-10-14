@@ -726,7 +726,7 @@ class PhaseSweepMCP(RunControl):
                     else completed.winner_views()
                 )
                 result_source = completed_source
-            elif self._runs.recovery_required(handle) or not self._runs._runner_is_live(handle):
+            elif self._runs.recovery_required(handle) or not self._runs.runner_may_be_alive(handle):
                 # No frozen result is available after the runner stopped or
                 # cleanup became uncertain. Do not reuse the mutable winner
                 # view captured before the final probe.
@@ -830,19 +830,15 @@ class PhaseSweepMCP(RunControl):
             # so it can release capacity even when a hard exit prevented the
             # runner from writing status.json. It cannot, however, make the
             # mutable shared study a historical result for that run. Re-read
-            # after deriving state: the runner may have completed its status
-            # write between the first read and the state check.
-            if self._runs._runner_is_live(handle):
+            # after the liveness probe: the runner may have completed its status
+            # write between the first read and the probe.
+            if self._runs.runner_may_be_alive(handle):
                 return None
-            # Reserve cleanup for a dead runner before this read fails closed.
-            # A concurrent recovery may own the transition lock, but that never
-            # makes mutable shared state historical evidence for this run ID.
-            self._runs.state(handle)
             terminal_status = self._runs.recorded_terminal_status(handle)
             if terminal_status is None:
                 raise RunResultSnapshotUnavailableError(handle.run_id)
         if terminal_status.get("result_snapshot_state") == "pending":
-            if self._runs._runner_is_live(handle):
+            if self._runs.runner_may_be_alive(handle):
                 return None
             # The runner can publish the complete snapshot and exit between
             # the status read and its liveness probe. Re-read before treating
