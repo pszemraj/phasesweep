@@ -39,6 +39,7 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _phase_study_name,
     _suggest,
+    _trial_state_label,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
 from phasesweep.engine.repeats import repeat_axis
@@ -1246,11 +1247,6 @@ def _log_finished_trial(
     :param optuna.trial.FrozenTrial trial: The just-finished trial.
     :param int finished: Terminal trials the phase's study holds, this one included.
     """
-    state = trial.state.name
-    if trial.state == optuna.trial.TrialState.COMPLETE and not trial.user_attrs.get(
-        FEASIBLE_ATTR, False
-    ):
-        state = "INFEASIBLE"
     parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
     value = "none" if trial.value is None else f"{trial.value:g}"
     duration = "none" if trial.duration is None else f"{trial.duration.total_seconds():.1f}s"
@@ -1263,7 +1259,7 @@ def _log_finished_trial(
         "phase=%s TRIAL trial=%d state=%s outcome=%s value=%s duration=%s%s (%d/%d finished)%s",
         run.phase.name,
         trial.number,
-        state,
+        _trial_state_label(trial),
         "unknown" if parsed is None else parsed.outcome,
         value,
         duration,

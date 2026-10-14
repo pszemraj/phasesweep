@@ -1166,6 +1166,54 @@ def test_status_and_show_winners_stay_successful_without_corruption(
     assert "trial_number" in capsys.readouterr().out
 
 
+def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``status --trials`` prints a table per phase, leaves plain status as YAML, and exits alike."""
+    materialized = materialize("current-journal", tmp_path, mode="tree")
+    config_path = materialized.config_path
+    generation_id = published_generation_id(materialized.experiment)
+    assert generation_id is not None
+    heading = "=== p === (2 trials)"
+
+    assert invoke_cli_boundary(["status", str(config_path), "--trials"], monkeypatch) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert generation_id in lines[0] and "winner (*)" in lines[0]
+    assert lines[lines.index(heading) + 1].split() == [
+        "trial",
+        "state",
+        "value",
+        "params",
+        "duration_s",
+        "winner",
+    ]
+    rows = lines[lines.index(heading) + 2 :]
+    assert [row.split()[:2] for row in rows] == [["0", "COMPLETE"], ["1", "COMPLETE"]]
+    # The fixture's two trials tie on the metric, and the tie goes to the lower trial number.
+    assert rows[0].endswith("*") and not rows[1].endswith("*")
+
+    assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0
+    assert yaml.safe_load(capsys.readouterr().out)["kind"] == "experiment"
+
+    tampered = _generation_dir(materialized.experiment, generation_id) / "phases/p/winner.yaml"
+    tampered.write_bytes(tampered.read_bytes() + b"\n# edited after publication\n")
+
+    exit_code = invoke_cli_boundary(["status", str(config_path), "--trials"], monkeypatch)
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Traceback" not in captured.err
+    # The tables still print, with no winner starred, before the boundary reports.
+    assert "no generation is published, so no winner is marked" in captured.out
+    assert heading in captured.out
+    assert not any(line.endswith("*") for line in captured.out.splitlines())
+    assert generation_id in captured.err
+    assert "does not match its recorded hash" in captured.err
+    assert "Do not run anything over this tree" in captured.err
+
+
 def _stub_run_command(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
     """Make ``phasesweep run`` reach the engine and fail with ``error``.
 

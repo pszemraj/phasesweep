@@ -23,7 +23,7 @@ from phasesweep.engine.errors import (
     WinnerIntegrityError,
 )
 from phasesweep.engine.publication_validation import ValidatedPublication
-from phasesweep.engine.repeats import RepeatAxis, _validate_repeats_block, group_key
+from phasesweep.engine.repeats import RepeatAxis, _validate_repeats_block, group_labels
 from phasesweep.engine.state import (
     Winner,
     _parse_winner_source,
@@ -126,17 +126,9 @@ def _write_trials_csv(
         return
     param_names = sorted({n for t in trials for n in t.params})
     attr_names = sorted({n for t in trials for n in t.user_attrs})
-    labels: dict[int, int] = {}
-    if repeats is not None:
-        keyed = {
-            t.number: group_key(t.number, t.params, repeats)
-            for t in trials
-            if repeats.key in t.params
-        }
-        last: dict[str, int] = {}
-        for number, key in keyed.items():
-            last[key] = max(last.get(key, number), number)
-        labels = {number: last[key] for number, key in keyed.items()}
+    labels = (
+        {} if repeats is None else group_labels(((t.number, t.params) for t in trials), repeats)
+    )
     fieldnames = [
         "number",
         "state",

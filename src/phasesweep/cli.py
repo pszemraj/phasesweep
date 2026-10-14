@@ -6,9 +6,9 @@ import logging
 import shlex
 import sys
 import traceback
+from collections.abc import Sequence
 from importlib import resources
 from pathlib import Path
-from typing import Any
 
 import click
 import yaml
@@ -20,8 +20,11 @@ from phasesweep.engine import (
     PhaseSweepError,
     PublicationAccessError,
     PublicationIntegrityError,
+    TrialTable,
+    TrialTables,
     UnsafeProcessCleanupError,
     experiment_status,
+    read_trial_tables,
     run_experiment,
 )
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
@@ -39,6 +42,7 @@ from phasesweep.mcp.registry import (
 from phasesweep.mcp.scaffold import scaffold_catalog_text
 from phasesweep.reporting import _progress_values, report_objective
 from phasesweep.runtime.files import atomic_create_text, private_atomic_write_text
+from phasesweep.runtime.json import JsonValue
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
     install_signal_handlers,
@@ -449,29 +453,27 @@ def _publication_access_error(subject: str, detail: str) -> PublicationAccessErr
     )
 
 
-def _raise_on_failed_publication(payload: dict[str, Any]) -> None:
+def _raise_on_failed_publication(
+    experiment: str, integrity: str, error: str | None, workdir: Path
+) -> None:
     """Escalate an unusable publication verdict to its typed operator error.
 
-    Reads the status payload that was just rendered rather than re-resolving
-    the pointer, so the exit status can never disagree with what the operator
-    was shown.
+    Reads the verdict of the resolution that was just rendered rather than
+    re-resolving the pointer, so the exit status can never disagree with what
+    the operator was shown.
 
-    :param dict[str, Any] payload: ``experiment_status`` payload already rendered.
+    :param str experiment: Experiment the publication belongs to.
+    :param str integrity: ``publication_integrity`` of the rendered resolution.
+    :param str | None error: ``publication_error`` beside a ``failed`` or ``permission_denied`` verdict.
+    :param Path workdir: Artifact root holding the generation namespaces.
     :raises PublicationAccessError: Publication validation was denied by permissions.
     :raises PublicationIntegrityError: A reported publication no longer validates.
     """
-    if payload.get("publication_integrity") == "permission_denied":
-        raise _publication_access_error(
-            f"Experiment {str(payload.get('experiment'))!r}",
-            str(payload.get("publication_error")),
-        )
-    if payload.get("publication_integrity") != "failed":
+    if integrity == "permission_denied":
+        raise _publication_access_error(f"Experiment {experiment!r}", str(error))
+    if integrity != "failed":
         return
-    raise _publication_integrity_error(
-        f"Experiment {str(payload.get('experiment'))!r}",
-        str(payload.get("publication_error")),
-        Path(str(payload.get("workdir"))),
-    )
+    raise _publication_integrity_error(f"Experiment {experiment!r}", str(error), workdir)
 
 
 @cli.command(
@@ -543,29 +545,154 @@ def _show_experiment_winners(experiment: Experiment) -> None:
             _render_phase_comment(comment, prefix="# ")
 
 
+def _param_text(value: JsonValue) -> str:
+    """Format one sampled param for a trial table, floats to four significant digits.
+
+    :param JsonValue value: The recorded param value.
+    :return str: Terminal text for the value.
+    """
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    return str(value)
+
+
+def _trial_cell(column: str, value: JsonValue) -> str:
+    """Format one trial-table cell for the terminal.
+
+    Metric-like numbers print to six significant digits, params to four, and
+    durations to a tenth of a second; a missing value prints as ``-``.
+
+    :param str column: Column header the cell sits under.
+    :param JsonValue value: The row's value for that column.
+    :return str: Terminal text for the cell.
+    """
+    if value is None:
+        return "-"
+    if isinstance(value, dict):
+        return ", ".join(f"{name}={_param_text(item)}" for name, item in value.items()) or "-"
+    if isinstance(value, float):
+        return f"{value:.1f}" if column == "duration_s" else f"{value:.6g}"
+    return str(value)
+
+
+#: Columns whose text is not a number, which a trial table left-aligns.
+_TEXT_TRIAL_COLUMNS = frozenset({"state", "params", "winner"})
+
+
+def _aligned_row(columns: Sequence[str], texts: Sequence[str], widths: Sequence[int]) -> str:
+    """Pad one table row to its column widths, text columns left and numbers right.
+
+    :param Sequence[str] columns: Column headers, which pick each column's alignment.
+    :param Sequence[str] texts: The row's cell texts, one per column.
+    :param Sequence[int] widths: Width of each column.
+    :return str: The row joined by two spaces, without trailing spaces.
+    """
+    padded = (
+        text.ljust(width) if column in _TEXT_TRIAL_COLUMNS else text.rjust(width)
+        for column, text, width in zip(columns, texts, widths, strict=True)
+    )
+    return "  ".join(padded).rstrip()
+
+
+def _trial_table_lines(table: TrialTable) -> list[str]:
+    """Render one phase's trial rows as aligned plain text.
+
+    :param TrialTable table: The phase's rows and columns.
+    :return list[str]: The header line followed by one line per trial, without trailing spaces.
+    """
+    cells = [[_trial_cell(column, row[column]) for column in table.columns] for row in table.rows]
+    widths = [
+        max(len(column), *(len(row[index]) for row in cells))
+        for index, column in enumerate(table.columns)
+    ]
+    return [
+        _aligned_row(table.columns, table.columns, widths),
+        *(_aligned_row(table.columns, row, widths) for row in cells),
+    ]
+
+
+def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
+    """Render every phase's trial table under a header that names the winner marks' source.
+
+    :param TrialTables tables: The tables one publication resolution produced.
+    :param bool persisted: Whether the experiment keeps its trials in a ledger.
+    :return str: The header line, then each phase's heading and table.
+    """
+    if tables.published_generation_id is None:
+        marks = "no generation is published, so no winner is marked"
+    else:
+        marks = (
+            f"winner (*) marks published generation {tables.published_generation_id}; "
+            "it does not follow a rerun until that rerun publishes"
+        )
+    lines = [f"experiment {tables.experiment}: {marks}"]
+    for table in tables.phases:
+        if not table.available:
+            note = "trial data unavailable"
+        elif not persisted:
+            note = "no trials recorded: storage is null"
+        elif not table.rows:
+            note = "no trials yet"
+        else:
+            note = f"{len(table.rows)} trial{'' if len(table.rows) == 1 else 's'}"
+        lines.extend(["", f"=== {table.phase} === ({note})"])
+        if table.rows:
+            lines.extend(_trial_table_lines(table))
+    return "\n".join(lines)
+
+
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
-    help="Print read-only trial counts and phase state for a phasesweep experiment.",
+    help=(
+        "Print read-only trial counts and phase state for a phasesweep experiment, as YAML; "
+        "--trials prints one table of trials per phase instead."
+    ),
     short_help="Print read-only run status.",
 )
 @click.argument("config_path", metavar="CONFIG", type=CONFIG_PATH)
-def status(config_path: Path) -> None:
+@click.option(
+    "--trials",
+    "show_trials",
+    is_flag=True,
+    help=(
+        "Print one aligned table of trials per phase (state, value, params, duration, "
+        "repeat group, observed values, winner) instead of the YAML status."
+    ),
+)
+def status(config_path: Path, show_trials: bool) -> None:
     """Print read-only run status for ``config_path``.
 
     The payload is printed first and in full even when it reports a corrupt
     publication: the operator needs the trial counts and generation identity
     to decide what to inspect, and the boundary's one-line diagnostic follows
-    on stderr (review v0.5.18 / finding F4).
+    on stderr (review v0.5.18 / finding F4). ``--trials`` prints the trial
+    tables in its place, from one publication resolution, and exits the same way.
 
     :param Path config_path: Experiment YAML file to inspect.
+    :param bool show_trials: Print per-phase trial tables instead of the YAML status.
     :raises PublicationAccessError: The reported publication cannot be
         validated as the current user.
     :raises PublicationIntegrityError: The reported publication no longer validates.
     """
     config = _load_cli_config(config_path)
+    if show_trials:
+        tables = read_trial_tables(config)
+        click.echo(_render_trial_tables(tables, persisted=config.resolved_storage is not None))
+        _raise_on_failed_publication(
+            tables.experiment,
+            tables.publication_integrity,
+            tables.publication_error,
+            _experiment_dir(config),
+        )
+        return
     payload = experiment_status(config)
     click.echo(yaml.safe_dump(payload, sort_keys=False).rstrip())
-    _raise_on_failed_publication(payload)
+    _raise_on_failed_publication(
+        str(payload["experiment"]),
+        str(payload["publication_integrity"]),
+        None if payload.get("publication_error") is None else str(payload["publication_error"]),
+        Path(str(payload["workdir"])),
+    )
 
 
 @cli.command(

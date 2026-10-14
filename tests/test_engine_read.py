@@ -23,11 +23,18 @@ from phasesweep.config import (
     JsonExtractor,
     LogRegexExtractor,
     Metric,
+    Observation,
     Phase,
     Sampler,
     WandbExtractor,
 )
-from phasesweep.engine import PublishedStudyMissingError, read_status, read_winner, read_winners
+from phasesweep.engine import (
+    PublishedStudyMissingError,
+    read_status,
+    read_trial_tables,
+    read_winner,
+    read_winners,
+)
 from phasesweep.engine.paths import (
     _experiment_dir,
     _generation_path,
@@ -38,7 +45,12 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
-from tests.conftest import make_experiment, mark_current_format, write_constant_trainer
+from tests.conftest import (
+    make_experiment,
+    mark_current_format,
+    write_constant_trainer,
+    write_trainer,
+)
 from tests.ledger_fixtures import ledger_file, materialize, published_generation_id, tree_snapshot
 
 
@@ -944,3 +956,109 @@ def test_read_winners_refuses_phase_names_that_are_not_path_components(
 
     with pytest.raises(ValueError, match="phase name"):
         read_winners(exp, phase_names=[unsafe_name])
+
+
+def test_read_trial_tables_has_no_rows_without_a_persisted_study(tmp_path: Path) -> None:
+    """A phase that never ran, and an in-memory ledger, read as empty tables and create nothing."""
+    path = tmp_path / "missing.journal"
+    persistent = read_trial_tables(_experiment(tmp_path, storage=f"journal:///{path}"))
+    in_memory = read_trial_tables(_experiment(tmp_path))
+
+    assert not path.exists()
+    for tables in (persistent, in_memory):
+        (table,) = tables.phases
+        assert (table.phase, table.available, table.rows) == ("p", True, ())
+        assert table.columns == ("trial", "state", "value", "params", "duration_s", "winner")
+        assert tables.publication_integrity == "absent"
+        assert tables.published_generation_id is None
+
+
+def _trial_id_trainer(tmp_path: Path, *, mem: dict[str, str] | None = None) -> Path:
+    """Write a trainer by trial: 0 logs x=0.5, 1 logs x=2.0, and 2 exits nonzero.
+
+    :param Path tmp_path: Directory to write the trainer into.
+    :param dict[str, str] | None mem: Trial id to the ``mem=`` value it also logs, if any.
+    :return Path: The trainer script.
+    """
+    logged = mem or {}
+    return write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import os
+        import sys
+
+        trial = os.environ["PHASESWEEP_TRIAL_ID"]
+        if trial == "2":
+            sys.exit(1)
+        print("x=" + {{"0": "0.5", "1": "2.0"}}[trial])
+        mem = {logged!r}.get(trial)
+        if mem is not None:
+            print("mem=" + mem)
+        """,
+    )
+
+
+_X_METRIC = LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)")
+
+
+def test_read_trial_tables_marks_winner_and_infeasible(tmp_path: Path) -> None:
+    """Each trial reads under its real state, and only the published winner is starred."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_trial_id_trainer(tmp_path),
+        metric=Metric(extractor=_X_METRIC, max=1.5),
+        n_trials=3,
+    )
+    run_experiment(experiment)
+
+    tables = read_trial_tables(experiment)
+
+    assert tables.experiment == "t"
+    assert tables.publication_integrity == "ok" and tables.publication_error is None
+    assert tables.published_generation_id == published_generation_id(experiment)
+    (table,) = tables.phases
+    assert table.available
+    assert table.columns == ("trial", "state", "value", "params", "duration_s", "winner")
+    rows = table.rows
+    assert [row["trial"] for row in rows] == [0, 1, 2]
+    # Trial 1 completed but breached the metric's max, so it never ranked; trial 2 failed.
+    assert [row["state"] for row in rows] == ["COMPLETE", "INFEASIBLE", "FAIL"]
+    assert [row["value"] for row in rows] == [0.5, 2.0, None]
+    assert [row["winner"] for row in rows] == ["*", "", ""]
+    for row in rows:
+        assert isinstance(row["params"], dict) and set(row["params"]) == {"x"}
+    duration = rows[0]["duration_s"]
+    assert isinstance(duration, float) and duration > 0
+
+
+def test_read_trial_tables_adds_one_column_per_observed_name(tmp_path: Path) -> None:
+    """Every ``observed:<name>`` any trial recorded is a column, empty where a trial lacked it."""
+    experiment = make_experiment(
+        persistent=tmp_path,
+        trainer=_trial_id_trainer(tmp_path, mem={"0": "3.0", "1": "4.0"}),
+        metric=Metric(extractor=_X_METRIC),
+        observe=[
+            Observation(
+                name="mem",
+                extractor=LogRegexExtractor(type="log_regex", pattern=r"mem=(?P<value>[0-9.]+)"),
+            ),
+            Observation(
+                name="absent", extractor=JsonExtractor(type="json", path="never.json", key="v")
+            ),
+        ],
+        n_trials=3,
+    )
+    run_experiment(experiment)
+
+    (table,) = read_trial_tables(experiment).phases
+
+    assert table.columns == (
+        "trial",
+        "state",
+        "value",
+        "params",
+        "duration_s",
+        "observed:mem",
+        "winner",
+    )
+    assert [row["observed:mem"] for row in table.rows] == [3.0, 4.0, None]

@@ -20,7 +20,7 @@ from phasesweep.config import (
     Sampler,
     sampler_search_space,
 )
-from phasesweep.engine import read_status, read_winner
+from phasesweep.engine import read_status, read_trial_tables, read_winner
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _suggest
 from phasesweep.engine.paths import _generation_winner_path, _phase_dir
@@ -241,6 +241,36 @@ def test_winner_view_projects_the_repeats_summary(tmp_path: Path) -> None:
 
     _members(winner)[1]["metric"] = 99.0
     assert _winner_view(winner, "p") is None
+
+
+def test_trial_tables_label_repeat_groups_and_star_every_winning_member(tmp_path: Path) -> None:
+    """A repeats phase's table groups trials as trials.csv does and stars the whole winning group."""
+    experiment, _ = _repeats_publication(tmp_path)
+    view = read_winner(experiment, "p")
+    assert view is not None and view.repeats is not None
+
+    (table,) = read_trial_tables(experiment).phases
+
+    assert table.columns == (
+        "trial",
+        "state",
+        "value",
+        "params",
+        "duration_s",
+        "repeat_group",
+        "winner",
+    )
+    assert [row["repeat_group"] for row in table.rows] == [2, 2, 2, 5, 5, 5]
+    params = [row["params"] for row in table.rows]
+    assert all(isinstance(p, dict) for p in params)
+    assert [p.get("seed") for p in params if isinstance(p, dict)] == [0, 1, 2, 0, 1, 2]
+    starred = [row["trial"] for row in table.rows if row["winner"] == "*"]
+    assert len(starred) == 3
+    assert starred == view.repeats["member_trials"]
+    with (_phase_dir(experiment, "p") / "trials.csv").open() as handle:
+        assert [row["repeat_group"] for row in csv.DictReader(handle)] == [
+            str(row["repeat_group"]) for row in table.rows
+        ]
 
 
 def test_carried_group_winner_must_agree_on_repeats(tmp_path: Path) -> None:

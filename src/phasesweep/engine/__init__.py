@@ -23,8 +23,11 @@ from phasesweep.engine.errors import (
 )
 from phasesweep.engine.read import (
     PhaseWinnerView,
+    TrialTable,
+    TrialTables,
     read_result,
     read_status,
+    read_trial_tables,
     read_winner,
     read_winners,
 )
@@ -61,6 +64,8 @@ __all__ = [
     "TerminalReport",
     "TrackingTargetUnavailableError",
     "TrialEvidenceMissingError",
+    "TrialTable",
+    "TrialTables",
     "TrialTargetRegressionError",
     "UnsafeProcessCleanupError",
     "Winner",
@@ -68,6 +73,7 @@ __all__ = [
     "experiment_status",
     "read_result",
     "read_status",
+    "read_trial_tables",
     "read_winner",
     "read_winners",
     "run_experiment",

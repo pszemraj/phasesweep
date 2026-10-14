@@ -97,6 +97,26 @@ effective_overrides:
 # verdicts on the ranked population follow
 ```
 
+Every trial of the same run, with its state, value, sampled params, and a `*` on each published winner, is one read-only command away:
+
+```bash
+phasesweep status experiment.yaml --trials
+```
+
+```text
+experiment phasesweep_starter: winner (*) marks published generation be4f520d0ec04175ac623ac6184d342e; it does not follow a rerun until that rerun publishes
+
+=== depth === (2 trials)
+trial  state     value  params            duration_s  winner
+    0  COMPLETE    0.3  model.n_layers=8         0.6  *
+    1  COMPLETE    0.5  model.n_layers=6         0.5
+
+=== learning_rate === (2 trials)
+trial  state        value  params               duration_s  winner
+    0  COMPLETE       0.3  optimizer.lr=0.0003         0.6  *
+    1  COMPLETE  0.413822  optimizer.lr=0.0001         0.6
+```
+
 ## Use your own trainer
 
 Choose the input interface your trainer already accepts:

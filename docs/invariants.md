@@ -86,9 +86,9 @@ The tree binding must name this ledger and every existing phase study must name 
 
 #### 6. Read paths construct and write nothing
 
-`read_status`, `read_winners`, `read_result`, CLI `status` and `show-winners`, and the MCP result snapshot build no file-backed storage, write no bytes, and report a phase whose format scan did not complete as unavailable rather than counting its trials.
+`read_status`, `read_winners`, `read_result`, `read_trial_tables`, CLI `status` (with or without `--trials`) and `show-winners`, and the MCP result snapshot build no file-backed storage, write no bytes, and report a phase whose format scan did not complete as unavailable rather than counting its trials.
 
-**Held by:** `engine.ledger.validate_ledger` and `engine.ledger.read_trial_stats`, under `engine.read.read_status`, `engine.read.read_winners`, and `mcp.snapshots.capture_result_snapshot`\
+**Held by:** `engine.ledger.validate_ledger` and `engine.ledger.read_trial_stats` or `engine.ledger.read_phase_trials`, under `engine.read.read_status`, `engine.read.read_winners`, `engine.read.read_trial_tables` (and so CLI `status --trials`), and `mcp.snapshots.capture_result_snapshot`\
 **Tests:** `tests/test_ledger_read_paths.py::test_read_path_never_constructs_file_backed_storage_or_writes_bytes`, `tests/test_format_cutover.py::test_inconclusive_scan_on_a_bound_tree_never_reports_unchecked_counts`
 
 #### 7. Recovery validates before it opens

@@ -20,23 +20,27 @@ validated publication (pinned, unfinished, or failed) is read from its files.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import logging
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
+import optuna
 import yaml
 
-from phasesweep.config import Experiment
+from phasesweep.config import Experiment, Phase
 from phasesweep.config.common import SAFE_NAME_PATTERN, _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.artifact_roots import _artifact_root_binding_applies
 from phasesweep.engine.confound import _confound_summary, _validate_confound_block
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
-from phasesweep.engine.ledger import read_trial_stats, validate_ledger
+from phasesweep.engine.ledger import read_phase_trials, read_trial_stats, validate_ledger
 from phasesweep.engine.optuna import (
     _published_phase_trial_refs,
     _published_trial_history_available,
+    _trial_state_label,
 )
 from phasesweep.engine.paths import (
     _generation_path,
@@ -45,15 +49,27 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import PublicationPointer, _resolve_publication_pointer
 from phasesweep.engine.publication_validation import _parse_phase_plan
-from phasesweep.engine.repeats import RepeatsSummary, _repeats_summary, _validate_repeats_block
+from phasesweep.engine.repeats import (
+    RepeatsSummary,
+    _repeats_summary,
+    _validate_repeats_block,
+    group_labels,
+    repeat_axis,
+)
 from phasesweep.engine.state import (
+    ATTEMPT_ID_ATTR,
+    DURATION_ATTR,
     GENERATION_SUMMARY_SCHEMA_VERSION,
+    OBSERVED_PREFIX,
     PublicationState,
     WinnerSource,
     _parse_winner_source,
     _validate_observed_block,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
+from phasesweep.runtime.json import JsonObject, JsonValue
+
+log = logging.getLogger(__name__)
 
 ResultContext: TypeAlias = Literal["represented_generation", "current_config"]
 """Which config's semantics a result payload's labels were read under.
@@ -828,3 +844,176 @@ def _read_status(
         "summary_present": summary_present,
     }
     return status, publication
+
+
+@dataclass(frozen=True)
+class TrialTable:
+    """One phase's trials as table rows, in trial-number order.
+
+    ``columns`` lists the keys every row carries, in display order: ``trial``,
+    ``state``, ``value``, ``params``, ``duration_s``, then ``repeat_group`` for a
+    repeats phase, one ``observed:<name>`` per report-only value any trial
+    recorded, and ``winner``. ``state`` is the Optuna state, except that a
+    COMPLETE trial that violated a constraint or a metric bound reads
+    ``INFEASIBLE``. ``winner`` is ``*`` on the trials the published generation's
+    winner stands on and empty elsewhere.
+    """
+
+    phase: str
+    #: ``False`` when the phase's trials could not be read; the rows are then empty.
+    available: bool
+    columns: tuple[str, ...]
+    rows: tuple[JsonObject, ...]
+
+
+@dataclass(frozen=True)
+class TrialTables:
+    """Every configured phase's trial table, from one publication resolution."""
+
+    experiment: str
+    #: The generation whose winners are marked, or ``None`` when nothing validates as published.
+    published_generation_id: str | None
+    publication_integrity: PublicationState
+    #: Validation diagnostic beside a ``failed`` or ``permission_denied`` integrity.
+    publication_error: str | None
+    phases: tuple[TrialTable, ...]
+
+
+def _recorded_number(value: object) -> float | None:
+    """Return a recorded user-attr number, or ``None`` when it is not one.
+
+    :param object value: A trial user-attr value.
+    :return float | None: The value as a float, or ``None`` for anything but a real number.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
+
+
+#: Columns every trial table starts with, as ``(header, getter)`` pairs.
+_CORE_TRIAL_COLUMNS: tuple[tuple[str, Callable[[optuna.trial.FrozenTrial], JsonValue]], ...] = (
+    ("trial", lambda trial: trial.number),
+    ("state", _trial_state_label),
+    ("value", lambda trial: trial.value),
+    ("params", lambda trial: dict(trial.params)),
+    ("duration_s", lambda trial: _recorded_number(trial.user_attrs.get(DURATION_ATTR))),
+)
+_REPEAT_GROUP_COLUMN = "repeat_group"
+_WINNER_COLUMN = "winner"
+
+
+def _winning_trials(winner: PhaseWinnerView | None) -> dict[int, str | None]:
+    """Map the trial numbers a published winner stands on to the attempt each must carry.
+
+    A repeats winner stands on every member of its group; its scalar fields
+    name the highest-numbered member, so only that member's attempt is known
+    from the path-free view and the others are matched by number alone.
+
+    :param PhaseWinnerView | None winner: The phase's published winner, if any.
+    :return dict[int, str | None]: Attempt id to require by trial number, ``None`` where unchecked.
+    """
+    if winner is None:
+        return {}
+    standing: dict[int, str | None] = {winner.trial_number: winner.attempt_id}
+    if winner.repeats is not None:
+        for number in winner.repeats["member_trials"]:
+            standing.setdefault(number, None)
+    return standing
+
+
+def _trial_table(
+    phase: Phase,
+    trials: Sequence[optuna.trial.FrozenTrial],
+    winner: PhaseWinnerView | None,
+    *,
+    available: bool = True,
+) -> TrialTable:
+    """Build one phase's table from its trials and the winner the publication holds for it.
+
+    :param Phase phase: The configured phase the trials belong to.
+    :param Sequence[optuna.trial.FrozenTrial] trials: The phase study's trials.
+    :param PhaseWinnerView | None winner: The published winner for the phase, if any.
+    :param bool available: ``False`` when the trials could not be read, so ``trials`` is empty.
+    :return TrialTable: The rows and the columns they carry.
+    """
+    axis = repeat_axis(phase)
+    groups = {} if axis is None else group_labels(((t.number, t.params) for t in trials), axis)
+    observed = sorted(
+        {name for t in trials for name in t.user_attrs if name.startswith(OBSERVED_PREFIX)}
+    )
+    columns = (
+        *(header for header, _ in _CORE_TRIAL_COLUMNS),
+        *([] if axis is None else [_REPEAT_GROUP_COLUMN]),
+        *observed,
+        _WINNER_COLUMN,
+    )
+    standing = _winning_trials(winner)
+    rows: list[JsonObject] = []
+    for trial in trials:
+        row: JsonObject = {header: getter(trial) for header, getter in _CORE_TRIAL_COLUMNS}
+        if axis is not None:
+            row[_REPEAT_GROUP_COLUMN] = groups.get(trial.number)
+        for name in observed:
+            row[name] = _recorded_number(trial.user_attrs.get(name))
+        attempt = standing.get(trial.number)
+        marked = trial.number in standing and (
+            attempt is None or trial.user_attrs.get(ATTEMPT_ID_ATTR) == attempt
+        )
+        row[_WINNER_COLUMN] = "*" if marked else ""
+        rows.append(row)
+    return TrialTable(phase=phase.name, available=available, columns=columns, rows=tuple(rows))
+
+
+def read_trial_tables(experiment: Experiment) -> TrialTables:
+    """Read every configured phase's trials as table rows, writing nothing.
+
+    Built on :func:`phasesweep.engine.ledger.validate_ledger` and
+    :func:`phasesweep.engine.ledger.read_phase_trials`, so it creates no study,
+    constructs no file-backed storage, and writes no byte. The publication
+    pointer is resolved once, before the trials are read, and the winner marks
+    come from that resolution. They therefore name the published generation's
+    winners, which is not the winner of a rerun that has not published yet. A
+    phase with no study, and every phase of an in-memory ledger, has no rows. A
+    phase whose trials cannot be read is reported unavailable instead of empty.
+
+    :param Experiment experiment: Parsed experiment config whose phases are read.
+    :raises ArtifactRootConflictError: The artifact root cannot be read or is bound to another ledger.
+    :raises StudySchemaMismatchError: A phase's study is populated under an unsupported schema.
+    :return TrialTables: One table per configured phase, in declaration order.
+    """
+    ledger = validate_ledger(experiment)
+    publication = _resolve_publication_pointer(experiment)
+    published_generation_id = _published_generation_id(publication)
+    winners = {
+        view.phase: view
+        for view in _represented_winners(
+            experiment,
+            publication,
+            published_generation_id,
+            [phase.name for phase in experiment.phases],
+        )
+    }
+    tables: list[TrialTable] = []
+    for phase in experiment.phases:
+        try:
+            read = read_phase_trials(ledger, phase)
+        except StudyStorageUnavailableError as exc:
+            cause = exc.__cause__ or exc
+            log.warning(
+                "could not read trial data from storage %s for phase %s: %s: %s",
+                ledger.storage_url,
+                phase.name,
+                type(cause).__name__,
+                cause,
+            )
+            tables.append(_trial_table(phase, [], None, available=False))
+            continue
+        trials = [] if read is None else read.trials
+        tables.append(_trial_table(phase, trials, winners.get(phase.name)))
+    return TrialTables(
+        experiment=experiment.experiment,
+        published_generation_id=published_generation_id,
+        publication_integrity=publication.state,
+        publication_error=publication.error,
+        phases=tuple(tables),
+    )

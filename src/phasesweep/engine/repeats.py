@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, get_args
 
@@ -225,6 +225,30 @@ def group_key(trial_number: int, params: Mapping[str, object], axis: RepeatAxis)
     slot = None if axis.slot_size is None else trial_number // axis.slot_size
     rest = {name: value for name, value in params.items() if name != axis.key}
     return json.dumps([slot, rest], sort_keys=True, separators=(",", ":"))
+
+
+def group_labels(
+    trials: Iterable[tuple[int, Mapping[str, object]]], axis: RepeatAxis
+) -> dict[int, int]:
+    """Label each trial of a repeats phase with the highest trial number of its group so far.
+
+    The groups are the ones selection ranks, by :func:`group_key`. An incomplete
+    group's label moves as more members are allocated. A trial without the
+    repeat key, which was stopped before sampling it, belongs to no group and
+    gets no label.
+
+    :param Iterable[tuple[int, Mapping[str, object]]] trials: ``(trial_number, params)``
+        of every trial of the phase.
+    :param RepeatAxis axis: The phase's repeat axis.
+    :return dict[int, int]: Group label by trial number, for the trials that have one.
+    """
+    keyed = {
+        number: group_key(number, params, axis) for number, params in trials if axis.key in params
+    }
+    last: dict[str, int] = {}
+    for number, key in keyed.items():
+        last[key] = max(last.get(key, number), number)
+    return {number: last[key] for number, key in keyed.items()}
 
 
 def reduce_values(values: Sequence[float], reduce: ReduceName) -> float:
