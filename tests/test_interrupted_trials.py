@@ -103,8 +103,8 @@ def test_stale_recovery_keeps_failures_and_interrupts_everything_else(
     assert _stale_recovery_outcome(parsed) == expected
 
 
-def test_cancelled_is_no_longer_an_outcome() -> None:
-    """The old ``cancelled`` label and the previous outcome schema are both rejected."""
+def test_the_outcome_parser_rejects_an_unknown_label_and_another_schema_version() -> None:
+    """A label outside the outcome vocabulary, such as ``cancelled``, and any other schema version parse as nothing."""
     assert _parsed_trial_outcome(_outcome(1, "cancelled")) is None
     previous = _outcome(1, "interrupted")
     previous["schema_version"] = TRIAL_OUTCOME_SCHEMA_VERSION - 1

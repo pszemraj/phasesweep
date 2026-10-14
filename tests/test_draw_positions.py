@@ -243,8 +243,8 @@ def test_seeded_random_draws_the_same_set_however_it_is_interrupted(
     assert _finished_draws(study) == _finished_draws(control)
 
 
-def test_seeded_random_draws_what_it_drew_before_draw_positions_existed() -> None:
-    """The position seed is the trial-number seed seeded random always used, so no seeded study changes its draws."""
+def test_a_seeded_draw_is_pinned_by_seed_study_position_and_label() -> None:
+    """A seeded draw is a fixed function of the seed, study name, position and label, so any change to that derivation fails here."""
     assert _position_seed(11, "t::p", 3, "lr") == 2070613593
     study = _study(_build_sampler(Sampler(type="random", seed=11), {}))
     _run(study, {"lr": _RANDOM_SPACE["lr"]}, 4)
