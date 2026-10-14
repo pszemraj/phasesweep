@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import signal
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, TypeAlias, TypeGuard
 
+from phasesweep.errors import ForeignPidNamespaceError
 from phasesweep.runtime.json import strict_json_loads
 
 # Process supervision logs on one channel, whichever module does the work.
@@ -22,7 +25,19 @@ log = logging.getLogger("phasesweep.runtime.process")
 
 _KILL_GRACE_SECONDS = 10.0
 PROCESS_IDENTITY_FILE = "process_identity.json"
-PROCESS_IDENTITY_SCHEMA_VERSION = 1
+PROCESS_IDENTITY_SCHEMA_VERSION = 2
+
+#: The kernel constant ``PROC_PID_INIT_INO``: the namespace link text of the
+#: initial PID namespace, fixed since Linux 3.8.
+INITIAL_PID_NAMESPACE = "pid:[4026531836]"
+_PID_NAMESPACE_PATTERN = re.compile(r"pid:\[[1-9][0-9]*\]")
+_PROC = Path("/proc")
+
+#: How a recorded PID namespace relates to the reader's. ``same``: PIDs recorded
+#: there can be probed here. ``gone``: the namespace provably has no process
+#: left. ``foreign``: PID numbers recorded there name unrelated processes here,
+#: so liveness is unknown.
+PidNamespaceVerdict: TypeAlias = Literal["same", "gone", "foreign"]
 
 
 @dataclass(frozen=True)
@@ -35,6 +50,7 @@ class StaleProcessIdentity:
     pgid: int
     proc_starttime: int | None
     boot_id: str | None
+    pid_namespace: str | None
 
 
 def read_boot_id() -> str | None:
@@ -65,6 +81,133 @@ def identity_from_earlier_boot(boot_id: str | None, current_boot_id: str | None)
     :return bool: Whether both boot ids are known and differ.
     """
     return boot_id is not None and current_boot_id is not None and boot_id != current_boot_id
+
+
+def is_pid_namespace(value: object) -> TypeGuard[str]:
+    """Return whether ``value`` is the link text of a PID namespace.
+
+    :param object value: Candidate namespace identity.
+    :return bool: Whether it has the form ``pid:[<inode>]``.
+    """
+    return isinstance(value, str) and _PID_NAMESPACE_PATTERN.fullmatch(value) is not None
+
+
+def read_pid_namespace() -> str | None:
+    """Return the PID namespace this process's PID numbers belong to.
+
+    PID plus start time identifies a process only inside one PID namespace: the
+    same number can name an unrelated process elsewhere. ``/proc`` is
+    trustworthy for that only when it is this namespace's own procfs, which
+    ``/proc/self`` proves by naming this process's own PID.
+
+    :return str | None: ``pid:[<inode>]``, or ``None`` when ``/proc`` is
+        missing, unreadable, or mounted from another PID namespace.
+    """
+    try:
+        if os.readlink(_PROC / "self") != str(os.getpid()):
+            return None
+        value = os.readlink(_PROC / "self" / "ns" / "pid")
+    except OSError:
+        return None
+    return value if is_pid_namespace(value) else None
+
+
+def pid_namespace_verdict(pid_namespace: str | None) -> PidNamespaceVerdict:
+    """Relate a recorded PID namespace to this process's.
+
+    ``gone`` is available only from the initial PID namespace, whose ``/proc``
+    lists every process on the host: when no process anywhere still lives in the
+    recorded namespace, its init has exited, and the kernel killed every member
+    with it, so nothing recorded there can still run. Any doubt, such as a
+    hidden process entry, a missing ``NSpid`` line, or an unreadable namespace
+    link, is ``foreign``.
+
+    :param str | None pid_namespace: Namespace recorded with the process identity.
+    :return PidNamespaceVerdict: ``same``, ``gone``, or ``foreign``.
+    """
+    current = read_pid_namespace()
+    if current is None or pid_namespace is None or not is_pid_namespace(pid_namespace):
+        return "foreign"
+    if pid_namespace == current:
+        return "same"
+    if current == INITIAL_PID_NAMESPACE and _pid_namespace_blocker(pid_namespace) is None:
+        return "gone"
+    return "foreign"
+
+
+def foreign_pid_namespace_reason(pid_namespace: str | None) -> str:
+    """Explain why a recorded PID namespace cannot be probed from this process.
+
+    :param str | None pid_namespace: Namespace recorded with the process identity.
+    :return str: A clause naming both namespaces, the remedy, and from the
+        initial namespace what stopped the host from proving the namespace empty.
+    """
+    recorded = pid_namespace if pid_namespace is not None else "unrecorded"
+    current = read_pid_namespace() or "unreadable"
+    reason = (
+        f"it was recorded in PID namespace {recorded}, but this process is in {current}, "
+        "so its PID numbers name unrelated processes here. Act from the namespace that "
+        "launched it, or from the host's initial PID namespace once that namespace has "
+        "no process left"
+    )
+    if current == INITIAL_PID_NAMESPACE and is_pid_namespace(pid_namespace):
+        blocker = _pid_namespace_blocker(pid_namespace)
+        if blocker == 0:
+            reason += " (this host's /proc hides other users' processes, so that cannot be proven)"
+        elif blocker is not None:
+            reason += (
+                f" (host process {blocker} is in that namespace or its namespace is unreadable,"
+                " so it cannot be proven empty)"
+            )
+    return reason
+
+
+def _pid_namespace_blocker(namespace: str) -> int | None:
+    """Find what stops a ``/proc`` scan from proving ``namespace`` empty.
+
+    Only meaningful from the initial PID namespace. Fails closed: a procfs that
+    hides other users' processes, a process without an ``NSpid`` line, or a
+    nested process whose namespace link cannot be read (a browser sandbox, for
+    one, is not dumpable) means absence is not proven.
+
+    :param str namespace: PID namespace identity to look for.
+    :return int | None: ``None`` when every process was inspected and none is in
+        the namespace; ``0`` when the scan cannot run at all; otherwise the host
+        PID of the first process that is in it or could not be ruled out.
+    """
+    try:
+        (_PROC / "1" / "status").read_bytes()
+        entries = tuple(_PROC.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text(encoding="utf-8", errors="replace")
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # exited during the scan
+        except OSError:
+            return int(entry.name)
+        nspid = next(
+            (line.split()[1:] for line in status.splitlines() if line.startswith("NSpid:")),
+            None,
+        )
+        if nspid is None:
+            return int(entry.name)
+        if len(nspid) < 2:
+            continue  # a member of the initial namespace itself
+        try:
+            link = os.readlink(entry / "ns" / "pid")
+        except (FileNotFoundError, ProcessLookupError):
+            if entry.exists():
+                return int(entry.name)
+            continue
+        except OSError:
+            return int(entry.name)
+        if link == namespace:
+            return int(entry.name)
+    return None
 
 
 @dataclass(frozen=True)
@@ -240,6 +383,7 @@ def read_stale_process_identity(
         "pgid",
         "proc_starttime",
         "boot_id",
+        "pid_namespace",
     }
     if not required_fields.issubset(payload):
         raise ValueError(f"Trial process identity at {path} is partial.")
@@ -281,6 +425,11 @@ def read_stale_process_identity(
     boot_id = payload.get("boot_id")
     if boot_id is not None and (not isinstance(boot_id, str) or not boot_id):
         raise ValueError(f"Trial process identity field 'boot_id' is invalid at {path}.")
+    pid_namespace = payload.get("pid_namespace")
+    if pid_namespace is not None and not (
+        isinstance(pid_namespace, str) and is_pid_namespace(pid_namespace)
+    ):
+        raise ValueError(f"Trial process identity field 'pid_namespace' is invalid at {path}.")
     return StaleProcessIdentity(
         schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
         attempt_id=attempt_id,
@@ -288,6 +437,7 @@ def read_stale_process_identity(
         pgid=positive_int("pgid"),
         proc_starttime=proc_starttime,
         boot_id=boot_id,
+        pid_namespace=pid_namespace,
     )
 
 
@@ -296,29 +446,38 @@ def cleanup_stale_trial_process(
     *,
     grace_seconds: float = _KILL_GRACE_SECONDS,
 ) -> bool:
-    """Safely clean a stale trial group using boot- and process-bound identity.
+    """Safely clean a stale trial group using boot-, namespace- and process-bound identity.
 
-    Refuses to act when ``identity`` lacks a recorded boot id or start time, or
-    the current boot id cannot be read, since PID-reuse safety cannot be
-    verified in that case. When ``identity.boot_id`` differs from the current
-    boot id, the host has rebooted since launch, so no process from that boot
-    can still be alive and cleanup is trivially complete. Otherwise delegates
-    to :func:`kill_stale_group` with the identity's ``pid``/``pgid``/starttime.
+    Refuses to act when ``identity`` lacks a recorded boot id, start time, or
+    PID namespace, or the current boot id cannot be read, since PID-reuse
+    safety cannot be verified in that case. When ``identity.boot_id`` differs
+    from the current boot id, the host has rebooted since launch, so no process
+    from that boot can still be alive and cleanup is trivially complete. A
+    recorded PID namespace that provably has no process left settles the same
+    way. A namespace this process cannot probe is refused: its PID numbers name
+    unrelated processes here, so signalling them could kill an innocent group.
+    Otherwise delegates to :func:`kill_stale_group` with the identity's
+    ``pid``/``pgid``/starttime.
 
-    Args:
-        identity: Durable process identity read from ``process_identity.json``.
-        grace_seconds: Seconds to wait after SIGTERM before escalating to
-            SIGKILL; forwarded to :func:`kill_stale_group`.
-
-    Returns:
-        ``True`` when it is safe to mark the trial ``FAIL`` (nothing to clean,
-        the host rebooted, or cleanup was confirmed). ``False`` when identity
-        cannot be verified or :func:`kill_stale_group` reports cleanup is
-        uncertain; callers must not advance state in that case.
-
+    :param StaleProcessIdentity identity: Durable process identity read from
+        ``process_identity.json``.
+    :param float grace_seconds: Seconds to wait after SIGTERM before escalating
+        to SIGKILL; forwarded to :func:`kill_stale_group`.
+    :raises ForeignPidNamespaceError: The identity was recorded in a PID
+        namespace this process cannot probe and cannot prove empty.
+    :return bool: ``True`` when it is safe to mark the trial ``FAIL`` (nothing
+        to clean, the host rebooted, the namespace is gone, or cleanup was
+        confirmed). ``False`` when identity cannot be verified or
+        :func:`kill_stale_group` reports cleanup is uncertain; callers must not
+        advance state in that case.
     """
     current_boot_id = read_boot_id()
-    if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
+    if (
+        identity.boot_id is None
+        or identity.proc_starttime is None
+        or identity.pid_namespace is None
+        or current_boot_id is None
+    ):
         log.warning(
             "Refusing automatic cleanup for attempt %s because robust process-birth identity "
             "is unavailable on this platform.",
@@ -331,6 +490,19 @@ def cleanup_stale_trial_process(
             identity.attempt_id,
         )
         return True
+    verdict = pid_namespace_verdict(identity.pid_namespace)
+    if verdict == "gone":
+        log.warning(
+            "Attempt %s belongs to PID namespace %s, which has no process left.",
+            identity.attempt_id,
+            identity.pid_namespace,
+        )
+        return True
+    if verdict == "foreign":
+        raise ForeignPidNamespaceError(
+            f"Attempt {identity.attempt_id} (pid={identity.pid}) cannot be cleaned from here: "
+            f"{foreign_pid_namespace_reason(identity.pid_namespace)}. Nothing was signalled."
+        )
     return kill_stale_group(
         identity.pid,
         identity.proc_starttime,
@@ -639,6 +811,11 @@ def kill_stale_group(
     SIGKILL. Callers must not advance state when this returns ``False``
     (review v0.5.7 / blocker 2): a leaked training process can still hold a
     GPU, scribble over W&B runs, or starve the host scheduler.
+
+    Precondition: the caller has established that ``pid`` and ``pgid`` were
+    recorded in this process's PID namespace (:func:`pid_namespace_verdict`
+    returned ``same``), or that the identity is a child this process just
+    spawned. In another namespace the same numbers name unrelated processes.
 
     Recovery order (review v0.5.3 / blocker 2):
 

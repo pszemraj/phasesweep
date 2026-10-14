@@ -128,6 +128,17 @@ class UnsafeProcessCleanupError(ProcessCleanupUncertainError):
     """
 
 
+class ForeignPidNamespaceError(ProcessCleanupUncertainError):
+    """Raised when a recorded process lives in a PID namespace this process cannot probe.
+
+    Its PID numbers name unrelated processes here, so the process can be neither
+    observed nor safely signalled; the remedy is to act from the namespace that
+    launched it, not to clean up by hand.
+    """
+
+    default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG
+
+
 class GpuConfigurationError(PhaseSweepError):
     """Raised when configured GPU isolation cannot be honored safely."""
 

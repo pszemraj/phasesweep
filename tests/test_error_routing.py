@@ -82,7 +82,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
-from phasesweep.errors import OperatorAction, PhaseSweepError
+from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.recovery import (
@@ -103,6 +103,11 @@ from phasesweep.runtime.files import (
     phasesweep_home,
 )
 from phasesweep.runtime.process import write_attempt_lifecycle
+from phasesweep.runtime.reaper import (
+    PROCESS_IDENTITY_SCHEMA_VERSION,
+    StaleProcessIdentity,
+    cleanup_stale_trial_process,
+)
 from phasesweep.tracking.mlflow import require_mlflow_sdk
 from tests.conftest import make_experiment, requires_nonroot
 from tests.ledger_fixtures import (
@@ -1368,7 +1373,31 @@ def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
     return study_policy._validate_environment_cohort(study, "d" * 64)
 
 
+def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Clean a stale trial group whose identity was recorded in another PID namespace."""
+    monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "boot")
+    monkeypatch.setattr("phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]")
+    return cleanup_stale_trial_process(
+        StaleProcessIdentity(
+            schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
+            attempt_id="foreign-attempt",
+            pid=4242,
+            pgid=4242,
+            proc_starttime=111,
+            boot_id="boot",
+            pid_namespace="pid:[4026539001]",
+        )
+    )
+
+
 ORIGIN_CASES = (
+    RoutingCase(
+        id="stale_trial_in_foreign_pid_namespace",
+        trigger=_clean_trial_from_foreign_namespace,
+        raised=ForeignPidNamespaceError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Act from the namespace that launched it",
+    ),
     RoutingCase(
         id="claim_ledger_tree_changed",
         trigger=_claim_after_unlocked_bind,

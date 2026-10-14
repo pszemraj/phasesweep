@@ -64,6 +64,7 @@ from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore
 from phasesweep.runtime.process import write_attempt_lifecycle
 from phasesweep.runtime.reaper import (
+    INITIAL_PID_NAMESPACE,
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
@@ -700,6 +701,7 @@ def test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling(
         pgid=12345,
         proc_starttime=111,
         boot_id="old-boot",
+        pid_namespace=INITIAL_PID_NAMESPACE,
     )
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "current-boot")
     monkeypatch.setattr(
@@ -722,6 +724,7 @@ def test_cleanup_stale_trial_process_refuses_unverifiable_platform_identity(
         pgid=12345,
         proc_starttime=None,
         boot_id=None,
+        pid_namespace=None,
     )
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: None)
 
@@ -1059,6 +1062,7 @@ def test_reaper_reports_storage_failures_after_cleanup(
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
+            pid_namespace=INITIAL_PID_NAMESPACE,
         )
 
     monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)

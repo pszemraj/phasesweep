@@ -54,6 +54,7 @@ from phasesweep.runtime.reaper import (
     _process_group_alive,
     _terminate_process_group,
     read_boot_id,
+    read_pid_namespace,
     read_proc_starttime,
 )
 from phasesweep.runtime.shutdown import (
@@ -303,8 +304,9 @@ def _trial_process_identity(
     Returns:
         A :class:`StaleProcessIdentity` combining the given fields with the
         current schema version, this process's ``/proc`` start time (``None``
-        off-Linux or if unreadable), and the current boot id (``None`` when
-        unavailable).
+        off-Linux or if unreadable), the current boot id (``None`` when
+        unavailable), and the PID namespace ``pid`` is numbered in (``None``
+        when unreadable).
 
     """
     return StaleProcessIdentity(
@@ -314,6 +316,7 @@ def _trial_process_identity(
         pgid=pgid,
         proc_starttime=read_proc_starttime(pid),
         boot_id=read_boot_id(),
+        pid_namespace=read_pid_namespace(),
     )
 
 
@@ -335,6 +338,7 @@ def _write_process_identity(path: Path, identity: StaleProcessIdentity) -> None:
                 "pgid": identity.pgid,
                 "proc_starttime": identity.proc_starttime,
                 "boot_id": identity.boot_id,
+                "pid_namespace": identity.pid_namespace,
             },
             sort_keys=True,
         )
