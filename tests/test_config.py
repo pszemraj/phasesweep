@@ -1127,7 +1127,7 @@ def test_repeats_requires_grid_or_seeded_random(sampler: JsonObject, spelled: st
     assert grid.phases[0].repeats is not None
     seeded = make_experiment(phases=[_repeats_phase()]).phases[0]
     assert seeded.sampler.seed == 0
-    assert sampler_capability_line(seeded) == (
+    assert sampler_capability_line(seeded, "journal:///tmp/x.journal") == (
         "phase 'p': sampler=random seed=0 (resumable, reproducible), repeats=seed×3 (mean)"
     )
 

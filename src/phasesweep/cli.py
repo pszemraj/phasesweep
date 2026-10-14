@@ -476,7 +476,7 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
         sampling = f"sampler={p.sampler.type}" if phase_draws(p) else "(fixed configuration)"
         click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} {sampling}{deps}")
         # Capability disclosure: state the resume/reproduce contract before a trial runs.
-        click.echo(f"{indent}    {sampler_capability_line(p)}")
+        click.echo(f"{indent}    {sampler_capability_line(p, experiment.resolved_storage)}")
         for warning in sampler_warnings(p):
             click.echo(f"{indent}    warning: {warning}")
         _render_phase_comment(p.comment, prefix=f"{indent}    # ")

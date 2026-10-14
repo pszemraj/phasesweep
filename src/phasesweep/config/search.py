@@ -352,28 +352,38 @@ def phase_draws(phase: Phase) -> bool:
     return bool(sampler_search_space(phase))
 
 
-def sampler_capability_line(phase: Phase) -> str:
+def sampler_capability_line(phase: Phase, storage: str | None) -> str:
     """Render the one-line resume/reproduce contract disclosed for ``phase``.
 
     Shared by ``phasesweep validate`` and ``phasesweep run --dry-run`` so both
     surfaces state the same contract in the same words before any trial runs.
-    Every phase resumes. A seeded phase is reproducible too, except TPE and
-    CMA-ES under ``n_jobs`` above 1, whose draws depend on which trials have
-    finished when each one is drawn.
+    A phase resumes only on persistent storage; an in-memory study ends with
+    the process. Grid, which shuffles with a fixed seed when none is set, and a
+    seeded sampler are reproducible too, except TPE and CMA-ES under ``n_jobs``
+    above 1, whose draws depend on which trials have finished when each one is
+    drawn.
 
     :param Phase phase: Phase whose sampler capability is described.
+    :param str | None storage: The experiment's resolved storage, ``None`` for
+        an in-memory study.
     :return str: One line naming the phase and either its sampler type, seed,
         capability and repeat axis, or that it is a fixed configuration with no
         sampler draws.
     """
+    resume = "not resumable: in-memory storage" if storage is None else "resumable"
     if not phase_draws(phase):
-        return f"phase {phase.name!r}: fixed configuration, no sampler draws (resumable)"
+        return f"phase {phase.name!r}: fixed configuration, no sampler draws ({resume})"
     sampler = phase.sampler
     seed = "" if sampler.seed is None else f" seed={sampler.seed}"
-    if sampler.seed is None or (sampler.type in ("tpe", "cmaes") and phase.n_jobs > 1):
-        capability = "resumable"
+    reproducible = (sampler.type == "grid" or sampler.seed is not None) and not (
+        sampler.type in ("tpe", "cmaes") and phase.n_jobs > 1
+    )
+    if not reproducible:
+        capability = resume
+    elif storage is None:
+        capability = f"reproducible, {resume}"
     else:
-        capability = "resumable, reproducible"
+        capability = f"{resume}, reproducible"
     repeats = phase.repeats
     axis = (
         ""

@@ -594,7 +594,8 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     result = CliRunner().invoke(cli_main, ["validate", str(p)])
 
     assert result.exit_code == 0, result.output
-    assert "phase 'depth': sampler=grid (resumable)" in result.output
+    # Grid shuffles with a fixed seed when none is set, so it reproduces unseeded.
+    assert "phase 'depth': sampler=grid (resumable, reproducible)" in result.output
     assert "phase 'lr': sampler=tpe seed=0 (resumable, reproducible)" in result.output
     assert "phase 'wd': sampler=random seed=3 (resumable, reproducible)" in result.output
     # Under several workers a model sampler's draws depend on which trials have finished.
@@ -626,6 +627,45 @@ def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path)
     assert "- baseline: n_trials=1 (fixed configuration)" in result.output
     assert "phase 'baseline': fixed configuration, no sampler draws (resumable)" in result.output
     assert "sampler=" not in result.output
+
+
+def test_validate_says_an_in_memory_phase_cannot_resume(tmp_path: Path) -> None:
+    """Without persistent storage the study ends with the process, so no phase line claims a resume."""
+    p = tmp_path / "exp.yaml"
+    p.write_text(
+        textwrap.dedent("""
+        experiment: t
+        trial_command: "echo {overrides}"
+        override_format: argparse
+        metric:
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
+        phases:
+          - name: lr
+            n_trials: 11
+            search_space: { lr: { type: float, low: 0.1, high: 1.0 } }
+          - name: wd
+            n_trials: 2
+            sampler: { type: random, seed: 3 }
+            search_space: { wd: { type: float, low: 0.0, high: 0.3 } }
+          - name: baseline
+            n_trials: 1
+            fixed_overrides: { lr: 0.1 }
+        """)
+    )
+
+    result = CliRunner().invoke(cli_main, ["validate", str(p)])
+
+    assert result.exit_code == 0, result.output
+    assert "phase 'lr': sampler=tpe (not resumable: in-memory storage)" in result.output
+    assert (
+        "phase 'wd': sampler=random seed=3 (reproducible, not resumable: in-memory storage)"
+        in result.output
+    )
+    assert (
+        "phase 'baseline': fixed configuration, no sampler draws "
+        "(not resumable: in-memory storage)" in result.output
+    )
+    assert "(resumable" not in result.output
 
 
 _TPE_STARTUP_WARNING = (
@@ -678,7 +718,7 @@ def test_validate_warns_when_tpe_never_leaves_startup(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     lines = [line.strip() for line in result.output.splitlines()]
-    capability = lines.index("phase 'lr': sampler=tpe (resumable)")
+    capability = lines.index("phase 'lr': sampler=tpe (not resumable: in-memory storage)")
     assert lines[capability + 1] == _TPE_STARTUP_WARNING
 
 
@@ -1257,7 +1297,7 @@ def test_dry_run_discloses_each_phases_sampler_capability(tmp_path, caplog):
     assert [
         r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN phase '")
     ] == [
-        "DRY RUN phase 'depth': sampler=grid (resumable)",
+        "DRY RUN phase 'depth': sampler=grid (resumable, reproducible)",
         "DRY RUN phase 'lr': sampler=tpe seed=0 (resumable, reproducible)",
         "DRY RUN phase 'wd': sampler=random seed=3 (resumable, reproducible)",
         "DRY RUN phase 'fixed': fixed configuration, no sampler draws (resumable)",

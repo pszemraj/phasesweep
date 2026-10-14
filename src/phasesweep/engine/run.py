@@ -706,7 +706,7 @@ def _run_experiment_inner(
         for warning in experiment_warnings(experiment):
             log.warning("DRY RUN warning: %s", warning)
         for previewed in experiment.phases:
-            log.info("DRY RUN %s", sampler_capability_line(previewed))
+            log.info("DRY RUN %s", sampler_capability_line(previewed, experiment.resolved_storage))
             for warning in sampler_warnings(previewed):
                 log.warning("DRY RUN warning: %s", warning)
         recorded = _preview_ledger(experiment, from_phase=from_phase)
