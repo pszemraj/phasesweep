@@ -1,6 +1,6 @@
 # PhaseSweep config_reference.yaml: every key the experiment YAML accepts, in signature form (key: type = default).
 # This file does not load as YAML. Start from examples/example.yaml, which does.
-# It is maintained by hand. tests/test_config_reference.py compares every key path, variant, type and default with the schema.
+# It ships inside the package as phasesweep/config_reference.yaml and is parsed by phasesweep.config.reference. It is maintained by hand. tests/test_config_reference.py compares every key path, variant, type and default with the schema.
 # That test also requires a description on every key, an Unset: line on every (optional) key, and a counterpart for every Conflicts with:, Overrides: and Overridden by: line.
 # It does not check the prose, so bounds, units and interactions are only as current as their last review against the code.
 # Conflicts with:, Overrides: and Overridden by: lines start with the full dotted paths of the other keys, separated by commas, and put any explanation after a parenthesis or a semicolon.

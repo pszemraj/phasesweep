@@ -4,7 +4,7 @@ A PhaseSweep configuration is one operator-authored YAML document for one ordere
 
 Run `phasesweep validate <config>` before launching. The loader rejects duplicate YAML mapping keys and unsupported fields before it creates run artifacts. A top-level `suite` is rejected: write each component as its own complete experiment YAML file and review its defaults explicitly.
 
-Field types, defaults, and validation constraints are in [config_reference.yaml](config_reference.yaml). It is a signature reference, not runnable YAML; start with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Both CLI commands take an explicit config path. YAML values override built-in defaults; CLI execution flags and ambient environment do not form a general config-key overlay. Config is read once per invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal and `execution.cwd` paths resolve against the invocation directory, rather than the YAML file. MCP's separate catalog and detached-launch path rules are documented in the [operator reference](mcp.md#the-catalog).
+Field types, defaults, and validation constraints are in [config_reference.yaml](../src/phasesweep/config_reference.yaml). It is a signature reference, not runnable YAML; start with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Both CLI commands take an explicit config path. YAML values override built-in defaults; CLI execution flags and ambient environment do not form a general config-key overlay. Config is read once per invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal and `execution.cwd` paths resolve against the invocation directory, rather than the YAML file. MCP's separate catalog and detached-launch path rules are documented in the [operator reference](mcp.md#the-catalog).
 
 ## Experiment YAML
 
@@ -104,7 +104,7 @@ flowchart TD
 > [!IMPORTANT]
 > YAML decides scalar types before PhaseSweep reads fixed overrides or categorical choices. In this loader, bare `1e-3` is a string, while `1.0e-3` and `0.001` are floats. PhaseSweep preserves that distinction so string categories remain usable. Write a decimal value (or an exponent with a decimal mantissa) for a numeric override, and quote a value when you intend a string category.
 
-Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's trial target covers its concrete combinations unless `allow_partial_grid: true` is set; CMA-ES accepts numeric spaces only. Sampler-specific limits and fields are listed in the [reference](config_reference.yaml).
+Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's trial target covers its concrete combinations unless `allow_partial_grid: true` is set; CMA-ES accepts numeric spaces only. Sampler-specific limits and fields are listed in the [reference](../src/phasesweep/config_reference.yaml).
 
 For persistent storage, `random`, `tpe`, and `cmaes` need a seed. TPE and CMA-ES also require `acknowledge_nonresumable: true`: their target must finish in one invocation rather than being resumed or enlarged across processes. See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation) for trial accounting, partial results, and sampler continuation, and [confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
 

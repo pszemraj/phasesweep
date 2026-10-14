@@ -122,7 +122,7 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 ## Reference
 
 - [Configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md): Experiment YAML, search spaces, inheritance, gates, and objective extractors.
-- [Configuration reference](https://github.com/pszemraj/phasesweep/blob/main/docs/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
+- [Configuration reference](https://github.com/pszemraj/phasesweep/blob/main/src/phasesweep/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings.
 - [Minimal starting configuration](https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml): one local toy-trainer attempt; validate or run it from the checkout root.
 - [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.
 - [MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md): installed-package agent onboarding and client-owned setup.

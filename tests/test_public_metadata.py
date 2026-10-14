@@ -8,7 +8,9 @@ them may carry a configured secret.
 
 from __future__ import annotations
 
+import fnmatch
 import importlib
+import importlib.resources
 import stat
 import subprocess
 import sys
@@ -49,6 +51,28 @@ def test_console_scripts_declare_importable_targets() -> None:
         module_name, _, attribute = target.partition(":")
         module = importlib.import_module(module_name)
         assert callable(getattr(module, attribute)), f"{target} is not callable"
+
+
+def test_package_data_covers_shipped_resources() -> None:
+    """Every non-Python file the package reads at run time is declared as package data."""
+    declared = _pyproject()["tool"]["setuptools"]["package-data"]
+    templates = importlib.resources.files("phasesweep").joinpath("templates")
+    shipped = {
+        "phasesweep": [
+            "config_reference.yaml",
+            *(f"templates/{entry.name}" for entry in templates.iterdir() if entry.is_file()),
+        ],
+        "phasesweep.mcp": ["agent_prompt.md"],
+    }
+    assert len(shipped["phasesweep"]) > 1, "no packaged templates found"
+    for package, relative_paths in shipped.items():
+        patterns = [*declared["*"], *declared.get(package, [])]
+        for relative in relative_paths:
+            resource = importlib.resources.files(package).joinpath(relative)
+            assert resource.is_file(), f"{package}: {relative} is not an importable resource"
+            assert any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns), (
+                f"{package}: {relative} matches no declared package-data pattern {patterns}"
+            )
 
 
 @pytest.mark.integration
