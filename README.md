@@ -61,14 +61,18 @@ phasesweep run experiment.yaml        # four tiny trials, a few seconds
 
 `phasesweep init` never overwrites an existing file; use `-o PATH` for another destination.
 
-The run log shows the phase chaining directly (abridged):
+The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining directly and gains one `TRIAL` line per finished trial; `tail -f` follows it while a sweep runs (abridged):
 
 ```text
 [depth/trial_0] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
+phase=depth TRIAL trial=0 state=COMPLETE outcome=success value=0.3 duration=0.8s (1/2 finished)
 [depth/trial_1] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
+phase=depth TRIAL trial=1 state=COMPLETE outcome=success value=0.5 duration=0.7s (2/2 finished)
 phase=depth WINNER trial=0 metric=0.3 params={'model.n_layers': 8}
 [learning_rate/trial_0] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
+phase=learning_rate TRIAL trial=0 state=COMPLETE outcome=success value=0.3 duration=0.8s (1/2 finished)
 [learning_rate/trial_1] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
+phase=learning_rate TRIAL trial=1 state=COMPLETE outcome=success value=0.413822 duration=0.8s (2/2 finished)
 phase=learning_rate WINNER trial=0 metric=0.3 params={'optimizer.lr': 0.0003}
 ```
 

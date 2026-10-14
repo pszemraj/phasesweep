@@ -10,7 +10,7 @@ For `workdir: ./runs` and `experiment: demo`, PhaseSweep writes under `runs/demo
 demo/
   .gitignore
   artifact_root_binding.json
-  run.log
+  run.log                         # progress stream, one TRIAL line per finished trial
   study.journal                   # storage: auto
   generation.yaml
   last_successful_generation.yaml
@@ -45,6 +45,17 @@ The root `summary.yaml` and per-phase `winner.yaml` files are convenience projec
 `config.snapshot.yaml` is the executed configuration, including materialized defaults and the resolved invocation context. `reproducibility.json` is the shareable generation identity record. Trial directories retain local evidence and attempt lifecycle information used for supported continuation and winner validation.
 
 MLflow-backed experiments additionally retain native run bindings in each trial directory and mutable delivery state and worker cleanup receipts under `tracking/<generation-id>/`. These records support upload retries and recovery and are separate from the committed scientific manifests. Disposable supervised-worker scratch uses `~/.cache/phasesweep/<backend>/workers/`, or the corresponding `XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`. Each operation removes its temporary directory. Host lock placement retains its separate OS-account-home contract. See [MLflow tracking](mlflow.md) for ownership and offline replay.
+
+### Following a run
+
+`run.log` is the process-free progress stream. `tail -f <workdir>/<experiment>/run.log` follows a run from any shell, with no MCP server, no lock, and no PhaseSweep process of its own. Every finished trial adds one `TRIAL` line, in the order trials finish:
+
+```text
+2026-01-01 12:00:03 I phasesweep.engine.phase phase=depth TRIAL trial=0 state=COMPLETE outcome=success value=0.3 duration=0.4s (1/2 finished)
+2026-01-01 12:00:04 I phasesweep.engine.phase phase=lr TRIAL trial=2 state=FAIL outcome=failure value=none duration=0.5s (3/6 finished) reason=non-zero exit code 3
+```
+
+`state` is the trial's Optuna state, except that a COMPLETE trial that violated a constraint or the metric's `min`/`max` bounds reads `INFEASIBLE`, as selection treats it. `outcome` is `success`, `failure`, `pruned`, or `cancelled`, and a failure adds `reason=` with the first line of its recorded cause. `value` is the metric, or `none` when the trial produced none. `(k/n finished)` counts every terminal trial the phase's study holds, resumed ones included, against `n_trials`. A phase with [`repeats`](config.md#repeats) adds `repeat=<key>=<value>`, which names the seed or other repeat value that trial ran. The line carries no params; the `WINNER` line closing each phase does. A fatal objective error logs `FATAL OBJECTIVE ERROR` and skips the trial's `TRIAL` line.
 
 ### Repeat groups
 

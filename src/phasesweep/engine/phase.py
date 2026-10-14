@@ -18,6 +18,7 @@ from phasesweep.config import Experiment, Phase
 from phasesweep.config.search import _placeholder_values_for, sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
+    _parsed_trial_outcome,
     _register_active_attempt,
     _retire_active_attempt,
     _trial_requires_cleanup_recovery,
@@ -1229,18 +1230,64 @@ def _after_trial(
         raise
 
 
+def _log_finished_trial(
+    run: _PhaseExecution, trial: optuna.trial.FrozenTrial, finished: int
+) -> None:
+    """Log one INFO line for a finished trial, the progress stream a ``tail -f`` follows.
+
+    A COMPLETE trial that is infeasible, whether by a constraint or by the
+    metric's bounds, reports ``INFEASIBLE`` in place of its Optuna state, as
+    selection treats it. The reason is the first line of the recorded outcome
+    cause. A repeats phase adds the trial's repeat value so a reader can see
+    which seed ran. Params stay out of the line; the phase's WINNER line carries
+    the winner's.
+
+    :param _PhaseExecution run: The phase execution the trial belongs to.
+    :param optuna.trial.FrozenTrial trial: The just-finished trial.
+    :param int finished: Terminal trials the phase's study holds, this one included.
+    """
+    state = trial.state.name
+    if trial.state == optuna.trial.TrialState.COMPLETE and not trial.user_attrs.get(
+        FEASIBLE_ATTR, False
+    ):
+        state = "INFEASIBLE"
+    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    value = "none" if trial.value is None else f"{trial.value:g}"
+    duration = "none" if trial.duration is None else f"{trial.duration.total_seconds():.1f}s"
+    axis = repeat_axis(run.phase)
+    repeat = ""
+    if axis is not None and axis.key in trial.params:
+        repeat = f" repeat={axis.key}={trial.params[axis.key]}"
+    cause_lines = parsed.cause.strip().splitlines() if parsed and parsed.cause else []
+    log.info(
+        "phase=%s TRIAL trial=%d state=%s outcome=%s value=%s duration=%s%s (%d/%d finished)%s",
+        run.phase.name,
+        trial.number,
+        state,
+        "unknown" if parsed is None else parsed.outcome,
+        value,
+        duration,
+        repeat,
+        finished,
+        run.phase.n_trials,
+        f" reason={cause_lines[0]}" if cause_lines else "",
+    )
+
+
 def _settle_finished_trial(
     run: _PhaseExecution,
     study: optuna.Study,
     trial: optuna.trial.FrozenTrial,
 ) -> None:
-    """Retire cleaned attempts, mirror MLflow outcomes, and snapshot CSV.
+    """Log the trial's line, retire cleaned attempts, mirror MLflow outcomes, and snapshot CSV.
 
     The threshold decision itself lives in ``_record_outcome``, inside the
     objective's completion-order critical section — a callback observing a
     mutable aggregate counter is race-prone under ``n_jobs > 1`` (review
     v0.5.17 / blocker 7). This callback repeats ``study.stop()`` in
-    case the tripping thread's stop call failed transiently.
+    case the tripping thread's stop call failed transiently. The trial's
+    line comes before the MLflow publication, which can raise, so a trial
+    that finished is always on record in ``run.log``.
 
     Args:
         run: The phase execution the trial belongs to.
@@ -1252,6 +1299,8 @@ def _settle_finished_trial(
     if run.aborted:
         with contextlib.suppress(Exception):
             study.stop()
+    finished = _finished_trial_count(study.get_trials(deepcopy=False))
+    _log_finished_trial(run, trial, finished)
     # Terminal state alone is insufficient for an unsafe-cleanup trial: its
     # registry entry is the cross-phase/storage recovery locator and must
     # survive until preflight durably consumes cleanup evidence.
@@ -1274,7 +1323,6 @@ def _settle_finished_trial(
         publish_unaccepted_trial(
             run.experiment, run.generation_id, trial, run.environment_identity.values
         )
-    finished = _finished_trial_count(study.get_trials(deepcopy=False))
     now = time.monotonic()
     if run.csv_throttle.should_write(finished, now):
         with contextlib.suppress(Exception):

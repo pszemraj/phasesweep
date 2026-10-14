@@ -144,7 +144,7 @@ For MLflow, `get_run_status` and `await_run` report the run's own current local 
 
 ## Run state and recovery
 
-Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, and recovery sidecar files under `state_dir/logs/`. The control-process log is separate from trainer `stdout.log` and `stderr.log`, which are inside the operator-owned experiment workdir.
+Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, and recovery sidecar files under `state_dir/logs/`. The control-process log is separate from trainer `stdout.log` and `stderr.log`, which are inside the operator-owned experiment workdir. That workdir also holds the engine's `run.log`, which gains one `TRIAL` line per finished trial, so an operator can `tail -f` it for per-trial progress without a tool call (see [following a run](runtime.md#following-a-run)). No tool returns it, and the agent instructions keep the agent from opening it.
 
 The server records a process identity and coordinates launch across servers sharing one state directory. It retains an uncertain-cleanup reservation when it cannot prove a detached process group has stopped. Cancellation uses the saved identity and can require confirmation of cleanup; a stale PID alone is never considered authority to signal another process.
 
