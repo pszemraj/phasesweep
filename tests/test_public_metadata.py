@@ -182,7 +182,7 @@ def test_engine_exports_all_typed_preflight_errors() -> None:
         "StudySchemaMismatchError",
         "StudyStorageUnavailableError",
         "PublishedStudyMissingError",
-        "TrialTargetRegressionError",
+        "TrialTargetRefusedError",
     )
 
     assert set(names).issubset(engine.__all__)

@@ -42,7 +42,7 @@ from phasesweep.engine import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
     UnsafeProcessCleanupError,
 )
 from phasesweep.engine.paths import (
@@ -1594,7 +1594,7 @@ def test_expected_operational_failures_share_one_base() -> None:
         StudyFingerprintMismatchError,
         StudySchemaMismatchError,
         StudyStorageUnavailableError,
-        TrialTargetRegressionError,
+        TrialTargetRefusedError,
         UnsafeLockPathError,
     ):
         assert issubclass(error_type, PhaseSweepError), error_type.__name__

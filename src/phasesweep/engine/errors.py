@@ -173,10 +173,11 @@ class SamplerContinuationUnsupportedError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
 
 
-class TrialTargetRegressionError(PhaseSweepError):
+class TrialTargetRefusedError(PhaseSweepError):
     """Raised when a phase's trial target contradicts the trials its study already holds.
 
-    Either the target is below the one the study accepted, or it is a fixed
+    The target is refused in either direction. It is too low when it falls below
+    the target the study already accepted. It is too high when it is a fixed
     configuration's target past what that configuration may retry: one attempt
     more than its failures while none has completed, and none more once one
     has. Both are fixed by correcting ``n_trials``.

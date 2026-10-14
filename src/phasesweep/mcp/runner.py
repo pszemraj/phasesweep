@@ -48,7 +48,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.mcp.runs import (
@@ -82,7 +82,7 @@ FailureCode: TypeAlias = Literal[
     "tracking_unavailable",
     "published_study_missing",
     "sampler_continuation_unsupported",
-    "trial_target_regression",
+    "trial_target_refused",
     "experiment_busy",
     "trainer_failed",
     "timeout",
@@ -213,7 +213,7 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     # An unwritable workdir still fits the storage category.
     (ActiveAttemptPersistenceError, "storage_unavailable"),
     (SamplerContinuationUnsupportedError, "sampler_continuation_unsupported"),
-    (TrialTargetRegressionError, "trial_target_regression"),
+    (TrialTargetRefusedError, "trial_target_refused"),
     (NoFeasibleTrialError, "trainer_failed"),
 )
 # Categories that only occur at one stage, whatever stage the caller reports.

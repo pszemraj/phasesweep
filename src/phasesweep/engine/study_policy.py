@@ -19,7 +19,7 @@ from phasesweep.engine.errors import (
     SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
 )
 from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
 from phasesweep.engine.state import (
@@ -428,13 +428,13 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
 
     :param optuna.Study study: Existing study whose accepted target is checked.
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
-    :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
+    :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
         study's durable accepted target, or a fixed configuration asks for more
         attempts than it may retry.
     """
     accepted_target = _accepted_trial_target(study)
     if phase.n_trials < accepted_target:
-        raise TrialTargetRegressionError(
+        raise TrialTargetRefusedError(
             f"Phase {phase.name!r} has already accepted a target of {accepted_target} terminal "
             f"trial(s), but the current config requests {phase.n_trials}. Use at least the prior "
             "target or a new experiment name."
@@ -460,12 +460,12 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, complet
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :param int finished: Terminal attempts the phase's study holds.
     :param int completed: How many of those are COMPLETE.
-    :raises TrialTargetRegressionError: The fixed configuration asks for more
+    :raises TrialTargetRefusedError: The fixed configuration asks for more
         attempts than it may retry; the message names the largest allowed target.
     """
     refusal = fixed_configuration_target_refusal(phase, finished=finished, completed=completed)
     if refusal is not None:
-        raise TrialTargetRegressionError(refusal)
+        raise TrialTargetRefusedError(refusal)
 
 
 def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
@@ -521,7 +521,7 @@ def _record_trial_target(study: optuna.Study, phase: Phase) -> None:
 
     :param optuna.Study study: Study whose accepted trial target is stored.
     :param Phase phase: Phase config supplying the new ``n_trials`` target.
-    :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
+    :raises TrialTargetRefusedError: ``phase.n_trials`` is lower than the
         study's already-accepted target.
     """
     _validate_trial_target(study, phase)

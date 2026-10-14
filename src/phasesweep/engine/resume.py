@@ -234,7 +234,7 @@ def _reject_fixed_targets_without_study(
     :param str | None from_phase: Optional resume point; phases before it are skipped.
     :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
         phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
-    :raises TrialTargetRegressionError: A reached fixed configuration without a
+    :raises TrialTargetRefusedError: A reached fixed configuration without a
         study asks for more than one trial; delegated to
         :func:`phasesweep.engine.study_policy._validate_fixed_configuration_target`.
     """

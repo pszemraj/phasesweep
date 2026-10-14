@@ -33,7 +33,7 @@ from phasesweep.engine import (
     SamplerContinuationUnsupportedError,
     TerminalReport,
     TrackingTargetUnavailableError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
     read_status,
     run_experiment,
 )
@@ -253,8 +253,8 @@ def _spawned_runner(
             id="tracking",
         ),
         pytest.param(
-            TrialTargetRegressionError("target moved backward"),
-            "trial_target_regression",
+            TrialTargetRefusedError("target moved backward"),
+            "trial_target_refused",
             "correct the experiment configuration",
             id="target",
         ),

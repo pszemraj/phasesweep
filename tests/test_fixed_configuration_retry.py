@@ -19,7 +19,7 @@ from phasesweep import run_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import Experiment, IntParam, LogRegexExtractor, Metric, Phase, Sampler
 from phasesweep.config.search import fixed_configuration_target_refusal
-from phasesweep.engine import NoFeasibleTrialError, TrialTargetRegressionError
+from phasesweep.engine import NoFeasibleTrialError, TrialTargetRefusedError
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR, TRIAL_TARGET_ATTR
@@ -128,7 +128,7 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
         run_experiment(attempt(1))
     assert _call_count(calls) == 1
 
-    with pytest.raises(TrialTargetRegressionError) as refused:
+    with pytest.raises(TrialTargetRefusedError) as refused:
         run_experiment(attempt(3))
     assert str(refused.value) == (
         "Phase 'p' is a fixed configuration with 1 failed attempt and no completed one; "
@@ -141,7 +141,7 @@ def test_failed_fixed_configuration_is_retried_by_raising_n_trials(
     assert winners["p"].metric == 1.0
     assert _states(attempt(2)) == ["FAIL", "COMPLETE"]
 
-    with pytest.raises(TrialTargetRegressionError) as repeated:
+    with pytest.raises(TrialTargetRefusedError) as repeated:
         run_experiment(attempt(3))
     assert str(repeated.value) == (
         "Phase 'p' is a fixed configuration that already has a completed trial; n_trials=3 "
@@ -165,7 +165,7 @@ def test_fixed_configuration_retry_counts_every_failed_attempt(tmp_path: Path) -
         run_experiment(_fixed(tmp_path, trainer, 2))
     assert _call_count(calls) == 2
 
-    with pytest.raises(TrialTargetRegressionError, match="2 failed attempts .* at most 3, not 4"):
+    with pytest.raises(TrialTargetRefusedError, match="2 failed attempts .* at most 3, not 4"):
         run_experiment(_fixed(tmp_path, trainer, 4))
     assert _call_count(calls) == 2
 
@@ -185,7 +185,7 @@ def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Pat
         run_experiment(_fixed(tmp_path, trainer, 1, metric=bounded))
     assert _states(_fixed(tmp_path, trainer, 1)) == ["COMPLETE"]
 
-    with pytest.raises(TrialTargetRegressionError, match="already has a completed trial"):
+    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
         run_experiment(_fixed(tmp_path, trainer, 2, metric=bounded))
     assert _call_count(calls) == 1
 
@@ -203,7 +203,7 @@ def test_stale_recovered_fixed_configuration_attempt_is_retried(tmp_path: Path) 
     assert _states(exp) == ["FAIL"]
     assert _call_count(calls) == 0
 
-    with pytest.raises(TrialTargetRegressionError, match="use at most 2, not 3"):
+    with pytest.raises(TrialTargetRefusedError, match="use at most 2, not 3"):
         run_experiment(_fixed(tmp_path, trainer, 3))
     assert _call_count(calls) == 0
 
@@ -226,19 +226,19 @@ def test_fresh_persistent_fixed_configuration_refuses_a_larger_target_before_any
     fixed = Phase(name="p", n_trials=3, inherits=["a"])
     exp = make_experiment(persistent=tmp_path, trainer=trainer, phases=[searching, fixed])
 
-    with pytest.raises(TrialTargetRegressionError) as dry:
+    with pytest.raises(TrialTargetRefusedError) as dry:
         run_experiment(exp, dry_run=True)
     assert str(dry.value) == _FRESH_THREE
     assert not (tmp_path / "studies.journal").exists()
 
-    with pytest.raises(TrialTargetRegressionError) as launched:
+    with pytest.raises(TrialTargetRefusedError) as launched:
         run_experiment(exp)
     assert str(launched.value) == _FRESH_THREE
     assert _call_count(calls) == 0
 
     # The MCP runner calls run_experiment, so this is the failure it records for a launch.
     failure = mcp_runner._safe_failure_payload(launched.value, stage="preflight")
-    assert failure["code"] == "trial_target_regression"
+    assert failure["code"] == "trial_target_refused"
     assert failure["actor"] == "operator"
 
     # The same tree runs once the fixed configuration asks for its one trial.
@@ -260,13 +260,13 @@ def test_dry_run_reads_the_recorded_attempts_of_a_persistent_fixed_configuration
         run_experiment(_fixed(tmp_path, trainer, 1))
 
     run_experiment(_fixed(tmp_path, trainer, 2), dry_run=True)
-    with pytest.raises(TrialTargetRegressionError, match="use at most 2, not 3"):
+    with pytest.raises(TrialTargetRefusedError, match="use at most 2, not 3"):
         run_experiment(_fixed(tmp_path, trainer, 3), dry_run=True)
     assert _call_count(calls) == 1
 
     run_experiment(_fixed(tmp_path, trainer, 2))
     run_experiment(_fixed(tmp_path, trainer, 2), dry_run=True)
-    with pytest.raises(TrialTargetRegressionError, match="already has a completed trial"):
+    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
         run_experiment(_fixed(tmp_path, trainer, 3), dry_run=True)
     assert _call_count(calls) == 2
 

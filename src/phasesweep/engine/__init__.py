@@ -18,7 +18,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
     TrackingTargetUnavailableError,
     TrialEvidenceMissingError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
     WinnerIntegrityError,
 )
 from phasesweep.engine.read import (
@@ -66,7 +66,7 @@ __all__ = [
     "TrialEvidenceMissingError",
     "TrialTable",
     "TrialTables",
-    "TrialTargetRegressionError",
+    "TrialTargetRefusedError",
     "UnsafeProcessCleanupError",
     "Winner",
     "WinnerIntegrityError",

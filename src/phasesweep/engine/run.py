@@ -99,7 +99,7 @@ def _preview_fixed_configuration_targets(
 
     :param Experiment experiment: Parsed experiment being previewed.
     :param str | None from_phase: Optional first phase a launch would execute.
-    :raises TrialTargetRegressionError: A reached fixed configuration asks for
+    :raises TrialTargetRefusedError: A reached fixed configuration asks for
         more attempts than it may retry given the trials recorded so far.
     :raises ArtifactRootConflictError: The tree is bound to a different owner.
     :raises StudySchemaMismatchError: A ledger study uses an unsupported schema.

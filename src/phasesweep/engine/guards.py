@@ -21,7 +21,7 @@ from phasesweep.engine.errors import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
 )
 from phasesweep.engine.ledger import ClaimedLedger, claim_ledger, validate_ledger
 from phasesweep.engine.optuna import _finished_trial_count
@@ -96,7 +96,7 @@ def _preflight_existing_studies(
         be read while its stale trials were recovered.
     :raises StudySchemaMismatchError: A phase's study uses an incompatible
         storage schema.
-    :raises TrialTargetRegressionError: A phase's study already accepted a
+    :raises TrialTargetRefusedError: A phase's study already accepted a
         higher trial target than the current config requests, or a fixed
         configuration asks for more attempts than its trials let it retry.
     :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
@@ -204,7 +204,7 @@ def _preflight_existing_studies(
             StudySchemaMismatchError,
             StudyFingerprintMismatchError,
             StudyStorageUnavailableError,
-            TrialTargetRegressionError,
+            TrialTargetRefusedError,
         ):
             if all(isinstance(error, error_type) for error in errors):
                 raise error_type(message, action=shared) from first

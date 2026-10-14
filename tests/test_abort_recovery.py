@@ -10,7 +10,7 @@ import pytest
 
 from phasesweep import run_experiment
 from phasesweep.config import Experiment
-from phasesweep.engine import StudySchemaMismatchError, TrialTargetRegressionError
+from phasesweep.engine import StudySchemaMismatchError, TrialTargetRefusedError
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.paths import _last_successful_generation_path
 from phasesweep.engine.selection import NoFeasibleTrialError
@@ -233,8 +233,8 @@ def test_changing_the_failure_limit_never_reinterprets_recorded_outcomes(tmp_pat
     ("failing_attr", "old_target_refusal"),
     [
         (PHASE_RECOVERY_ATTR, NoFeasibleTrialError),
-        (TRIAL_TARGET_ATTR, TrialTargetRegressionError),
-        (_ALLOCATION_CONTEXT_ATTR, TrialTargetRegressionError),
+        (TRIAL_TARGET_ATTR, TrialTargetRefusedError),
+        (_ALLOCATION_CONTEXT_ATTR, TrialTargetRefusedError),
     ],
 )
 @pytest.mark.integration

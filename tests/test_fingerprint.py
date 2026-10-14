@@ -37,7 +37,7 @@ from phasesweep.engine import (
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
-    TrialTargetRegressionError,
+    TrialTargetRefusedError,
     read_status,
     read_winner,
     read_winners,
@@ -904,7 +904,7 @@ def test_persistent_trial_target_cannot_move_backward(tmp_path: Path) -> None:
     winner_before = _winner_path(experiment, "p").read_bytes()
 
     lowered = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 1})]})
-    with pytest.raises(TrialTargetRegressionError, match="accepted a target of 3"):
+    with pytest.raises(TrialTargetRefusedError, match="accepted a target of 3"):
         run_experiment(lowered)
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
