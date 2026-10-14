@@ -244,6 +244,37 @@ def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
     assert {trial.params["x"] for trial in loaded.trials} == {1, 2, 3, 4}
 
 
+def test_grid_top_up_never_reruns_a_failed_point(tmp_path: Path) -> None:
+    """A failed grid point counts as visited, so a top-up reaches only points never tried."""
+    choices = [1, 2, 3]
+    search_space = {"x": CategoricalParam(type="categorical", choices=choices)}
+    sampler = Sampler(type="grid", seed=0)
+    storage = _resolve_storage(f"journal:///{tmp_path / 'grid.journal'}")
+
+    def objective(trial: optuna.Trial) -> float:
+        value = trial.suggest_categorical("x", choices)
+        if trial.number == 0:
+            raise RuntimeError("interrupted")
+        return float(value)
+
+    for target in (2, 3):
+        study = optuna.create_study(
+            study_name="failed-grid::p",
+            storage=storage,
+            sampler=_build_sampler(sampler, search_space),
+            load_if_exists=True,
+        )
+        study.optimize(objective, n_trials=target - len(study.trials), catch=(RuntimeError,))
+
+    loaded = optuna.load_study(study_name="failed-grid::p", storage=storage)
+    assert [trial.state for trial in loaded.trials] == [
+        optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.COMPLETE,
+    ]
+    assert sorted(trial.params["x"] for trial in loaded.trials) == choices
+
+
 def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
     """Failing a stale trial that holds a grid's last unfinished point commits FAIL.
 
