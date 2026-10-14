@@ -43,7 +43,7 @@ phases:
       optimizer.lr: { type: categorical, choices: [0.0001, 0.0003] }
 ```
 
-The packaged fake trainer uses the optional `report_objective(...)` envelope helper. Your own trainer can report through W&B, MLflow, ordinary JSON, or logs.
+The packaged fake trainer reports through the optional `report_objective(...)` helper, which the `json_envelope` extractor reads. Your own trainer can report through that helper, W&B, MLflow, ordinary JSON, or logs.
 
 ## Install and try it
 
@@ -59,7 +59,7 @@ phasesweep validate starter.yaml    # checks it without launching anything
 phasesweep run starter.yaml         # four tiny trials, a few seconds
 ```
 
-`phasesweep init` never overwrites an existing file. `phasesweep init --list` names the other templates, which cover a trainer that takes `--key=value` flags, one phase per architecture, a chained search and a noisy objective; `--template NAME` writes one, and `-o PATH` names the file or a directory that receives `NAME.yaml`. Every template runs as written on the packaged toy trainer, so replace its trainer command, keys and extractor with your own.
+`phasesweep init` never overwrites an existing file. `phasesweep init --list` names the other templates, which cover a trainer that takes `--key=value` flags, one phase per architecture, a chained search and a [noisy objective](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets); `--template NAME` writes one, and `-o PATH` names the file or a directory that receives `NAME.yaml`. Every template runs as written on the packaged toy trainer, so replace its trainer command, keys and extractor with your own.
 
 The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining directly and gains one `TRIAL` line per finished trial; `tail -f` follows it while a sweep runs (abridged):
 
@@ -119,7 +119,7 @@ trial  state        value  params               duration_s  winner
 
 ## Use your own trainer
 
-Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates) closest to your trainer, then choose the input interface it already accepts:
+Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#templates) closest to your trainer, then choose the input interface it already accepts. `phasesweep explain KEY` prints the reference for one key, and a configuration error from `validate` or `run` ends with `see: phasesweep explain KEY` lines naming the keys involved.
 
 | Input | Command placeholder |
 | --- | --- |
@@ -131,6 +131,8 @@ Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/
 > [!TIP]
 > `phasesweep run starter.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects.
 
+The trainer runs in `execution.cwd`, or in the directory you started PhaseSweep from when that is unset, with a minimal environment: `PATH`, `HOME`, `TMPDIR` and a few more, not the shell's `PYTHONPATH`, conda settings, caches or credentials. Name what it needs under `env` or `execution.inherit_env`; `validate` and `--dry-run` print the `environment:` and `trainer cwd:` lines, and a relative path in the config resolves against the config file's directory. The [trainer contract](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract) has the details.
+
 For ordinary JSON output, pass an output path under `{trial_dir}` to your trainer and select it with `extractor: {type: json, path: result.json, key: eval.loss}`. For W&B, use `extractor: {type: wandb, entity: YOUR_ENTITY, project: YOUR_PROJECT, metric_key: eval/loss}`, have the trainer honor the supplied W&B identity, and install the extra:
 
 ```bash
@@ -139,13 +141,15 @@ pip install "phasesweep[wandb]"
 
 For native MLflow metrics, install `phasesweep[mlflow]`, configure an existing experiment in the `mlflow` block, and use `extractor: {type: mlflow, metric_key: eval/loss, select: last}`. See the [MLflow guide](https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md) for both run ownership modes, a complete CPU example, Databricks setup, and retrying result uploads.
 
+Report through `phasesweep.report_objective(...)` and the `json_envelope` extractor when the checkpoint behind a value matters, as with Transformers' `load_best_model_at_end`; the same call can write report-only values with `extra=`. A top-level `observe:` list records such values per trial without ranking on them, for example a held-out test score, and `metric.min` / `metric.max` keep a collapsed run from winning. When the metric moves with the seed, rank by a mean over seeds with `repeats`. [Noisy objectives and small budgets](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets) covers these together, and [objective evidence](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#objective-evidence-constraints-and-gates) defines the extractors, bounds and `observe`.
+
 ## Connect an agent
 
-The optional MCP server connects an AI agent to experiments you have approved without exposing config or storage paths, trainer commands, environment values, or raw logs. Sampled winner values follow the catalog's `visible_params` policy. Follow the [MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md) to install the extra, review the catalog authority boundary, configure a client-owned connection, and verify the result.
+The optional MCP server connects an AI agent to experiments you have approved without exposing config or storage paths, trainer commands, environment values, or raw logs. Sampled winner values follow the catalog's `visible_params` policy. Follow the [MCP setup](https://github.com/pszemraj/phasesweep/blob/main/docs/mcp_setup.md) to install the extra, review the catalog authority boundary, configure a client-owned connection, and verify the result; `phasesweep mcp call` runs one tool from a shell without a client.
 
 ## Reference
 
-- [Configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md): Experiment YAML, search spaces, inheritance, gates, and objective extractors.
+- [Configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md): Experiment YAML, search spaces, inheritance, repeats and noisy objectives, gates, and objective extractors.
 - [Configuration reference](https://github.com/pszemraj/phasesweep/blob/main/src/phasesweep/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings. Too long to read whole; `phasesweep explain` lists the top-level keys and `phasesweep explain 'phases[].sampler'` prints one key and everything below it.
 - [Minimal starting configuration](https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml): one local toy-trainer attempt; validate or run it from the checkout root.
 - [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.

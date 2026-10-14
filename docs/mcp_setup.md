@@ -16,7 +16,7 @@ Contributor and editable-install setup is in [development](development.md). Inst
 
 ### 2. Create and review the catalog
 
-If you do not have an experiment yet, `phasesweep init` creates an installed-package starter named `starter.yaml` without overwriting files; `phasesweep init --list` names the other [templates](config.md#templates). The [configuration reference](../src/phasesweep/config_reference.yaml) describes the accepted experiment fields, including backend selection and environment composition.
+If you do not have an experiment yet, `phasesweep init` creates an installed-package starter named `starter.yaml` without overwriting files; `phasesweep init --list` names the other [templates](config.md#templates), including `noisy` for a metric that moves with the seed. The [configuration reference](../src/phasesweep/config_reference.yaml) describes the accepted experiment fields, including backend selection and environment composition; `phasesweep explain KEY` prints one key from it, and a connected agent that is asked for config-authoring help gets the same lookup from the `explain_config` tool.
 
 Before cataloging a source-checkout trainer, follow the [trainer environment preflight](config.md#source-checkout-preflight) to verify its imported library and supported arguments under the configured environment. Then create the catalog:
 

@@ -4,6 +4,8 @@ A PhaseSweep configuration is one operator-authored YAML document for one ordere
 
 Run `phasesweep validate <config>` before launching. The loader rejects duplicate YAML mapping keys and unsupported fields before it creates run artifacts. A top-level `suite` is rejected: write each component as its own complete experiment YAML file and review its defaults explicitly.
 
+Two sections cover the usual reasons to leave the defaults. [Noisy objectives and small budgets](#noisy-objectives-and-small-budgets) is for a metric that moves with the seed or a phase with few trials: ranking by a mean over seeds with `repeats`, a seed audit, viability bounds and report-only `observe` values. [Objective evidence, constraints, and gates](#objective-evidence-constraints-and-gates) is for what the trainer reports, including the `json_envelope` extractor that records which checkpoint a value came from.
+
 Field types, defaults, and validation constraints are in [config_reference.yaml](../src/phasesweep/config_reference.yaml), which is too long to read whole: `phasesweep explain KEY` prints one key and everything below it, and the [reference index](#reference-index) lists where each top-level key lives. It is a signature reference, not runnable YAML; start with a [template](#templates) written by `phasesweep init`, or with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Both CLI commands take an explicit config path. YAML values override built-in defaults; CLI execution flags and ambient environment do not form a general config-key overlay. Config is read once per invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal and `execution.cwd` paths resolve against the directory of the YAML file, so the same file writes the same artifact tree from any directory, through the CLI or MCP. An `Experiment` built in Python has no file and resolves them against the process working directory. MCP's separate catalog paths are documented in the [operator reference](mcp.md#the-catalog).
 
 ## Reference index
@@ -32,7 +34,7 @@ Field types, defaults, and validation constraints are in [config_reference.yaml]
 | `argparse` | A trainer that takes `--key=value` flags: `override_format: argparse`, `trainer_config` as the base, a seeded random learning-rate search. | `phasesweep init --template argparse` |
 | `architectures` | One phase per architecture, none inheriting another, each fixing its model keys and running a small learning-rate grid. | `phasesweep init --template architectures` |
 | `chained` | A seeded random learning-rate search, then a phase that inherits it and searches a key the first phase only fixed. | `phasesweep init --template chained` |
-| `noisy` | A noisy objective: a seed audit that measures the spread, a grid ranked by the mean over seeds with [repeats](#repeats), a `metric.max` viability bound and an `observe` entry. | `phasesweep init --template noisy` |
+| `noisy` | A noisy objective: a seed audit that measures the spread, a grid ranked by the mean over seeds with [repeats](#repeats), a `metric.max` viability bound and an `observe` entry; [Noisy objectives and small budgets](#noisy-objectives-and-small-budgets) explains each. | `phasesweep init --template noisy` |
 
 ## Experiment YAML
 
@@ -132,7 +134,7 @@ flowchart TD
 > [!IMPORTANT]
 > YAML decides scalar types before PhaseSweep reads fixed overrides or categorical choices. In this loader, bare `1e-3` is a string, while `1.0e-3` and `0.001` are floats. PhaseSweep preserves that distinction so string categories remain usable. Write a decimal value (or an exponent with a decimal mantissa) for a numeric override, and quote a value when you intend a string category.
 
-Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's trial target covers its concrete combinations unless `allow_partial_grid: true` is set; CMA-ES accepts numeric spaces only. `validate` and `run --dry-run` warn when a `tpe` phase's `n_trials` does not exceed `sampler.n_startup_trials` (default 10), because then every trial is sampled at random. Sampler-specific limits and fields are listed in the [reference](../src/phasesweep/config_reference.yaml).
+Supported sampler types are `grid`, `random`, `tpe`, and `cmaes`. A grid's trial target covers its concrete combinations unless `allow_partial_grid: true` is set; CMA-ES accepts numeric spaces only. `validate` and `run --dry-run` warn when a `tpe` phase's `n_trials` does not exceed `sampler.n_startup_trials` (default 10), because then every trial is sampled at random. Sampler-specific limits and fields are listed in the [reference](../src/phasesweep/config_reference.yaml). Choosing a sampler for a noisy objective or a small trial budget is covered in [Noisy objectives and small budgets](#noisy-objectives-and-small-budgets).
 
 For persistent storage, a phase with a `search_space` that uses `random`, `tpe`, or `cmaes` needs a seed. TPE and CMA-ES also require `acknowledge_nonresumable: true`: their target must finish in one invocation rather than being resumed or enlarged across processes. A phase with an empty `search_space` and no `repeats` draws nothing and is exempt from both. See [timeouts and continuation](runtime.md#timeouts-cleanup-and-continuation) for trial accounting, partial results, and sampler continuation, and [confound verdicts](runtime.md#confound-verdicts) for the advisory checks.
 
@@ -217,7 +219,7 @@ The metric is a finite scalar extracted after the trainer exits successfully. Us
 - `json` reads a finite JSON number at a saved trial-relative path and dotted key, for example `{type: json, path: result.json, key: eval.loss}`. It records no evaluation position, so selection's `evaluation_point` check is always `n/a` for it (as for `log_regex`).
 - `wandb` reads an exact scalar key such as `eval/loss` from the finished run whose ID is the immutable trial attempt ID. It requires the optional `wandb` extra and an authorized entity/project.
 - `mlflow` reads native metric history from the bound finished run. It requires the optional `mlflow` extra, an existing experiment in the top-level `mlflow` block, and an explicit `select: last | min | max | step`. See the [MLflow guide](mlflow.md) for ownership, selection, and result delivery.
-- `json_envelope` reads an attempt-bound versioned envelope from a trial-relative path. Python trainers can call `phasesweep.report_objective` to write it to the managed `PHASESWEEP_OBJECTIVE_PATH`.
+- `json_envelope` reads an attempt-bound versioned envelope from a trial-relative path. Python trainers can call `phasesweep.report_objective` to write it to the managed `PHASESWEEP_OBJECTIVE_PATH`. It is the extractor that binds the evaluation policy, checkpoint and step, so use it when the checkpoint behind a value matters, as with Transformers `load_best_model_at_end` (see the `evaluation_point` note below). `report_objective(..., extra=...)` also writes report-only values for [`observe`](#objective-evidence-constraints-and-gates) to read.
 - `log_regex` reads a trial-relative log file and selects a numeric named `(?P<value>...)` match; `select: last` remains the default.
 
 `constraints` use the same scalar readers. A valid measured constraint violation is a completed but infeasible trial; missing or invalid evidence fails the trial. Phase `gates` include `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, `wandb_summary_required`, and `mlflow_required`. `mlflow_required` separately names `metrics`, `params`, and `tags` from the same bound run. A failed gate fails the trial. There is no advisory gate mode or baseline substitution.
@@ -277,7 +279,7 @@ PhaseSweep supplies `WANDB_BASE_URL`, `WANDB_ENTITY`, `WANDB_PROJECT`, `WANDB_RU
 
 The reader receives the trainer's composed authentication and transport environment. Use `execution.passthrough_env` for rotating environment credentials or proxies; the default `inherit_env: none` does not pass an unlisted credential at all. Excluded parent credentials are not reacquired. Supported SDK account authentication also works; an API-key environment variable is not mandatory. Credentials are never serialized in worker requests. Syntax validation and dry runs do not authenticate.
 
-W&B's source is keyed by attempt ID; it makes none of the envelope's evaluation-metadata or trainer-input-content assurances. It only records where in the run's history the objective's value was logged.
+W&B's source is keyed by attempt ID; it makes none of the envelope's evaluation-metadata or trainer-input-content assurances. It only records where in the run's history the objective's value was logged. Report through `json_envelope` instead when the checkpoint behind the value must be recorded.
 
 ## Trainer contract
 

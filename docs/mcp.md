@@ -92,7 +92,7 @@ Save the `run_id` returned by launch. To reconnect from another chat or after a 
 
 If it returns `found: false`, `run` is null and there is no run to resume. `await_run` is bounded server-side waiting; use it for monitoring rather than tight status polling. One call accepts at most 600 seconds in `timeout_seconds`; to keep waiting, call it again with the same `run_id`. Never cancel a run or launch a replacement automatically.
 
-`get_run_results` is run-specific. A plain `phasesweep run` can publish winners, but it does not create an MCP run record. Its results remain inspectable through `phasesweep status` and `phasesweep show-winners`; the server does not create handles for an arbitrary existing output tree.
+`get_run_results` is run-specific. A plain `phasesweep run` can publish winners, but it does not create an MCP run record. Its results remain inspectable through `phasesweep status` (add `--trials` for one row per trial) and `phasesweep show-winners`; the server does not create handles for an arbitrary existing output tree.
 
 ### Calling a tool from a shell
 
@@ -171,7 +171,7 @@ For MLflow, `get_run_status` and `await_run` report the run's own current local 
 
 ## Run state and recovery
 
-Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, and recovery sidecar files under `state_dir/logs/`. The control-process log is separate from trainer `stdout.log` and `stderr.log`, which are inside the operator-owned experiment workdir. That workdir also holds the engine's `run.log`, which gains one `TRIAL` line per finished trial, so an operator can `tail -f` it for per-trial progress without a tool call (see [following a run](runtime.md#following-a-run)). No tool returns it, and the agent instructions keep the agent from opening it.
+Each run has a UUID-bearing handle under `state_dir/runs/`, plus private log, saved-config, terminal-status, and recovery sidecar files under `state_dir/logs/`. The control-process log is separate from trainer `stdout.log` and `stderr.log`, which are inside the operator-owned experiment workdir. That workdir also holds the engine's `run.log`, which gains one `TRIAL` line per finished trial, so an operator can `tail -f` it for per-trial progress without a tool call (see [following a run](runtime.md#following-a-run)), or print the trials as a table with `phasesweep status CONFIG --trials`. No tool returns it, and the agent instructions keep the agent from opening it.
 
 The server records a process identity and coordinates launch across servers sharing one state directory. It retains an uncertain-cleanup reservation when it cannot prove a detached process group has stopped. Cancellation uses the saved identity and can require confirmation of cleanup; a stale PID alone is never considered authority to signal another process.
 
