@@ -703,7 +703,7 @@ def _persist_spawned_handle(
     config_sha256: str,
     started_at: str,
     allow_cancel: bool,
-) -> None:
+) -> RunHandle:
     """Persist this runner's process identity before it launches any training work.
 
     :param Path state_dir: Server state dir whose ``runs/`` receives the handle.
@@ -715,6 +715,7 @@ def _persist_spawned_handle(
     :raises RuntimeError: If Linux ``/proc`` start time, boot id, or PID namespace
         is unavailable, so the handle could not be made PID-reuse safe, or the
         server never created a pending handle for ``run_id``.
+    :return RunHandle: The spawned handle now on disk.
     """
     store = RunStore(state_dir)
     pid = os.getpid()
@@ -739,28 +740,29 @@ def _persist_spawned_handle(
     pending = store.get(run_id)
     if pending is None:
         raise RuntimeError(f"cannot persist runner identity for unknown run {run_id!r}")
-    store.update(
-        RunHandle(
-            run_id=run_id,
-            experiment_id=experiment_id,
-            config_sha256=config_sha256,
-            pid=pid,
-            pgid=pgid,
-            pid_starttime=pid_starttime,
-            started_at=started_at,
-            launch_state="spawned",
-            allow_cancel=allow_cancel,
-            visible_params_at_launch=pending.visible_params_at_launch,
-            # Binds pid/pid_starttime to this boot: after a reboot the pair can
-            # name an unrelated process, and a reader that knows the boot
-            # differs can rule the runner dead without signalling anything.
-            boot_id=boot_id,
-            # Binds pid/pgid to the namespace that numbers them: a reader in
-            # another PID namespace sees unrelated processes under the same
-            # numbers and must not probe or signal them.
-            pid_namespace=pid_namespace,
-        )
+    handle = RunHandle(
+        run_id=run_id,
+        experiment_id=experiment_id,
+        config_sha256=config_sha256,
+        config_dir=pending.config_dir,
+        pid=pid,
+        pgid=pgid,
+        pid_starttime=pid_starttime,
+        started_at=started_at,
+        launch_state="spawned",
+        allow_cancel=allow_cancel,
+        visible_params_at_launch=pending.visible_params_at_launch,
+        # Binds pid/pid_starttime to this boot: after a reboot the pair can
+        # name an unrelated process, and a reader that knows the boot
+        # differs can rule the runner dead without signalling anything.
+        boot_id=boot_id,
+        # Binds pid/pgid to the namespace that numbers them: a reader in
+        # another PID namespace sees unrelated processes under the same
+        # numbers and must not probe or signal them.
+        pid_namespace=pid_namespace,
     )
+    store.update(handle)
+    return handle
 
 
 def _complete_launch_handshake(ready_fd: int, ack_fd: int, lease_fd: int) -> None:
@@ -878,7 +880,7 @@ def main(argv: list[str] | None = None) -> int:
         # The server also saves this handle after Popen returns. The runner's
         # self-write closes the restart-recovery window if the server dies
         # after Popen but before its own spawned-handle save reaches disk.
-        _persist_spawned_handle(
+        handle = _persist_spawned_handle(
             state_dir=state_dir,
             run_id=args.run_id,
             experiment_id=args.experiment_id,
@@ -906,10 +908,14 @@ def main(argv: list[str] | None = None) -> int:
         # find and terminate.
         os.chdir(project_cwd)
         try:
+            # The snapshot sits in the state directory, so relative config
+            # paths resolve against the directory recorded at launch, not the
+            # snapshot's location or this process's cwd.
             config = load_experiment_snapshot(
                 config_path,
                 args.config_sha256,
                 source=f"run snapshot {args.run_id}",
+                config_dir=Path(handle.config_dir),
             )
         except (OSError, ValueError) as exc:
             raise RuntimeError(str(exc)) from exc

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import shlex
 import sys
@@ -147,24 +146,6 @@ def _load_cli_config(path: Path) -> Experiment:
         raise ConfigError(f"{path}: {exc}") from exc
 
 
-def _starter_experiment_text(target: Path) -> str:
-    """Render the packaged starter config with target-local absolute paths.
-
-    :param Path target: Absolute destination for the starter YAML.
-    :return str: Rendered annotated YAML text.
-    """
-    template = (
-        resources.files("phasesweep")
-        .joinpath("templates", "starter_experiment.yaml")
-        .read_text(encoding="utf-8")
-    )
-    runs_dir = target.parent / "runs"
-    # JSON and YAML double-quoted scalars share escaping for valid Unicode.
-    # Keep non-ASCII workdir characters literal to avoid JSON's UTF-16 surrogate
-    # pairs.
-    return template.replace("__PHASESWEEP_WORKDIR__", json.dumps(str(runs_dir), ensure_ascii=False))
-
-
 @cli.command(
     context_settings=CONTEXT_SETTINGS,
     help="Write a runnable two-phase starter experiment without overwriting files.",
@@ -192,7 +173,11 @@ def init(output: Path) -> None:
     if target.exists() or target.is_symlink():
         click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)
         raise click.exceptions.Exit(2)
-    text = _starter_experiment_text(target)
+    text = (
+        resources.files("phasesweep")
+        .joinpath("templates", "starter_experiment.yaml")
+        .read_text(encoding="utf-8")
+    )
     try:
         if not atomic_create_text(target, text):
             click.echo(f"phasesweep init: refusing to overwrite existing path {target}", err=True)

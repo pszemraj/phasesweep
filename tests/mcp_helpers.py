@@ -226,6 +226,7 @@ def make_run_handle(
     run_id: str,
     experiment_id: str = "exp",
     config_sha256: str = "0" * 64,
+    config_dir: str = "/",
     pid: int | None = None,
     starttime: int | None = None,
     launch_state: RunLaunchState = "spawned",
@@ -240,6 +241,7 @@ def make_run_handle(
     :param str run_id: Run identifier.
     :param str experiment_id: Catalog experiment identifier.
     :param str config_sha256: Configuration digest the handle pins.
+    :param str config_dir: Absolute directory the snapshot's relative paths resolve against.
     :param int | None pid: Runner PID, or this process when ``None``.
     :param int | None starttime: Runner start time, or the one read from ``/proc`` when ``None``.
     :param RunLaunchState launch_state: ``launching`` records no process identity at all.
@@ -270,6 +272,7 @@ def make_run_handle(
         run_id=run_id,
         experiment_id=experiment_id,
         config_sha256=config_sha256,
+        config_dir=config_dir,
         pid=process_id,
         pgid=process_group_id,
         pid_starttime=process_starttime,
@@ -291,7 +294,7 @@ DEAD_RUNNER_STARTTIME = 111
 
 
 class StagedRunOptions(TypedDict, total=False):
-    """Arguments of :func:`make_run_handle` that identify a run, other than its configuration digest."""
+    """Arguments of :func:`make_run_handle` that identify a run, other than its configuration digest and directory."""
 
     run_id: Required[str]
     experiment_id: str
@@ -307,6 +310,7 @@ class DeadRunOptions(StagedRunOptions, total=False):
     """Arguments of :func:`make_run_handle` other than ``pid`` and ``starttime``."""
 
     config_sha256: str
+    config_dir: str
 
 
 def make_dead_run_handle(**kwargs: Unpack[DeadRunOptions]) -> RunHandle:
@@ -347,16 +351,22 @@ def claim_runner_handle(
     *,
     run_id: str,
     config_sha256: str,
+    config_dir: Path,
     started_at: str,
     experiment_id: str = "srv",
     visible_params_at_launch: VisibleParamsPolicy = "none",
 ) -> None:
-    """Create the launch reservation a real MCP server owns before spawning."""
+    """Create the launch reservation a real MCP server owns before spawning.
+
+    ``config_dir`` is the cataloged config's directory, which the runner
+    resolves the snapshot's relative paths against.
+    """
     store.create(
         RunHandle(
             run_id=run_id,
             experiment_id=experiment_id,
             config_sha256=config_sha256,
+            config_dir=str(config_dir),
             pid=None,
             pgid=None,
             pid_starttime=None,
@@ -430,7 +440,8 @@ def run_claimed_runner(
 
     :param RunStore store: Run store receiving the reservation and the terminal status.
     :param str run_id: Run identifier to claim.
-    :param Path config: Configuration the runner loads as its snapshot.
+    :param Path config: Configuration the runner loads as its snapshot; its
+        directory is the recorded config directory.
     :param str experiment_id: Catalog experiment identifier.
     :param str | None config_sha256: Digest the runner must see, or the digest of ``config`` when ``None``.
     :param str | None started_at: Claimed launch timestamp, or the current time when ``None``.
@@ -445,6 +456,7 @@ def run_claimed_runner(
         store,
         run_id=run_id,
         config_sha256=config_sha256,
+        config_dir=config.resolve().parent,
         started_at=started_at,
         experiment_id=experiment_id,
     )
@@ -475,13 +487,18 @@ def _stage_run(
     """Persist a run handle pinned to ``config`` together with ``config`` as its launch snapshot.
 
     :param RunStore store: Store receiving the handle and the snapshot.
-    :param Path config: Configuration whose bytes become the snapshot and the pinned digest.
+    :param Path config: Configuration whose bytes become the snapshot and the pinned
+        digest, and whose directory the handle records as its config directory.
     :param Callable new_handle: Builder such as :func:`make_run_handle` for the handle.
     :param handle_kwargs: Remaining arguments for ``new_handle``.
     :return RunHandle: The persisted handle.
     """
     snapshot = config.read_bytes()
-    handle = new_handle(config_sha256=hashlib.sha256(snapshot).hexdigest(), **handle_kwargs)
+    handle = new_handle(
+        config_sha256=hashlib.sha256(snapshot).hexdigest(),
+        config_dir=str(config.resolve().parent),
+        **handle_kwargs,
+    )
     store.create(handle)
     store.config_snapshot_path(handle.run_id).write_bytes(snapshot)
     return handle
@@ -576,6 +593,7 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
                 run_id=run_id,
                 experiment_id=pending.experiment_id,
                 config_sha256=pending.config_sha256,
+                config_dir=pending.config_dir,
                 pid=DummyProc.pid,
                 pgid=DummyProc.pid,
                 pid_starttime=read_proc_starttime(DummyProc.pid),

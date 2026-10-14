@@ -4,7 +4,8 @@ experiment: phasesweep_starter
 storage: auto
 provenance:
   revision: "phasesweep-starter-v1"
-workdir: __PHASESWEEP_WORKDIR__
+# Relative paths here resolve against this file's directory, not the shell's.
+workdir: ./runs
 execution:
   # none is the default: the trainer gets only PATH, HOME, LANG, LC_ALL, TMPDIR,
   # USER, LOGNAME and TZ, plus env. To pass a shell variable such as PYTHONPATH,

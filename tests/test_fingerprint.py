@@ -1113,7 +1113,7 @@ def test_relative_storage_identity_is_bound_to_the_invocation_cwd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The same relative URL from another cwd cannot reinterpret one tree."""
+    """A Python-built experiment's relative URL from another cwd cannot reinterpret one tree."""
     trainer = write_constant_trainer(tmp_path)
     registration_cwd = tmp_path / "registration"
     foreign_cwd = tmp_path / "foreign"

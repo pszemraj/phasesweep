@@ -60,7 +60,7 @@ from phasesweep.errors import OperatorAction, UnsafeProcessCleanupError
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.errors import ConcurrencyLimitError
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunStore
+from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import open_private_text
@@ -201,6 +201,7 @@ def _spawned_runner(
         store,
         run_id=run_id,
         config_sha256=config_sha256,
+        config_dir=config.resolve().parent,
         started_at=started_at,
         experiment_id="cancel_me",
     )
@@ -440,7 +441,12 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
         digest = hashlib.sha256(config_path.read_bytes()).hexdigest()
         started_at = utc_now_iso()
         claim_runner_handle(
-            store, run_id=run_id, config_sha256=digest, started_at=started_at, experiment_id="t"
+            store,
+            run_id=run_id,
+            config_sha256=digest,
+            config_dir=config_path.resolve().parent,
+            started_at=started_at,
+            experiment_id="t",
         )
         snapshot = store.config_snapshot_path(run_id)
         snapshot.write_bytes(config_path.read_bytes())
@@ -1459,6 +1465,7 @@ def test_recover_run_reconciles_hard_exit_around_publication_pointer(
         store,
         run_id=run_id,
         config_sha256=config_sha256,
+        config_dir=config_path.resolve().parent,
         started_at=started_at,
         experiment_id=crash_boundary,
     )
@@ -1630,6 +1637,7 @@ def test_runner_binds_its_persisted_identity_to_the_current_boot(tmp_path: Path)
         store,
         run_id="r-boot",
         config_sha256="a" * 64,
+        config_dir=tmp_path,
         started_at=started_at,
         experiment_id="cancel_me",
         visible_params_at_launch=["lr"],
@@ -1753,6 +1761,7 @@ def test_runner_does_not_persist_a_receipt_without_process_identity(
         store,
         run_id=run_id,
         config_sha256="0" * 64,
+        config_dir=tmp_path,
         started_at=started_at,
     )
     monkeypatch.setattr(mcp_runner, reader, lambda *_args: None)
@@ -1803,10 +1812,10 @@ def test_runner_enters_the_project_directory_after_its_identity_is_durable(
     observed: dict[str, object] = {}
     real_persist = mcp_runner._persist_spawned_handle
 
-    def persist_with_held_lease(*args: object, **kwargs: object) -> None:
+    def persist_with_held_lease(*args: object, **kwargs: object) -> RunHandle:
         os.fstat(inherited_lease_fd)
         assert not store.is_pre_spawn_orphan("r-cwd")
-        real_persist(*args, **kwargs)
+        return real_persist(*args, **kwargs)
 
     def record_cwd(*_args: object, **_kwargs: object) -> None:
         observed["cwd"] = Path.cwd()

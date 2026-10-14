@@ -669,7 +669,11 @@ def test_runner_refuses_to_persist_a_receipt_without_a_pid_namespace(
 ) -> None:
     _config, _app, registry, store = side_effect_app(tmp_path)
     claim_runner_handle(
-        store, run_id="srv-no-namespace", config_sha256="0" * 64, started_at=utc_now_iso()
+        store,
+        run_id="srv-no-namespace",
+        config_sha256="0" * 64,
+        config_dir=tmp_path,
+        started_at=utc_now_iso(),
     )
     monkeypatch.setattr(mcp_runner, "read_pid_namespace", lambda: None)
 

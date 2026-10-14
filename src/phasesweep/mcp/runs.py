@@ -247,6 +247,10 @@ class RunHandle:
     run_id: str
     experiment_id: str
     config_sha256: str
+    # Absolute directory of the cataloged config file. The run's config
+    # snapshot lives in the state directory, so its relative paths resolve
+    # against this recorded directory, never the snapshot's own location.
+    config_dir: str
     pid: int | None
     pgid: int | None
     # /proc start time for PID-reuse-safe liveness. None only on the pre-spawn
@@ -288,20 +292,25 @@ class PreparedRun:
         self.lease.close()
 
 
-def load_experiment_snapshot(path: Path, expected_sha256: str, *, source: str) -> Experiment:
+def load_experiment_snapshot(
+    path: Path, expected_sha256: str, *, source: str, config_dir: Path
+) -> Experiment:
     """Read, verify, and parse one immutable experiment snapshot.
 
     :param Path path: Snapshot file to read.
     :param str expected_sha256: Digest recorded with the run handle.
     :param str source: Human-readable parser source label.
+    :param Path config_dir: Absolute directory of the cataloged config file,
+        recorded with the run handle; relative config paths resolve against it.
     :raises OSError: If the snapshot cannot be read.
-    :raises ValueError: If its digest or syntax is invalid.
+    :raises ValueError: If its digest or syntax is invalid, or ``config_dir``
+        is not absolute.
     :return Experiment: Verified experiment configuration.
     """
     data = path.read_bytes()
     if hashlib.sha256(data).hexdigest() != expected_sha256:
         raise ValueError("run snapshot hash mismatch")
-    return load_experiment_bytes(data, source=source)
+    return load_experiment_bytes(data, source=source, config_dir=config_dir)
 
 
 class RunStore:
@@ -765,6 +774,7 @@ class RunStore:
             "run_id",
             "experiment_id",
             "config_sha256",
+            "config_dir",
             "started_at",
             "allow_cancel",
             "visible_params_at_launch",
@@ -1000,6 +1010,8 @@ class RunStore:
         ):
             return None
         if not is_sha256_hex(handle.config_sha256):
+            return None
+        if not _valid_config_dir(handle.config_dir):
             return None
         if type(handle.allow_cancel) is not bool:
             return None
@@ -1655,6 +1667,15 @@ def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:
     :return bool: Whether the value is ``None`` or a positive non-bool integer.
     """
     return value is None or (type(value) is int and value > 0)
+
+
+def _valid_config_dir(value: object) -> TypeGuard[str]:
+    """Return whether ``value`` is an absolute directory path as a launch records it.
+
+    :param object value: Value to validate.
+    :return bool: Whether the value is an absolute path string without NUL.
+    """
+    return type(value) is str and "\0" not in value and Path(value).is_absolute()
 
 
 def _valid_optional_pid_namespace(value: object) -> TypeGuard[str | None]:

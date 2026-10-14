@@ -479,7 +479,10 @@ def _load_recovery_config(store: RunStore, handle: RunHandle) -> Experiment:
         )
     try:
         return load_experiment_snapshot(
-            snapshot, handle.config_sha256, source=f"run snapshot {handle.run_id}"
+            snapshot,
+            handle.config_sha256,
+            source=f"run snapshot {handle.run_id}",
+            config_dir=Path(handle.config_dir),
         )
     except OSError as exc:
         raise RunRecoveryError(
@@ -629,9 +632,10 @@ def _load_recovery_studies(
             try:
                 _check_study_artifact_root(study, config)
             except ArtifactRootConflictError as exc:
-                # The config is the run's digest-pinned snapshot and MCP
-                # workdirs are absolute, so only the filesystem can have moved
-                # the root away: restore it, not the config the claim path fixes.
+                # The config is the run's digest-pinned snapshot, resolved
+                # against the config directory recorded at launch, so only the
+                # filesystem can have moved the root away: restore it, not the
+                # config the claim path fixes.
                 raise RunRecoveryError.rewrap(
                     exc, str(exc), action=OperatorAction.RESTORE_TREE
                 ) from exc

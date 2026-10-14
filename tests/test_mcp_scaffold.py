@@ -218,18 +218,14 @@ def test_scaffold_refuses_unsafe_state(tmp_path: Path) -> None:
 
 
 def test_init_catalog_validates_before_publish(tmp_path: Path) -> None:
-    config = tmp_path / "rel.yaml"
-    config.write_text(
-        mcp_experiment_config_text(tmp_path, name="rel").replace(
-            f"workdir: {tmp_path}/runs/rel", "workdir: runs/relative"
-        )
-    )
+    config = tmp_path / "mem.yaml"
+    config.write_text(mcp_experiment_config_text(tmp_path, name="mem", with_storage=False))
     output = tmp_path / "catalog.yaml"
     result = CliRunner().invoke(
         cli_main, ["mcp", "init-catalog", "--from", str(config), "-o", str(output)]
     )
     assert result.exit_code == 2
-    assert "absolute workdir" in result.output
+    assert "storage must be persistent" in result.output
     assert not output.exists()
     assert not list(tmp_path.glob(".catalog.yaml.*.tmp"))
     assert not (tmp_path / "runs").exists()

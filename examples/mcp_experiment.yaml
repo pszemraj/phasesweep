@@ -1,4 +1,4 @@
-# MCP-safe variant of the toy example. It uses absolute scratch paths because MCP servers must survive restarts and launches from arbitrary working directories.
+# MCP variant of the toy example. It keeps its outputs and ledger under /tmp scratch paths, apart from the CLI example's checkout-local runs.
 
 experiment: tiny_lm_16mb_mcp
 storage: journal:////tmp/phasesweep-mcp-tiny-lm/phases.journal

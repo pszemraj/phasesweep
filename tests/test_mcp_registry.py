@@ -145,7 +145,9 @@ def test_auto_storage_is_absolute_for_mcp(tmp_path: Path) -> None:
     assert registered.experiment.storage == "auto"
     assert storage_backend(registered.experiment.resolved_storage) == "journal"
     assert not Path(registered.experiment.workdir).exists()
-    snapshot = load_experiment_snapshot(config, file_sha256(config), source="test")
+    snapshot = load_experiment_snapshot(
+        config, file_sha256(config), source="test", config_dir=config.resolve().parent
+    )
     assert isinstance(snapshot, Experiment)
     assert canonical_storage_identity(snapshot.resolved_storage) == canonical_storage_identity(
         registered.experiment.resolved_storage
@@ -275,26 +277,46 @@ def test_catalog_rejects_invalid_visible_params_policy(tmp_path: Path) -> None:
         )
 
 
-def test_relative_workdir_rejected_for_mcp(tmp_path: Path) -> None:
+def test_relative_workdir_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
     config = _write(
-        tmp_path / "exp.yaml",
+        config_dir / "exp.yaml",
         _experiment_yaml(tmp_path).replace(f"workdir: {tmp_path}/runs/reg_ok", "workdir: runs"),
     )
 
-    with pytest.raises(CatalogError, match="absolute workdir"):
-        Registry.load(_catalog(tmp_path, config))
+    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
+
+    assert registered.experiment.workdir == str(config_dir.resolve() / "runs")
 
 
-def test_relative_execution_cwd_rejected_for_mcp(tmp_path: Path) -> None:
-    """Same stability rule as ``workdir``: a relative trainer cwd would mean
-    one thing to a CLI operator and another to the detached MCP runner."""
+def test_relative_execution_cwd_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
+    """A relative trainer cwd names one directory for the CLI and the detached runner."""
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
     config = _write(
-        tmp_path / "exp.yaml",
+        config_dir / "exp.yaml",
         _experiment_yaml(tmp_path) + "execution:\n  cwd: trainer\n",
     )
 
-    with pytest.raises(CatalogError, match=r"absolute execution\.cwd"):
-        Registry.load(_catalog(tmp_path, config))
+    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
+
+    assert registered.experiment.execution.cwd == str(config_dir.resolve() / "trainer")
+
+
+def test_relative_journal_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    config = _write(
+        config_dir / "exp.yaml",
+        _experiment_yaml(tmp_path).replace(
+            f"journal:///{tmp_path}/reg_ok.journal", '"journal:///relative.journal"'
+        ),
+    )
+
+    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
+
+    assert registered.experiment.storage == f"journal:///{config_dir.resolve()}/relative.journal"
 
 
 def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
@@ -343,13 +365,9 @@ def test_absolute_execution_cwd_accepted_for_mcp(tmp_path: Path) -> None:
             "journal URL names no file",
             id="empty-journal-path-refused-at-config-load",
         ),
-        # This is a valid journal URL at config load, so the registry's own
-        # path-stability check is what refuses it.
-        pytest.param(
-            '"journal:///relative.journal"',
-            "absolute .*journal storage path",
-            id="relative-journal",
-        ),
+        # Valid at config load; the registry refuses it because a detached run
+        # cannot be monitored or resumed without a durable ledger.
+        pytest.param("null", "storage must be persistent", id="in-memory"),
     ],
 )
 def test_nonpersistent_storage_rejected_for_mcp(

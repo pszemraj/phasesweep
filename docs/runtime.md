@@ -4,7 +4,7 @@ PhaseSweep runs one ordered Experiment on a POSIX host. It uses same-host file l
 
 ## Output layout
 
-For `workdir: ./runs` and `experiment: demo`, PhaseSweep writes under `./runs/demo/`:
+For `workdir: ./runs` and `experiment: demo`, PhaseSweep writes under `runs/demo/` beside the config file:
 
 ```text
 demo/

@@ -16,8 +16,8 @@
 # Unknown keys are rejected at every level, and a duplicate key anywhere in the YAML is rejected.
 # trainer_config, fixed_overrides, search_space, provenance and env are maps with user-chosen keys.
 # fixed_overrides and search_space keys must be dotted paths, provenance keys and values must be nonblank, and env keys must be valid variable names.
-# Paths: workdir, a relative journal path in storage, and execution.cwd resolve against the directory phasesweep is started from, not against the config file. A leading ~ is expanded in all three, and symlinks are resolved.
-# An MCP catalog rejects a relative workdir, execution.cwd or journal path, and an omitted execution.cwd becomes the catalog entry's cwd, which defaults to the config file's directory.
+# Paths: a relative workdir, journal path in storage, or execution.cwd resolves against the directory of this config file (after symlinks to the file are resolved), not the directory phasesweep is started from, so the CLI and MCP resolve it identically. A leading ~ is expanded in all three, and symlinks are resolved.
+# Under MCP an omitted execution.cwd becomes the catalog entry's cwd, which defaults to the config file's directory.
 # Trial-relative paths (extractor and gate path and file values) resolve inside the attempt directory.
 # There is no variable interpolation in the YAML. trial_command is a Python format string, so write a shell variable as $VAR or ${{VAR}}. ${VAR} fails config load as an unknown placeholder.
 # YAML scalars follow PyYAML (YAML 1.1) typing: 1e-3 and 1.0e3 load as strings, while 1.0e-3, 0.001 and 1.0e+3 load as floats. Quote anything meant to stay a string.
@@ -44,7 +44,7 @@
 experiment: string (required)
 
 # Shell command template that runs one trainer attempt, for example: python train.py --config {config_path}
-# It runs as /bin/sh -c in a new session, in the execution.cwd directory (the directory phasesweep was started from when unset), with the composed trainer environment. By default that is a minimal base plus env, not the shell's environment; see execution.inherit_env.
+# It runs as /bin/sh -c in a new session, in the execution.cwd directory (the directory phasesweep was started from when unset, or the catalog entry's cwd under MCP), with the composed trainer environment. By default that is a minimal base plus env, not the shell's environment; see execution.inherit_env.
 # Its stdout and stderr are written to stdout.log and stderr.log in the attempt directory. Both files are truncated at the start of each attempt.
 # The trainer must exit 0. A nonzero exit code fails the attempt before any evidence is read.
 # Each attempt directory also holds command.txt (the rendered command), overrides_resolved.json (the flat audit copy of the overrides, with sorted keys), and the trainer input file that override_format selects.
@@ -59,7 +59,7 @@ experiment: string (required)
 # Requires: argparse and hydra need {overrides} and reject {config_path} and {overrides_path}; json_file needs {overrides_path} and rejects {config_path} and {overrides}.
 # Requires: for argparse, hydra and json_file the placeholder is needed only when the phase has at least one inherited, fixed or sampled override.
 # A placeholder that does not match override_format fails config load.
-# Recommended: set execution.cwd and use absolute paths for the interpreter and script, so the command does not depend on the directory phasesweep was started from.
+# Recommended: set execution.cwd (execution.cwd: . for the config file's directory) or use absolute paths for the interpreter and script, so the command does not depend on the directory phasesweep was started from. The command itself is not a path field and is never rewritten.
 trial_command: string (required)
 
 # Primary objective: the finite scalar each trial reports and how trials are ranked.
@@ -684,7 +684,8 @@ override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 # ---------- Storage and provenance ----------
 
 # Where the study ledger is kept. null is disposable in-memory storage, auto is <workdir>/<experiment>/study.journal, and journal:///path selects an explicit local journal file.
-# In journal URLs three slashes start a relative path and four an absolute one: journal:///./runs/study.journal is relative to the invocation directory and journal:////tmp/study.journal is absolute.
+# In journal URLs three slashes start a relative path and four an absolute one: journal:///./runs/study.journal is relative to the config file's directory and journal:////tmp/study.journal is absolute.
+# A relative path is rewritten at config load to the absolute four-slash form under the config file's directory.
 # A leading ~ is expanded after three slashes, so journal:///~/x.journal is $HOME/x.journal. After four slashes it is literal, so journal:////~/x.journal is /~/x.journal.
 # The ledger identity is the path after symlinks are resolved.
 # SQLite, :memory:, external database URLs and every other form are rejected.
@@ -692,7 +693,7 @@ override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 # Reuse of an existing ledger also requires current-format artifacts, matching trainer, evidence and provenance semantics, and the same trainer-environment cohort.
 # Changing semantic inputs needs a new experiment name. Run-control changes do not waive a stored abort or partial-timeout decision.
 # Requires: a journal URL spells its scheme exactly as lowercase journal and names a nonempty path. JOURNAL:///x.journal, journal:/// and journal:// fail config load.
-# Requires: a journal URL carries no ? or #, because a query or fragment would silently cut the path. Config load fails; use auto when a directory name contains one.
+# Requires: a journal URL carries no ? or #, because a query or fragment would silently cut the path, and neither does the config file's directory when the path is relative. Config load fails; use auto when a directory name contains one.
 # Requires: provenance is nonempty for auto or a journal; stochastic phases also need phases[].sampler.seed, and tpe and cmaes need phases[].sampler.acknowledge_nonresumable. Config load fails otherwise.
 # Requires: workdir and the experiment name keep pointing at the same ledger. An artifact root <workdir>/<experiment> remembers its storage identity, which includes null, so switching between null and a journal or between two journals is refused, and so is opening one journal under another workdir or experiment name.
 # Excluded from the study fingerprint.
@@ -700,7 +701,7 @@ override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 storage: string | null = null
 
 # Directory that holds per-experiment generations, phase and attempt directories, logs and winner files.
-# A relative path resolves against the directory phasesweep is started from, not the YAML file or execution.cwd. A leading ~ is expanded and symlinks are resolved. Write . for the directory phasesweep is started from; the empty string fails config load.
+# A relative path, including the default ./runs, resolves against the config file's directory, not the directory phasesweep is started from or execution.cwd. A leading ~ is expanded and symlinks are resolved. Write . for the config file's directory; the empty string fails config load.
 # Requires: storage and the experiment name agree with the artifact-root binding already in <workdir>/<experiment>; a mismatch refuses reuse.
 # Excluded from the study fingerprint.
 # Warning: changing execution.cwd does not move this directory. Give trainer outputs a trial-specific path through trainer_config or trial_command.
@@ -970,15 +971,15 @@ mlflow: object | null = null
 env: map[string, string] = {}
 
 # Trainer subprocess working directory and environment-selection contract. Nested defaults apply when the block is omitted.
-# Without the block the trainer runs in the directory phasesweep was started from with the minimal base environment (inherit_env none) plus env.
+# Without the block the trainer runs in the directory phasesweep was started from (the catalog entry's cwd under MCP) with the minimal base environment (inherit_env none) plus env.
 # The effective working directory, the inheritance mode and names, and the pass-through names are part of the study fingerprint.
 execution: object = {}
-  # Working directory of every trainer process. A leading ~ is expanded and a relative path resolves against the directory phasesweep is started from, not the config file.
+  # Working directory of every trainer process. A leading ~ is expanded and a relative path resolves against the config file's directory, not the directory phasesweep is started from. Write . for the config file's directory.
   # The directory is not checked at config load or run start. It must exist when each trainer is launched; otherwise that attempt fails before the trainer starts and counts toward phases[].max_consecutive_failures.
-  # The effective absolute directory is part of the study fingerprint, so two invocations from different directories do not share a study.
+  # The effective absolute directory is part of the study fingerprint, so when it is unset two invocations from different directories do not share a study.
   # Requires: a nonempty string when set; the empty string fails config load.
-  # Unset: the trainer runs in the directory phasesweep was started from.
-  # Recommended: use an absolute path so script and data paths resolve the same way from every invocation. workdir and local evidence paths keep their own rules.
+  # Unset: the trainer runs in the directory phasesweep was started from, or the catalog entry's cwd under MCP.
+  # Recommended: set it so script and data paths resolve the same way from every invocation. workdir and local evidence paths keep their own rules.
   cwd: string | null = null
 
   # Which ambient variables the trainer inherits. none (the default) keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME and TZ, when present. A list of names adds exactly those variables to that base. all passes every variable.

@@ -12,7 +12,6 @@ from optuna.storages import JournalStorage
 from optuna.storages.journal import JournalFileBackend
 
 from phasesweep import load_experiment
-from phasesweep.cli import _starter_experiment_text
 from phasesweep.cli import cli as cli_main
 from phasesweep.mcp.registry import Registry
 from phasesweep.runtime.files import file_url_path
@@ -28,9 +27,11 @@ def test_init_creates_runnable_starter_and_catalog(tmp_path: Path) -> None:
         assert "phasesweep mcp init-catalog --from experiment.yaml" in result.output
 
         config_path = Path("experiment.yaml").resolve()
+        # The template is written verbatim; its relative workdir anchors at load.
+        assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["workdir"] == "./runs"
         experiment = load_experiment(config_path)
         assert experiment.experiment == "phasesweep_starter"
-        assert Path(experiment.workdir).is_absolute()
+        assert experiment.workdir == str(config_path.parent / "runs")
         assert experiment.storage == "auto"
         assert file_url_path(experiment.resolved_storage) == str(
             config_path.parent / "runs" / experiment.experiment / "study.journal"
@@ -68,47 +69,24 @@ def test_init_creates_parent_directories_for_custom_output(tmp_path: Path) -> No
     assert Path(experiment.workdir) == output.parent / "runs"
 
 
-def _assert_starter_destination_round_trip(output: Path) -> Path:
-    """Render and initialize ``output``, then return its decoded work directory."""
-    runs_dir = output.parent / "runs"
-    rendered = yaml.safe_load(_starter_experiment_text(output))
-    assert rendered["workdir"] == str(runs_dir)
-    assert rendered["storage"] == "auto"
+def test_init_round_trips_non_bmp_destination_path(tmp_path: Path) -> None:
+    """A non-BMP character in the destination directory survives config load.
+
+    The starter's relative workdir resolves against the config file's
+    directory, so the loaded workdir must name that directory's ``runs`` with
+    every character intact; a lone surrogate would fail every later
+    filesystem call with ``UnicodeEncodeError``.
+    """
+    project = tmp_path / "\U0001f680 sweeps"
+    project.mkdir()
+    output = project / "experiment.yaml"
 
     result = CliRunner().invoke(cli_main, ["init", "-o", str(output)])
 
     assert result.exit_code == 0, result.output
-    return Path(load_experiment(output).workdir)
-
-
-@pytest.mark.parametrize(
-    "project_name",
-    [
-        pytest.param("\U0001f680 sweeps", id="non_bmp_character"),
-        pytest.param("__PHASESWEEP_STORAGE__", id="placeholder_literal"),
-    ],
-)
-def test_init_round_trips_awkward_destination_paths(tmp_path: Path, project_name: str) -> None:
-    """Rendered paths must survive YAML decoding byte-for-byte.
-
-    ``json.dumps`` with the default ``ensure_ascii=True`` escapes a non-BMP
-    character as a UTF-16 surrogate pair, which a YAML double-quoted scalar
-    decodes into lone surrogates; every later filesystem call on the decoded
-    workdir then fails with ``UnicodeEncodeError``.
-
-    Placeholder substitution must also never rescan text it already inserted.
-    Replacing the placeholders one after another lets a destination path that
-    contains a placeholder literal be rewritten by a later replacement, which
-    corrupts a config that ``init`` still reports as written.
-    """
-    project = tmp_path / project_name
-    project.mkdir()
-    output = project / "experiment.yaml"
-    runs_dir = output.parent / "runs"
-    workdir = _assert_starter_destination_round_trip(output)
-    # Lone surrogates raise UnicodeEncodeError here; a real path does not.
+    workdir = Path(load_experiment(output).workdir)
     workdir.mkdir(parents=True)
-    assert workdir == runs_dir
+    assert workdir == project / "runs"
 
 
 def test_init_preserves_question_mark_in_journal_path(tmp_path: Path) -> None:

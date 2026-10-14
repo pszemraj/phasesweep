@@ -7,7 +7,7 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from phasesweep.config.common import (
     ConfigFloat,
@@ -18,6 +18,7 @@ from phasesweep.config.common import (
     _validate_optional_bounds,
     _validate_override_key,
     _validate_safe_name,
+    anchor_relative_path,
 )
 from phasesweep.config.search import (
     NON_RESUMABLE_SAMPLERS,
@@ -581,14 +582,14 @@ class ExecutionContext(_Frozen):
     cwd: str | None = Field(
         default=None,
         description=(
-            "Working directory for every trainer subprocess. Relative paths "
-            "resolve against the invocation cwd at launch (same rule as "
-            "workdir); prefer an absolute path so CLI and MCP invocations "
-            "agree. When set, the RESOLVED path joins the semantic "
+            "Working directory for every trainer subprocess. A relative path "
+            "resolves against the config file's directory (same rule as "
+            "workdir), or against the process cwd for an Experiment built in "
+            "Python. When set, the RESOLVED path joins the semantic "
             "fingerprint, so the same study can never mix trainers reached "
             "through different working directories. When unset, trainers run "
-            "in the invocation cwd and that effective resolved directory joins "
-            "the fingerprint."
+            "in the invocation cwd (the catalog entry's cwd under MCP) and that "
+            "effective resolved directory joins the fingerprint."
         ),
     )
     inherit_env: Literal["all", "none"] | list[str] = Field(
@@ -633,19 +634,24 @@ class ExecutionContext(_Frozen):
 
     @field_validator("cwd")
     @classmethod
-    def _cwd_is_nonempty(cls, value: str | None) -> str | None:
-        """Reject an empty trainer working directory.
+    def _anchor_cwd(cls, value: str | None, info: ValidationInfo) -> str | None:
+        """Reject an empty trainer working directory and anchor a relative one.
 
         :param str | None value: Configured trainer working directory.
+        :param ValidationInfo info: Validation info carrying the config directory, if any.
         :raises ValueError: The path is the empty string.
-        :return str | None: The validated path, unchanged.
+        :return str | None: The path, resolved against the config file's
+            directory when it is relative and the config came from a file.
         """
+        if value is None:
+            return None
         if value == "":
             raise ValueError(
-                "execution.cwd must be a nonempty path; omit it to run trainers in the "
-                "directory phasesweep is started from."
+                "execution.cwd must be a nonempty path; write '.' for the config file's "
+                "directory, or omit it to run trainers in the directory phasesweep is "
+                "started from."
             )
-        return value
+        return anchor_relative_path(value, info)
 
     @model_validator(mode="after")
     def _validate_inherit_names(self) -> ExecutionContext:
@@ -696,10 +702,20 @@ class Experiment(_Frozen):
         description=(
             "Local Optuna journal storage URL, auto for study.journal inside the "
             "experiment artifact namespace, or null for non-resumable in-memory runs. "
-            "Use journal:///path.journal for an explicit, resumable, parallel-safe study."
+            "Use journal:///path.journal for an explicit, resumable, parallel-safe study; "
+            "a relative journal path resolves like workdir."
         ),
     )
-    workdir: str = Field(default="./runs", description="Where per-trial directories are created.")
+    workdir: str = Field(
+        default="./runs",
+        # The default is relative too, so it must be anchored like a written value.
+        validate_default=True,
+        description=(
+            "Where per-trial directories are created. A relative path resolves against "
+            "the config file's directory, or against the process cwd for an Experiment "
+            "built in Python."
+        ),
+    )
     trial_command: str = Field(
         description=(
             "Shell command template. Placeholders: {config_path}, {overrides}, {overrides_path}, "
@@ -765,14 +781,18 @@ class Experiment(_Frozen):
 
     @field_validator("storage")
     @classmethod
-    def _storage_is_local(cls, value: str | None) -> str | None:
+    def _storage_is_local(cls, value: str | None, info: ValidationInfo) -> str | None:
         """Allow only null, auto, and local journal storage that names a plain file.
 
         :param str | None value: Configured Optuna storage locator.
+        :param ValidationInfo info: Validation info carrying the config directory, if any.
         :raises ValueError: The locator is not null, ``"auto"``, or a
             ``journal:///`` URL with the exact lowercase scheme, or the URL
-            carries a query or fragment, or its path is empty.
-        :return str | None: The validated locator, unchanged.
+            carries a query or fragment, or its path is empty, or a relative
+            path anchored to the config directory would contain ``?`` or ``#``.
+        :return str | None: The locator; a relative journal path in a config
+            loaded from a file becomes an absolute four-slash URL under the
+            config file's directory.
         """
         if value is None or value == "auto":
             return value
@@ -792,29 +812,43 @@ class Experiment(_Frozen):
                 "Remove it. To keep the journal under a directory whose name contains ? or #, "
                 "use `storage: auto` with that workdir."
             )
-        if file_url_path(value) == "":
+        raw_path = file_url_path(value)
+        if raw_path == "":
             raise ValueError(
                 f"storage journal URL names no file; got {value!r}. Write "
                 "`storage: journal:///path/to/study.journal`."
             )
+        anchored_path = anchor_relative_path(raw_path, info)
+        if anchored_path != raw_path:
+            # The anchored path is absolute, so the URL takes the four-slash form.
+            value = f"journal:///{anchored_path}"
+            if "?" in value or "#" in value:
+                raise ValueError(
+                    "storage journal path is relative, and the config file's directory it "
+                    "resolves against contains ? or #, which a journal URL cannot carry; got "
+                    f"{anchored_path!r}. Use `storage: auto`, which keeps the journal under "
+                    "workdir whatever its directory names contain."
+                )
         canonical_storage_identity(value)
         return value
 
     @field_validator("workdir")
     @classmethod
-    def _workdir_is_nonempty(cls, value: str) -> str:
-        """Reject an empty artifact-root directory.
+    def _anchor_workdir(cls, value: str, info: ValidationInfo) -> str:
+        """Reject an empty artifact-root directory and anchor a relative one.
 
         :param str value: Configured per-trial directory root.
+        :param ValidationInfo info: Validation info carrying the config directory, if any.
         :raises ValueError: The path is the empty string.
-        :return str: The validated path, unchanged.
+        :return str: The path, resolved against the config file's directory when
+            it is relative and the config came from a file.
         """
         if value == "":
             raise ValueError(
-                "workdir must be a nonempty path; write '.' to use the directory "
-                "phasesweep is started from, or omit workdir for ./runs."
+                "workdir must be a nonempty path; write '.' for the config file's "
+                "directory, or omit workdir for ./runs."
             )
-        return value
+        return anchor_relative_path(value, info)
 
     @field_validator("env")
     @classmethod

@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, NoReturn
 
 from pydantic import ValidationError
@@ -654,6 +655,7 @@ class PhaseSweepMCP(RunControl):
                 snapshot_path,
                 handle.config_sha256,
                 source=f"run snapshot {handle.run_id}",
+                config_dir=Path(handle.config_dir),
             )
         except (OSError, ValueError) as exc:
             log.info("invalid config snapshot for run=%s: %s", handle.run_id, exc)

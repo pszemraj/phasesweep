@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+from phasesweep.config.common import CONFIG_DIR_CONTEXT
 from phasesweep.config.models import Experiment
 
 
@@ -162,17 +163,24 @@ def _load_yaml_mapping_from_text(text: str, source: str | Path) -> dict[str, Any
     return data
 
 
-def load_experiment_bytes(data: bytes, source: str | Path = "<bytes>") -> Experiment:
+def load_experiment_bytes(
+    data: bytes, source: str | Path = "<bytes>", *, config_dir: Path | None = None
+) -> Experiment:
     """Parse and validate a config from an already-read byte snapshot.
 
     Args:
         data: UTF-8 YAML bytes.
         source: Human-readable source label used in validation errors.
+        config_dir: Absolute directory of the config file the bytes came from.
+            Relative ``workdir``, journal ``storage`` and ``execution.cwd``
+            paths resolve against it. ``None`` leaves them relative to the
+            process working directory.
 
     Returns:
         :class:`Experiment` parsed from exactly ``data``.
 
     Raises:
+        ValueError: ``config_dir`` is not absolute.
         ConfigError: ``data`` is not UTF-8 text, the YAML cannot be parsed (including
             duplicate mapping keys rejected by the strict loader), or the top level
             is not a mapping.
@@ -180,12 +188,15 @@ def load_experiment_bytes(data: bytes, source: str | Path = "<bytes>") -> Experi
             model validation.
 
     """
+    if config_dir is not None and not config_dir.is_absolute():
+        raise ValueError(f"config_dir must be absolute; got {str(config_dir)!r}")
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ConfigError(f"{source}: config must be UTF-8 text: {exc}") from exc
     parsed = _load_yaml_mapping_from_text(text, source)
-    return Experiment.model_validate(parsed)
+    context = None if config_dir is None else {CONFIG_DIR_CONTEXT: config_dir}
+    return Experiment.model_validate(parsed, context=context)
 
 
 def load_experiment(path: str | Path) -> Experiment:
@@ -195,6 +206,10 @@ def load_experiment(path: str | Path) -> Experiment:
     ``safe_load`` silently keeps the last value for a duplicate key, which can
     cause an experiment to silently use the wrong search range or fixed
     override (review v0.5.6 / non-blocking hardening item).
+
+    Relative ``workdir``, journal ``storage`` and ``execution.cwd`` paths
+    resolve against the directory of the file after symlinks are resolved, so
+    the same file names the same artifact tree from any working directory.
 
     Args:
         path: Filesystem path to the experiment YAML file.
@@ -211,4 +226,6 @@ def load_experiment(path: str | Path) -> Experiment:
 
     """
     path_obj = Path(path)
-    return load_experiment_bytes(path_obj.read_bytes(), source=path_obj)
+    return load_experiment_bytes(
+        path_obj.read_bytes(), source=path_obj, config_dir=path_obj.resolve().parent
+    )
