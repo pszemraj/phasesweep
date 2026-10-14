@@ -628,13 +628,20 @@ def invoke_cli_boundary(
 def single_trial_confound(trial_number: int) -> dict[str, Any]:
     """Return the confound block selection records for a one-trial population."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "ranked_trials": [trial_number],
+        "ranked_groups": None,
         "checks": {
             "evaluation_point": {"verdict": "n/a", "reason": "only one trial was ranked"},
             "survivorship": {
                 "verdict": "ok",
-                "detail": {"ranked": 1, "infeasible": 0, "failed": 0, "pruned": 0},
+                "detail": {
+                    "ranked": 1,
+                    "infeasible": 0,
+                    "incomplete_group": 0,
+                    "failed": 0,
+                    "pruned": 0,
+                },
             },
             "tie": {"verdict": "n/a", "reason": "only one trial was ranked"},
         },

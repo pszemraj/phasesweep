@@ -16,14 +16,14 @@ completion:
   incomplete: false
   reason: null
   timeout_scope: null
-generation_id: 050d325824ab4d3194da489d9d48ed9f
-attempt_id: 2c183397a15a471ca214588d71af1aac
+generation_id: 2ce8daf6002c4c8f874391ba921712c3
+attempt_id: d91680465f9b4d1397db44f2da3d3be4
 winner_source:
   kind: phase_trial
   phase: p
   trial_number: 0
-  generation_id: 050d325824ab4d3194da489d9d48ed9f
-  attempt_id: 2c183397a15a471ca214588d71af1aac
+  generation_id: 2ce8daf6002c4c8f874391ba921712c3
+  attempt_id: d91680465f9b4d1397db44f2da3d3be4
 trainer_input:
   schema_version: 1
   format: argparse
@@ -35,7 +35,7 @@ objective_provenance:
   extractor:
     config_sha256: b7b4aa1d877c36c43b4c3c2c1ff207148492ab08e2b0e0a4096f8b4b43e6e1a2
     kind: log_regex
-  recorded_at: '2026-10-14T05:00:58+00:00'
+  recorded_at: '2026-10-14T05:30:26+00:00'
   schema_version: 3
   source:
     kind: file
@@ -44,13 +44,14 @@ objective_provenance:
     path: stdout.log
     sha256: 4aefd9d9b7f57cbfc31e8739fd45762b4eef95203a53299f58a0584920ef8087
     size_bytes: 11
-trainer_env_digest: 1a78f75d67b1f10f2fa590712fa8fbab15c2e23bfd4f6475e105ce30f9931f42
+trainer_env_digest: 6d68543da7965a4d9fc4dbf82313f1898c5cc460d8cc15d1861af8e95313fce6
 trainer_inherit_env: none
 confound:
-  schema_version: 1
+  schema_version: 2
   ranked_trials:
   - 0
   - 1
+  ranked_groups: null
   checks:
     evaluation_point:
       verdict: n/a
@@ -61,6 +62,7 @@ confound:
       detail:
         ranked: 2
         infeasible: 0
+        incomplete_group: 0
         failed: 0
         pruned: 0
     tie:
@@ -68,4 +70,5 @@ confound:
       detail:
         tied_trials:
         - 1
+        within_noise: null
 observed: {}

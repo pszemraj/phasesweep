@@ -194,21 +194,40 @@ class SurvivorshipSummary(_SnapshotModel):
     verdict: ConfoundVerdict = Field(
         description=(
             f"{_VERDICT_DESCRIPTION} Heterogeneous when failed and pruned trials are at "
-            "least as numerous as ranked ones; infeasible trials never flag."
+            "least as numerous as ranked ones; infeasible and incomplete_group trials "
+            "never flag."
         )
     )
     ranked: NonNegativeInt
     infeasible: NonNegativeInt
+    incomplete_group: NonNegativeInt = Field(
+        description=(
+            "Feasible trials of a repeats phase left unranked because another member of "
+            "their repeat group failed, was infeasible, or never ran; 0 without repeats."
+        )
+    )
     failed: NonNegativeInt
     pruned: NonNegativeInt
 
 
 class TieSummary(_SnapshotModel):
-    """Whether the winner tied exactly with trials that used other params."""
+    """Whether the winner stands clear of ranked units that used other params.
+
+    A unit is a trial, or a complete repeat group in a repeats phase.
+    """
 
     verdict: ConfoundVerdict = Field(description=_VERDICT_DESCRIPTION)
     tied_trials: NonNegativeInt | None = Field(
-        description="Trials tying the winner with other params; null when not checked."
+        description=(
+            "Units tying the winner's metric exactly with other params; null when not checked."
+        )
+    )
+    within_noise: NonNegativeInt | None = Field(
+        description=(
+            "Repeat groups whose aggregate is within two standard errors of the winning "
+            "group's, exact ties included: an advisory heuristic, not a significance test. "
+            "Null without repeats or when not checked."
+        )
     )
 
 

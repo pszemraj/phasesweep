@@ -3,10 +3,17 @@
 PhaseSweep has no control trial: every trial in a phase is a peer, and
 selection picks the best ranked value. A confound verdict therefore answers
 whether the population selection just compared was homogeneous enough for
-"best" to mean what it says. Each check is a countable fact about that
-population, never a significance test -- the ledger holds no replicate trials
-to estimate noise from, so a p-value would be invented. Every verdict is
-advisory: it never blocks selection or publication.
+"best" to mean what it says. Every verdict is advisory: it never blocks
+selection or publication.
+
+The population takes one of two shapes. Without ``repeats`` the ranked units
+are single trials, and the ledger holds no replicates to estimate noise from,
+so every check is a countable fact about the population. With ``repeats`` the
+ranked units are complete repeat groups (``ranked_groups``), each a list of
+member trials. The tie check then also compares each group's aggregate with
+the winning group's against their combined standard errors; that comparison
+is an advisory heuristic, never a p-value. Feasible trials whose group never
+completed are counted as ``incomplete_group``, apart from infeasible ones.
 
 The block is computed once per selection and frozen onto the winner. A
 carried winner keeps it verbatim, and it never joins a fingerprint, so an
@@ -19,11 +26,12 @@ objective provenance and passes the records in.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import Any, Literal, get_args
 
 import optuna
 
+from phasesweep.engine.repeats import RankedGroup, within_noise
 from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
 from phasesweep.runtime.json import progress_position
 
@@ -39,12 +47,13 @@ ConfoundCheck = Literal["evaluation_point", "survivorship", "tie"]
 
 CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 
-CONFOUND_SCHEMA_VERSION = 1
+CONFOUND_SCHEMA_VERSION = 2
 
-_SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "failed", "pruned")
+_SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "incomplete_group", "failed", "pruned")
 # Where a terminal trial that selection did not rank is counted. A COMPLETE
-# trial outside the ranked set violated a constraint or the metric's bounds;
-# a trial that failed an evidence gate or extraction is FAIL.
+# trial outside the ranked set violated a constraint or the metric's bounds,
+# unless it was feasible and only its repeat group was incomplete; a trial
+# that failed an evidence gate or extraction is FAIL.
 _EXCLUDED_BY_STATE = {
     optuna.trial.TrialState.COMPLETE: "infeasible",
     optuna.trial.TrialState.FAIL: "failed",
@@ -64,27 +73,41 @@ def _assess_population(
     winner: optuna.trial.FrozenTrial,
     *,
     provenance: Mapping[int, Mapping[str, Any]],
+    groups: Sequence[RankedGroup] | None = None,
+    incomplete_group: Collection[int] = (),
 ) -> dict[str, Any]:
     """Classify the population one winner selection compared.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase
         study, the population survivorship counts.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Trials selection ranked:
-        candidates that satisfy every constraint.
-    :param optuna.trial.FrozenTrial winner: The selected trial, one of ``ranked``.
+        candidates that satisfy every constraint, and for a repeats phase every
+        member of a complete group.
+    :param optuna.trial.FrozenTrial winner: The selected trial, one of
+        ``ranked``; for a repeats phase, the last member of the winning group.
     :param Mapping[int, Mapping[str, Any]] provenance: Validated objective
         provenance keyed by trial number, for every ranked trial whose record
         could be read.
+    :param Sequence[RankedGroup] | None groups: The complete repeat groups
+        selection ranked, or ``None`` for a phase without repeats.
+    :param Collection[int] incomplete_group: Numbers of feasible trials whose
+        repeat group was incomplete, so selection could not rank them.
     :return dict[str, Any]: The ``confound`` block persisted on the winner.
     """
     ordered = sorted(ranked, key=lambda trial: trial.number)
+    ordered_groups = None if groups is None else sorted(groups, key=lambda group: group.numbers)
     return {
         "schema_version": CONFOUND_SCHEMA_VERSION,
         "ranked_trials": [trial.number for trial in ordered],
+        "ranked_groups": (
+            None if ordered_groups is None else [list(group.numbers) for group in ordered_groups]
+        ),
         "checks": {
             "evaluation_point": _evaluation_point(ordered, provenance),
-            "survivorship": _survivorship(trials, ordered),
-            "tie": _tie(ordered, winner),
+            "survivorship": _survivorship(trials, ordered, incomplete_group),
+            "tie": _tie(ordered, winner)
+            if ordered_groups is None
+            else _group_tie(ordered_groups, winner),
         },
     }
 
@@ -142,6 +165,7 @@ def _evaluation_point(
 def _survivorship(
     trials: Sequence[optuna.trial.FrozenTrial],
     ranked: Sequence[optuna.trial.FrozenTrial],
+    incomplete_group: Collection[int],
 ) -> dict[str, Any]:
     """Check whether failed and pruned trials at least match the ranked ones.
 
@@ -150,11 +174,14 @@ def _survivorship(
     which configurations could win. Failed trials include evidence-gate and
     extraction failures. An infeasible trial violated one of the operator's
     constraints or the metric's own bounds, which define what may win, so it is
-    counted but never flags.
+    counted but never flags. A feasible trial whose repeat group never
+    completed is counted as ``incomplete_group`` and never flags either: the
+    member that kept its group out is counted where it belongs.
     The counts are recorded whatever the verdict, and the check always runs.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials.
+    :param Collection[int] incomplete_group: Feasible trials in incomplete repeat groups.
     :return dict[str, Any]: The check record.
     """
     ranked_numbers = {trial.number for trial in ranked}
@@ -162,8 +189,11 @@ def _survivorship(
     counts["ranked"] = len(ranked_numbers)
     for trial in trials:
         bucket = _EXCLUDED_BY_STATE.get(trial.state)
-        if bucket is not None and trial.number not in ranked_numbers:
-            counts[bucket] += 1
+        if bucket is None or trial.number in ranked_numbers:
+            continue
+        if bucket == "infeasible" and trial.number in incomplete_group:
+            bucket = "incomplete_group"
+        counts[bucket] += 1
     return _checked("survivorship", counts)
 
 
@@ -176,6 +206,7 @@ def _tie(
     Selection breaks exact ties by lower trial number. Tied trials that share
     the winner's params are repeats of one configuration and change nothing;
     tied trials with other params mean the winner was chosen arbitrarily.
+    Single trials carry no noise estimate, so ``within_noise`` is ``None``.
 
     :param Sequence[optuna.trial.FrozenTrial] ranked: Ranked trials by number.
     :param optuna.trial.FrozenTrial winner: The selected trial.
@@ -190,7 +221,35 @@ def _tie(
         and trial.value == winner.value
         and trial.params != winner.params
     ]
-    return _checked("tie", {"tied_trials": tied})
+    return _checked("tie", {"tied_trials": tied, "within_noise": None})
+
+
+def _group_tie(
+    groups: Sequence[RankedGroup],
+    winner: optuna.trial.FrozenTrial,
+) -> dict[str, object]:
+    """Check whether the winning repeat group stands clear of the other groups.
+
+    ``tied_trials`` names the groups whose aggregate equals the winner's
+    exactly; the lowest member trial number broke that tie. ``within_noise``
+    names the groups whose aggregate lies within two combined standard errors
+    of the winner's, exact ties included. Each group is named by its last
+    member. A group with the winner's params is another slot of the same
+    configuration and is skipped.
+
+    :param Sequence[RankedGroup] groups: Ranked groups ordered by their members.
+    :param optuna.trial.FrozenTrial winner: The last member of the winning group.
+    :return dict[str, object]: The check record.
+    """
+    if len(groups) < 2:
+        return _not_checked("only one repeat group was ranked")
+    best = next(group for group in groups if group.representative == winner.number)
+    others = [
+        group for group in groups if group is not best and dict(group.params) != dict(best.params)
+    ]
+    tied = sorted(group.representative for group in others if group.aggregate == best.aggregate)
+    noisy = sorted(group.representative for group in others if within_noise(best, group))
+    return _checked("tie", {"tied_trials": tied, "within_noise": noisy})
 
 
 def _groups(pairs: Iterable[tuple[int, Any]]) -> list[dict[str, Any]]:
@@ -243,7 +302,7 @@ def _evaluation_point_flagged(detail: Mapping[str, Any]) -> bool:
 _FLAGGED: dict[ConfoundCheck, Callable[[Mapping[str, Any]], bool]] = {
     "evaluation_point": _evaluation_point_flagged,
     "survivorship": _survivorship_flagged,
-    "tie": lambda detail: bool(detail["tied_trials"]),
+    "tie": lambda detail: bool(detail["tied_trials"]) or bool(detail["within_noise"]),
 }
 
 
@@ -267,10 +326,12 @@ def _validate_confound_block(data: object, *, winner_trial: int) -> dict[str, An
     :param int winner_trial: Trial number of the winner the block sits on.
     :raises ValueError: The block is absent, has another schema version, any
         check record is malformed or contradicts its evidence, the evidence
-        disagrees with the ranked trials, or the winner is not one of them.
+        disagrees with the ranked trials or groups, or the winner is not one of
+        them or, with repeat groups, not the last member of its own group.
     :return dict[str, Any]: The validated block, rebuilt from plain values.
     """
-    if not isinstance(data, Mapping) or set(data) != {"schema_version", "ranked_trials", "checks"}:
+    keys = {"schema_version", "ranked_trials", "ranked_groups", "checks"}
+    if not isinstance(data, Mapping) or set(data) != keys:
         raise ValueError("confound block is missing or has unexpected keys")
     if type(data["schema_version"]) is not int or data["schema_version"] != CONFOUND_SCHEMA_VERSION:
         raise ValueError(f"confound schema_version is not {CONFOUND_SCHEMA_VERSION}")
@@ -279,15 +340,54 @@ def _validate_confound_block(data: object, *, winner_trial: int) -> dict[str, An
         raise ValueError(
             f"confound ranked_trials does not include the winner, trial {winner_trial}"
         )
+    groups = _validate_ranked_groups(data["ranked_groups"], ranked)
+    if groups is not None and not any(group[-1] == winner_trial for group in groups):
+        raise ValueError(
+            f"confound ranked_groups has no group whose last member is the winner, "
+            f"trial {winner_trial}"
+        )
     checks = data["checks"]
     if not isinstance(checks, Mapping) or set(checks) != set(CONFOUND_CHECKS):
         raise ValueError(f"confound checks must be exactly {', '.join(CONFOUND_CHECKS)}")
     validated = {name: _validate_check(name, checks[name]) for name in CONFOUND_CHECKS}
     _validate_against_ranked(validated, ranked)
+    _validate_against_units(validated["tie"], validated["survivorship"], ranked, groups)
     tie = validated["tie"]
-    if "detail" in tie and winner_trial in tie["detail"]["tied_trials"]:
+    if "detail" in tie and winner_trial in [
+        *tie["detail"]["tied_trials"],
+        *(tie["detail"]["within_noise"] or []),
+    ]:
         raise ValueError("confound tie lists the winner as tying with itself")
-    return {"schema_version": CONFOUND_SCHEMA_VERSION, "ranked_trials": ranked, "checks": validated}
+    return {
+        "schema_version": CONFOUND_SCHEMA_VERSION,
+        "ranked_trials": ranked,
+        "ranked_groups": groups,
+        "checks": validated,
+    }
+
+
+def _validate_ranked_groups(value: object, ranked: list[int]) -> list[list[int]] | None:
+    """Validate the ranked repeat groups against the ranked trials.
+
+    :param object value: Parsed ``ranked_groups``: ``None``, or a list of member lists.
+    :param list[int] ranked: The block's ranked trial numbers.
+    :raises ValueError: The groups are not lists of at least two ascending
+        trial numbers of one size, are not ordered by their members, or do not
+        cover each ranked trial exactly once.
+    :return list[list[int]] | None: The groups, or ``None`` for a phase without repeats.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ValueError("confound ranked_groups is neither null nor a list of groups")
+    groups = [_trial_numbers(group, label="ranked_groups member list") for group in value]
+    if any(len(group) < 2 or len(group) != len(groups[0]) for group in groups):
+        raise ValueError("confound ranked_groups are not groups of one size of at least two")
+    if groups != sorted(groups):
+        raise ValueError("confound ranked_groups are not ordered by their members")
+    if sorted(number for group in groups for number in group) != ranked:
+        raise ValueError("confound ranked_groups do not cover each ranked trial once")
+    return groups
 
 
 def _validate_against_ranked(
@@ -297,15 +397,13 @@ def _validate_against_ranked(
 
     :param Mapping[ConfoundCheck, Mapping[str, Any]] checks: Individually validated records.
     :param list[int] ranked: The block's ranked trial numbers.
-    :raises ValueError: A single ranked trial was compared, several were not,
-        the evaluation groups do not cover each ranked trial once, the
-        survivorship count differs, or a tied trial was not ranked.
+    :raises ValueError: A single ranked trial was compared, the evaluation
+        groups do not cover each ranked trial once, the survivorship count
+        differs, or a tied trial was not ranked.
     """
     evaluation, survivorship, tie = (checks[name] for name in CONFOUND_CHECKS)
-    if len(ranked) < 2 and (evaluation["verdict"] != "n/a" or tie["verdict"] != "n/a"):
+    if len(ranked) < 2 and evaluation["verdict"] != "n/a":
         raise ValueError("confound compared trials though only one was ranked")
-    if len(ranked) >= 2 and tie["verdict"] == "n/a":
-        raise ValueError("confound tie is n/a though several trials were ranked")
     if "detail" in evaluation:
         grouped = sorted(
             number for group in evaluation["detail"]["values"] for number in group["trials"]
@@ -316,6 +414,51 @@ def _validate_against_ranked(
         raise ValueError("confound survivorship ranked count differs from ranked_trials")
     if "detail" in tie and not set(tie["detail"]["tied_trials"]) <= set(ranked):
         raise ValueError("confound tie lists a trial that was not ranked")
+
+
+def _validate_against_units(
+    tie: Mapping[str, object],
+    survivorship: Mapping[str, object],
+    ranked: list[int],
+    groups: list[list[int]] | None,
+) -> None:
+    """Validate the tie and survivorship evidence against the block's ranked units.
+
+    A unit is a repeat group when the block has groups, and a trial otherwise.
+
+    :param Mapping[str, object] tie: The validated tie record.
+    :param Mapping[str, object] survivorship: The validated survivorship record.
+    :param list[int] ranked: The block's ranked trial numbers.
+    :param list[list[int]] | None groups: The block's ranked repeat groups, if any.
+    :raises ValueError: A single ranked unit was compared, several were not,
+        ``incomplete_group`` or ``within_noise`` is recorded without groups,
+        ``within_noise`` is absent with them, or a listed trial does not name
+        another ranked group.
+    """
+    units = len(ranked) if groups is None else len(groups)
+    unit_name = "trials" if groups is None else "repeat groups"
+    if units < 2 and tie["verdict"] != "n/a":
+        raise ValueError(f"confound compared {unit_name} though only one was ranked")
+    if units >= 2 and tie["verdict"] == "n/a":
+        raise ValueError(f"confound tie is n/a though several {unit_name} were ranked")
+    counts = survivorship["detail"]
+    if groups is None and isinstance(counts, Mapping) and counts["incomplete_group"]:
+        raise ValueError("confound survivorship counts incomplete_group trials without repeats")
+    detail = tie.get("detail")
+    if not isinstance(detail, Mapping):
+        return
+    tied, noisy = detail["tied_trials"], detail["within_noise"]
+    if groups is None:
+        if noisy is not None:
+            raise ValueError("confound tie lists within_noise groups without repeat groups")
+        return
+    if noisy is None:
+        raise ValueError("confound tie has no within_noise list though repeat groups were ranked")
+    representatives = {group[-1] for group in groups}
+    if not set(tied) <= representatives or not set(noisy) <= representatives:
+        raise ValueError("confound tie lists a trial that is not the last member of a ranked group")
+    if not set(tied) <= set(noisy):
+        raise ValueError("confound tie lists an exact tie that within_noise omits")
 
 
 def _validate_check(name: ConfoundCheck, check: object) -> dict[str, Any]:
@@ -373,7 +516,7 @@ def _validate_evaluation_detail(detail: object) -> dict[str, Any]:
 
 
 def _validate_survivorship_detail(detail: object) -> dict[str, Any]:
-    """Validate survivorship evidence: the four outcome counts.
+    """Validate survivorship evidence: the outcome counts.
 
     :param object detail: Parsed evidence.
     :raises ValueError: A count is missing, extra, or not a non-negative int.
@@ -390,15 +533,21 @@ def _validate_survivorship_detail(detail: object) -> dict[str, Any]:
 
 
 def _validate_tie_detail(detail: object) -> dict[str, Any]:
-    """Validate tie evidence: the trials that tied the winner with other params.
+    """Validate tie evidence: exact ties with other params, and groups within noise.
 
     :param object detail: Parsed evidence.
-    :raises ValueError: The trial list is missing or malformed.
+    :raises ValueError: A list is missing or malformed.
     :return dict[str, Any]: The validated evidence.
     """
-    if not isinstance(detail, Mapping) or set(detail) != {"tied_trials"}:
-        raise ValueError("confound tie evidence must list tied_trials")
-    return {"tied_trials": _trial_numbers(detail["tied_trials"], label="tie tied_trials")}
+    if not isinstance(detail, Mapping) or set(detail) != {"tied_trials", "within_noise"}:
+        raise ValueError("confound tie evidence must list tied_trials and within_noise")
+    noisy = detail["within_noise"]
+    return {
+        "tied_trials": _trial_numbers(detail["tied_trials"], label="tie tied_trials"),
+        "within_noise": (
+            None if noisy is None else _trial_numbers(noisy, label="tie within_noise")
+        ),
+    }
 
 
 _DETAIL_VALIDATORS: dict[ConfoundCheck, Callable[[object], dict[str, Any]]] = {
@@ -457,12 +606,38 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
                 f"survivorship: {detail['failed']} failed and {detail['pruned']} pruned "
                 f"trials against {detail['ranked']} ranked"
             )
-        else:
+        elif detail["within_noise"] is None:
             tied = ", ".join(str(number) for number in detail["tied_trials"])
             lines.append(
                 f"tie: trial(s) {tied} matched the winner's value exactly with different "
                 "params, and the lower trial number won"
             )
+        else:
+            lines.extend(_describe_group_tie(detail["tied_trials"], detail["within_noise"]))
+    return lines
+
+
+def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
+    """Describe a flagged tie between repeat groups, each named by its last member.
+
+    :param Sequence[int] tied: Groups that matched the winning group's aggregate exactly.
+    :param Sequence[int] noisy: Groups within noise of it, exact ties included.
+    :return list[str]: A sentence for exact ties and one for the other groups within noise.
+    """
+    lines: list[str] = []
+    if tied:
+        lines.append(
+            f"tie: the repeat group(s) ending at trial(s) {', '.join(map(str, tied))} matched "
+            "the winning group's aggregate exactly with different params, and the group "
+            "with the lowest trial number won"
+        )
+    untied = [number for number in noisy if number not in tied]
+    if untied:
+        lines.append(
+            f"tie: the repeat group(s) ending at trial(s) {', '.join(map(str, untied))} are "
+            "within two standard errors of the winning group's aggregate, so their order "
+            "may be seed noise (an advisory heuristic, not a significance test)"
+        )
     return lines
 
 
@@ -504,6 +679,11 @@ def _confound_summary(block: Mapping[str, Any], *, winner_trial: int) -> dict[st
         "tie": {
             "verdict": tie["verdict"],
             "tied_trials": len(tie["detail"]["tied_trials"]) if "detail" in tie else None,
+            "within_noise": (
+                len(tie["detail"]["within_noise"])
+                if "detail" in tie and tie["detail"]["within_noise"] is not None
+                else None
+            ),
         },
     }
 
