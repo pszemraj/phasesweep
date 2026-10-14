@@ -357,17 +357,16 @@ class _PositionGridSampler(optuna.samplers.GridSampler):
 
         A rerun copies its source's ``grid_id``. New draws take positions
         ``0..M-1`` in the grid's seeded shuffle, so no two trials that are not
-        reruns share a point under any ``n_jobs``. A fixed configuration's grid
-        is one empty point, which each of its retries takes.
+        reruns share a point under any ``n_jobs``.
 
         :param optuna.Study study: The active study.
         :param optuna.trial.FrozenTrial trial: The trial about to run.
-        :raises RuntimeError: The position lies past a nonempty grid, which the
-            trial target's cardinality check rules out.
+        :raises RuntimeError: The position lies past the grid, which the trial
+            target's cardinality check rules out.
         """
-        if "grid_id" in trial.system_attrs or "fixed_params" in trial.system_attrs:
+        if "grid_id" in trial.system_attrs:
             return
-        grid_id = _draw_position(study, trial) if self._search_space else 0
+        grid_id = _draw_position(study, trial)
         if grid_id >= len(self._all_grids):
             raise RuntimeError(
                 f"Trial {trial.number} of study {study.study_name!r} has draw position "
@@ -596,13 +595,17 @@ def _build_sampler(
     Returns:
         A configured :class:`optuna.samplers.BaseSampler` subclass instance.
         A seeded stochastic sampler draws by draw position, so a study resumes
-        and grows without drawing a configuration twice; an unseeded one is
-        Optuna's own, which only in-memory storage allows.
+        and grows without repeating a draw; an unseeded one is Optuna's own,
+        which only in-memory storage allows. A fixed configuration, whose
+        search space is empty, gets a plain random sampler that is never
+        consulted.
 
     Raises:
         ValueError: The validated grid search space cannot be enumerated.
 
     """
+    if not search_space:
+        return optuna.samplers.RandomSampler(seed=cfg.seed)
     if cfg.type == "tpe":
         with warnings.catch_warnings():
             warnings.filterwarnings(

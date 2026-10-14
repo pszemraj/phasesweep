@@ -182,6 +182,15 @@ def test_grid_covers_every_point_once_across_interruptions(n_jobs: int) -> None:
     assert sorted(grid_ids) == list(range(6))
 
 
+def test_a_fixed_configuration_gets_no_grid_and_its_retries_no_grid_attributes() -> None:
+    """An empty search space consults no sampler, so even a grid phase stamps no grid point on its attempts."""
+    sampler = _build_sampler(Sampler(type="grid"), {})
+    assert not isinstance(sampler, optuna.samplers.GridSampler)
+    study = _study(sampler)
+    _run(study, {}, 2)
+    assert [t.system_attrs for t in study.get_trials()] == [{}, {}]
+
+
 def test_grid_runs_every_pending_rerun_after_the_last_new_point() -> None:
     """Two pending reruns both run, although every grid point was assigned before them."""
     study = _study(_build_sampler(Sampler(type="grid", seed=0), _GRID_SPACE))
@@ -246,8 +255,9 @@ def test_seeded_random_draws_the_same_set_however_it_is_interrupted(
 def test_a_seeded_draw_is_pinned_by_seed_study_position_and_label() -> None:
     """A seeded draw is a fixed function of the seed, study name, position and label, so any change to that derivation fails here."""
     assert _position_seed(11, "t::p", 3, "lr") == 2070613593
-    study = _study(_build_sampler(Sampler(type="random", seed=11), {}))
-    _run(study, {"lr": _RANDOM_SPACE["lr"]}, 4)
+    space = {"lr": _RANDOM_SPACE["lr"]}
+    study = _study(_build_sampler(Sampler(type="random", seed=11), space))
+    _run(study, space, 4)
     assert study.get_trials()[3].params["lr"] == 0.0030591554960112855
 
 
