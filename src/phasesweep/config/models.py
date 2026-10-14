@@ -1436,7 +1436,9 @@ def _validate_persistent_sampler_seed(storage: str | None, phase: Phase) -> None
     invocation, so the durable trials it accumulates cannot be reproduced or
     explained afterwards, and a resumed or enlarged study could draw a
     configuration it already ran. A seed keys every draw by its position in
-    the study, so a resume draws what an uninterrupted run would have.
+    the study, so an interruption repeats no draw: ``random`` then draws what
+    an uninterrupted run would at any ``n_jobs``, and ``tpe`` and ``cmaes`` do
+    at ``n_jobs`` 1 given the same trial values.
 
     ``grid`` is exempt: it enumerates a fixed matrix. A phase with an empty
     ``search_space`` is exempt too, whatever its sampler: it draws nothing.

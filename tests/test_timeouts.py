@@ -392,8 +392,8 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
 
     # The child study now binds the parent's published winner. A third
     # identical run must still replay both studies without treating the
-    # parent's accepted partial target as a top-up, and without asking TPE to
-    # reconstruct continuation state for suggestions that will never launch.
+    # parent's accepted partial target as a top-up, and without launching a
+    # trial.
     launch_count = len(launched_trials)
     replayed = run_experiment(exp)
     assert replayed["p"].trial_number == winners["p"].trial_number

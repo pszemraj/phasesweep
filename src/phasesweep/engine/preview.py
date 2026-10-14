@@ -200,7 +200,7 @@ def _refuse_as_a_launch_would(
     and a snapshot cannot. Such a study gets the checks that do not depend on
     that recovery (direction and schema) and a fixed configuration's attempt
     limit from counts that treat each attempt as recovery would record it;
-    it is left out of the target, bound-descendant and sampler checks. A launch
+    it is left out of the target and bound-descendant checks. A launch
     also checks the trainer environment, the stored fingerprints, the trial
     evidence and each study's artifact-root claim, which a preview does not.
 

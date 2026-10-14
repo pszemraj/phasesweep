@@ -47,7 +47,7 @@ phases:
   - name: learning_rate
     comment: "Search the learning rate on a shallow model, which is cheap to train."
     n_trials: 4
-    # Each draw derives from this seed and the draw position, so an interrupted trial reruns its exact draw.
+    # Each draw derives from this seed and the draw position, so a resumed phase draws the same set as an uninterrupted one.
     sampler: { type: random, seed: 0 }
     fixed_overrides:
       model.n_layers: 4

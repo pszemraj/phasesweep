@@ -117,7 +117,7 @@ trial  state        value  params               duration_s  winner
     1  COMPLETE  0.413822  optimizer.lr=0.0001         0.6
 ```
 
-A run stopped by Ctrl-C or a kill resumes when you run the same config again: finished phases replay their winners, and a phase cut short reruns the trials the stop interrupted, with their parameters, before it draws anything new. An interrupted trial never counts toward `n_trials`, so the resumed phase evaluates what an uninterrupted run would ([interrupted trials rerun](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#interrupted-trials-rerun)).
+A run stopped by Ctrl-C or a kill resumes when you run the same config again: finished phases replay their winners, and a phase cut short reruns the trials the stop interrupted, with their parameters, before it draws anything new. An interrupted trial never counts toward `n_trials`, so under `grid` or seeded `random` the resumed phase evaluates what an uninterrupted run would at any `n_jobs`, and under seeded `tpe` or `cmaes` it does at `n_jobs: 1` given the same trial values ([interrupted trials rerun](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#interrupted-trials-rerun), [why TPE and CMA-ES need `n_jobs: 1`](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets)).
 
 ## Use your own trainer
 
