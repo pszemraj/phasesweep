@@ -117,7 +117,7 @@ The first successful upload converts the pending publisher into the project's tr
 - `phasesweep.evidence`: JSON, envelope, log, W&B, and MLflow extraction and gates.
 - `phasesweep.reporting`: trainer-side JSON-envelope objective writer.
 - `phasesweep.tracking`: MLflow run bindings, supervised controller operations, result delivery, and upload retries.
-- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering.
+- `phasesweep.runtime`: subprocess supervision, GPU leases, locks, local storage URLs, and override rendering. `runtime/supervisor.py` is the launch barrier every trial passes: a stdlib-only script started by path under `python -I -S` with only `PATH` in its environment, which receives the trainer's command and environment only after the trial's process identity is on disk, so nothing from the trainer environment runs before cleanup can find it. Keep its imports to the stdlib; [invariant 9](invariants.md#9-nothing-runs-before-its-process-identity-is-durable) has the whole rule.
 - `phasesweep.mcp`: catalog registry, stdio server, detached runner, durable run handles, frozen snapshots, and operator recovery.
 - `phasesweep.cli`: Click command surface.
 
@@ -138,7 +138,7 @@ Within `phasesweep.engine`, module ownership is intentionally direct:
 
 `mcp.recovery.recover_run` implements [operator recovery](mcp.md#run-state-and-recovery); the CLI owns its arguments and rendering.
 
-The ordering rules these modules must hold, and the test that owns each one, are listed in [durability invariants](invariants.md).
+The ordering rules these modules must hold, and the test that owns each one, are listed in [durability invariants](invariants.md). `tests/test_invariants_doc.py` holds that file to the code: every `Held by` symbol must import, every cited test must exist, and every numbered reference to an invariant in `src/`, `tests/`, or `docs/` must carry the rule's title in quotes, as in `invariant 2 ("Validation writes nothing")`, or link to its heading, so a renumbering cannot silently repoint it. It cannot notice a missing rule: a new ordering rule or ledger entry point needs its own entry, citing the code and the test that hold it.
 
 The ordinary control flow is:
 
@@ -176,4 +176,3 @@ flowchart TD
 - TODO(mcp): Replace the private FastMCP strict-schema patch when the SDK exposes a tested public closed-input-schema API; keep behavior-level request validation as the safety net until then.
 - TODO(runtime): Design an explicit completion-budget mode only if its attempt accounting, failure cap, and timeout semantics are specified separately.
 - TODO(runtime): Add a deliberately scoped generation-pruning command only if it preserves the current last-successful pointer and all cited winner provenance.
-- TODO(engine): Keep [durability invariants](invariants.md) in step with the ledger chokepoint. A storage constructor outside `engine/ledger.py` already fails `tests/test_ledger_contract.py`, but a new ordering rule or ledger entry point needs its own invariant entry, citing the code and the test that hold it.

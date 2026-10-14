@@ -1,6 +1,6 @@
 # Durability invariants
 
-The experiment lock serializes local ledger mutations. Artifact-root and format checks precede claims, durable outcome records precede terminal trial states, and generation validation precedes the publication-pointer commit. Operator recovery identifies processes from durable attempt and run records.
+The experiment lock serializes local ledger mutations. Artifact-root and format checks precede claims, durable outcome records precede terminal trial states, and generation validation precedes the publication-pointer commit. No trial or detached-runner code runs before its process identity is durable, and operator recovery identifies processes from durable attempt and run records.
 
 > [!IMPORTANT]
 > Error text is authoritative, and a wrap preserves the operator's remediation. Never fix a failing test by weakening a message match or an ordering assertion.
@@ -47,9 +47,9 @@ flowchart TD
 
 #### 1. Mutations hold the experiment lock
 
-A run, and a `recover-run` the operator confirms, hold the experiment lock before they read or write the artifact tree or the ledger.
+A run, and a `recover-run` the operator confirms, hold the experiment lock before they read or write the artifact tree or the ledger. `sync-tracking` holds it too: it retires tracking attempts and writes the tracking tree, reading the ledger only through `validate_ledger` and `read_phase_trials`.
 
-**Held by:** `engine.locking._experiment_lock`, entered as the outermost durable-state context in `engine.run._run_experiment_outcome`, and in `mcp.recovery.recover_run` only when the operator confirms\
+**Held by:** `engine.locking._experiment_lock`, entered as the outermost durable-state context in `engine.run._run_experiment_outcome`, in `mcp.recovery.recover_run` only when the operator confirms, and in `tracking.publication.sync_tracking` inside `runtime.shutdown.signal_handler_scope` for its whole body: tracking-only attempt resolution, record rebuilds, and deliveries\
 **Test:** `tests/test_locking.py::test_run_experiment_holds_experiment_lock_for_duration`
 
 #### 2. Validation writes nothing
@@ -102,67 +102,116 @@ Recovery validates the binding and the format before it opens any study, never c
 
 #### 8. Attempts are registered before launch
 
-The attempt registry is scanned before anything else in the continuation preflight, and each attempt is durably registered before its trainer is launched.
+The attempt registry is scanned before anything else in the continuation preflight, and each attempt is durably registered before its trainer is launched. Each entry records the producing phase and study names and an absolute storage locator, so the registry still resolves the attempt after a phase rename, a storage-URL change, or a change of working directory.
 
-**Held by:** `engine.attempts._preflight_active_attempts`, run first by `engine.guards._preflight_existing_studies`; then `engine.attempts._register_active_attempt`, called in `engine.phase` before the GPU lease and the launch\
-**Test:** `tests/test_stale_reaper.py::test_unpersistable_attempt_refuses_to_launch_its_trainer`
+**Held by:** `engine.attempts._preflight_active_attempts`, run first by `engine.guards._preflight_existing_studies`; then `engine.attempts._register_active_attempt`, called in `engine.phase` before the GPU lease and the launch, which freezes the locator from `runtime.files.storage_recovery_locator` into the entry\
+**Tests:** `tests/test_stale_reaper.py::test_unpersistable_attempt_refuses_to_launch_its_trainer`, `tests/test_stale_reaper.py::test_renamed_phase_cannot_hide_stale_trainer_from_recovery`, `tests/test_stale_reaper.py::test_storage_change_cannot_hide_stale_attempt_from_recovery`, `tests/test_stale_reaper.py::test_relative_registry_storage_recovers_from_the_registration_cwd`
 
-#### 9. Preflight finishes before the claims it guards
+#### 9. Nothing runs before its process identity is durable
+
+Until a process's identity is durable, nothing the trial, the trainer environment, or the experiment project controls executes in it. Such code could fork and `setsid` out of the process group recorded afterwards, and cleanup would then confirm an empty group while the escaped process keeps running. A trial launches through `runtime/supervisor.py`, which imports nothing beyond the stdlib modules `contextlib`, `json`, `os`, `signal`, `sys`, and `time`, and is started by file path, never with `-m`, under `python -I -S` with an environment holding only `PATH`. No `PYTHONPATH`, `sitecustomize`, or shadowing `phasesweep` from the trainer environment can load, and `-I` keeps the script's own directory, which holds the sibling modules `json.py` and `time.py`, off `sys.path`. The trainer's command, environment, and working directory cross the acknowledgement pipe only after `process_identity.json` is written, and a blocked trainer whose pipe closes first exits without executing anything. The MCP detached runner, which must import `phasesweep`, starts under `-P -s` in the server's owner-only state directory, with `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, and `PYTHONEXECUTABLE` removed and `PYTHONNOUSERSITE=1`. It receives the project directory only as `--cwd` and enters it only after its spawned handle is persisted and the launch handshake completes.
+
+**Held by:** `runtime.process._spawn_blocked_supervisor`, `runtime.process._sanitized_supervisor_env`, and `runtime.process._supervisor_script_path`; `runtime.process.run_supervised`, which writes the identity with `runtime.process._write_process_identity` before `runtime.process._encode_launch_payload` crosses the pipe; `runtime.supervisor._read_launch_payload` and `runtime.supervisor._run_trainer`, which exits 75 on EOF without `exec`; `mcp.run_control.RunControl._spawn` with `mcp.run_control._runner_env`, `mcp.run_control._PRE_IMPORT_CODE_ENV_VARS`, and `mcp.run_control.RunControl._neutral_spawn_cwd`; `mcp.runner.main`, which enters the project directory only after `mcp.runner._persist_spawned_handle` and `mcp.runner._complete_launch_handshake`\
+**Tests:** `tests/test_process_supervision.py::test_spawn_blocked_supervisor_launch_argv_and_env`, `tests/test_process_supervision.py::test_supervisor_never_imports_poisoned_modules_from_pythonpath`, `tests/test_process_supervision.py::test_hard_parent_death_before_identity_commit_never_starts_trainer`, `tests/test_mcp_launch.py::test_launch_hardens_runner_interpreter_flags_and_environment`, `tests/test_mcp_launch.py::test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd`, `tests/test_mcp_launch.py::test_spawned_runner_cannot_execute_project_local_code`, `tests/test_mcp_runner.py::test_runner_enters_the_project_directory_after_its_identity_is_durable`, `tests/test_mcp_runner.py::test_runner_persists_identity_even_when_the_project_directory_is_gone`
+
+#### 10. Lifecycle states that skip signalling are written only on proof
+
+Recovery signals nothing for an attempt only on a durable lifecycle state that proves no process can remain, so each such state is written only once its proof exists; a state written early lets recovery skip a live process group. `allocated` is written before the attempt is registered, before its trial attributes make it discoverable, and before it waits for a GPU, so with no process identity beside it, it means no launch began. `launching` is written before `Popen`, so a spawned supervisor whose identity write failed never reads as `allocated`. The trial-directory attribute is set before `launch_trial`, so a `RUNNING` trial without it launched nothing. `exited` with confirmed cleanup is written only once the whole process group is proven gone, or when no supervisor was spawned at all, and `process_identity.json` stays beside it. Every other state falls through to identity validation and fails closed.
+
+**Held by:** `engine.phase._execute_objective`, which writes `allocated` through `runtime.process.write_attempt_lifecycle` before `engine.attempts._register_active_attempt`, the trial attributes, and the GPU wait, and sets `engine.state.TRIAL_DIR_ATTR` before `engine.trial.launch_trial`; `runtime.process.run_supervised`, which writes `launching` before `runtime.process._spawn_blocked_supervisor` and calls `runtime.process._record_attempt_exited` only when cleanup is confirmed; read by `engine.attempts._attempt_process_resolution`, `engine.attempts._resolve_attempt`, and `engine.cleanup._reap_stale_trials`, which resolves no process for a trial without the trial-directory attribute\
+**Tests:** `tests/test_process_supervision.py::test_identity_write_failure_marks_launch_before_popen`, `tests/test_process_supervision.py::test_unexpected_status_read_failure_reports_uncertain_cleanup`, `tests/test_process_supervision.py::test_run_supervised_retains_identity_and_records_exit_on_success`, `tests/test_stale_reaper.py::test_prelaunch_allocated_attempt_recovers_without_identity`, `tests/test_stale_reaper.py::test_exited_attempt_recovers_without_signalling`
+
+#### 11. Preflight finishes before the claims it guards
 
 Environment preflight finishes before the generation claim, and the continuation preflight finishes before the generation is marked running or any attempt is registered.
 
-**Held by:** `engine.run._run_experiment_outcome`, which calls `_preflight_missing_reached_phase_environments` before `engine.generation._claim_generation`, then `engine.guards._preflight_existing_studies`, `engine.resume._preflight_skipped_winners`, and `engine.resume._preflight_reached_fingerprint` before the running state\
-**Test:** `tests/test_runtime_behavior.py::test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup`
+**Held by:** `engine.run._run_experiment_outcome`, which calls `_preflight_missing_reached_phase_environments` before `engine.generation._claim_generation`, then `engine.guards._preflight_existing_studies`, `engine.evidence._validate_selection_evidence`, `engine.resume._reject_bound_descendant_topups`, `engine.resume._reject_unsupported_sampler_topups`, `engine.resume._preflight_skipped_winners`, and `engine.resume._preflight_reached_fingerprint` before the running state\
+**Tests:** `tests/test_runtime_behavior.py::test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup`, `tests/test_trial_evidence.py::test_topup_refuses_a_candidate_whose_evidence_left_the_tree`
 
 `claim_ledger` runs before environment preflight, and the generation claim runs before the continuation chain, so the chain guards the running state and the attempts, not either claim.
 
-#### 10. No terminal trial without its outcome record
+#### 12. A persistent study holds one environment cohort
 
-No Optuna trial reaches a terminal state before its durable outcome record is written; a failed outcome write leaves the trial `RUNNING` for recovery.
+A persistent study holds trials from one semantic trainer environment. The config fingerprint deliberately leaves ambient values out and relies on this check, so trials from two environments in one study would be ranked against each other as if they were comparable. The environment digest covers every inherited value outside `passthrough_env`. It is the first attribute written on each allocated trial, before the abort check and any lifecycle or registry write, and `_run_phase` also records it on the study as an allocation context before Optuna allocates, so a trial that dies between allocation and its first attribute still belongs to a known cohort. Before another trial is allocated into a populated study, both the continuation preflight and `_run_phase` refuse a study whose recorded digests differ from this invocation's, or that holds a trial whose digest is neither on the trial nor covered by an allocation context. Per-trial `PHASESWEEP_*` and GPU bindings are applied after the digest is taken, and `CUDA_VISIBLE_DEVICES` stays out of the base inherited environment, so neither splits a cohort.
 
-**Held by:** `engine.phase._record_outcome`, which writes the outcome attribute before any terminal transition and raises `engine.phase._TrialOutcomeUnrecordedAbort` when it cannot\
-**Test:** `tests/test_runtime_behavior.py::test_persistent_outcome_write_failure_leaves_trial_running_until_recovery`
+**Held by:** `engine.trial._environment_identity`; `engine.study_policy._record_allocation_context`, called by `engine.phase._run_phase` before the optimize loop; `engine.phase._execute_objective`, which stamps `engine.state.TRAINER_ENV_DIGEST_ATTR` first; `engine.study_policy._validate_environment_cohort`, called from `engine.guards._preflight_existing_studies` and `engine.phase._run_phase`; `config.models.BASE_INHERITED_ENV`; `engine.fingerprints._execution_identity`, which leaves ambient values out\
+**Tests:** `tests/test_fingerprint.py::test_changed_semantic_inherited_value_rejects_topup_before_allocation`, `tests/test_runtime_behavior.py::test_parallel_abort_stamps_environment_before_pruning`, `tests/test_stale_reaper.py::test_allocation_context_covers_first_environment_write_failure`, `tests/test_fingerprint.py::test_identical_semantic_environment_resumes_persistent_study`
 
-#### 11. An abort is recorded with the outcome that trips it
+#### 13. No terminal trial without its outcome record
+
+No Optuna trial reaches a terminal state before its durable outcome record is written; a failed outcome write leaves the trial `RUNNING` for recovery. The failure reaches the operator once, as a retryable storage outage, after the optimize loop drains, whatever `n_jobs` is. Recovery writes the failure outcome and the cleanup-recovery ledger before it commits `FAIL`.
+
+**Held by:** `engine.phase._record_outcome`, which writes the outcome attribute before any terminal transition and raises `engine.phase._TrialOutcomeUnrecordedAbort` when it cannot; `engine.phase._objective`, whose first handler re-raises that abort untouched; `engine.phase._run_phase`, which converts it to `StudyStorageUnavailableError` once, after the optimize loop drains; `engine.attempts._fail_stale_running_trial`, which writes the failure outcome and the cleanup-recovery ledger before recovery commits `FAIL`\
+**Tests:** `tests/test_runtime_behavior.py::test_persistent_outcome_write_failure_leaves_trial_running_until_recovery`, `tests/test_runtime_behavior.py::test_parallel_outcome_write_failure_surfaces_without_orphan_terminal_rows`, `tests/test_stale_reaper.py::test_reaper_reports_storage_failures_after_cleanup`
+
+#### 14. An abort is recorded with the outcome that trips it
 
 A phase abort is written in the same record as the outcome that trips it, and replay honors the first abort recorded after the recovery boundary. A later success resets the failure streak but never a recorded abort, and a changed `max_consecutive_failures` governs new work only, never recorded outcomes. Recovering from an abort accepts the raised `n_trials` in the same record that retires the abort, so an interrupted recovery keeps its authorization and the old target never runs it.
 
 **Held by:** `engine.phase._record_outcome`, which writes the record `engine.phase._PhaseExecution.abort_decision` returns with the outcome; `engine.study_policy._load_phase_policy_state`, which replays it; `engine.phase._resume_phase`, which applies the current limit only before new work; `engine.study_policy._record_recovery_boundary`, whose record `engine.study_policy._accepted_trial_target` reads as an accepted target\
 **Tests:** `tests/test_runtime_behavior.py::test_parallel_failure_threshold_uses_completion_order`, `tests/test_abort_recovery.py::test_changing_the_failure_limit_never_reinterprets_recorded_outcomes`, `tests/test_abort_recovery.py::test_interrupted_recovery_keeps_the_raised_target_authorization`
 
-#### 12. An unreadable ledger means cleanup is uncertain
+#### 15. An unreadable ledger means cleanup is uncertain
 
 A ledger that cannot be read makes cleanup uncertain, never confirmed, and the attempt stays registered for a later retry. A journal's partial final record does not make it unreadable: the registry opener repairs it first, as invariant 2 ("Validation writes nothing") describes, and reads the attempt as it would on a healthy journal.
 
 **Held by:** `engine.cleanup._reap_stale_trials`, which raises `ProcessCleanupUncertainError`; `engine.attempts._registry_attempt_fail_stale_trial`, which opens through `engine.ledger.open_registry_study` and retains the entry when storage is unreachable; `engine.guards._preflight_existing_studies`, which marks the cleanup report uncertain\
 **Tests:** `tests/test_stale_reaper.py::test_registry_storage_failure_marks_cleanup_report_uncertain`, `tests/test_stale_reaper.py::test_registry_retains_attempt_when_journal_snapshot_is_unreadable`, `tests/test_stale_reaper.py::test_registry_reads_its_attempt_after_repairing_a_partial_journal_record`
 
+#### 16. Unconfirmed cleanup stops new work until recovery proves it
+
+A process group whose cleanup is not confirmed stops all further work until recovery proves it gone, because the leaked group may still hold its GPU and other resources. The trainer check runs while the trial still holds its GPU lease and records a phase-fatal abort before the lease is released, so no queued worker can launch onto the leaked group. `UnsafeProcessCleanupError`, raised for a trainer or for an evidence or tracking worker, is not a `TrialExecutionError` and is never in Optuna's `catch` tuple, so no such trial is committed as an ordinary failure while the phase continues. The trial's outcome records the `unsafe_process_cleanup` policy, and its attempt-registry entry outlives its terminal state. Only the study's cleanup-recovery ledger, written when the next run's preflight or a confirmed `recover-run` proves the group gone, retires the entry; raising `n_trials` does not. A stale-process cleanup that cannot confirm the group gone never advances state.
+
+**Held by:** `engine.phase._execute_objective`, which checks cleanup inside `runtime.gpu.GpuPool.acquire` and calls `engine.phase._PhaseExecution.record_fatal`; `engine.phase._objective`, which records the `fatal` outcome with the `unsafe_process_cleanup` policy; `engine.phase._run_phase`, whose `catch` tuple holds only `TrialExecutionError`; `errors.UnsafeProcessCleanupError`; `engine.phase._settle_finished_trial`, which keeps the entry while `engine.attempts._trial_requires_cleanup_recovery` holds; `engine.cleanup._recover_cleanup_uncertain_trials` and `engine.attempts._record_cleanup_recovery`, which write `engine.state.CLEANUP_RECOVERED_TRIALS_ATTR`, called from `engine.guards._preflight_existing_studies` and `mcp.recovery._recover_trial_evidence`; `engine.attempts._resolve_attempt`, which raises when `runtime.reaper.cleanup_stale_trial_process` cannot confirm the group gone\
+**Tests:** `tests/test_process_supervision.py::test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu`, `tests/test_runtime_behavior.py::test_unsafe_cleanup_blocks_topup_until_recovery`
+
+#### 17. A GPU lease holds the card the trainer binds until its group exits
+
+A GPU lease excludes the physical card the trainer actually uses for as long as any process in the trainer's group can run on it; otherwise two trainers share one card and neither measurement means what it claims. Host locks key on the card's canonical identity from the `nvidia-smi` inventory, so a numeric index and its UUID contend for one lock. A trainer handed numeric tokens always gets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, overriding a configured value, because those indices were locked in PCI order and another order could bind a different card. The lease descriptors pass to the supervisor guardian, which stays outside the trainer's process group, keeps them until the whole group is gone, and closes them in the trainer child before `exec`, so the exclusion survives an orchestrator hard exit.
+
+**Held by:** `runtime.gpu.GpuDevice.lock_identity`, `runtime.gpu.GpuDevice.lock_name`, and `runtime.gpu._bind_lock_identities`; `runtime.gpu.GpuPool.acquire`, which yields the lease descriptors; `engine.trial.launch_trial`, which forces `CUDA_DEVICE_ORDER` for numeric tokens and forwards the descriptors to `runtime.process.run_supervised`; `runtime.process._spawn_blocked_supervisor`, which passes them to the guardian; `runtime.supervisor.main` and `runtime.supervisor._close_trainer_fds`\
+**Tests:** `tests/test_gpu_pool.py::test_numeric_index_and_uuid_token_lock_the_same_physical_gpu`, `tests/test_trial_launch.py::test_launch_trial_cuda_environment[numeric-forces-lock-compatible-order]`, `tests/test_trial_launch.py::test_launch_trial_forwards_gpu_lease_fds`, `tests/test_gpu_pool.py::test_gpu_lease_survives_orchestrator_hard_exit`
+
 ### Publication
 
-#### 13. Publication is a transaction
+#### 18. Publication is a transaction
 
-The generation's own summary and winners are read back and validated before `last_successful_generation.yaml` commits, a failure before the commit leaves the prior pointer authoritative, and shutdown signals are absorbed until the commit lands. The pointer commits before its generation's lifecycle record, so it can be the only proof that generation committed; the record is written before the pointer moves off it, and if that write fails the pointer stays.
+The generation's own summary and winners are read back and validated before `last_successful_generation.yaml` commits, a failure before the commit leaves the prior pointer authoritative, and shutdown signals are absorbed until the commit lands. The pointer commits before its generation's lifecycle record, so it can be the only proof that generation committed; the record is written before the pointer moves off it, and if that write fails the pointer stays. Once the pointer commits, nothing after it reclassifies the publication: each post-commit step logs and swallows its own failure, `BaseException` included, and a directory fsync after the rename never raises.
 
-**Held by:** `engine.generation._publish_generation`, running inside `runtime.shutdown.absorb_shutdown_signals`, with `engine.generation._validate_generation_publishable` before the pointer write and `engine.generation._record_superseded_publication` before the pointer moves\
-**Tests:** `tests/test_publication_transaction.py::test_shutdown_signal_during_publication_is_absorbed_until_committed`, `tests/test_publication_transaction.py::test_next_publication_records_the_generation_whose_record_was_lost`, `tests/test_publication_transaction.py::test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer`
+**Held by:** `engine.generation._publish_generation`, running inside `runtime.shutdown.absorb_shutdown_signals`, with `engine.generation._validate_generation_publishable` and a required sidecar's `engine.run.PublicationHook.prepare` before the pointer write and `engine.generation._record_superseded_publication` before the pointer moves; `engine.generation._log_on_failure` around every post-commit step; `runtime.files.fsync_directory`\
+**Tests:** `tests/test_publication_transaction.py::test_shutdown_signal_during_publication_is_absorbed_until_committed`, `tests/test_publication_transaction.py::test_next_publication_records_the_generation_whose_record_was_lost`, `tests/test_publication_transaction.py::test_unwritable_record_for_the_superseded_generation_keeps_the_prior_pointer`, `tests/test_publication_transaction.py::test_required_publication_sidecar_failure_prevents_pointer_commit`, `tests/test_publication_transaction.py::test_directory_fsync_failure_after_pointer_rename_still_publishes`, `tests/test_publication_transaction.py::test_control_flow_exception_from_postcommit_record_write_cannot_downgrade_success`
 
-#### 14. A published result is read once
+#### 19. A published result is read once
 
 Validation reads every published artifact once, refusing symlinks and paths outside the generations root, and returns what it read. `show-winners`, `read_status`, `read_winners`, `read_result`, the MCP result snapshot and winner reads, and a `--from-phase` resume all show or build on those bytes; none reopens a published artifact by path. A generation that is not the validated publication, such as a pinned, unfinished, or failed one, is read from its files under the permissive read contract. A `--from-phase` resume, whether a run, a dry run, or an MCP launch, refuses a recorded publication that does not validate or cannot be read, with `PublicationIntegrityError` or `PublicationAccessError`; only a tree that never published reads as having no winner yet.
 
 **Held by:** `engine.publication_validation._validate_generation_manifest`, returning the `ValidatedPublication` that `engine.publication.PublicationPointer.validated` carries, consumed by `engine.read._represented_winners`, `cli._show_experiment_winners`, and `engine.artifacts._load_winner`; `engine.resume._published_for_resume`, which turns an unusable verdict into a refusal for the run preflight, the dry run, and the MCP launch gate\
 **Tests:** `tests/test_publication_transaction.py::test_published_reads_consume_the_bytes_validation_read`, `tests/test_publication_transaction.py::test_unusable_publication_is_refused_for_resume_never_read_as_absent`, `tests/test_mcp_launch.py::test_resume_refuses_an_unusable_publication_instead_of_reporting_no_winner`
 
+#### 20. A result read describes one generation in its own terms
+
+One status or result read describes one generation, labelled the way that generation recorded it; mixing two publications, or relabelling one with the current config, misreports historical numbers or hides a published winner. `read_status` resolves the last-success pointer once and takes every identity, winner, and summary fact from that resolution, capturing trial counts only afterwards, so a publication that lands mid-read is counted with its trials. A caller that reports status and winners read from the tree together uses `read_result`, never `read_status` paired with `read_winners`. A published result's metric name and goal, objective-evidence assurance, and phase plan come from the represented generation's own summary and winner files, never the current config. Winners are enumerated under `result_phase_plan`, so a renamed phase neither hides its winner nor reads as missing, and `result_context` and `published_config_matches_current` say which config supplied the labels. CLI `show-winners`, the MCP result snapshot, `get_run_results`, and tracking rebuilds keep both rules.
+
+**Held by:** `engine.read._read_status`, which calls `engine.publication._resolve_publication_pointer` once and then `engine.ledger.read_trial_stats`; `engine.read.read_result` and `engine.read._winner_view`; `cli._show_experiment_winners`, which renders the validated generation's phase plan; `mcp.snapshots.capture_result_snapshot`; `mcp.tools.PhaseSweepMCP.winners` and `mcp.redaction.winners_payload`, which take their labels from the status payload; `tracking.publication._save_generation_intents`, which reads the phase graph from the generation's validated artifacts\
+**Tests:** `tests/test_publication_transaction.py::test_read_status_single_captures_the_published_pointer`, `tests/test_engine_read.py::test_read_status_captures_trial_data_after_resolving_the_publication_pointer`, `tests/test_engine_read.py::test_published_result_is_not_reinterpreted_by_config_drift`, `tests/test_engine_read.py::test_published_result_keeps_its_own_phase_plan_after_a_rename`, `tests/test_mcp_read_tools.py::test_published_results_keep_their_own_metric_after_a_catalog_metric_edit`, `tests/test_mcp_read_tools.py::test_published_winner_survives_a_catalog_phase_rename`, `tests/test_cli.py::test_show_winners_renders_historical_annotations_on_config_drift`, `tests/test_mlflow_terminal_delivery.py::test_rebuilt_winner_references_keep_the_generation_graph`
+
+#### 21. An unusable publication never reads as absent
+
+Only a missing pointer file means nothing was published. A last-success pointer that exists but whose publication cannot be validated reads as `failed`, or `permission_denied` when a read is refused, and carries no validated publication. Every consumer that would act on "nothing published" refuses instead: a run's claim refuses before any write, `status` and `show-winners` report the verdict and exit non-zero, MCP reads expose no winners, a `--from-phase` resume refuses as invariant 19 ("A published result is read once") describes, and recovery refuses to reconcile a prepared publication. A caller told "nothing published" could re-run over the tree and advance the pointer past evidence that still needs operator attention.
+
+**Held by:** `engine.publication._resolve_publication_pointer` and `engine.publication._unresolvable_pointer`; `engine.artifact_roots._check_published_phase_studies`, which refuses inside `engine.ledger.claim_ledger`; `engine.read._read_status`, which reports `publication_integrity` and no published facts; `cli._show_experiment_winners` and `cli._raise_on_failed_publication`; `mcp.tools.PhaseSweepMCP.winners`, which exposes no winners for `failed`, `permission_denied`, or `unknown`; `engine.resume._published_for_resume`; `mcp.recovery._publication_recovery_action`\
+**Tests:** `tests/test_publication_transaction.py::test_corrupt_publication_is_reported_as_failed_not_absent`, `tests/test_publication_transaction.py::test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun`, `tests/test_cli.py::test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero`, `tests/test_mcp_read_tools.py::test_mcp_winners_hide_unusable_live_publications`
+
 ### MCP runs
 
-#### 15. A PID alone is never authority
+#### 22. A PID alone is never authority
 
 A process is identified by PID, start time, boot id, and PID namespace together, and a differing boot id settles a reboot without signalling anything. A namespace is its inode plus the start time of its PID 1, because the kernel reuses a freed namespace's inode within seconds. A PID recorded in another PID namespace names an unrelated process here, so it is never probed or signalled. Only the host's initial namespace can prove such processes gone, from the recorded PIDs and process groups at every nesting level; anywhere else, or when a process there cannot be ruled out, cleanup refuses with `ForeignPidNamespaceError`, which names any blocking host process and gives no manual `kill` advice. A stale attempt is signalled through one procedure, whichever source found it: the attempt registry, a stale `RUNNING` trial, or a terminal trial that recorded cleanup uncertainty.
 
 **Held by:** `runtime.reaper.identity_from_earlier_boot`, `runtime.reaper.same_pid_namespace`, `runtime.reaper.recorded_process_blocker`, `mcp.runs.RunStore.runner_view`, `runtime.reaper.is_same_live_process`, `runtime.reaper.cleanup_stale_trial_process`, whose only caller is `engine.attempts._resolve_attempt`\
 **Tests:** `tests/test_mcp_runs.py::test_state_reserves_recovery_on_pid_reuse_mismatch`, `tests/test_stale_reaper.py::test_cleanup_stale_trial_process_accepts_prior_boot_without_signalling`, `tests/test_pid_namespace.py::test_cleanup_stale_trial_process_refuses_foreign_namespace_without_signalling`, `tests/test_pid_namespace.py::test_a_reused_inode_with_another_pid_1_start_time_is_foreign`, `tests/test_pid_namespace.py::test_an_unreadable_candidate_blocks_only_for_its_exact_numbers`, `tests/test_attempt_resolution.py::test_only_resolve_attempt_signals_a_stale_process_group`
 
-#### 16. A dead runner stays live until recovery decides
+#### 23. A dead runner stays live until recovery decides
 
 A dead runner with no terminal status stays in the live set until `recover-run` decides; liveness alone never concludes a run. The one exception is a runner from a boot that has ended: nothing from that boot survived, and a boot never comes back, so the run reads `failed` without a signal. Deriving state writes nothing, so a read tool never creates or removes a marker: the writers that must reserve cleanup (cancel, failed-spawn cleanup, `recover-run`) persist their own marker, and a marker that a later status or boot supersedes is read as inert. A runner recorded in a PID namespace the server cannot observe is neither alive nor dead: it stays live on durable evidence alone, is never reaped, probed, or signalled, and `cancel_run` and `recover-run` refuse it. When the host's initial namespace proves its processes gone, it reads as a dead runner that needs recovery, never as terminal, because that proof says nothing of its trials and a later reader may be unable to repeat it; only `recover-run` settles the run, and the status it writes outlives any later proof.
 
@@ -171,14 +220,14 @@ A dead runner with no terminal status stays in the live set until `recover-run` 
 
 ### Errors and fixtures
 
-#### 17. Wraps keep the operator's remediation
+#### 24. Wraps keep the operator's remediation
 
 Every operator-facing error declares one remediation, and a wrap preserves it instead of replacing it with the wrapper's own advice. Alternatives route the one that keeps the operator's existing work, repairs of which none suffices alone route to reading the logs, and retrying what failed after a repair is implied. A preflight that collects several refusals routes the remediation they share, or reading the logs when they disagree. `recover-run` never routes a refusal back to itself except to a confirmed run, so `RunRecoveryError` defaults to reading the logs. An MCP run's failure payload takes its next steps only from the action, so no error type gives the agent advice of its own; unconfirmed cleanup adds recover-run after the repair.
 
 **Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.default_action` with the `action` each instance carries, `errors.PhaseSweepError.rewrap`, `mcp.runner._OPERATOR_STEPS`, `mcp.runner._cleanup_steps`\
 **Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`, `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`, `tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`
 
-#### 18. Refusals are tested against a real ledger
+#### 25. Refusals are tested against a real ledger
 
 Refusals are tested against a ledger produced by the public API, and read paths run under a patch that records and raises on any file-backed storage construction.
 
@@ -187,14 +236,14 @@ Refusals are tested against a ledger produced by the public API, and read paths 
 
 ### Selection
 
-#### 19. A confound verdict never joins a fingerprint or gets read as clean
+#### 26. A confound verdict never joins a fingerprint or gets read as clean
 
 The confound block is computed once per selection and frozen onto the winner; `n/a` means a check could not run and must never be rendered or counted as `ok`. In a repeats phase it ranks complete groups, lists them as `ranked_groups`, and the validator requires the winner's `repeats` members to be one of them. No downstream phase fingerprint depends on any block's content, so an observation can never invalidate a study or block a top-up, and a top-up that reselects the same trial for a larger ranked population publishes a fresh block rather than reusing the old one. A `--from-phase` resume carries the parent winner's block verbatim. The block's authoritative copy is the generation's `phases/<phase>/winner.yaml`, which the generation manifest covers: an edited verdict there fails `publication_integrity` like any other tampered artifact. The per-phase `winner.yaml` projection is never read back.
 
 **Held by:** `engine.confound._assess_population`, `engine.confound._validate_check` refusing an `n/a` record without a `reason`, `engine.fingerprints._phase_fingerprint`, which never reads `engine.state.Winner.confound`, and `engine.publication_validation._validate_generation_manifest`, which calls `engine.confound._validate_confound_block`\
 **Tests:** `tests/test_confound.py::test_verdicts_are_three_distinct_values_and_not_checked_is_never_ok`, `tests/test_confound.py::test_confound_block_never_moves_a_downstream_fingerprint`, `tests/test_confound.py::test_published_block_is_manifest_covered`, `tests/test_confound.py::test_top_up_reselection_publishes_a_fresh_block_for_its_larger_population`, `tests/test_confound.py::test_inheriting_phases_are_warned_and_from_phase_carries_the_block`, `tests/test_repeats.py::test_repeats_block_and_confound_groups_agree_on_the_winning_group`
 
-#### 20. A repeat group is fixed once complete and its last member names it
+#### 27. A repeat group is fixed once complete and its last member names it
 
 A repeat group holds exactly one trial per repeat value: under grid its key is the trial's params without the repeat key, and under seeded random it is also the configuration slot `trial_number // R`, so a later top-up can add groups but never a member to a complete one. The winner's scalar fields describe the group's highest-numbered member, so a winning group cites the generation that ran its last member; that generation saw the group complete, and because exact ties go to the group with the lowest member trial number, it selected the same winner. A carried winner's source check therefore holds without a repeats-specific path, and every member's evidence is verified wherever the winner's is.
 
@@ -203,10 +252,10 @@ A repeat group holds exactly one trial per repeat value: under grid its key is t
 
 ## Detached-run recovery rationale
 
-A dead runner without terminal status may still have trials being reaped, so invariant 16 ("A dead runner stays live until recovery decides") keeps its capacity slot occupied until `recover-run` decides from durable evidence. Invariant 7 ("Recovery validates before it opens") governs that recovery's ledger access. Process identity includes the boot id because PID and `/proc` start time can both be reused after reboot, and the PID namespace because the same numbers name unrelated processes in another one; an unknown boot id or PID namespace on either side refuses to signal.
+A dead runner without terminal status may still have trials being reaped, so invariant 23 ("A dead runner stays live until recovery decides") keeps its capacity slot occupied until `recover-run` decides from durable evidence. Invariant 7 ("Recovery validates before it opens") governs that recovery's ledger access. Process identity includes the boot id because PID and `/proc` start time can both be reused after reboot, and the PID namespace because the same numbers name unrelated processes in another one; an unknown boot id or PID namespace on either side refuses to signal.
 
 ### Persisted spawned handle
 
-A detached runner outlives its parent by design. If the server restarts with no handle on disk, it has no record of that runner, and a second `launch_run` spawns a duplicate sweep against the same ledger. The handle is created before `Popen`, replaced by the runner's own receipt once the runner has persisted its identity, and confirmed through a ready/ack handshake, so no child ever exists without a durable handle naming it.
+A detached runner outlives its parent by design. If the server restarts with no handle on disk, it has no record of that runner, and a second `launch_run` spawns a duplicate sweep against the same ledger. The handle is created before `Popen`, replaced by the runner's own receipt once the runner has persisted its identity, and confirmed through a ready/ack handshake, so no child ever exists without a durable handle naming it. What the runner may execute before that handle exists, through its interpreter flags, environment, and working directory, is invariant 9 ("Nothing runs before its process identity is durable").
 
 **Held by:** `mcp.run_control.RunControl._spawn`, `mcp.run_control.RunControl._terminate_failed_spawn`, and `mcp.run_control.RunControl._pending_handle`; `mcp.runner._persist_spawned_handle` refuses to persist a runner receipt without a boot id or PID namespace.
