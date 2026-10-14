@@ -94,7 +94,6 @@ def _abort(sequence: int) -> JsonObject:
     [
         pytest.param(None, "interrupted", id="no-record"),
         pytest.param(_outcome(1, "success"), "interrupted", id="uncommitted-success"),
-        pytest.param(_outcome(1, "pruned"), "interrupted", id="uncommitted-prune"),
         pytest.param(_outcome(1, "interrupted"), "interrupted", id="interrupted"),
         pytest.param(_outcome(1, "failure"), "failure", id="failure"),
         pytest.param(

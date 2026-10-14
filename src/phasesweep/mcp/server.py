@@ -335,7 +335,7 @@ class PhaseValidationPayload(_ToolPayload):
     n_trials: int = Field(
         ge=1,
         description=(
-            "Target number of terminal attempts; COMPLETE, FAIL, and PRUNED trials all count. "
+            "Target number of terminal attempts; COMPLETE and FAIL trials both count. "
             "INTERRUPTED trials never count: each reruns with its parameters before any new draw."
         ),
     )
@@ -414,9 +414,7 @@ class PhaseStatusPayload(_ToolPayload):
     running_trials_total: int = Field(ge=0, description="Cumulative RUNNING study rows.")
     target_terminal_trials: int = Field(ge=0, description="Configured terminal-trial target.")
     completed_trials_total: int = Field(ge=0, description="Cumulative COMPLETE study rows.")
-    terminal_trials_total: int = Field(
-        ge=0, description="Cumulative COMPLETE + PRUNED + FAIL study rows."
-    )
+    terminal_trials_total: int = Field(ge=0, description="Cumulative COMPLETE + FAIL study rows.")
     terminal_trials_before_run: int = Field(
         ge=0, description="Terminal rows that predate the represented generation."
     )

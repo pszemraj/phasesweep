@@ -2012,7 +2012,7 @@ def test_uncertain_cleanup_aborts_parallel_phase_before_reusing_gpu(
         with pytest.raises(UnsafeProcessCleanupError):
             run_experiment(exp)
 
-        # The queued second worker must have pruned before launch. If the
+        # The queued second worker must have stopped before launch. If the
         # GPU was reused or the abort flag was checked too late, a second
         # ``trial_*/process_identity.json`` record would exist.
         launched_identities = sorted(phase_dir.glob(f"trial_*/{PROCESS_IDENTITY_FILE}"))

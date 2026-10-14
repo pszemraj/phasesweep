@@ -293,20 +293,18 @@ def publish_unaccepted_trial(
     trial: FrozenTrial,
     environment: Mapping[str, str],
 ) -> None:
-    """Finish the managed run of a failed or pruned trial after confirmed cleanup.
+    """Finish the managed run of a failed or interrupted trial after confirmed cleanup.
 
     No evidence capture ran to finish that run, so it would otherwise stay
-    RUNNING. A pruned or interrupted trial's run finishes ``KILLED``, a failed
-    one's ``FAILED``. Trainer-owned runs and attempts that never created a run
-    are left alone.
+    RUNNING. An interrupted trial's run finishes ``KILLED``, a failed one's
+    ``FAILED``. Trainer-owned runs and attempts that never created a run are
+    left alone.
 
     :param Experiment experiment: Configured experiment.
     :param str generation_id: Producing generation.
-    :param FrozenTrial trial: Locally terminal FAIL or PRUNED trial.
+    :param FrozenTrial trial: Locally terminal FAIL trial, interrupted or not.
     :param Mapping[str, str] environment: Composed authentication environment.
     """
-    from optuna.trial import TrialState
-
     from phasesweep.engine.state import TRIAL_DIR_ATTR, _trial_interrupted
 
     directory = trial.user_attrs.get(TRIAL_DIR_ATTR)
@@ -314,8 +312,7 @@ def publish_unaccepted_trial(
         return
     binding = read_binding(Path(directory))
     if binding["run_mode"] == "managed":
-        killed = trial.state == TrialState.PRUNED or _trial_interrupted(trial)
-        status = "KILLED" if killed else "FAILED"
+        status = "KILLED" if _trial_interrupted(trial) else "FAILED"
         _finish_attempt(experiment, generation_id, binding, status, environment)
 
 
@@ -415,7 +412,7 @@ def _save_attempt_intents(
         its study's recovery.
     :param str | None ended: Status for every unaccepted managed run once the
         invocation that owned it ended with confirmed cleanup, or ``None`` to
-        finish only trials Optuna failed or pruned with confirmed cleanup.
+        finish only trials Optuna failed with confirmed cleanup.
     :return list[Path]: The records saved, in attempt order.
     """
     from optuna.trial import TrialState
@@ -439,7 +436,7 @@ def _save_attempt_intents(
         settled = trial.state.is_finished() and (
             found.cleanup_recovered or not _trial_requires_cleanup_recovery(trial)
         )
-        if settled and (trial.state == TrialState.PRUNED or _trial_interrupted(trial)):
+        if settled and _trial_interrupted(trial):
             status = "KILLED"
         elif ended is not None:
             status = ended

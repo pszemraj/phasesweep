@@ -614,8 +614,8 @@ def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenT
 
     An objective may have written its outcome immediately before the
     orchestrator died. A recorded failure or fatal exception stands, with any
-    abort it tripped, and so does a recorded interruption. A success or prune
-    Optuna never committed, and a trial with no record, become ``interrupted``
+    abort it tripped, and so does a recorded interruption. A success Optuna
+    never committed, and a trial with no record, become ``interrupted``
     (:func:`phasesweep.engine.state._stale_recovery_outcome`): recovery cannot
     prove what such a trial measured, so it reruns. Recovery itself never
     records an abort decision. Malformed or duplicate records are replaced

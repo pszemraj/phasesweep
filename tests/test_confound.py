@@ -45,7 +45,6 @@ from tests.conftest import make_experiment, write_constant_trainer
 
 _COMPLETE = optuna.trial.TrialState.COMPLETE
 _FAIL = optuna.trial.TrialState.FAIL
-_PRUNED = optuna.trial.TrialState.PRUNED
 _RUNNING = optuna.trial.TrialState.RUNNING
 
 
@@ -307,23 +306,22 @@ def test_evaluation_point_heterogeneous_line_mentions_training_length() -> None:
 
 
 @pytest.mark.parametrize(
-    ("ranked", "infeasible", "failed", "pruned", "verdict"),
+    ("ranked", "infeasible", "failed", "verdict"),
     [
-        pytest.param(1, 0, 1, 0, "heterogeneous", id="last-standing"),
-        pytest.param(2, 0, 1, 1, "heterogeneous", id="half-failed-or-pruned"),
-        pytest.param(3, 0, 1, 1, "ok", id="majority-ranked"),
+        pytest.param(1, 0, 1, "heterogeneous", id="last-standing"),
+        pytest.param(2, 0, 2, "heterogeneous", id="half-failed"),
+        pytest.param(3, 0, 2, "ok", id="majority-ranked"),
         # Constraints define what may win; excluding by them is no bias.
-        pytest.param(2, 5, 1, 0, "ok", id="minority-feasible"),
-        pytest.param(1, 0, 0, 0, "ok", id="single-trial"),
+        pytest.param(2, 5, 1, "ok", id="minority-feasible"),
+        pytest.param(1, 0, 0, "ok", id="single-trial"),
     ],
 )
 def test_survivorship_flags_failures_at_least_matching_the_ranked(
-    ranked: int, infeasible: int, failed: int, pruned: int, verdict: str
+    ranked: int, infeasible: int, failed: int, verdict: str
 ) -> None:
     specs = (
         [(_COMPLETE, 0.5 + index, index) for index in range(ranked + infeasible)]
         + [(_FAIL, None, 50 + index) for index in range(failed)]
-        + [(_PRUNED, None, 70 + index) for index in range(pruned)]
         + [(_RUNNING, None, 99)]
     )
     trials = _trials(*specs)
@@ -336,7 +334,6 @@ def test_survivorship_flags_failures_at_least_matching_the_ranked(
             "infeasible": infeasible,
             "incomplete_group": 0,
             "failed": failed,
-            "pruned": pruned,
         },
     }
     assert block["ranked_trials"] == list(range(ranked))
@@ -515,7 +512,7 @@ def test_survivorship_counts_feasible_trials_in_incomplete_groups() -> None:
 
     assert block["checks"]["survivorship"] == {
         "verdict": "ok",
-        "detail": {"ranked": 2, "infeasible": 1, "incomplete_group": 2, "failed": 1, "pruned": 0},
+        "detail": {"ranked": 2, "infeasible": 1, "incomplete_group": 2, "failed": 1},
     }
     assert _validate_confound_block(block, winner_trial=1) == block
 
@@ -758,7 +755,6 @@ def test_summary_keeps_only_verdicts_and_numbers() -> None:
             "infeasible": 0,
             "incomplete_group": 0,
             "failed": 1,
-            "pruned": 0,
         },
         "tie": {"verdict": "heterogeneous", "tied_trials": 1, "within_noise": None},
     }
@@ -870,7 +866,7 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
     assert len(warnings) == 1
     assert warnings[0].startswith("[p] potential confounds in the 2 ranked trials")
     assert "2 distinct step values (400, 1000)" in warnings[0]
-    assert "2 failed and 0 pruned trials against 2 ranked" in warnings[0]
+    assert "2 failed trials against 2 ranked" in warnings[0]
 
 
 def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:

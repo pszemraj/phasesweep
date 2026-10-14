@@ -170,7 +170,6 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
         "2": ("managed", TrialState.FAIL),  # its callback already recorded it
         "3": ("trainer", TrialState.FAIL),  # PhaseSweep never ends a trainer's run
         "4": ("managed", TrialState.COMPLETE),  # accepted; its record was never saved
-        "5": ("managed", TrialState.PRUNED),
     }
     for number, (digit, (mode, state)) in enumerate(attempts.items()):
         attempt = digit * 32
@@ -204,7 +203,6 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     assert [(r["binding"]["attempt_id"][0], r["finish"]) for r in requests] == [
         ("1", "KILLED"),
         ("4", None),
-        ("5", "KILLED"),
         ("a", "KILLED"),
     ]
     accepted = requests[1]["projection"]
@@ -256,7 +254,7 @@ def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, m
 
 
 def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypatch):
-    """An interrupted trial's managed run ends KILLED, as a pruned one's does; a failed one's ends FAILED."""
+    """An interrupted trial's managed run ends KILLED; a failed one's ends FAILED."""
     config, _uploads = _remote_example(tmp_path, monkeypatch)
     config["storage"] = f"journal:///{tmp_path}/study.journal"
     experiment = Experiment.model_validate(config)

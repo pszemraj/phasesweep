@@ -292,7 +292,7 @@ def _rank_groups(
 
     A group is complete when it holds one trial per repeat value and every one
     of them is eligible (:func:`_eligible`). Trials that never recorded the
-    repeat param were pruned before their first suggestion and belong to no group.
+    repeat param belong to no group.
     An interrupted trial belongs to none either: its rerun takes its place, in
     the same group because it has the same draw position.
 

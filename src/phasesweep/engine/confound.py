@@ -50,7 +50,7 @@ CONFOUND_CHECKS: tuple[ConfoundCheck, ...] = get_args(ConfoundCheck)
 
 CONFOUND_SCHEMA_VERSION = 2
 
-_SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "incomplete_group", "failed", "pruned")
+_SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "incomplete_group", "failed")
 # Where a terminal trial that selection did not rank is counted. A COMPLETE
 # trial outside the ranked set violated a constraint or the metric's bounds,
 # unless it was feasible and only its repeat group was incomplete; a trial
@@ -58,7 +58,6 @@ _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "incomplete_group", "failed", "p
 _EXCLUDED_BY_STATE = {
     optuna.trial.TrialState.COMPLETE: "infeasible",
     optuna.trial.TrialState.FAIL: "failed",
-    optuna.trial.TrialState.PRUNED: "pruned",
 }
 # Evaluation positions within this fraction of the furthest one count as one
 # point: a fixed-token batch-size sweep stops each trial within a batch of its
@@ -168,7 +167,7 @@ def _survivorship(
     ranked: Sequence[optuna.trial.FrozenTrial],
     incomplete_group: Collection[int],
 ) -> dict[str, Any]:
-    """Check whether failed and pruned trials at least match the ranked ones.
+    """Check whether failed trials at least match the ranked ones.
 
     When they do, "best" is a claim about the survivors: anything that made a
     configuration fail, diverge, or run out of time is now correlated with
@@ -281,12 +280,12 @@ def _checked(name: ConfoundCheck, detail: dict[str, Any]) -> dict[str, Any]:
 
 
 def _survivorship_flagged(counts: Mapping[str, int]) -> bool:
-    """Whether failed and pruned trials were at least as numerous as ranked ones.
+    """Whether failed trials were at least as numerous as ranked ones.
 
     :param Mapping[str, int] counts: Survivorship counts.
     :return bool: Whether the failures could have decided what was ranked.
     """
-    return counts["failed"] + counts["pruned"] >= max(1, counts["ranked"])
+    return counts["failed"] >= max(1, counts["ranked"])
 
 
 def _evaluation_point_flagged(detail: Mapping[str, Any]) -> bool:
@@ -605,8 +604,7 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
             )
         elif name == "survivorship":
             lines.append(
-                f"survivorship: {detail['failed']} failed and {detail['pruned']} pruned "
-                f"trials against {detail['ranked']} ranked"
+                f"survivorship: {detail['failed']} failed trials against {detail['ranked']} ranked"
             )
         elif detail["within_noise"] is None:
             tied = ", ".join(str(number) for number in detail["tied_trials"])

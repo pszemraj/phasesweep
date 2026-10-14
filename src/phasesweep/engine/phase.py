@@ -197,17 +197,16 @@ class _TrialOutcomeUnrecordedAbort(BaseException):
     """Control-flow abort for a trial whose outcome record could not be written.
 
     Derives directly from :class:`BaseException` on purpose, and must keep
-    doing so. Optuna's ``_run_trial`` catches ``optuna.TrialPruned`` and
-    ``(Exception, KeyboardInterrupt)`` around the objective and then calls
-    ``_tell_with_warning`` unconditionally, so *any* ``Exception`` leaving the
-    objective commits that trial's terminal state. A terminal row whose
-    ``TRIAL_OUTCOME_ATTR`` is missing cannot be repaired afterwards - Optuna
-    raises ``UpdateFinishedTrialError`` for user-attr writes on a finished
-    trial - and permanently wedges the study, because every later invocation
-    rejects it in ``_load_phase_policy_state``. Raising from outside Optuna's
-    catch set is what keeps the trial ``RUNNING`` instead, where the standard
-    stale-attempt recovery writes the outcome *before* the terminal
-    transition.
+    doing so. Optuna's ``_run_trial`` catches ``(Exception, KeyboardInterrupt)``
+    around the objective and then calls ``_tell_with_warning`` unconditionally,
+    so *any* ``Exception`` leaving the objective commits that trial's terminal
+    state. A terminal row whose ``TRIAL_OUTCOME_ATTR`` is missing cannot be
+    repaired afterwards - Optuna raises ``UpdateFinishedTrialError`` for
+    user-attr writes on a finished trial - and permanently wedges the study,
+    because every later invocation rejects it in ``_load_phase_policy_state``.
+    Raising from outside Optuna's catch set is what keeps the trial ``RUNNING``
+    instead, where the standard stale-attempt recovery writes the outcome
+    *before* the terminal transition.
 
     Deliberately not a :class:`PhaseSweepError`: it never reaches an operator.
     ``_run_phase`` converts it into :class:`StudyStorageUnavailableError` once
@@ -883,8 +882,8 @@ def _record_outcome(
     Args:
         run: The phase execution the outcome belongs to.
         trial: The Optuna trial whose terminal outcome is being recorded.
-        outcome: One of ``"success"``, ``"failure"``, ``"pruned"``,
-            ``"interrupted"``, or ``"fatal"``.
+        outcome: One of ``"success"``, ``"failure"``, ``"interrupted"``, or
+            ``"fatal"``.
         cause: Optional human-readable explanation stored on the outcome
             payload.
         fatal_policy: Optional policy name stored on the outcome payload
@@ -1273,9 +1272,6 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         # trial RUNNING for stale-attempt recovery. Only the direct call path
         # from ``_execute_objective`` needs the guard: the same abort raised
         # from inside a sibling handler already bypasses the rest.
-        raise
-    except optuna.TrialPruned as exc:
-        _record_outcome(run, trial, "pruned", cause=str(exc))
         raise
     except (_DeadlineTrialExecutionError, _UnlaunchedAbortError) as exc:
         _record_outcome(run, trial, "interrupted", cause=str(exc))

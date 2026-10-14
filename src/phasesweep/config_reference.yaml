@@ -70,7 +70,7 @@ trial_command: string (required)
 # Requires: metric.name, constraints[].name and observe[].name must all be distinct; duplicate names fail config load.
 # Selection records three advisory confound verdicts on the winner: evaluation_point, survivorship and tie. They cannot be disabled or tuned and never block selection or publication.
 # evaluation_point is flagged when the lowest ranked position on the evaluation axis is more than 1% short of the furthest.
-# survivorship is flagged when failed plus pruned trials are at least max(1, ranked trials). Interrupted trials are not counted, because their reruns stand in for them. Infeasible trials, including those outside metric.min or metric.max, are counted but never flagged, and so are feasible trials of a phases[].repeats group that never completed (incomplete_group).
+# survivorship is flagged when failed trials are at least max(1, ranked trials). Interrupted trials are not counted, because their reruns stand in for them. Infeasible trials, including those outside metric.min or metric.max, are counted but never flagged, and so are feasible trials of a phases[].repeats group that never completed (incomplete_group).
 # tie is flagged when another ranked trial has exactly the winner's value with different sampled parameters. With phases[].repeats it compares complete groups: it is also flagged when another group's reduced value lies within two standard errors of the winning group's (within_noise), a heuristic rather than a significance test.
 # A verdict of n/a means not checked. evaluation_point is n/a when fewer than two trials were ranked, and tie when fewer than two trials, or with repeats fewer than two groups, were ranked.
 # evaluation_point needs a recorded position, and only json_envelope, wandb and mlflow objectives record one. It is always n/a for json and log_regex objectives; report through json_envelope (report_objective), wandb (evaluation_axis) or mlflow (the selected step) when the comparison needs it. phasesweep validate and run --dry-run print an evaluation_point check: line that says which case applies.
@@ -269,7 +269,7 @@ phases: list[object] (required)
   # Renaming a phase starts a new study (<experiment>::<phase>).
   - name: string (required)
 
-    # Target number of finished attempts in this phase, an integer >= 1. An attempt is finished once it has failed, been pruned or completed.
+    # Target number of finished attempts in this phase, an integer >= 1. An attempt is finished once it has failed or completed.
     # Failed and infeasible attempts consume the target, not only successes. If no feasible result is eligible the phase fails.
     # An interrupted attempt (phase or run deadline, host shutdown, a phase abort before its trainer launched, an attempt recovered after its orchestrator stopped) never consumes the target: on persistent storage the next run reruns it with its parameters before any new draw.
     # Running the same config again on persistent storage re-ranks the stored trials and republishes when the target is already reached.
@@ -499,14 +499,14 @@ phases: list[object] (required)
       seed: int | null = null
 
       # Number of random startup trials before the tpe surrogate model is fitted, an integer >= 0.
-      # Only COMPLETE and PRUNED trials count toward it in Optuna, so failed attempts lengthen the random phase.
+      # Only completed trials count toward it, so failed attempts lengthen the random phase.
       # validate and the dry run warn when a tpe phase with a nonempty phases[].search_space has phases[].n_trials at or below this value, because then every trial is sampled at random and the model is never fitted.
       # Only used when: phases[].sampler.type is tpe. Every other type must leave it at 10, or config load fails.
       n_startup_trials: int = 10
 
     # Stop the phase after this many consecutive failed or infeasible attempts, an integer >= 1.
     # These count as failures: a nonzero trainer exit, a per-trial timeout, a failed extraction or gate, a violated constraint or metric bound, a failed MLflow run preparation, and a fatal error.
-    # A feasible success resets the count. Pruned and interrupted attempts (phase or run deadline, host shutdown, a phase abort before the trainer launched, an attempt recovered after its orchestrator stopped) leave it unchanged.
+    # A feasible success resets the count. Interrupted attempts (phase or run deadline, host shutdown, a phase abort before the trainer launched, an attempt recovered after its orchestrator stopped) leave it unchanged.
     # A trial the abort stops before its trainer launched is interrupted, so the raised phases[].n_trials that recovers the abort reruns it first.
     # Failed attempts still count toward phases[].n_trials.
     # The count and a recorded abort persist on durable storage in completion order.
@@ -1034,7 +1034,7 @@ observe: list[object] = []
 # The credentials need write access: PhaseSweep creates runs, logs metrics, params and tags, uploads artifacts and ends runs.
 # validate and --dry-run do not check authentication or the experiment. Each phase with trials left to run checks both before it allocates a trial.
 # The first phase to run creates one summary run per invocation in the experiment, and managed attempt runs are created under it.
-# Result projections are queued for each accepted trial, for generation winners and summaries, and, for managed runs, as a status-only record that ends the run of a failed or pruned attempt.
+# Result projections are queued for each accepted trial, for generation winners and summaries, and, for managed runs, as a status-only record that ends the run of a failed or interrupted attempt.
 # A projection is written to the attempt's run as phasesweep.* metrics at step 0 (objective, feasible, duration_seconds, constraint.<name>, observed.<name>), phasesweep.override.<key> params, phasesweep.* tags and a phasesweep/<name>.json artifact.
 # A failed upload leaves a pending delivery without invalidating accepted scientific results.
 # phasesweep sync-tracking CONFIG retries every pending upload of every generation and rebuilds a published generation's unsaved winner records from its artifacts; --generation ID limits it to one generation. It trains nothing and rereads no metrics.
@@ -1065,7 +1065,7 @@ mlflow: object | null = null
   experiment_name: string | null = null
 
   # Who creates and finishes each attempt's MLflow run.
-  # managed: PhaseSweep creates the run before the trainer starts and supplies MLFLOW_RUN_ID. The trainer must log to that run. PhaseSweep ends a run that is still RUNNING after a successful trainer exit, and marks it FAILED or KILLED for a failed or pruned attempt.
+  # managed: PhaseSweep creates the run before the trainer starts and supplies MLFLOW_RUN_ID. The trainer must log to that run. PhaseSweep ends a run that is still RUNNING after a successful trainer exit, and marks it FAILED for a failed attempt or KILLED for an interrupted one.
   # trainer: the trainer creates and ends its own run and calls phasesweep.tracking.bind_mlflow_run(actual_run_id) inside the active run. PhaseSweep never ends a trainer-owned run.
   # An attempt is ineligible when no binding exists, the run is outside the experiment or deleted, it carries another attempt's identity tags, it ended FAILED or KILLED, or it restarted during capture. A successful process exit alone does not make it eligible.
   # Only the bound run's own metrics are read; a parent or child run is never read and unsupported as evidence.

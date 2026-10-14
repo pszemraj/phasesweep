@@ -20,24 +20,25 @@ WinnerSourceKind = Literal["phase_trial"]
 PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
 """Verdict on a last-success pointer, including inaccessible validation evidence."""
 
-TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL", "INTERRUPTED"]
-"""Name of an Optuna ``TrialState`` member, or ``INTERRUPTED``, as status payloads report it."""
+TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "FAIL", "INTERRUPTED"]
+"""Name of a trial state as status payloads report it, including ``INTERRUPTED``."""
 
 TRIAL_STATE_NAMES: tuple[TrialStateName, ...] = (
     "WAITING",
     "RUNNING",
     "COMPLETE",
-    "PRUNED",
     "FAIL",
     "INTERRUPTED",
 )
 """Every counted trial state, in the key order status payloads use.
 
 ``INTERRUPTED`` is an Optuna ``FAIL`` trial whose recorded outcome is
-``interrupted``; it is counted apart from ``FAIL`` and reruns.
+``interrupted``; it is counted apart from ``FAIL`` and reruns. Optuna's
+``PRUNED`` is absent because the study's ``NopPruner`` never prunes and no
+trainer raises ``TrialPruned``.
 """
 
-TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "PRUNED", "FAIL")
+TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "FAIL")
 """The states that count toward ``n_trials``; an interrupted trial is in none of them."""
 
 RecoveredTrialState = Literal["FAIL", "INTERRUPTED"]
@@ -202,7 +203,7 @@ TRIAL_OUTCOME_ABORT_KEY = "abort"
 # ``interrupted`` is the one label for a trial whose orchestrator stopped it before it
 # could finish: a signal, a phase or run deadline, or recovery after the orchestrator died.
 # The outcome's ``cause`` says which.
-_TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "interrupted", "fatal"})
+_TRIAL_OUTCOMES = frozenset({"success", "failure", "interrupted", "fatal"})
 # On a rerun of an interrupted trial: the source's trial number, written in the rerun's
 # creation record. A rerun takes its source's draw position.
 RERUN_OF_ATTR = "phasesweep_rerun_of"
@@ -387,7 +388,7 @@ def _stale_recovery_outcome(parsed: _ParsedTrialOutcome | None) -> str:
     """Return the outcome stale recovery records for a RUNNING trial whose orchestrator stopped.
 
     A failure or fatal error the objective already recorded stands, and so does an
-    interruption; anything else, including a success or prune Optuna never committed and
+    interruption; anything else, including a success Optuna never committed and
     no record at all, becomes ``interrupted``. Shared by recovery and the dry run, so the
     preview predicts what recovery writes.
 

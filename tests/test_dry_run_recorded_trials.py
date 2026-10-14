@@ -52,7 +52,7 @@ from tests.recovery_helpers import stamp_artifact_root
 
 _STATE = optuna.trial.TrialState
 
-_OUTCOME = {_STATE.COMPLETE: "success", _STATE.FAIL: "failure", _STATE.PRUNED: "pruned"}
+_OUTCOME = {_STATE.COMPLETE: "success", _STATE.FAIL: "failure"}
 
 _UNREADABLE = (
     "DRY RUN warning: phase={name} recorded trials could not be read, so it is previewed as a "

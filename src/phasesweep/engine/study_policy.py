@@ -67,7 +67,7 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
     :param int consecutive_failures: Count observed before ``outcome``.
     :param str outcome: Terminal outcome. ``"failure"`` or ``"fatal"``
         increments the count, ``"success"`` resets it to zero, and any other
-        outcome (e.g. ``"pruned"``, ``"interrupted"``) leaves it unchanged.
+        outcome (``"interrupted"``) leaves it unchanged.
     :return int: The count after applying ``outcome``.
     """
     if outcome in {"failure", "fatal"}:

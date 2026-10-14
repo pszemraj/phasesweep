@@ -1496,7 +1496,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     "outcomes",
     [
         ["failure", "failure", "success", "failure", "failure"],
-        ["success", "pruned", "failure", "interrupted", "failure"],
+        ["success", "failure", "interrupted", "failure"],
         ["fatal", "success", "failure"],
     ],
 )

@@ -197,9 +197,8 @@ class SurvivorshipSummary(_SnapshotModel):
 
     verdict: ConfoundVerdict = Field(
         description=(
-            f"{_VERDICT_DESCRIPTION} Heterogeneous when failed and pruned trials are at "
-            "least as numerous as ranked ones; infeasible and incomplete_group trials "
-            "never flag."
+            f"{_VERDICT_DESCRIPTION} Heterogeneous when failed trials are at least as "
+            "numerous as ranked ones; infeasible and incomplete_group trials never flag."
         )
     )
     ranked: NonNegativeInt
@@ -211,7 +210,6 @@ class SurvivorshipSummary(_SnapshotModel):
         )
     )
     failed: NonNegativeInt
-    pruned: NonNegativeInt
 
 
 class TieSummary(_SnapshotModel):
