@@ -938,3 +938,36 @@ def test_acknowledge_nonresumable_rejected_on_resumable_samplers(sampler_type: s
     """The acknowledgement states a contract these samplers do not impose."""
     with pytest.raises(ValidationError, match="acknowledge_nonresumable"):
         Sampler(type=sampler_type, seed=0, acknowledge_nonresumable=True)  # type: ignore[arg-type]
+
+
+def test_metric_bounds_are_optional_finite_and_ordered() -> None:
+    """Each bound is optional alone, finite, never boolean, and ordered when both are set."""
+    from phasesweep.config.models import experiment_contract_lines
+
+    extractor: JsonObject = {"type": "log_regex", "pattern": r"x=(?P<value>[0-9.]+)"}
+
+    def metric(**bounds: JsonValue) -> Metric:
+        return Metric.model_validate({"extractor": extractor, **bounds})
+
+    unbounded = metric()
+    assert (unbounded.min, unbounded.max) == (None, None)
+    assert (metric(min=0.5).min, metric(min=0.5).max) == (0.5, None)
+    assert (metric(max=2).min, metric(max=2).max) == (None, 2.0)
+    assert (metric(min=0.5, max=0.5).min, metric(min=0.5, max=0.5).max) == (0.5, 0.5)
+
+    with pytest.raises(ValidationError, match=r"min \(3.0\) > max \(2.0\)"):
+        metric(min=3, max=2)
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError, match="must be finite"):
+            metric(min=bad)
+        with pytest.raises(ValidationError, match="must be finite"):
+            metric(max=bad)
+    with pytest.raises(ValidationError, match="must be numbers, not booleans"):
+        metric(max=True)
+
+    plain = experiment_contract_lines(make_experiment(metric=unbounded))[0]
+    bounded = experiment_contract_lines(make_experiment(metric=metric(min=0.5, max=2)))[0]
+    assert "bounds" not in plain
+    assert "bounds={'max': 2.0, 'min': 0.5}" in bounded
+    only_max = experiment_contract_lines(make_experiment(metric=metric(max=2)))[0]
+    assert "bounds={'max': 2.0}" in only_max

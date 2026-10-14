@@ -15,6 +15,8 @@ metric:
     file: stdout.log
     pattern: PSWOBJ=(?P<value>[0-9.eE+-]+)
     select: last
+  max: null
+  min: null
 constraints: []
 phases:
 - name: p

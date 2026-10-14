@@ -243,6 +243,19 @@ metric: object (required)
     # Requires: not equal to metric_key or to the text before its last dot; otherwise config load fails.
     evaluation_axis: string = "_step"
 
+  # Inclusive viability ceiling on the metric value, finite, in the metric's units. A larger value makes the attempt infeasible.
+  # An infeasible attempt completes with its real value, so the sampler still learns from it, but it cannot win. It counts toward phases[].max_consecutive_failures and as infeasible in the survivorship verdict.
+  # Selection re-checks the bound from the stored value. When no attempt is eligible, the error names the bound or bounds and the best value among completed attempts with its trial number.
+  # Requires: min at most max when both are set, and both finite; config load fails otherwise.
+  # Unset: no upper bound.
+  max: float | null = null
+
+  # Inclusive viability floor on the metric value, finite, in the metric's units. A smaller value makes the attempt infeasible, with the same consequences as max.
+  # Use a bound to refuse a degenerate score, such as a loss of exactly 0 from a leaked evaluation set. It never ranks and does not steer the search.
+  # Requires: min at most max when both are set, and both finite; config load fails otherwise.
+  # Unset: no lower bound.
+  min: float | null = null
+
 # Ordered list of phase objects; at least one is required. Values below describe one item.
 # Phases run strictly in declared order. A failed phase ends the run, and no later phase starts.
 # Warning: inherits transfers override values, never model weights or checkpoints. The trainer must load a checkpoint explicitly if that is intended.
@@ -455,7 +468,7 @@ phases: list[object] (required)
       acknowledge_nonresumable: bool = false
 
     # Stop the phase after this many consecutive failed or infeasible attempts, an integer >= 1.
-    # These count as failures: a nonzero trainer exit, a per-trial timeout, a failed extraction or gate, a violated constraint, a failed MLflow run preparation, a stale attempt recovered after a crash, and a fatal error.
+    # These count as failures: a nonzero trainer exit, a per-trial timeout, a failed extraction or gate, a violated constraint or metric bound, a failed MLflow run preparation, a stale attempt recovered after a crash, and a fatal error.
     # A feasible success resets the count. Pruned and cancelled attempts (phase or run deadline, host shutdown) leave it unchanged.
     # Failed attempts still count toward phases[].n_trials.
     # The count and a recorded abort persist on durable storage in completion order.

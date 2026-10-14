@@ -133,11 +133,14 @@ The metric is a finite scalar extracted after the trainer exits successfully. Us
 
 `constraints` use the same scalar readers. A valid measured constraint violation is a completed but infeasible trial; missing or invalid evidence fails the trial. Phase `gates` include `required_file`, `json_equals`, `json_scalar_bound`, `artifact_size`, `sha256`, `wandb_summary_required`, and `mlflow_required`. `mlflow_required` separately names `metrics`, `params`, and `tags` from the same bound run. A failed gate fails the trial. There is no advisory gate mode or baseline substitution.
 
+`metric.min` and `metric.max` are optional inclusive viability bounds on the metric itself. They must be finite, `min` may not exceed `max`, and either may be set alone. A trial whose metric falls outside them is infeasible exactly like a violated constraint: it completes with its real value (the sampler still learns from it), counts toward `max_consecutive_failures` and as `infeasible` in the `survivorship` verdict, and selection re-checks the bounds from the stored value. A bound refuses a degenerate score, such as a loss of exactly 0 from a leaked evaluation set; it does not steer the search. When no trial survives, the `NoFeasibleTrialError` names the bound or bounds and the best value among the completed trials with its trial number. The bounds are part of the metric's identity, so changing one starts a new study.
+
 All local evidence paths are relative to the fresh attempt directory; there is no latest-file discovery or fallback to a shared result. Objective extraction, gate failure, a non-finite metric, or a nonzero trainer exit fails the attempt. When no feasible eligible trial remains, the phase fails; PhaseSweep does not invent a carried baseline.
 
 These scoring decisions are separate:
 
 - `metric.goal` ranks the scalar selected for each trial.
+- `metric.min` and `metric.max` decide whether that scalar is viable; they never rank.
 - `log_regex.select` chooses an observation within that trial (`last`, `first`, `min`, or `max`).
 - W&B selects an exact finished-summary key; ordinary JSON selects a saved path and dotted key.
 - MLflow uses an explicit [native history selector](mlflow.md#select-metrics-and-require-evidence).
@@ -147,7 +150,7 @@ For example, in a fixed-token batch-size sweep each trial's optimizer `step` cou
 
 Only `json_envelope`, `wandb` and `mlflow` objectives record a position, so `evaluation_point` is `n/a` for `json` and `log_regex`; `validate` and `run --dry-run` print an `evaluation_point check:` line that says whether the configured extractor supports it. With W&B or MLflow the position is where the metric was logged. Under Transformers `load_best_model_at_end=True`, `train()` reloads the best checkpoint's weights, so a final evaluation scores that checkpoint, yet its logged position reads as the trainer's final global step for every trial. If the evaluated checkpoint matters, report through `json_envelope` with `policy`, `checkpoint` (for Transformers, `trainer.state.best_model_checkpoint`) and `step`. A phase that searches training length, such as epochs or `max_steps`, flags `evaluation_point` by design.
 
-The trainer owns evaluation cadence, early stopping, checkpoint selection, and custom aggregation. PhaseSweep has one experiment-level metric and does not prune training. `validate` and `run --dry-run` display the configured source, key/path/pattern, applicable reduction, and ranking goal.
+The trainer owns evaluation cadence, early stopping, checkpoint selection, and custom aggregation. PhaseSweep has one experiment-level metric and does not prune training. `validate` and `run --dry-run` display the configured source, key/path/pattern, applicable reduction, ranking goal, and viability bounds when set.
 
 ### W&B evidence
 

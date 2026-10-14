@@ -65,11 +65,27 @@ OverrideFormat = Literal["yaml_file", "argparse", "hydra", "json_file"]
 
 
 class Metric(_Frozen):
-    """Primary optimization objective: name, direction, and how to extract it."""
+    """Primary optimization objective: name, direction, how to extract it, and viability bounds."""
 
     name: str = "objective"
     goal: Literal["minimize", "maximize"] = "minimize"
     extractor: ObjectiveExtractor = Field(discriminator="type")
+    max: ConfigFloat | None = None
+    min: ConfigFloat | None = None
+
+    @model_validator(mode="after")
+    def _validate_viability_bounds(self) -> Metric:
+        """Reject non-finite or inverted viability bounds when any is set.
+
+        :return Metric: Self, unchanged.
+        """
+        if self.min is not None or self.max is not None:
+            _validate_optional_bounds(
+                label=f"Metric {self.name!r}",
+                min_value=self.min,
+                max_value=self.max,
+            )
+        return self
 
     @field_validator("name")
     @classmethod
@@ -102,11 +118,14 @@ def _metric_scoring_line(metric: Metric) -> str:
     """Describe the scalar source, within-trial selection, and between-trial goal.
 
     :param Metric metric: Configured optimization metric.
-    :return str: One line naming the metric, its goal, and its extractor config.
+    :return str: One line naming the metric, its goal, its viability bounds when set, and
+        its extractor config.
     """
+    bounds = metric.model_dump(mode="json", include={"min", "max"}, exclude_none=True)
     return (
         f"metric={metric.name!r} goal={metric.goal} "
-        f"extractor={metric.extractor.model_dump(mode='json', exclude_none=True)}"
+        + (f"bounds={bounds} " if bounds else "")
+        + f"extractor={metric.extractor.model_dump(mode='json', exclude_none=True)}"
     )
 
 

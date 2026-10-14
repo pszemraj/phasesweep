@@ -244,3 +244,64 @@ def test_rejects_nan_constraint_values_defensively():
     assert sel.trial_number == 0, (
         "NaN-constraint trial 1 must be rejected even though metric was lower"
     )
+
+
+def _with_bounds(exp, **bounds: float):
+    """Return ``exp`` with the given metric ``min``/``max`` viability bounds."""
+    return exp.model_copy(update={"metric": exp.metric.model_copy(update=bounds)})
+
+
+def test_metric_bounds_are_rechecked_at_selection() -> None:
+    """A stored value outside today's bounds cannot win, whatever its feasible attr says."""
+    exp = _with_bounds(_make_exp(), min=0.2, max=2.0)
+    study = _make_study()
+    # Every trial carries feasible=True, as if the bounds were set or tightened later.
+    _add_trial(study, 0.1, params={"x": 1})
+    _add_trial(study, 3.0, params={"x": 2})
+    _add_trial(study, 0.5, params={"x": 3})
+    _add_trial(study, 2.0, params={"x": 4})
+
+    winner = select_winner(study, exp)
+
+    assert (winner.trial_number, winner.metric) == (2, pytest.approx(0.5))
+    survivorship = winner.confound["checks"]["survivorship"]["detail"]
+    assert survivorship["ranked"] == 2
+    assert survivorship["infeasible"] == 2
+
+
+def test_metric_bounds_no_feasible_message_names_bound_and_best_value() -> None:
+    """When the bounds leave nothing, the error names them and the best value seen."""
+    study = _make_study()
+    _add_trial(study, 5.0, params={"x": 1})
+    _add_trial(study, 3.5, params={"x": 2}, feasible=False)
+    _add_trial(study, 7.0, params={"x": 3})
+    study.add_trial(
+        optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL, user_attrs={"x": 1})
+    )
+
+    with pytest.raises(NoFeasibleTrialError) as excinfo:
+        select_winner(study, _with_bounds(_make_exp(), max=2.0))
+    assert str(excinfo.value) == (
+        "No feasible completed trials in phase. The phase's trials.csv records each "
+        "failed trial's reason; trainer output is in its trial_* directory. "
+        "Metric bounds: metric.max=2.0. The best value among COMPLETE trials with a finite "
+        "value is 3.5 (trial 1)."
+    )
+
+    with pytest.raises(NoFeasibleTrialError, match=r"metric\.min=6\.0.*is 7\.0 \(trial 2\)"):
+        select_winner(study, _with_bounds(_make_exp(goal="maximize"), min=6.0, max=6.5))
+
+    unbounded_study = _make_study()
+    _add_trial(unbounded_study, 0.1, feasible=False, params={"x": 1})
+    with pytest.raises(NoFeasibleTrialError) as unbounded:
+        select_winner(unbounded_study, _make_exp())
+    assert "Metric bounds" not in str(unbounded.value)
+
+
+def test_metric_bounds_note_without_a_completed_value() -> None:
+    """Bounds are still named when no trial recorded a finite value to compare."""
+    study = _make_study()
+    study.add_trial(optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL))
+
+    with pytest.raises(NoFeasibleTrialError, match=r"metric\.min=1\.0, metric\.max=2\.0.*finite"):
+        select_winner(study, _with_bounds(_make_exp(), min=1.0, max=2.0))

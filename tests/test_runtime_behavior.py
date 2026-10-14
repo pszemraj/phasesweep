@@ -57,6 +57,7 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
+    FEASIBLE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
@@ -1857,3 +1858,57 @@ def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
             live[trial.number],
             surface=f"{sampler.type} FrozenTrial.params[{trial.number}]",
         )
+
+
+def _bounded_metric(**bounds: float) -> Metric:
+    """Return a log_regex ``x=<value>`` metric with the given viability bounds."""
+    return Metric(
+        extractor=LogRegexExtractor(type="log_regex", pattern=r"x=(?P<value>[0-9.eE+-]+)"),
+        **bounds,
+    )
+
+
+def test_metric_outside_bounds_is_complete_and_infeasible(tmp_path: Path) -> None:
+    """A metric outside min/max completes with its real value, cannot win, and counts as a failure."""
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        """
+        import os
+        print("x=" + {"0": "0.5", "1": "20.0", "2": "5.0"}[os.environ["PHASESWEEP_TRIAL_ID"]])
+        """,
+    )
+    storage = f"journal:///{tmp_path / 'bounds.journal'}"
+    exp = make_experiment(
+        workdir=tmp_path / "runs",
+        storage=storage,
+        trainer=trainer,
+        metric=_bounded_metric(min=1.0, max=10.0),
+        n_trials=3,
+        max_consecutive_failures=5,
+    )
+
+    winners = run_experiment(exp)
+
+    assert (winners["p"].trial_number, winners["p"].metric) == (2, 5.0)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
+    trials = study.get_trials(deepcopy=False)
+    assert [t.state for t in trials] == [optuna.trial.TrialState.COMPLETE] * 3
+    assert [t.value for t in trials] == [0.5, 20.0, 5.0]
+    assert [t.user_attrs[FEASIBLE_ATTR] for t in trials] == [False, False, True]
+    assert [t.user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] for t in trials] == [
+        "failure",
+        "failure",
+        "success",
+    ]
+
+    always_out = make_experiment(
+        experiment="aborts",
+        workdir=tmp_path / "aborts-runs",
+        storage=f"journal:///{tmp_path / 'aborts.journal'}",
+        trainer=write_trainer(tmp_path / "high.py", 'print("x=20.0")'),
+        metric=_bounded_metric(max=10.0),
+        n_trials=6,
+        max_consecutive_failures=2,
+    )
+    with pytest.raises(NoFeasibleTrialError, match="aborted"):
+        run_experiment(always_out)

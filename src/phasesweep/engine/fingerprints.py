@@ -39,6 +39,7 @@ _RUN_CONTROL_KEYS = frozenset(
         "allow_seed_search",
     }
 )
+# v7 / v6: the metric's min/max viability bounds are part of its identity.
 # v6 / v5: the retained configuration surface changed. v5 / v4: the embedded
 # complete trainer_config is part of the core experiment and phase identity.
 # v4 / v3: an omitted execution.cwd contributes its effective
@@ -49,8 +50,8 @@ _RUN_CONTROL_KEYS = frozenset(
 # configured device-set size — the trainer's world size.
 # Existing populated studies from earlier schemas fail the fingerprint check
 # on resume, and the refusal names the operator's options.
-FINGERPRINT_SCHEMA_VERSION = 6
-EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 5
+FINGERPRINT_SCHEMA_VERSION = 7
+EXPERIMENT_FINGERPRINT_SCHEMA_VERSION = 6
 
 
 def _execution_identity(experiment: Experiment) -> dict[str, Any]:

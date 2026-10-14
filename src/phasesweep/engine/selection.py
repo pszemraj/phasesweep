@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
@@ -73,7 +75,8 @@ def select_winner(
       1. Trial must be COMPLETE, with a finite value, a truthy feasibility
          attr, and nonempty generation/attempt ids
          (:func:`phasesweep.engine.evidence._selection_candidate_identity`).
-      2. All constraint values (read from user_attrs) must satisfy bounds.
+      2. The metric value must lie inside the metric's ``min``/``max`` bounds,
+         and all constraint values (read from user_attrs) must satisfy theirs.
       3. Among survivors, argmin/argmax on metric.
       4. Ties — exact float equality only — broken by lower trial_number.
 
@@ -104,41 +107,21 @@ def select_winner(
 
     Raises:
         NoFeasibleTrialError: If no trial in the study is both COMPLETE and
-            satisfies every constraint.
+            satisfies every constraint and the metric's bounds. When the metric
+            has bounds, the message names them and the best COMPLETE value seen.
 
     """
     minimize = experiment.metric.goal == "minimize"
     constraints_by_name = {c.name: c for c in experiment.constraints}
 
     trials = study.get_trials(deepcopy=False)
-    survivors: list[optuna.trial.FrozenTrial] = []
-    for t in trials:
-        if _selection_candidate_identity(t) is None:
-            continue
-        # Re-verify constraints from user_attrs in case rules changed or stored
-        # values are non-finite (defense in depth — review v0.5.2 / item 3).
-        ok = True
-        for name, c in constraints_by_name.items():
-            v = t.user_attrs.get(constraint_attr(name))
-            if v is None:
-                ok = False
-                break
-            try:
-                v_f = float(v)
-            except (TypeError, ValueError):
-                ok = False
-                break
-            if not check_bounds(v_f, min_value=c.min, max_value=c.max):
-                ok = False
-                break
-        if not ok:
-            continue
-        survivors.append(t)
+    survivors = [t for t in trials if _eligible(t, experiment)]
 
     if not survivors:
         raise NoFeasibleTrialError(
             "No feasible completed trials in phase. The phase's trials.csv records each "
             "failed trial's reason; trainer output is in its trial_* directory."
+            + _metric_bounds_note(trials, experiment)
         )
 
     best_value = (
@@ -214,15 +197,81 @@ def select_winner(
     )
 
 
-def _trial_value(trial: optuna.trial.FrozenTrial) -> float:
-    """Return the non-None metric value for a known survivor trial.
+def _eligible(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> bool:
+    """Return whether a trial may be ranked under the current bounds.
 
-    :param optuna.trial.FrozenTrial trial: Completed feasible trial already filtered by
-        :func:`select_winner`.
+    The trial must pass :func:`_selection_candidate_identity`, hold a metric
+    value inside the metric's viability bounds, and hold every constraint
+    value inside its bounds. The bounds are re-checked here, from the stored
+    values, in case the rules changed or a stored value is non-finite (defense
+    in depth).
+
+    :param optuna.trial.FrozenTrial trial: Persisted trial to classify.
+    :param Experiment experiment: Parsed experiment; supplies the metric and constraint bounds.
+    :return bool: ``True`` when the trial is a selection candidate.
+    """
+    if _selection_candidate_identity(trial) is None:
+        return False
+    metric = experiment.metric
+    if not check_bounds(_trial_value(trial), min_value=metric.min, max_value=metric.max):
+        return False
+    for constraint in experiment.constraints:
+        raw = trial.user_attrs.get(constraint_attr(constraint.name))
+        if raw is None:
+            return False
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return False
+        if not check_bounds(value, min_value=constraint.min, max_value=constraint.max):
+            return False
+    return True
+
+
+def _metric_bounds_note(trials: Sequence[optuna.trial.FrozenTrial], experiment: Experiment) -> str:
+    """Name the metric's viability bounds and the best value seen, for an empty ranking.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase study.
+    :param Experiment experiment: Parsed experiment; supplies the bounds and the goal.
+    :return str: A sentence naming each set bound and the best COMPLETE finite value with
+        its trial number, or an empty string when the metric has no bounds.
+    """
+    metric = experiment.metric
+    named = [
+        f"metric.{label}={value!r}"
+        for label, value in (("min", metric.min), ("max", metric.max))
+        if value is not None
+    ]
+    if not named:
+        return ""
+    seen = [
+        t
+        for t in trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+        and t.value is not None
+        and math.isfinite(t.value)
+    ]
+    note = f" Metric bounds: {', '.join(named)}."
+    if not seen:
+        return note + " No COMPLETE trial recorded a finite metric value."
+    sign = 1.0 if metric.goal == "minimize" else -1.0
+    best = min(seen, key=lambda t: (sign * _trial_value(t), t.number))
+    return note + (
+        f" The best value among COMPLETE trials with a finite value is "
+        f"{_trial_value(best)!r} (trial {best.number})."
+    )
+
+
+def _trial_value(trial: optuna.trial.FrozenTrial) -> float:
+    """Return the non-None metric value for a completed trial known to hold one.
+
+    :param optuna.trial.FrozenTrial trial: COMPLETE trial already screened for a value, as
+        :func:`select_winner` does before ranking.
     :return float: Scalar objective value for the trial.
     """
     value = trial.value
-    assert value is not None  # survivor invariant from select_winner
+    assert value is not None  # callers screen for a recorded value first
+    return value
     return value
 
 

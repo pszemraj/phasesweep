@@ -43,8 +43,8 @@ CONFOUND_SCHEMA_VERSION = 1
 
 _SURVIVORSHIP_COUNTS = ("ranked", "infeasible", "failed", "pruned")
 # Where a terminal trial that selection did not rank is counted. A COMPLETE
-# trial outside the ranked set violated a constraint; a trial that failed an
-# evidence gate or extraction is FAIL.
+# trial outside the ranked set violated a constraint or the metric's bounds;
+# a trial that failed an evidence gate or extraction is FAIL.
 _EXCLUDED_BY_STATE = {
     optuna.trial.TrialState.COMPLETE: "infeasible",
     optuna.trial.TrialState.FAIL: "failed",
@@ -149,7 +149,8 @@ def _survivorship(
     configuration fail, diverge, or run out of time is now correlated with
     which configurations could win. Failed trials include evidence-gate and
     extraction failures. An infeasible trial violated one of the operator's
-    constraints, which define what may win, so it is counted but never flags.
+    constraints or the metric's own bounds, which define what may win, so it is
+    counted but never flags.
     The counts are recorded whatever the verdict, and the check always runs.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.

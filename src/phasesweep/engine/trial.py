@@ -782,8 +782,9 @@ def extract_trial_result(
         (review v0.5.17 / blocker 8)
 
     A trial that produced a finite metric and finite constraint values but violated
-    a bound is COMPLETE+infeasible — that's a valid evaluation, not an instrumentation
-    failure, and should still inform the sampler. Expected extraction and gate
+    a bound (a constraint's, or the metric's own ``min``/``max``) is COMPLETE+infeasible
+    — that's a valid evaluation, not an instrumentation failure, and should still
+    inform the sampler. Expected extraction and gate
     failures are returned in :class:`TrialResult`; this function has no domain
     exception outcome for callers to catch.
 
@@ -907,7 +908,9 @@ def extract_trial_result(
         )
 
     constraint_values: dict[str, float] = {}
-    feasible = True
+    feasible = check_bounds(
+        metric_value, min_value=experiment.metric.min, max_value=experiment.metric.max
+    )
     for c in experiment.constraints:
         expired = _deadline_failure(f"constraint extractor {c.name!r}")
         if expired is not None:
