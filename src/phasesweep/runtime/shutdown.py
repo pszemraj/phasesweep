@@ -102,6 +102,21 @@ class PhaseSweepShutdown(SystemExit):
 _deferred_shutdown_signum: int | None = None
 _main_thread_defer_depth = 0
 
+# The shutdown signal the handler is servicing, or None. CPython runs the
+# handler only in the main thread, so a worker thread whose trainer the handler
+# kills never sees ``PhaseSweepShutdown``; it reads this to record the trial as
+# interrupted rather than failed. Set before the handler kills any child, and
+# cleared when the next run enters ``signal_handler_scope``.
+_servicing_signum: int | None = None
+
+
+def servicing_shutdown_signal() -> int | None:
+    """Return the shutdown signal the handler is servicing.
+
+    :return int | None: The signal number, or ``None`` when no shutdown is under way.
+    """
+    return _servicing_signum
+
 
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
     """Kill all tracked child process groups, then exit.
@@ -147,7 +162,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             or ignored during an active handler invocation as described above.
 
     """
-    global _deferred_shutdown_signum  # noqa: PLW0603
+    global _deferred_shutdown_signum, _servicing_signum  # noqa: PLW0603
 
     # Python signal handlers can interrupt an earlier invocation of this
     # handler. Let the first signal finish the authoritative cleanup pass;
@@ -165,6 +180,7 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
             return
         # Any recorded-but-unserviced signal is superseded by this invocation.
         _deferred_shutdown_signum = None
+        _servicing_signum = signum
 
         with _launch_lock, _lock:
             pgids = tuple(_active_children)
@@ -404,8 +420,11 @@ def signal_handler_scope() -> Iterator[None]:
         outermost run whose child processes must be cleaned up on shutdown.
 
     """
-    global _scope_depth  # noqa: PLW0603
+    global _scope_depth, _servicing_signum  # noqa: PLW0603
 
+    if _scope_depth == 0:
+        # A new outermost run starts with no shutdown under way.
+        _servicing_signum = None
     if _process_lifetime_owner:
         # An entry point (CLI/MCP) already owns shutdown signals for the
         # whole process. Nothing to install or restore, on any thread — but

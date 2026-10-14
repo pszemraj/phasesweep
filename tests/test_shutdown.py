@@ -25,7 +25,12 @@ from phasesweep.runtime.shutdown import (
     install_signal_handlers,
     signal_handler_scope,
 )
-from tests.conftest import make_experiment, write_constant_trainer, write_trainer
+from tests.conftest import (
+    make_experiment,
+    restored_signal_ownership,
+    write_constant_trainer,
+    write_trainer,
+)
 
 
 @pytest.mark.integration
@@ -595,3 +600,12 @@ def test_deferred_shutdown_services_at_outermost_window_exit() -> None:
         inner_exited = True
     assert inner_exited, "inner window exit must not service the deferred shutdown"
     assert excinfo.value.code == 128 + signal.SIGTERM
+
+
+def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> None:
+    """A worker thread can tell a shutdown is under way, and the next outermost run starts without one."""
+    with pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGINT, None)
+    assert runtime_shutdown.servicing_shutdown_signal() == signal.SIGINT
+    with restored_signal_ownership(), signal_handler_scope():
+        assert runtime_shutdown.servicing_shutdown_signal() is None

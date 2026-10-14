@@ -102,7 +102,7 @@ from phasesweep.engine.trial import (
 )
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.process import write_attempt_lifecycle
-from phasesweep.runtime.shutdown import PhaseSweepShutdown
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
 
 log = logging.getLogger("phasesweep.engine.phase")
 
@@ -1232,7 +1232,15 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         _record_outcome(run, trial, "interrupted", cause=str(exc))
         raise
     except TrialExecutionError as exc:
-        _record_outcome(run, trial, "failure", cause=str(exc))
+        signum = servicing_shutdown_signal()
+        if signum is None:
+            _record_outcome(run, trial, "failure", cause=str(exc))
+        else:
+            # Under n_jobs > 1 the shutdown handler runs in the main thread and
+            # kills this worker's trainer, which ends here as a trainer error.
+            _record_outcome(
+                run, trial, "interrupted", cause=f"orchestrator interrupted by signal {signum}"
+            )
         raise
     except UnsafeProcessCleanupError as exc:
         run.record_fatal(exc)
