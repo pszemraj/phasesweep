@@ -4,7 +4,23 @@ A PhaseSweep configuration is one operator-authored YAML document for one ordere
 
 Run `phasesweep validate <config>` before launching. The loader rejects duplicate YAML mapping keys and unsupported fields before it creates run artifacts. A top-level `suite` is rejected: write each component as its own complete experiment YAML file and review its defaults explicitly.
 
-Field types, defaults, and validation constraints are in [config_reference.yaml](../src/phasesweep/config_reference.yaml). It is a signature reference, not runnable YAML; start with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Both CLI commands take an explicit config path. YAML values override built-in defaults; CLI execution flags and ambient environment do not form a general config-key overlay. Config is read once per invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal and `execution.cwd` paths resolve against the directory of the YAML file, so the same file writes the same artifact tree from any directory, through the CLI or MCP. An `Experiment` built in Python has no file and resolves them against the process working directory. MCP's separate catalog paths are documented in the [operator reference](mcp.md#the-catalog).
+Field types, defaults, and validation constraints are in [config_reference.yaml](../src/phasesweep/config_reference.yaml), which is too long to read whole: `phasesweep explain KEY` prints one key and everything below it, and the [reference index](#reference-index) lists where each top-level key lives. It is a signature reference, not runnable YAML; start with [example.yaml](../examples/example.yaml) for one local CPU toy-trainer attempt. Both CLI commands take an explicit config path. YAML values override built-in defaults; CLI execution flags and ambient environment do not form a general config-key overlay. Config is read once per invocation, with no general `${VAR}` interpolation. Relative `workdir`, journal and `execution.cwd` paths resolve against the directory of the YAML file, so the same file writes the same artifact tree from any directory, through the CLI or MCP. An `Experiment` built in Python has no file and resolves them against the process working directory. MCP's separate catalog paths are documented in the [operator reference](mcp.md#the-catalog).
+
+## Reference index
+
+`phasesweep explain` with no argument lists every top-level key with its signature, a one-line summary and its sub-key count. `phasesweep explain KEY` prints the key and every key below it, one entry per discriminator variant labelled `[type=...]`. `phases[].sampler`, `phases.sampler` and `phases.0.sampler` name the same key. An unknown key exits 2 and names the closest documented keys.
+
+| Section | Top-level keys | Command |
+| --- | --- | --- |
+| Required experiment fields | `experiment`, `trial_command`, `metric`, `phases` | `phasesweep explain phases` |
+| Trainer inputs | `trainer_config`, `override_format` | `phasesweep explain override_format` |
+| Storage and provenance | `storage`, `workdir`, `provenance` | `phasesweep explain storage` |
+| Constraints | `constraints` | `phasesweep explain constraints` |
+| Observations | `observe` | `phasesweep explain observe` |
+| MLflow target and ownership | `mlflow` | `phasesweep explain mlflow` |
+| Execution environment | `env`, `execution`, `timeout_seconds_per_run` | `phasesweep explain execution` |
+
+`phases` and `metric` are the largest subtrees. Narrow them with a path such as `phasesweep explain 'phases[].sampler'`, and quote any key that contains brackets so the shell does not expand it.
 
 ## Experiment YAML
 

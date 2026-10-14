@@ -15,6 +15,15 @@ import yaml
 
 from phasesweep.config import ConfigError, Experiment, load_experiment
 from phasesweep.config.models import experiment_contract_lines
+from phasesweep.config.reference import (
+    closest,
+    first_sentence,
+    lookup,
+    plain_path,
+    reference_location,
+    sub_key_count,
+    top_level_entries,
+)
 from phasesweep.config.search import phase_draws, sampler_capability_line, sampler_warnings
 from phasesweep.engine import (
     PhaseSweepError,
@@ -57,6 +66,10 @@ _USAGE_EXIT = 2  # bad input: config or arguments
 _FAILURE_EXIT = 1  # the run itself failed
 _INTERNAL_EXIT = 70  # sysexits EX_SOFTWARE: a phasesweep bug
 _ABORT_EXIT = 130  # 128 + SIGINT
+
+# Column limits for the `explain` listing.
+_SIGNATURE_COLUMN_CAP = 40
+_SUMMARY_WIDTH = 72
 
 
 def _configure_logging(verbose: bool) -> None:
@@ -401,6 +414,69 @@ def _render_phase_comment(comment: str | None, *, prefix: str) -> None:
     if comment:
         for line in comment.strip().splitlines():
             click.echo(f"{prefix}{line}")
+
+
+@cli.command(
+    context_settings=CONTEXT_SETTINGS,
+    help=(
+        "Explain config keys from the packaged reference. Without KEY, list the top-level "
+        "keys; with a KEY such as 'phases[].sampler', print that key and every key below it. "
+        "The spellings phases[].sampler, phases.sampler and phases.0.sampler are equivalent."
+    ),
+    short_help="Explain config keys.",
+)
+@click.argument("key", metavar="[KEY]", required=False)
+def explain(key: str | None) -> None:
+    """Print the configuration reference for one key, or list the top-level keys.
+
+    :param str | None key: Config key in any spelling the reference accepts, or None to list
+        the top-level keys.
+    :raises click.exceptions.Exit: With code 2 when ``key`` matches no documented key.
+    """
+    if key is None:
+        _render_reference_index()
+        return
+    entries = lookup(key) if plain_path(key) else ()
+    if not entries:
+        near = closest(key)
+        hint = (
+            f"Closest: {', '.join(near)}."
+            if near
+            else "Run `phasesweep explain` to list the top-level keys."
+        )
+        click.echo(f"phasesweep explain: no config key matches {key!r}. {hint}", err=True)
+        raise click.exceptions.Exit(_USAGE_EXIT)
+    for index, entry in enumerate(entries):
+        if index:
+            click.echo()
+        click.echo(f"{entry.path}: {entry.signature}")
+        for line in entry.comments:
+            click.echo(f"  {line}")
+
+
+def _render_reference_index() -> None:
+    """Print each section's top-level keys with signature, summary and sub-key count."""
+    entries = top_level_entries()
+    width = max(len(entry.path) for entry in entries)
+    # A signature longer than the cap overflows its column instead of widening every row.
+    sig_width = max(len(e.signature) for e in entries if len(e.signature) <= _SIGNATURE_COLUMN_CAP)
+    section = None
+    for entry in entries:
+        if entry.section != section:
+            if section is not None:
+                click.echo()
+            click.echo(entry.section)
+            section = entry.section
+        count = sub_key_count(entry)
+        suffix = f" ({count} sub-key{'' if count == 1 else 's'})" if count else ""
+        summary = first_sentence(entry, _SUMMARY_WIDTH)
+        click.echo(f"  {entry.path:<{width}}  {entry.signature:<{sig_width}}  {summary}{suffix}")
+    click.echo()
+    click.echo("Narrow with a key, for example: phasesweep explain 'phases[].sampler'")
+    click.echo(
+        "General notes on file paths, YAML typing and environment variables open the "
+        f"header of {reference_location()}"
+    )
 
 
 def _publication_integrity_error(

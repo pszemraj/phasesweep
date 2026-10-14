@@ -316,7 +316,7 @@ def test_help_registers_commands_and_options() -> None:
     assert result.exit_code == 0
     assert "-h, --help" in result.output
     assert "recover-run" not in result.output
-    for command in ("init", "mcp", "run", "show-winners", "status", "validate"):
+    for command in ("explain", "init", "mcp", "run", "show-winners", "status", "validate"):
         assert command in result.output
 
     for command in ("run", "validate", "show-winners", "status"):

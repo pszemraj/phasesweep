@@ -15,6 +15,7 @@ import importlib.resources
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from importlib.resources.abc import Traversable
 
 _SECTION = re.compile(r"# -{10} (.+?) -{10}")
 _ENTRY = re.compile(r"( *)(- )?([\w.-]+): (.+)")
@@ -123,6 +124,22 @@ def _parse(text: str) -> tuple[ReferenceEntry, ...]:
     return tuple(entries)
 
 
+def _reference_resource() -> Traversable:
+    """Locate the packaged reference file.
+
+    :return Traversable: The resource ``phasesweep/config_reference.yaml``.
+    """
+    return importlib.resources.files("phasesweep").joinpath("config_reference.yaml")
+
+
+def reference_location() -> str:
+    """Name the packaged reference file, for pointing readers at its general notes.
+
+    :return str: Filesystem location of ``config_reference.yaml`` in the installed package.
+    """
+    return str(_reference_resource())
+
+
 @functools.cache
 def reference_entries() -> tuple[ReferenceEntry, ...]:
     """Return every documented key of the packaged reference, in file order.
@@ -130,12 +147,41 @@ def reference_entries() -> tuple[ReferenceEntry, ...]:
     :raises ValueError: If the packaged reference does not parse.
     :return tuple[ReferenceEntry, ...]: One entry per documented key and variant.
     """
-    text = (
-        importlib.resources.files("phasesweep")
-        .joinpath("config_reference.yaml")
-        .read_text(encoding="utf-8")
-    )
-    return _parse(text)
+    return _parse(_reference_resource().read_text(encoding="utf-8"))
+
+
+def top_level_entries() -> tuple[ReferenceEntry, ...]:
+    """Return the entries of the top-level config keys, in file order.
+
+    :return tuple[ReferenceEntry, ...]: One entry per key of the experiment mapping.
+    """
+    return tuple(entry for entry in reference_entries() if "." not in entry.path)
+
+
+def sub_key_count(entry: ReferenceEntry) -> int:
+    """Count the documented entries below a key, one per variant of a discriminated key.
+
+    :param ReferenceEntry entry: A documented key.
+    :return int: Number of entries below it, zero for a leaf.
+    """
+    return len(lookup(entry.path)) - 1
+
+
+def first_sentence(entry: ReferenceEntry, limit: int = 80) -> str:
+    """Return the first sentence of an entry's description, shortened to fit a listing.
+
+    :param ReferenceEntry entry: A documented key.
+    :param int limit: Longest result in characters; a longer sentence is cut at a word
+        boundary and ends in ``...``.
+    :return str: The first sentence, or an empty string when the entry has no comments.
+    """
+    if not entry.comments:
+        return ""
+    head = re.match(r"(.+?[.!?])(?:\s|$)", entry.comments[0])
+    sentence = head[1] if head else entry.comments[0]
+    if len(sentence) <= limit:
+        return sentence
+    return sentence[: limit - 3].rsplit(" ", 1)[0].rstrip(",;:") + "..."
 
 
 @functools.cache

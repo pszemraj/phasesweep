@@ -25,10 +25,13 @@ from phasesweep.config.reference import (
     ReferenceEntry,
     _parse,
     closest,
+    first_sentence,
     loc_to_path,
     lookup,
     plain_path,
     reference_entries,
+    sub_key_count,
+    top_level_entries,
 )
 from phasesweep.mcp.registry import _Allow, _Catalog, _Entry
 from phasesweep.runtime.json import JsonObject
@@ -283,6 +286,51 @@ def test_configuration_guide_complete_yaml_examples_load_through_real_loader() -
     assert complete, "The configuration guide must retain a complete experiment example"
     for index, block in enumerate(complete):
         load_experiment_bytes(block.encode("utf-8"), source=f"docs/config.md YAML example {index}")
+
+
+def test_config_guide_index_lists_every_top_level_key() -> None:
+    """The guide's reference index names each top-level key under the section it sits in."""
+    guide = (REPO / "docs/config.md").read_text()
+    index = guide.split("## Reference index\n", 1)[1].split("\n## ", 1)[0]
+    rows = re.findall(
+        r"^\| ([^|`]+?) \| ((?:`[^`]+`(?:, )?)+) \| `phasesweep explain ([^`]+)` \|$",
+        index,
+        re.MULTILINE,
+    )
+    documented = {section: re.findall(r"`([^`]+)`", keys) for section, keys, _ in rows}
+    assert len(documented) == len(rows), "Duplicate index section"
+    expected: dict[str, list[str]] = {}
+    for entry in top_level_entries():
+        expected.setdefault(entry.section, []).append(entry.path)
+    assert documented == expected
+    for section, _, command_key in rows:
+        assert command_key in documented[section], (section, command_key)
+
+
+def test_top_level_entries_are_the_undotted_paths_in_file_order() -> None:
+    """Top-level keys are exactly the entries whose path has no dot."""
+    paths = [entry.path for entry in top_level_entries()]
+    assert paths[:4] == ["experiment", "trial_command", "metric", "phases"]
+    assert paths == [entry.path for entry in reference_entries() if "." not in entry.path]
+
+
+def test_sub_key_count_counts_entries_below_a_key() -> None:
+    """A leaf has none, and a container counts every entry below it."""
+    by_path = {entry.path: entry for entry in reference_entries()}
+    assert sub_key_count(by_path["storage"]) == 0
+    assert sub_key_count(by_path["execution"]) == len(
+        [path for path in by_path if path.startswith("execution.")]
+    )
+    assert sub_key_count(by_path["phases"]) > 40
+
+
+def test_first_sentence_stops_at_the_first_full_stop_and_shortens_long_ones() -> None:
+    """A listing row shows one sentence, cut at a word boundary when it is long."""
+    storage = next(entry for entry in reference_entries() if entry.path == "storage")
+    assert first_sentence(storage) == "Where the study ledger is kept."
+    long = ReferenceEntry("k", "string", ("Word " * 40 + "end. Second.",), "S")
+    assert first_sentence(long, 30) == "Word Word Word Word Word..."
+    assert first_sentence(ReferenceEntry("k", "string", (), "S")) == ""
 
 
 def test_mcp_catalog_table_matches_all_catalog_paths() -> None:
