@@ -612,9 +612,8 @@ class GetRunResultsResult(_ToolPayload):
     Every result-scoped field describes the represented generation under the
     config that produced it: ``metric``, ``declared_phase_count``,
     ``missing_phases``, and ``all_phases_have_winners`` are measured against
-    the historical phase plan, not the current one (review v0.5.16 /
-    blocker 4). ``result_context`` and ``published_config_matches_current``
-    disclose which config that was.
+    the historical phase plan, not the current one. ``result_context`` and
+    ``published_config_matches_current`` disclose which config that was.
     """
 
     experiment_id: ExperimentId

@@ -750,15 +750,15 @@ class PhaseSweepMCP(RunControl):
         Every label describing the winners -- metric name and goal, objective
         evidence, and the declared phase plan the completeness fields are
         measured against -- comes from the represented generation's own
-        recorded semantics, never from the current catalog config (review
-        v0.5.16 / blocker 4). Reading them from the current config relabeled
-        historical numbers with a metric they were never optimized for,
-        asserted evidence guarantees the run never had, and, after a phase
-        rename, hid the published winner while reporting the new name as
-        missing. ``result_context`` and ``published_config_matches_current``
-        report which config supplied the labels and whether it still matches
-        the one a further run would execute. Visibility is unchanged: the
-        current policy still decides which historical *values* are redacted.
+        recorded semantics, never from the current catalog config. Reading
+        them from the current config would relabel historical numbers with a
+        metric they were never optimized for, assert evidence guarantees the
+        run never had, and, after a phase rename, hide the published winner
+        while reporting the new name as missing. ``result_context`` and
+        ``published_config_matches_current`` report which config supplied the
+        labels and whether it still matches the one a further run would
+        execute. Visibility is unchanged: the current policy still decides
+        which historical *values* are redacted.
 
         :param str run_id: Detached run id whose snapshot should be read.
         :return dict[str, Any]: Path-free winners payload for the agent.
@@ -787,8 +787,7 @@ class PhaseSweepMCP(RunControl):
             assert experiment is not None
             # One pointer resolution supplies the status and the winners of
             # the queried run's generation, never a later mutable pointer,
-            # enumerated under the plan that generation published under
-            # (review v0.5.16 / blocker 4).
+            # enumerated under the plan that generation published under.
             status, winner_views = self._live_result(target_id, experiment, handle)
             if status["publication_integrity"] in {"failed", "permission_denied", "unknown"}:
                 winner_views = []

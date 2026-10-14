@@ -492,9 +492,9 @@ def capture_result_snapshot(
     (unpublished) partial results, correctly flagged ``is_published: False``.
 
     The engine and this capture must agree about what a valid terminal
-    result is (review v0.5.16 / blocker 2): the per-generation lifecycle
-    record is an optional post-commit diagnostic to the engine, so its
-    absence is logged, never fatal here; storage reads only *enrich* the
+    result is: the per-generation lifecycle record is an optional
+    post-commit diagnostic to the engine, so its absence is tolerated here
+    and only a mismatch is logged; storage reads only *enrich* the
     snapshot (a phase whose counts are unreadable is frozen with
     ``trial_data_available: false`` rather than failing the capture); and
     when the engine hands over its own authoritative ``engine_winners``, the
@@ -504,13 +504,13 @@ def capture_result_snapshot(
     Exactly one storage read backs that agreement. Every trial fact frozen
     here -- counts, generation counts, and the RUNNING identities later used
     to reconcile cleanup evidence -- comes from the single tolerant
-    :func:`phasesweep.engine.read.read_status` call below. This function used
-    to reload each phase study afterwards to collect those identities, an
-    intolerant read with no retry: one transient "database is locked" in that
-    window failed the capture of an otherwise successful multi-hour run, and
-    a terminal snapshot that was never captured is unrecoverable by design
+    :func:`phasesweep.engine.read.read_status` call below. Reloading each
+    phase study afterwards to collect those identities would be an intolerant
+    read with no retry: one transient "database is locked" in that window
+    would fail the capture of an otherwise successful multi-hour run, and a
+    terminal snapshot that was never captured is unrecoverable by design
     (see docs/mcp.md). Freezing a valid terminal result must not depend on a
-    second storage round trip (PR #5 review / reviewer 2, blocker 6).
+    second storage round trip.
 
     :param Experiment experiment: Exact config snapshot the detached runner executed.
     :param str | None generation_id: Engine generation known to own the experiment lock.
@@ -538,12 +538,12 @@ def capture_result_snapshot(
     # One tolerant read supplies every storage fact this snapshot freezes,
     # including the RUNNING identities in each phase's ``running_attempts``
     # (``None`` where ``trial_data_available`` is false). This capture must
-    # never reread a study afterwards (PR #5 review / reviewer 2, blocker 6).
+    # never reread a study afterwards.
     if engine_winners is not None:
         status = read_status(experiment, generation_id=generation_id)
         # The engine's terminal report is the authority on a successful
-        # outcome (review v0.5.16 / blocker 2); freeze exactly what it
-        # returned instead of re-reading the winner files.
+        # outcome; freeze exactly what it returned instead of re-reading the
+        # winner files.
         winner_snapshots = [
             _winner_snapshot(phase_name, winner) for phase_name, winner in engine_winners.items()
         ]
@@ -552,9 +552,8 @@ def capture_result_snapshot(
         # generation this snapshot *represents*, not the (possibly different)
         # true current pointer: a pinned capture wants exactly its own
         # generation's winners even when a newer generation has since become
-        # current (review v0.5.15 / blocker 3). A published generation's
-        # winners are the bytes its validation read, enumerated under its own
-        # recorded phase plan (review v0.5.16 / blocker 4).
+        # current. A published generation's winners are the bytes its
+        # validation read, enumerated under its own recorded phase plan.
         status, winner_views = read_result(experiment, generation_id=generation_id)
         winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
     snapshot = RunResultSnapshot(
@@ -684,9 +683,8 @@ def finalize_result_snapshot(
         phase.running = phase.trials["RUNNING"]
         # generation_trials was captured scoped to represented_generation_id
         # (the pinned id for a run snapshot), not current_generation_id, which
-        # is now always the actual mutable pointer and may be unrelated to --
-        # or absent for -- this snapshot's own generation (review v0.5.15 /
-        # blocker 3).
+        # is always the actual mutable pointer and may be unrelated to --
+        # or absent for -- this snapshot's own generation.
         generation_id = parsed.status.represented_generation_id
         generation_recovered = [
             attempt

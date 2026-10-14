@@ -8,9 +8,9 @@ server from the frozen registry; it is never agent input.
 
 The server starts this process in its own state directory, not the
 experiment's, so that nothing in the project tree can execute during
-interpreter startup - before any identity exists to clean up (review v0.5.17 /
-blocker 9). The project directory arrives as ``--cwd`` and is entered here,
-after every import has run and this runner's identity is durable.
+interpreter startup - before any identity exists to clean up. The project
+directory arrives as ``--cwd`` and is entered here, after every import has run
+and this runner's identity is durable.
 """
 
 from __future__ import annotations
@@ -442,10 +442,10 @@ def _write_status_file_with_retry(
 ) -> None:
     """Write one terminal status record, retrying only transient persistence errors.
 
-    Only :class:`OSError` is retried (PR #5 review / reviewer 2 pass 2, blocker
-    6). A serialization error is a defect of the payload, not of the
-    filesystem: retrying it cannot succeed, and the caller depends on seeing it
-    immediately so it can downgrade the record to a serializable one.
+    Only :class:`OSError` is retried. A serialization error is a defect of the
+    payload, not of the filesystem: retrying it cannot succeed, and the caller
+    depends on seeing it immediately so it can downgrade the record to a
+    serializable one.
 
     :param Path status_path: Destination ``status.json`` path for the run.
     :param dict[str, object] payload: JSON-serializable terminal status payload.
@@ -588,12 +588,12 @@ def _write_status(
 
     Nothing raises out of the persistence work itself, by design: this runs
     from ``main``'s ``finally`` with the run's own exception possibly in
-    flight, so raising a persistence error would mask the run's primary exit
-    (PR #5 review / reviewer 2 pass 2, blocker 6). The failure is reported
-    through the return value instead, which ``main`` turns into a nonzero exit
-    code on the otherwise-successful path. A shutdown signal deferred by the
-    window below is still delivered at its exit, after the terminal record is
-    durable; that is the run's own cancellation, not a persistence error.
+    flight, so raising a persistence error would mask the run's primary exit.
+    The failure is reported through the return value instead, which ``main``
+    turns into a nonzero exit code on the otherwise-successful path. A shutdown
+    signal deferred by the window below is still delivered at its exit, after
+    the terminal record is durable; that is the run's own cancellation, not a
+    persistence error.
 
     Every write is monotonic: state only ever moves toward more evidence.
     A ``complete`` transition that cannot be persisted leaves the durable

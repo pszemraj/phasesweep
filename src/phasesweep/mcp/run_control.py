@@ -82,8 +82,7 @@ class _SpawnBookkeepingError(Exception):
 
 # Environment variables that make the interpreter execute code before the
 # detached runner's first statement. They are dropped from the child's
-# environment (review v0.5.17 / blocker 9); PYTHONNOUSERSITE backs up the
-# ``-s`` flag for the same reason.
+# environment; PYTHONNOUSERSITE backs up the ``-s`` flag for the same reason.
 _PRE_IMPORT_CODE_ENV_VARS = (
     "PYTHONPATH",
     "PYTHONHOME",
@@ -822,18 +821,17 @@ class RunControl:
             cmd.append("--allow-cancel")
         if from_phase is not None:
             cmd += ["--from-phase", from_phase]
-        # Pre-identity trust boundary (review v0.5.17 / blocker 9). Everything
-        # between exec and the runner's own durable handle write runs before
-        # this server can name the process it just created. Spawning with the
-        # experiment's project directory as cwd put that window inside the
-        # project's reach: interpreter startup would import a project-local
-        # `phasesweep/` shadow package or `sitecustomize.py`, and a
-        # PYTHONPATH/PYTHONHOME/PYTHONSTARTUP-injected module would run
-        # earlier still. Any of it could fork+setsid out of the process group
-        # recorded below, after which "cleanup confirmed" would be a claim
-        # about an empty group. So the child starts in the server-owned state
-        # directory, with -P/-s and a sanitized environment, and receives the
-        # project directory as an explicit argument it applies only after its
+        # Pre-identity trust boundary. Everything between exec and the runner's
+        # own durable handle write runs before this server can name the process
+        # it just created. Spawning with the experiment's project directory as
+        # cwd would put that window inside the project's reach: interpreter
+        # startup would import a project-local `phasesweep/` shadow package or
+        # `sitecustomize.py`, and a PYTHONPATH/PYTHONHOME/PYTHONSTARTUP-injected
+        # module would run earlier still. Any of it could fork+setsid out of the
+        # process group recorded below, after which "cleanup confirmed" would be
+        # a claim about an empty group. So the child starts in the server-owned
+        # state directory, with -P/-s and a sanitized environment, and receives
+        # the project directory as an explicit argument it applies only after its
         # identity is on disk.
         spawn_cwd = self._neutral_spawn_cwd()
         # Open the log here, hand the fd to the child, then close our copy. The

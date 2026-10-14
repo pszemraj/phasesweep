@@ -1082,12 +1082,11 @@ class RunStore:
         authoritative: returncode 0 -> succeeded, a signalled code ->
         cancelled, and any other return code -> failed. The engine's exit
         status is the single authority on success; a failed *result snapshot*
-        capture degrades the run's frozen results, never its outcome — the
-        old ``returncode 0 + snapshot failed -> failed`` rule let an optional
-        diagnostic artifact contradict an engine-defined, already-published
-        success (review v0.5.16 / blocker 2). Pending result snapshot capture
-        remains running so another launch cannot mutate shared result storage
-        before the snapshot is frozen. With no status.json, a live
+        capture degrades the run's frozen results, never its outcome, so an
+        optional diagnostic artifact cannot contradict an engine-defined,
+        already-published success. Pending result snapshot capture remains
+        running so another launch cannot mutate shared result storage before
+        the snapshot is frozen. With no status.json, a live
         (non-zombie) PID means running. A dead or unverifiable spawned runner with no status
         cannot prove that its separately-sessioned trial descendants are gone,
         so it remains ``running`` (``recovery_required`` reports it) until
