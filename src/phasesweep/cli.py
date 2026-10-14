@@ -15,7 +15,7 @@ import yaml
 
 from phasesweep.config import ConfigError, Experiment, load_experiment
 from phasesweep.config.models import experiment_contract_lines
-from phasesweep.config.search import phase_draws, sampler_capability_line
+from phasesweep.config.search import phase_draws, sampler_capability_line, sampler_warnings
 from phasesweep.engine import (
     PhaseSweepError,
     PublicationAccessError,
@@ -383,6 +383,8 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
         # resume/reproduce contract before a trial runs, not after an
         # interrupted operator hits the runtime continuation guard.
         click.echo(f"{indent}    {sampler_capability_line(p)}")
+        for warning in sampler_warnings(p):
+            click.echo(f"{indent}    warning: {warning}")
         _render_phase_comment(p.comment, prefix=f"{indent}    # ")
 
 

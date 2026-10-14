@@ -443,6 +443,7 @@ phases: list[object] (required)
 
       # Number of random startup trials before the tpe surrogate model is fitted, an integer >= 0.
       # Only COMPLETE and PRUNED trials count toward it in Optuna, so failed attempts lengthen the random phase.
+      # validate and the dry run warn when a tpe phase with a nonempty phases[].search_space has phases[].n_trials at or below this value, because then every trial is sampled at random and the model is never fitted.
       # Only used when: phases[].sampler.type is tpe. Every other type must leave it at 10, or config load fails.
       n_startup_trials: int = 10
 

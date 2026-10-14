@@ -566,6 +566,137 @@ def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path)
     assert "sampler=" not in result.output
 
 
+_TPE_STARTUP_WARNING = (
+    "warning: Phase 'lr': tpe with n_trials=5 <= n_startup_trials=10, so every trial is "
+    "sampled at random and TPE never fits its model. Use sampler.type: random with a seed "
+    "(resumable, same coverage), or set sampler.n_startup_trials below n_trials."
+)
+_LR_SPACE = "{ lr: { type: float, low: 0.1, high: 1.0 } }"
+
+# Phase bodies, after the name, for which no startup warning applies.
+_QUIET_TPE_BUDGETS = [
+    pytest.param(f"n_trials: 11\nsearch_space: {_LR_SPACE}", id="budget-exceeds-startup"),
+    pytest.param(
+        f"n_trials: 5\nsampler: {{ type: tpe, n_startup_trials: 4 }}\nsearch_space: {_LR_SPACE}",
+        id="startup-below-budget",
+    ),
+    pytest.param(
+        f"n_trials: 5\nsampler: {{ type: random }}\nsearch_space: {_LR_SPACE}",
+        id="random-sampler",
+    ),
+    pytest.param("n_trials: 1\nfixed_overrides: { lr: 0.1 }", id="empty-search-space"),
+]
+
+
+def _write_tpe_budget_config(tmp_path: Path, phase_body: str) -> Path:
+    """Write an in-memory experiment whose single phase ``lr`` has ``phase_body``."""
+    path = tmp_path / "exp.yaml"
+    body = textwrap.indent(phase_body, "    ")
+    path.write_text(
+        textwrap.dedent("""
+        experiment: t
+        trial_command: "echo {overrides}"
+        override_format: argparse
+        metric:
+          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
+        phases:
+          - name: lr
+        """)
+        + body
+        + "\n"
+    )
+    return path
+
+
+def test_validate_warns_when_tpe_never_leaves_startup(tmp_path: Path) -> None:
+    """A tpe budget at or below its startup trials is random search; validate says so."""
+    path = _write_tpe_budget_config(tmp_path, f"n_trials: 5\nsearch_space: {_LR_SPACE}")
+
+    result = CliRunner().invoke(cli_main, ["validate", str(path)])
+
+    assert result.exit_code == 0, result.output
+    lines = [line.strip() for line in result.output.splitlines()]
+    capability = lines.index(
+        "phase 'lr': sampler=tpe (non-resumable: run each target in one invocation)"
+    )
+    assert lines[capability + 1] == _TPE_STARTUP_WARNING
+
+
+def test_validate_warns_at_the_startup_boundary(tmp_path: Path) -> None:
+    path = _write_tpe_budget_config(tmp_path, f"n_trials: 10\nsearch_space: {_LR_SPACE}")
+
+    result = CliRunner().invoke(cli_main, ["validate", str(path)])
+
+    assert "tpe with n_trials=10 <= n_startup_trials=10" in result.output
+
+
+@pytest.mark.parametrize("phase_body", _QUIET_TPE_BUDGETS)
+def test_validate_does_not_warn_when_tpe_leaves_startup(tmp_path: Path, phase_body: str) -> None:
+    result = CliRunner().invoke(
+        cli_main, ["validate", str(_write_tpe_budget_config(tmp_path, phase_body))]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "warning:" not in result.output
+
+
+def test_dry_run_warns_when_tpe_never_leaves_startup(tmp_path: Path, caplog) -> None:
+    caplog.set_level(logging.INFO)
+    exp = make_experiment(
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(
+                name="lr",
+                n_trials=5,
+                search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
+            )
+        ],
+    )
+
+    run_experiment(exp, dry_run=True)
+
+    warnings = [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+    assert [(r.levelno, r.getMessage()) for r in warnings] == [
+        (logging.WARNING, f"DRY RUN {_TPE_STARTUP_WARNING}")
+    ]
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        pytest.param(
+            Phase(
+                name="lr",
+                n_trials=11,
+                search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
+            ),
+            id="budget-exceeds-startup",
+        ),
+        pytest.param(
+            Phase(
+                name="lr",
+                n_trials=5,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
+            ),
+            id="random-sampler",
+        ),
+        pytest.param(
+            Phase(name="lr", n_trials=1, fixed_overrides={"lr": 0.1}), id="empty-search-space"
+        ),
+    ],
+)
+def test_dry_run_does_not_warn_when_tpe_leaves_startup(
+    tmp_path: Path, caplog, phase: Phase
+) -> None:
+    caplog.set_level(logging.INFO)
+    exp = make_experiment(trial_command="echo {overrides}", phases=[phase])
+
+    run_experiment(exp, dry_run=True)
+
+    assert not [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+
+
 def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
     """``show-winners`` prints comment before the winner block so the reader
     frames numerical results against intent. Also covers the no-winner-yet

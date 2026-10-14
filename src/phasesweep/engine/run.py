@@ -25,7 +25,7 @@ from phasesweep._metadata import __version__
 from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload, experiment_contract_lines
-from phasesweep.config.search import sampler_capability_line
+from phasesweep.config.search import sampler_capability_line, sampler_warnings
 from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
@@ -684,6 +684,8 @@ def _run_experiment_inner(
             log.info("DRY RUN %s", line)
         for previewed in experiment.phases:
             log.info("DRY RUN %s", sampler_capability_line(previewed))
+            for warning in sampler_warnings(previewed):
+                log.warning("DRY RUN warning: %s", warning)
 
     # Only a dry run resumes without preloaded winners; it resolves the
     # publication once for every phase it skips.

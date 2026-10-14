@@ -335,6 +335,27 @@ def sampler_capability_line(phase: Phase) -> str:
     return f"phase {phase.name!r}: sampler={sampler.type}{seed} ({capability})"
 
 
+def sampler_warnings(phase: Phase) -> list[str]:
+    """List the advisory warnings about a phase's sampler and trial budget.
+
+    Shared by ``phasesweep validate`` and ``phasesweep run --dry-run``. A
+    warning never blocks a run. A phase that draws nothing has no sampler to
+    warn about.
+
+    :param Phase phase: Phase whose sampler and trial target are checked.
+    :return list[str]: One sentence per warning, empty when nothing is amiss.
+    """
+    sampler = phase.sampler
+    if sampler.type == "tpe" and phase_draws(phase) and phase.n_trials <= sampler.n_startup_trials:
+        return [
+            f"Phase {phase.name!r}: tpe with n_trials={phase.n_trials} <= "
+            f"n_startup_trials={sampler.n_startup_trials}, so every trial is sampled at random "
+            "and TPE never fits its model. Use sampler.type: random with a seed (resumable, "
+            "same coverage), or set sampler.n_startup_trials below n_trials."
+        ]
+    return []
+
+
 def _validate_sampler_search_space(phase: Phase) -> None:
     """Reject sampler/search-space combinations Optuna will not accept at runtime.
 
