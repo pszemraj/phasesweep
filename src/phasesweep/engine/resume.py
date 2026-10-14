@@ -243,42 +243,6 @@ def _reject_fixed_targets_without_study(
             study_policy_ops._validate_fixed_configuration_target(phase, finished=0, completed=0)
 
 
-def _preview_recorded_refusals(
-    experiment: Experiment,
-    studies: Mapping[str, optuna.Study],
-    *,
-    from_phase: str | None,
-) -> None:
-    """Refuse in a dry run what a launch's preflight refuses over the recorded studies.
-
-    A launch checks every reached phase's study against its trial target, and
-    then refuses a stateful sampler's continuation. A dry run applies those same
-    checks to read-only snapshots of the studies, in the same order, so it
-    refuses before it previews anything, as the launch refuses before it runs
-    anything. Nothing is recovered or written, so the caller leaves out a study
-    that still holds attempts a launch would recover first.
-
-    :param Experiment experiment: Parsed experiment whose phase chain is scanned
-        from ``from_phase`` (or the start) onward.
-    :param Mapping[str, optuna.Study] studies: Read-only snapshot studies keyed
-        by phase name; phases with no recorded study are omitted.
-    :param str | None from_phase: Optional resume point; phases before it are skipped.
-    :raises TrialTargetRefusedError: A study already accepted a higher target
-        than its phase requests, or a fixed configuration asks for more
-        attempts than it may retry; delegated to
-        :func:`phasesweep.engine.study_policy._validate_trial_target`.
-    :raises SamplerContinuationUnsupportedError: A stateful sampler's study
-        cannot continue; delegated to :func:`_reject_unsupported_sampler_topups`.
-    """
-    for _index, phase in experiment.phases_from(from_phase):
-        study = studies.get(phase.name)
-        if study is not None:
-            study_policy_ops._validate_trial_target(study, phase)
-    _reject_unsupported_sampler_topups(
-        experiment, from_phase=from_phase, existing_studies=dict(studies)
-    )
-
-
 def _preflight_reached_fingerprint(
     experiment: Experiment,
     *,

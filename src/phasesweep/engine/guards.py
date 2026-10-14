@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import optuna
 
 from phasesweep.config import Experiment
@@ -186,37 +188,59 @@ def _preflight_existing_studies(
                     )
         except Exception as exc:
             errors.append(exc)
-    if errors:
-        first = errors[0]
-        if len(errors) == 1:
-            raise first
-        message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
-            str(error) for error in errors
-        )
-        # No single error speaks for an aggregate, whatever its types: it
-        # routes to a remediation only when every collected error names the
-        # same one, and otherwise to reading the refusals it lists.
-        remediations = {error.action for error in errors if isinstance(error, PhaseSweepError)}
-        shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
-        for error_type in (
-            StudySchemaMismatchError,
-            StudyFingerprintMismatchError,
-            StudyStorageUnavailableError,
-            TrialTargetRefusedError,
-        ):
-            if all(isinstance(error, error_type) for error in errors):
-                raise error_type(message, action=shared) from first
-        cleanup_error = next(
-            (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
-            None,
-        )
-        if cleanup_error is not None:
-            raise ProcessCleanupUncertainError(message, action=shared) from cleanup_error
-        unexpected = next(
-            (error for error in errors if not isinstance(error, PhaseSweepError)),
-            None,
-        )
-        if unexpected is not None:
-            raise RuntimeError(message) from unexpected
-        raise PhaseSweepError(message, action=shared) from first
+    _raise_collected_errors(errors)
     return studies
+
+
+def _raise_collected_errors(errors: Sequence[Exception]) -> None:
+    """Raise the one refusal a preflight collected, or one refusal that combines several.
+
+    The live preflight and the dry-run preview both collect a refusal per
+    study and report them through this, so a preview names the same studies,
+    in the same message and type, as the launch it previews.
+
+    :param Sequence[Exception] errors: Refusals collected across the studies, in
+        phase order; nothing is raised when it is empty.
+    :raises StudySchemaMismatchError: Every collected refusal is one, or the only one.
+    :raises StudyFingerprintMismatchError: Every collected refusal is one.
+    :raises StudyStorageUnavailableError: Every collected refusal is one.
+    :raises TrialTargetRefusedError: Every collected refusal is one.
+    :raises ProcessCleanupUncertainError: Any collected refusal is one.
+    :raises PhaseSweepError: The collected refusals are expected but of mixed kinds.
+    :raises RuntimeError: At least one collected error is an unexpected
+        implementation failure that must retain traceback reporting.
+    """
+    if not errors:
+        return
+    first = errors[0]
+    if len(errors) == 1:
+        raise first
+    message = "Experiment recovery preflight found multiple unsafe studies: " + "; ".join(
+        str(error) for error in errors
+    )
+    # No single error speaks for an aggregate, whatever its types: it
+    # routes to a remediation only when every collected error names the
+    # same one, and otherwise to reading the refusals it lists.
+    remediations = {error.action for error in errors if isinstance(error, PhaseSweepError)}
+    shared = remediations.pop() if len(remediations) == 1 else OperatorAction.INSPECT_LOGS
+    for error_type in (
+        StudySchemaMismatchError,
+        StudyFingerprintMismatchError,
+        StudyStorageUnavailableError,
+        TrialTargetRefusedError,
+    ):
+        if all(isinstance(error, error_type) for error in errors):
+            raise error_type(message, action=shared) from first
+    cleanup_error = next(
+        (error for error in errors if isinstance(error, ProcessCleanupUncertainError)),
+        None,
+    )
+    if cleanup_error is not None:
+        raise ProcessCleanupUncertainError(message, action=shared) from cleanup_error
+    unexpected = next(
+        (error for error in errors if not isinstance(error, PhaseSweepError)),
+        None,
+    )
+    if unexpected is not None:
+        raise RuntimeError(message) from unexpected
+    raise PhaseSweepError(message, action=shared) from first

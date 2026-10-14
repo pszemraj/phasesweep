@@ -259,6 +259,25 @@ def test_read_path_never_constructs_file_backed_storage_or_writes_bytes(
     assert state_changes == {}, f"{read_path} changed the MCP state directory: {state_changes}"
 
 
+@pytest.mark.parametrize("mode", LEDGER_MODES)
+def test_dry_run_over_the_current_golden_ledger_replays_its_finished_phase(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dry run replays the fixture's finished phase and hands out its real winner.
+
+    The matrix above asserts only the verdict, which a placeholder winner satisfies as well, so
+    this pins the replay itself: a stand-in winner has trial number -1.
+    """
+    materialized = materialize("current-journal", tmp_path, mode=mode)
+    attempts = forbid_file_backed_storage(monkeypatch, allow_memory_studies=True)
+
+    winners = run_experiment(materialized.experiment, dry_run=True)
+
+    assert attempts == []
+    assert winners["p"].trial_number != -1
+    assert materialized.unchanged(), materialized.changes()
+
+
 @pytest.mark.parametrize(("fixture_name", "mode"), _mode_cells())
 def test_recovery_inspect_never_writes_to_a_golden_ledger(
     fixture_name: str, mode: str, tmp_path: Path

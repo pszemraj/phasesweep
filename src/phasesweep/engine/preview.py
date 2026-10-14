@@ -1,23 +1,40 @@
-"""Dry-run preview of one phase against the trials its ledger already records.
+"""Dry-run preview of an experiment against the trials its ledger already records.
 
-A dry run reads the ledger through the write-nothing door and judges each
-phase by the rules a launch applies, so it refuses and replays as a launch
-would while it creates no study and changes nothing. The rules live in
-:mod:`phasesweep.engine.phase`; this module only feeds them read-only
-snapshots and reports the verdict.
+A dry run reads the ledger through the write-nothing door and applies the
+rules a launch applies to what it read, so it refuses and replays as a launch
+would while it creates no study and changes nothing. The rules live where the
+launch calls them (:mod:`phasesweep.engine.ledger`,
+:mod:`phasesweep.engine.guards`, :mod:`phasesweep.engine.resume`,
+:mod:`phasesweep.engine.study_policy`, :mod:`phasesweep.engine.phase`); this
+module only reads the studies, feeds the rules read-only snapshots in the
+launch's order, and reports the verdict.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 import optuna
 
+import phasesweep.engine.resume as resume_ops
 from phasesweep.config import Experiment, Phase
 from phasesweep.config.search import sampler_search_space
+from phasesweep.engine.artifact_roots import (
+    _artifact_root_binding_applies,
+    _check_published_phase_studies,
+)
+from phasesweep.engine.errors import StudyStorageUnavailableError
 from phasesweep.engine.fingerprints import _phase_fingerprint
-from phasesweep.engine.ledger import RecordedPhase, open_preview_study
-from phasesweep.engine.optuna import _phase_study_name, _suggest
+from phasesweep.engine.guards import _raise_collected_errors
+from phasesweep.engine.ledger import open_preview_study, read_phase_studies, validate_ledger
+from phasesweep.engine.optuna import (
+    _completed_trial_count,
+    _finished_trial_count,
+    _phase_study_name,
+    _suggest,
+)
 from phasesweep.engine.paths import _phase_dir
 from phasesweep.engine.phase import (
     _composed_overrides,
@@ -27,11 +44,181 @@ from phasesweep.engine.phase import (
     _placeholder_winner,
     _replay_met_target,
 )
-from phasesweep.engine.state import Winner
-from phasesweep.engine.study_policy import _load_phase_policy_state
+from phasesweep.engine.state import STUDY_SCHEMA_ATTR, Winner
+from phasesweep.engine.study_policy import (
+    _load_phase_policy_state,
+    _validate_fixed_configuration_target,
+    _validate_study_direction,
+    _validate_study_schema,
+    _validate_trial_target,
+)
 from phasesweep.runtime.commands import render_command
 
 log = logging.getLogger("phasesweep.engine.preview")
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedPhase:
+    """What a ledger already holds for one phase, counted as a launch would count it."""
+
+    #: Terminal attempts, plus each RUNNING one, which a launch recovers as failed first.
+    finished: int
+    #: How many of those are COMPLETE.
+    completed: int
+    #: How many attempts are RUNNING, which a launch recovers before it checks anything.
+    running: int
+    #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
+    study: optuna.Study | None
+
+
+def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
+    """Count one phase's snapshot study the way a launch counts it.
+
+    :param optuna.Study | None study: The phase's snapshot study, or ``None`` when
+        the ledger holds no such study, which counts zero attempts.
+    :return RecordedPhase: The counts and the study.
+    """
+    if study is None:
+        return RecordedPhase(finished=0, completed=0, running=0, study=None)
+    trials = study.get_trials(deepcopy=False)
+    running = sum(1 for trial in trials if trial.state == optuna.trial.TrialState.RUNNING)
+    return RecordedPhase(
+        finished=_finished_trial_count(trials) + running,
+        completed=_completed_trial_count(trials),
+        running=running,
+        study=study,
+    )
+
+
+def _read_recorded_phases(experiment: Experiment) -> dict[str, RecordedPhase | None]:
+    """Read every phase's study from one capture of the ledger, creating and writing nothing.
+
+    The read goes through the write-nothing door ``status`` uses, so it
+    neither creates a study nor constructs file-backed storage. A missing
+    ledger or study counts zero attempts. A ledger that cannot be inspected
+    leaves every phase unread, so the preview falls back to a fresh study and
+    says so.
+
+    :param Experiment experiment: Parsed experiment being previewed.
+    :raises ArtifactRootConflictError: The tree is bound to a different owner.
+    :raises StudySchemaMismatchError: A ledger study uses an unsupported schema.
+    :return dict[str, RecordedPhase | None]: One entry per phase, by phase name;
+        ``None`` for every phase when the ledger could not be read.
+    """
+    try:
+        studies = read_phase_studies(validate_ledger(experiment))
+    except StudyStorageUnavailableError as exc:
+        log.warning(
+            "DRY RUN warning: the ledger could not be inspected, and a real run refuses "
+            "a ledger it cannot read: %s",
+            exc,
+        )
+        return {phase.name: None for phase in experiment.phases}
+    return {name: _recorded_phase(study) for name, study in studies.items()}
+
+
+def _refuse_as_a_launch_would(
+    experiment: Experiment,
+    recorded: Mapping[str, RecordedPhase],
+    *,
+    from_phase: str | None,
+) -> None:
+    """Apply a launch's claim and preflight refusals to the recorded studies, in its order.
+
+    A launch checks what the ledger holds before it runs anything, so the
+    preview refuses before it previews anything. The order is the launch's
+    (:func:`phasesweep.engine.ledger.claim_ledger`, then
+    :func:`phasesweep.engine.guards._preflight_existing_studies`, then the
+    top-up checks of :mod:`phasesweep.engine.resume`), so the first refusal is
+    the one a launch gives, and several studies' refusals are combined as it
+    combines them. Every check is the launch's own function, run on the
+    read-only snapshots.
+
+    A launch recovers each RUNNING attempt as failed before it checks that
+    attempt's study, and a snapshot cannot. Such a study gets the checks that
+    do not depend on that recovery (direction and schema) and a fixed
+    configuration's attempt limit from counts that treat the attempt as failed;
+    it is left out of the target, bound-descendant and sampler checks. A launch
+    also checks the trainer environment, the stored fingerprints, the trial
+    evidence and each study's artifact-root claim, which a preview does not.
+
+    :param Experiment experiment: Parsed experiment being previewed.
+    :param Mapping[str, RecordedPhase] recorded: What the ledger holds for each phase.
+    :param str | None from_phase: Optional first phase a launch would execute.
+    :raises PublishedStudyMissingError: A reached phase has a published winner
+        whose trial is missing from, or below the history boundary of, its study.
+    :raises PublicationAccessError: The last publication cannot be read.
+    :raises PublicationIntegrityError: The last publication no longer validates.
+    :raises StudySchemaMismatchError: A study's direction differs from the
+        config's, or its failure-policy state is malformed.
+    :raises TrialTargetRefusedError: A study already accepted a higher target
+        than its phase requests, or a fixed configuration asks for more
+        attempts than it may retry.
+    :raises StudyContextConflictError: An upstream top-up would invalidate a
+        descendant study already bound to its winner.
+    :raises SamplerContinuationUnsupportedError: A stateful sampler's study
+        cannot continue.
+    """
+    studies = {name: record.study for name, record in recorded.items() if record.study is not None}
+    if _artifact_root_binding_applies(experiment):
+        _check_published_phase_studies(experiment, studies, from_phase=from_phase)
+    errors: list[Exception] = []
+    reached = from_phase is None
+    for phase in experiment.phases:
+        if phase.name == from_phase:
+            reached = True
+        study = studies.get(phase.name)
+        if study is None:
+            continue
+        record = recorded[phase.name]
+        try:
+            _validate_study_direction(study, experiment.metric.goal)
+            # The only write ``_validate_study_schema`` makes stamps an empty,
+            # unstamped study, which a snapshot cannot take and which cannot
+            # fail the check.
+            if study.get_trials(deepcopy=False) or STUDY_SCHEMA_ATTR in study.user_attrs:
+                _validate_study_schema(study)
+            if reached and record.running:
+                _validate_fixed_configuration_target(
+                    phase, finished=record.finished, completed=record.completed
+                )
+            elif reached:
+                _validate_trial_target(study, phase)
+        except Exception as exc:
+            errors.append(exc)
+    _raise_collected_errors(errors)
+    settled = {name: study for name, study in studies.items() if not recorded[name].running}
+    resume_ops._reject_bound_descendant_topups(
+        experiment, from_phase=from_phase, existing_studies=settled
+    )
+    resume_ops._reject_unsupported_sampler_topups(
+        experiment, from_phase=from_phase, existing_studies=settled
+    )
+    resume_ops._reject_fixed_targets_without_study(
+        experiment, from_phase=from_phase, existing_studies=studies
+    )
+
+
+def _preview_ledger(
+    experiment: Experiment, *, from_phase: str | None
+) -> dict[str, RecordedPhase | None]:
+    """Read what the ledger holds and refuse what a launch would refuse over it.
+
+    :param Experiment experiment: Parsed experiment being previewed.
+    :param str | None from_phase: Optional first phase a launch would execute.
+    :raises ArtifactRootConflictError: The tree is bound to a different owner.
+    :raises PhaseSweepError: A launch would refuse the recorded studies, as
+        :func:`_refuse_as_a_launch_would` documents. A ledger that cannot be
+        read is not refused here: the preview cannot tell what it holds, so it
+        warns and previews every phase as fresh, where a launch refuses it.
+    :return dict[str, RecordedPhase | None]: One entry per phase, by phase name;
+        ``None`` for every phase when the ledger could not be read.
+    """
+    recorded = _read_recorded_phases(experiment)
+    readable = {name: record for name, record in recorded.items() if record is not None}
+    if len(readable) == len(recorded):
+        _refuse_as_a_launch_would(experiment, readable, from_phase=from_phase)
+    return recorded
 
 
 def _preview_resume_phase(
@@ -47,8 +234,9 @@ def _preview_resume_phase(
     (recovering stale trials, stamping the schema, binding the fingerprint) and
     minus the fingerprint comparison, whose inherited winners a preview may
     only have stood in for. A replayed winner is selected from the recorded
-    trials but not evidence-verified, which reads the trial directories and may
-    query W&B or MLflow.
+    trials but not evidence-verified: that proof reads the trial directories,
+    may query W&B or MLflow, and records the environment-drift warning once per
+    process, so a preview leaves it, and that warning, to the launch.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
@@ -93,8 +281,10 @@ def _preview_phase(
     refuses. A phase that would replay returns the winner a launch would
     republish, which its children inherit. A phase with trials still to run
     returns a placeholder (:func:`_dry_run_phase`). A phase whose recorded
-    state could not be read, or whose RUNNING attempts a launch recovers
-    first, is previewed from its counts alone, as a placeholder.
+    state could not be read is previewed as a fresh phase, and one whose
+    RUNNING attempts a launch recovers first is previewed from its counts,
+    with those attempts counted as failed and its recorded state unjudged;
+    both return a placeholder.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
@@ -119,15 +309,15 @@ def _preview_phase(
     resume: _PhaseResume | None = None
     if recorded is None:
         log.warning(
-            "DRY RUN warning: phase=%s recorded trial counts could not be read, so it is "
-            "previewed as a fresh phase and a real run may launch fewer trials",
+            "DRY RUN warning: phase=%s recorded trials could not be read, so it is "
+            "previewed as a fresh phase; a real run refuses a ledger it cannot read",
             phase.name,
         )
     elif recorded.running:
         log.warning(
             "DRY RUN warning: phase=%s has %d RUNNING attempt(s) that a real run recovers "
-            "as failed before it checks the phase, so its recorded target, sampler and abort "
-            "state are not previewed",
+            "as failed before it checks the phase, so they are counted as failed and its "
+            "accepted target, sampler continuation and abort state are not checked",
             phase.name,
             recorded.running,
         )

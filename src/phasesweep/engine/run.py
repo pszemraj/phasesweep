@@ -21,7 +21,6 @@ import phasesweep.engine.locking as locking_ops
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.resume as resume_ops
-import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep._metadata import __version__
 from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
@@ -30,7 +29,7 @@ from phasesweep.config.models import (
     experiment_contract_lines,
     experiment_warnings,
 )
-from phasesweep.config.search import phase_draws, sampler_capability_line, sampler_warnings
+from phasesweep.config.search import sampler_capability_line, sampler_warnings
 from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
@@ -38,7 +37,7 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
-from phasesweep.engine.preview import _preview_phase
+from phasesweep.engine.preview import RecordedPhase, _preview_ledger, _preview_phase
 from phasesweep.engine.publication import _published_winner_path_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
@@ -83,59 +82,6 @@ def _preflight_missing_reached_phase_environments(
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
             _trainer_environment(experiment, phase.name)
-
-
-def _read_recorded_phases_for_preview(
-    experiment: Experiment,
-) -> dict[str, ledger_ops.RecordedPhase | None]:
-    """Read what every phase's study already holds, for a dry run to preview from.
-
-    The read goes through the write-nothing door ``status`` uses, so it neither
-    creates a study nor constructs file-backed storage. A missing ledger or
-    study counts zero attempts. A ledger that cannot be inspected leaves every
-    phase unread, so the preview falls back to a fresh study and says so.
-
-    :param Experiment experiment: Parsed experiment being previewed.
-    :raises ArtifactRootConflictError: The tree is bound to a different owner.
-    :raises StudySchemaMismatchError: A ledger study uses an unsupported schema.
-    :return dict[str, ledger_ops.RecordedPhase | None]: One entry per phase, by
-        phase name; ``None`` for a phase whose trials could not be read.
-    """
-    try:
-        ledger = ledger_ops.validate_ledger(experiment)
-    except StudyStorageUnavailableError as exc:
-        log.warning("DRY RUN warning: the ledger could not be inspected: %s", exc)
-        return {phase.name: None for phase in experiment.phases}
-    return ledger_ops.read_recorded_phases(ledger)
-
-
-def _preview_fixed_configuration_targets(
-    experiment: Experiment,
-    recorded: Mapping[str, ledger_ops.RecordedPhase | None],
-    *,
-    from_phase: str | None,
-) -> None:
-    """Refuse in a dry run a fixed configuration's target that a launch would refuse.
-
-    Only a reached fixed configuration asking for more than one trial depends
-    on the recorded attempts. A phase whose trials could not be read is
-    skipped: the preview cannot tell, and a launch refuses an unreadable ledger
-    on its own.
-
-    :param Experiment experiment: Parsed experiment being previewed.
-    :param Mapping[str, ledger_ops.RecordedPhase | None] recorded: What the ledger
-        holds for each phase, from :func:`_read_recorded_phases_for_preview`.
-    :param str | None from_phase: Optional first phase a launch would execute.
-    :raises TrialTargetRefusedError: A reached fixed configuration asks for
-        more attempts than it may retry given the trials recorded so far.
-    """
-    for _index, phase in experiment.phases_from(from_phase):
-        counts = recorded.get(phase.name)
-        if phase_draws(phase) or phase.n_trials <= 1 or counts is None:
-            continue
-        study_policy_ops._validate_fixed_configuration_target(
-            phase, finished=counts.finished, completed=counts.completed
-        )
 
 
 @dataclass(frozen=True)
@@ -263,7 +209,10 @@ def run_experiment(
         dry_run: If ``True``, log the trials each phase would launch given the
             attempts the ledger already records, and render one example trial
             command per phase, but launch no subprocesses; no summary is
-            written and the ledger is only read.
+            written and the ledger is only read. It applies the launch's claim
+            and preflight refusals over the recorded studies, except those
+            that need a RUNNING attempt recovered first, the trainer
+            environment, the stored fingerprints, or the trial evidence.
         terminal_callback: Optional synchronous callback invoked with the
             structured terminal report while the experiment lock is still held.
         publication_hook: Optional required precommit/postcommit sidecar used by
@@ -274,7 +223,9 @@ def run_experiment(
 
     Returns:
         Mapping from phase name (in declaration order) to that phase's
-        :class:`Winner`. For dry runs the winners are placeholders.
+        :class:`Winner`. For dry runs a phase that would replay its recorded
+        result returns that result's winner, and every other phase returns a
+        placeholder.
 
     Raises:
         NoFeasibleTrialError: A phase exhausted ``max_consecutive_failures``
@@ -728,16 +679,19 @@ def _run_experiment_inner(
     Raises:
         TimeoutError: The whole-run wallclock deadline expired before a phase
             could start.
-        PublicationAccessError: A dry run resumes over a recorded publication
-            this user cannot read.
-        PublicationIntegrityError: A dry run resumes over a recorded publication
+        PublicationAccessError: A dry run reads a recorded publication this
+            user cannot read.
+        PublicationIntegrityError: A dry run reads a recorded publication
             that is unreadable, malformed, or fails validation.
+        PhaseSweepError: A dry run found a refusal a launch makes over the
+            recorded studies, as :func:`phasesweep.engine.preview._preview_ledger`
+            documents.
 
     """
     dry_run = ledger is None
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
-    recorded: dict[str, ledger_ops.RecordedPhase | None] = {}
+    recorded: dict[str, RecordedPhase | None] = {}
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
@@ -753,17 +707,7 @@ def _run_experiment_inner(
             log.info("DRY RUN %s", sampler_capability_line(previewed))
             for warning in sampler_warnings(previewed):
                 log.warning("DRY RUN warning: %s", warning)
-        recorded = _read_recorded_phases_for_preview(experiment)
-        _preview_fixed_configuration_targets(experiment, recorded, from_phase=from_phase)
-        resume_ops._preview_recorded_refusals(
-            experiment,
-            {
-                name: record.study
-                for name, record in recorded.items()
-                if record is not None and record.study is not None and not record.running
-            },
-            from_phase=from_phase,
-        )
+        recorded = _preview_ledger(experiment, from_phase=from_phase)
 
     # Only a dry run resumes without preloaded winners; it resolves the
     # publication once for every phase it skips.

@@ -19,9 +19,9 @@ module's handles, in one fixed order.
    claims the ledger: it reads it only through :func:`validate_ledger` and
    :func:`read_phase_trials`. ``status``, ``show-winners``, live MCP reads,
    and ``recover-run`` inspection hold no lock, which is why everything they
-   reach writes nothing. A dry run is the same kind of read: it counts the
-   attempts a ledger already holds and applies a launch's checks to the
-   read-only studies (:func:`read_recorded_phases`), and renders its example
+   reach writes nothing. A dry run is the same kind of read: it reads every
+   phase's study from one capture (:func:`read_phase_studies`), applies a
+   launch's checks to those read-only studies, and renders its example
    command on an in-memory study (:func:`open_preview_study`).
 2. :func:`validate_ledger` checks the artifact-root binding, then scans the
    ledger's format, writing nothing and constructing no file-backed storage.
@@ -107,23 +107,21 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
-    TERMINAL_TRIAL_STATES,
 )
 from phasesweep.runtime.files import fsync_directory, journal_file_path
 
 __all__ = [
     "ClaimedLedger",
     "PhaseTrials",
-    "RecordedPhase",
     "ValidatedLedger",
     "claim_ledger",
     "open_existing_study",
     "open_phase_study",
     "open_preview_study",
     "open_registry_study",
+    "read_phase_studies",
     "read_phase_study",
     "read_phase_trials",
-    "read_recorded_phases",
     "read_trial_stats",
     "repair_incomplete_journal_record",
     "resolved_ledger_path",
@@ -1100,67 +1098,6 @@ def read_trial_stats(
 
 
 @dataclass(frozen=True, slots=True)
-class RecordedPhase:
-    """What a ledger already holds for one phase, as a launch would count it."""
-
-    #: Terminal attempts, including each RUNNING one a launch recovers as failed first.
-    finished: int
-    #: How many of those are COMPLETE.
-    completed: int
-    #: How many attempts are RUNNING, which a launch recovers before it checks anything.
-    running: int
-    #: The phase's study as a read-only snapshot, or ``None`` when it holds no trials.
-    study: optuna.Study | None
-
-
-def read_recorded_phases(ledger: ValidatedLedger) -> dict[str, RecordedPhase | None]:
-    """Read every phase's recorded attempts from a validated ledger, writing nothing.
-
-    The counts are :func:`read_trial_stats` reduced to the numbers a launch's
-    target rules use, and a phase with trials also carries its study from
-    :func:`read_phase_study`, so a caller can apply the launch's own checks
-    to it. A missing ledger or study counts zero attempts. In-memory storage
-    keeps nothing between invocations, so every phase counts zero.
-
-    :param ValidatedLedger ledger: Handle from :func:`validate_ledger`.
-    :return dict[str, RecordedPhase | None]: One entry per configured phase, by
-        phase name; ``None`` for a phase whose trials could not be read.
-    :raises StudySchemaMismatchError: A phase's study is populated under an
-        unsupported schema.
-    """
-    if ledger.backend != "journal":
-        return {
-            phase.name: RecordedPhase(finished=0, completed=0, running=0, study=None)
-            for phase in ledger.experiment.phases
-        }
-    recorded: dict[str, RecordedPhase | None] = {}
-    for name, stats in read_trial_stats(ledger, {}).items():
-        if not stats.available:
-            recorded[name] = None
-            continue
-        running = stats.counts.get("RUNNING", 0)
-        finished = sum(stats.counts.get(state, 0) for state in TERMINAL_TRIAL_STATES) + running
-        study = None
-        if finished:
-            try:
-                study = read_phase_study(ledger, name)
-            except StudyStorageUnavailableError:
-                study = None
-            if study is None:
-                # The counts came from another capture of the journal, so a study
-                # that cannot be read now is unreadable, not absent.
-                recorded[name] = None
-                continue
-        recorded[name] = RecordedPhase(
-            finished=finished,
-            completed=stats.counts.get("COMPLETE", 0),
-            running=running,
-            study=study,
-        )
-    return recorded
-
-
-@dataclass(frozen=True, slots=True)
 class PhaseTrials:
     """One phase study's trials and its confirmed cleanup recoveries, from one snapshot.
 
@@ -1217,6 +1154,58 @@ def read_phase_study(ledger: ValidatedLedger, phase: Phase | str) -> optuna.Stud
         [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
     )
     return study
+
+
+def read_phase_studies(ledger: ValidatedLedger) -> dict[str, optuna.Study | None]:
+    """Read every configured phase's study from one capture of the ledger, writing nothing.
+
+    The journal is captured once and every study is loaded from that one
+    replay, so the studies describe a single moment however many phases
+    there are, and a caller that counts trials and applies a launch's checks
+    to them cannot see two different journals. Each study is the read-only
+    snapshot :func:`read_phase_study` returns. A study that exists but holds
+    no trials is returned too: its accepted target still binds a launch.
+
+    :param ValidatedLedger ledger: Handle from :func:`validate_ledger` or :func:`claim_ledger`.
+    :return dict[str, optuna.Study | None]: One entry per configured phase, by
+        phase name; ``None`` for a phase with no such study, or one this
+        handle cannot reach.
+    :raises StudyStorageUnavailableError: The handle's format scan did not
+        complete, or the journal could not be completely read or replayed.
+    :raises StudySchemaMismatchError: A study is populated under an unsupported schema.
+    """
+    failure = ledger.format_scan_failure
+    if failure is not None:
+        raise type(failure).rewrap(failure, str(failure)) from failure
+    phases = ledger.experiment.phases
+    if ledger.backend == "memory":
+        return {phase.name: read_phase_study(ledger, phase) for phase in phases}
+    assert ledger.storage_url is not None
+    snapshot = _journal_snapshot_storage(
+        ledger.storage_url, f"experiment {ledger.experiment_name!r} trial data"
+    )
+    studies: dict[str, optuna.Study | None] = {}
+    for phase in phases:
+        study_name = _phase_study_name(ledger.experiment, phase)
+        if snapshot is None:
+            studies[phase.name] = None
+            continue
+        try:
+            study = optuna.load_study(study_name=study_name, storage=snapshot)
+        except KeyError:
+            studies[phase.name] = None
+            continue
+        except Exception as exc:
+            raise StudyStorageUnavailableError(
+                f"Journal storage {ledger.storage_url} could not be replayed while reading "
+                f"study {study_name!r}."
+            ) from exc
+        trials = study.get_trials(deepcopy=False)
+        _validate_storage_versions(
+            [(study.study_name, study.user_attrs.get(STUDY_SCHEMA_ATTR), bool(trials))]
+        )
+        studies[phase.name] = study
+    return studies
 
 
 def read_phase_trials(ledger: ValidatedLedger, phase: Phase | str) -> PhaseTrials | None:

@@ -386,7 +386,10 @@ def report_objective_cmd(
     "--dry-run",
     is_flag=True,
     show_default=True,
-    help="Print what a run would launch and one example command per phase, without launching trials.",
+    help=(
+        "Print what a run would launch and one example command per phase, and refuse most of "
+        "what a run would refuse over the recorded trials, without launching trials."
+    ),
 )
 @click.option(
     "-v",
@@ -401,8 +404,9 @@ def run(config_path: Path, from_phase: str | None, dry_run: bool, verbose: bool)
     :param Path config_path: Path to the experiment YAML file.
     :param str | None from_phase: Optional phase name to start from after loading
         earlier winners from disk.
-    :param bool dry_run: Preview the trials each phase would launch and render example
-        commands, without launching subprocesses.
+    :param bool dry_run: Preview the trials each phase would launch, refuse most of what a
+        run would refuse over the recorded trials, and render example commands, without
+        launching subprocesses.
     :param bool verbose: Enable debug logging for phasesweep and INFO logging for Optuna.
     :raises ConfigError: The config file cannot be parsed or fails model validation.
     :raises SystemExit: With code 2 when ``from_phase`` names no configured phase; a

@@ -477,7 +477,9 @@ def _judge_recorded_phase(
     """Apply the trial-target, partial-decision and abort rules to a phase's recorded study.
 
     The one place these rules live, shared by the live resume and the dry-run
-    preview. It only reads the study.
+    preview. It never writes the study. A replayed winner is evidence-verified
+    only with ``verify_evidence``, which reads trial directories, may query W&B
+    or MLflow, and records the environment-drift warning once per process.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being judged.
@@ -485,7 +487,8 @@ def _judge_recorded_phase(
     :param optuna.Study study: The phase's study, live or a read-only snapshot.
     :param _PhasePolicyState policy_state: The study's replayed failure-policy state.
     :param str phase_fingerprint: Fingerprint carried on a replayed winner.
-    :param bool verify_evidence: Whether a replayed winner's evidence is re-proved.
+    :param bool verify_evidence: Whether a replayed winner's evidence is re-proved;
+        see :func:`_select_phase_winner` for everything it covers.
     :raises TrialTargetRefusedError: ``phase.n_trials`` is below the accepted
         target, or a fixed configuration asks for more attempts than it may retry.
     :raises NoFeasibleTrialError: The phase aborted, or its streak meets the
@@ -497,6 +500,8 @@ def _judge_recorded_phase(
         feasible trial.
     :raises StudySchemaMismatchError: Durable phase state is malformed or
         contradicts the study's trials.
+    :raises TrialEvidenceMissingError: A replayed winner's evidence is missing
+        or altered; only when ``verify_evidence`` is set.
     :return _PhaseResume | Winner: The validated state, or the winner an
         accepted partial-timeout decision replays.
     """
@@ -1713,7 +1718,8 @@ def _replay_met_target(
     :param dict[str, Winner] inherited_winners: Winners from earlier phases in the chain.
     :param optuna.Study study: The phase's study, live or a read-only snapshot.
     :param _PhaseResume resume: The phase's validated durable state.
-    :param bool verify_evidence: Whether the winner's evidence is re-proved.
+    :param bool verify_evidence: Whether the winner's evidence is re-proved; see
+        :func:`_select_phase_winner` for everything it covers.
     :raises StudySchemaMismatchError: The study accepted an abort recovery target
         but has no remaining trial slots.
     :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
@@ -1765,9 +1771,11 @@ def _select_phase_winner(
     :param optuna.Study study: Study whose terminal trials supply the winner.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
-    :param bool verify_evidence: Whether to re-prove the selected trial's evidence. A
-        dry run turns this off, because the proof reads the trial directories and may
-        query W&B or MLflow.
+    :param bool verify_evidence: Whether to re-prove the selected trial and warn about
+        environment drift. The proof reads the trial directories and may query W&B or
+        MLflow, and the drift warning consumes a process-global warn-once key
+        (``_ENVIRONMENT_DRIFT_WARNED``), so a dry run turns both off and leaves them
+        to the launch.
     :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
         bounds, or with ``repeats`` no group is complete.
     :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
