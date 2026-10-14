@@ -18,7 +18,7 @@ import phasesweep.mcp.run_control as mcp_run_control
 import phasesweep.mcp.runner as mcp_runner
 import phasesweep.mcp.runs as mcp_runs
 import phasesweep.runtime.reaper as reaper
-from phasesweep.errors import ForeignPidNamespaceError, OperatorAction
+from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import CatalogError, ExperimentBusyError, RunNamespaceMismatchError
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
@@ -26,9 +26,14 @@ from phasesweep.mcp.registry import Registry, require_linux_mcp_host
 from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN
 from phasesweep.mcp.tools import PhaseSweepMCP
-from phasesweep.runtime.process import _trial_process_identity, _write_process_identity
+from phasesweep.runtime import process as runtime_process
+from phasesweep.runtime.process import (
+    _trial_process_identity,
+    _write_process_identity,
+    run_supervised,
+)
 from phasesweep.runtime.reaper import (
-    INITIAL_PID_NAMESPACE,
+    INITIAL_PID_NAMESPACE_LINK,
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
@@ -36,6 +41,7 @@ from phasesweep.runtime.reaper import (
     foreign_pid_namespace_reason,
     pid_namespace_verdict,
     read_pid_namespace,
+    read_proc_starttime,
     read_stale_process_identity,
 )
 from phasesweep.runtime.time import utc_now_iso
@@ -51,25 +57,40 @@ from tests.mcp_helpers import (
 )
 from tests.recovery_helpers import write_trial_identity
 
-RECORDED = "pid:[4026539001]"
-OTHER = "pid:[4026539002]"
-NESTED_READER = "pid:[4026539333]"
+RECORDED = "pid:[4026539001]@100"
+OTHER = "pid:[4026539002]@100"
+NESTED_READER = "pid:[4026539333]@100"
+#: The reader in the host's initial PID namespace, whose PID 1 started at tick 5.
+INITIAL_READER = f"{INITIAL_PID_NAMESPACE_LINK}@5"
 
 
-def _write_process(proc: Path, pid: int, *, nspid: list[int] | None, namespace: str | None) -> None:
-    """Add one fake ``/proc/<pid>`` entry with an optional ``NSpid`` line and PID namespace link."""
+def _link(namespace: str) -> str:
+    """Return the ``ns/pid`` link text a recorded namespace names."""
+    return namespace.partition("@")[0]
+
+
+def _write_process(
+    proc: Path,
+    pid: int,
+    *,
+    nspid: list[int] | None,
+    namespace: str | None,
+    starttime: int = 5,
+) -> None:
+    """Add one fake ``/proc/<pid>`` entry with a stat record, an optional ``NSpid`` line, and an optional PID namespace link."""
     entry = proc / str(pid)
     (entry / "ns").mkdir(parents=True)
     lines = ["Name:\tfake", "State:\tS (sleeping)"]
     if nspid is not None:
         lines.append("NSpid:\t" + "\t".join(str(value) for value in nspid))
     (entry / "status").write_text("\n".join(lines) + "\n")
+    (entry / "stat").write_text(f"{pid} (fake) S 0 {pid} {pid} " + "0 " * 15 + f"{starttime}\n")
     if namespace is not None:
-        (entry / "ns" / "pid").symlink_to(namespace)
+        (entry / "ns" / "pid").symlink_to(_link(namespace))
 
 
 def _fake_proc(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, reader: str | None = INITIAL_PID_NAMESPACE
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, reader: str | None = INITIAL_READER
 ) -> Path:
     """Replace ``/proc`` with a readable init entry, and the reader's namespace with ``reader``."""
     proc = tmp_path / "proc"
@@ -79,13 +100,18 @@ def _fake_proc(
     return proc
 
 
-def _identity(*, pid_namespace: str | None, boot_id: str | None = "boot") -> StaleProcessIdentity:
+def _identity(
+    *,
+    pid_namespace: str,
+    boot_id: str | None = "boot",
+    proc_starttime: int | None = 111,
+) -> StaleProcessIdentity:
     return StaleProcessIdentity(
         schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
         attempt_id="ns-attempt",
         pid=4242,
         pgid=4242,
-        proc_starttime=111,
+        proc_starttime=proc_starttime,
         boot_id=boot_id,
         pid_namespace=pid_namespace,
     )
@@ -106,7 +132,7 @@ def test_read_pid_namespace_names_this_process_namespace() -> None:
     if namespace is None:
         pytest.skip("/proc is not this process's own procfs")
 
-    assert namespace == os.readlink("/proc/self/ns/pid")
+    assert namespace == f"{os.readlink('/proc/self/ns/pid')}@{read_proc_starttime(1)}"
     assert reaper.is_pid_namespace(namespace)
 
 
@@ -115,6 +141,7 @@ def test_read_pid_namespace_refuses_procfs_of_another_namespace(
 ) -> None:
     """A procfs whose ``self`` is not this PID cannot answer for this namespace's numbers."""
     proc = tmp_path / "proc"
+    _write_process(proc, 1, nspid=None, namespace=None, starttime=100)
     _write_process(proc, os.getpid(), nspid=None, namespace=RECORDED)
     monkeypatch.setattr(reaper, "_PROC", proc)
 
@@ -126,10 +153,23 @@ def test_read_pid_namespace_refuses_procfs_of_another_namespace(
     assert read_pid_namespace() == RECORDED
 
 
+def test_read_pid_namespace_needs_its_pid_1_start_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without its PID 1, a namespace's inode could be one an ended namespace used."""
+    proc = tmp_path / "proc"
+    _write_process(proc, os.getpid(), nspid=None, namespace=RECORDED)
+    (proc / "self").symlink_to(str(os.getpid()))
+    monkeypatch.setattr(reaper, "_PROC", proc)
+
+    assert read_pid_namespace() is None
+
+
 def test_read_pid_namespace_rejects_a_malformed_link(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     proc = tmp_path / "proc"
+    _write_process(proc, 1, nspid=None, namespace=None)
     _write_process(proc, os.getpid(), nspid=None, namespace="net:[4026539001]")
     (proc / "self").symlink_to(str(os.getpid()))
     monkeypatch.setattr(reaper, "_PROC", proc)
@@ -149,12 +189,27 @@ def test_verdict_same_and_foreign(monkeypatch: pytest.MonkeyPatch) -> None:
     assert pid_namespace_verdict(RECORDED) == "foreign"
 
 
+def test_a_reused_inode_with_another_pid_1_start_time_is_foreign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kernel reuses an ended namespace's inode within seconds, so the inode alone is not the namespace."""
+    reused = f"{_link(RECORDED)}@200"
+    monkeypatch.setattr(reaper, "read_pid_namespace", lambda: reused)
+    monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
+    _forbid_signals(monkeypatch)
+
+    assert pid_namespace_verdict(reused) == "same"
+    assert pid_namespace_verdict(RECORDED) == "foreign"
+    with pytest.raises(ForeignPidNamespaceError, match="Nothing was signalled"):
+        cleanup_stale_trial_process(_identity(pid_namespace=RECORDED))
+
+
 def test_verdict_gone_only_from_initial_namespace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     proc = _fake_proc(tmp_path, monkeypatch)
     _write_process(proc, 50, nspid=[50, 1], namespace=OTHER)
-    _write_process(proc, 51, nspid=[51], namespace=INITIAL_PID_NAMESPACE)
+    _write_process(proc, 51, nspid=[51], namespace=INITIAL_PID_NAMESPACE_LINK)
 
     assert pid_namespace_verdict(RECORDED) == "gone"
     assert pid_namespace_verdict(OTHER) == "foreign"
@@ -235,12 +290,43 @@ def test_trial_process_identity_records_the_launching_namespace(tmp_path: Path) 
     if namespace is None:
         pytest.skip("/proc is not this process's own procfs")
 
-    identity = _trial_process_identity(attempt_id="ns-attempt", pid=os.getpid(), pgid=os.getpid())
+    identity = _trial_process_identity(
+        attempt_id="ns-attempt", pid=os.getpid(), pgid=os.getpid(), pid_namespace=namespace
+    )
     _write_process_identity(tmp_path / PROCESS_IDENTITY_FILE, identity)
 
     assert identity.pid_namespace == namespace
     assert json.loads((tmp_path / PROCESS_IDENTITY_FILE).read_text())["pid_namespace"] == namespace
     assert read_stale_process_identity(tmp_path, expected_attempt_id="ns-attempt") == identity
+
+
+def test_trial_launch_refuses_an_unreadable_pid_namespace_before_anything_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runtime_process, "read_pid_namespace", lambda: None)
+    monkeypatch.setattr(
+        runtime_process,
+        "_spawn_blocked_supervisor",
+        lambda **_kwargs: pytest.fail("no trial may start without a recorded namespace"),
+    )
+
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+
+    with (tmp_path / "out.log").open("w") as out, pytest.raises(PhaseSweepError) as caught:
+        run_supervised(
+            "true",
+            env={},
+            stdout=out,
+            stderr=out,
+            timeout=None,
+            trial_dir=trial_dir,
+            attempt_id="ns-attempt",
+        )
+
+    assert caught.value.action is OperatorAction.FIX_CONFIG
+    assert "PID namespace" in str(caught.value)
+    assert list(trial_dir.iterdir()) == []
 
 
 def test_read_stale_process_identity_requires_pid_namespace(tmp_path: Path) -> None:
@@ -259,15 +345,11 @@ def test_read_stale_process_identity_requires_pid_namespace(tmp_path: Path) -> N
     with pytest.raises(ValueError, match="partial"):
         read_stale_process_identity(tmp_path, expected_attempt_id="ns-attempt")
 
-    record["pid_namespace"] = "pid:[0]"
-    path.write_text(json.dumps(record))
-    with pytest.raises(ValueError, match="pid_namespace"):
-        read_stale_process_identity(tmp_path, expected_attempt_id="ns-attempt")
-
-    record["pid_namespace"] = None
-    path.write_text(json.dumps(record))
-    unrecorded = read_stale_process_identity(tmp_path, expected_attempt_id="ns-attempt")
-    assert unrecorded.pid_namespace is None
+    for invalid in (None, _link(RECORDED), "pid:[0]@100", f"{_link(RECORDED)}@"):
+        record["pid_namespace"] = invalid
+        path.write_text(json.dumps(record))
+        with pytest.raises(ValueError, match="pid_namespace"):
+            read_stale_process_identity(tmp_path, expected_attempt_id="ns-attempt")
 
 
 def test_cleanup_stale_trial_process_refuses_foreign_namespace_without_signalling(
@@ -315,16 +397,25 @@ def test_cleanup_stale_trial_process_signals_only_within_the_same_namespace(
     assert signalled == [(4242, 111)]
 
 
-def test_cleanup_stale_trial_process_refuses_an_identity_without_a_namespace(
+def test_cleanup_stale_trial_process_refuses_a_foreign_identity_before_checking_its_birth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(reaper, "read_boot_id", lambda: "boot")
+    """An identity without boot id or start time is refused as foreign, never with kill advice for its numbers."""
+    monkeypatch.setattr(reaper, "read_boot_id", lambda: None)
+    monkeypatch.setattr(reaper, "read_pid_namespace", lambda: NESTED_READER)
     _forbid_signals(monkeypatch)
 
-    assert cleanup_stale_trial_process(_identity(pid_namespace=None)) is False
+    with pytest.raises(ForeignPidNamespaceError, match="Nothing was signalled"):
+        cleanup_stale_trial_process(
+            _identity(pid_namespace=RECORDED, boot_id=None, proc_starttime=None)
+        )
 
 
-_HOLD_NAMESPACE = "readlink /proc/self/ns/pid; exec sleep 120"
+#: Prints the namespace's link, its PID 1's start time, and the holder's own
+#: PID there, then leads a session of its own, as runners and trials do.
+_HOLD_NAMESPACE = (
+    'readlink /proc/self/ns/pid; cut -d" " -f22 /proc/1/stat; echo $$; exec setsid sleep 120'
+)
 
 #: Ways to start a process in a fresh PID namespace with its own procfs. The first
 #: needs unprivileged user namespaces; the second works where only bubblewrap may
@@ -340,8 +431,8 @@ def _blocker_note() -> str:
     return f"host process {reaper._pid_namespace_blocker('pid:[1]')}"
 
 
-def _start_namespace_holder() -> tuple[subprocess.Popen[str], str]:
-    """Start a process in a new PID namespace and return it with that namespace's identity."""
+def _start_namespace_holder() -> tuple[subprocess.Popen[str], str, int]:
+    """Start a process in a new PID namespace; return it, that namespace, and its PID there."""
     refusals: list[str] = []
     for launcher in _NAMESPACE_LAUNCHERS:
         executable = shutil.which(launcher[0])
@@ -355,9 +446,10 @@ def _start_namespace_holder() -> tuple[subprocess.Popen[str], str]:
         )
         assert child.stdout is not None
         assert child.stderr is not None
-        namespace = child.stdout.readline().strip()
+        link = child.stdout.readline().strip()
+        namespace = f"{link}@{child.stdout.readline().strip()}"
         if reaper.is_pid_namespace(namespace):
-            return child, namespace
+            return child, namespace, int(child.stdout.readline())
         child.kill()
         refusals.append(f"{launcher[0]}: {child.stderr.read().strip()}")
         child.wait(timeout=10)
@@ -367,11 +459,12 @@ def _start_namespace_holder() -> tuple[subprocess.Popen[str], str]:
 @pytest.mark.integration
 def test_verdict_tracks_a_real_child_pid_namespace() -> None:
     """A namespace with a live member reads foreign; once its init dies it reads gone."""
-    if read_pid_namespace() != INITIAL_PID_NAMESPACE:
+    current = read_pid_namespace()
+    if current is None or _link(current) != INITIAL_PID_NAMESPACE_LINK:
         pytest.skip("the gone verdict needs the initial PID namespace")
-    child, namespace = _start_namespace_holder()
+    child, namespace, _pid = _start_namespace_holder()
     try:
-        assert pid_namespace_verdict(read_pid_namespace()) == "same"
+        assert pid_namespace_verdict(current) == "same"
         assert pid_namespace_verdict(namespace) == "foreign"
 
         child.kill()
@@ -379,7 +472,7 @@ def test_verdict_tracks_a_real_child_pid_namespace() -> None:
         # Inode 1 is never a namespace. If even that is unprovable, an unrelated
         # process (a browser sandbox is not dumpable) hides its namespace from
         # this user, and the scan correctly refuses to call anything empty.
-        if pid_namespace_verdict("pid:[1]") != "gone":
+        if pid_namespace_verdict("pid:[1]@0") != "gone":
             pytest.skip(f"this host cannot prove any namespace empty: {_blocker_note()}")
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and pid_namespace_verdict(namespace) != "gone":

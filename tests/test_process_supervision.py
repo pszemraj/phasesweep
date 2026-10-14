@@ -35,7 +35,6 @@ from phasesweep.runtime.process import (
     run_supervised,
 )
 from phasesweep.runtime.reaper import (
-    INITIAL_PID_NAMESPACE,
     PROCESS_IDENTITY_FILE,
     PROCESS_IDENTITY_SCHEMA_VERSION,
     StaleProcessIdentity,
@@ -1924,7 +1923,7 @@ def test_reaper_raises_when_cleanup_uncertain(
             pgid=99999,
             proc_starttime=12345,
             boot_id="test-boot",
-            pid_namespace=INITIAL_PID_NAMESPACE,
+            pid_namespace="pid:[4026539001]@100",
         )
 
     monkeypatch.setattr("phasesweep.engine.attempts.read_stale_process_identity", fake_identity)

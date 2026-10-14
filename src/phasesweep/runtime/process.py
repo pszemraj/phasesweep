@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
 
-from phasesweep.errors import UnsafeProcessCleanupError
+from phasesweep.errors import OperatorAction, PhaseSweepError, UnsafeProcessCleanupError
 from phasesweep.runtime import supervisor as _supervisor
 from phasesweep.runtime.files import atomic_write_text
 from phasesweep.runtime.json import strict_json_loads
@@ -291,6 +291,7 @@ def _trial_process_identity(
     attempt_id: str,
     pid: int,
     pgid: int,
+    pid_namespace: str,
 ) -> StaleProcessIdentity:
     """Build the identity persisted before a blocked supervisor may exec the trainer.
 
@@ -300,13 +301,14 @@ def _trial_process_identity(
             reader cannot mistake it for a different trial's process.
         pid: PID of the just-launched supervisor process.
         pgid: Process-group ID the supervisor was registered under.
+        pid_namespace: PID namespace ``pid`` and ``pgid`` are numbered in,
+            from :func:`read_pid_namespace` before the launch.
 
     Returns:
         A :class:`StaleProcessIdentity` combining the given fields with the
         current schema version, this process's ``/proc`` start time (``None``
-        off-Linux or if unreadable), the current boot id (``None`` when
-        unavailable), and the PID namespace ``pid`` is numbered in (``None``
-        when unreadable).
+        off-Linux or if unreadable), and the current boot id (``None`` when
+        unavailable).
 
     """
     return StaleProcessIdentity(
@@ -316,7 +318,7 @@ def _trial_process_identity(
         pgid=pgid,
         proc_starttime=read_proc_starttime(pid),
         boot_id=read_boot_id(),
-        pid_namespace=read_pid_namespace(),
+        pid_namespace=pid_namespace,
     )
 
 
@@ -853,6 +855,8 @@ def run_supervised(
         confirm the group is gone).
 
     Raises:
+        PhaseSweepError: This process's PID namespace is unreadable, so nothing
+            was recorded or launched.
         RuntimeError: The supervisor never signalled readiness, or signalled an
             unexpected byte, so no process group was ever created.
         OSError: The supervisor process or its pipes could not be created, or
@@ -896,6 +900,18 @@ def run_supervised(
     ack_write: int | None = None
     status_read: int | None = None
     identity_path = trial_dir / PROCESS_IDENTITY_FILE
+    # The trial inherits this namespace, so it is read before anything is
+    # recorded or spawned: without it a later cleanup could not tell the
+    # trial's PID from another namespace's, so the launch is refused with
+    # nothing to undo.
+    pid_namespace = read_pid_namespace()
+    if pid_namespace is None:
+        raise PhaseSweepError(
+            "cannot read this process's PID namespace: /proc must be the procfs of its own "
+            "PID namespace, with that namespace's PID 1 readable. Refused to launch a trial "
+            "whose process identity could not be tied to it.",
+            action=OperatorAction.FIX_CONFIG,
+        )
 
     try:
         with defer_shutdown_signals(), _launch_lock:
@@ -919,6 +935,7 @@ def run_supervised(
                 attempt_id=attempt_id,
                 pid=pgid,
                 pgid=pgid,
+                pid_namespace=pid_namespace,
             )
             _write_process_identity(identity_path, identity)
             if deadline is not None and time.monotonic() >= deadline:

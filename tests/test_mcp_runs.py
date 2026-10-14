@@ -830,8 +830,10 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
         ("boot_id", None),
         ("pid_namespace", ""),
         ("pid_namespace", "malformed"),
-        ("pid_namespace", "net:[4026531840]"),
-        ("pid_namespace", "pid:[0]"),
+        ("pid_namespace", "net:[4026531840]@1"),
+        ("pid_namespace", "pid:[0]@1"),
+        ("pid_namespace", "pid:[4026531836]"),
+        ("pid_namespace", "pid:[4026531836]@"),
         ("pid_namespace", 4026531836),
         ("pid_namespace", None),
         ("visible_params_at_launch", "some"),
@@ -862,7 +864,7 @@ def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: obj
         ("pid", os.getpid()),
         ("pgid", os.getpid()),
         ("boot_id", "11111111-1111-1111-1111-111111111111"),
-        ("pid_namespace", "pid:[4026531836]"),
+        ("pid_namespace", "pid:[4026531836]@1"),
     ],
 )
 def test_launching_handle_cannot_have_process_identity(
@@ -1250,6 +1252,15 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
                 "run_id": "exp-1",
                 "config_sha256": "a" * 64,
                 "cleanup_confirmed": False,
+                "pid_namespace": "pid:[4026539001]",
+            },
+            id="pid_namespace_without_pid_1_start_time",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
                 "pid_namespace": 4026531836,
             },
             id="pid_namespace_integer",
@@ -1319,7 +1330,7 @@ def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) ->
 
 def test_pid_namespace_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    namespace = "pid:[4026539001]"
+    namespace = "pid:[4026539001]@100"
     handle = make_dead_run_handle(run_id="exp-1", pid_namespace=namespace)
 
     store.create(handle)
@@ -1343,7 +1354,7 @@ def test_cleanup_marker_cannot_move_a_spawned_identity_to_another_namespace(
     store.mark_cleanup_uncertain(handle)
     marker_path = store.cleanup_uncertain_path(handle.run_id)
     marker = json.loads(marker_path.read_text())
-    marker["pid_namespace"] = "pid:[4026539001]"
+    marker["pid_namespace"] = "pid:[4026539001]@100"
     private_atomic_write_text(marker_path, json.dumps(marker))
 
     assert not store.cleanup_uncertain(handle)

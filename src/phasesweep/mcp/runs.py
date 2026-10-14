@@ -265,9 +265,9 @@ class RunHandle:
     # "launching" placeholder: a spawned handle is never persisted without it
     # (see mcp/runner.py _persist_spawned_handle and mcp/run_control.py _spawn).
     boot_id: str | None = None
-    # PID namespace that pid/pgid are numbered in. A reader in another
-    # namespace cannot probe them. None only on the pre-spawn "launching"
-    # placeholder, like boot_id.
+    # PID namespace that pid/pgid are numbered in, as its inode and the start
+    # time of its PID 1. A reader in another namespace cannot probe them. None
+    # only on the pre-spawn "launching" placeholder, like boot_id.
     pid_namespace: str | None = None
 
 
@@ -1679,10 +1679,10 @@ def _valid_config_dir(value: object) -> TypeGuard[str]:
 
 
 def _valid_optional_pid_namespace(value: object) -> TypeGuard[str | None]:
-    """Return whether ``value`` is ``None`` or the link text of a PID namespace.
+    """Return whether ``value`` is ``None`` or a PID namespace as phasesweep records it.
 
     :param object value: Value to validate.
-    :return bool: Whether the value is ``None`` or ``pid:[<inode>]``.
+    :return bool: Whether the value is ``None`` or ``pid:[<inode>]@<PID 1 start time>``.
     """
     return value is None or is_pid_namespace(value)
 

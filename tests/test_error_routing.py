@@ -1219,10 +1219,12 @@ def _recover_run_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.Monk
     """Recover a run whose runner was recorded in a PID namespace this process cannot observe."""
     state_dir = tmp_path / "mcp-state"
     store = RunStore(state_dir)
-    handle = make_run_handle(run_id="wrap-recover", pid_namespace="pid:[4026539001]")
+    handle = make_run_handle(run_id="wrap-recover", pid_namespace="pid:[4026539001]@100")
     store.create(handle)
     store.mark_cleanup_uncertain(handle)
-    monkeypatch.setattr("phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]")
+    monkeypatch.setattr(
+        "phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]@100"
+    )
     return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 
 
@@ -1387,7 +1389,9 @@ def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
 def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Clean a stale trial group whose identity was recorded in another PID namespace."""
     monkeypatch.setattr("phasesweep.runtime.reaper.read_boot_id", lambda: "boot")
-    monkeypatch.setattr("phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]")
+    monkeypatch.setattr(
+        "phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]@100"
+    )
     return cleanup_stale_trial_process(
         StaleProcessIdentity(
             schema_version=PROCESS_IDENTITY_SCHEMA_VERSION,
@@ -1396,7 +1400,7 @@ def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.Monk
             pgid=4242,
             proc_starttime=111,
             boot_id="boot",
-            pid_namespace="pid:[4026539001]",
+            pid_namespace="pid:[4026539001]@100",
         )
     )
 
