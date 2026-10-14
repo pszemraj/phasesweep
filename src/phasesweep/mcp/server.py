@@ -28,6 +28,7 @@ from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import TrialStateName, WinnerSourceKind
 from phasesweep.evidence.models import _ObjectiveEvidenceFields
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
+from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger, AuditTransport
 from phasesweep.mcp.errors import CatalogError, McpToolError
 from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
@@ -1025,6 +1026,18 @@ def build_server(app: PhaseSweepMCP) -> Any:
     return mcp
 
 
+def _open_app(registry: Registry, transport: AuditTransport) -> PhaseSweepMCP:
+    """Build the tool implementation with an audit log that records its transport.
+
+    :param Registry registry: Validated catalog registry.
+    :param AuditTransport transport: How calls reach the tools: ``stdio`` when served,
+        ``cli`` for ``phasesweep mcp call``.
+    :return PhaseSweepMCP: Tool implementation over the catalog's run store and audit log.
+    """
+    audit = AuditLogger(registry.state_dir / AUDIT_LOG_NAME, transport=transport)
+    return PhaseSweepMCP(registry, RunStore(registry.state_dir), audit=audit)
+
+
 def serve(catalog: Path) -> int:
     """Load the catalog, build the run store, and serve the nine tools over stdio.
 
@@ -1054,8 +1067,7 @@ def serve(catalog: Path) -> int:
         print(f"phasesweep mcp: {exc}", file=sys.stderr)
         return 2
 
-    app = PhaseSweepMCP(registry, RunStore(registry.state_dir))
-    build_server(app).run(transport="stdio")
+    build_server(_open_app(registry, "stdio")).run(transport="stdio")
     return 0
 
 
@@ -1063,8 +1075,9 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
     """Run one tool of the served catalog in this process and print its result.
 
     The call goes through FastMCP's own ``call_tool``, so the strict input
-    schema, the redaction wrapper and the audit log run exactly as they do for a
-    connected client.
+    schema, the redaction wrapper and the audit log run as they do for a connected
+    client, except that the audit records carry ``transport: "cli"`` so they stay
+    distinguishable from a served client's.
 
     :param Path catalog: Operator-authored catalog file.
     :param str tool: Registered tool name, such as ``list_experiments``.
@@ -1105,7 +1118,7 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
 
     from mcp.server.fastmcp.exceptions import ToolError
 
-    server = build_server(PhaseSweepMCP(registry, RunStore(registry.state_dir)))
+    server = build_server(_open_app(registry, "cli"))
     try:
         # Every tool declares structured output, so a result is (unstructured, structured).
         _unstructured, structured = asyncio.run(server.call_tool(tool, arguments))

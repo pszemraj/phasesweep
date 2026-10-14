@@ -164,6 +164,17 @@ def test_mcp_call_rejects_non_object_json(tmp_path: Path, text: str) -> None:
     assert not (tmp_path / "state").exists()
 
 
+def _audit_records(tmp_path: Path) -> list[dict[str, object]]:
+    """Read the audit log of the catalog written by ``_catalog``.
+
+    :param Path tmp_path: Directory holding the catalog's ``state`` directory.
+    :return list[dict[str, object]]: One decoded record per line, oldest first.
+    """
+    return [
+        json.loads(line) for line in (tmp_path / "state" / "audit.jsonl").read_text().splitlines()
+    ]
+
+
 def test_mcp_call_audits_refused_launch(tmp_path: Path) -> None:
     """A launch the catalog forbids is refused and recorded like one from a connected client."""
     catalog = _catalog(tmp_path)
@@ -171,14 +182,39 @@ def test_mcp_call_audits_refused_launch(tmp_path: Path) -> None:
     result = _mcp_call(catalog, TOOL_LAUNCH_RUN, '{"experiment_id": "srv"}')
 
     assert result.exit_code == 1
-    records = [
-        json.loads(line) for line in (tmp_path / "state" / "audit.jsonl").read_text().splitlines()
-    ]
+    records = _audit_records(tmp_path)
     assert len(records) == 1
     assert records[0]["tool"] == TOOL_LAUNCH_RUN
     assert records[0]["outcome"] == "error"
     assert records[0]["error_type"] == "PermissionDeniedError"
     assert records[0]["args"] == {"experiment_id": "srv"}
+
+
+def test_audit_records_tell_a_cli_call_from_a_served_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mcp call`` records ``cli`` and ``local-cli``; a served call keeps ``stdio`` and ``local-stdio``."""
+    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    from phasesweep.mcp.server import serve
+
+    catalog = _catalog(tmp_path)
+
+    def run_one_launch(self: FastMCP, transport: str = "stdio") -> None:
+        """Stand in for the blocking stdio loop with one client call through the same dispatch."""
+        with pytest.raises(ToolError):
+            asyncio.run(self.call_tool(TOOL_LAUNCH_RUN, {"experiment_id": "srv"}))
+
+    monkeypatch.setattr(FastMCP, "run", run_one_launch)
+
+    assert serve(catalog) == 0
+    assert _mcp_call(catalog, TOOL_LAUNCH_RUN, '{"experiment_id": "srv"}').exit_code == 1
+
+    served, called = _audit_records(tmp_path)
+    assert (served["transport"], served["actor"]) == ("stdio", "local-stdio")
+    assert (called["transport"], called["actor"]) == ("cli", "local-cli")
+    assert served["session_id"] != called["session_id"]
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,7 @@ from typing import Any
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.resume import _accept_skipped_winner, _published_for_resume
 from phasesweep.engine.state import Winner
-from phasesweep.mcp.audit import AuditLogger
+from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger
 from phasesweep.mcp.errors import (
     ConcurrencyLimitError,
     ConfigChangedError,
@@ -176,11 +176,12 @@ class RunControl:
 
         :param Registry registry: Validated catalog registry.
         :param RunStore runs: Persistent detached-run store.
-        :param AuditLogger | None audit: Optional audit sink override; defaults to state_dir/audit.jsonl.
+        :param AuditLogger | None audit: Optional audit sink override; defaults to the
+            ``stdio`` log under ``state_dir``.
         """
         self._registry = registry
         self._runs = runs
-        self._audit = audit or AuditLogger(registry.state_dir / "audit.jsonl")
+        self._audit = audit or AuditLogger(registry.state_dir / AUDIT_LOG_NAME)
 
     def _audit_success(
         self,
