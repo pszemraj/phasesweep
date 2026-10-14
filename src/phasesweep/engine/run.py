@@ -27,7 +27,11 @@ import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep._metadata import __version__
 from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
-from phasesweep.config.models import _metric_semantics_payload, experiment_contract_lines
+from phasesweep.config.models import (
+    _metric_semantics_payload,
+    experiment_contract_lines,
+    experiment_warnings,
+)
 from phasesweep.config.search import phase_draws, sampler_capability_line, sampler_warnings
 from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import (
@@ -737,6 +741,8 @@ def _run_experiment_inner(
         # reads immediately before committing to a run.
         for line in experiment_contract_lines(experiment):
             log.info("DRY RUN %s", line)
+        for warning in experiment_warnings(experiment):
+            log.warning("DRY RUN warning: %s", warning)
         for previewed in experiment.phases:
             log.info("DRY RUN %s", sampler_capability_line(previewed))
             for warning in sampler_warnings(previewed):

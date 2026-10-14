@@ -727,6 +727,7 @@ trainer_config: map[string, any] = {}
 # yaml_file writes the complete trainer_config with the overrides applied to trainer_config.yaml; the command passes its path as {config_path}.
 # json_file writes trainer_config with the overrides applied, with dotted keys expanded into nested objects, to overrides.json; with an empty trainer_config the file holds only the overrides. The command passes its path as {overrides_path}.
 # argparse puts trainer_config's flattened leaves and the overrides in the command as shell-quoted --key=value tokens at {overrides}. null renders as None and booleans as true or false. String values are written as they are.
+# A boolean therefore reaches the trainer as --key=true or --key=false, which a plain store_true flag rejects. validate and run --dry-run warn once, naming every boolean trainer_config leaf, fixed override and categorical choice; set such a flag in trial_command or have the trainer accept a value.
 # hydra puts trainer_config's flattened leaves and the overrides in the command as shell-quoted key=value tokens at {overrides}, without importing Hydra. null renders as null, booleans as true or false, and strings are double-quoted with quotes escaped.
 # Floats render with Python's str() in both formats, and a list renders as [a,b].
 # argparse and hydra accept null, booleans, integers, finite floats, strings and lists of those. hydra also rejects control characters and ${...} in strings.

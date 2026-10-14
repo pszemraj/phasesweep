@@ -17,7 +17,7 @@ import yaml
 
 from phasesweep.config import ConfigError, Experiment, load_experiment
 from phasesweep.config.io import describe_validation_error
-from phasesweep.config.models import experiment_contract_lines
+from phasesweep.config.models import experiment_contract_lines, experiment_warnings
 from phasesweep.config.reference import (
     closest,
     first_sentence,
@@ -460,6 +460,8 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
     """
     for line in experiment_contract_lines(experiment):
         click.echo(f"{indent}{line}")
+    for warning in experiment_warnings(experiment):
+        click.echo(f"{indent}warning: {warning}")
     for p in experiment.phases:
         deps = f" inherits={p.inherits}" if p.inherits else ""
         sampling = f"sampler={p.sampler.type}" if phase_draws(p) else "(fixed configuration)"

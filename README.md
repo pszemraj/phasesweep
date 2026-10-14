@@ -128,6 +128,8 @@ Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/
 | Native Hydra overrides (`hydra`) | `{overrides}` produces `key=value` for every `trainer_config` leaf and override |
 | Nested JSON, base plus overrides (`json_file`) | `--overrides {overrides_path}` |
 
+`argparse` renders a boolean as `--key=true` or `--key=false`, which a plain `store_true` flag rejects; `validate` and `--dry-run` warn when a configured value would render that way. Write such a flag in `trial_command` instead, or have the trainer accept a value.
+
 > [!TIP]
 > `phasesweep run starter.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects. A phase that inherits another previews with stand-in values for the parent's winner, and its line says so.
 

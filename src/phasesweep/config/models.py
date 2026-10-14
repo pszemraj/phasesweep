@@ -149,6 +149,56 @@ def experiment_contract_lines(experiment: Experiment) -> list[str]:
     ]
 
 
+def experiment_warnings(experiment: Experiment) -> list[str]:
+    """List the advisory warnings about the experiment as a whole.
+
+    Shared by ``validate`` and ``run --dry-run`` beside
+    :func:`phasesweep.config.search.sampler_warnings`, which covers one phase. A
+    warning never blocks a run.
+
+    :param Experiment experiment: Loaded experiment.
+    :return list[str]: One sentence per warning, empty when nothing is amiss.
+    """
+    warnings: list[str] = []
+    flags = _argparse_boolean_flags(experiment)
+    if flags:
+        warnings.append(
+            "argparse renders booleans as --key=true/--key=false; a store_true flag rejects a "
+            "value, so set such flags in trial_command or have the trainer accept a value. "
+            f"Rendered that way: {', '.join(flags)}."
+        )
+    return warnings
+
+
+def _argparse_boolean_flags(experiment: Experiment) -> list[str]:
+    """Name each flag ``override_format: argparse`` would render as a boolean value.
+
+    :param Experiment experiment: Loaded experiment.
+    :return list[str]: One ``--key (where)`` entry per boolean ``trainer_config`` leaf, fixed
+        override or categorical choice, empty under any other override format.
+    """
+    if experiment.override_format != "argparse":
+        return []
+    flags = [
+        f"--{key} (trainer_config)"
+        for key, value in flatten_trainer_config(experiment.trainer_config).items()
+        if isinstance(value, bool)
+    ]
+    for phase in experiment.phases:
+        flags.extend(
+            f"--{key} (phase {phase.name!r} fixed_overrides)"
+            for key, value in phase.fixed_overrides.items()
+            if isinstance(value, bool)
+        )
+        flags.extend(
+            f"--{key} (phase {phase.name!r} search_space)"
+            for key, param in sampler_search_space(phase).items()
+            if isinstance(param, CategoricalParam)
+            and any(isinstance(choice, bool) for choice in param.choices)
+        )
+    return flags
+
+
 def _observation_line(observation: Observation) -> str:
     """Name one report-only observation and what its extractor reads.
 

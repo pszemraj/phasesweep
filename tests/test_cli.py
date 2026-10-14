@@ -709,6 +709,83 @@ def test_dry_run_does_not_warn_when_tpe_leaves_startup(
     assert not [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
 
 
+_ARGPARSE_BOOLEAN_WARNING = (
+    "warning: argparse renders booleans as --key=true/--key=false; a store_true flag rejects a "
+    "value, so set such flags in trial_command or have the trainer accept a value. "
+    "Rendered that way: --load_best_model_at_end (trainer_config), "
+    "--fp16 (phase 'p' fixed_overrides), --shuffle (phase 'p' search_space)."
+)
+
+
+def _boolean_experiment(tmp_path: Path, **overrides: object) -> Experiment:
+    """Build an experiment with a boolean in its trainer config, a fixed override and a choice."""
+    return make_experiment(
+        workdir=tmp_path / "runs",
+        trainer_config={"load_best_model_at_end": True, "epochs": 3},
+        phases=[
+            Phase(
+                name="p",
+                n_trials=2,
+                sampler=Sampler(type="grid"),
+                fixed_overrides={"fp16": False},
+                search_space={
+                    "shuffle": CategoricalParam(type="categorical", choices=[True, False])
+                },
+            )
+        ],
+        **overrides,
+    )
+
+
+def test_validate_and_dry_run_warn_when_argparse_renders_a_boolean(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One warning lists every flag argparse would hand the trainer as ``--key=true``."""
+    experiment = _boolean_experiment(tmp_path)
+    config = tmp_path / "experiment.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert [line.strip() for line in result.output.splitlines() if "warning:" in line] == [
+        _ARGPARSE_BOOLEAN_WARNING
+    ]
+    caplog.set_level(logging.INFO)
+    run_experiment(experiment, dry_run=True)
+    warnings = [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+    assert [(r.levelno, r.getMessage()) for r in warnings] == [
+        (logging.WARNING, f"DRY RUN {_ARGPARSE_BOOLEAN_WARNING}")
+    ]
+
+
+@pytest.mark.parametrize(
+    ("override_format", "trial_command"),
+    [
+        pytest.param("hydra", "echo {overrides}", id="hydra"),
+        pytest.param("yaml_file", "echo {config_path}", id="yaml_file"),
+        pytest.param("json_file", "echo {overrides_path}", id="json_file"),
+    ],
+)
+def test_boolean_warning_is_only_for_argparse(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, override_format: str, trial_command: str
+) -> None:
+    """Hydra and the file formats carry a boolean as a value, so they stay quiet."""
+    experiment = _boolean_experiment(
+        tmp_path, override_format=override_format, trial_command=trial_command
+    )
+    config = tmp_path / "experiment.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "warning:" not in result.output
+    caplog.set_level(logging.INFO)
+    run_experiment(experiment, dry_run=True)
+    assert not [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+
+
 _REPEATS_BUDGET_WARNING = (
     "warning: Phase 'lr': max_consecutive_failures=3 <= 3 repeats.values, so one configuration "
     "that fails on every repeat value can abort the phase by itself; under seeded random its "
