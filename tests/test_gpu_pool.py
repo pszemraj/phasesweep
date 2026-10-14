@@ -45,11 +45,11 @@ _TEST_UUID_MAP = {str(index): f"GPU-test-{index}" for index in range(16)}
 def deterministic_gpu_uuid_map(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default every test to a deterministic ``nvidia-smi`` UUID map.
 
-    Canonical lock identity (review v0.5.17 / blocker 6) is resolved from that
-    map, so without this stub the fixed device indices used throughout this file
-    would resolve differently — or fail closed as nonexistent — depending on
-    which GPUs the test host happens to have. Tests that exercise resolution
-    re-patch the probe themselves.
+    Canonical lock identity is resolved from that map, so without this stub
+    the fixed device indices used throughout this file would resolve
+    differently — or fail closed as nonexistent — depending on which GPUs the
+    test host happens to have. Tests that exercise resolution re-patch the
+    probe themselves.
     """
     monkeypatch.setattr(
         "phasesweep.runtime.gpu._detect_gpu_uuid_map",
@@ -455,7 +455,7 @@ def test_gpu_lease_survives_orchestrator_hard_exit(tmp_path, monkeypatch) -> Non
         reaped = True
 
         # The direct trainer exits, but its SIGTERM-ignoring worker remains.
-        # The old guardian released the lease at this exact boundary.
+        # The lease must stay held at this exact boundary, while the worker lives.
         root_exit_deadline = time.monotonic() + 2.0
         while time.monotonic() < root_exit_deadline:
             try:
@@ -648,8 +648,7 @@ def test_uuid_map_parser_rejects_placeholder_values(monkeypatch) -> None:
 
     Restricted drivers (vGPU, locked-down containers) report the same
     placeholder for every index; accepting it would map ALL indices to one
-    identity and silently collapse a multi-GPU pool to a single lock
-    (review v0.5.17 gap hunt)."""
+    identity and silently collapse a multi-GPU pool to a single lock."""
 
     class _Out:
         returncode = 0
@@ -964,7 +963,7 @@ def test_real_nvidia_smi_resolves_index_zero_to_a_uuid(monkeypatch) -> None:
             "whole_node.*requires n_jobs=1",
             id="whole-node-requires-single-job",
         ),
-        # whole_node's device set is the trainer's world size, a semantic input, so leaving it to ambient detection is rejected (review v0.5.17 gap hunt).
+        # whole_node's device set is the trainer's world size, a semantic input, so leaving it to ambient detection is rejected.
         pytest.param(
             {"gpu_policy": "whole_node"},
             "whole_node.*explicit gpu_ids or gpu_devices",
@@ -975,7 +974,7 @@ def test_real_nvidia_smi_resolves_index_zero_to_a_uuid(monkeypatch) -> None:
             "cannot be combined",
             id="none-policy-rejects-explicit-gpu-list",
         ),
-        # The fingerprint records the declared count, so a repeat is a semantic lie: gpu_ids=[0, 0] would fingerprint a 2-GPU world and lease one card (PR #5 review / reviewer 2, blocker 2).
+        # The fingerprint records the declared count, so a repeat is a semantic lie: gpu_ids=[0, 0] would fingerprint a 2-GPU world and lease one card.
         pytest.param(
             {"gpu_policy": "whole_node", "gpu_ids": [0, 0]},
             "whole_node.*requires unique device tokens",

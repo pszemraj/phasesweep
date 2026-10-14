@@ -252,8 +252,8 @@ def test_storage_backend_collapses_dialect_suffixes() -> None:
 
 def test_file_url_path_preserves_absolute_paths() -> None:
     """``file_url_path`` must distinguish three-slash (relative) from
-    four-slash (absolute) URLs. Pre-v0.5.10 it used ``lstrip("/")`` which
-    destroyed the leading ``/`` on absolute paths."""
+    four-slash (absolute) URLs. Stripping every leading ``/`` would destroy
+    the leading ``/`` on absolute paths."""
     cases = [
         ("journal:///relative.journal", "relative.journal"),
         ("journal:///relative.journal?timeout=30", "relative.journal"),

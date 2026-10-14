@@ -177,9 +177,9 @@ def test_metric_ordering_preserves_representable_differences(
 ) -> None:
     """Any representable metric difference decides the winner, never the trial number.
 
-    Regression for review v0.5.17 / finding H: 1e-13 and 3e-13 are 2e-13 apart,
-    which the removed absolute 1e-12 tie epsilon swallowed — the lower trial
-    number won regardless of which result was actually better.
+    1e-13 and 3e-13 are 2e-13 apart, which an absolute 1e-12 tie epsilon would
+    swallow — the lower trial number would win regardless of which result was
+    actually better.
     """
     exp = _make_exp(goal=goal)
     study = _make_study()

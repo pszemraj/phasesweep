@@ -481,7 +481,7 @@ def test_operator_recovery_skips_liveness_and_signalling_for_earlier_boot(
 ) -> None:
     """A PID recycled after a reboot must not fake runner liveness or absorb
     the recovery group signal: a recorded boot id from an earlier boot proves
-    the runner and its descendants are gone (review v0.5.17 / finding E).
+    the runner and its descendants are gone.
 
     The handle deliberately records this test process's own live PID and start
     time — the strongest possible "looks live" collision — under a foreign
@@ -642,8 +642,7 @@ def test_operator_recovery_finalizes_orphaned_pending_snapshot(tmp_path: Path) -
     assert terminal["result_snapshot_state"] == "failed"
     assert terminal["result_snapshot_error"] == "InterruptedFinalization"
     # The engine exit status stays authoritative: an unavailable frozen
-    # snapshot degrades result reads (below), never the run outcome itself
-    # (review v0.5.16 / blocker 2).
+    # snapshot degrades result reads (below), never the run outcome itself.
     assert store.state(handle) == "succeeded"
     assert not store.recovery_required(handle)
     assert live_runs(store) == []
@@ -1786,7 +1785,7 @@ def test_operator_recovery_retry_counts_ledger_evidence_after_lost_recovery_reco
     """A crash after the study-ledger write but before the run-level recovery
     record must not wedge the run forever: the --confirm retry counts the
     durable ledger evidence for this run's own generation instead of refusing
-    with "no trial-level cleanup evidence" (review v0.5.17 gap hunt)."""
+    with "no trial-level cleanup evidence"."""
     from phasesweep.runtime.files import private_atomic_write_text as real_write
 
     run_id = "srv-ledger-retry"
@@ -1841,11 +1840,11 @@ def test_operator_recovery_retry_clears_marker_after_terminal_only_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Interrupting ``clear_cleanup_uncertain`` after a recovery whose only
-    evidence was a cleanup-uncertain terminal trial used to wedge the run:
-    the retry found nothing fresh to recover and refused even though the
-    recovery record was already on disk. The study ledger now supplies the
-    evidence (review v0.5.17 gap hunt; the existing retry pin covered only
-    the reaped-RUNNING-trial variant, whose attempt ids persist in status)."""
+    evidence was a cleanup-uncertain terminal trial must not wedge the run:
+    the retry finds nothing fresh to recover but must not refuse while the
+    recovery record is already on disk. The study ledger supplies the
+    evidence (the reaped-RUNNING-trial variant is pinned separately, and its
+    attempt ids persist in status)."""
     run_id = "srv-terminal-marker-retry"
     store, handle, _trial_number, _config_path, recover = _stage_terminal_uncertain_run(
         tmp_path, monkeypatch, run_id=run_id, mark_uncertain=True

@@ -91,7 +91,7 @@ def test_argparse_renders_the_documented_wire_forms():
 def test_argparse_rendering_rejects_values_outside_the_wire_contract(value):
     """Defense in depth behind the config validator: str()-ing a mapping or a
     date into a command line is how two different commands end up sharing one
-    fingerprint (PR #5 review / reviewer 2, blocker 3)."""
+    fingerprint."""
     with pytest.raises(TypeError, match="yaml_file"):
         format_argparse({"model": value})
 
@@ -710,7 +710,7 @@ def _override_yaml(tmp_path, override_format: str, body: str):
 # ``knob`` holds a value with no faithful argparse wire form in every case:
 # a mapping renders through str() while the fingerprint dumps JSON-normalized
 # keys, and a YAML-native date/non-finite float has no canonical rendering at
-# all (PR #5 review / reviewer 2, blocker 3).
+# all.
 _UNRENDERABLE_ARGPARSE_VALUES = [
     pytest.param("{1: x}", r"Phase 't'.*'knob'.*type dict", id="int-keyed-mapping"),
     pytest.param('{1: x, "1": y}', r"Phase 't'.*'knob'.*type dict", id="mixed-key-mapping"),

@@ -100,8 +100,8 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
     """Status reports RUNNING identities beside the counts they explain.
 
     The MCP terminal snapshot reconciles RUNNING rows against cleanup evidence
-    and must not reread a study to learn which rows those are (PR #5 review /
-    reviewer 2, blocker 6), so this comes from the same tolerant read.
+    and must not reread a study to learn which rows those are, so this comes
+    from the same tolerant read.
     """
     path = tmp_path / "phases.journal"
     exp = _experiment(tmp_path, storage=f"journal:///{path}")
@@ -243,7 +243,7 @@ def test_journal_partial_final_record_reads_as_optuna_does_and_is_repaired_befor
 
     Optuna's reader skips a final line that lacks its newline or does not
     decode, so status reports the complete records a live load would see. A
-    write no longer refuses on sight: under Optuna's own journal lock it
+    write does not refuse on sight: under Optuna's own journal lock it
     backs the damaged bytes up beside the journal, cuts the journal back to
     its last complete record, and continues. When nothing survives the cut
     (``keep_prefix=False``) and a generation already published a winner from
@@ -725,9 +725,9 @@ def test_objective_evidence_assurance_attempt_triple_by_kind(
 
 # --------------------------------------------------------------------------
 # Published results are rendered under their own historical semantics, never
-# reinterpreted through whatever config is loaded today (review v0.5.16 /
-# blocker 4). The golden fixture publishes phase ``p`` under the metric
-# ``objective`` (minimize); each test edits the config that reads it.
+# reinterpreted through whatever config is loaded today. The golden fixture
+# publishes phase ``p`` under the metric ``objective`` (minimize); each test
+# edits the config that reads it.
 # --------------------------------------------------------------------------
 
 
@@ -745,11 +745,11 @@ def _edited(experiment: Experiment, metric: Metric | None = None, **phase: objec
 
 
 def test_published_result_is_not_reinterpreted_by_config_drift(tmp_path: Path) -> None:
-    """Review v0.5.16 / blocker 4 reproduction: publish objective/minimize, reload as y/maximize.
+    """Publish objective/minimize, reload as y/maximize: the result keeps its own semantics.
 
-    Pre-fix, status labeled the official generation with the *current*
-    metric name and inverted goal, and winner parsing silently dropped the
-    actual winner because the current metric key was absent from the
+    Status must not label the official generation with the *current* metric
+    name and inverted goal, and winner parsing must not silently drop the
+    actual winner because the current metric key is absent from the
     historical file.
     """
     drifted = _edited(
@@ -804,7 +804,7 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
     ``phases`` stays the *current* config's progress view -- a run would have
     to produce a winner for ``q`` -- while ``result_phase_plan`` reports the
     plan the publication actually used, so a reader can enumerate it instead
-    of concluding the publication is empty (review v0.5.16 / blocker 4).
+    of concluding the publication is empty.
     """
     renamed = _edited(_published(tmp_path), name="q", comment="renamed phase")
 

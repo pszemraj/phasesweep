@@ -460,9 +460,8 @@ def test_categorical_rejects_equal_but_distinct_choices(
     ``CategoricalDistribution`` records a sampled value as ``choices.index(value)``,
     so ``1``, ``1.0``, and ``True`` all persist as the first equal choice. The
     trainer would run one value while the published winner and every inherited
-    override claimed another (PR #5 review / reviewer 2, blocker 1). A plain
-    repeated choice is the same hazard and also inflates cardinality and skews
-    sampling weight.
+    override claimed another. A plain repeated choice is the same hazard and
+    also inflates cardinality and skews sampling weight.
     """
     with pytest.raises(ValidationError, match=message):
         CategoricalParam(type="categorical", choices=choices)

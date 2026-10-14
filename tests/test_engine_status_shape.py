@@ -48,7 +48,7 @@ FAILED_PUBLICATION_STATUS_KEYS = [
 
 ``publication_error`` is the one conditional key: it appears only alongside
 ``publication_integrity: "failed"`` or ``"permission_denied"`` so a healthy
-payload carries no empty error field (review v0.5.18 / finding F4).
+payload carries no empty error field.
 """
 
 PHASE_STATUS_KEYS = {
@@ -68,7 +68,7 @@ PHASE_STATUS_KEYS = {
 # deliberately does not republish them under the path-bearing CLI contract.
 # ``result_phase_plan`` is the represented generation's own phase plan, which
 # the CLI reads straight from the generation summary in ``show-winners``
-# instead (review v0.5.16 / blocker 4).
+# instead.
 READ_STATUS_ONLY_KEYS = {
     "metric",
     "result_context",
@@ -86,9 +86,8 @@ READ_STATUS_ONLY_PHASE_KEYS = {
 
 ``running_attempts`` is the identity of each RUNNING row in the same storage
 snapshot the counts came from. The MCP terminal snapshot consumes it so it
-never has to reread a study to reconcile RUNNING trials (PR #5 review /
-reviewer 2, blocker 6); the CLI phase payload keeps exactly
-``PHASE_STATUS_KEYS`` and republishes none of it.
+never has to reread a study to reconcile RUNNING trials; the CLI phase payload
+keeps exactly ``PHASE_STATUS_KEYS`` and republishes none of it.
 """
 
 
@@ -126,9 +125,9 @@ def test_read_status_only_phase_keys_never_reach_the_cli_contract(tmp_path: Path
     """The path-free phase view carries running attempts; the CLI view does not.
 
     Both directions matter. The MCP terminal snapshot depends on
-    ``running_attempts`` arriving from the same tolerant read as the counts
-    (PR #5 review / reviewer 2, blocker 6), and ``experiment_status`` is a
-    pinned public contract that must not grow a key because of it.
+    ``running_attempts`` arriving from the same tolerant read as the counts,
+    and ``experiment_status`` is a pinned public contract that must not grow a
+    key because of it.
     """
     experiment = _published(tmp_path)
 
@@ -146,9 +145,9 @@ def test_status_shape_reports_a_corrupt_publication_without_fabricating_results(
 ) -> None:
     """A publication that no longer validates adds two keys and invents nothing.
 
-    Review v0.5.18 / finding F4: the payload for a corrupt publication used to
-    be byte-identical to a tree that had never published, so the operator's
-    natural next move was to re-run over the evidence.
+    The payload for a corrupt publication must differ from the one for a tree
+    that never published; if the two were identical, the operator's natural
+    next move would be to re-run over the evidence.
     """
     experiment = _published(tmp_path)
     generation_id = published_generation_id(experiment)

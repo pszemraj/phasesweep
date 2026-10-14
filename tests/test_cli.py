@@ -1019,10 +1019,10 @@ def test_status_refuses_an_unreadable_journal_storage_at_format_boundary(tmp_pat
 def test_show_winners_renders_historical_annotations_on_config_drift(tmp_path: Path) -> None:
     """A published result keeps its own comments and is labeled historical on drift.
 
-    Review v0.5.16 / blocker 4: the experiment CLI used to decorate a
-    historical winner with the *current* phase comments; it now uses saved
-    annotations and an explicit marker when the current config no longer
-    matches the published one.
+    The experiment CLI must not decorate a historical winner with the
+    *current* phase comments; it uses the saved annotations and prints an
+    explicit marker when the current config no longer matches the published
+    one.
     """
     trainer = write_param_echo_trainer(tmp_path)
     config_path = tmp_path / "exp.yaml"
@@ -1069,12 +1069,12 @@ def test_status_and_show_winners_report_a_corrupt_publication_and_exit_nonzero(
     artifact: str,
     appended: bytes,
 ) -> None:
-    """Review v0.5.18 / finding F4: a corrupt publication is not a fresh tree.
+    """A corrupt publication is not a fresh tree.
 
-    ``status`` used to print a payload byte-identical to a never-run workdir
-    and exit 0, so the operator's natural next move -- re-run -- advanced the
-    pointer and erased the only evidence of corruption. ``show-winners`` must
-    likewise not answer "no winner yet" over it. Both commands are read-only,
+    ``status`` must not print a payload byte-identical to a never-run workdir
+    and exit 0, or the operator's natural next move -- re-run -- would advance
+    the pointer and erase the only evidence of corruption. ``show-winners``
+    must likewise not answer "no winner yet" over it. Both commands are read-only,
     so they share one corrupted tree. Editing a published winner artifact or
     the claim-time reproducibility record (which feeds the same reporting as
     any winner) stops the generation manifest from validating.
@@ -1120,11 +1120,11 @@ def test_status_reports_an_unreadable_snapshot_as_permission_denied(
 ) -> None:
     """A snapshot this user may not read reports permission, not corruption.
 
-    Re-review v0.5.19 / observation N1: ``config.snapshot.yaml`` is owner-only,
-    so a second operator inspecting a healthy tree was told the publication no
-    longer validates and to restore the generation namespace. The read still
-    fails closed -- nothing unvalidatable may read as published -- but the
-    reason names the permission denial and the user who can validate it.
+    ``config.snapshot.yaml`` is owner-only, so a second operator inspecting a
+    healthy tree must not be told the publication no longer validates and to
+    restore the generation namespace. The read still fails closed -- nothing
+    unvalidatable may read as published -- but the reason names the permission
+    denial and the user who can validate it.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
     config_path, experiment = materialized.config_path, materialized.experiment

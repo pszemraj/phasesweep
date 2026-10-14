@@ -692,9 +692,8 @@ def test_extraction_past_deadline_fails_the_trial(tmp_path: Path) -> None:
     """A successful trainer whose evidence lands past the deadline cannot count.
 
     ``timeout_seconds_per_phase``/``timeout_seconds_per_run`` bound the whole
-    trial; before review v0.5.17 / blocker 8 extraction ran with no deadline
-    at all, so a run could exceed both configured limits and still publish a
-    complete winner.
+    trial, extraction included, so a run cannot exceed both configured limits
+    and still publish a complete winner.
     """
     experiment = make_experiment(workdir=tmp_path)
     (tmp_path / "r.json").write_text('{"x": 1.0}')
@@ -931,11 +930,11 @@ def test_unrelated_launch_timeout_is_not_relabelled_as_phase_deadline(
 def test_slow_extraction_cannot_publish_complete_past_phase_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Reviewer repro (review v0.5.17 / blocker 8): quick trainer, slow extraction.
+    """A quick trainer with slow extraction times out and publishes nothing.
 
     The trainer finishes inside the 0.5s budget but extraction takes 3s. The
-    run used to publish ``incomplete: false`` more than 2x past both limits;
-    it must now report a timeout and publish nothing.
+    run must report a timeout rather than publish ``incomplete: false`` more
+    than 2x past both limits.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(

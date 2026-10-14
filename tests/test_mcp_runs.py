@@ -928,9 +928,9 @@ def test_successful_process_with_failed_result_snapshot_is_still_succeeded(tmp_p
 
     A failed *result snapshot* capture degrades the run's frozen results
     (result reads surface the finalization state explicitly), never the run
-    outcome itself — the old ``returncode 0 + snapshot failed -> failed``
-    rule let an optional diagnostic contradict an engine-defined,
-    already-published success (review v0.5.16 / blocker 2).
+    outcome itself — a ``returncode 0 + snapshot failed -> failed`` rule would
+    let an optional diagnostic contradict an engine-defined, already-published
+    success.
     """
     store = RunStore(tmp_path / "state")
     handle = make_run_handle(run_id="exp-1")

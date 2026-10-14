@@ -36,8 +36,8 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
 
     A library that leaves its own SIGTERM/SIGINT/SIGHUP handlers and unblocked
     mask installed after returning steals the embedding process's own
-    shutdown handling permanently (review v0.5.14 / blocker 6). This must be
-    undone whether the run succeeds or raises.
+    shutdown handling permanently. This must be undone whether the run
+    succeeds or raises.
     """
 
     def host_handler(_signum: int, _frame: object) -> None:
@@ -82,13 +82,13 @@ def test_signal_handler_scope_restores_host_signal_state_on_success_and_failure(
 @pytest.mark.signals_own_pid
 def test_signal_handler_scope_delivers_pending_signal_to_host_handler_after_restore() -> None:
     """A signal pending at scope-exit must reach the restored HOST handler, not
-    ``_shutdown_handler`` mid-restoration (review v0.5.15 / blocker 2A).
+    ``_shutdown_handler`` mid-restoration.
 
-    Pre-fix, the mask was restored before the host handlers, so a pending
-    SIGTERM fired while ``_shutdown_handler`` was still installed for it,
-    raising ``PhaseSweepShutdown`` out of the cleanup path and leaving some
-    host handlers unrestored. The fixed order is: block, then restore
-    handlers, then restore the mask.
+    Restoring the mask before the host handlers would let a pending SIGTERM
+    fire while ``_shutdown_handler`` was still installed for it, raising
+    ``PhaseSweepShutdown`` out of the cleanup path and leaving some host
+    handlers unrestored. The required order is: block, then restore handlers,
+    then restore the mask.
     """
     if not hasattr(signal, "pthread_sigmask"):
         pytest.skip("pthread_sigmask not available")
@@ -135,7 +135,7 @@ def test_signal_handler_scope_continues_restoring_after_one_signal_signal_failur
 
     Every other prior handler must still be restored, and the first
     restoration error surfaces once the scope body itself did not already
-    raise (review v0.5.15 / blocker 2A).
+    raise.
     """
     prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
     try:
@@ -298,12 +298,12 @@ def test_worker_thread_install_cannot_steal_scope_ownership() -> None:
     """A worker-thread ``install_signal_handlers()`` raises and takes nothing.
 
     During an open main-thread ``signal_handler_scope()`` every shutdown
-    handler already points at ``_shutdown_handler``, so a worker thread used
-    to take the idempotent fast path, flip ``_process_lifetime_owner``, and
+    handler already points at ``_shutdown_handler``, so a worker thread must
+    not take the idempotent fast path, flip ``_process_lifetime_owner``, and
     silently convert the scope's temporary installation into permanent
-    process ownership — the scope exit then skipped restoring the host's
-    handlers (review v0.5.16 / blocker 5). The install must now reject
-    off-main-thread callers before touching any ownership state.
+    process ownership — the scope exit would then skip restoring the host's
+    handlers. The install rejects off-main-thread callers before touching any
+    ownership state.
     """
 
     def host_handler(_signum: int, _frame: object) -> None:
@@ -336,9 +336,9 @@ def test_absorb_shutdown_signals_reports_signal_and_defers_it_to_next_checkpoint
     """A shutdown inside an absorb window is reported, not raised — then honored later.
 
     The publication transaction uses this to win its race against a shutdown signal
-    deterministically (review v0.5.16 / blocker 1): the window exit reports the absorbed signal on
-    the yielded object instead of raising, and the next ``defer_shutdown_signals()`` exit (e.g. the
-    next trial launch) still delivers the shutdown before new work starts.
+    deterministically: the window exit reports the absorbed signal on the yielded object
+    instead of raising, and the next ``defer_shutdown_signals()`` exit (e.g. the next trial
+    launch) still delivers the shutdown before new work starts.
     """
     prior_handlers = {sig: signal.getsignal(sig) for sig in runtime_shutdown._SHUTDOWN_SIGNALS}
     try:
@@ -540,11 +540,10 @@ def test_sigterm_via_worker_thread_mid_launch_window_defers_instead_of_deadlocki
     Library pools (e.g. BLAS workers pulled in via numpy/optuna) keep SIGTERM
     unblocked, so a process-directed SIGTERM sent during the masked launch
     window is delivered to one of them — and CPython then runs the Python
-    handler in the main thread anyway, mid-critical-section. Pre-fix the
-    handler re-acquired ``_launch_lock`` held by that same thread and hung
-    until the MCP server's 30s grace SIGKILLed the runner with no status.json
-    written (the flaky-cancel e2e failures). The handler must record the signal
-    and let the window exit service it.
+    handler in the main thread anyway, mid-critical-section. A handler that
+    re-acquired ``_launch_lock`` held by that same thread would hang until the
+    MCP server's 30s grace SIGKILLed the runner with no status.json written.
+    The handler must record the signal and let the window exit service it.
     """
     code = r"""
 import os, signal, threading, time

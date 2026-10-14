@@ -198,8 +198,7 @@ def test_published_generation_metadata_never_exposes_configured_secrets(
     it necessarily holds ``env:`` values and is written ``0600``. Every other
     file in the generation namespace -- the summary, the lifecycle record, the
     winners, and ``reproducibility.json`` -- is ordinary umask-governed
-    metadata an operator may share, and must carry digests rather than values
-    (review v0.5.18 / finding F6).
+    metadata an operator may share, and must carry digests rather than values.
     """
     secret = "s3cr3t-public-metadata-sentinel"
     experiment = make_experiment(

@@ -183,8 +183,8 @@ def _claimed_over(
 def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     """If config changed AND a stale RUNNING trial exists, reap must happen first.
 
-    Previously, _verify_fingerprint raised before _reap_stale_trials could run,
-    leaving the prior orchestrator's training process holding the GPU.
+    If _verify_fingerprint raised before _reap_stale_trials could run, the
+    prior orchestrator's training process would keep holding the GPU.
     """
     storage = f"journal:///{tmp_path / 'p.journal'}"
 
@@ -1102,10 +1102,10 @@ def test_reaper_reports_storage_failures_after_cleanup(
 def test_prelaunch_allocated_attempt_recovers_without_identity(tmp_path: Path) -> None:
     """A worker killed while queued for a GPU leaves 'allocated' and no identity.
 
-    Recovery used to treat the missing process identity as unverifiable
-    cleanup and fail closed forever (review v0.5.17 / blocker 2 gap A). The
-    durable 'allocated' marker proves no process was ever created, so the
-    stale trial is failed safely and the study unwedges.
+    Recovery must not treat the missing process identity as unverifiable
+    cleanup and fail closed forever. The durable 'allocated' marker proves no
+    process was ever created, so the stale trial is failed safely and the
+    study unwedges.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     exp = make_experiment(
@@ -1135,8 +1135,7 @@ def test_exited_attempt_recovers_without_signalling(
     """A crash between process exit and the Optuna commit recovers via 'exited'.
 
     The retained identity plus the durable 'exited' transition prove the group
-    is gone; recovery must fail the trial without sending any signal (review
-    v0.5.17 / blocker 2 gap B).
+    is gone; recovery must fail the trial without sending any signal.
     """
     exp = make_experiment(
         experiment="exited",
@@ -1680,10 +1679,10 @@ def test_in_memory_attempt_registry_accepts_locatorless_entries(tmp_path: Path) 
 def test_renamed_phase_cannot_hide_stale_trainer_from_recovery(tmp_path: Path) -> None:
     """The attempt registry finds stale work whose phase left the config.
 
-    Reviewer repro (review v0.5.17 / blocker 3): kill the orchestrator while a
-    trainer is alive, rename the phase in the YAML, run again. Recovery used to
-    walk only the *current* phase list, so the old trainer stayed alive and
-    overlapped the new sweep. The registry scan is phase-graph-independent.
+    Kill the orchestrator while a trainer is alive, rename the phase in the
+    YAML, run again. Recovery must not walk only the *current* phase list, or
+    the old trainer would stay alive and overlap the new sweep. The registry
+    scan is phase-graph-independent.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
     storage = f"journal:///{tmp_path / 'r.journal'}"
@@ -1792,8 +1791,7 @@ def test_storage_change_cannot_hide_stale_attempt_from_recovery(tmp_path: Path) 
     """A registered attempt is repaired through its *recorded* storage URL.
 
     The current config points at a different storage; the registry entry keeps
-    the producing study reachable so its RUNNING trial is still failed
-    (review v0.5.17 / blocker 3).
+    the producing study reachable so its RUNNING trial is still failed.
     """
     trainer = write_trainer(tmp_path, "print('x=1.0')")
 

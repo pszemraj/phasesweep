@@ -374,8 +374,8 @@ def isolate_signal_ownership_tokens() -> Iterator[None]:
     """Snapshot and restore PhaseSweep's process-level signal state per test.
 
     ``phasesweep.runtime.shutdown._process_lifetime_owner`` and ``_scope_depth``
-    are plain module globals (review v0.5.15 / blocker 2B), deliberately not
-    re-derived from OS ground truth the way the actual signal handlers are.
+    are plain module globals, deliberately not re-derived from OS ground truth
+    the way the actual signal handlers are.
     A test that calls ``install_signal_handlers()`` (or drives a CLI/MCP main
     in-process) would otherwise permanently replace pytest's SIGTERM/SIGINT/
     SIGHUP handlers and unblock those signals, as well as flipping the private
@@ -736,8 +736,7 @@ def assert_published_winner_evidence_local(experiment_dir: Path) -> None:
     namespace holding the evidence behind that number, so it must resolve
     *inside the tree the reader is reading*. When one study is allowed to back
     two roots, both report ``publication_integrity: ok`` while the winner in
-    one of them cites a generation that only exists in the other (re-review
-    v0.5.19 / blocker B1).
+    one of them cites a generation that only exists in the other.
 
     :param Path experiment_dir: Experiment artifact namespace to check, i.e.
         ``<workdir>/<experiment>``.

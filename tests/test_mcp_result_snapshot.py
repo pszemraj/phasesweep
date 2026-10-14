@@ -275,8 +275,8 @@ def test_terminal_snapshot_tolerates_missing_lifecycle_record(tmp_path: Path) ->
     """A missing per-generation record must not fail the snapshot capture.
 
     The engine writes that record as an optional post-commit diagnostic; a
-    capture that hard-required it contradicted engine-defined success
-    whenever the best-effort write had failed (review v0.5.16 / blocker 2).
+    capture that hard-required it would contradict engine-defined success
+    whenever the best-effort write had failed.
     """
     experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
     mark_current_format(experiment)
@@ -338,8 +338,7 @@ def test_terminal_snapshot_freezes_unavailable_trial_data_flags(
     """Unavailable trial storage freezes explicit flags without a redundant study read.
 
     ``running_attempts`` is ``None`` rather than ``[]`` here: nothing was read,
-    so an empty list would claim there are no RUNNING rows (PR #5 review /
-    reviewer 2, blocker 6).
+    so an empty list would claim there are no RUNNING rows.
     """
     storage = None
     if storage_kind == "corrupt-journal":
@@ -503,13 +502,12 @@ def test_terminal_snapshot_survives_a_post_engine_study_load_failure(
 ) -> None:
     """A successful run's result is frozen even if studies became unloadable.
 
-    PR #5 review / reviewer 2, blocker 6: the capture used to reread every
-    phase study after ``read_status`` to collect RUNNING rows, with no
-    tolerance for failure. One transient lock in that millisecond-wide window
-    failed the capture, and a terminal snapshot that was never captured is
-    unrecoverable by design -- so a completed run's frozen result was lost to
-    storage flakiness that the tolerant status read itself shrugs off. The
-    fatal read simply no longer happens.
+    The capture collects RUNNING rows from the tolerant ``read_status`` read
+    instead of rereading every phase study afterwards. A reread would have no
+    tolerance for failure: one transient lock in that millisecond-wide window
+    would fail the capture, and a terminal snapshot that was never captured is
+    unrecoverable by design -- so a completed run's frozen result would be
+    lost to storage flakiness that the tolerant status read itself shrugs off.
 
     The one tolerant read replays a journal snapshot through ``optuna.load_study``,
     so exactly one load succeeds and any reload after it fails.
@@ -791,9 +789,8 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     The current-generation pointer legitimately moves to this new (failed)
     invocation -- a new invocation always overwrites it starting from
     "preflighting", and every outcome path must drive it to a terminal state
-    (review v0.5.15 / blocker 3) -- but the convenience root projections and,
-    critically, the last-success pointer stay exactly as the prior successful
-    publication left them.
+    -- but the convenience root projections and, critically, the last-success
+    pointer stay exactly as the prior successful publication left them.
     """
     phases = [
         Phase(
@@ -853,8 +850,7 @@ def test_failed_fingerprint_preflight_preserves_published_results(
     # will succeed). published_generation_id is always the actual validated
     # last-success pointer -- the *first* (successful) run here -- never
     # forced to equal the pinned generation_id, even though this pinned
-    # capture's own represented_generation_id is that failed generation
-    # (review v0.5.15 / blocker 3, defect 2: "pinned reads lie").
+    # capture's own represented_generation_id is that failed generation.
     assert captured[0]["status"]["current_generation_id"] == callback_generations[0]  # type: ignore[index]
     assert captured[0]["status"]["published_generation_id"] == first_generation  # type: ignore[index]
     assert captured[0]["status"]["represented_generation_id"] == callback_generations[0]  # type: ignore[index]

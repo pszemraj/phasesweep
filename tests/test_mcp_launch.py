@@ -1005,9 +1005,9 @@ def test_launch_spawns_runner_in_neutral_dir_and_passes_project_cwd(
     """The child must not start inside the project it is about to run.
 
     Interpreter startup from the experiment's directory executes project-local
-    code before the server can name the process it created (review v0.5.17 /
-    blocker 9), so ``Popen`` uses the server-owned state directory and the
-    project directory travels as an explicit argument the runner applies later.
+    code before the server can name the process it created, so ``Popen`` uses
+    the server-owned state directory and the project directory travels as an
+    explicit argument the runner applies later.
     """
     config = _config(tmp_path)
     runner_cwd = tmp_path / "runner-cwd"
@@ -1145,9 +1145,10 @@ def test_project_local_shadow_package_would_run_under_the_old_spawn_contract(
 ) -> None:
     """Control for the test above: the poison is genuinely executable.
 
-    Reproducing the pre-fix contract - project cwd, no ``-P``/``-s``, inherited
-    environment - must import the shadow package, so a passing hardened case is
-    evidence about the fix rather than about an inert fixture.
+    Reproducing the unhardened spawn contract - project cwd, no ``-P``/``-s``,
+    inherited environment - must import the shadow package, so a passing
+    hardened case is evidence about the hardening rather than about an inert
+    fixture.
     """
     _captured, project, markers, parent_env = _launch_with_poison_project(tmp_path, monkeypatch)
     # PYTHONHOME alone would break the interpreter before it could import

@@ -717,7 +717,7 @@ def test_record_write_failure_still_yields_succeeded_run_with_complete_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end (review v0.5.16 / blocker 2): the engine and MCP agree on success.
+    """End-to-end: the engine and MCP agree on success.
 
     The per-generation lifecycle record write is injected to fail after the
     pointer commit — a failure the engine's own transaction contract accepts.
@@ -763,7 +763,7 @@ def test_shutdown_during_terminal_snapshot_capture_keeps_the_published_result(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end (PR #5 review / reviewer 2 pass 2, blocker 3): cancel loses the race.
+    """End-to-end: a cancel arriving during snapshot capture loses the race.
 
     A real SIGTERM is delivered to this process while the terminal snapshot of
     an already-published generation is being captured. The engine invokes that
@@ -1214,9 +1214,8 @@ def test_transient_terminal_status_write_failure_is_retried(
 ) -> None:
     """A one-shot OS failure must not cost a finished run its terminal evidence.
 
-    Injected at ``os.replace`` (PR #5 review / reviewer 2 pass 2, blocker 6) so
-    the retry runs through the real private atomic writer - temp file, fsync,
-    replace - rather than a stubbed one.
+    Injected at ``os.replace`` so the retry runs through the real private
+    atomic writer - temp file, fsync, replace - rather than a stubbed one.
     """
     status_path = tmp_path / "status.json"
     monkeypatch.setattr(mcp_runner, "finalize_result_snapshot", lambda snapshot: snapshot)
@@ -1318,7 +1317,7 @@ def test_unpersistable_complete_transition_keeps_the_recoverable_pending_record(
 
     ``pending`` plus a dead runner is exactly what ``recover-run`` finalizes, so the runner
     must not trade it for the permanent ``failed`` state when the complete transition
-    cannot be persisted (PR #5 review / reviewer 2 pass 2, blocker 6).
+    cannot be persisted.
     """
     store = RunStore(tmp_path / "state")
     run_id = "pending-run"
@@ -1786,7 +1785,7 @@ def test_runner_enters_the_project_directory_after_its_identity_is_durable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``--cwd`` replaces the ambient cwd the server used to hand the child.
+    """``--cwd`` supplies the project directory instead of an ambient cwd inherited from the server.
 
     The inherited lease stays held through ``_persist_spawned_handle``. The
     subsequent chdir therefore exposes the project only after the server has

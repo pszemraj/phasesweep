@@ -159,7 +159,7 @@ def test_list_validate_launch_monitor_winners(tmp_path: Path) -> None:
         assert "objective_evidence" in winners["metric"]
         # A frozen run reports its own recorded semantics, and they match the
         # config it executed - the drift disclosure is silent here because
-        # there is nothing to disclose (review v0.5.16 / blocker 4).
+        # there is nothing to disclose.
         assert winners["result_context"] == "represented_generation"
         assert winners["published_config_matches_current"] is True
         assert awaited["result_phase_plan"] == ["depth", "lr"]

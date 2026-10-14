@@ -381,7 +381,7 @@ def test_launch_trial_inherit_env_none_filters_ambient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The default ``inherit_env: none`` drops ambient vars while keeping the base set and
-    configured ``env`` entries (review v0.5.17 / blocker 4)."""
+    configured ``env`` entries."""
     monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
     env = _capture_launch_env(
         tmp_path,

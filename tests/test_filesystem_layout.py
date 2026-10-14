@@ -38,9 +38,8 @@ def test_two_experiments_sharing_workdir_have_disjoint_output_trees(
     tmp_path: Path,
 ) -> None:
     """Two configs with the same ``workdir`` but different experiment names
-    must not share any output paths — pre-v0.5.7 they did, which let one run
-    silently overwrite the other's ``trial_*/``, ``winner.yaml``, and
-    ``summary.yaml``.
+    must not share any output paths, or one run would silently overwrite the
+    other's ``trial_*/``, ``winner.yaml``, and ``summary.yaml``.
     """
     exp_a = make_experiment(workdir=str(tmp_path / "runs"))
     exp_b = make_experiment(workdir=str(tmp_path / "runs"))
@@ -76,7 +75,7 @@ def test_run_experiment_writes_summary_at_namespaced_path(
         Path(exp.workdir).mkdir(exist_ok=True)
     run_experiment(exp)
     assert (_summary_path(exp)).is_file()
-    # The pre-v0.5.7 location must NOT be created.
+    # Nothing is written directly under the bare workdir.
     assert not (Path(exp.workdir).resolve() / "summary.yaml").exists()
     assert (_experiment_dir(exp) / ".gitignore").read_text() == "*\n"
     assert not (Path(exp.workdir) / ".gitignore").exists()

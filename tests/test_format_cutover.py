@@ -552,11 +552,11 @@ _PARTIAL_FINAL_RECORDS = {
 def test_writers_repair_a_partial_final_journal_record(tmp_path: Path, damage: str) -> None:
     """Every path that may write repairs a bad last journal line before it proceeds.
 
-    Reads skip that line as Optuna does, so the format scan passes. A write no
-    longer refuses on sight: under Optuna's own journal lock it backs the
+    Reads skip that line as Optuna does, so the format scan passes. A write
+    does not refuse on sight: under Optuna's own journal lock it backs the
     damaged bytes up beside the journal and truncates back to the last
     complete record, for ``claim_ledger``, ``open_registry_study``, and a
-    confirmed recovery alike. Unconfirmed inspection no longer checks the tail
+    confirmed recovery alike. Unconfirmed inspection does not check the tail
     at all, so it neither raises nor changes a byte.
     """
 

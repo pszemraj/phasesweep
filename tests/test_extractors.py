@@ -1018,7 +1018,7 @@ def test_log_regex_reports_no_matches(tmp_path):
 
 def test_provenance_freezes_file_digest_and_extractor_identity(tmp_path):
     """The provenance sink freezes the exact evidence bytes and the extractor's
-    config identity at extraction time (review v0.5.17 / finding F)."""
+    config identity at extraction time."""
     raw = json.dumps({"eval": {"loss": 0.42}}).encode("utf-8")
     (tmp_path / "result.json").write_bytes(raw)
     cfg = JsonExtractor(type="json", path="result.json", key="eval.loss")
@@ -1114,9 +1114,9 @@ def test_provenance_log_regex_records_selected_line_and_whole_file_digest(tmp_pa
 
 
 def test_log_regex_splits_carriage_return_progress_lines(tmp_path):
-    """Lone carriage returns are line boundaries, matching the historical
-    text-mode universal-newline reader — tqdm-style progress logs separate
-    updates with bare "\\r" (review v0.5.17 / finding F follow-up)."""
+    """Lone carriage returns are line boundaries, matching a text-mode
+    universal-newline reader — tqdm-style progress logs separate updates with
+    bare "\\r"."""
     _assert_log_regex_provenance(
         tmp_path,
         "eval_loss=2.5\reval_loss=1.9\reval_loss=2.1\nfinal eval_loss=2.2\r\n",

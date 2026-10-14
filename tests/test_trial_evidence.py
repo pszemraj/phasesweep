@@ -1,14 +1,14 @@
 """Selection may not rank or republish a trial whose evidence left the tree.
 
 Winner selection reads Optuna alone - state, value, feasibility, execution ids,
-constraint readings - so before this guard an experiment whose winning trial
-directory had been deleted happily reselected that trial and republished its
+constraint readings - so without this guard an experiment whose winning trial
+directory had been deleted would reselect that trial and republish its
 number, metric, and provenance from a tree holding nothing behind them, with
-``publication_integrity: ok`` (PR #5 review / reviewer 2, blocker 7). These
-tests cover the three places that now fail closed: the launch preflight over
-every selection-eligible candidate, the digest check on the trial that actually
-becomes the published winner, and the manifest rule that a winner carried from
-an earlier generation must find that generation in this same tree.
+``publication_integrity: ok``. These tests cover the three places that fail
+closed: the launch preflight over every selection-eligible candidate, the
+digest check on the trial that actually becomes the published winner, and the
+manifest rule that a winner carried from an earlier generation must find that
+generation in this same tree.
 """
 
 from __future__ import annotations
@@ -1074,9 +1074,8 @@ def test_deleting_a_carried_winners_source_generation_fails_read_and_write(
 ) -> None:
     """The cited generation holds the evidence, so its absence is corruption.
 
-    This is the tree ``assert_published_winner_evidence_local`` rejects
-    (re-review v0.5.19 / blocker B1) and that the manifest used to report as
-    ``ok``.
+    This is the tree ``assert_published_winner_evidence_local`` rejects, and
+    the manifest must report it as ``failed`` rather than ``ok``.
     """
     experiment, source_generation, _carrying = _tree_with_a_carried_winner(tmp_path)
     shutil.rmtree(_generations_dir(experiment) / source_generation)
@@ -1199,8 +1198,8 @@ def test_winner_carried_from_a_generation_that_crashed_before_publication_publis
     starts a new recovery streak for a random sampler), completes, and
     legitimately publishes trial 0, citing the crashed generation.
 
-    Requiring a winner record in every cited source generation - the reviewer's
-    blanket rule - would make this ordinary recovery permanently unpublishable.
+    Requiring a winner record in every cited source generation would make this
+    ordinary recovery permanently unpublishable.
     """
     recovery_marker = tmp_path / "recovered.txt"
     crashing = _evidence_experiment(

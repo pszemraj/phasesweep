@@ -77,14 +77,14 @@ def test_full_sweep_and_replay(tmp_path):
     assert 0.0 <= reg["optimizer.weight_decay"] <= 0.3
     assert 0.0 <= reg["model.dropout"] <= 0.3
 
-    # Persistence on disk. v0.5.7: outputs are namespaced as
+    # Persistence on disk. Outputs are namespaced as
     # <workdir>/<experiment>/<phase>/, summary at <workdir>/<experiment>/summary.yaml.
     runs_dir = tmp_path / "runs"
     exp_dir = runs_dir / exp.experiment
     summary = yaml.safe_load((exp_dir / "summary.yaml").read_text())
     assert {p["name"] for p in summary["phases"]} == {"depth", "lr", "regularization"}
 
-    # Frozen objective evidence provenance (review v0.5.17 / finding F): the
+    # Frozen objective evidence provenance: the
     # winner records the digest of the exact evidence file its scalar came from.
     provenance = depth_winner.objective_provenance
     assert provenance is not None
