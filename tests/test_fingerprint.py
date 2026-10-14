@@ -162,7 +162,7 @@ def _two_phase_experiment(
 ) -> Experiment:
     """Build an arch -> lr two-phase experiment for from-phase tests.
 
-    Each phase has a search space, so v0.5.7 trial_command validation needs
+    Each phase has a search space, so trial_command validation needs
     ``{overrides}``. The trainer writes a constant ``r.json`` so trials
     actually complete and the experiment produces a saved winner.
     """
@@ -288,7 +288,7 @@ def test_interrupted_first_publication_still_publishes_and_reads_resolve_correct
     """A projection failure during the very first publication is diagnostic-only.
 
     Convenience projections (root ``winner.yaml`` etc.) are a
-    best-effort, post-commit cache (review v0.5.15 / blocker 3): a failure
+    best-effort, post-commit cache: a failure
     partway through them must not fail the run or block the pointer commit,
     even on a generation's first-ever publication. Reads must still resolve
     correctly via the generation-scoped artifacts regardless of which root
@@ -477,8 +477,7 @@ def test_fingerprint_includes_semantic_fields_but_ignores_run_control() -> None:
         ),
         # Under whole_node the device-set SIZE is the trainer's world size —
         # semantic — while its spelling stays run-control, and under
-        # single_per_trial the whole list stays run-control (review v0.5.17
-        # gap hunt).
+        # single_per_trial the whole list stays run-control.
         (
             "whole_node_device_count",
             lambda: (
@@ -521,9 +520,8 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
 ) -> None:
     """The trainer's cwd and env-inheritance contract are semantic inputs.
 
-    Both were unbound implicit inputs before review v0.5.17 / blocker 4: one
-    study could mix trials launched from different directories or with
-    different credentials visible. Both fingerprints must move when either
+    Left unbound, one study could mix trials launched from different
+    directories or with different credentials visible. Both fingerprints must move when either
     changes, and must not move when the operator merely spells out the
     default block.
     """
@@ -734,8 +732,7 @@ def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
 
     The flag never changes what a trial samples or means — on persistent
     storage its legal value is fully determined by ``sampler.type`` — so
-    acknowledging an existing study's sampler (review v0.5.18 / finding F7)
-    must not invalidate that study.
+    acknowledging an existing study's sampler must not invalidate that study.
     """
     from phasesweep.engine.fingerprints import _phase_semantic_payload
 
@@ -763,9 +760,8 @@ def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
     The fingerprint hashes ``model_dump(mode="json")`` through
     ``json.dumps(..., default=str)``, which preserves that distinction only for
     values strict JSON can hold — which is why ``JsonEqualsGate.value`` is
-    restricted to a strict JSON-scalar union (PR #5 review / reviewer 2,
-    blocker 4). Anything it now rejects (a YAML date, an int-keyed mapping)
-    would have collapsed onto a colliding twin here.
+    restricted to a strict JSON-scalar union. Anything it rejects (a YAML
+    date, an int-keyed mapping) would collapse onto a colliding twin here.
     """
 
     def fingerprint_for(value: bool | int | float | str | None) -> str:
@@ -830,7 +826,7 @@ def test_stateful_sampler_rejects_interrupted_resume_and_top_up(tmp_path: Path) 
 
     Optuna storage does not persist process-local sampler state, so a fresh
     process would restart the seeded suggestion stream and could re-evaluate
-    identical startup suggestions (review v0.5.14 / blocker 3).
+    identical startup suggestions.
     """
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"journal:///{tmp_path / 'studies.journal'}"
@@ -972,7 +968,7 @@ def test_upstream_top_up_detects_transitively_bound_descendant() -> None:
 
 @pytest.mark.integration
 def test_second_workdir_is_rejected_and_leaves_the_bound_root_untouched(tmp_path: Path) -> None:
-    """One persistent study cannot back two publication roots (review v0.5.19 / finding F5)."""
+    """One persistent study cannot back two publication roots."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     bound = _two_phase_experiment(workdir=tmp_path / "runs_a", trainer=trainer, storage=storage)
@@ -1248,9 +1244,9 @@ def _unbound_two_phase_studies(
 def test_refused_multi_phase_binding_claims_nothing(tmp_path: Path, arch_trials: int) -> None:
     """A refused run must not leave an earlier phase bound to the rejected root.
 
-    Claiming inside the check loop bound every phase examined before the
-    conflicting one, so the tree the operator was told nothing happened to
-    already had a binding pointing at it (re-review v0.5.19 / blocker B3).
+    Claiming inside the check loop would bind every phase examined before the
+    conflicting one, leaving a binding pointing at a tree the operator was told
+    nothing happened to.
     """
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
@@ -1277,8 +1273,7 @@ def test_unreadable_study_blocks_binding_for_its_siblings_too(
 
     The unreadable study aborts the run either way - as unconfirmed cleanup,
     with the storage failure chained beneath it - so claiming the readable
-    studies would invent a binding for an invocation that never ran a trial
-    (re-review v0.5.19 / blocker B3).
+    studies would invent a binding for an invocation that never ran a trial.
     """
     import phasesweep.engine.ledger as ledger
 
@@ -1514,14 +1509,14 @@ def _fabricate_interrupted_attempt(
 def test_transient_study_read_failure_aborts_before_any_recovery(tmp_path: Path) -> None:
     """A read that fails once must abort the run, not be retried into recovery.
 
-    Reviewer repro (PR #5 review / reviewer 2, issue 1): discovery swallowed
-    the storage failure, the main preflight loop re-read the study, the second
-    read succeeded, and stale-trial reaping then mutated a study whose
-    artifact-root binding had never been checked - a wrong-root invocation
-    silently failing the bound tree's RUNNING trial. Discovery is now the only
-    read, so the failure escalates and nothing in either tree is touched. The
-    unpatched second invocation pins the same refusal for the ordinary
-    wrong-root case: it conflicts before the registry scan can reap anything.
+    If discovery swallowed the storage failure and the main preflight loop
+    re-read the study, the second read would succeed and stale-trial reaping
+    would mutate a study whose artifact-root binding had never been checked -
+    a wrong-root invocation silently failing the bound tree's RUNNING trial.
+    Discovery is the only read, so the failure escalates and nothing in either
+    tree is touched. The unpatched second invocation pins the same refusal for
+    the ordinary wrong-root case: it conflicts before the registry scan can
+    reap anything.
     """
     import phasesweep.engine.ledger as ledger
 
@@ -1866,7 +1861,7 @@ def test_winner_and_trial_attrs_record_trainer_environment_identity(
     """Every trial records which environment produced it; the winner keeps the digest.
 
     Names are diagnostic and persisted; values are secrets and never leave the
-    process (review v0.5.18 / finding F3).
+    process.
     """
     monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
     trainer = write_constant_trainer(tmp_path)
@@ -1967,11 +1962,10 @@ def test_zero_trial_preflight_failure_does_not_poison_fingerprint(
 ) -> None:
     """A resource failure before any trial must not bind an empty study forever.
 
-    Reviewer repro (review v0.5.17 / finding A): the fingerprint is stamped
-    before GPU preflight; a config that failed before launching any trial used
-    to leave a zero-trial study bound to that fingerprint, so the *corrected*
-    config was rejected with StudyFingerprintMismatchError even though nothing
-    ever ran.
+    The fingerprint is stamped before GPU preflight; a config that fails
+    before launching any trial must not leave a zero-trial study bound to that
+    fingerprint, or the *corrected* config would be rejected with
+    StudyFingerprintMismatchError even though nothing ever ran.
     """
     from tests.conftest import make_experiment, write_trainer
 
