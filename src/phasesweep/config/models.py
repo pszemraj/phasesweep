@@ -741,9 +741,9 @@ class Phase(_Frozen):
             example = seed_keys[0]
             raise ValueError(
                 f"Phase {self.name!r}: seed keys cannot be searched: {seed_keys}. A searched "
-                "seed lets seed noise win as if it were a configuration. Move the seed to "
-                f"fixed_overrides, or measure seed noise with repeats: {{key: {example}, "
-                "values: [0, 1, 2]}."
+                "seed lets seed noise win as if it were a configuration. Fix the seed in "
+                "fixed_overrides or trainer_config. To compare finalists across seeds, use "
+                f"repeats: {{key: {example}, values: [0, 1, 2]}}."
             )
         return self
 

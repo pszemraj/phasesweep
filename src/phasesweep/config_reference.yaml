@@ -316,15 +316,15 @@ phases: list[object] (required)
     # Conflicts with: phases[].search_space (the same key cannot be both fixed and sampled in one phase; config load fails).
     # Conflicts with: phases[].repeats.key (the repeat key cannot also be fixed; config load fails).
     # Requires: a fixed key and another key that is its prefix or extension cannot coexist across the inherited, fixed, sampled and repeat keys; config load fails.
-    # Recommended: fix batch size, seed, data split and the training and evaluation budget here when comparing hyperparameters, or put the seed in phases[].repeats to rank by its mean. PhaseSweep does not equalize training between trials.
+    # Recommended: fix batch size, seed, data split and the training and evaluation budget here when comparing hyperparameters. To compare discrete finalists across seeds instead, put the seed in phases[].repeats. PhaseSweep does not equalize training between trials.
     fixed_overrides: map[string, any] = {}
 
     # Map from a dotted trainer-defined override key to the parameter that is sampled for it. optimizer.lr below is an example key; replace it with any valid dotted name.
     # The key rules are the same as for phases[].fixed_overrides, and the sampled value is passed to the trainer like a fixed value.
     # Float and int values reach the trainer as Python floats and ints, and categorical choices keep their YAML type.
     # An empty search_space without phases[].repeats is a fixed configuration: the phase draws nothing from its sampler and runs phases[].fixed_overrides as they are. phases[].n_trials above 1 only retries failed attempts, as phases[].n_trials describes. validate and the dry run say "fixed configuration, no sampler draws (resumable)".
-    # An empty search_space with phases[].repeats is a seed audit: one configuration run once per repeat value.
-    # A key that is exactly seed or ends in .seed fails config load, because a searched seed lets seed noise win as if it were a configuration. Fix the seed in phases[].fixed_overrides, or measure seed noise with phases[].repeats. The match is case sensitive.
+    # An empty search_space with phases[].repeats is a seed audit: one configuration run once per repeat value, an optional one-off for measuring how far a configuration moves with the seed.
+    # A key that is exactly seed or ends in .seed fails config load, because a searched seed lets seed noise win as if it were a configuration. Fix the seed in phases[].fixed_overrides or trainer_config. To compare finalists across seeds, use phases[].repeats. The match is case sensitive.
     # Overrides: trainer_config (the sampled value replaces the base value at the same dotted path).
     # Overrides: phases[].inherits (a sampled value replaces an inherited value that was only fixed; a key an inherited phase sampled cannot be searched again, and config load fails).
     # Conflicts with: phases[].fixed_overrides (a key cannot be both fixed and sampled in one phase; config load fails).
@@ -392,6 +392,7 @@ phases: list[object] (required)
         step: int = 1
 
     # Run every configuration once per repeat value, typically seeds, and rank configurations by a reducer over their members instead of by any single trial.
+    # A targeted tool: R values multiply the phase's cost by R. Use it to compare a few discrete finalists, such as architectures or another categorical choice, whose gap is near the noise; to measure how far one configuration moves with the seed; or to report a final configuration's spread. For a continuous hyperparameter such as the learning rate, more distinct values of it, one trial each (a denser grid or more seeded random draws over a log range), cover the same ground, and the trend across neighbors shows the noise.
     # The sampler draws the repeat value as one more axis, so a phase of N configurations with R values runs N x R trials.
     # Under grid every cell is one configuration with one repeat value. Under seeded random each slot of R consecutive trial numbers draws one configuration and runs it once per value, value number trial_number mod R.
     # A configuration ranks only as a complete group: one trial per repeat value, every one COMPLETE, feasible, inside metric.min and metric.max and every constraint. A group with a failed or infeasible member never ranks, and a failed member is not retried.
@@ -403,7 +404,7 @@ phases: list[object] (required)
     # Conflicts with: phases[].allow_partial_grid (a partial grid would leave most groups incomplete; config load fails).
     # Requires: phases[].sampler.type grid, or random with phases[].sampler.seed; any other sampler fails config load.
     # Requires: with an empty phases[].search_space, phases[].n_trials equals the number of values; with random it is a multiple of it; with grid it equals the number of configurations times the number of values.
-    # Unset: every trial ranks on its own.
+    # Unset (the default): one trial per configuration, and every trial ranks on its own.
     repeats: object | null = null
       # Dotted override key that receives the repeat value on every trial, for example seed or data.shard. The key rules are the same as for phases[].fixed_overrides.
       # The value reaches the trainer like a sampled value and is recorded as a param, so trials.csv has a param column for it.

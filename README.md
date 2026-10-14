@@ -143,7 +143,7 @@ pip install "phasesweep[wandb]"
 
 For native MLflow metrics, install `phasesweep[mlflow]`, configure an existing experiment in the `mlflow` block, and use `extractor: {type: mlflow, metric_key: eval/loss, select: last}`. See the [MLflow guide](https://github.com/pszemraj/phasesweep/blob/main/docs/mlflow.md) for both run ownership modes, a complete CPU example, Databricks setup, and retrying result uploads.
 
-Report through `phasesweep.report_objective(...)` and the `json_envelope` extractor when the checkpoint behind a value matters, as with Transformers' `load_best_model_at_end`; the same call can write report-only values with `extra=`. A top-level `observe:` list records such values per trial without ranking on them, for example a held-out test score, and `metric.min` / `metric.max` keep a collapsed run from winning. When the metric moves with the seed, rank by a mean over seeds with `repeats`. [Noisy objectives and small budgets](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets) covers these together, and [objective evidence](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#objective-evidence-constraints-and-gates) defines the extractors, bounds and `observe`.
+Report through `phasesweep.report_objective(...)` and the `json_envelope` extractor when the checkpoint behind a value matters, as with Transformers' `load_best_model_at_end`; the same call can write report-only values with `extra=`. A top-level `observe:` list records such values per trial without ranking on them, for example a held-out test score, and `metric.min` / `metric.max` keep a collapsed run from winning. When the metric moves with the seed, spend trials on more distinct values and read the trend across neighbors; `repeats` ranks by a mean over seeds when you compare a few discrete finalists. [Noisy objectives and small budgets](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets) covers these together, and [objective evidence](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#objective-evidence-constraints-and-gates) defines the extractors, bounds and `observe`.
 
 ## Connect an agent
 
@@ -151,7 +151,7 @@ The optional MCP server connects an AI agent to experiments you have approved wi
 
 ## Reference
 
-- [Configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md): Experiment YAML, search spaces, inheritance, repeats and noisy objectives, gates, and objective extractors.
+- [Configuration guide](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md): Experiment YAML, search spaces, inheritance, noisy objectives and small budgets, repeats, gates, and objective extractors.
 - [Configuration reference](https://github.com/pszemraj/phasesweep/blob/main/src/phasesweep/config_reference.yaml): per-key types, defaults, valid values, interactions, and lifecycle warnings. Too long to read whole; `phasesweep explain` lists the top-level keys and `phasesweep explain 'phases[].sampler'` prints one key and everything below it.
 - [Minimal starting configuration](https://github.com/pszemraj/phasesweep/blob/main/examples/example.yaml): one local toy-trainer attempt; validate or run it from the checkout root.
 - [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md): filesystem layout, locks, GPU leases, process supervision, fingerprints, and resume.

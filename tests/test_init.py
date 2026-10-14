@@ -231,18 +231,28 @@ def test_init_template_runs_to_a_winner_per_phase_on_the_toy_trainer(
 
 @pytest.mark.integration
 @pytest.mark.usefixtures("trainer_python_on_path")
-def test_noisy_template_winner_carries_the_seed_spread(tmp_path: Path) -> None:
+def test_noisy_template_winner_comes_from_single_trials_and_records_the_observation(
+    tmp_path: Path,
+) -> None:
     winners = _init_and_run(tmp_path, "noisy")
 
-    audit = winners["seed_audit"].repeats
-    assert audit is not None
-    assert audit["key"] == "seed"
-    assert audit["spread"]["n"] == 6
-    assert audit["spread"]["sd"] > 0
-    grid = winners["learning_rate"].repeats
-    assert grid is not None
-    assert sorted(member["repeat"] for member in grid["members"]) == [1, 2, 3]
+    assert list(winners) == ["learning_rate"]
+    assert winners["learning_rate"].repeats is None
     assert winners["learning_rate"].observed == {"param_bytes": 8_800_000.0}
+
+
+def test_noisy_template_is_a_dense_single_seed_learning_rate_grid(tmp_path: Path) -> None:
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        assert runner.invoke(cli_main, ["init", "--template", "noisy"]).exit_code == 0
+        experiment = load_experiment(Path("noisy.yaml").resolve())
+
+    (phase,) = experiment.phases
+    assert phase.repeats is None
+    assert phase.n_trials == 8
+    assert phase.sampler.type == "grid"
+    assert list(phase.search_space) == ["optimizer.lr"]
+    assert experiment.trainer_config["seed"] == 1
 
 
 def test_init_creates_parent_directories_for_custom_output(tmp_path: Path) -> None:

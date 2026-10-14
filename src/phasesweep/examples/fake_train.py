@@ -4,8 +4,8 @@ The loss is a deterministic formula of the model, optimizer and regularization v
 optional integer ``seed`` (a top-level ``seed`` in the config YAML, or a ``seed=N`` /
 ``--seed=N`` token) adds a Gaussian term of scale ``SEED_NOISE_SCALE``, drawn deterministically
 from that seed and the trial's hyperparameters, so one seed gives different configurations
-different noise and repeats over seeds spread the way a noisy objective does. Without a seed
-there is no noise.
+different noise: neighboring learning rates scatter around the trend, and repeats over seeds
+spread, the way a noisy objective does. Without a seed there is no noise.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import yaml
 from phasesweep import report_objective
 
 #: Standard deviation of the loss noise a ``seed`` adds, comparable to the loss gap between
-#: neighboring learning rates so a few seeds leave close configurations within noise.
+#: neighboring learning rates, so close configurations scatter about the trend.
 SEED_NOISE_SCALE = 0.02
 
 

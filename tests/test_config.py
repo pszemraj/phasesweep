@@ -1297,13 +1297,13 @@ def test_repeats_key_overrides_inherited_value_and_is_never_exported() -> None:
 
 
 @pytest.mark.parametrize("key", ["seed", "trainer.seed"])
-def test_seed_search_keys_point_at_repeats(key: str) -> None:
+def test_seed_search_keys_say_how_to_fix_the_seed(key: str) -> None:
     with pytest.raises(ValidationError) as excinfo:
         Phase(name="p", n_trials=2, search_space={key: {"type": "int", "low": 0, "high": 9}})
     assert (
         f"Phase 'p': seed keys cannot be searched: ['{key}']. A searched seed lets seed noise "
-        "win as if it were a configuration. Move the seed to fixed_overrides, or measure seed "
-        f"noise with repeats: {{key: {key}, values: [0, 1, 2]}}."
+        "win as if it were a configuration. Fix the seed in fixed_overrides or trainer_config. "
+        f"To compare finalists across seeds, use repeats: {{key: {key}, values: [0, 1, 2]}}."
     ) in str(excinfo.value)
     assert Phase(
         name="p", n_trials=2, search_space={"seedling": {"type": "int", "low": 0, "high": 9}}

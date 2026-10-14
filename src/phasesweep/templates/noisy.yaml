@@ -1,14 +1,17 @@
-# phasesweep template: a noisy objective, with a seed audit, repeats, a metric bound and observe
+# phasesweep template: eight log-spaced learning rates, one trial each, for a noisy objective, with a metric bound and observe
 # Details on any key: phasesweep explain <key>, e.g. phasesweep explain 'phases[].sampler'
 #
-# When one run's metric moves with the seed, a single trial cannot rank configurations whose true
-# gap is smaller than that movement. This template measures the movement, then ranks by the mean
-# over several seeds. Background: the "Noisy objectives and small budgets" section of
+# When one run's metric moves with the seed, the cheapest way to see past the noise is more distinct
+# values, not repeats. This template tries eight learning rates spaced evenly on a log scale, one
+# trial each. Neighboring rates act as replicates: noise shows as scatter around the trend, and the
+# best rate is where the trend bottoms out. Read the trend with phasesweep status CONFIG --trials
+# or in trials.csv. A winner that is an isolated dip among clearly worse neighbors is likely noise,
+# and the trend is the better guide. Background: the "Noisy objectives and small budgets" section of
 # https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets
 #
-# It runs as written on the packaged toy trainer, which adds seed noise when given a seed. For
-# your own trainer, replace trial_command, the trainer_config keys, the metric extractor, the
-# observe entry and the bound, and make the trainer read the seed from the key repeats.key names.
+# It runs as written on the packaged toy trainer, which adds seed noise when its config carries a
+# seed, so trainer_config pins seed 1. For your own trainer, replace trial_command, the
+# trainer_config keys, the metric extractor, the observe entry and the bound.
 experiment: phasesweep_noisy
 storage: auto
 provenance:
@@ -25,6 +28,9 @@ execution:
 trial_command: "python -m phasesweep.examples.fake_train --config {config_path}"
 
 trainer_config:
+  # One fixed seed for every trial. Each learning rate still draws its own noise from the toy
+  # trainer, so the scatter around the trend is visible.
+  seed: 1
   model:
     n_layers: 8
     dropout: 0.1
@@ -35,9 +41,9 @@ trainer_config:
 metric:
   name: eval_loss
   goal: minimize
-  # Viability bound: a loss above this means the run diverged. A configuration ranks only if every
-  # one of its seeds is inside the bound, so one diverged seed disqualifies the configuration
-  # instead of being averaged into a mean that hides it. Set it from the seed audit's spread.
+  # Viability bound: a loss above this means the run diverged. A trial outside the bound completes
+  # with its real value but cannot win, so a diverged run never ranks. Set it above the loss of
+  # ordinary runs, which the trial table shows.
   max: 0.6
   extractor:
     type: json_envelope
@@ -55,22 +61,15 @@ observe:
     extractor: { type: json, path: result.json, key: param_bytes }
 
 phases:
-  - name: seed_audit
-    comment: "Run the unchanged baseline once per seed to measure how far the loss moves from the seed alone."
-    # An empty search_space is one fixed configuration, so n_trials equals the number of seeds.
-    # This phase's WINNER line in run.log, and the repeats block of its winner.yaml, give the
-    # mean, standard deviation and range over the seeds.
-    n_trials: 6
-    sampler: { type: grid }
-    search_space: {}
-    repeats: { key: seed, values: [1, 2, 3, 4, 5, 6] }
-
   - name: learning_rate
-    comment: "Compare three close learning rates, each ranked by its mean over three seeds."
-    # Three learning rates times three seeds is nine trials. The trainer receives the seed as the
-    # top-level key seed. Choices closer than the seed spread can tie, and the run log says so.
-    n_trials: 9
+    comment: "Eight learning rates evenly spaced on a log scale, one trial each; read the trend across them."
+    # Eight values and eight trials: a grid runs every value once. Grid takes explicit values, so
+    # the log spacing is in the list (each value is about 1.39 times the one before it). For a
+    # range instead, a seeded random phase over a float with log: true draws values evenly across
+    # orders of magnitude. More values give a clearer trend, at one trial each.
+    n_trials: 8
     sampler: { type: grid }
     search_space:
-      optimizer.lr: { type: categorical, choices: [0.0002, 0.0003, 0.0004] }
-    repeats: { key: seed, values: [1, 2, 3], reduce: mean }
+      optimizer.lr:
+        type: categorical
+        choices: [0.0001, 0.00014, 0.0002, 0.00027, 0.00037, 0.00052, 0.00072, 0.001]
