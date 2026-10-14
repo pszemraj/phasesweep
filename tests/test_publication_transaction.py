@@ -35,6 +35,7 @@ from phasesweep.cli import _show_experiment_winners
 from phasesweep.config import Experiment, IntParam, Phase, Sampler
 from phasesweep.engine import (
     NoFeasibleTrialError,
+    PublicationAccessError,
     PublicationCommitError,
     PublicationIntegrityError,
     TerminalReport,
@@ -1419,6 +1420,86 @@ def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Pat
 
     assert pointer_path.is_symlink()
     assert current_path.read_bytes() == current
+
+
+def _with_later_phase(experiment: Experiment) -> Experiment:
+    """Append a phase ``q`` after the published phase, so a resume can start from it."""
+    later = Phase(
+        name="q",
+        inherits=["p"],
+        n_trials=1,
+        sampler=Sampler(type="random", seed=1),
+        search_space={"b": IntParam(type="int", low=0, high=10)},
+    )
+    return experiment.model_copy(update={"phases": [*experiment.phases, later]})
+
+
+@pytest.mark.parametrize(
+    ("tamper", "match"),
+    [("append", "byte length"), ("rewrite", "digest")],
+)
+def test_summary_anchor_mismatch_raises_under_the_resume_flag(
+    tmp_path: Path, tamper: str, match: str
+) -> None:
+    """A summary that disagrees with its pointer is a refusal, not a verdict, for a resume."""
+    experiment, generation_id = _golden_publication(tmp_path)
+    summary_path = _generation_summary_path(experiment, generation_id)
+    content = summary_path.read_bytes()
+    summary_path.write_bytes(content + b"\n" if tamper == "append" else content[:-2] + b"#\n")
+
+    verdict = _resolve_publication_pointer(experiment)
+    assert verdict.state == "failed" and verdict.error is not None and match in verdict.error
+    with pytest.raises(PublicationIntegrityError, match=match):
+        _resolve_publication_pointer(experiment, raise_on_manifest_error=True)
+    with pytest.raises(PublicationIntegrityError, match=match):
+        _published_for_resume(experiment)
+
+
+@pytest.mark.parametrize("damage", ["dangling_pointer", "malformed_pointer", "missing_summary"])
+def test_unusable_publication_is_refused_for_resume_never_read_as_absent(
+    tmp_path: Path, damage: str
+) -> None:
+    """A recorded publication that cannot be used refuses a resume instead of answering "no winner yet"."""
+    experiment, generation_id = _golden_publication(tmp_path)
+    pointer_path = _last_successful_generation_path(experiment)
+    if damage == "dangling_pointer":
+        pointer_path.unlink()
+        pointer_path.symlink_to("missing-target.yaml")
+    elif damage == "malformed_pointer":
+        pointer_path.write_text("not a pointer\n")
+    else:
+        _generation_summary_path(experiment, generation_id).unlink()
+    assert _resolve_publication_pointer(experiment, raise_on_manifest_error=True).state == "failed"
+
+    with pytest.raises(PublicationIntegrityError):
+        _published_for_resume(experiment)
+    with pytest.raises(PublicationIntegrityError):
+        run_experiment(_with_later_phase(experiment), from_phase="q", dry_run=True)
+
+
+def test_absent_publication_is_still_nothing_published_for_resume(tmp_path: Path) -> None:
+    """Only a tree that never published reads as absent."""
+    experiment, _ = _golden_publication(tmp_path)
+    _last_successful_generation_path(experiment).unlink()
+
+    assert _published_for_resume(experiment) is None
+
+
+@requires_nonroot
+def test_unreadable_pointer_is_an_access_refusal_for_resume(tmp_path: Path) -> None:
+    """A pointer this user may not read is a permission refusal, not an absent publication."""
+    experiment, _ = _golden_publication(tmp_path)
+    pointer_path = _last_successful_generation_path(experiment)
+    original_mode = stat.S_IMODE(pointer_path.stat().st_mode)
+    pointer_path.chmod(0o000)
+    try:
+        assert _resolve_publication_pointer(experiment).state == "permission_denied"
+        with pytest.raises(PublicationAccessError, match="permission denied"):
+            _published_for_resume(experiment)
+        with pytest.raises(PublicationAccessError):
+            run_experiment(_with_later_phase(experiment), from_phase="q", dry_run=True)
+    finally:
+        pointer_path.chmod(original_mode)
 
 
 def test_surviving_pointer_prevents_root_projection_fallback_after_generation_loss(

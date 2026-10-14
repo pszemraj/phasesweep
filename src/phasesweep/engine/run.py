@@ -664,6 +664,10 @@ def _run_experiment_inner(
     Raises:
         TimeoutError: The whole-run wallclock deadline expired before a phase
             could start.
+        PublicationAccessError: A dry run resumes over a recorded publication
+            this user cannot read.
+        PublicationIntegrityError: A dry run resumes over a recorded publication
+            that is unreadable, malformed, or fails validation.
 
     """
     dry_run = ledger is None

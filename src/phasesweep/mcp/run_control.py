@@ -19,6 +19,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.resume import _accept_skipped_winner, _published_for_resume
 from phasesweep.engine.state import Winner
 from phasesweep.mcp.audit import AuditLogger
@@ -31,6 +32,7 @@ from phasesweep.mcp.errors import (
     McpToolError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    ResumePublicationUnusableError,
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
     RunNamespaceMismatchError,
@@ -252,6 +254,8 @@ class RunControl:
             does not allow ``from_phase`` resumes.
         :raises InvalidPhaseError: If ``from_phase`` names no phase of this experiment.
         :raises ResumeNotReadyError: If an earlier phase has no compatible winner.
+        :raises ResumePublicationUnusableError: If the recorded publication no longer
+            validates or this server cannot read it.
         :raises LaunchInProgressError: If another launch currently holds the launch lock.
         :raises ExperimentBusyError: If this experiment already has a live run.
         :raises ConcurrencyLimitError: If the server is at ``max_concurrent_runs``.
@@ -554,6 +558,8 @@ class RunControl:
         :raises ResumeNotReadyError: If an earlier phase has no published
             winner, or its winner or source evidence is unusable or
             incompatible with the current config.
+        :raises ResumePublicationUnusableError: If the recorded publication no
+            longer validates or this server cannot read it.
         """
         skipped = reg.experiment.phases[: reg.phase_names.index(from_phase)]
         if not skipped:
@@ -568,6 +574,12 @@ class RunControl:
                 winners[phase.name] = _accept_skipped_winner(
                     reg.experiment, phase, winners, publication
                 )
+        except PublicationIntegrityError as exc:
+            log.info("resume refused for experiment=%s: %s", reg.id, exc)
+            raise ResumePublicationUnusableError(reg.id, from_phase, "failed") from None
+        except PublicationAccessError as exc:
+            log.info("resume refused for experiment=%s: %s", reg.id, exc)
+            raise ResumePublicationUnusableError(reg.id, from_phase, "permission_denied") from None
         except FileNotFoundError:
             raise ResumeNotReadyError(reg.id, from_phase, phase.name) from None
         except (

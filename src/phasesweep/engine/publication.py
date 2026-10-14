@@ -114,14 +114,20 @@ def _resolve_publication_pointer(
 
     :param Experiment experiment: Experiment config with artifact root details.
     :param bool raise_on_manifest_error: Re-raise a publication's
-        manifest error for an actionable resume failure instead of reporting
-        it as an unusable verdict, as read-only status APIs require. Only the
-        manifest branch raises; every other failure resolves to ``failed`` or
+        manifest error or summary-anchor mismatch for an actionable resume
+        failure instead of reporting it as an unusable verdict, as read-only
+        status APIs require. Only those two raise: a manifest artifact that
+        cannot be read or fails validation, and a summary whose byte length or
+        SHA-256 disagrees with the pointer. Every other failure resolves to a
+        verdict: an unreadable or malformed pointer, a dangling target, and a
+        missing, unparsable, or misnamed summary are ``failed``, and a
+        permission denial on the pointer or the summary is
         ``permission_denied``.
     :raises PublicationAccessError: ``raise_on_manifest_error`` is set and a
         manifest artifact cannot be read as the current user.
     :raises PublicationIntegrityError: ``raise_on_manifest_error`` is set and
-        the target's artifact manifest does not validate.
+        the target's summary disagrees with the pointer's byte length or
+        SHA-256, or its artifact manifest does not validate.
     :return PublicationPointer: The publication verdict for this experiment.
     """
     pointer_path = path_ops._last_successful_generation_path(experiment)

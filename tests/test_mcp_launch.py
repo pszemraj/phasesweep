@@ -31,6 +31,7 @@ from phasesweep.engine import (
     run_experiment,
 )
 from phasesweep.engine.paths import (
+    _last_successful_generation_path,
     _phase_dir,
 )
 from phasesweep.engine.publication_validation import ValidatedPublication
@@ -42,6 +43,7 @@ from phasesweep.mcp.errors import (
     InvalidPhaseError,
     PermissionDeniedError,
     ResumeNotReadyError,
+    ResumePublicationUnusableError,
     RunCapacityUnknownError,
     UnknownExperimentError,
 )
@@ -61,6 +63,7 @@ from phasesweep.runtime.reaper import (
 )
 from tests.conftest import (
     file_mode,
+    requires_nonroot,
     write_constant_trainer,
 )
 from tests.ledger_fixtures import republish_as_incomplete
@@ -240,6 +243,41 @@ def test_resume_requires_prior_winner(tmp_path: Path) -> None:
 
     assert "get_latest_run('srv') first" in str(excinfo.value)
     assert "get_run_results with its run_id" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("damage", "message"),
+    [
+        pytest.param("dangling", "no longer validates", id="failed"),
+        pytest.param(
+            "unreadable",
+            "cannot read the recorded publication",
+            id="permission_denied",
+            marks=requires_nonroot,
+        ),
+    ],
+)
+def test_resume_refuses_an_unusable_publication_instead_of_reporting_no_winner(
+    tmp_path: Path, damage: str, message: str
+) -> None:
+    """A recorded publication that cannot be used refuses the resume, naming that state."""
+    _config_path, app, registry, store = side_effect_app(tmp_path, phases=RESUMABLE_PHASES)
+    pointer = _last_successful_generation_path(registry.get("srv").experiment)
+    pointer.parent.mkdir(parents=True, exist_ok=True)
+    if damage == "dangling":
+        pointer.symlink_to("missing-target.yaml")
+    else:
+        pointer.write_text("schema_version: 1\n")
+        pointer.chmod(0o000)
+    try:
+        with pytest.raises(ResumePublicationUnusableError, match=message) as excinfo:
+            app.launch("srv", from_phase="q")
+    finally:
+        if damage == "unreadable":
+            pointer.chmod(0o600)
+
+    assert "no winner yet" not in str(excinfo.value)
+    assert store.list_handles() == []
 
 
 @pytest.mark.parametrize(

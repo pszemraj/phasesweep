@@ -12,6 +12,7 @@ Two audiences, two trees:
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal
 
 _MAX_CAPACITY_BLOCKING_RUN_IDS = 5
 
@@ -293,3 +294,34 @@ class ResumeNotReadyError(McpToolError):
             "first; if it finds a run, call get_run_results with its run_id. Resume only after "
             "every earlier phase has a winner."
         )
+
+
+class ResumePublicationUnusableError(McpToolError):
+    """Raised when ``from_phase`` resume is requested over a publication that cannot be used."""
+
+    def __init__(
+        self,
+        experiment_id: str,
+        from_phase: str,
+        publication_integrity: Literal["failed", "permission_denied"],
+    ) -> None:
+        """Create a resume-over-unusable-publication tool error.
+
+        :param str experiment_id: Catalog id being resumed.
+        :param str from_phase: Requested resume phase.
+        :param Literal["failed", "permission_denied"] publication_integrity: Whether
+            the recorded publication no longer validates or cannot be read by this server.
+        """
+        if publication_integrity == "failed":
+            detail = (
+                "the recorded publication no longer validates (publication_integrity: failed). "
+                "Do not retry and do not launch a replacement run; stop and report that the "
+                "published result needs operator inspection."
+            )
+        else:
+            detail = (
+                "this server cannot read the recorded publication to validate it "
+                "(publication_integrity: permission_denied). Do not retry; stop and ask the "
+                "operator to re-read it as the publishing user or restore read permission."
+            )
+        super().__init__(f"cannot resume {experiment_id!r} from phase {from_phase!r}: {detail}")
