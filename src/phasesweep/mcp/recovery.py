@@ -60,7 +60,7 @@ from phasesweep.mcp.snapshots import (
 )
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.reaper import (
-    identity_from_earlier_boot,
+    foreign_pid_namespace_reason,
     is_same_live_process,
     kill_stale_group,
     read_boot_id,
@@ -148,14 +148,24 @@ def recover_run(
         return
 
     identity = store.cleanup_identity(handle)
+    visibility = store.runner_visibility(handle)
+    if visibility == "unobservable":
+        # The recorded PID, start time, and group are numbered in another PID
+        # namespace, where they name unrelated processes: neither a liveness
+        # check nor a signal would mean anything, so nothing is touched.
+        raise RunRecoveryError(
+            f"the runner of {run_id} cannot be inspected from here: "
+            f"{foreign_pid_namespace_reason(identity.pid_namespace)}",
+            action=OperatorAction.FIX_CONFIG,
+        )
     current_boot = read_boot_id()
     if needs.cleanup_needed and (identity.boot_id is None or current_boot is None):
         raise RunRecoveryError(
             "runner boot id is unavailable; refusing automated process-group cleanup "
             "because PID reuse after reboot cannot be ruled out"
         )
-    earlier_boot = identity_from_earlier_boot(identity.boot_id, current_boot)
-    _require_dead_runner(identity, earlier_boot=earlier_boot, cleanup_needed=needs.cleanup_needed)
+    provably_gone = visibility == "gone"
+    _require_dead_runner(identity, provably_gone=provably_gone, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
     transition_lock = store.transition_lock(handle) if confirm else contextlib.nullcontext()
@@ -165,7 +175,7 @@ def recover_run(
                 identity,
                 needs,
                 confirm=confirm,
-                earlier_boot=earlier_boot,
+                provably_gone=provably_gone,
                 cleanup_recorded=store._cleanup_recovered(handle),
             )
             # The runner may have written its terminal status after the initial
@@ -416,23 +426,26 @@ def _recovery_needs(
 
 
 def _require_dead_runner(
-    identity: ProcessIdentity, *, earlier_boot: bool, cleanup_needed: bool
+    identity: ProcessIdentity, *, provably_gone: bool, cleanup_needed: bool
 ) -> None:
     """Reject a live runner or an identity that cannot be checked safely.
 
-    A prior boot proves recorded processes are gone. Otherwise, a cleanup requiring a PID must
-    include its Linux start time before the live-process check can safely distinguish PID reuse.
+    A prior boot, or a PID namespace with no process left, proves recorded processes are gone.
+    Otherwise, a cleanup requiring a PID must include its Linux start time before the
+    live-process check can safely distinguish PID reuse. The caller has already refused a runner
+    recorded in a PID namespace this process cannot observe.
 
-    :param ProcessIdentity identity: Recorded runner PID, start time, process group, and boot ID.
-    :param bool earlier_boot: Whether the recorded boot predates the current host boot.
+    :param ProcessIdentity identity: Recorded runner PID, start time, process group, boot ID, and PID namespace.
+    :param bool provably_gone: Whether the recorded boot or PID namespace proves no process remains.
     :param bool cleanup_needed: Whether recovery would need to clean up the runner group.
     :raises RunRecoveryError: The runner is live or PID reuse cannot be excluded.
     """
-    # PID and /proc start time are unique only within one boot. An earlier boot
-    # proves the runner and descendants are gone without signalling a recycled PID.
+    # PID and /proc start time are unique only within one boot and PID namespace.
+    # Either ending proves the runner and descendants are gone without signalling
+    # a recycled PID.
     if (
         cleanup_needed
-        and not earlier_boot
+        and not provably_gone
         and identity.pid is not None
         and identity.pid_starttime is None
     ):
@@ -442,7 +455,7 @@ def _require_dead_runner(
         )
     # The live runner holds the run: once cancel_run stops it, the same request
     # can proceed, while another recover-run would stop at this same check.
-    if not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
+    if not provably_gone and is_same_live_process(identity.pid, identity.pid_starttime):
         raise RunRecoveryError(
             "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
         )
@@ -487,7 +500,7 @@ def _cleanup_runner(
     needs: _RecoveryNeeds,
     *,
     confirm: bool,
-    earlier_boot: bool,
+    provably_gone: bool,
     cleanup_recorded: bool,
 ) -> None:
     """Re-check and, when confirmed, clean the recorded runner process group.
@@ -498,20 +511,20 @@ def _cleanup_runner(
     :param ProcessIdentity identity: Recorded runner process identity and process-group ID.
     :param _RecoveryNeeds needs: Decisions indicating whether runner cleanup is required.
     :param bool confirm: Enable liveness checks and any required process-group cleanup.
-    :param bool earlier_boot: Whether the recorded process belongs to an earlier system boot.
+    :param bool provably_gone: Whether the recorded boot or PID namespace proves no process remains.
     :param bool cleanup_recorded: Prior durable recovery evidence already confirms group cleanup.
     :raises RunRecoveryError: A runner is still live or process-group cleanup remains uncertain.
     """
     # Keep the lock from this liveness check through every signal, study
     # mutation, and recovery-state write in recover_run.
-    if confirm and not earlier_boot and is_same_live_process(identity.pid, identity.pid_starttime):
+    if confirm and not provably_gone and is_same_live_process(identity.pid, identity.pid_starttime):
         raise RunRecoveryError(
             "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
         )
     if (
         needs.cleanup_needed
         and confirm
-        and not earlier_boot
+        and not provably_gone
         and not cleanup_recorded
         and not kill_stale_group(
             identity.pid, identity.pid_starttime, pgid=identity.pgid, grace_seconds=30.0

@@ -20,6 +20,7 @@ from phasesweep.mcp.errors import (
 from phasesweep.mcp.runs import RunHandle, RunState
 from phasesweep.runtime.reaper import (
     read_boot_id,
+    read_pid_namespace,
 )
 from tests.conftest import (
     reaped_pid,
@@ -72,6 +73,7 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
         pgid=runner_pid,
         pid_starttime=111,
         boot_id=read_boot_id(),
+        pid_namespace=read_pid_namespace(),
     )
     original_state = store.state
     first_read = True

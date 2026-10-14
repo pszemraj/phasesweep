@@ -2,7 +2,7 @@
 
 The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. PhaseSweep owns the server and catalog; each MCP client owns its own connection configuration and instructions. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
 
-The server runs over local stdio and is supported on Linux. It needs readable `/proc` process start times to distinguish process reuse during cancellation and recovery.
+The server runs over local stdio and is supported on Linux. It needs readable `/proc` process start times and its own PID namespace to distinguish process reuse during cancellation and recovery.
 
 ## The catalog
 
@@ -83,6 +83,7 @@ Save the `run_id` returned by launch. To reconnect from another chat or after a 
     "state": "running",
     "started_at": "2026-01-01T00:00:00Z",
     "recovery_required": false,
+    "runner_observable": true,
     "failure": null
   }
 }
@@ -127,6 +128,8 @@ Also report a winner's `incomplete: true`: a wallclock timeout cut its phase sho
 
 `recovery_required: true` means cleanup, launch handoff, or snapshot finalization needs operator recovery. Agents should stop rather than guessing at process or result state; [run state and recovery](#run-state-and-recovery) shows where each case comes from.
 
+`runner_observable: false` appears only while a run is `running` and its runner was recorded in another PID namespace than the server's. The server then cannot tell whether the runner is alive and cannot cancel it, so the run reads `running` from durable evidence alone. Agents keep monitoring, never call `cancel_run`, and tell the user if trial counts stop advancing; [PID namespaces](#pid-namespaces) explains the cause.
+
 Winner results describe selected values, not convergence curves, robustness, causality, or unreturned trial history. Confound counts describe the population selection ranked, not the winner's robustness. Treat `<redacted>` values as deliberate catalog policy, not missing data.
 
 The operator may configure MLflow, W&B, ordinary JSON, log, or envelope scoring. Frozen scientific result reads preserve the producing reader's assurance fields and need no tracking SDK, credentials, or remote access. W&B reads an exact finished-summary key from its managed attempt ID. MLflow reads native metric history from the verified bound run in its configured experiment; `last`, `min`, `max`, or exact `step` selects the within-trial observation. Both record the selected history position, without asserting the envelope's evaluation metadata or input-content guarantees. The trainer owns evaluation and aggregation; `metric.goal` ranks the selected trial scalars. Log reduction defaults to `last` and is independent of the ranking goal. Operators preparing native logging should follow [MLflow run ownership and Transformers integration](mlflow.md#choose-run-ownership) and the [trainer environment preflight](config.md#source-checkout-preflight).
@@ -166,6 +169,14 @@ Without `--confirm`, the command only inspects the run and reports the actions i
 
 > [!WARNING]
 > Do not delete run-handle files individually: a run history consists of its handle and matching log/status/config sidecars. Archive that complete set only between campaigns after the run is terminal and no recovery is required.
+
+### PID namespaces
+
+A PID and its start time identify a process only inside one PID namespace, so each saved process identity also records the namespace its numbers belong to, and the server records its own when it launches a runner. This matters when a sandbox, container, or other isolation gives different MCP server processes different views of the same state directory.
+
+A run whose runner was recorded in another namespace is neither alive nor dead from here. It stays `running`, holds its concurrency slot, and reports `runner_observable: false`; the server never waits on, probes, or signals the numbers it recorded, because they name unrelated processes in its own namespace. `cancel_run` refuses it with nothing signalled, and `recover-run` refuses it with a message naming both namespaces. Act from the namespace that launched the run instead.
+
+From the host's initial PID namespace, a recorded namespace that has no process left settles like a reboot: nothing in it can still hold a resource, so the run reads as `failed` and recovery clears it without a signal. The server proves that by finding no process in the recorded namespace after scanning all of `/proc`, and any process it cannot inspect, including another user's when `/proc` is mounted with `hidepid`, or a sandboxed one that is not dumpable, counts as possibly still in it. On such a host the namespace cannot be proven empty, and recovery from the initial namespace refuses with the blocking process named.
 
 ## Security boundary
 

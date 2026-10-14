@@ -22,7 +22,7 @@ import phasesweep.mcp.runs as mcp_runs
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
 from phasesweep.mcp.runs import RunStore, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
-from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
+from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from tests.conftest import file_mode, is_pid_zombie, reaped_pid, requires_nonroot
 from tests.ledger_fixtures import tree_snapshot
 from tests.mcp_helpers import (
@@ -328,6 +328,7 @@ def test_update_allows_only_spawn_transition_and_idempotent_retry(tmp_path: Path
         pid_starttime=read_proc_starttime(os.getpid()),
         launch_state="spawned",
         boot_id=read_boot_id(),
+        pid_namespace=read_pid_namespace(),
     )
     store.create(pending)
 
@@ -778,6 +779,7 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
             "pgid": handle.pgid,
             "pid_starttime": handle.pid_starttime,
             "boot_id": handle.boot_id,
+            "pid_namespace": handle.pid_namespace,
             "cleanup_confirmed": False,
         }
     else:
@@ -826,6 +828,12 @@ def test_run_state_json_live_symlinks_are_rejected(tmp_path: Path, record_kind: 
         ("boot_id", "malformed"),
         ("boot_id", 12345),
         ("boot_id", None),
+        ("pid_namespace", ""),
+        ("pid_namespace", "malformed"),
+        ("pid_namespace", "net:[4026531840]"),
+        ("pid_namespace", "pid:[0]"),
+        ("pid_namespace", 4026531836),
+        ("pid_namespace", None),
         ("visible_params_at_launch", "some"),
         ("visible_params_at_launch", [""]),
         ("visible_params_at_launch", ["lr", "lr"]),
@@ -854,6 +862,7 @@ def test_loaded_handle_shape_is_validated(tmp_path: Path, field: str, value: obj
         ("pid", os.getpid()),
         ("pgid", os.getpid()),
         ("boot_id", "11111111-1111-1111-1111-111111111111"),
+        ("pid_namespace", "pid:[4026531836]"),
     ],
 )
 def test_launching_handle_cannot_have_process_identity(
@@ -1218,10 +1227,37 @@ def test_dead_runner_state_does_not_wait_for_confirmed_recovery(tmp_path: Path) 
             },
             id="boot_id_boolean",
         ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "pid_namespace": "",
+            },
+            id="pid_namespace_empty",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "pid_namespace": "malformed",
+            },
+            id="pid_namespace_malformed",
+        ),
+        pytest.param(
+            {
+                "run_id": "exp-1",
+                "config_sha256": "a" * 64,
+                "cleanup_confirmed": False,
+                "pid_namespace": 4026531836,
+            },
+            id="pid_namespace_integer",
+        ),
     ],
 )
 def test_cleanup_uncertain_marker_shape_is_validated(tmp_path: Path, payload: object) -> None:
-    """A marker with an invalid shape, including an invalid boot id, is not trusted."""
+    """A marker with an invalid shape, including an invalid boot id or PID namespace, is not trusted."""
     store = RunStore(tmp_path / "state")
     handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
     store.create(handle)
@@ -1279,6 +1315,39 @@ def test_boot_id_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) ->
     assert loaded.boot_id == boot_id
     assert json.loads(store.cleanup_uncertain_path("exp-1").read_text())["boot_id"] == boot_id
     assert store.cleanup_identity(loaded).boot_id == boot_id
+
+
+def test_pid_namespace_roundtrips_through_handle_and_cleanup_marker(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    namespace = "pid:[4026539001]"
+    handle = make_dead_run_handle(run_id="exp-1", pid_namespace=namespace)
+
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+
+    loaded = store.get("exp-1")
+    assert loaded == handle
+    assert loaded.pid_namespace == namespace
+    marker = json.loads(store.cleanup_uncertain_path("exp-1").read_text())
+    assert marker["pid_namespace"] == namespace
+    assert store.cleanup_identity(loaded).pid_namespace == namespace
+
+
+def test_cleanup_marker_cannot_move_a_spawned_identity_to_another_namespace(
+    tmp_path: Path,
+) -> None:
+    """A marker naming a different PID namespace than the handle is not trusted."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-1", config_sha256="a" * 64)
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+    marker_path = store.cleanup_uncertain_path(handle.run_id)
+    marker = json.loads(marker_path.read_text())
+    marker["pid_namespace"] = "pid:[4026539001]"
+    private_atomic_write_text(marker_path, json.dumps(marker))
+
+    assert not store.cleanup_uncertain(handle)
+    assert store.cleanup_identity(handle).pid_namespace == handle.pid_namespace
 
 
 def test_cleanup_marker_cannot_override_live_spawned_identity(tmp_path: Path) -> None:

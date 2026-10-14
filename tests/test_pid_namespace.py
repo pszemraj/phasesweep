@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -11,8 +12,20 @@ from pathlib import Path
 
 import pytest
 
+import phasesweep.mcp.recovery as mcp_recovery
+import phasesweep.mcp.registry as mcp_registry
+import phasesweep.mcp.run_control as mcp_run_control
+import phasesweep.mcp.runner as mcp_runner
+import phasesweep.mcp.runs as mcp_runs
 import phasesweep.runtime.reaper as reaper
 from phasesweep.errors import ForeignPidNamespaceError, OperatorAction
+from phasesweep.mcp.audit import AuditLogger
+from phasesweep.mcp.errors import CatalogError, ExperimentBusyError, RunNamespaceMismatchError
+from phasesweep.mcp.recovery import RunRecoveryError, recover_run
+from phasesweep.mcp.registry import Registry, require_linux_mcp_host
+from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN
+from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.process import _trial_process_identity, _write_process_identity
 from phasesweep.runtime.reaper import (
     INITIAL_PID_NAMESPACE,
@@ -24,6 +37,17 @@ from phasesweep.runtime.reaper import (
     pid_namespace_verdict,
     read_pid_namespace,
     read_stale_process_identity,
+)
+from phasesweep.runtime.time import utc_now_iso
+from tests.ledger_fixtures import tree_snapshot
+from tests.mcp_helpers import (
+    claim_runner_handle,
+    live_runs,
+    patch_popen_capture,
+    side_effect_app,
+    stage_dead_run,
+    stage_live_run,
+    write_run_status,
 )
 from tests.recovery_helpers import write_trial_identity
 
@@ -364,3 +388,310 @@ def test_verdict_tracks_a_real_child_pid_namespace() -> None:
     finally:
         child.kill()
         child.wait(timeout=10)
+
+
+# A run whose runner was recorded in another PID namespace is neither alive nor
+# dead from here: the MCP server reads it on durable evidence alone and never
+# probes, reaps, or signals the numbers it recorded.
+
+
+def _stage_foreign_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    allow_cancel: bool = False,
+    cleanup_uncertain: bool = False,
+) -> tuple[PhaseSweepMCP, Registry, RunStore, RunHandle]:
+    """Serve the standard experiment from a nested PID namespace with one run recorded in another."""
+    config, app, registry, store = side_effect_app(tmp_path)
+    monkeypatch.setattr(reaper, "read_pid_namespace", lambda: NESTED_READER)
+    handle = stage_dead_run(
+        store,
+        "srv-foreign",
+        config,
+        registry.get("srv").id,
+        cleanup_uncertain=cleanup_uncertain,
+        allow_cancel=allow_cancel,
+        pid_namespace=RECORDED,
+    )
+    return app, registry, store, handle
+
+
+def _write_finished_status(store: RunStore, run_id: str) -> None:
+    """Record a clean exit whose result snapshot capture failed, the simplest terminal status."""
+    write_run_status(
+        store,
+        run_id,
+        returncode=0,
+        error_class=None,
+        cleanup_confirmed=True,
+        result_snapshot_state="failed",
+        result_snapshot_error="InterruptedFinalization",
+    )
+
+
+def _forbid_run_signals(monkeypatch: pytest.MonkeyPatch, *modules: object) -> None:
+    """Fail the test if any of ``modules`` signals a process group."""
+
+    def refuse(*_args: object, **_kwargs: object) -> bool:
+        raise AssertionError("a process outside this PID namespace must never be signalled")
+
+    for module in modules:
+        monkeypatch.setattr(module, "kill_stale_group", refuse)
+
+
+def test_foreign_namespace_runner_reads_running_and_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _app, registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch)
+    before = tree_snapshot(registry.state_dir)
+    monkeypatch.setattr(
+        mcp_runs,
+        "reap_child",
+        lambda _pid: pytest.fail("a PID from another namespace must never be waited on"),
+    )
+
+    assert store.runner_visibility(handle) == "unobservable"
+    assert store.runner_may_be_alive(handle)
+    assert store.state(handle) == "running"
+    assert not store.recovery_required(handle)
+    assert not store.snapshot_recovery_required(handle)
+    assert live_runs(store) == [handle]
+    assert tree_snapshot(registry.state_dir) == before
+
+
+def test_foreign_namespace_terminal_status_still_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durable evidence needs no probe, so a finished run reads terminal from anywhere."""
+    _app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch)
+    _write_finished_status(store, handle.run_id)
+
+    assert store.state(handle) == "succeeded"
+
+
+def test_foreign_namespace_runner_holds_its_concurrency_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _registry, _store, handle = _stage_foreign_run(tmp_path, monkeypatch)
+
+    with pytest.raises(ExperimentBusyError) as caught:
+        app.launch("srv")
+
+    assert handle.run_id in str(caught.value)
+
+
+def test_gone_namespace_settles_like_an_earlier_boot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _app, registry, store, handle = _stage_foreign_run(
+        tmp_path, monkeypatch, cleanup_uncertain=True
+    )
+    _fake_proc(tmp_path / "fake", monkeypatch)
+    before = tree_snapshot(registry.state_dir)
+
+    assert store.runner_visibility(handle) == "gone"
+    assert not store.runner_may_be_alive(handle)
+    assert store.state(handle) == "failed"
+    assert not store.recovery_required(handle)
+    assert live_runs(store) == []
+    assert tree_snapshot(registry.state_dir) == before
+
+
+@pytest.mark.parametrize("tool", ["status", "await_run", "winners", "latest_run"])
+def test_foreign_namespace_read_tools_leave_state_dir_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str
+) -> None:
+    app, registry, _store, handle = _stage_foreign_run(tmp_path, monkeypatch)
+    monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
+    before = tree_snapshot(registry.state_dir)
+
+    if tool == "await_run":
+        payload = asyncio.run(app.await_run(handle.run_id, timeout_seconds=0))
+    elif tool == "winners":
+        payload = app.winners(run_id=handle.run_id)
+    elif tool == "latest_run":
+        payload = app.latest_run("srv")
+    else:
+        payload = app.status(run_id=handle.run_id)
+
+    assert tree_snapshot(registry.state_dir) == before
+    if tool != "winners":
+        run = payload["run"]
+        assert run["state"] == "running"
+        assert run["recovery_required"] is False
+        assert run["runner_observable"] is False
+
+
+def test_observable_run_reports_runner_observable(tmp_path: Path) -> None:
+    config, app, registry, store = side_effect_app(tmp_path)
+    handle = stage_live_run(store, "srv-here", config, registry.get("srv").id)
+
+    run = app.status(run_id=handle.run_id)["run"]
+
+    assert run["state"] == "running"
+    assert run["runner_observable"] is True
+
+
+def test_finished_foreign_run_reports_runner_observable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a running run can be unobservable: a finished one needs no runner."""
+    app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch)
+    _write_finished_status(store, handle.run_id)
+
+    run = app.status(run_id=handle.run_id)["run"]
+
+    assert run["state"] == "succeeded"
+    assert run["runner_observable"] is True
+
+
+def test_cancel_refuses_foreign_namespace_without_signalling_or_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, allow_cancel=True)
+    audit_path = registry.state_dir / "audit.jsonl"
+    app = PhaseSweepMCP(registry, store, audit=AuditLogger(audit_path))
+    _forbid_run_signals(monkeypatch, mcp_run_control)
+
+    with pytest.raises(RunNamespaceMismatchError, match="PID namespace") as caught:
+        app.cancel(handle.run_id)
+
+    assert "nothing was signalled" in str(caught.value)
+    assert str(registry.state_dir) not in str(caught.value)
+    assert not store.cleanup_uncertain_path(handle.run_id).exists()
+    assert store.state(handle) == "running"
+    events = [json.loads(line) for line in audit_path.read_text().splitlines()]
+    assert [(event["tool"], event["outcome"], event["error_type"]) for event in events] == [
+        (TOOL_CANCEL_RUN, "error", "RunNamespaceMismatchError")
+    ]
+
+
+def test_cancel_settles_gone_namespace_without_signalling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reached, as the earlier-boot twin is, through an unfinalized terminal snapshot."""
+    app, _registry, store, handle = _stage_foreign_run(tmp_path, monkeypatch, allow_cancel=True)
+    write_run_status(store, handle.run_id, returncode=0, result_snapshot_state="pending")
+    _fake_proc(tmp_path / "fake", monkeypatch)
+    _forbid_run_signals(monkeypatch, mcp_run_control)
+
+    result = app.cancel(handle.run_id)
+
+    assert result["cleanup_confirmed"] is True
+
+
+def test_recover_run_refuses_foreign_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _app, registry, _store, handle = _stage_foreign_run(
+        tmp_path, monkeypatch, cleanup_uncertain=True
+    )
+    _forbid_run_signals(monkeypatch, mcp_recovery)
+    before = tree_snapshot(registry.state_dir)
+
+    for confirm in (False, True):
+        with pytest.raises(RunRecoveryError) as caught:
+            recover_run(registry.state_dir, handle.run_id, confirm=confirm, emit=lambda _m: None)
+        assert caught.value.action is OperatorAction.FIX_CONFIG
+        assert RECORDED in str(caught.value)
+        assert NESTED_READER in str(caught.value)
+        assert "kill -9" not in str(caught.value)
+
+    assert tree_snapshot(registry.state_dir) == before
+
+
+def test_recover_run_settles_gone_namespace_without_signalling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _app, registry, store, handle = _stage_foreign_run(
+        tmp_path, monkeypatch, cleanup_uncertain=True
+    )
+    _fake_proc(tmp_path / "fake", monkeypatch)
+    _forbid_run_signals(monkeypatch, mcp_recovery)
+    messages: list[str] = []
+
+    recover_run(registry.state_dir, handle.run_id, confirm=False, emit=messages.append)
+
+    assert messages
+    assert "still appears live" not in "\n".join(messages)
+    assert store.cleanup_uncertain_path(handle.run_id).is_file()
+
+
+def test_spawn_refuses_unreadable_pid_namespace_before_popen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, app, _registry, store = side_effect_app(tmp_path)
+    monkeypatch.setattr(mcp_run_control, "read_pid_namespace", lambda: None)
+    monkeypatch.setattr(
+        "phasesweep.mcp.run_control.subprocess.Popen",
+        lambda *_args, **_kwargs: pytest.fail("no child may exist without a recorded namespace"),
+    )
+
+    with pytest.raises(RuntimeError, match="PID namespace"):
+        app.launch("srv")
+
+    assert [h for h in store.list_handles() if h.launch_state == "spawned"] == []
+
+
+def test_launch_records_the_servers_pid_namespace_in_the_spawned_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, app, _registry, store = side_effect_app(tmp_path)
+    patch_popen_capture(monkeypatch)
+
+    run_id = app.launch("srv")["run_id"]
+
+    handle = store.get(run_id)
+    assert handle is not None
+    assert handle.pid_namespace == read_pid_namespace()
+
+
+def test_runner_receipt_from_another_namespace_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server compares the runner's receipt with its own view of the child, namespace included."""
+    _config, app, _registry, store = side_effect_app(tmp_path)
+    captured = patch_popen_capture(monkeypatch)
+    monkeypatch.setattr("tests.mcp_helpers.read_pid_namespace", lambda: RECORDED)
+    monkeypatch.setattr(mcp_run_control, "kill_stale_group", lambda *_args, **_kwargs: True)
+
+    with pytest.raises(RuntimeError, match="did not match"):
+        app.launch("srv")
+
+    run_id = captured["cmd"][captured["cmd"].index("--run-id") + 1]
+    terminal = json.loads(store.status_path(run_id).read_text())
+    assert terminal["returncode"] == 1
+
+
+def test_runner_refuses_to_persist_a_receipt_without_a_pid_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, _app, registry, store = side_effect_app(tmp_path)
+    claim_runner_handle(
+        store, run_id="srv-no-namespace", config_sha256="0" * 64, started_at=utc_now_iso()
+    )
+    monkeypatch.setattr(mcp_runner, "read_pid_namespace", lambda: None)
+
+    with pytest.raises(RuntimeError, match="PID namespace"):
+        mcp_runner._persist_spawned_handle(
+            state_dir=registry.state_dir,
+            run_id="srv-no-namespace",
+            experiment_id="srv",
+            config_sha256="0" * 64,
+            started_at=utc_now_iso(),
+            allow_cancel=False,
+        )
+
+    pending = store.get("srv-no-namespace")
+    assert pending is not None
+    assert pending.launch_state == "launching"
+
+
+def test_server_startup_requires_a_readable_pid_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mcp_registry, "read_pid_namespace", lambda: None)
+
+    with pytest.raises(CatalogError, match="PID namespace"):
+        require_linux_mcp_host()

@@ -67,4 +67,5 @@ Use `phasesweep mcp check --catalog /absolute/path/to/catalog.yaml` after a cata
 - `action 'launch' is not permitted` or `action 'cancel' is not permitted`: change the catalog only if that is the authority you intend, then reconnect the client.
 - `concurrency limit reached`: await one of the returned blocking run IDs. Do not cancel it or launch a replacement automatically.
 - `recovery_required: true`, unresolved launch, uncertain cleanup, or unavailable terminal snapshot: stop agent activity and follow [run state and recovery](mcp.md#run-state-and-recovery).
+- `runner_observable: false`, or `cancel_run` or `recover-run` naming a recorded PID namespace: the run's runner was launched from another PID namespace than this server's, for example a different sandbox. Run cancellation and recovery from the environment that launched it, as described in [PID namespaces](mcp.md#pid-namespaces).
 - Catalog path, storage, or working-directory rejection: follow [the catalog requirements](mcp.md#the-catalog).

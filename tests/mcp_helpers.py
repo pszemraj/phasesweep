@@ -30,7 +30,7 @@ from phasesweep.mcp.registry import Registry, VisibleParamsPolicy
 from phasesweep.mcp.run_control import _runner_protocol_argv
 from phasesweep.mcp.runs import RunHandle, RunLaunchState, RunStore, write_status_file
 from phasesweep.mcp.tools import PhaseSweepMCP
-from phasesweep.runtime.reaper import read_boot_id, read_proc_starttime
+from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
 
@@ -232,6 +232,7 @@ def make_run_handle(
     allow_cancel: bool = False,
     visible_params_at_launch: VisibleParamsPolicy = "none",
     boot_id: str | None = None,
+    pid_namespace: str | None = None,
     started_at: str | None = None,
 ) -> RunHandle:
     """Build a run handle; by default a spawned one owned by pytest itself.
@@ -245,6 +246,7 @@ def make_run_handle(
     :param bool allow_cancel: Whether the launch snapshot permits cancellation.
     :param VisibleParamsPolicy visible_params_at_launch: Parameter visibility frozen at launch.
     :param str | None boot_id: Boot id to record, or this host's current one when ``None``.
+    :param str | None pid_namespace: PID namespace to record, or this process's own when ``None``.
     :param str | None started_at: Launch timestamp, or the current time when ``None``.
     :return RunHandle: The handle, not yet persisted.
     """
@@ -278,6 +280,9 @@ def make_run_handle(
         boot_id=(read_boot_id() if boot_id is None else boot_id)
         if launch_state == "spawned"
         else None,
+        pid_namespace=(read_pid_namespace() if pid_namespace is None else pid_namespace)
+        if launch_state == "spawned"
+        else None,
     )
 
 
@@ -294,6 +299,7 @@ class StagedRunOptions(TypedDict, total=False):
     allow_cancel: bool
     visible_params_at_launch: VisibleParamsPolicy
     boot_id: str | None
+    pid_namespace: str | None
     started_at: str | None
 
 
@@ -489,8 +495,12 @@ def stage_dead_run(
     *,
     cleanup_uncertain: bool,
     allow_cancel: bool = False,
+    pid_namespace: str | None = None,
 ) -> RunHandle:
-    """Persist a spawned run of ``config`` whose runner has exited, as recover-run finds it."""
+    """Persist a spawned run of ``config`` whose runner has exited, as recover-run finds it.
+
+    ``pid_namespace`` records another PID namespace, or this process's own when ``None``.
+    """
     handle = _stage_run(
         store,
         config,
@@ -498,6 +508,7 @@ def stage_dead_run(
         run_id=run_id,
         experiment_id=experiment_id,
         allow_cancel=allow_cancel,
+        pid_namespace=pid_namespace,
     )
     if cleanup_uncertain:
         store.mark_cleanup_uncertain(handle)
@@ -573,6 +584,7 @@ def patch_popen_capture(monkeypatch: Any) -> dict[str, Any]:
                 allow_cancel=pending.allow_cancel,
                 visible_params_at_launch=pending.visible_params_at_launch,
                 boot_id=read_boot_id(),
+                pid_namespace=read_pid_namespace(),
             )
         )
         os.write(ready_fd, b"R")

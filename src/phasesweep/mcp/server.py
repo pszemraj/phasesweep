@@ -300,6 +300,15 @@ class RunPayload(_ToolPayload):
             "A launch handoff observed mid-transition can still settle."
         )
     )
+    runner_observable: bool = Field(
+        description=(
+            "False only while the run is running and its runner lives in another PID "
+            "namespace than this server, so this server can neither confirm the runner is "
+            "alive nor cancel it. State then rests on durable evidence alone: keep "
+            "monitoring phase trial counts, do not call cancel_run, and tell the user if "
+            "the counts stop advancing."
+        )
+    )
     failure: FailurePayload | None = Field(
         default=None,
         description=(

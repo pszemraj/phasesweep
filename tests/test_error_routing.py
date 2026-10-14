@@ -1210,9 +1210,20 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
         store.cleanup_identity(handle),
         load_only_recovery_needs(),
         confirm=True,
-        earlier_boot=False,
+        provably_gone=False,
         cleanup_recorded=False,
     )
+
+
+def _recover_run_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
+    """Recover a run whose runner was recorded in a PID namespace this process cannot observe."""
+    state_dir = tmp_path / "mcp-state"
+    store = RunStore(state_dir)
+    handle = make_run_handle(run_id="wrap-recover", pid_namespace="pid:[4026539001]")
+    store.create(handle)
+    store.mark_cleanup_uncertain(handle)
+    monkeypatch.setattr("phasesweep.runtime.reaper.read_pid_namespace", lambda: "pid:[4026539333]")
+    return recover_run(state_dir, "wrap-recover", confirm=False, emit=lambda _message: None)
 
 
 def _append_failure_outcomes(
@@ -1574,6 +1585,13 @@ ORIGIN_CASES = (
         raised=RunRecoveryError,
         action=OperatorAction.RETRY,
         message="runner still appears live; use cancel_run first",
+    ),
+    RoutingCase(
+        id="recover_runner_in_foreign_pid_namespace",
+        trigger=_recover_run_from_foreign_namespace,
+        raised=RunRecoveryError,
+        action=OperatorAction.FIX_CONFIG,
+        message="Act from the namespace that launched it",
     ),
     RoutingCase(
         id="prior_phase_abort",

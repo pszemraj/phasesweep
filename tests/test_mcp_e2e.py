@@ -504,6 +504,7 @@ def test_fastmcp_blocking_tools_do_not_delay_concurrent_await(
             "state": "running",
             "started_at": utc_now_iso(),
             "recovery_required": False,
+            "runner_observable": True,
             "failure": None,
         },
         "elapsed_seconds": 0,

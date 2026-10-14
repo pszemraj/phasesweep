@@ -33,7 +33,7 @@ from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,
 )
-from phasesweep.runtime.reaper import read_proc_starttime
+from phasesweep.runtime.reaper import read_pid_namespace, read_proc_starttime
 
 VisibleParamsPolicy: TypeAlias = Literal["none", "all"] | list[str]
 
@@ -42,8 +42,8 @@ def require_linux_mcp_host() -> None:
     """Require Linux process identity semantics for autonomous MCP control.
 
     :raises CatalogError: If the host cannot provide Linux ``/proc`` process
-        start times used to prevent PID-reuse mistakes during cancellation and
-        crash recovery.
+        start times and this process's own PID namespace, both used to prevent
+        PID-reuse mistakes during cancellation and crash recovery.
     """
     if not sys.platform.startswith("linux"):
         raise CatalogError(
@@ -56,6 +56,12 @@ def require_linux_mcp_host() -> None:
             "the phasesweep MCP server cannot read this process's Linux /proc start time, "
             "which is required for PID-reuse-safe cancellation and crash recovery",
             suggestion="mount /proc with process stat access for the MCP server process",
+        )
+    if read_pid_namespace() is None:
+        raise CatalogError(
+            "the phasesweep MCP server cannot read its own PID namespace, which is required "
+            "to tell its runners' process ids from those of another namespace",
+            suggestion="run the MCP server where /proc is the procfs of its own PID namespace",
         )
 
 

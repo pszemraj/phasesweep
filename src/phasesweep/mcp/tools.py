@@ -236,6 +236,7 @@ class PhaseSweepMCP(RunControl):
 
         :param RunHandle handle: Persisted run handle to derive.
         :return dict[str, Any]: Run id, state, launch timestamp, and recovery flag.
+            ``runner_observable`` is False for a running run in another PID namespace.
         """
         state = self._runs.state(handle)
         return {
@@ -243,6 +244,9 @@ class PhaseSweepMCP(RunControl):
             "state": state,
             "started_at": handle.started_at,
             "recovery_required": self._runs.recovery_required(handle),
+            "runner_observable": not (
+                state == "running" and self._runs.runner_visibility(handle) == "unobservable"
+            ),
             "failure": self._run_failure_payload(handle, state=state),
         }
 

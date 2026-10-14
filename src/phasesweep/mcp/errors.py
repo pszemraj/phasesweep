@@ -252,6 +252,22 @@ class RunLaunchUnsettledError(McpToolError):
         )
 
 
+class RunNamespaceMismatchError(McpToolError):
+    """Raised when cancellation targets a runner recorded in another PID namespace."""
+
+    def __init__(self, run_id: str) -> None:
+        """Create a PID-namespace cancellation error.
+
+        :param str run_id: Run id whose runner this server cannot signal.
+        """
+        super().__init__(
+            f"run {run_id!r} was launched in another PID namespace, where its recorded "
+            "process ids name unrelated processes for this server, so nothing was "
+            "signalled. Do not retry. Keep monitoring the run with get_run_status, and "
+            "tell the user it can only be cancelled from the environment that launched it."
+        )
+
+
 class ResumeNotReadyError(McpToolError):
     """Raised when ``from_phase`` resume is requested but an earlier winner is unusable."""
 

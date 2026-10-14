@@ -672,7 +672,8 @@ def mcp_recover_run(state_dir: Path, run_id: str, confirm: bool) -> None:
         directory or run id is unknown, the launch outcome is still unresolved, no
         immutable terminal snapshot exists, an interrupted publication cannot
         be reconciled from its pointer, runner identity cannot rule out PID
-        reuse, the runner still appears live, the run config snapshot is missing or
+        reuse, the runner lives in a PID namespace this process cannot observe,
+        the runner still appears live, the run config snapshot is missing or
         does not match its recorded digest, no trial-level cleanup evidence can be
         confirmed, restored storage cannot account for published history, or study
         recovery fails with a ``RuntimeError``.

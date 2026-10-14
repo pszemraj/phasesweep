@@ -1000,6 +1000,7 @@ def test_latest_run_returns_one_computed_reattachment_handle(tmp_path: Path) -> 
         "state": "running",
         "started_at": handle.started_at,
         "recovery_required": False,
+        "runner_observable": True,
         "failure": None,
     }
 

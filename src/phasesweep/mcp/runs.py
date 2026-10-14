@@ -18,7 +18,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Literal, TypeGuard, cast
+from typing import IO, Literal, TypeAlias, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from phasesweep.config import Experiment
@@ -39,7 +39,9 @@ from phasesweep.runtime.files import (
 )
 from phasesweep.runtime.reaper import (
     identity_from_earlier_boot,
+    is_pid_namespace,
     is_same_live_process,
+    pid_namespace_verdict,
     read_boot_id,
     reap_child,
 )
@@ -47,6 +49,12 @@ from phasesweep.runtime.time import parse_utc_iso
 
 RunState = Literal["running", "succeeded", "failed", "cancelled"]
 RunLaunchState = Literal["launching", "spawned"]
+#: How this process can see a run's runner. ``observable``: its PID and start
+#: time can be probed here. ``gone``: provably no process of it remains, because
+#: its boot ended or its PID namespace has no process left. ``unobservable``:
+#: it was recorded in another PID namespace, whose PID numbers name unrelated
+#: processes here, so liveness is unknown rather than dead.
+RunnerVisibility: TypeAlias = Literal["observable", "gone", "unobservable"]
 
 # Single source of truth for the launch handshake: phasesweep.mcp.runner writes
 # LAUNCH_READY_BYTE once its process identity is durable, and
@@ -64,6 +72,7 @@ __all__ = [
     "RunLaunchState",
     "RunState",
     "RunStore",
+    "RunnerVisibility",
     "UnsupportedStateFormatError",
     "write_status_file",
 ]
@@ -88,7 +97,7 @@ _RUN_EVIDENCE_SUFFIXES = (
     ".launch.lock",
     ".transition.lock",
 )
-MCP_STATE_FORMAT_VERSION = 2
+MCP_STATE_FORMAT_VERSION = 3
 _STATE_FORMAT_MARKER_NAME = ".phasesweep-format.json"
 _STATE_FORMAT_MARKER_PAYLOAD = {"schema_version": MCP_STATE_FORMAT_VERSION}
 
@@ -228,6 +237,7 @@ class ProcessIdentity:
     pgid: int | None
     pid_starttime: int | None
     boot_id: str | None = None
+    pid_namespace: str | None = None
 
 
 @dataclass(frozen=True)
@@ -251,6 +261,10 @@ class RunHandle:
     # "launching" placeholder: a spawned handle is never persisted without it
     # (see mcp/runner.py _persist_spawned_handle and mcp/run_control.py _spawn).
     boot_id: str | None = None
+    # PID namespace that pid/pgid are numbered in. A reader in another
+    # namespace cannot probe them. None only on the pre-spawn "launching"
+    # placeholder, like boot_id.
+    pid_namespace: str | None = None
 
 
 @dataclass
@@ -1006,12 +1020,15 @@ class RunStore:
             return None
         if not _valid_optional_boot_id(handle.boot_id):
             return None
+        if not _valid_optional_pid_namespace(handle.pid_namespace):
+            return None
         if handle.launch_state == "launching":
             if (
                 handle.pid is not None
                 or handle.pgid is not None
                 or handle.pid_starttime is not None
                 or handle.boot_id is not None
+                or handle.pid_namespace is not None
             ):
                 return None
         else:
@@ -1021,7 +1038,7 @@ class RunStore:
                 return None
             if type(handle.pid_starttime) is not int or handle.pid_starttime <= 0:
                 return None
-            if handle.boot_id is None:
+            if handle.boot_id is None or handle.pid_namespace is None:
                 return None
         return handle
 
@@ -1048,6 +1065,12 @@ class RunStore:
         restart cannot know whether ``Popen`` completed before the crash; known
         launch failures write terminal status explicitly.
 
+        A runner recorded in another PID namespace is neither alive nor dead
+        from here: its PID numbers name unrelated processes, so it stays
+        ``running`` on durable evidence alone and is never reaped or signalled.
+        If that namespace is provably empty, the runner is gone and the run
+        settles like one from an earlier boot.
+
         Deriving state writes nothing: every writer that must reserve cleanup
         (cancel, failed-spawn cleanup, operator recovery) persists its own
         marker, and a marker that a later status or boot supersedes is read as
@@ -1056,14 +1079,17 @@ class RunStore:
         :param RunHandle handle: The run handle to evaluate.
         :return RunState: One of ``running`` / ``succeeded`` / ``failed`` / ``cancelled``.
         """
+        visibility = self.runner_visibility(handle)
         # Reap the runner if it has exited. The runner is our child; without
         # this it lingers as a zombie until the server dies, and every state
         # query is a natural place to clean it up (no signal handler needed).
-        if handle.pid is not None:
+        # Only in the namespace its PID is numbered in: elsewhere the number
+        # may be an unrelated child of this process.
+        if handle.pid is not None and visibility == "observable":
             reap_child(handle.pid)
         status = self._read_status(handle)
-        earlier_boot = self.from_earlier_boot(handle)
-        if not earlier_boot and self._marker_reserves(handle, status, gone=False):
+        gone = visibility == "gone"
+        if not gone and self._marker_reserves(handle, status, gone=False):
             return "running"
         if status is not None:
             return self._state_from_status(handle, status)
@@ -1073,12 +1099,15 @@ class RunStore:
             # child has not self-persisted yet", so reserve concurrency until
             # a known launch error or operator recovery writes terminal status.
             return "running"
-        if earlier_boot:
-            # The host rebooted since this runner was spawned. Neither it nor
-            # any descendant it ever had can still hold a GPU or a lock, so
+        if gone:
+            # The host rebooted since this runner was spawned, or its PID
+            # namespace has no process left. Neither the runner nor any
+            # descendant it ever had can still hold a GPU or a lock, so
             # cleanup is confirmed with no signal sent and the run derives
             # terminal instead of parking in cleanup-uncertain recovery.
             return "failed"
+        if visibility == "unobservable":
+            return "running"
         # No status.json: the run is live only if its process is genuinely alive.
         # A zombie (exited without recording a cause - SIGKILL/OOM, or an early
         # SIGTERM before the engine installed its handlers) still answers
@@ -1164,6 +1193,7 @@ class RunStore:
             pgid=handle.pgid,
             pid_starttime=handle.pid_starttime,
             boot_id=handle.boot_id,
+            pid_namespace=handle.pid_namespace,
         )
         candidate_has_identity = candidate.pid is not None or candidate.pgid is not None
         identity = existing if existing is not None and not candidate_has_identity else candidate
@@ -1174,6 +1204,7 @@ class RunStore:
             "pgid": identity.pgid,
             "pid_starttime": identity.pid_starttime,
             "boot_id": identity.boot_id,
+            "pid_namespace": identity.pid_namespace,
             "cleanup_confirmed": False,
         }
         private_atomic_write_text(
@@ -1219,19 +1250,31 @@ class RunStore:
             pgid=handle.pgid,
             pid_starttime=handle.pid_starttime,
             boot_id=handle.boot_id,
+            pid_namespace=handle.pid_namespace,
         )
 
-    def from_earlier_boot(self, handle: RunHandle) -> bool:
-        """Return whether this run's strongest identity predates the current boot.
+    def runner_visibility(self, handle: RunHandle) -> RunnerVisibility:
+        """Relate this run's strongest identity to the boot and PID namespace reading it.
 
-        Callers use this as a conclusive not-alive / cleanup-confirmed verdict:
-        it is safe to skip signalling a PID or process group entirely, because
-        the identity being verified cannot correspond to any live process.
+        ``gone`` is a conclusive not-alive / cleanup-confirmed verdict: it is
+        safe to skip signalling a PID or process group entirely, because the
+        identity being verified cannot correspond to any live process (its boot
+        ended, or its PID namespace has no process left). ``unobservable`` is
+        the opposite of a verdict: the recorded numbers belong to another PID
+        namespace, so this process can neither probe nor signal them.
 
-        :param RunHandle handle: Run handle whose recorded boot should be checked.
-        :return bool: Whether the recorded boot id is known and differs from this boot.
+        :param RunHandle handle: Run handle whose recorded boot and namespace are checked.
+        :return RunnerVisibility: ``gone``, ``unobservable``, or ``observable``.
         """
-        return identity_from_earlier_boot(self.cleanup_identity(handle).boot_id, read_boot_id())
+        identity = self.cleanup_identity(handle)
+        if identity_from_earlier_boot(identity.boot_id, read_boot_id()):
+            return "gone"
+        if identity.pid is None:
+            return "observable"
+        verdict = pid_namespace_verdict(identity.pid_namespace)
+        if verdict == "gone":
+            return "gone"
+        return "observable" if verdict == "same" else "unobservable"
 
     def latest_run_for(self, experiment_id: str) -> RunHandle | None:
         """Return the newest persisted handle for an experiment deterministically.
@@ -1266,7 +1309,7 @@ class RunStore:
         dead_spawned_without_status = (
             handle.launch_state == "spawned"
             and status is None
-            and not self.from_earlier_boot(handle)
+            and self.runner_visibility(handle) == "observable"
             and not self.runner_may_be_alive(handle)
             and self._read_status(handle) is None
         )
@@ -1283,11 +1326,13 @@ class RunStore:
         :param RunHandle handle: Persisted run whose cleanup evidence is checked.
         :return bool: True when a server marker still reserves process
             cleanup or terminal runner status still needs trial reconciliation.
-            A prior boot proves processes dead but does not update their durable
-            trial rows or an already-frozen result snapshot.
+            A prior boot, or a PID namespace with no process left, proves
+            processes dead but does not update their durable trial rows or an
+            already-frozen result snapshot.
         """
         status = self._read_status(handle)
-        if self._marker_reserves(handle, status, gone=self.from_earlier_boot(handle)):
+        gone = self.runner_visibility(handle) == "gone"
+        if self._marker_reserves(handle, status, gone=gone):
             return True
         terminal_cleanup_uncertain = status is not None and status.get("cleanup_confirmed") is False
         return terminal_cleanup_uncertain and not self._cleanup_recovered(handle)
@@ -1370,21 +1415,21 @@ class RunStore:
             and not self.runner_may_be_alive(handle)
         )
 
-    @staticmethod
-    def runner_may_be_alive(handle: RunHandle) -> bool:
+    def runner_may_be_alive(self, handle: RunHandle) -> bool:
         """Return whether a spawned handle may still identify a live runner.
 
         :param RunHandle handle: Persisted runner identity.
         :return bool: True when PID and starttime still identify a non-zombie
-            process of the boot the handle was written under.
+            process of the boot and PID namespace the handle was written under,
+            or when the runner lives in a PID namespace this process cannot
+            observe. False when it is provably gone or observably dead.
         """
-        return (
-            handle.launch_state == "spawned"
-            and handle.pid is not None
-            and handle.pid_starttime is not None
-            and not identity_from_earlier_boot(handle.boot_id, read_boot_id())
-            and is_same_live_process(handle.pid, handle.pid_starttime)
-        )
+        if handle.launch_state != "spawned" or handle.pid is None or handle.pid_starttime is None:
+            return False
+        visibility = self.runner_visibility(handle)
+        if visibility != "observable":
+            return visibility == "unobservable"
+        return is_same_live_process(handle.pid, handle.pid_starttime)
 
     def _read_status(self, handle: RunHandle) -> dict[str, object] | None:
         """Read the runner-written terminal status payload.
@@ -1473,7 +1518,7 @@ class RunStore:
         return (
             status.get("cleanup_confirmed") is False
             and not self._cleanup_recovered(handle)
-            and not self.from_earlier_boot(handle)
+            and self.runner_visibility(handle) != "gone"
         )
 
     def _cleanup_recovered(self, handle: RunHandle) -> bool:
@@ -1547,6 +1592,7 @@ class RunStore:
         pgid = payload.get("pgid")
         pid_starttime = payload.get("pid_starttime")
         boot_id = payload.get("boot_id")
+        pid_namespace = payload.get("pid_namespace")
         if not _valid_positive_optional_int(pid):
             return None
         if not _valid_positive_optional_int(pgid):
@@ -1554,6 +1600,8 @@ class RunStore:
         if not _valid_positive_optional_int(pid_starttime):
             return None
         if not _valid_optional_boot_id(boot_id):
+            return None
+        if not _valid_optional_pid_namespace(pid_namespace):
             return None
         if pid is None:
             if pgid is not None or pid_starttime is not None:
@@ -1566,6 +1614,7 @@ class RunStore:
             pgid=pgid,
             pid_starttime=pid_starttime,
             boot_id=boot_id,
+            pid_namespace=pid_namespace,
         )
         if handle.launch_state == "spawned":
             durable_identity = ProcessIdentity(
@@ -1573,6 +1622,7 @@ class RunStore:
                 pgid=handle.pgid,
                 pid_starttime=handle.pid_starttime,
                 boot_id=handle.boot_id,
+                pid_namespace=handle.pid_namespace,
             )
             if any(
                 marker_value is not None and marker_value != durable_value
@@ -1582,12 +1632,14 @@ class RunStore:
                         identity.pgid,
                         identity.pid_starttime,
                         identity.boot_id,
+                        identity.pid_namespace,
                     ),
                     (
                         durable_identity.pid,
                         durable_identity.pgid,
                         durable_identity.pid_starttime,
                         durable_identity.boot_id,
+                        durable_identity.pid_namespace,
                     ),
                     strict=True,
                 )
@@ -1603,6 +1655,15 @@ def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:
     :return bool: Whether the value is ``None`` or a positive non-bool integer.
     """
     return value is None or (type(value) is int and value > 0)
+
+
+def _valid_optional_pid_namespace(value: object) -> TypeGuard[str | None]:
+    """Return whether ``value`` is ``None`` or the link text of a PID namespace.
+
+    :param object value: Value to validate.
+    :return bool: Whether the value is ``None`` or ``pid:[<inode>]``.
+    """
+    return value is None or is_pid_namespace(value)
 
 
 def _valid_optional_boot_id(value: object) -> TypeGuard[str | None]:

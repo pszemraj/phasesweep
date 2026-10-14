@@ -33,6 +33,7 @@ from phasesweep.mcp.errors import (
     ResumeNotReadyError,
     RunCapacityUnknownError,
     RunLaunchUnsettledError,
+    RunNamespaceMismatchError,
     UnknownExperimentError,
     UnknownRunError,
 )
@@ -50,9 +51,9 @@ from phasesweep.mcp.tool_names import TOOL_CANCEL_RUN, TOOL_LAUNCH_RUN
 from phasesweep.runtime.files import ensure_private_dir, open_private_text
 from phasesweep.runtime.process import fd_ready
 from phasesweep.runtime.reaper import (
-    identity_from_earlier_boot,
     kill_stale_group,
     read_boot_id,
+    read_pid_namespace,
     read_proc_starttime,
 )
 from phasesweep.runtime.time import utc_now_iso
@@ -404,6 +405,8 @@ class RunControl:
         :raises PermissionDeniedError: If the run's entry did not allow cancel at launch time.
         :raises RunLaunchUnsettledError: If the launch has not yet persisted a
             process identity, so there is nothing safe to signal.
+        :raises RunNamespaceMismatchError: If the runner was recorded in another
+            PID namespace, where its PID and process group cannot be signalled.
         """
         args = {"run_id": run_id}
         resolved: dict[str, Any] = {}
@@ -442,6 +445,14 @@ class RunControl:
                         # No PID/PGID is durable yet. Signalling an empty identity
                         # could let launch continue after a false cancel response.
                         raise RunLaunchUnsettledError(run_id)
+                    if (
+                        before == "running"
+                        and self._runs.runner_visibility(handle) == "unobservable"
+                    ):
+                        # The recorded PID and process group are numbered in
+                        # another PID namespace, where they name unrelated
+                        # processes. Refuse before reserving or signalling.
+                        raise RunNamespaceMismatchError(run_id)
                     if before == "running":
                         # Reserve capacity before signalling; recovery cannot
                         # clear this marker between the reread and its write.
@@ -462,13 +473,16 @@ class RunControl:
                 # uncertainty, child trial PGIDs may still live, so keep the run
                 # counted as live and fail closed.
                 identity = self._runs.cleanup_identity(handle)
-                current_boot = read_boot_id()
-                same_boot = identity.boot_id is not None and identity.boot_id == current_boot
-                earlier_boot = identity_from_earlier_boot(identity.boot_id, current_boot)
-                # A prior boot proves cleanup without a signal. An unknown boot
-                # cannot make saved PID/starttime safe to signal after reboot.
-                runner_group_gone = earlier_boot or (
+                visibility = self._runs.runner_visibility(handle)
+                gone = visibility == "gone"
+                same_boot = identity.boot_id is not None and identity.boot_id == read_boot_id()
+                # A prior boot, or a PID namespace with no process left, proves
+                # cleanup without a signal. An unknown boot cannot make saved
+                # PID/starttime safe to signal after reboot, and another live
+                # PID namespace cannot be signalled from here at all.
+                runner_group_gone = gone or (
                     same_boot
+                    and visibility == "observable"
                     and kill_stale_group(
                         identity.pid,
                         identity.pid_starttime,
@@ -480,7 +494,7 @@ class RunControl:
                     terminal_status = self._runs.recorded_terminal_status(handle)
                     cleanup_recovered = self._runs._cleanup_recovered(handle)
                     confirmed = runner_group_gone and (
-                        earlier_boot
+                        gone
                         or (
                             terminal_status is not None
                             and terminal_status.get("cleanup_confirmed") is True
@@ -738,12 +752,23 @@ class RunControl:
         :param str | None from_phase: Optional phase to resume from.
         :param PreparedRun preparation: Durable preparation and inherited launch lease.
         :raises OSError: The log or detached runner cannot be opened before spawn.
+        :raises RuntimeError: If this process's PID namespace is unreadable, so
+            the child's PID could not be tied to the namespace that numbers it.
         :raises _SpawnBookkeepingError: Post-spawn identity bookkeeping fails; the
             exception records whether cleanup of the spawned process group was confirmed.
         :return RunHandle: Runner-validated spawned handle.
         """
         pending = preparation.handle
         run_id = pending.run_id
+        # The child inherits this namespace, so it is read before any pipe or
+        # child exists: an unreadable namespace refuses the launch with nothing
+        # to clean up.
+        pid_namespace = read_pid_namespace()
+        if pid_namespace is None:
+            raise RuntimeError(
+                "cannot read this process's PID namespace; refused launch because later "
+                "cancellation could not tell whether the runner's PID is visible"
+            )
         config_snapshot_path = preparation.config_snapshot_path
         log_path = self._runs.log_path(run_id)
         status_path = self._runs.status_path(run_id)
@@ -835,6 +860,7 @@ class RunControl:
                     allow_cancel=pending.allow_cancel,
                     visible_params_at_launch=pending.visible_params_at_launch,
                     boot_id=None,
+                    pid_namespace=pid_namespace,
                 )
                 pid_starttime = read_proc_starttime(proc.pid)
                 handle = replace(handle, pid_starttime=pid_starttime)
@@ -885,6 +911,7 @@ class RunControl:
                 allow_cancel=pending.allow_cancel,
                 visible_params_at_launch=pending.visible_params_at_launch,
                 boot_id=boot_id,
+                pid_namespace=pid_namespace,
             )
             cleanup_confirmed = self._terminate_failed_spawn(
                 cleanup_handle, exc, acknowledged=runner_acknowledged

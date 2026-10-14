@@ -56,6 +56,7 @@ from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.files import open_private_text
 from phasesweep.runtime.reaper import (
     read_boot_id,
+    read_pid_namespace,
     read_proc_starttime,
 )
 from tests.conftest import (
@@ -563,6 +564,7 @@ def test_launch_terminates_real_runner_when_log_context_exit_fails(
                 pgid=proc.pid,
                 pid_starttime=read_proc_starttime(proc.pid),
                 boot_id=read_boot_id(),
+                pid_namespace=read_pid_namespace(),
                 launch_state="spawned",
             )
         )
