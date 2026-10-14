@@ -350,11 +350,14 @@ def _evidence_experiment(
     max_consecutive_failures: int = 3,
     fixed_overrides: dict[str, object] | None = None,
     override_format: str = "argparse",
+    trainer_config: dict[str, object] | None = None,
 ) -> Experiment:
     """Build a one-phase experiment on journal storage with a seeded sampler.
 
     Persistent storage is what makes a top-up reselect an *existing* trial
-    rather than starting over, which is the whole subject here.
+    rather than starting over, which is the whole subject here. A
+    ``trainer_config`` base applies to every format; ``yaml_file`` gets a
+    default one.
     """
     # Every trial of the default constant trainer logs the same objective, so
     # the tie break (lowest trial number) makes trial 0 the winner however many
@@ -363,10 +366,10 @@ def _evidence_experiment(
         trainer = write_constant_trainer(tmp_path)
     else:
         trainer = write_trainer(tmp_path / "trainer.py", trainer_body)
-    trainer_config = None
     if override_format == "yaml_file":
         trainer_input = "--config {config_path}"
-        trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
+        if trainer_config is None:
+            trainer_config = {"model": {"depth": 4}, "output_dir": "{trial_dir}/outputs"}
     elif override_format == "json_file":
         trainer_input = "--input {overrides_path}"
     else:
@@ -486,6 +489,62 @@ def test_trial_records_the_exact_generated_trainer_input(
         "size_bytes": input_path.stat().st_size,
         "sha256": hashlib.sha256(input_path.read_bytes()).hexdigest(),
     }
+
+
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_cli_trainer_input_record_is_the_merged_trainer_config(
+    tmp_path: Path,
+    override_format: str,
+) -> None:
+    """The record for argparse and hydra binds the flat base-plus-overrides mapping."""
+    experiment = _evidence_experiment(
+        tmp_path,
+        override_format=override_format,
+        trainer_config={"model": {"depth": 4}, "output_dir": "{trial_dir}/out"},
+        fixed_overrides={"model.width": 64},
+    )
+    run_experiment(experiment)
+    trial_dir = _sole_trial_dir(experiment)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=_resolve_storage(experiment.storage),
+    )
+    trial = study.get_trials(deepcopy=False)[0]
+    resolved = trial_dir / "overrides_resolved.json"
+
+    assert json.loads(resolved.read_text()) == {
+        "model.depth": 4,
+        "model.width": 64,
+        "output_dir": f"{trial_dir}/out",
+        "x": trial.params["x"],
+    }
+    assert trial.user_attrs[TRAINER_INPUT_ATTR] == {
+        "schema_version": 1,
+        "format": override_format,
+        "filename": "overrides_resolved.json",
+        "size_bytes": resolved.stat().st_size,
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("override_format", ["argparse", "hydra"])
+def test_cli_trainer_input_without_trainer_config_is_the_overrides_alone(
+    tmp_path: Path,
+    override_format: str,
+) -> None:
+    """An empty base leaves the recorded bytes as the sorted overrides JSON."""
+    experiment = _evidence_experiment(
+        tmp_path, override_format=override_format, fixed_overrides={"b.y": 2, "a": 1}
+    )
+    run_experiment(experiment)
+    study = optuna.load_study(
+        study_name=_phase_study_name(experiment, experiment.phases[0]),
+        storage=_resolve_storage(experiment.storage),
+    )
+    params = study.get_trials(deepcopy=False)[0].params
+
+    expected = json.dumps({"b.y": 2, "a": 1, **params}, indent=2, sort_keys=True) + "\n"
+    assert (_sole_trial_dir(experiment) / "overrides_resolved.json").read_text() == expected
 
 
 def _published_winner_payload(experiment: Experiment, generation_id: str) -> dict:

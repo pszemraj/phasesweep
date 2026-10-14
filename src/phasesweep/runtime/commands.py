@@ -10,11 +10,14 @@ import json
 import math
 import re
 import shlex
+from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
+
+from phasesweep.runtime.json import JsonValue
 
 _CliOverrideFormat = Literal["argparse", "hydra"]
 
@@ -133,24 +136,32 @@ def dump_overrides_json(payload: Any) -> str:
     return json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
 
 
-def dump_json_file_overrides(overrides: dict[str, Any]) -> str:
-    """Expand dotted keys and serialize the overrides-only trainer input.
+def dump_json_file_overrides(
+    overrides: dict[str, JsonValue],
+    *,
+    trainer_config: dict[str, JsonValue] | None = None,
+    substitutions: dict[str, str] | None = None,
+) -> str:
+    """Expand dotted keys into the base trainer config and serialize the trainer input.
 
-    :param dict[str, Any] overrides: Resolved overrides, without a base configuration.
+    :param dict[str, JsonValue] overrides: Resolved overrides.
+    :param dict[str, JsonValue] | None trainer_config: Operator-authored base the
+        overrides are composed into; ``None`` or empty leaves only the overrides.
+    :param dict[str, str] | None substitutions: Runtime placeholders expanded in
+        base-config string values before overrides are applied.
     :return str: Exact text to write to ``overrides.json``.
-    :raises ValueError: A key collides with another key's namespace.
+    :raises ValueError: A key collides with another key's namespace, or an
+        override must descend through a non-mapping base value.
     :raises TypeError: A value cannot be represented as JSON.
     """
-    nested: dict[str, Any] = {}
-    for key, value in overrides.items():
+    for key in overrides:
         parts = key.split(".")
         if any(".".join(parts[:index]) in overrides for index in range(1, len(parts))):
             raise ValueError(f"Cannot expand override {key!r}: a parent key is also overridden.")
-        current = nested
-        for part in parts[:-1]:
-            current = current.setdefault(part, {})
-        current[parts[-1]] = value
-    return dump_overrides_json(nested)
+    base: dict[str, JsonValue] = {} if trainer_config is None else trainer_config
+    if substitutions:
+        base = _substitute_trainer_config_placeholders(base, substitutions)
+    return dump_overrides_json(compose_trainer_config(base, overrides))
 
 
 def format_argparse(overrides: dict[str, Any]) -> str:
@@ -331,6 +342,84 @@ def dump_trial_trainer_config_yaml(
     return dump_trainer_config_yaml(compose_trainer_config(base, overrides))
 
 
+def flatten_trainer_config(mapping: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    """Flatten nested mappings into dotted keys for a command-line wire.
+
+    Lists and scalars are leaves. An empty mapping stays a leaf so the CLI
+    renderer refuses it with its usual message.
+
+    :param Mapping[str, JsonValue] mapping: Trainer configuration, possibly nested.
+    :raises TypeError: A mapping key is not a string.
+    :raises ValueError: Two paths flatten to one dotted key, as a literal
+        ``"a.b"`` key does beside a nested ``a: {b: ...}``.
+    :return dict[str, JsonValue]: Dotted key to leaf value, in traversal order.
+    """
+    flat: dict[str, JsonValue] = {}
+    _flatten_into(flat, mapping, "")
+    return flat
+
+
+def _flatten_into(
+    flat: dict[str, JsonValue], mapping: Mapping[str, JsonValue], prefix: str
+) -> None:
+    """Add the leaves of ``mapping`` to ``flat`` under dotted keys.
+
+    :param dict[str, JsonValue] flat: Accumulator of dotted key to leaf value.
+    :param Mapping[str, JsonValue] mapping: Subtree to walk.
+    :param str prefix: Dotted path of ``mapping``; empty at the root.
+    :raises TypeError: A mapping key is not a string.
+    :raises ValueError: A dotted key is produced twice.
+    """
+    for key, value in mapping.items():
+        if not isinstance(key, str):
+            raise TypeError(
+                f"trainer_config has non-string mapping key {key!r} "
+                f"({type(key).__name__}). Trainer config keys must be strings."
+            )
+        path = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict) and value:
+            _flatten_into(flat, value, path)
+        elif path in flat:
+            raise ValueError(
+                f"trainer_config produces the dotted key {path!r} twice; a literal key "
+                "containing a dot collides with the nested mapping of the same path."
+            )
+        else:
+            flat[path] = value
+
+
+def merged_cli_overrides(
+    trainer_config: dict[str, JsonValue],
+    overrides: dict[str, JsonValue],
+    *,
+    substitutions: dict[str, str] | None = None,
+) -> dict[str, JsonValue]:
+    """Merge the base trainer config and the overrides into one flat mapping.
+
+    The base is the lowest-priority layer, as in ``yaml_file``: placeholders in
+    its strings expand, overrides apply at their dotted paths, and the result is
+    flattened to dotted keys. Without a base the overrides pass through in
+    their own order.
+
+    :param dict[str, JsonValue] trainer_config: Operator-authored base trainer config.
+    :param dict[str, JsonValue] overrides: Composed inherited, fixed, and sampled values.
+    :param dict[str, str] | None substitutions: Runtime placeholders expanded in
+        base-config string values before overrides are applied.
+    :raises TypeError: A base mapping key is not a string.
+    :raises ValueError: An override must descend through a non-mapping base
+        value, or two paths flatten to one dotted key.
+    :return dict[str, JsonValue]: Dotted key to value for an argparse or hydra command.
+    """
+    if not trainer_config:
+        return dict(overrides)
+    base = (
+        trainer_config
+        if not substitutions
+        else _substitute_trainer_config_placeholders(trainer_config, substitutions)
+    )
+    return flatten_trainer_config(compose_trainer_config(base, overrides))
+
+
 def render_command(
     template: str,
     overrides: dict[str, Any],
@@ -364,7 +453,9 @@ def render_command(
         run_name: Composite ``<experiment>-<phase>-<trial_id>-<attempt_id>``
             identifier used for ``{run_name}``.
         trainer_config: Base trainer configuration embedded in the PhaseSweep
-            YAML. Used only by ``yaml_file``.
+            YAML. Every format composes the overrides into it; strings in it
+            expand the runtime placeholders (``{trial_dir}``, ``{trial_id}``,
+            ``{phase}``, ``{run_name}``).
         materialized_input_path: Exact generated input already written by the
             launch path. When supplied for a file mode, command rendering uses
             this path without serializing or rewriting the input.
@@ -381,14 +472,14 @@ def render_command(
     """
     config_path = ""
     overrides_path = ""
+    base = {} if trainer_config is None else trainer_config
+    config_substitutions = {
+        "{trial_dir}": str(trial_dir),
+        "{trial_id}": str(trial_id),
+        "{phase}": phase,
+        "{run_name}": run_name,
+    }
     if fmt == "yaml_file":
-        base = {} if trainer_config is None else trainer_config
-        config_substitutions = {
-            "{trial_dir}": str(trial_dir),
-            "{trial_id}": str(trial_id),
-            "{phase}": phase,
-            "{run_name}": run_name,
-        }
         if materialized_input_path is not None:
             config_path = str(materialized_input_path)
         else:
@@ -398,14 +489,20 @@ def render_command(
             config_path = str(trial_dir / TRAINER_INPUT_FILENAMES["yaml_file"])
         overrides_str = ""
     elif fmt == "argparse":
-        overrides_str = format_argparse(overrides)
+        overrides_str = format_argparse(
+            merged_cli_overrides(base, overrides, substitutions=config_substitutions)
+        )
     elif fmt == "hydra":
-        overrides_str = format_hydra(overrides)
+        overrides_str = format_hydra(
+            merged_cli_overrides(base, overrides, substitutions=config_substitutions)
+        )
     elif fmt == "json_file":
         if materialized_input_path is not None:
             overrides_path = str(materialized_input_path)
         else:
-            dump_json_file_overrides(overrides)
+            dump_json_file_overrides(
+                overrides, trainer_config=base, substitutions=config_substitutions
+            )
             overrides_path = str(trial_dir / TRAINER_INPUT_FILENAMES["json_file"])
         overrides_str = ""
     else:

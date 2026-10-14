@@ -30,7 +30,7 @@ demo/
       attempt_lifecycle.json
       process_identity.json
       trainer_config.yaml       # yaml_file only
-      overrides.json            # json_file only; nested overrides
+      overrides.json            # json_file only; nested trainer_config with overrides applied
       overrides_resolved.json
       command.txt
       stdout.log

@@ -265,6 +265,81 @@ def test_launch_trial_hashes_and_passes_complete_trainer_yaml(
     }
 
 
+@pytest.mark.parametrize("override_format", ["argparse", "hydra", "json_file"])
+def test_launch_trial_delivers_trainer_config_in_every_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    override_format: str,
+) -> None:
+    """The base reaches argparse, hydra and json_file, and the trainer-input record binds the bytes."""
+    trial_dir = tmp_path / "trial_0"
+    placeholder = "{overrides_path}" if override_format == "json_file" else "{overrides}"
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        gpu_id=None,
+        experiment_kwargs={
+            "trial_command": f"python train.py {placeholder}",
+            "override_format": override_format,
+            "trainer_config": {"model": {"depth": 4, "width": 128}, "out": "{trial_dir}/outputs"},
+        },
+        overrides={"model.depth": 8},
+    )
+
+    trainer_input = trial_dir / captured["trainer_input"]["filename"]
+    resolved = json.loads((trial_dir / "overrides_resolved.json").read_text())
+    if override_format == "json_file":
+        assert trainer_input.name == "overrides.json"
+        assert json.loads(trainer_input.read_text()) == {
+            "model": {"depth": 8, "width": 128},
+            "out": f"{trial_dir}/outputs",
+        }
+        assert resolved == {"model.depth": 8}
+        assert shlex.split(captured["command"]) == ["python", "train.py", str(trainer_input)]
+    else:
+        merged = {"model.depth": 8, "model.width": 128, "out": f"{trial_dir}/outputs"}
+        assert trainer_input.name == "overrides_resolved.json"
+        assert resolved == merged
+        quote = '"' if override_format == "hydra" else ""
+        separator = "" if override_format == "hydra" else "--"
+        assert sorted(shlex.split(captured["command"])[2:]) == sorted(
+            [
+                f"{separator}model.depth=8",
+                f"{separator}model.width=128",
+                f"{separator}out={quote}{trial_dir}/outputs{quote}",
+            ]
+        )
+    assert (
+        captured["trainer_input"]["sha256"]
+        == hashlib.sha256(trainer_input.read_bytes()).hexdigest()
+    )
+    assert captured["PHASESWEEP_OVERRIDES_SHA256"] == captured["trainer_input"]["sha256"]
+
+
+def test_launch_trial_cli_input_without_trainer_config_is_the_overrides_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty base leaves the argparse trainer input as the sorted overrides JSON."""
+    overrides = {"zeta.depth": 8, "alpha": 1, "zeta.width": 2}
+    captured = _capture_launch_env(
+        tmp_path,
+        monkeypatch,
+        gpu_id=None,
+        experiment_kwargs={"trial_command": "python train.py {overrides}"},
+        overrides=overrides,
+    )
+
+    expected = json.dumps(overrides, indent=2, sort_keys=True) + "\n"
+    assert (tmp_path / "trial_0" / "overrides_resolved.json").read_text() == expected
+    assert captured["PHASESWEEP_OVERRIDES_SHA256"] == hashlib.sha256(expected.encode()).hexdigest()
+    assert shlex.split(captured["command"])[2:] == [
+        "--zeta.depth=8",
+        "--alpha=1",
+        "--zeta.width=2",
+    ]
+
+
 def test_launch_trial_inherit_env_all_passes_ambient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

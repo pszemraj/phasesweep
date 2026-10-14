@@ -44,6 +44,7 @@ from phasesweep.runtime.commands import (
     TRAINER_INPUT_FILENAMES,
     dump_json_file_overrides,
     dump_trial_trainer_config_yaml,
+    merged_cli_overrides,
     render_command,
 )
 from phasesweep.runtime.files import atomic_write_text, private_atomic_write_text
@@ -511,8 +512,10 @@ def prepare_trainer_input(
     """Atomically write and identify the exact input one trainer will consume.
 
     One serialized byte string is used for the atomic write, environment
-    digest, and durable trial record. Argparse mode consumes the resolved-
-    overrides audit file; YAML mode consumes the generated trainer config.
+    digest, and durable trial record. Argparse and hydra consume the flat
+    ``overrides_resolved.json``, which holds the base trainer config merged
+    with the overrides; YAML and JSON modes consume their generated file and
+    leave ``overrides_resolved.json`` as the overrides-only audit record.
 
     :param Experiment experiment: Experiment supplying format and base config.
     :param str phase_name: Phase label used for runtime placeholders.
@@ -523,28 +526,34 @@ def prepare_trainer_input(
     :return PreparedTrainerInput: Materialized input bytes and historical identity.
     """
     trial_dir.mkdir(parents=True, exist_ok=True)
-    resolved_text = _json_dump_overrides(overrides)
-    resolved_path = trial_dir / "overrides_resolved.json"
-    atomic_write_text(resolved_path, resolved_text)
-
     run_name = trial_run_name(experiment, phase_name, trial_id, attempt_id)
+    substitutions = {
+        "{trial_dir}": str(trial_dir),
+        "{trial_id}": str(trial_id),
+        "{phase}": phase_name,
+        "{run_name}": run_name,
+    }
     filename = TRAINER_INPUT_FILENAMES[experiment.override_format]
     if experiment.override_format == "yaml_file":
         text = dump_trial_trainer_config_yaml(
-            experiment.trainer_config,
-            overrides,
-            substitutions={
-                "{trial_dir}": str(trial_dir),
-                "{trial_id}": str(trial_id),
-                "{phase}": phase_name,
-                "{run_name}": run_name,
-            },
+            experiment.trainer_config, overrides, substitutions=substitutions
         )
     elif experiment.override_format == "json_file":
-        text = dump_json_file_overrides(overrides)
+        text = dump_json_file_overrides(
+            overrides, trainer_config=experiment.trainer_config, substitutions=substitutions
+        )
     else:
-        text = resolved_text
+        text = _json_dump_overrides(
+            merged_cli_overrides(experiment.trainer_config, overrides, substitutions=substitutions)
+        )
 
+    resolved_text = (
+        _json_dump_overrides(overrides)
+        if experiment.override_format in ("yaml_file", "json_file")
+        else text
+    )
+    resolved_path = trial_dir / "overrides_resolved.json"
+    atomic_write_text(resolved_path, resolved_text)
     if filename != resolved_path.name:
         atomic_write_text(trial_dir / filename, text)
     return PreparedTrainerInput(
@@ -1006,10 +1015,11 @@ def extract_trial_result(
 
 
 def _json_dump_overrides(overrides: dict[str, Any]) -> str:
-    """Serialize resolved overrides to indented JSON for ``overrides_resolved.json``.
+    """Serialize a flat override mapping to indented JSON for ``overrides_resolved.json``.
 
     Args:
-        overrides: The composed (inherited + fixed + sampled) overrides dict.
+        overrides: The composed (inherited + fixed + sampled) overrides dict,
+            or for argparse and hydra that dict merged into the base trainer config.
 
     Returns:
         Trailing-newline-terminated, sorted, two-space-indented JSON.

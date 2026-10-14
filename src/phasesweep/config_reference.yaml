@@ -47,7 +47,7 @@ experiment: string (required)
 # It runs as /bin/sh -c in a new session, in the execution.cwd directory (the directory phasesweep was started from when unset, or the catalog entry's cwd under MCP), with the composed trainer environment. By default that is a minimal base plus env, not the shell's environment; see execution.inherit_env.
 # Its stdout and stderr are written to stdout.log and stderr.log in the attempt directory. Both files are truncated at the start of each attempt.
 # The trainer must exit 0. A nonzero exit code fails the attempt before any evidence is read.
-# Each attempt directory also holds command.txt (the rendered command), overrides_resolved.json (the flat audit copy of the overrides, with sorted keys), and the trainer input file that override_format selects.
+# Each attempt directory also holds command.txt (the rendered command), overrides_resolved.json (the flat copy of the overrides, with sorted keys; under argparse and hydra it also carries trainer_config's flattened leaves and is the trainer input), and the trainer input file that override_format selects.
 # execution.record_env true adds environment.json to that list.
 # Supported placeholders: {config_path}, {overrides}, {overrides_path}, {trial_dir}, {trial_id}, {phase}, {run_name}.
 # Unknown placeholders and malformed braces fail config load. {{ and }} write literal braces.
@@ -57,7 +57,7 @@ experiment: string (required)
 # {trial_id} is the phase-local Optuna trial number, and {run_name} is <experiment>-<phase>-<trial_id>-<attempt_id> with the immutable attempt ID.
 # Requires: override_format selects the trainer-input placeholder; yaml_file needs {config_path} and rejects {overrides} and {overrides_path}.
 # Requires: argparse and hydra need {overrides} and reject {config_path} and {overrides_path}; json_file needs {overrides_path} and rejects {config_path} and {overrides}.
-# Requires: for argparse, hydra and json_file the placeholder is needed only when the phase has at least one inherited, fixed or sampled override.
+# Requires: for argparse, hydra and json_file the placeholder is needed only when the phase has at least one inherited, fixed or sampled override or the experiment has a nonempty trainer_config.
 # A placeholder that does not match override_format fails config load.
 # Recommended: set execution.cwd (execution.cwd: . for the config file's directory) or use absolute paths for the interpreter and script, so the command does not depend on the directory phasesweep was started from. The command itself is not a path field and is never rewritten.
 trial_command: string (required)
@@ -657,28 +657,30 @@ phases: list[object] (required)
 
 # ---------- Trainer inputs ----------
 
-# Complete base input for the external trainer, written to trainer_config.yaml in each attempt directory after the phase's overrides are applied.
+# Base input for the external trainer under every override_format, with the phase's overrides applied on top at their dotted paths.
+# yaml_file writes it complete to trainer_config.yaml in each attempt directory. json_file writes it, nested, to overrides.json. argparse and hydra flatten nested mappings into dotted keys and render every leaf at {overrides}.
 # PhaseSweep forwards its keys to the program in trial_command, not to a built-in training API. Common trainer-defined keys are model.name, optimizer.lr and output_dir.
 # Values must be null, booleans, integers, finite floats, strings, lists or string-keyed mappings. Quote YAML dates.
-# String values anywhere in the mapping expand {trial_dir}, {trial_id}, {phase} and {run_name} once, before overrides are applied. Keys and override values are not expanded.
+# With argparse and hydra every flattened leaf must also render in that format: no mapping inside a list and no empty mapping, and hydra rejects control characters and ${...} in strings. A literal key containing a dot that collides with a nested mapping fails config load.
+# String values anywhere in the mapping expand {trial_dir}, {trial_id}, {phase} and {run_name} once, before overrides are applied, in every format. Keys and override values are not expanded.
 # Other braces stay literal in this mapping: {config_path} is not expanded and {{ and }} are not unescaped. Substituted values are inserted as raw text.
 # Use output_dir: "{trial_dir}/checkpoints" to give each trial its own output directory.
 # trainer_config.yaml is written with keys sorted at every level.
 # No model download, optimizer setting, batch size or step budget is supplied automatically.
-# Only used when: override_format is yaml_file. A nonempty mapping with any other format fails config load.
+# Requires: a nonempty trainer_config makes the placeholder that matches override_format required in trial_command, because the base must reach the trainer; config load fails otherwise.
 # Overridden by: phases[].inherits, phases[].fixed_overrides, phases[].search_space (at their exact dotted paths; an override that must descend through an existing non-mapping value, meaning a scalar, null or list, fails config load).
 trainer_config: map[string, any] = {}
 
 # How the trainer receives its inputs.
 # yaml_file writes the complete trainer_config with the overrides applied to trainer_config.yaml; the command passes its path as {config_path}.
-# json_file writes only the overrides, with dotted keys expanded into nested objects, to overrides.json; the command passes its path as {overrides_path}.
-# argparse puts the overrides in the command as shell-quoted --key=value tokens at {overrides}. null renders as None and booleans as true or false. String values are written as they are.
-# hydra puts the overrides in the command as shell-quoted key=value tokens at {overrides}, without importing Hydra. null renders as null, booleans as true or false, and strings are double-quoted with quotes escaped.
+# json_file writes trainer_config with the overrides applied, with dotted keys expanded into nested objects, to overrides.json; with an empty trainer_config the file holds only the overrides. The command passes its path as {overrides_path}.
+# argparse puts trainer_config's flattened leaves and the overrides in the command as shell-quoted --key=value tokens at {overrides}. null renders as None and booleans as true or false. String values are written as they are.
+# hydra puts trainer_config's flattened leaves and the overrides in the command as shell-quoted key=value tokens at {overrides}, without importing Hydra. null renders as null, booleans as true or false, and strings are double-quoted with quotes escaped.
 # Floats render with Python's str() in both formats, and a list renders as [a,b].
 # argparse and hydra accept null, booleans, integers, finite floats, strings and lists of those. hydra also rejects control characters and ${...} in strings.
 # json_file requires strict JSON-compatible values.
-# Every attempt also gets overrides_resolved.json, the flat audit copy of the overrides. It is not the complete YAML trainer input.
-# Requires: trial_command uses the placeholder that matches, and trainer_config is empty unless the format is yaml_file; violations fail config load.
+# Every attempt also gets overrides_resolved.json. For yaml_file and json_file it is the flat audit copy of the overrides alone and not the trainer input. For argparse and hydra it is the trainer input: the merged flat mapping of trainer_config and the overrides, which is the overrides alone when trainer_config is empty.
+# Requires: trial_command uses the placeholder that matches; violations fail config load.
 # Part of the study fingerprint.
 override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 

@@ -100,9 +100,9 @@ Choose the input interface your trainer already accepts:
 | Input | Command placeholder |
 | --- | --- |
 | Complete base-plus-overrides YAML (`yaml_file`, default) | `--config {config_path}` |
-| Command-line flags (`argparse`) | `{overrides}` produces `--key=value` |
-| Native Hydra overrides (`hydra`) | `{overrides}` produces `key=value` |
-| Nested overrides-only JSON (`json_file`) | `--overrides {overrides_path}` |
+| Command-line flags (`argparse`) | `{overrides}` produces `--key=value` for every `trainer_config` leaf and override |
+| Native Hydra overrides (`hydra`) | `{overrides}` produces `key=value` for every `trainer_config` leaf and override |
+| Nested JSON, base plus overrides (`json_file`) | `--overrides {overrides_path}` |
 
 > [!TIP]
 > `phasesweep run experiment.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects.

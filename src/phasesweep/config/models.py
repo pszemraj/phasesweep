@@ -43,6 +43,16 @@ from phasesweep.evidence.models import (
     objective_evidence_assurance,
     wandb_gate_identity,
 )
+from phasesweep.runtime.commands import (
+    _OverrideValueError,
+    _render_override_value,
+    dump_json_file_overrides,
+    dump_overrides_json,
+    dump_trial_trainer_config_yaml,
+    flatten_trainer_config,
+    merged_cli_overrides,
+    render_command,
+)
 from phasesweep.runtime.files import (
     canonical_storage_identity,
     file_url_path,
@@ -945,18 +955,40 @@ class Experiment(_Frozen):
         return self
 
     @model_validator(mode="after")
-    def _validate_trainer_config_mode(self) -> Experiment:
-        """Reject an embedded trainer config that the selected mode would ignore.
+    def _validate_trainer_config_wire(self) -> Experiment:
+        """Require the embedded trainer config to have a wire form in the selected format.
 
-        :raises ValueError: ``trainer_config`` is nonempty outside ``yaml_file`` mode.
+        ``yaml_file`` validates the base together with each phase's overrides.
+        The other formats carry the base too, so its keys and leaves must
+        render on their wire before any phase composes into it.
+
+        :raises ValueError: ``trainer_config`` holds a key or value that the
+            selected ``override_format`` cannot carry.
         :return Experiment: Self, unchanged.
         """
-        if self.override_format != "yaml_file" and self.trainer_config:
+        fmt = self.override_format
+        if fmt == "yaml_file" or not self.trainer_config:
+            return self
+        if fmt == "json_file":
+            try:
+                dump_overrides_json(self.trainer_config)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"trainer_config cannot be written as JSON for override_format='json_file': {exc}"
+                ) from exc
+            return self
+        cli_format: Literal["argparse", "hydra"] = "hydra" if fmt == "hydra" else "argparse"
+        try:
+            flat = flatten_trainer_config(self.trainer_config)
+        except (TypeError, ValueError) as exc:
             raise ValueError(
-                "trainer_config is consumed only by the default override_format='yaml_file'. "
-                f"The selected compatibility format {self.override_format!r} would ignore it; "
-                "remove trainer_config or use yaml_file with {config_path}."
-            )
+                f"trainer_config cannot be flattened for override_format={fmt!r}: {exc}"
+            ) from exc
+        for key, value in flat.items():
+            try:
+                _render_override_value(value, cli_format)
+            except _OverrideValueError as exc:
+                raise ValueError(f"trainer_config key {key!r}: {exc}") from exc
         return self
 
     @field_validator("experiment")
@@ -1205,8 +1237,6 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
     :raises ValueError: A composed value is outside the selected CLI value contract.
     """
     if experiment.override_format == "json_file":
-        from phasesweep.runtime.commands import dump_overrides_json
-
         for key, value in phase.fixed_overrides.items():
             try:
                 dump_overrides_json(value)
@@ -1219,8 +1249,6 @@ def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
         return
     if experiment.override_format not in {"argparse", "hydra"}:
         return
-
-    from phasesweep.runtime.commands import _OverrideValueError, _render_override_value
 
     override_format: Literal["argparse", "hydra"] = (
         "hydra" if experiment.override_format == "hydra" else "argparse"
@@ -1349,10 +1377,11 @@ def _validate_trial_command_template(
       ``{trial_dir[0]}``), which ``str.format`` would apply to the rendered string.
     * Unbalanced braces (``{trial_dir`` -> ``str.format`` raises ``ValueError``).
     * The primary ``yaml_file`` mode missing ``{config_path}``.
-    * Phases using the explicit ``argparse`` compatibility format with
-      overrides but a template missing
-      ``{overrides}`` — the same silent-no-op failure mode (review v0.5.6 /
-      blocker 2).
+    * Phases using a non-YAML format with overrides or a ``trainer_config`` but
+      a template missing the format's placeholder, the same silent-no-op
+      failure mode.
+    * A ``trainer_config`` and composed overrides that cannot be merged for
+      the selected format.
 
     Both placeholder checks parse real ``str.format`` field names so that an
     escaped ``{{overrides}}`` (rendered as the literal string ``{overrides}``)
@@ -1372,13 +1401,6 @@ def _validate_trial_command_template(
             the chosen ``override_format``).
 
     """
-    # Lazy import to avoid a circular config <-> overrides cycle.
-    from phasesweep.runtime.commands import (
-        dump_json_file_overrides,
-        dump_trial_trainer_config_yaml,
-        render_command,
-    )
-
     # Build a synthetic override dict: one value per locked or sampled key.
     # Inherited keys are present in the real call too (they come from parent
     # winners), so the placeholder set must include them or render_command
@@ -1387,19 +1409,25 @@ def _validate_trial_command_template(
     overrides.update(phase.fixed_overrides)
     overrides.update(_placeholder_values_for(phase.search_space))
 
-    has_overrides = bool(overrides)
+    # Every format delivers the base trainer_config, so a nonempty one needs the
+    # format's placeholder just as an override does.
+    has_overrides = bool(overrides) or (
+        experiment.override_format != "yaml_file" and bool(experiment.trainer_config)
+    )
 
     placeholder_dir = Path("__phasesweep_validate_trial_dir__")
-    if experiment.override_format == "yaml_file":
-        try:
+    try:
+        if experiment.override_format == "yaml_file":
             dump_trial_trainer_config_yaml(experiment.trainer_config, overrides)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                f"Phase {phase.name!r}: trainer_config and composed overrides are invalid — "
-                f"{type(exc).__name__}: {exc}."
-            ) from exc
-    elif experiment.override_format == "json_file":
-        dump_json_file_overrides(overrides)
+        elif experiment.override_format == "json_file":
+            dump_json_file_overrides(overrides, trainer_config=experiment.trainer_config)
+        else:
+            merged_cli_overrides(experiment.trainer_config, overrides)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"Phase {phase.name!r}: trainer_config and composed overrides are invalid — "
+            f"{type(exc).__name__}: {exc}."
+        ) from exc
     # Parse the template once so we can both (a) preflight-render below and
     # (b) check that the documented placeholders are actually referenced.
     # Both arms surface the same "failed to render" wrapping for unbalanced
@@ -1480,17 +1508,19 @@ def _validate_trial_command_template(
         required_placeholder = "overrides"
 
     # When a phase has no overrides at all (no inherited, fixed, or sampled
-    # keys), a constant trial_command is legitimate — the user is sweeping
-    # the same configuration repeatedly, e.g. for variance estimation.
+    # keys) and no trainer_config to deliver, a constant trial_command is
+    # legitimate — the user is sweeping the same configuration repeatedly,
+    # e.g. for variance estimation.
     if not has_overrides:
         return
 
     if required_placeholder not in fields:
         raise ValueError(
             f"override_format={experiment.override_format!r} but phase "
-            f"{phase.name!r} has inherited, fixed, or sampled overrides "
-            f"and trial_command does not reference {{{required_placeholder}}}. All "
-            "sampled parameters would be ignored — the trainer would "
+            f"{phase.name!r} has inherited, fixed, or sampled overrides or a "
+            f"trainer_config and trial_command does not reference "
+            f"{{{required_placeholder}}}. All sampled parameters and the "
+            "trainer_config would be ignored — the trainer would "
             "run with the same hard-coded configuration every trial. "
             f"Add {{{required_placeholder}}} to trial_command, or use the default "
             "override_format='yaml_file' with trainer_config and {config_path}."
