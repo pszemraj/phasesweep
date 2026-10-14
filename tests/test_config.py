@@ -560,7 +560,7 @@ def test_execution_accepts_named_inherit_list() -> None:
 
     assert execution.inherit_env == ["WANDB_API_KEY", "HF_TOKEN"]
     assert execution.cwd is None
-    assert ExecutionContext().inherit_env == "all"
+    assert ExecutionContext().inherit_env == "none"
 
 
 def test_execution_rejects_ambiguous_environment_classification() -> None:

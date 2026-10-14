@@ -106,22 +106,6 @@ class TrialResult:
     deadline_exhausted: bool = False
 
 
-# Minimal environment base used when the execution contract narrows
-# inheritance below "all": enough for a shell + interpreter to start and
-# write temp files, nothing that can carry semantic configuration.
-#
-# CUDA_VISIBLE_DEVICES is deliberately NOT here. It decides whether a trial
-# trains on CPU or GPU, so admitting the ambient value would let two operators
-# running the identical config from differently-exported shells write
-# CPU-trained and GPU-trained evaluations into one study under one semantic
-# fingerprint — exactly the unfingerprinted ambient input the narrowed
-# contracts exist to exclude (the fingerprint covers the contract's mode/names
-# and configured ``env``, never ambient values). Bind trainer visibility with
-# a top-level ``env.CUDA_VISIBLE_DEVICES`` entry, which is fingerprinted and
-# also drives GPU pool discovery, or name the variable in an ``inherit_env``
-# list to opt its ambient value in explicitly.
-_BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
-
 _TRIAL_BOUND_ENV = (
     "PHASESWEEP_TRIAL_DIR",
     "PHASESWEEP_TRIAL_ID",
@@ -137,6 +121,10 @@ _TRIAL_BOUND_ENV = (
 # contract reports the divergence once per phase instead of once per trial.
 _DROPPED_CUDA_VISIBILITY_WARNED: set[tuple[str, str, str]] = set()
 
+# Warn-once keys for :func:`_warn_narrowed_environment_exit`, with the same
+# once-per-phase-per-process scope.
+_NARROWED_ENV_EXIT_WARNED: set[tuple[str, str]] = set()
+
 
 def _trainer_environment(
     experiment: Experiment,
@@ -146,9 +134,9 @@ def _trainer_environment(
 ) -> dict[str, str]:
     """Compose the trainer environment per the execution contract.
 
-    ``inherit_env: all`` preserves the historical full-inheritance behavior.
-    ``none`` starts from the minimal base; a list adds exactly the named
-    semantic ambient variables on top of that base. ``passthrough_env`` adds
+    ``inherit_env: none`` (the default) starts from the minimal base; a list
+    adds exactly the named semantic ambient variables on top of that base, and
+    ``all`` copies the whole ambient environment. ``passthrough_env`` adds
     credential/transport variables to either narrowed contract. Configured
     ``experiment.env`` values apply last, except trial-bound keys that
     PhaseSweep assigns for each attempt.
@@ -161,14 +149,11 @@ def _trainer_environment(
         settings conflict or remote logging is disabled (``FIX_CONFIG``).
     :return dict[str, str]: The composed trainer environment.
     """
-    contract = experiment.execution.inherit_env
-    if contract == "all":
+    admitted = experiment.execution.inherited_env_names()
+    if admitted is None:
         env = os.environ.copy()
     else:
-        names = list(_BASE_INHERITED_ENV)
-        if isinstance(contract, list):
-            names.extend(contract)
-        names.extend(experiment.execution.passthrough_env)
+        names = [*admitted, *experiment.execution.passthrough_env]
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
     # These values are assigned for each trial after the base environment is
@@ -350,7 +335,7 @@ def _warn_dropped_cuda_visibility(
     """Warn once when the trainer's GPU visibility diverges from the parent's.
 
     The narrowed ``inherit_env`` contracts drop the ambient
-    ``CUDA_VISIBLE_DEVICES`` on purpose (see :data:`_BASE_INHERITED_ENV`). The
+    ``CUDA_VISIBLE_DEVICES`` on purpose (see :data:`~phasesweep.config.models.BASE_INHERITED_ENV`). The
     GPU pool still reads that ambient value for discovery: it leases and
     re-binds device tokens, and pins a disable sentinel (``""``/``-1``) into
     every trial. The remaining unbound case is ``gpu_policy: none``, where the
@@ -386,6 +371,48 @@ def _warn_dropped_cuda_visibility(
         phase_name,
         ambient,
         experiment.execution.inherit_env,
+    )
+
+
+def _warn_narrowed_environment_exit(
+    *,
+    experiment: Experiment,
+    phase_name: str,
+    trial_id: int,
+    return_code: int,
+) -> None:
+    """Warn once per phase when a trainer exits nonzero under a narrowed environment.
+
+    A trainer that was started without a variable it needs, such as ``PYTHONPATH``
+    or a cache path, usually fails with an error that never mentions the
+    environment. Name the contract and the three ways to widen it, once per
+    phase for the process, so the first failure carries the hint without
+    repeating it for every later trial.
+
+    :param Experiment experiment: Parsed experiment supplying the contract.
+    :param str phase_name: Phase whose trial failed, used for the warn-once key.
+    :param int trial_id: Phase-local trial number of the failed trial.
+    :param int return_code: The nonzero exit code the trainer returned.
+    """
+    admitted = experiment.execution.inherited_env_names()
+    if admitted is None:
+        return
+    key = (experiment.experiment, phase_name)
+    if key in _NARROWED_ENV_EXIT_WARNED:
+        return
+    _NARROWED_ENV_EXIT_WARNED.add(key)
+    log.warning(
+        "[%s/trial_%d] the trainer exited with code %d under execution.inherit_env=%r, "
+        "so it received only %s plus env and passthrough_env values. If it needs another "
+        "ambient variable (PYTHONPATH, a virtualenv or conda setting, a cache path, a "
+        "credential), name it in execution.inherit_env: [NAME], set it under env:, or set "
+        "execution.inherit_env: all. The trainer's own error is in stderr.log in the "
+        "trial directory. This hint is shown once per phase.",
+        phase_name,
+        trial_id,
+        return_code,
+        experiment.execution.inherit_env,
+        ", ".join(admitted),
     )
 
 
@@ -806,6 +833,12 @@ def extract_trial_result(
 
     if rc != 0 and failure_reason is None:
         failure_reason = f"non-zero exit code {rc}"
+        _warn_narrowed_environment_exit(
+            experiment=experiment,
+            phase_name=executed.ctx.phase,
+            trial_id=executed.ctx.trial_id,
+            return_code=rc,
+        )
 
     if failure_reason is not None:
         return _failed_trial(

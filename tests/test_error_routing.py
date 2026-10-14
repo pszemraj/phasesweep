@@ -29,7 +29,13 @@ import yaml
 
 import phasesweep
 import phasesweep.engine.ledger as engine_ledger
-from phasesweep.config import Experiment, IntParam, Phase, WandbSummaryRequiredGate
+from phasesweep.config import (
+    ExecutionContext,
+    Experiment,
+    IntParam,
+    Phase,
+    WandbSummaryRequiredGate,
+)
 from phasesweep.engine import (
     ArtifactRootConflictError,
     IncompleteJournalRecordError,
@@ -235,11 +241,12 @@ def test_unmarked_study_refusals_route_to_fresh_namespace(label, call):
 
 def test_trainer_environment_config_refusal_routes_to_fix_config(monkeypatch):
     experiment = make_experiment(
+        execution=ExecutionContext(inherit_env=["WANDB_MODE"]),
         gates=[
             WandbSummaryRequiredGate(
                 type="wandb_summary_required", entity="e", project="p", keys=["eval/loss"]
             )
-        ]
+        ],
     )
     monkeypatch.setenv("WANDB_MODE", "offline")
 

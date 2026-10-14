@@ -20,14 +20,22 @@ import yaml
 
 from phasesweep.config import (
     ExecutionContext,
+    Experiment,
     JsonEnvelopeExtractor,
     Metric,
     WandbSummaryRequiredGate,
 )
 from phasesweep.engine.artifacts import _warn_environment_drift
-from phasesweep.engine.trial import TrialExecutionError, _environment_identity, launch_trial
+from phasesweep.engine.trial import (
+    ExecutedTrial,
+    TrialExecutionError,
+    TrialResult,
+    _environment_identity,
+    extract_trial_result,
+    launch_trial,
+)
 from phasesweep.runtime.process import ProcessResult, fd_ready
-from tests.conftest import make_experiment
+from tests.conftest import make_experiment, make_trial_context
 
 
 def _capture_launch_env(
@@ -260,23 +268,35 @@ def test_launch_trial_hashes_and_passes_complete_trainer_yaml(
 def test_launch_trial_inherit_env_all_passes_ambient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default contract preserves historical full-environment inheritance."""
+    """``inherit_env: all`` is the explicit opt-in to full-environment inheritance."""
     monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
-    env = _capture_launch_env(tmp_path, monkeypatch)
+    env = _capture_launch_env(tmp_path, monkeypatch, execution=ExecutionContext(inherit_env="all"))
     assert env["PHASESWEEP_TEST_AMBIENT_SECRET"] == "leak"
+
+
+def test_launch_trial_default_contract_drops_ambient(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without an execution block the trainer gets the base set and configured ``env`` only."""
+    monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
+    monkeypatch.setenv("PYTHONPATH", "/ambient/src")
+    env = _capture_launch_env(tmp_path, monkeypatch, experiment_env={"KEEP_ME": "explicit"})
+    assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in env
+    assert "PYTHONPATH" not in env
+    assert env["KEEP_ME"] == "explicit"
+    assert env["PATH"] == os.environ["PATH"]
 
 
 def test_launch_trial_inherit_env_none_filters_ambient(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``inherit_env: none`` drops ambient vars while keeping the base set and
+    """The default ``inherit_env: none`` drops ambient vars while keeping the base set and
     configured ``env`` entries (review v0.5.17 / blocker 4)."""
     monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
     env = _capture_launch_env(
         tmp_path,
         monkeypatch,
         experiment_env={"KEEP_ME": "explicit"},
-        execution=ExecutionContext(inherit_env="none"),
     )
     assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in env
     assert env["KEEP_ME"] == "explicit"
@@ -336,7 +356,7 @@ def test_launch_trial_pool_pinned_sentinel_binds_visibility_under_strict_contrac
 @pytest.mark.parametrize(
     ("ambient_visibility", "experiment_env", "execution"),
     [
-        pytest.param("-1", None, None, id="inherit-all"),
+        pytest.param("-1", None, ExecutionContext(inherit_env="all"), id="inherit-all"),
         pytest.param(
             "-1",
             None,
@@ -410,6 +430,76 @@ def test_launch_trial_no_visibility_warning_when_a_device_is_leased(
 
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
     assert not [r for r in caplog.records if "ambient CUDA_VISIBLE_DEVICES" in r.message]
+
+
+def _exit_code_result(tmp_path: Path, experiment: Experiment, phase: str, code: int) -> TrialResult:
+    """Extract the result of a trainer that exited with ``code`` and wrote nothing.
+
+    :param Path tmp_path: Directory standing in for the trial directory.
+    :param Experiment experiment: Experiment whose contract is under test.
+    :param str phase: Phase name recorded in the trial context.
+    :param int code: Trainer exit code.
+    :return TrialResult: The extracted (failed) result.
+    """
+    executed = ExecutedTrial(
+        ctx=make_trial_context(tmp_path, phase=phase),
+        process=ProcessResult(return_code=code, timed_out=False, pid=1, duration_seconds=0.1),
+    )
+    return extract_trial_result(experiment=experiment, executed=executed)
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        pytest.param(ExecutionContext(), id="default"),
+        pytest.param(ExecutionContext(inherit_env=["HF_HOME"]), id="named-list"),
+    ],
+)
+def test_nonzero_exit_under_narrowed_environment_warns_once_per_phase(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    execution: ExecutionContext,
+) -> None:
+    """The first nonzero exit in a phase names the environment contract and its three fixes."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+    experiment = make_experiment(execution=execution)
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        results = [
+            _exit_code_result(tmp_path, experiment, "p", 3),
+            _exit_code_result(tmp_path, experiment, "p", 3),
+            _exit_code_result(tmp_path, experiment, "other", 4),
+        ]
+
+    assert [result.failure_reason for result in results] == [
+        "non-zero exit code 3",
+        "non-zero exit code 3",
+        "non-zero exit code 4",
+    ]
+    hints = [r.getMessage() for r in caplog.records if "execution.inherit_env" in r.getMessage()]
+    assert len(hints) == 2
+    assert hints[0].startswith("[p/trial_0] the trainer exited with code 3 under ")
+    assert hints[1].startswith("[other/trial_0] the trainer exited with code 4 under ")
+    for fix in ("execution.inherit_env: [NAME]", "env:", "execution.inherit_env: all"):
+        assert fix in hints[0]
+    assert "PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ" in hints[0]
+    assert ("HF_HOME" in hints[0]) == isinstance(execution.inherit_env, list)
+
+
+def test_nonzero_exit_hint_is_silent_for_full_inheritance_and_for_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``inherit_env: all`` has no narrowed contract to blame, and a zero exit has no failure."""
+    monkeypatch.setattr("phasesweep.engine.trial._NARROWED_ENV_EXIT_WARNED", set())
+
+    with caplog.at_level(logging.WARNING, logger="phasesweep.engine.trial"):
+        _exit_code_result(
+            tmp_path, make_experiment(execution=ExecutionContext(inherit_env="all")), "p", 2
+        )
+        _exit_code_result(tmp_path, make_experiment(), "p", 0)
+
+    assert not [r for r in caplog.records if "execution.inherit_env" in r.getMessage()]
 
 
 def test_launch_trial_inherit_env_list_adds_exactly_named(

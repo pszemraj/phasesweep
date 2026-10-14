@@ -33,7 +33,7 @@ The generator refuses to write a manifest whose declared verdicts disagree with 
 The generator keeps the fixture tracked and independent of the generating host:
 
 - `artifact_root/t/.gitignore` is rewritten from PhaseSweep's `*` to `!*`. A deeper ignore file wins over the repository root's negation, so the original would hide the whole fixture from git.
-- the experiment declares `execution.inherit_env: none`, because the default records every ambient variable *name* in the ledger, which would commit the generating operator's environment shape and differ on every machine.
+- the experiment declares `execution.inherit_env: none` explicitly. `none` records only the fixed base names in the ledger, while `all` would record every ambient variable *name*, committing the generating operator's environment shape and differing on every machine. The pin keeps the fixture independent of the default.
 - the experiment declares `execution.cwd: /`. An unset trainer cwd puts the invocation directory into every phase and experiment fingerprint, so a fixture would match its own config only in the checkout that generated it. With the pin, the stored fingerprints are the same from any clone path and any generating directory; `tests/test_ledger_read_paths.py::test_fixture_fingerprints_do_not_depend_on_the_working_directory` holds that.
 
 ## Churn

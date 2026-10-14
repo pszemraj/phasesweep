@@ -7,8 +7,6 @@ trial_command: "python -m phasesweep.examples.mlflow_train --config {config_path
 trainer_config:
   model: {depth: 1}
   optimizer: {rate: 0}
-execution:
-  inherit_env: [PATH]
 mlflow:
   tracking_uri: http://127.0.0.1:5000
   experiment_name: phasesweep-native

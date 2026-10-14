@@ -171,13 +171,15 @@ Within a phase, the primary objective, W&B constraints, and that phase's W&B gat
 
 PhaseSweep supplies `WANDB_BASE_URL`, `WANDB_ENTITY`, `WANDB_PROJECT`, `WANDB_RUN_ID`, and `WANDB_RESUME=never`. Trainers must honor those values and finish their run. Explicit conflicting identity settings and offline/disabled modes are rejected before training; ambient identity defaults are normalized. An ordinary `wandb.init()`, scalar log/summary assignment, and `finish()` are sufficient; no PhaseSweep import or local objective mirror is needed.
 
-The reader receives the trainer's composed authentication and transport environment. Use `execution.passthrough_env` for rotating environment credentials or proxies, including under `inherit_env: none`. Excluded parent credentials are not reacquired. Supported SDK account authentication also works; an API-key environment variable is not mandatory. Credentials are never serialized in worker requests. Syntax validation and dry runs do not authenticate.
+The reader receives the trainer's composed authentication and transport environment. Use `execution.passthrough_env` for rotating environment credentials or proxies; the default `inherit_env: none` does not pass an unlisted credential at all. Excluded parent credentials are not reacquired. Supported SDK account authentication also works; an API-key environment variable is not mandatory. Credentials are never serialized in worker requests. Syntax validation and dry runs do not authenticate.
 
 W&B's source is keyed by attempt ID; it makes none of the envelope's evaluation-metadata or trainer-input-content assurances. It only records where in the run's history the objective's value was logged.
 
 ## Trainer contract
 
 The trainer runs in `execution.cwd` when configured, otherwise the invocation directory. It receives the configured environment plus PhaseSweep-managed attempt identity, evidence-path, trainer-input, and GPU variables. Use `execution.inherit_env` to choose ambient variables and `execution.passthrough_env` for rotating credentials or transport settings. Top-level `env` values remain semantic configuration.
+
+By default (`inherit_env: none`) the trainer receives only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `USER`, `LOGNAME`, and `TZ`, when set, plus top-level `env`. Everything else in the shell is dropped, including `PYTHONPATH`, virtualenv and conda settings, cache paths such as `HF_HOME`, proxies, credentials, and `CUDA_VISIBLE_DEVICES`. Widen it with `inherit_env: [NAME, ...]` for named variables, set a value under `env`, or choose `inherit_env: all` for the whole shell environment; `all` also makes every shell variable, such as `PWD`, part of the persistent-study environment cohort. `phasesweep validate` and `phasesweep run --dry-run` print the contract on an `environment:` line, and when a trial exits nonzero under a narrowed contract the first such trial in each phase logs a warning that names these fixes.
 
 See [GPU isolation](runtime.md#gpu-isolation) for discovery precedence and how device visibility interacts with environment inheritance.
 
@@ -217,7 +219,6 @@ Before launching a source-checkout trainer, verify the package actually imported
 ```yaml
 execution:
   cwd: /absolute/path/to/transformers
-  inherit_env: none
 env:
   PYTHONPATH: /absolute/path/to/transformers/src
 ```
@@ -231,4 +232,4 @@ CUDA_VISIBLE_DEVICES='' PYTHONPATH=/absolute/path/to/transformers/src \
   /absolute/path/to/python /absolute/path/to/transformers/examples/pytorch/token-classification/run_ner.py --help
 ```
 
-Carry all required settings into the experiment's composed environment: `inherit_env: none` drops ambient `PYTHONPATH` and other shell settings. Use the actual example's `--help` to choose supported arguments; configuration validation does not execute the trainer or establish library compatibility. For Transformers with managed MLflow, also apply the [full-script run context](mlflow.md#transformers-trainer) before launch so final evaluation remains in the bound run. The W&B integration uses its own native callback and managed attempt identity.
+Carry all required settings into the experiment's composed environment: the default `inherit_env: none` drops ambient `PYTHONPATH` and other shell settings. Use the actual example's `--help` to choose supported arguments; configuration validation does not execute the trainer or establish library compatibility. For Transformers with managed MLflow, also apply the [full-script run context](mlflow.md#transformers-trainer) before launch so final evaluation remains in the bound run. The W&B integration uses its own native callback and managed attempt identity.

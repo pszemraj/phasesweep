@@ -103,7 +103,38 @@ def experiment_contract_lines(experiment: Experiment) -> list[str]:
     :param Experiment experiment: Loaded experiment.
     :return list[str]: One line per experiment-wide contract, in print order.
     """
-    return [_metric_scoring_line(experiment.metric)]
+    return [_metric_scoring_line(experiment.metric), _environment_contract_line(experiment)]
+
+
+def _environment_contract_line(experiment: Experiment) -> str:
+    """Describe the trainer environment contract and which of its values pin a study.
+
+    The line is static: it reads the config and never ``os.environ``, so ``validate``
+    prints the same text from any shell.
+
+    :param Experiment experiment: Loaded experiment.
+    :return str: One line naming the inherited names, the ``env`` keys and the pass-through names.
+    """
+    execution = experiment.execution
+    contract = execution.inherit_env
+    admitted = execution.inherited_env_names()
+    if admitted is None:
+        inherited = "inherit_env=all (every ambient variable enters the digest)"
+    else:
+        label = f"[{', '.join(contract)}]" if isinstance(contract, list) else contract
+        inherited = f"inherit_env={label} (enter the digest when set: {', '.join(admitted)})"
+    passthrough = (
+        f"passthrough_env: {', '.join(sorted(execution.passthrough_env))} "
+        "(excluded from the digest)"
+        if execution.passthrough_env
+        else "passthrough_env: none"
+    )
+    parts = [inherited, f"env keys: {', '.join(sorted(experiment.env)) or 'none'}", passthrough]
+    if experiment.storage is not None:
+        parts.append(
+            "a persistent study refuses to resume when any value outside passthrough_env changes"
+        )
+    return "environment: " + "; ".join(parts)
 
 
 class Constraint(_Frozen):
@@ -482,16 +513,33 @@ def _is_environment_name(name: str) -> bool:
     return bool(name) and "=" not in name and "\x00" not in name
 
 
+# Minimal environment base used when the execution contract narrows
+# inheritance below "all": enough for a shell + interpreter to start and
+# write temp files, nothing that can carry semantic configuration.
+#
+# CUDA_VISIBLE_DEVICES is deliberately NOT here. It decides whether a trial
+# trains on CPU or GPU, so admitting the ambient value would let two operators
+# running the identical config from differently-exported shells write
+# CPU-trained and GPU-trained evaluations into one study under one semantic
+# fingerprint — exactly the unfingerprinted ambient input the narrowed
+# contracts exist to exclude (the fingerprint covers the contract's mode/names
+# and configured ``env``, never ambient values). Bind trainer visibility with
+# a top-level ``env.CUDA_VISIBLE_DEVICES`` entry, which is fingerprinted and
+# also drives GPU pool discovery, or name the variable in an ``inherit_env``
+# list to opt its ambient value in explicitly.
+BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
+
+
 class ExecutionContext(_Frozen):
     """Explicit trainer execution-context contract (review v0.5.17 / blocker 4).
 
-    Without this block, the trainer inherits the orchestrator's *entire*
-    ambient environment and current working directory — two unbounded
+    The ambient environment and the current working directory are two unbounded
     implicit semantic inputs that never contribute to study identity, so one
-    persistent study can silently mix evaluations from different trainers,
-    datasets, or credentials. Declaring the contract makes both explicit,
-    passes them to the trainer deterministically, and binds them into the
-    semantic fingerprint.
+    persistent study could silently mix evaluations from different trainers,
+    datasets, or credentials. This contract makes both explicit: the default
+    passes the trainer only :data:`BASE_INHERITED_ENV` plus configured ``env``
+    values, ``inherit_env`` widens that on purpose, and the choices bind into
+    the semantic fingerprint.
     """
 
     cwd: str | None = Field(
@@ -508,16 +556,18 @@ class ExecutionContext(_Frozen):
         ),
     )
     inherit_env: Literal["all", "none"] | list[str] = Field(
-        default="all",
+        default="none",
         description=(
-            "Which ambient environment variables the trainer inherits. 'all' "
-            "(default) preserves the historical full-inheritance behavior. "
-            "'none' starts from a minimal documented base (PATH, HOME, LANG, "
-            "LC_ALL, TMPDIR, USER, LOGNAME, TZ). A list inherits the base "
-            "plus exactly the named variables. Configured `env` values are "
-            "always applied on top and are always semantic. In persistent "
-            "studies, inherited values outside `passthrough_env` must match "
-            "the existing trial cohort before another trial is allocated."
+            "Which ambient environment variables the trainer inherits. 'none' "
+            "(default) passes a minimal documented base (PATH, HOME, LANG, "
+            "LC_ALL, TMPDIR, USER, LOGNAME, TZ) and drops everything else, "
+            "such as PYTHONPATH, virtualenv settings, cache paths and "
+            "credentials. A list inherits the base plus exactly the named "
+            "variables. 'all' opts in to the full ambient environment. "
+            "Configured `env` values are always applied on top and are always "
+            "semantic. In persistent studies, inherited values outside "
+            "`passthrough_env` must match the existing trial cohort before "
+            "another trial is allocated."
         ),
     )
     passthrough_env: list[str] = Field(
@@ -589,6 +639,16 @@ class ExecutionContext(_Frozen):
                     f"ambient variable once: {overlap!r}"
                 )
         return self
+
+    def inherited_env_names(self) -> tuple[str, ...] | None:
+        """List the ambient variable names the ``inherit_env`` contract admits.
+
+        :return tuple[str, ...] | None: The base set plus any listed names, or None
+            when ``inherit_env`` is ``all`` and every ambient variable is admitted.
+        """
+        if isinstance(self.inherit_env, list):
+            return (*BASE_INHERITED_ENV, *self.inherit_env)
+        return None if self.inherit_env == "all" else BASE_INHERITED_ENV
 
 
 class Experiment(_Frozen):

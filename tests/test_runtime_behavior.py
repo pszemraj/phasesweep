@@ -16,6 +16,7 @@ from phasesweep import run_experiment
 from phasesweep.config import (
     CategoricalParam,
     Constraint,
+    ExecutionContext,
     Experiment,
     FloatParam,
     IntParam,
@@ -490,7 +491,12 @@ def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
     """A newly reached W&B phase must validate before an existing phase can top up."""
     trainer = write_constant_trainer(tmp_path)
     local = Phase(name="local", n_trials=1, sampler=Sampler(type="random", seed=0))
-    initial = make_experiment(persistent=tmp_path, trainer=trainer, phases=[local])
+    initial = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        phases=[local],
+        execution=ExecutionContext(inherit_env=["WANDB_MODE"]),
+    )
     run_experiment(initial)
     generation_before = _generation_path(initial).read_bytes()
 

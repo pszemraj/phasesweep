@@ -44,7 +44,7 @@
 experiment: string (required)
 
 # Shell command template that runs one trainer attempt, for example: python train.py --config {config_path}
-# It runs as /bin/sh -c in a new session, in the execution.cwd directory (the directory phasesweep was started from when unset), with the composed trainer environment.
+# It runs as /bin/sh -c in a new session, in the execution.cwd directory (the directory phasesweep was started from when unset), with the composed trainer environment. By default that is a minimal base plus env, not the shell's environment; see execution.inherit_env.
 # Its stdout and stderr are written to stdout.log and stderr.log in the attempt directory. Both files are truncated at the start of each attempt.
 # The trainer must exit 0. A nonzero exit code fails the attempt before any evidence is read.
 # Each attempt directory also holds command.txt (the rendered command), overrides_resolved.json (the flat audit copy of the overrides, with sorted keys), and the trainer input file that override_format selects.
@@ -960,11 +960,12 @@ mlflow: object | null = null
 # Explicit phases[].gpu_ids and phases[].gpu_devices take priority over env.CUDA_VISIBLE_DEVICES for pool discovery. The trainer receives its leased device token.
 # env.CUDA_VISIBLE_DEVICES of "" or -1 disables CUDA for the phase. Under single_per_trial any other value must name devices that exist, and an unknown token fails when the phase launches. Under none it reaches the trainer unchecked.
 # Recommended: put rotating credentials and proxy settings in execution.passthrough_env and make them available to the controller too. Trainer telemetry settings are kept when their backend is not an evidence consumer.
-# Recommended: under gpu_policy none set CUDA_VISIBLE_DEVICES here, or list it in execution.inherit_env when narrowing inheritance, because otherwise an ambient GPU restriction is dropped.
+# Recommended: under gpu_policy none set CUDA_VISIBLE_DEVICES here, or list it in execution.inherit_env (or choose all), because the default inherit_env none drops an ambient GPU restriction.
 # Recommended: set cache variables such as HF_HOME, HF_DATASETS_CACHE, TORCH_HOME and TMPDIR to writable locations when needed. PhaseSweep does not provision or warm trainer caches.
 env: map[string, string] = {}
 
 # Trainer subprocess working directory and environment-selection contract. Nested defaults apply when the block is omitted.
+# Without the block the trainer runs in the directory phasesweep was started from with the minimal base environment (inherit_env none) plus env.
 # The effective working directory, the inheritance mode and names, and the pass-through names are part of the study fingerprint.
 execution: object = {}
   # Working directory of every trainer process. A leading ~ is expanded and a relative path resolves against the directory phasesweep is started from, not the config file.
@@ -975,7 +976,9 @@ execution: object = {}
   # Recommended: use an absolute path so script and data paths resolve the same way from every invocation. workdir and local evidence paths keep their own rules.
   cwd: string | null = null
 
-  # Which ambient variables the trainer inherits. all passes every variable. none keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME and TZ, when present. A list of names adds exactly those variables to that base.
+  # Which ambient variables the trainer inherits. none (the default) keeps only PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME and TZ, when present. A list of names adds exactly those variables to that base. all passes every variable.
+  # The default drops PYTHONPATH, virtualenv and conda settings, cache paths such as HF_HOME, proxies and credentials. A trainer that needs one of them fails or behaves differently, so name it in a list, set it under env, or choose all.
+  # phasesweep validate and run --dry-run print this contract on an environment: line. When a trial exits nonzero under none or a list, the first one in each phase logs a warning that names these three fixes.
   # CUDA_VISIBLE_DEVICES is never in the base set. Bind it with env.CUDA_VISIBLE_DEVICES or name it here.
   # The same selection applies to the environment of PhaseSweep's own MLflow and W&B workers.
   # Overridden by: env (a configured value replaces an inherited value of the same name).
@@ -985,7 +988,7 @@ execution: object = {}
   # To clear a mismatch, restore the environment, move the variable to execution.passthrough_env, or use a new experiment name.
   # inherit_env none and an empty list give the same environment but different study fingerprints.
   # Recommended: list the model, cache and GPU variables the trainer needs. Narrowed inheritance does not later pick up excluded credential or cache variables.
-  inherit_env: "all" | "none" | list[string] = "all"
+  inherit_env: "all" | "none" | list[string] = "none"
 
   # Names of ambient variables whose values may change between invocations, for example MLFLOW_TRACKING_TOKEN or HTTPS_PROXY. Names must be unique, nonempty, unpadded and free of = and NUL characters.
   # With inherit_env all this list adds nothing to the environment, because every ambient variable is already inherited. With none or a list, it adds these variables to the base set.

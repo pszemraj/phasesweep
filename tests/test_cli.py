@@ -19,6 +19,7 @@ from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
     CategoricalParam,
+    ExecutionContext,
     Experiment,
     FloatParam,
     JsonEnvelopeExtractor,
@@ -136,6 +137,86 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
 
     assert result.exit_code == 0, result.output
     assert "goal=minimize" in result.output
+
+
+_BASE_ENV_NAMES = "PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ"
+_REFUSES_TO_RESUME = (
+    "a persistent study refuses to resume when any value outside passthrough_env changes"
+)
+_ENVIRONMENT_CONTRACT_CASES = [
+    pytest.param(
+        {},
+        f"environment: inherit_env=none (enter the digest when set: {_BASE_ENV_NAMES}); "
+        "env keys: none; passthrough_env: none",
+        id="default-in-memory",
+    ),
+    pytest.param(
+        {
+            "execution": ExecutionContext(inherit_env=["HF_HOME"], passthrough_env=["HF_TOKEN"]),
+            "env": {"B_FLAG": "1", "A_FLAG": "2"},
+            "persistent": True,
+        },
+        f"environment: inherit_env=[HF_HOME] (enter the digest when set: {_BASE_ENV_NAMES}, "
+        "HF_HOME); env keys: A_FLAG, B_FLAG; passthrough_env: HF_TOKEN (excluded from the digest); "
+        + _REFUSES_TO_RESUME,
+        id="list-and-passthrough-persistent",
+    ),
+    pytest.param(
+        {"execution": ExecutionContext(inherit_env="all")},
+        "environment: inherit_env=all (every ambient variable enters the digest); "
+        "env keys: none; passthrough_env: none",
+        id="all",
+    ),
+]
+
+
+def _environment_contract_experiment(tmp_path: Path, case: dict) -> Experiment:
+    """Build the experiment behind one environment-contract case.
+
+    :param Path tmp_path: Scratch directory for the workdir and, when persistent, the journal.
+    :param dict case: Keyword arguments for :func:`make_experiment`, where ``persistent``
+        is a flag that selects journal storage under ``tmp_path``.
+    :return Experiment: The experiment for the case.
+    """
+    kwargs = dict(case)
+    if kwargs.pop("persistent", False):
+        kwargs["persistent"] = tmp_path
+    return make_experiment(workdir=tmp_path / "runs", n_trials=1, **kwargs)
+
+
+@pytest.mark.parametrize(("case", "expected"), _ENVIRONMENT_CONTRACT_CASES)
+def test_validate_discloses_environment_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: dict, expected: str
+) -> None:
+    """``validate`` prints the static environment contract and never reads the ambient one."""
+    monkeypatch.setenv("PHASESWEEP_TEST_AMBIENT_SECRET", "leak")
+    experiment = _environment_contract_experiment(tmp_path, case)
+    config = tmp_path / "experiment.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    lines = [line.strip() for line in result.output.splitlines() if "environment:" in line]
+    assert lines == [expected]
+    assert "leak" not in result.output
+    assert "PHASESWEEP_TEST_AMBIENT_SECRET" not in result.output
+
+
+@pytest.mark.parametrize(("case", "expected"), _ENVIRONMENT_CONTRACT_CASES)
+def test_dry_run_logs_environment_contract(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, case: dict, expected: str
+) -> None:
+    """``run --dry-run`` logs the same environment line ``validate`` prints."""
+    experiment = _environment_contract_experiment(tmp_path, case)
+
+    with caplog.at_level(logging.INFO):
+        run_experiment(experiment, dry_run=True)
+
+    lines = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN environment:")
+    ]
+    assert lines == [f"DRY RUN {expected}"]
 
 
 def test_help_registers_commands_and_options() -> None:
@@ -896,6 +977,7 @@ def test_cli_boundary_rejects_ambient_offline_wandb_before_generation(
 
     experiment = make_experiment(
         workdir=tmp_path / "runs",
+        execution=ExecutionContext(inherit_env=[env_name]),
         metric=Metric(
             name="loss",
             goal="minimize",
