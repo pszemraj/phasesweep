@@ -37,7 +37,13 @@ from phasesweep.engine.errors import (
     StudyStorageUnavailableError,
 )
 from phasesweep.engine.phase import _placeholder_winner, _run_phase
-from phasesweep.engine.preview import RecordedPhase, _preview_ledger, _preview_phase
+from phasesweep.engine.preview import (
+    PhasePreview,
+    RecordedPhase,
+    _dry_run_total_line,
+    _preview_ledger,
+    _preview_phase,
+)
 from phasesweep.engine.publication import _published_winner_path_for
 from phasesweep.engine.read import read_status
 from phasesweep.engine.selection import _winner_summary_item
@@ -692,6 +698,7 @@ def _run_experiment_inner(
     skip_until = from_phase is not None
     winners: dict[str, Winner] = {}
     recorded: dict[str, RecordedPhase | None] = {}
+    previews: list[PhasePreview] = []
     if run_deadline is None and not dry_run and experiment.timeout_seconds_per_run is not None:
         run_deadline = time.monotonic() + experiment.timeout_seconds_per_run
 
@@ -764,7 +771,8 @@ def _run_experiment_inner(
 
         _warn_flagged_inheritance(phase.name, inherited)
         if ledger is None:
-            winner = _preview_phase(experiment, phase, inherited, recorded.get(phase.name))
+            previews.append(_preview_phase(experiment, phase, inherited, recorded.get(phase.name)))
+            winner = previews[-1].winner
         else:
             assert generation_id is not None
             winner = _run_phase(
@@ -802,6 +810,7 @@ def _run_experiment_inner(
         winners[phase.name] = winner
 
     if dry_run:
+        log.info("DRY RUN %s", _dry_run_total_line(previews))
         log.info("DRY RUN complete. No trials launched, no summary written.")
         return winners
 

@@ -13,7 +13,7 @@ launch's order, and reports the verdict.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import optuna
@@ -69,6 +69,37 @@ class RecordedPhase:
     running: int
     #: The phase's study as a read-only snapshot, or ``None`` when the ledger holds none.
     study: optuna.Study | None
+
+
+@dataclass(frozen=True, slots=True)
+class PhasePreview:
+    """What a dry run says one previewed phase would do."""
+
+    #: The winner the phase hands its children: a replayed one, or a placeholder.
+    winner: Winner
+    #: Trials a launch would run, the count the phase's "would launch" line prints.
+    launches: int
+    #: Whether the phase would replay a recorded result and launch no trials.
+    replays: bool
+
+
+def _dry_run_total_line(previews: Sequence[PhasePreview]) -> str:
+    """Total the trials a dry run would launch from the counts its phase lines print.
+
+    :param Sequence[PhasePreview] previews: The previewed phases, in order. A phase that
+        ``--from-phase`` skips is not previewed and so is not counted.
+    :return str: The line, without the ``DRY RUN`` prefix.
+    """
+    trials = sum(preview.launches for preview in previews)
+    launching = sum(1 for preview in previews if preview.launches)
+    replaying = sum(1 for preview in previews if preview.replays)
+    line = (
+        f"total: would launch {trials} {'trial' if trials == 1 else 'trials'} "
+        f"across {launching} {'phase' if launching == 1 else 'phases'}"
+    )
+    if replaying:
+        line += f" ({replaying} other {'phase replays' if replaying == 1 else 'phases replay'})"
+    return line
 
 
 def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
@@ -273,18 +304,19 @@ def _preview_phase(
     phase: Phase,
     inherited_winners: dict[str, Winner],
     recorded: RecordedPhase | None,
-) -> Winner:
-    """Log what a launch would do with the phase's recorded trials, and return its winner.
+) -> PhasePreview:
+    """Log what a launch would do with the phase's recorded trials, and return the verdict.
 
     The recorded trials are judged by the rules a launch applies
     (:func:`_preview_resume_phase`), so the preview refuses what a launch
-    refuses. A phase that would replay returns the winner a launch would
-    republish, which its children inherit. A phase with trials still to run
-    returns a placeholder (:func:`_dry_run_phase`). A phase whose recorded
+    refuses. A phase that would replay carries the winner a launch would
+    republish, which its children inherit, and launches no trials. A phase with
+    trials still to run carries a placeholder (:func:`_dry_run_phase`) and the
+    ``remaining`` count its line prints. A phase whose recorded
     state could not be read is previewed as a fresh phase, and one whose
     RUNNING attempts a launch recovers first is previewed from its counts,
     with those attempts counted as failed and its recorded state unjudged;
-    both return a placeholder.
+    both carry a placeholder.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
@@ -293,7 +325,8 @@ def _preview_phase(
     :param RecordedPhase | None recorded: What the ledger holds for the phase,
         or ``None`` when that could not be read and the phase previews as fresh.
     :raises PhaseSweepError: A launch would refuse the phase's recorded state.
-    :return Winner: The winner a replay would publish, or a placeholder.
+    :return PhasePreview: The winner a replay would publish or a placeholder, the
+        trials a launch would run, and whether the phase replays.
     """
     completed = 0 if recorded is None else recorded.finished
     remaining = max(0, phase.n_trials - completed)
@@ -332,7 +365,7 @@ def _preview_phase(
                 completed,
                 phase.n_trials,
             )
-            return resumed
+            return PhasePreview(winner=resumed, launches=0, replays=True)
         resume = resumed
     if remaining == 0:
         log.info(
@@ -343,13 +376,16 @@ def _preview_phase(
             phase.n_trials,
         )
         if study is None or resume is None:
-            return _placeholder_winner(experiment, phase, inherited_winners)
-        return _replay_met_target(
-            experiment, phase, inherited_winners, study, resume, verify_evidence=False
-        )
-    return _dry_run_phase(
+            winner = _placeholder_winner(experiment, phase, inherited_winners)
+        else:
+            winner = _replay_met_target(
+                experiment, phase, inherited_winners, study, resume, verify_evidence=False
+            )
+        return PhasePreview(winner=winner, launches=0, replays=True)
+    winner = _dry_run_phase(
         experiment, phase, inherited_winners, open_preview_study(experiment, phase), remaining
     )
+    return PhasePreview(winner=winner, launches=remaining, replays=False)
 
 
 def _dry_run_phase(

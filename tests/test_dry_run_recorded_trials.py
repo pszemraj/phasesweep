@@ -448,6 +448,37 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     assert _PLACEHOLDERS in command
 
 
+def test_total_line_sums_the_launches_the_phase_lines_print(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The total counts launching and replaying phases, leaves skipped ones out, and a refusal prints none."""
+    experiment = _persistent(
+        tmp_path, _phase("a", 2), _phase("b", 2, inherits=("a",)), _phase("c", 3, inherits=("b",))
+    )
+    _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2)
+
+    def totals() -> list[str]:
+        return [
+            m for m in (r.getMessage() for r in caplog.records) if m.startswith("DRY RUN total")
+        ]
+
+    _preview(experiment, tmp_path, caplog)
+    assert totals() == [
+        "DRY RUN total: would launch 5 trials across 2 phases (1 other phase replays)"
+    ]
+
+    caplog.clear()
+    run_experiment(experiment, from_phase="b", dry_run=True)
+    assert totals() == ["DRY RUN total: would launch 5 trials across 2 phases"]
+
+    caplog.clear()
+    lowered = _persistent(tmp_path, _phase("d", 2))
+    _record(lowered, "d", _STATE.COMPLETE, _STATE.FAIL, target=4)
+    with pytest.raises(TrialTargetRefusedError):
+        run_experiment(lowered, dry_run=True)
+    assert totals() == []
+
+
 def test_running_attempt_counts_as_failed_toward_a_fixed_configurations_retry_limit(
     tmp_path: Path,
 ) -> None:
