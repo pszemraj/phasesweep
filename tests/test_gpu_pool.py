@@ -34,6 +34,7 @@ from phasesweep.runtime.gpu import (
     _try_host_gpu_lease,
 )
 from phasesweep.runtime.process import run_supervised
+from phasesweep.runtime.shutdown import PhaseSweepShutdown, _shutdown_handler
 
 # Bound before any monkeypatching so live tests can restore the real probe.
 _real_detect_gpu_inventory = _detect_gpu_inventory
@@ -186,6 +187,42 @@ def test_whole_node_policy_cancels_while_waiting_for_host_lock(tmp_path, monkeyp
     competitor = GpuPool.create(n_jobs=1, explicit_ids=[0])
     with competitor.acquire(deadline=time.monotonic() + 1.0) as assignment:
         assert assignment.visible_devices == "0"
+
+
+def test_shutdown_wakes_a_lease_wait_blocked_on_a_busy_local_slot(tmp_path, monkeypatch) -> None:
+    """The shutdown handler ends a deadline-less wait at once, before the slot frees, naming its signal."""
+    monkeypatch.setattr("phasesweep.runtime.gpu.lock_dir", lambda: tmp_path)
+    pool = GpuPool.create(n_jobs=1, explicit_ids=[3])
+    result: list[BaseException] = []
+    blocked = threading.Event()
+
+    class _ObservedCondition(threading.Condition):
+        def wait(self, timeout: float | None = None) -> bool:
+            blocked.set()
+            return threading.Condition.wait(self, timeout)
+
+    pool._condition = _ObservedCondition()
+
+    def wait_for_the_slot() -> None:
+        try:
+            with pool.acquire():
+                result.append(AssertionError("acquired a slot during a shutdown"))
+        except BaseException as exc:
+            result.append(exc)
+
+    with pool.acquire():
+        waiter = threading.Thread(target=wait_for_the_slot)
+        waiter.start()
+        assert blocked.wait(5.0)
+        with pytest.raises(PhaseSweepShutdown):
+            _shutdown_handler(signal.SIGINT, None)
+        # Still holding the slot: only the handler's wake can end the wait.
+        waiter.join(timeout=2.0)
+        assert not waiter.is_alive()
+
+    assert len(result) == 1
+    assert isinstance(result[0], GpuLeaseCancelledError)
+    assert "shutdown signal 2" in str(result[0])
 
 
 def test_none_policy_disables_cuda_isolation(monkeypatch) -> None:

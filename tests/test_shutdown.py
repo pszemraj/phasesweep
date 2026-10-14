@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -17,8 +18,11 @@ import pytest
 from phasesweep import run_experiment
 from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.runtime import shutdown as runtime_shutdown
+from phasesweep.runtime.process import ATTEMPT_LIFECYCLE_FILE, run_supervised
+from phasesweep.runtime.reaper import PROCESS_IDENTITY_FILE
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
+    ShutdownLaunchRefusedError,
     SignalOwnershipUnavailableError,
     _shutdown_handler,
     defer_shutdown_signals,
@@ -609,3 +613,53 @@ def test_shutdown_handler_names_the_signal_it_services_until_the_next_run() -> N
     assert runtime_shutdown.servicing_shutdown_signal() == signal.SIGINT
     with restored_signal_ownership(), signal_handler_scope():
         assert runtime_shutdown.servicing_shutdown_signal() is None
+
+
+def test_shutdown_handler_wakes_registered_waiters_after_naming_the_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each waker runs once the servicing signal is visible, and a failing waker stops none of the others."""
+    seen: list[int | None] = []
+
+    def failing() -> None:
+        raise RuntimeError("waker failed")
+
+    monkeypatch.setattr(
+        runtime_shutdown,
+        "_shutdown_wakers",
+        [failing, lambda: seen.append(runtime_shutdown.servicing_shutdown_signal())],
+    )
+    with pytest.raises(PhaseSweepShutdown):
+        _shutdown_handler(signal.SIGTERM, None)
+    assert seen == [signal.SIGTERM]
+
+
+def test_a_launch_while_a_shutdown_is_serviced_starts_no_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch that reaches the launch lock after the handler named its signal is refused before any spawn."""
+    monkeypatch.setattr(
+        "phasesweep.runtime.process.servicing_shutdown_signal", lambda: signal.SIGTERM
+    )
+    ran = tmp_path / "ran"
+    trial_dir = tmp_path / "trial"
+    trial_dir.mkdir()
+    with (
+        (trial_dir / "stdout.log").open("w") as stdout,
+        (trial_dir / "stderr.log").open("w") as stderr,
+        pytest.raises(ShutdownLaunchRefusedError, match="interrupted by signal 15"),
+    ):
+        run_supervised(
+            f"{sys.executable} -c 'open({str(ran)!r}, \"w\")'",
+            env=dict(os.environ),
+            stdout=stdout,
+            stderr=stderr,
+            timeout=10.0,
+            trial_dir=trial_dir,
+            attempt_id="refused-attempt",
+        )
+    assert not ran.exists()
+    assert not (trial_dir / PROCESS_IDENTITY_FILE).exists()
+    lifecycle = json.loads((trial_dir / ATTEMPT_LIFECYCLE_FILE).read_text())
+    assert lifecycle["state"] == "exited"
+    assert lifecycle["cleanup_confirmed"] is True

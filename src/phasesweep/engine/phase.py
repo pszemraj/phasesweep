@@ -8,7 +8,7 @@ import json
 import logging
 import threading
 import time
-from collections.abc import Collection, Sequence
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 from uuid import uuid4
@@ -39,9 +39,9 @@ from phasesweep.engine.optuna import (
     _finished_trial_count,
     _phase_study_name,
     _suggest,
-    _trial_state_label,
 )
 from phasesweep.engine.paths import _phase_dir, _trial_dir_for
+from phasesweep.engine.progress import _log_finished_trial, _log_phase_header, _log_reruns
 from phasesweep.engine.repeats import repeat_axis
 from phasesweep.engine.selection import NoFeasibleTrialError, select_winner
 from phasesweep.engine.state import (
@@ -56,7 +56,6 @@ from phasesweep.engine.state import (
     OVERRIDES_ATTR,
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
-    RERUN_OF_ATTR,
     RETURN_CODE_ATTR,
     TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
@@ -67,7 +66,6 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     Winner,
     WinnerSource,
-    _parsed_trial_outcome,
     constraint_attr,
     observed_attr,
 )
@@ -100,9 +98,14 @@ from phasesweep.engine.trial import (
     prepare_trainer_input,
     trial_run_name,
 )
+from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.runtime.gpu import GpuLeaseCancelledError, GpuLeaseTimeoutError, GpuPool
 from phasesweep.runtime.process import write_attempt_lifecycle
-from phasesweep.runtime.shutdown import PhaseSweepShutdown, servicing_shutdown_signal
+from phasesweep.runtime.shutdown import (
+    PhaseSweepShutdown,
+    ShutdownLaunchRefusedError,
+    servicing_shutdown_signal,
+)
 
 log = logging.getLogger("phasesweep.engine.phase")
 
@@ -703,6 +706,7 @@ class _PhaseExecution:
     csv_throttle: CsvSnapshotThrottle = field(default_factory=CsvSnapshotThrottle)
     outcome_lock: threading.Lock = field(default_factory=threading.Lock)
     fatal_lock: threading.Lock = field(default_factory=threading.Lock)
+    workers: _WorkerTrials = field(default_factory=_WorkerTrials)
 
     def resume_from(self, policy_state: _PhasePolicyState) -> None:
         """Continue the completion order the durable outcome ledger replays.
@@ -836,6 +840,19 @@ def _refuse_launch_after_deadline(run: _PhaseExecution) -> None:
         run.stop_for_deadline()
         raise _DeadlineTrialExecutionError(
             f"{run.timeout_source or 'wallclock'} deadline reached before trial launch."
+        )
+
+
+def _refuse_launch_during_shutdown() -> None:
+    """Refuse to start a trial while a shutdown signal is being serviced.
+
+    :raises TrialExecutionError: A shutdown is being serviced, so
+        :func:`_objective` records the trial as interrupted by that signal.
+    """
+    signum = servicing_shutdown_signal()
+    if signum is not None:
+        raise TrialExecutionError(
+            f"trainer launch refused: orchestrator interrupted by signal {signum}"
         )
 
 
@@ -987,6 +1004,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
 
     if run.aborted:
         raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE)
+    _refuse_launch_during_shutdown()
 
     sampled = {name: _suggest(trial, name, p) for name, p in sampler_search_space(phase).items()}
     overrides = _composed_overrides(experiment, phase, sampled, run.inherited_winners)
@@ -1093,22 +1111,29 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
             # cleanup_confirmed check.
             if run.aborted:
                 raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE)
+            # A shutdown's kill sweep frees leases; a queued worker that takes
+            # one afterwards must not start a trainer no handler will kill.
+            _refuse_launch_during_shutdown()
 
             _refuse_launch_after_deadline(run)
-            executed = launch_trial(
-                experiment=experiment,
-                phase_name=phase.name,
-                trial_id=trial.number,
-                generation_id=run.generation_id,
-                attempt_id=attempt_id,
-                trial_dir=trial_dir,
-                overrides=overrides,
-                timeout_seconds=phase.timeout_seconds_per_trial,
-                wallclock_deadline=run.optimize_deadline,
-                gpu_id=gpu_assignment.visible_devices,
-                gpu_lease_fds=gpu_assignment.lease_fds,
-                prepared_input=prepared_input,
-            )
+            try:
+                executed = launch_trial(
+                    experiment=experiment,
+                    phase_name=phase.name,
+                    trial_id=trial.number,
+                    generation_id=run.generation_id,
+                    attempt_id=attempt_id,
+                    trial_dir=trial_dir,
+                    overrides=overrides,
+                    timeout_seconds=phase.timeout_seconds_per_trial,
+                    wallclock_deadline=run.optimize_deadline,
+                    gpu_id=gpu_assignment.visible_devices,
+                    gpu_lease_fds=gpu_assignment.lease_fds,
+                    prepared_input=prepared_input,
+                )
+            except ShutdownLaunchRefusedError as exc:
+                # The shutdown began between the check above and the launch lock.
+                raise TrialExecutionError(str(exc)) from exc
 
             # CRITICAL: this check must happen INSIDE the GPU lease.
             # Releasing the lease before observing ``cleanup_confirmed=False``
@@ -1142,6 +1167,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         run.stop_for_deadline()
         raise _DeadlineTrialExecutionError(str(exc)) from exc
     except GpuLeaseCancelledError as exc:
+        _refuse_launch_during_shutdown()
         raise _UnlaunchedAbortError(_UNLAUNCHED_ABORT_CAUSE) from exc
 
     # Extraction happens outside GPU lease but INSIDE the phase/run
@@ -1207,6 +1233,17 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
 
     assert result.metric is not None  # guaranteed when failure_reason is None
     return result.metric
+
+
+def _tracked_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
+    """Run :func:`_objective` while the phase's worker tracker counts it.
+
+    :param _PhaseExecution run: The phase execution the trial belongs to.
+    :param optuna.Trial trial: The active Optuna trial being evaluated.
+    :return float: The metric :func:`_objective` returns.
+    """
+    with run.workers.track(trial.number):
+        return _objective(run, trial)
 
 
 def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
@@ -1335,83 +1372,6 @@ def _after_trial(
         raise
 
 
-def _log_finished_trial(
-    run: _PhaseExecution, trial: optuna.trial.FrozenTrial, finished: int
-) -> None:
-    """Log one INFO line for a finished trial, the progress stream a ``tail -f`` follows.
-
-    A COMPLETE trial that is infeasible, whether by a constraint or by the
-    metric's bounds, reports ``INFEASIBLE`` in place of its Optuna state, as
-    selection treats it, and an interrupted trial reports ``INTERRUPTED``. The
-    reason is the first line of the recorded outcome cause. A repeats phase adds
-    the trial's repeat value so a reader can see which seed ran, and a rerun
-    names the interrupted trial it reran. Params stay out of the line; the
-    phase's WINNER line carries the winner's.
-
-    :param _PhaseExecution run: The phase execution the trial belongs to.
-    :param optuna.trial.FrozenTrial trial: The just-finished trial.
-    :param int finished: Trials the phase's study holds that count toward its
-        target, this one included unless it was interrupted.
-    """
-    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    value = "none" if trial.value is None else f"{trial.value:g}"
-    duration = "none" if trial.duration is None else f"{trial.duration.total_seconds():.1f}s"
-    axis = repeat_axis(run.phase)
-    repeat = ""
-    if axis is not None and axis.key in trial.params:
-        repeat = f" repeat={axis.key}={trial.params[axis.key]}"
-    source = trial.user_attrs.get(RERUN_OF_ATTR)
-    rerun = "" if source is None else f" rerun_of={source}"
-    reason = _first_cause_line(trial)
-    log.info(
-        "phase=%s TRIAL trial=%d state=%s outcome=%s value=%s duration=%s%s%s (%d/%d finished)%s",
-        run.phase.name,
-        trial.number,
-        _trial_state_label(trial),
-        "unknown" if parsed is None else parsed.outcome,
-        value,
-        duration,
-        repeat,
-        rerun,
-        finished,
-        run.phase.n_trials,
-        "" if reason is None else f" reason={reason}",
-    )
-
-
-def _first_cause_line(trial: optuna.trial.FrozenTrial) -> str | None:
-    """Return the first line of a trial's recorded outcome cause.
-
-    :param optuna.trial.FrozenTrial trial: Trial whose outcome record is read.
-    :return str | None: The cause's first nonblank line, or None when it recorded none.
-    """
-    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
-    lines = parsed.cause.strip().splitlines() if parsed and parsed.cause else []
-    return lines[0] if lines else None
-
-
-def _log_reruns(phase: Phase, study: optuna.Study, reruns: Sequence[tuple[int, int]]) -> None:
-    """Log one INFO line per rerun scheduled, naming the interrupted trial and why it stopped.
-
-    :param Phase phase: The phase whose study scheduled the reruns.
-    :param optuna.Study study: That study.
-    :param Sequence[tuple[int, int]] reruns: ``(source, rerun)`` trial numbers, as
-        :func:`~phasesweep.engine.study_policy._record_reruns` returns them.
-    """
-    if not reruns:
-        return
-    trials = {trial.number: trial for trial in study.get_trials(deepcopy=False)}
-    for source, rerun in reruns:
-        reason = _first_cause_line(trials[source])
-        log.info(
-            "phase=%s RERUN trial=%d of=%d%s",
-            phase.name,
-            rerun,
-            source,
-            "" if reason is None else f" reason={reason}",
-        )
-
-
 def _settle_finished_trial(
     run: _PhaseExecution,
     study: optuna.Study,
@@ -1438,7 +1398,7 @@ def _settle_finished_trial(
         with contextlib.suppress(Exception):
             study.stop()
     finished = _finished_trial_count(study.get_trials(deepcopy=False))
-    _log_finished_trial(run, trial, finished)
+    _log_finished_trial(run.phase, trial, finished)
     # Terminal state alone is insufficient for an unsafe-cleanup trial: its
     # registry entry is the cross-phase/storage recovery locator and must
     # survive until preflight durably consumes cleanup evidence.
@@ -1663,14 +1623,12 @@ def _run_phase(
     trials = study.get_trials(deepcopy=False)
     finished = _finished_trial_count(trials)
     remaining = max(0, phase.n_trials - finished)
-    log.info(
-        "phase=%s study=%s finished=%d remaining=%d reruns=%d n_jobs=%d",
-        phase.name,
+    _log_phase_header(
+        phase,
         study_name,
-        finished,
-        remaining,
-        _pending_rerun_count(trials),
-        phase.n_jobs,
+        finished=finished,
+        remaining=remaining,
+        reruns=_pending_rerun_count(trials),
     )
 
     if remaining == 0:
@@ -1758,15 +1716,23 @@ def _run_phase(
             # every interrupted trial reruns with its own params before any new
             # draw, and the allocation context above covers the reruns.
             _log_reruns(phase, study, _record_reruns(study))
-            study.optimize(
-                functools.partial(_objective, run),
-                n_trials=remaining,
-                n_jobs=phase.n_jobs,
-                timeout=budget.timeout,
-                gc_after_trial=True,
-                callbacks=[functools.partial(_after_trial, run)],
-                catch=(TrialExecutionError,),
-            )
+            try:
+                study.optimize(
+                    functools.partial(_tracked_objective, run),
+                    n_trials=remaining,
+                    n_jobs=phase.n_jobs,
+                    timeout=budget.timeout,
+                    gc_after_trial=True,
+                    callbacks=[functools.partial(_after_trial, run)],
+                    catch=(TrialExecutionError,),
+                )
+            except BaseException:
+                # A shutdown can raise here while Optuna's worker threads are
+                # still finishing their trials; the run's reconciliation must
+                # not reap a trial a live worker is about to record.
+                if phase.n_jobs > 1:
+                    _await_worker_trials(run.workers, study)
+                raise
         finally:
             # Always snapshot trials.csv, even if ``study.optimize`` raises
             # (n_jobs=1 fatal-objective path) or some other transient backend

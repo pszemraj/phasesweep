@@ -29,6 +29,7 @@ import re
 import subprocess
 import threading
 import time
+import weakref
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ from typing import IO
 from phasesweep.config.models import GpuPolicy
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.runtime.files import lock_dir, try_lock_file, unlock_file
+from phasesweep.runtime.shutdown import register_shutdown_waker, servicing_shutdown_signal
 
 log = logging.getLogger("phasesweep.runtime.gpu")
 
@@ -50,7 +52,7 @@ class GpuLeaseTimeoutError(TimeoutError):
 
 
 class GpuLeaseCancelledError(RuntimeError):
-    """Raised when the owning phase cancels queued GPU lease waits."""
+    """Raised when the owning phase cancels queued GPU lease waits, or a shutdown is being serviced."""
 
 
 @dataclass(frozen=True)
@@ -515,6 +517,7 @@ class GpuPool:
 
         if devices:
             self._available = list(devices)
+        _live_pools.add(self)
 
     @classmethod
     def create(
@@ -707,9 +710,14 @@ class GpuPool:
         :return float | None: Remaining seconds, or ``None`` when no deadline is active.
         :raises GpuLeaseTimeoutError: The deadline has already passed, so
             waiting further would overrun the phase/run wallclock budget.
+        :raises GpuLeaseCancelledError: The owning phase cancelled queued waits,
+            or a shutdown signal is being serviced.
         """
         if self._cancelled.is_set():
             raise GpuLeaseCancelledError("GPU lease wait cancelled by phase abort.")
+        signum = servicing_shutdown_signal()
+        if signum is not None:
+            raise GpuLeaseCancelledError(f"GPU lease wait cancelled by shutdown signal {signum}.")
         if deadline is None:
             return None
         remaining = deadline - time.monotonic()
@@ -732,6 +740,10 @@ class GpuPool:
     def cancel_waiters(self) -> None:
         """Cancel current and future lease waits and wake local-slot waiters."""
         self._cancelled.set()
+        self.wake_waiters()
+
+    def wake_waiters(self) -> None:
+        """Wake local-slot waiters so each re-checks cancellation and shutdown."""
         with self._condition:
             self._condition.notify_all()
 
@@ -908,6 +920,20 @@ class GpuPool:
             )
         finally:
             self._release(acquired)
+
+
+# Every pool alive in this process, so a shutdown can wake the threads queued on
+# any of them; a pool drops out once nothing references it.
+_live_pools: weakref.WeakSet[GpuPool] = weakref.WeakSet()
+
+
+def _wake_live_pools() -> None:
+    """Wake every live pool's queued lease waiters to see a shutdown being serviced."""
+    for pool in list(_live_pools):
+        pool.wake_waiters()
+
+
+register_shutdown_waker(_wake_live_pools)
 
 
 def _normalize_devices(tokens: Iterable[int | str]) -> list[GpuDevice]:

@@ -58,10 +58,12 @@ from phasesweep.runtime.reaper import (
 )
 from phasesweep.runtime.shutdown import (
     PhaseSweepShutdown,
+    ShutdownLaunchRefusedError,
     _launch_lock,
     _register,
     _unregister,
     defer_shutdown_signals,
+    servicing_shutdown_signal,
 )
 
 log = logging.getLogger("phasesweep.runtime.process")
@@ -849,6 +851,8 @@ def run_supervised(
     Raises:
         PhaseSweepError: This process's PID namespace is unreadable, so nothing
             was recorded or launched.
+        ShutdownLaunchRefusedError: A shutdown signal is being serviced, so
+            no process was started and the attempt is recorded as exited.
         RuntimeError: The supervisor never signalled readiness, or signalled an
             unexpected byte, so no process group was ever created.
         OSError: The supervisor process or its pipes could not be created, or
@@ -906,6 +910,12 @@ def run_supervised(
 
     try:
         with defer_shutdown_signals(), _launch_lock:
+            # The handler sets the servicing signal before it takes this lock
+            # to snapshot children, so a launch past this check is in its
+            # snapshot and one after it never starts a process.
+            signum = servicing_shutdown_signal()
+            if signum is not None:
+                raise ShutdownLaunchRefusedError(signum)
             # Advance durably before Popen. Without this boundary, a spawned
             # supervisor whose identity write and cleanup both fail is
             # indistinguishable on recovery from a worker killed while still

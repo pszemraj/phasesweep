@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import csv
 import logging
+import os
+import signal
+import threading
+import time
 from pathlib import Path
 
 import optuna
@@ -11,6 +15,8 @@ import pytest
 from optuna.distributions import IntDistribution
 
 from phasesweep import run_experiment
+from phasesweep.config import Experiment
+from phasesweep.engine import phase as phase_module
 from phasesweep.engine import read_trial_tables
 from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.fingerprints import _phase_fingerprint
@@ -22,6 +28,7 @@ from phasesweep.engine.optuna import (
     _trial_state_label,
 )
 from phasesweep.engine.paths import _phase_dir
+from phasesweep.engine.selection import NoFeasibleTrialError
 from phasesweep.engine.state import (
     PHASE_FINGERPRINT_ATTR,
     RERUN_OF_ATTR,
@@ -37,9 +44,11 @@ from phasesweep.engine.study_policy import (
     _record_reruns,
     _rerun_sources,
 )
+from phasesweep.engine.workers import _await_worker_trials, _WorkerTrials
 from phasesweep.runtime.json import JsonObject
 from phasesweep.runtime.process import write_attempt_lifecycle
-from tests.conftest import make_experiment, write_param_echo_trainer
+from phasesweep.runtime.shutdown import PhaseSweepShutdown
+from tests.conftest import make_experiment, write_param_echo_trainer, write_trainer
 from tests.recovery_helpers import fabricate_stale_trial
 
 _STALE_CAUSE = "stale RUNNING trial recovered after its orchestrator stopped"
@@ -302,3 +311,230 @@ def test_a_stale_trial_reruns_its_own_draw_before_any_new_one(
         ("COMPLETE", None),
         ("COMPLETE", None),
     ]
+
+
+_SIGINT_CAUSE = f"orchestrator interrupted by signal {int(signal.SIGINT)}"
+
+
+def _phase_trials(experiment: Experiment) -> list[optuna.trial.FrozenTrial]:
+    """Read the trials of the experiment's phase ``p``.
+
+    :param Experiment experiment: Experiment whose ledger is read.
+    :return list[optuna.trial.FrozenTrial]: Its trials in number order.
+    """
+    storage = _resolve_storage(experiment.resolved_storage)
+    return optuna.load_study(study_name="t::p", storage=storage).get_trials(deepcopy=False)
+
+
+def _cause(trial: optuna.trial.FrozenTrial) -> str | None:
+    """Return the cause a trial's outcome record carries.
+
+    :param optuna.trial.FrozenTrial trial: Trial whose record is read.
+    :return str | None: The recorded cause, or ``None`` without a record.
+    """
+    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    return None if parsed is None else parsed.cause
+
+
+@pytest.mark.parametrize("serviced", [True, False], ids=["shutdown", "no-shutdown"])
+def test_a_trainer_that_fails_while_a_shutdown_is_serviced_is_interrupted_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, serviced: bool
+) -> None:
+    """A worker sees its trainer die when the handler kills it; that counts as an interruption, not a failure."""
+    launched = tmp_path / "launched"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys
+        from pathlib import Path
+        Path({str(launched)!r}).touch()
+        sys.exit(1)
+        """,
+    )
+    exp = make_experiment(
+        persistent=tmp_path, trainer=trainer, n_trials=1, max_consecutive_failures=1
+    )
+    # The shutdown starts once the trainer runs, as the handler's kill sweep does.
+    monkeypatch.setattr(
+        phase_module,
+        "servicing_shutdown_signal",
+        lambda: signal.SIGINT if serviced and launched.exists() else None,
+    )
+
+    expected = (
+        (RuntimeError, "stopped after 0/1")
+        if serviced
+        else (NoFeasibleTrialError, "aborted after 1 consecutive failures")
+    )
+    with pytest.raises(expected[0], match=expected[1]):
+        run_experiment(exp)
+
+    (trial,) = _phase_trials(exp)
+    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.resolved_storage))
+    assert launched.exists()
+    if serviced:
+        assert _trial_state_label(trial) == "INTERRUPTED"
+        assert _cause(trial) == _SIGINT_CAUSE
+        assert _load_phase_policy_state(study).consecutive_failures == 0
+        assert _record_reruns(study) == [(0, 1)]
+    else:
+        assert _trial_state_label(trial) == "FAIL"
+        assert _load_phase_policy_state(study).consecutive_failures == 1
+        assert _record_reruns(study) == []
+
+
+@pytest.mark.parametrize("refusing_check", [1, 2], ids=["before-allocation", "inside-the-lease"])
+def test_no_trainer_starts_while_a_shutdown_is_serviced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusing_check: int
+) -> None:
+    """A trial that reaches either launch gate during a shutdown is interrupted by its signal and starts nothing."""
+    launched = tmp_path / "launched"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        from pathlib import Path
+        Path({str(launched)!r}).touch()
+        print("x=1")
+        """,
+    )
+    exp = make_experiment(persistent=tmp_path, trainer=trainer, n_trials=1)
+    checks = 0
+
+    def servicing() -> int | None:
+        nonlocal checks
+        checks += 1
+        return signal.SIGINT if checks >= refusing_check else None
+
+    monkeypatch.setattr(phase_module, "servicing_shutdown_signal", servicing)
+    with pytest.raises(RuntimeError, match="stopped after 0/1"):
+        run_experiment(exp)
+
+    (trial,) = _phase_trials(exp)
+    assert not launched.exists()
+    assert _trial_state_label(trial) == "INTERRUPTED"
+    assert _cause(trial) == _SIGINT_CAUSE
+
+
+@pytest.mark.integration
+@pytest.mark.signals_own_pid
+def test_a_shutdown_waits_for_parallel_workers_to_record_their_own_trials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A signal during Optuna's final join lets each worker record its interruption before reconciliation reaps."""
+    reached = tmp_path / "reached"
+    reached.mkdir()
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import os, time
+        from pathlib import Path
+        Path({str(reached)!r}, os.environ["PHASESWEEP_TRIAL_ID"]).touch()
+        time.sleep(60)
+        """,
+    )
+    exp = make_experiment(
+        persistent=tmp_path,
+        trainer=trainer,
+        n_trials=2,
+        n_jobs=2,
+        gpu_policy="none",
+        allow_no_gpu_isolation=True,
+        timeout_seconds_per_trial=60.0,
+    )
+    record_outcome = phase_module._record_outcome
+
+    def slow_interruption(
+        run: phase_module._PhaseExecution,
+        trial: optuna.Trial,
+        outcome: str,
+        *,
+        cause: str | None = None,
+        fatal_policy: str | None = None,
+    ) -> None:
+        # Holds each worker past the moment a reconciliation that did not wait would reap.
+        if outcome == "interrupted":
+            time.sleep(1.0)
+        record_outcome(run, trial, outcome, cause=cause, fatal_policy=fatal_policy)
+
+    monkeypatch.setattr(phase_module, "_record_outcome", slow_interruption)
+
+    def interrupt_once_both_trainers_run() -> None:
+        deadline = time.monotonic() + 30.0
+        while len(list(reached.iterdir())) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    sender = threading.Thread(target=interrupt_once_both_trainers_run, daemon=True)
+    caplog.set_level(logging.INFO, logger="phasesweep")
+    sender.start()
+    with pytest.raises(PhaseSweepShutdown):
+        run_experiment(exp)
+    sender.join(timeout=5.0)
+
+    trials = _phase_trials(exp)
+    assert [_trial_state_label(trial) for trial in trials] == ["INTERRUPTED", "INTERRUPTED"]
+    assert [_cause(trial) for trial in trials] == [_SIGINT_CAUSE, _SIGINT_CAUSE]
+    assert not any("FATAL OBJECTIVE ERROR" in record.getMessage() for record in caplog.records)
+
+
+class _ObservedWorkers(_WorkerTrials):
+    """Worker tracker that reports when the main thread starts waiting on it."""
+
+    def __init__(self) -> None:
+        """Track objectives and record the first wait."""
+        super().__init__()
+        self.waiting = threading.Event()
+
+    def wait_idle(self) -> frozenset[int]:
+        """Report the wait, then wait as the real tracker does.
+
+        :return frozenset[int]: The abandoned trials.
+        """
+        self.waiting.set()
+        return super().wait_idle()
+
+
+def test_the_shutdown_wait_holds_until_a_running_worker_tells_its_trial() -> None:
+    """The main thread returns only after the worker's objective ended and Optuna told the trial."""
+    study = optuna.create_study()
+    trial = study.ask()
+    workers = _ObservedWorkers()
+    entered = threading.Event()
+
+    def worker() -> None:
+        with workers.track(trial.number):
+            entered.set()
+            # Finish only once the main thread is waiting on this objective.
+            assert workers.waiting.wait(10.0)
+        study.tell(trial, state=optuna.trial.TrialState.FAIL)
+
+    running = threading.Thread(target=worker)
+    running.start()
+    assert entered.wait(10.0)
+    _await_worker_trials(workers, study)
+    assert study.trials[0].state == optuna.trial.TrialState.FAIL
+    running.join(10.0)
+
+
+def test_the_shutdown_wait_skips_a_trial_its_objective_abandoned() -> None:
+    """A trial a shutdown left RUNNING on purpose is stale recovery's, so the wait does not hold for it."""
+    study = optuna.create_study()
+    trial = study.ask()
+    workers = _WorkerTrials()
+    with pytest.raises(SystemExit), workers.track(trial.number):
+        raise SystemExit(130)
+    started = time.monotonic()
+    _await_worker_trials(workers, study)
+    assert time.monotonic() - started < 1.0
+
+
+def test_the_shutdown_wait_gives_up_on_a_running_trial_no_worker_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A RUNNING trial no objective runs any more (its tell failed) bounds the wait instead of hanging it."""
+    monkeypatch.setattr("phasesweep.engine.workers._WORKER_SETTLE_SECONDS", 0.2)
+    study = optuna.create_study()
+    study.ask()
+    started = time.monotonic()
+    _await_worker_trials(_WorkerTrials(), study)
+    assert 0.2 <= time.monotonic() - started < 2.0

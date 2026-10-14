@@ -17,7 +17,7 @@ import signal
 import subprocess
 import sys
 import threading
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from types import FrameType
 from typing import Any
@@ -105,9 +105,27 @@ _main_thread_defer_depth = 0
 # The shutdown signal the handler is servicing, or None. CPython runs the
 # handler only in the main thread, so a worker thread whose trainer the handler
 # kills never sees ``PhaseSweepShutdown``; it reads this to record the trial as
-# interrupted rather than failed. Set before the handler kills any child, and
-# cleared when the next run enters ``signal_handler_scope``.
+# interrupted rather than failed, and every launch path reads it to refuse a new
+# trainer. Set before the handler takes ``_launch_lock`` to snapshot children,
+# so a launcher holding that lock either sees it or registers a child the
+# snapshot includes. Cleared when the next run enters ``signal_handler_scope``.
 _servicing_signum: int | None = None
+
+# Callables the handler runs once it has set ``_servicing_signum``, so waits
+# that would otherwise block a worker thread (a GPU lease queue) wake and see it.
+_shutdown_wakers: list[Callable[[], None]] = []
+
+
+class ShutdownLaunchRefusedError(RuntimeError):
+    """Raised by a launch that a shutdown being serviced refused before any process started."""
+
+    def __init__(self, signum: int) -> None:
+        """Name the signal that refused the launch.
+
+        :param int signum: The shutdown signal being serviced.
+        """
+        super().__init__(f"trainer launch refused: orchestrator interrupted by signal {signum}")
+        self.signum = signum
 
 
 def servicing_shutdown_signal() -> int | None:
@@ -116,6 +134,17 @@ def servicing_shutdown_signal() -> int | None:
     :return int | None: The signal number, or ``None`` when no shutdown is under way.
     """
     return _servicing_signum
+
+
+def register_shutdown_waker(waker: Callable[[], None]) -> None:
+    """Have the shutdown handler call ``waker`` once a shutdown is being serviced.
+
+    A waker runs in the main thread inside the signal handler, so it must only
+    notify waiting threads: no blocking, no I/O.
+
+    :param Callable[[], None] waker: Callable that wakes threads blocked in a wait.
+    """
+    _shutdown_wakers.append(waker)
 
 
 def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
@@ -181,6 +210,11 @@ def _shutdown_handler(signum: int, _frame: FrameType | None) -> None:
         # Any recorded-but-unserviced signal is superseded by this invocation.
         _deferred_shutdown_signum = None
         _servicing_signum = signum
+        for waker in _shutdown_wakers:
+            try:
+                waker()
+            except Exception:
+                log.exception("Failed to wake a waiting thread after signal %d", signum)
 
         with _launch_lock, _lock:
             pgids = tuple(_active_children)
