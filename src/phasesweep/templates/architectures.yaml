@@ -4,6 +4,7 @@
 # Every phase fixes one architecture in fixed_overrides and searches the same small learning-rate
 # grid, so each winner is the best learning rate for its own architecture. No phase has inherits,
 # so none sees another's result. Compare the winners with phasesweep show-winners.
+# To hand the best architecture to later phases, search it as one categorical key in a single phase that they inherit.
 #
 # It runs as written on the packaged toy trainer, where an architecture is the layer count. For
 # your own trainer, replace trial_command, the trainer_config keys, the metric extractor and the

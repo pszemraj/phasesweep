@@ -32,7 +32,7 @@ Field types, defaults, and validation constraints are in [config_reference.yaml]
 | --- | --- | --- |
 | `starter` | Two chained phases, depth then learning rate, on the toy trainer. The default. | `phasesweep init --template starter` |
 | `argparse` | A trainer that takes `--key=value` flags: `override_format: argparse`, `trainer_config` as the base, a seeded random learning-rate search. | `phasesweep init --template argparse` |
-| `architectures` | One phase per architecture, none inheriting another, each fixing its model keys and running a small learning-rate grid. | `phasesweep init --template architectures` |
+| `architectures` | One phase per architecture, none inheriting another, each fixing its model keys and running a small learning-rate grid, so the winners are compared by hand; [handing the best on](#comparing-options-and-handing-the-best-on) needs one categorical key in a single phase. | `phasesweep init --template architectures` |
 | `chained` | A seeded random learning-rate search, then a phase that inherits it and searches a key the first phase only fixed. | `phasesweep init --template chained` |
 | `noisy` | A noisy objective: a seed audit that measures the spread, a grid ranked by the mean over seeds with [repeats](#repeats), a `metric.max` viability bound and an `observe` entry; [Noisy objectives and small budgets](#noisy-objectives-and-small-budgets) explains each. | `phasesweep init --template noisy` |
 
@@ -126,6 +126,14 @@ flowchart TD
 ```
 
 `model.depth` reaches the final phase along both paths with the same origin, so the diamond is valid and needs no duplicate declaration. `optimizer.family` arrives from two independent origins, so validation refuses the child until it fixes that key; its `adamw` then becomes the origin that descendants inherit.
+
+### Comparing options and handing the best on
+
+Phases that do not inherit from each other are independent comparisons: each searches on its own and publishes its own winner, and you read the winners side by side with `phasesweep show-winners`. Nothing carries the best of them into a later phase, because a later phase inherits from named phases and not from a ranking across them. To hand the best of several options to later phases, search the options as one categorical key in a single phase, for example `model_name_or_path: {type: categorical, choices: [...]}`, so that phase publishes one winner and its children inherit the chosen value. Options that need different fixed keys cannot share one phase, since a phase has one set of `fixed_overrides` and the categorical varies one key. For those, run one phase per option and choose between them by hand, as the `architectures` template does.
+
+### Stopping between stages
+
+No flag stops a run after a phase; the stopping point is the config file. Run a config that holds only the phases of the first stage, read the winners with `phasesweep show-winners`, and decide. Then append the later phases to the same file and run it again with the same `experiment`, `workdir` and storage. The finished phases replay their published winners without launching a trial, and only the appended phases run; an appended phase that inherits a finished one runs with that winner's values. Leave the finished phases as they are: an edit to a field that is part of a finished phase's study identity, for example its sampler seed or search space, is refused and names the changed field. The storage must be persistent, because `storage: null` keeps nothing to replay. `--from-phase NAME` is the opposite tool: it starts a run at a later phase and loads the earlier winners from disk, and it never stops early.
 
 ## Search spaces and samplers
 

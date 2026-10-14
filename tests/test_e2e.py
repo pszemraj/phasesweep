@@ -19,11 +19,12 @@ import yaml
 
 from phasesweep import load_experiment, run_experiment
 from phasesweep.config import IntParam, Phase, Sampler
+from phasesweep.engine import read_winner
 from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.phase import GpuPool
 from phasesweep.engine.state import PHASE_FINGERPRINT_ATTR
-from tests.conftest import copy_fake_train, make_experiment, write_constant_trainer
+from tests.conftest import copy_fake_train, make_experiment, write_constant_trainer, write_trainer
 
 # A full three-phase sweep against the real fake trainer: every test here spawns
 # trainer subprocesses and runs for seconds, not milliseconds.
@@ -171,3 +172,62 @@ def test_bound_topup_survives_child_preflight_failure_with_empty_fingerprinted_s
     assert child_study_after.get_trials(deepcopy=False)
     expected_fingerprint = _phase_fingerprint(topped_up, child, {"parent": winners["parent"]})
     assert child_study_after.user_attrs[PHASE_FINGERPRINT_ATTR] == expected_fingerprint
+
+
+def test_appended_phase_runs_alone_and_inherits_the_replayed_winner(tmp_path: Path) -> None:
+    """Appending a phase to a finished persistent experiment launches only that phase.
+
+    The finished phase replays its published winner without a trainer launch,
+    and the appended phase that inherits it runs with the replayed winner's values.
+    """
+    launches = tmp_path / "launches.txt"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--x", type=int, default=0)
+        ap.add_argument("--y", type=int, default=0)
+        args, _ = ap.parse_known_args()
+        with open({str(launches)!r}, "a") as log:
+            log.write(f"{{args.x}} {{args.y}}\\n")
+        print(f"x={{args.x + args.y}}")
+        """,
+    )
+    first = Phase(
+        name="first",
+        n_trials=3,
+        gpu_policy="none",
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+    later = Phase(
+        name="later",
+        inherits=["first"],
+        n_trials=2,
+        gpu_policy="none",
+        sampler=Sampler(type="random", seed=1),
+        search_space={"y": IntParam(type="int", low=0, high=10)},
+    )
+    stage_one = make_experiment(persistent=tmp_path, trainer=trainer, phases=[first])
+    finished = run_experiment(stage_one)
+    stage_one_launches = launches.read_text().splitlines()
+    assert len(stage_one_launches) == 3
+
+    both = stage_one.model_copy(update={"phases": [first, later]})
+    winners = run_experiment(both)
+
+    launched = launches.read_text().splitlines()
+    assert launched[:3] == stage_one_launches
+    assert len(launched) == 5
+    inherited_x = finished["first"].params["x"]
+    assert {line.split()[0] for line in launched[3:]} == {str(inherited_x)}
+    assert winners["first"].trial_number == finished["first"].trial_number
+    assert winners["first"].metric == finished["first"].metric
+    assert winners["later"].effective_overrides["x"] == inherited_x
+    storage = _resolve_storage(both.storage)
+    assert len(optuna.load_study(study_name="t::first", storage=storage).trials) == 3
+    assert len(optuna.load_study(study_name="t::later", storage=storage).trials) == 2
+    published = read_winner(both, "later")
+    assert published is not None
+    assert published.params == winners["later"].params
