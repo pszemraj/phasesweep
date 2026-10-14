@@ -67,6 +67,13 @@ _LEDGER_REFUSED = (
 
 _PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 
+_RUNNING_WARNING = (
+    "DRY RUN warning: phase={name} has 1 RUNNING attempt(s) that a real run recovers before it "
+    "checks the phase, as failed where the trial recorded a failure and otherwise as "
+    "interrupted, which reruns; they are counted that way, and its accepted target, sampler "
+    "continuation and abort state are not checked"
+)
+
 
 def _phase(
     name: str,
@@ -130,13 +137,16 @@ def _record(
     *states: optuna.trial.TrialState,
     target: int,
     outcomes: bool = True,
+    running_outcome: str | None = None,
 ) -> None:
     """Write a phase study as a prior run left it, one trial per state, with no trainer.
 
     It carries what a launch reads back: the format stamp, the artifact-root claim, the
     accepted target, the environment cohort, and a terminal outcome for every finished trial
-    (none with ``outcomes`` off, which is malformed failure-policy state). Its COMPLETE
-    trials hold no objective evidence, so selecting a winner from them fails.
+    (none with ``outcomes`` off, which is malformed failure-policy state). A RUNNING trial
+    carries ``running_outcome`` when given, as an objective that recorded its outcome just
+    before its orchestrator died. Its COMPLETE trials hold no objective evidence, so
+    selecting a winner from them fails.
     """
     study = optuna.create_study(
         study_name=f"{experiment.experiment}::{phase}",
@@ -157,11 +167,12 @@ def _record(
             TRAINER_ENV_DIGEST_ATTR: identity.digest,
             TRAINER_ENV_ATTR: dict(identity.tracked),
         }
-        if outcomes and state != _STATE.RUNNING:
+        outcome = running_outcome if state == _STATE.RUNNING else _OUTCOME[state]
+        if outcomes and outcome is not None:
             attrs[TRIAL_OUTCOME_ATTR] = {
                 "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
                 "sequence": sequence,
-                "outcome": _OUTCOME[state],
+                "outcome": outcome,
                 "cause": None,
             }
         value = 1.0 if state == _STATE.COMPLETE else None
@@ -430,15 +441,13 @@ def test_one_remaining_trial_reads_in_the_singular(
 def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A real run recovers a RUNNING attempt first, so the dry run counts it as failed and says so."""
+    """A real run recovers a RUNNING attempt first, so the dry run counts it as recovery will and says so."""
     experiment = _persistent(tmp_path, _phase("a", 2), _phase("b", 2, inherits=("a",)))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2)
+    _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2, running_outcome="failure")
 
     assert _preview(experiment, tmp_path, caplog) == [
         "phase=a study=t::a completed=2 remaining=0 n_jobs=1",
-        "DRY RUN warning: phase=a has 1 RUNNING attempt(s) that a real run recovers as failed "
-        "before it checks the phase, so they are counted as failed and its accepted target, "
-        "sampler continuation and abort state are not checked",
+        _RUNNING_WARNING.format(name="a"),
         "DRY RUN phase=a target met (2 of 2 trials recorded): would replay its existing "
         "result and launch no trials",
         "phase=b study=t::b completed=0 remaining=2 n_jobs=1",
@@ -446,6 +455,20 @@ def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(
     ]
     (command,) = _commands(caplog)
     assert _PLACEHOLDERS in command
+
+
+def test_running_attempt_without_a_recorded_failure_previews_as_a_rerun(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A RUNNING attempt that recorded no failure recovers as interrupted, so it never counts."""
+    experiment = _persistent(tmp_path, _phase("a", 2))
+    _record(experiment, "a", _STATE.COMPLETE, _STATE.RUNNING, target=2)
+
+    assert _preview(experiment, tmp_path, caplog) == [
+        "phase=a study=t::a completed=1 remaining=1 n_jobs=1",
+        _RUNNING_WARNING.format(name="a"),
+        "DRY RUN phase=a would launch 1 trial",
+    ]
 
 
 def test_total_line_sums_the_launches_the_phase_lines_print(
@@ -463,9 +486,7 @@ def test_total_line_sums_the_launches_the_phase_lines_print(
         ]
 
     _preview(experiment, tmp_path, caplog)
-    assert totals() == [
-        "DRY RUN total: would launch 5 trials across 2 phases (1 other phase replays)"
-    ]
+    assert totals() == ["DRY RUN total: would launch 6 trials across 3 phases"]
 
     caplog.clear()
     run_experiment(experiment, from_phase="b", dry_run=True)
@@ -482,13 +503,25 @@ def test_total_line_sums_the_launches_the_phase_lines_print(
 def test_running_attempt_counts_as_failed_toward_a_fixed_configurations_retry_limit(
     tmp_path: Path,
 ) -> None:
-    """A fixed configuration over a RUNNING attempt may reach two attempts, never three."""
+    """Over a RUNNING attempt that recorded a failure, a fixed configuration may reach two attempts, never three."""
     allowed = _persistent(tmp_path, _phase("a", 2, fixed=True))
-    _record(allowed, "a", _STATE.RUNNING, target=1)
+    _record(allowed, "a", _STATE.RUNNING, target=1, running_outcome="failure")
     run_experiment(allowed, dry_run=True)
 
     with pytest.raises(TrialTargetRefusedError, match="use at most 2, not 3"):
         run_experiment(_persistent(tmp_path, _phase("a", 3, fixed=True)), dry_run=True)
+
+
+def test_running_attempt_that_will_rerun_leaves_a_fixed_configuration_at_one_attempt(
+    tmp_path: Path,
+) -> None:
+    """A RUNNING attempt that recorded no failure reruns, so a fixed configuration stays at n_trials 1."""
+    experiment = _persistent(tmp_path, _phase("a", 1, fixed=True))
+    _record(experiment, "a", _STATE.RUNNING, target=1)
+    run_experiment(experiment, dry_run=True)
+
+    with pytest.raises(TrialTargetRefusedError, match="would run 2 identical trials"):
+        run_experiment(_persistent(tmp_path, _phase("a", 2, fixed=True)), dry_run=True)
 
 
 def test_met_target_without_a_feasible_trial_is_refused_as_a_run_refuses(

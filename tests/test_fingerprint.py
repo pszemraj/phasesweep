@@ -195,7 +195,7 @@ def _fake_top_up_study(*, completed: int = 0, fingerprint: str | None = None) ->
     :return SimpleNamespace: Object with the ``user_attrs``/``get_trials``
         surface :func:`_reject_bound_descendant_topups` uses.
     """
-    trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE) for _ in range(completed)]
+    trials = [SimpleNamespace(state=optuna.trial.TrialState.COMPLETE, user_attrs={})] * completed
     return SimpleNamespace(
         user_attrs={} if fingerprint is None else {"phasesweep_fingerprint": fingerprint},
         get_trials=lambda *, deepcopy: trials,

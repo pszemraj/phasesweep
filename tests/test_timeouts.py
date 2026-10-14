@@ -204,11 +204,11 @@ def test_rerun_replays_an_accepted_partial_result_only_under_current_opt_in(
 
 @pytest.mark.parametrize("allow_incomplete_on_timeout", [False, True])
 @pytest.mark.integration
-def test_timeout_after_all_terminal_trials_is_complete_enough(
+def test_timeout_that_interrupts_the_last_trial_leaves_the_phase_incomplete(
     tmp_path: Path,
     allow_incomplete_on_timeout: bool,
 ) -> None:
-    """A timeout guard should not reject a phase once every requested trial is terminal."""
+    """A trial the phase deadline cancels is interrupted, not finished, so the phase is short of its target."""
     trainer = write_trial_zero_trainer(tmp_path, otherwise="time.sleep(30.0)")
     exp = make_experiment(
         experiment="phase_timeout_all_terminal",
@@ -220,28 +220,15 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         sampler=Sampler(type="random", seed=0),
     )
 
-    winners = run_experiment(exp)
-
-    completion = winners["p"].completion
+    if not allow_incomplete_on_timeout:
+        with pytest.raises(TimeoutError, match=r"after 1/2 completed evaluations \(1 terminal"):
+            run_experiment(exp)
+        return
+    completion = run_experiment(exp)["p"].completion
     assert completion["requested_trials"] == 2
     assert completion["completed_trials"] == 1
-    assert completion["finished_trials"] == 2
-    assert completion["incomplete"] is False
-
-    current = exp.model_copy(
-        update={
-            "phases": [
-                exp.phases[0].model_copy(update={"allow_incomplete_on_timeout": False}),
-            ],
-        }
-    )
-    loaded = _load_winner(
-        current,
-        current.phases[0],
-        {},
-        publication=_published_for_resume(current),
-    )
-    assert loaded.completion["incomplete"] is False
+    assert completion["finished_trials"] == 1
+    assert completion["incomplete"] is True
 
 
 @pytest.mark.integration

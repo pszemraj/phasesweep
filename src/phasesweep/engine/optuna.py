@@ -33,6 +33,10 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     RERUN_OF_ATTR,
     TERMINAL_TRIAL_STATES,
+    TRIAL_STATE_NAMES,
+    RecoveredTrialState,
+    TrialStateName,
+    _trial_interrupted,
 )
 
 
@@ -44,8 +48,9 @@ class _TrialRef:
     which trial it is, and which generation/attempt claimed it.
     Values are ``None`` when the trial never recorded that attribute (e.g. a
     row written by an older PhaseSweep). Published references additionally
-    carry their terminal and complete count boundary. Those count fields are
-    not part of a trial-row identity comparison.
+    carry their terminal and complete count boundary, and a RUNNING row the
+    state stale recovery will record for it. Those fields are not part of a
+    trial-row identity comparison.
     """
 
     trial_number: int
@@ -53,6 +58,7 @@ class _TrialRef:
     attempt_id: str | None
     finished_trials: int | None = field(default=None, compare=False)
     completed_trials: int | None = field(default=None, compare=False)
+    recovers_as: RecoveredTrialState | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -74,13 +80,45 @@ class _PhaseTrialStats:
     published_trial_available: bool = False
 
 
+def _trial_count_state(trial: optuna.trial.FrozenTrial) -> TrialStateName:
+    """Return the state a trial is counted under: ``INTERRUPTED``, or its Optuna state.
+
+    The one classifier behind every state-keyed count, so an interrupted trial
+    (:func:`~phasesweep.engine.state._trial_interrupted`) is never counted as
+    finished anywhere.
+
+    :param optuna.trial.FrozenTrial trial: Trial to classify.
+    :return TrialStateName: ``INTERRUPTED`` for an interrupted trial, otherwise
+        the Optuna state name.
+    """
+    if _trial_interrupted(trial):
+        return "INTERRUPTED"
+    name = trial.state.name
+    for state in TRIAL_STATE_NAMES:
+        if state == name:
+            return state
+    raise ValueError(f"Trial {trial.number} has an unknown Optuna state {name!r}.")
+
+
 def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of terminal trials in ``trials``.
+    """Return the number of trials that count toward ``n_trials``.
+
+    A trial counts once it is terminal and was not interrupted: an interrupted
+    trial reruns instead, so it never consumes the trial target.
 
     :param Iterable[optuna.trial.FrozenTrial] trials: Trials whose states should be counted.
-    :return int: Number of trials with a finished state.
+    :return int: Number of trials in a state of :data:`~phasesweep.engine.state.TERMINAL_TRIAL_STATES`.
     """
-    return sum(1 for trial in trials if trial.state.is_finished())
+    return sum(1 for trial in trials if _trial_count_state(trial) in TERMINAL_TRIAL_STATES)
+
+
+def _drawn_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
+    """Return the number of draw positions a study has used: its trials that are not reruns.
+
+    :param Iterable[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :return int: Number of trials without :data:`~phasesweep.engine.state.RERUN_OF_ATTR`.
+    """
+    return sum(1 for trial in trials if RERUN_OF_ATTR not in trial.user_attrs)
 
 
 def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:

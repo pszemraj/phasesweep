@@ -32,6 +32,7 @@ from typing import Any, Literal, get_args
 import optuna
 
 from phasesweep.engine.repeats import RankedGroup, within_noise
+from phasesweep.engine.state import _trial_interrupted
 from phasesweep.evidence.models import POSITIONED_EXTRACTOR_KINDS
 from phasesweep.runtime.json import progress_position
 
@@ -176,7 +177,8 @@ def _survivorship(
     constraints or the metric's own bounds, which define what may win, so it is
     counted but never flags. A feasible trial whose repeat group never
     completed is counted as ``incomplete_group`` and never flags either: the
-    member that kept its group out is counted where it belongs.
+    member that kept its group out is counted where it belongs. An interrupted
+    trial measured nothing and reruns, so it is not counted at all.
     The counts are recorded whatever the verdict, and the check always runs.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the study.
@@ -189,7 +191,7 @@ def _survivorship(
     counts["ranked"] = len(ranked_numbers)
     for trial in trials:
         bucket = _EXCLUDED_BY_STATE.get(trial.state)
-        if bucket is None or trial.number in ranked_numbers:
+        if bucket is None or trial.number in ranked_numbers or _trial_interrupted(trial):
             continue
         if bucket == "infeasible" and trial.number in incomplete_group:
             bucket = "incomplete_group"

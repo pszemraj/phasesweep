@@ -1248,7 +1248,7 @@ def test_operator_recovery_scopes_cleanup_evidence_to_its_reported_cause(
             terminal = json.loads(store.status_path(earlier_run_id).read_text())
             frozen_phase = terminal["result_snapshot"]["status"]["phases"][0]
             assert frozen_phase["trials"]["RUNNING"] == 0
-            assert frozen_phase["trials"]["FAIL"] == 1
+            assert frozen_phase["trials"]["INTERRUPTED"] == 1
             assert frozen_phase["running_attempts"] == []
         assert store.state(handle) == "failed"
     else:
@@ -1422,7 +1422,8 @@ def test_operator_recovery_clears_cleanup_uncertainty(
             "RUNNING": 0,
             "COMPLETE": 0,
             "PRUNED": 0,
-            "FAIL": 1,
+            "FAIL": 0,
+            "INTERRUPTED": 1,
         }
         assert recovered_status["phases"][0]["running_trials_total"] == 0
 
@@ -1530,12 +1531,13 @@ def test_operator_snapshot_repair_retry_reuses_cleanup_recovery(
     assert terminal["result_snapshot_state"] == "complete"
     phase = terminal["result_snapshot"]["status"]["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
-    assert phase["trials"]["FAIL"] == 1
+    assert phase["trials"]["INTERRUPTED"] == 1
     assert phase["generation_trials"]["RUNNING"] == 0
-    assert phase["generation_trials"]["FAIL"] == 1
+    assert phase["generation_trials"]["INTERRUPTED"] == 1
     assert not store.recovery_required(handle)
     recovered_status = app.status(run_id=run_id)["phases"][0]
-    assert recovered_status["terminal_trials_this_run"] == 1
+    # An interrupted trial is not terminal for the budget: it reruns.
+    assert recovered_status["terminal_trials_this_run"] == 0
     assert recovered_status["terminal_trials_before_run"] == 0
     assert recovered_status["target_already_satisfied"] is False
 
@@ -1614,7 +1616,7 @@ def test_operator_recovery_keeps_frozen_snapshot_when_final_status_cannot_be_wri
     assert not store.recovery_required(handle)
     phase = app.status(run_id=run_id)["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
-    assert phase["trials"]["FAIL"] == 1
+    assert phase["trials"]["INTERRUPTED"] == 1
 
 
 def test_operator_recovery_uses_runner_reconciliation_evidence(
@@ -1733,7 +1735,7 @@ def test_operator_cleanup_recovery_retry_counts_persisted_attempt_evidence(
     terminal = json.loads(store.status_path(run_id).read_text())
     phase = terminal["result_snapshot"]["status"]["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
-    assert phase["trials"]["FAIL"] == 1
+    assert phase["trials"]["INTERRUPTED"] == 1
     assert store.state(handle) == "cancelled"
     assert live_runs(store) == []
 

@@ -1409,7 +1409,7 @@ def test_phase_deadline_expiring_during_launch_fails_as_timeout(
 
     monkeypatch.setattr(_process, "_write_process_identity", slow_write_identity)
 
-    with pytest.raises(TimeoutError, match="deadline"):
+    with pytest.raises(TimeoutError, match="timed out via (phase|run) guard after 0/1"):
         run_experiment(experiment)
 
     assert not trial_dir_marker.exists(), "trainer started after the phase deadline expired"
@@ -1439,7 +1439,7 @@ def test_phase_deadline_expiring_during_input_preparation_prevents_launch(
 
     monkeypatch.setattr(phase_mod, "prepare_trainer_input", slow_prepare)
 
-    with pytest.raises(TimeoutError, match="deadline"):
+    with pytest.raises(TimeoutError, match="timed out via (phase|run) guard after 0/1"):
         run_experiment(experiment)
 
     assert not trial_dir_marker.exists(), "trainer started after input preparation used the budget"
@@ -1478,7 +1478,7 @@ def test_deadline_expiring_during_launch_preparation_prevents_trainer_start(
 
     monkeypatch.setattr(trial_module, "_record_trainer_environment", delayed_record)
 
-    with pytest.raises(TimeoutError, match="deadline"):
+    with pytest.raises(TimeoutError, match="timed out via (phase|run) guard after 0/1"):
         run_experiment(experiment)
 
     assert not marker.exists()

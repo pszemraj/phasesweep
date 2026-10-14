@@ -59,6 +59,7 @@ from phasesweep.engine.state import (
     CLEANUP_CONFIRMED_ATTR,
     CLEANUP_RECOVERED_TRIALS_ATTR,
     FEASIBLE_ATTR,
+    RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_ATTR,
@@ -1214,8 +1215,11 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
     assert winners["p"].metric == pytest.approx(0.5)
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(f"journal:///{db}"))
     trials = study.get_trials(deepcopy=False)
+    # Recovery cannot prove what the unrecorded trial measured, so it is
+    # interrupted and reruns (trial 1) before the second draw (trial 2).
     assert [trial.state for trial in trials] == [
         optuna.trial.TrialState.FAIL,
+        optuna.trial.TrialState.COMPLETE,
         optuna.trial.TrialState.COMPLETE,
     ]
     assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR] == {
@@ -1224,8 +1228,9 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
         "outcome": "interrupted",
         "cause": "stale RUNNING trial recovered after its orchestrator stopped",
     }
+    assert trials[1].user_attrs[RERUN_OF_ATTR] == 0
     # The whole point: the ledger still validates, so the study is reusable.
-    assert _load_phase_policy_state(study).max_sequence == 2
+    assert _load_phase_policy_state(study).max_sequence == 3
 
 
 @pytest.mark.integration

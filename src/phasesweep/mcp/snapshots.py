@@ -26,6 +26,7 @@ from phasesweep.engine.repeats import RepeatsSummary, _repeats_summary
 from phasesweep.engine.state import (
     TRIAL_STATE_NAMES,
     PublicationState,
+    RecoveredTrialState,
     Winner,
     WinnerSource,
     WinnerSourceKind,
@@ -68,6 +69,8 @@ class RunningAttemptSnapshot(_SnapshotModel):
     trial_number: NonNegativeInt
     generation_id: str | None = None
     attempt_id: str | None = None
+    recovers_as: RecoveredTrialState
+    """The state stale recovery records for this row, read from its outcome record at capture."""
 
 
 class PhaseStatusSnapshot(_SnapshotModel):
@@ -636,10 +639,12 @@ def finalize_result_snapshot(
     A phase whose capture recorded no RUNNING identities (``running_attempts``
     is ``None``, which pairs with ``trial_data_available: false``) is left
     exactly as captured: there is nothing to reconcile the cleanup report
-    against, and its counts were never read either.
+    against, and its counts were never read either. Each reconciled attempt
+    moves from ``RUNNING`` to the state its capture recorded it recovers as,
+    ``INTERRUPTED`` or ``FAIL``.
 
     :param Mapping[str, object] snapshot: Raw snapshot captured under the experiment lock.
-    :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled to FAIL.
+    :param Collection[str] confirmed_attempt_ids: Exact RUNNING attempts reconciled by recovery.
     :param Mapping[str, tuple[str, int, str]] | None confirmed_attempt_locations:
         Reconciled attempt ids mapped to phase, trial number, and generation;
         used when the frozen row was captured before its Optuna identity attrs
@@ -679,7 +684,8 @@ def finalize_result_snapshot(
         if len(recovered) > running:
             raise RuntimeError("cleanup report identifies more attempts than the snapshot records")
         phase.trials["RUNNING"] = running - len(recovered)
-        phase.trials["FAIL"] = phase.trials.get("FAIL", 0) + len(recovered)
+        for attempt, _generation_id in recovered:
+            phase.trials[attempt.recovers_as] = phase.trials.get(attempt.recovers_as, 0) + 1
         phase.running = phase.trials["RUNNING"]
         # generation_trials was captured scoped to represented_generation_id
         # (the pinned id for a run snapshot), not current_generation_id, which
@@ -702,9 +708,10 @@ def finalize_result_snapshot(
                     "cleanup report identifies more generation attempts than the snapshot records"
                 )
             phase.generation_trials["RUNNING"] = generation_running - len(generation_recovered)
-            phase.generation_trials["FAIL"] = phase.generation_trials.get("FAIL", 0) + len(
-                generation_recovered
-            )
+            for attempt in generation_recovered:
+                phase.generation_trials[attempt.recovers_as] = (
+                    phase.generation_trials.get(attempt.recovers_as, 0) + 1
+                )
         recovered_trial_numbers = {attempt.trial_number for attempt, _generation_id in recovered}
         phase.running_attempts = [
             attempt

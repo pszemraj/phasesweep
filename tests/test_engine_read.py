@@ -45,6 +45,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.run import experiment_status
+from phasesweep.engine.state import TRIAL_OUTCOME_ATTR, TRIAL_OUTCOME_SCHEMA_VERSION
 from tests.conftest import (
     make_experiment,
     mark_current_format,
@@ -113,6 +114,10 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
     running = study.ask()
     running.set_user_attr("phasesweep_generation_id", "gen-1")
     running.set_user_attr("phasesweep_attempt_id", "attempt-1")
+    running.set_user_attr(
+        TRIAL_OUTCOME_ATTR,
+        {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": "failure"},
+    )
     study.ask()
     mark_current_format(exp, study)
 
@@ -121,8 +126,18 @@ def test_read_status_reports_running_attempts_from_the_counted_snapshot(tmp_path
     assert phase["trial_data_available"] is True
     assert phase["trials"] == {"COMPLETE": 1, "RUNNING": 2}
     assert phase["running_attempts"] == [
-        {"trial_number": 1, "generation_id": "gen-1", "attempt_id": "attempt-1"},
-        {"trial_number": 2, "generation_id": None, "attempt_id": None},
+        {
+            "trial_number": 1,
+            "generation_id": "gen-1",
+            "attempt_id": "attempt-1",
+            "recovers_as": "FAIL",
+        },
+        {
+            "trial_number": 2,
+            "generation_id": None,
+            "attempt_id": None,
+            "recovers_as": "INTERRUPTED",
+        },
     ]
 
 

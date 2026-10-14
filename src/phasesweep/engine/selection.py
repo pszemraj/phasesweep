@@ -34,6 +34,7 @@ from phasesweep.engine.state import (
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
+    _trial_interrupted,
     _validate_observed_block,
     constraint_attr,
 )
@@ -286,6 +287,8 @@ def _rank_groups(
     A group is complete when it holds one trial per repeat value and every one
     of them is eligible (:func:`_eligible`). Trials that never recorded the
     repeat param were pruned before their first suggestion and belong to no group.
+    An interrupted trial belongs to none either: its rerun takes its place, in
+    the same group because it has the same draw position.
 
     :param Sequence[optuna.trial.FrozenTrial] trials: Every trial in the phase study.
     :param Experiment experiment: Parsed experiment; supplies the eligibility bounds.
@@ -296,7 +299,7 @@ def _rank_groups(
     by_key: dict[str, list[optuna.trial.FrozenTrial]] = {}
     draw_positions = _draw_positions(trials)
     for trial in trials:
-        if axis.key in trial.params:
+        if axis.key in trial.params and not _trial_interrupted(trial):
             key = group_key(draw_positions[trial.number], trial.params, axis)
             by_key.setdefault(key, []).append(trial)
     groups: list[RankedGroup] = []

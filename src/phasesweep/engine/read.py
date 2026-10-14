@@ -829,6 +829,7 @@ def _read_status(
                             "trial_number": attempt.trial_number,
                             "generation_id": attempt.generation_id,
                             "attempt_id": attempt.attempt_id,
+                            "recovers_as": attempt.recovers_as,
                         }
                         for attempt in stats.running_attempts
                     ]

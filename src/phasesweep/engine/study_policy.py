@@ -27,7 +27,11 @@ from phasesweep.engine.fingerprints import (
     _changed_payload_keys,
     _render_changed_values,
 )
-from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
+from phasesweep.engine.optuna import (
+    _completed_trial_count,
+    _drawn_trial_count,
+    _finished_trial_count,
+)
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -35,6 +39,7 @@ from phasesweep.engine.state import (
     PHASE_DECISION_SCHEMA_VERSION,
     PHASE_RECOVERY_ATTR,
     PHASE_RECOVERY_SCHEMA_VERSION,
+    RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_ATTR,
@@ -43,6 +48,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
     _parsed_trial_outcome,
+    _trial_interrupted,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
 
@@ -485,19 +491,20 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
     process restarts that stream, so a mid-target resume can exactly repeat
     already-evaluated startup suggestions and spend the remaining budget on
     duplicates. Until PhaseSweep persists real sampler continuation state, a
-    stateful phase is restartable only before its first terminal trial or after
-    reaching its accepted target. A phase with an empty search space draws
-    nothing, so it has no sampler state to lose and resumes freely; how far it
-    may be raised is :func:`_validate_fixed_configuration_target`'s rule.
+    stateful phase is restartable only before its first draw or once every draw
+    of its accepted target was made; a rerun of an interrupted trial reuses its
+    source's params and needs no sampler state. A phase with an empty search
+    space draws nothing, so it has no sampler state to lose and resumes freely;
+    how far it may be raised is :func:`_validate_fixed_configuration_target`'s rule.
 
-    :param optuna.Study study: Existing study whose finished-trial count is checked.
+    :param optuna.Study study: Existing study whose drawn-trial count is checked.
     :param Phase phase: Phase config supplying the sampler type and trial target.
     :raises SamplerContinuationUnsupportedError: The phase draws from a stateful
         sampler (``tpe`` or ``cmaes``) and either raises its previously accepted
-        trial target or was interrupted before reaching it.
+        trial target or was interrupted before drawing all of it.
     """
-    finished = _finished_trial_count(study.get_trials(deepcopy=False))
-    if phase.sampler.type not in NON_RESUMABLE_SAMPLERS or not phase_draws(phase) or finished == 0:
+    drawn = _drawn_trial_count(study.get_trials(deepcopy=False))
+    if phase.sampler.type not in NON_RESUMABLE_SAMPLERS or not phase_draws(phase) or drawn == 0:
         return
 
     accepted_target = _accepted_trial_target(study)
@@ -514,10 +521,10 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
             "reproduce this sampler's process-local continuation state safely. Use a new "
             "experiment name, or run the full target in one invocation."
         )
-    if finished < accepted_target:
+    if drawn < accepted_target:
         raise SamplerContinuationUnsupportedError(
             f"Phase {phase.name!r} uses {phase.sampler.type!r} and was interrupted at "
-            f"{finished}/{accepted_target} terminal trial(s). PhaseSweep cannot reconstruct "
+            f"{drawn}/{accepted_target} terminal trial(s). PhaseSweep cannot reconstruct "
             "this sampler's exact process-local continuation state, so resuming could "
             "re-evaluate identical suggestions and waste the remaining budget. Use a new "
             "experiment name (optionally with a stateless random/grid sampler), or run the "
@@ -606,6 +613,59 @@ def _record_allocation_context(
             "allocations": records,
         },
     )
+
+
+def _rerun_sources(trials: Sequence[optuna.trial.FrozenTrial]) -> list[optuna.trial.FrozenTrial]:
+    """Return the interrupted trials that still need a rerun, in trial-number order.
+
+    A source needs one exactly when it is interrupted and no trial names it
+    under :data:`~phasesweep.engine.state.RERUN_OF_ATTR`. Both facts are fixed
+    once written, so the answer needs no "scheduled" flag and a crash between
+    two reruns loses or duplicates none.
+
+    :param Sequence[optuna.trial.FrozenTrial] trials: Every trial of one study.
+    :return list[optuna.trial.FrozenTrial]: Interrupted trials without a rerun.
+    """
+    named = {trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials}
+    return sorted(
+        (trial for trial in trials if _trial_interrupted(trial) and trial.number not in named),
+        key=lambda trial: trial.number,
+    )
+
+
+def _record_reruns(study: optuna.Study) -> list[tuple[int, int]]:
+    """Schedule one WAITING rerun for every interrupted trial that has none.
+
+    Each rerun is created in one storage record carrying its source's params,
+    distributions and system attrs (a grid point, a CMA-ES generation) and
+    :data:`~phasesweep.engine.state.RERUN_OF_ATTR`. Optuna's ``ask`` pops
+    WAITING trials before it creates new ones and returns their stored params
+    without consulting the sampler, so the reruns run first with exactly their
+    sources' configurations, and each takes its source's draw position.
+
+    :param optuna.Study study: Study about to allocate work.
+    :return list[tuple[int, int]]: ``(source, rerun)`` trial numbers, one per
+        rerun created, in source order.
+    """
+    sources = _rerun_sources(study.get_trials(deepcopy=False))
+    for source in sources:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=optuna.trial.TrialState.WAITING,
+                params=source.params,
+                distributions=source.distributions,
+                system_attrs=dict(source.system_attrs),
+                user_attrs={RERUN_OF_ATTR: source.number},
+            )
+        )
+    if not sources:
+        return []
+    reruns = {
+        trial.user_attrs[RERUN_OF_ATTR]: trial.number
+        for trial in study.get_trials(deepcopy=False)
+        if RERUN_OF_ATTR in trial.user_attrs
+    }
+    return [(source.number, reruns[source.number]) for source in sources]
 
 
 def _prelaunch_trial_environment(

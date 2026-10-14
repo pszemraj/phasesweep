@@ -19,8 +19,8 @@ WinnerSourceKind = Literal["phase_trial"]
 PublicationState = Literal["ok", "absent", "failed", "permission_denied"]
 """Verdict on a last-success pointer, including inaccessible validation evidence."""
 
-TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL"]
-"""Name of an Optuna ``TrialState`` member, as status payloads report it."""
+TrialStateName = Literal["WAITING", "RUNNING", "COMPLETE", "PRUNED", "FAIL", "INTERRUPTED"]
+"""Name of an Optuna ``TrialState`` member, or ``INTERRUPTED``, as status payloads report it."""
 
 TRIAL_STATE_NAMES: tuple[TrialStateName, ...] = (
     "WAITING",
@@ -28,11 +28,19 @@ TRIAL_STATE_NAMES: tuple[TrialStateName, ...] = (
     "COMPLETE",
     "PRUNED",
     "FAIL",
+    "INTERRUPTED",
 )
-"""Every trial-state name, in the key order status payloads use."""
+"""Every counted trial state, in the key order status payloads use.
+
+``INTERRUPTED`` is an Optuna ``FAIL`` trial whose recorded outcome is
+``interrupted``; it is counted apart from ``FAIL`` and reruns.
+"""
 
 TERMINAL_TRIAL_STATES: tuple[TrialStateName, ...] = ("COMPLETE", "PRUNED", "FAIL")
-"""The trial states Optuna reports as finished."""
+"""The states that count toward ``n_trials``; an interrupted trial is in none of them."""
+
+RecoveredTrialState = Literal["FAIL", "INTERRUPTED"]
+"""The counted state stale recovery leaves a RUNNING trial in."""
 
 
 @dataclass(frozen=True)
@@ -389,6 +397,21 @@ def _stale_recovery_outcome(parsed: _ParsedTrialOutcome | None) -> str:
     if parsed is not None and parsed.outcome in {"failure", "fatal", "interrupted"}:
         return parsed.outcome
     return "interrupted"
+
+
+def _recovered_trial_state(trial: FrozenTrial) -> RecoveredTrialState:
+    """Predict the counted state stale recovery leaves a RUNNING trial in.
+
+    Read from the outcome the trial's objective recorded, which nothing changes
+    once its orchestrator has stopped, so a dry run or a frozen snapshot can
+    count the trial as recovery will.
+
+    :param FrozenTrial trial: RUNNING trial to predict for.
+    :return RecoveredTrialState: ``FAIL`` when recovery keeps a recorded failure
+        or fatal error, otherwise ``INTERRUPTED``.
+    """
+    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    return "INTERRUPTED" if _stale_recovery_outcome(parsed) == "interrupted" else "FAIL"
 
 
 def _trial_interrupted(trial: FrozenTrial) -> bool:

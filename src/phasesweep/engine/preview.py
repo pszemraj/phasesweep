@@ -44,7 +44,7 @@ from phasesweep.engine.phase import (
     _placeholder_winner,
     _replay_met_target,
 )
-from phasesweep.engine.state import STUDY_SCHEMA_ATTR, Winner
+from phasesweep.engine.state import STUDY_SCHEMA_ATTR, Winner, _recovered_trial_state
 from phasesweep.engine.study_policy import (
     _load_phase_policy_state,
     _validate_fixed_configuration_target,
@@ -61,7 +61,9 @@ log = logging.getLogger("phasesweep.engine.preview")
 class RecordedPhase:
     """What a ledger already holds for one phase, counted as a launch would count it."""
 
-    #: Terminal attempts, plus each RUNNING one, which a launch recovers as failed first.
+    #: Attempts that count toward ``n_trials``: terminal ones that were not interrupted,
+    #: plus each RUNNING one whose objective recorded a failure, which a launch recovers
+    #: as failed first. Any other RUNNING attempt recovers as interrupted and reruns.
     finished: int
     #: How many of those are COMPLETE.
     completed: int
@@ -112,11 +114,12 @@ def _recorded_phase(study: optuna.Study | None) -> RecordedPhase:
     if study is None:
         return RecordedPhase(finished=0, completed=0, running=0, study=None)
     trials = study.get_trials(deepcopy=False)
-    running = sum(1 for trial in trials if trial.state == optuna.trial.TrialState.RUNNING)
+    running = [trial for trial in trials if trial.state == optuna.trial.TrialState.RUNNING]
+    recovered_as_failed = sum(1 for trial in running if _recovered_trial_state(trial) == "FAIL")
     return RecordedPhase(
-        finished=_finished_trial_count(trials) + running,
+        finished=_finished_trial_count(trials) + recovered_as_failed,
         completed=_completed_trial_count(trials),
-        running=running,
+        running=len(running),
         study=study,
     )
 
@@ -165,10 +168,11 @@ def _refuse_as_a_launch_would(
     combines them. Every check is the launch's own function, run on the
     read-only snapshots.
 
-    A launch recovers each RUNNING attempt as failed before it checks that
-    attempt's study, and a snapshot cannot. Such a study gets the checks that
-    do not depend on that recovery (direction and schema) and a fixed
-    configuration's attempt limit from counts that treat the attempt as failed;
+    A launch recovers each RUNNING attempt before it checks that attempt's
+    study (as interrupted, or as failed when its objective recorded a failure),
+    and a snapshot cannot. Such a study gets the checks that do not depend on
+    that recovery (direction and schema) and a fixed configuration's attempt
+    limit from counts that treat each attempt as recovery would record it;
     it is left out of the target, bound-descendant and sampler checks. A launch
     also checks the trainer environment, the stored fingerprints, the trial
     evidence and each study's artifact-root claim, which a preview does not.
@@ -315,8 +319,8 @@ def _preview_phase(
     ``remaining`` count its line prints. A phase whose recorded
     state could not be read is previewed as a fresh phase, and one whose
     RUNNING attempts a launch recovers first is previewed from its counts,
-    with those attempts counted as failed and its recorded state unjudged;
-    both carry a placeholder.
+    with those attempts counted as recovery would record them and its recorded
+    state unjudged; both carry a placeholder.
 
     :param Experiment experiment: Parsed experiment config.
     :param Phase phase: The phase being previewed.
@@ -349,7 +353,8 @@ def _preview_phase(
     elif recorded.running:
         log.warning(
             "DRY RUN warning: phase=%s has %d RUNNING attempt(s) that a real run recovers "
-            "as failed before it checks the phase, so they are counted as failed and its "
+            "before it checks the phase, as failed where the trial recorded a failure and "
+            "otherwise as interrupted, which reruns; they are counted that way, and its "
             "accepted target, sampler continuation and abort state are not checked",
             phase.name,
             recorded.running,

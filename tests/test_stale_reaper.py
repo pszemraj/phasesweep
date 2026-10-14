@@ -51,6 +51,7 @@ from phasesweep.engine.state import (
     CLEANUP_RECOVERED_TRIALS_ATTR,
     GENERATION_ID_ATTR,
     PHASE_FINGERPRINT_ATTR,
+    RERUN_OF_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_ATTR,
@@ -965,11 +966,16 @@ def test_allocation_context_recovers_repeated_optuna_allocation_interruptions(
         study_name="t::p", storage=engine_ledger._resolve_storage(exp.storage)
     )
     trials = study.get_trials(deepcopy=False)
+    # Each interrupted allocation reruns: the second run popped the first's
+    # rerun before dying, and the last run reruns that one before two new draws.
     assert [trial.state for trial in trials] == [
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.FAIL,
         optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.COMPLETE,
     ]
+    assert [trial.user_attrs.get(RERUN_OF_ATTR) for trial in trials] == [None, 0, 1, None, None]
     identity = _environment_identity(exp, "p")
     assert all(trial.user_attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest for trial in trials)
 

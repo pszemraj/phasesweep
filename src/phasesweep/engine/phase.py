@@ -80,6 +80,7 @@ from phasesweep.engine.study_policy import (
     _PhasePolicyState,
     _record_allocation_context,
     _record_recovery_boundary,
+    _record_reruns,
     _record_trial_target,
     _validate_environment_cohort,
     _validate_study_direction,
@@ -1691,6 +1692,10 @@ def _run_phase(
                 generation_id=generation_id,
                 trainer_environment=environment_identity.digest,
             )
+            # Optuna's ask pops WAITING trials before it creates new ones, so
+            # every interrupted trial reruns with its own params before any new
+            # draw, and the allocation context above covers the reruns.
+            _record_reruns(study)
             study.optimize(
                 functools.partial(_objective, run),
                 n_trials=remaining,

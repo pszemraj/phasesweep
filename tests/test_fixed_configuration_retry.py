@@ -1,9 +1,10 @@
 """A fixed configuration is retried by raising ``n_trials``, one attempt per failed one.
 
 A fixed configuration draws nothing, so every attempt runs the same trial. ``n_trials`` counts
-terminal attempts, failed ones included, which would leave a failed or interrupted fixed
-configuration stuck unless raising the target may replace its failures. It may, by one attempt per
-failure while nothing completed, and never once something did.
+terminal attempts, failed ones included, which would leave a failed fixed configuration stuck
+unless raising the target may replace its failures. It may, by one attempt per failure while
+nothing completed, and never once something did. An interrupted attempt never counts: it reruns
+at the same target.
 """
 
 from __future__ import annotations
@@ -190,26 +191,23 @@ def test_infeasible_completed_attempt_closes_a_fixed_configuration(tmp_path: Pat
     assert _call_count(calls) == 1
 
 
-def test_stale_recovered_fixed_configuration_attempt_is_retried(tmp_path: Path) -> None:
-    """An attempt a kill or reboot left RUNNING recovers as failed, which a raised target replaces."""
+def test_stale_recovered_fixed_configuration_attempt_reruns_at_the_same_target(
+    tmp_path: Path,
+) -> None:
+    """An attempt a kill or reboot left RUNNING recovers as interrupted and reruns without a raised target."""
     trainer, calls = _flaky_trainer(tmp_path, failures=0)
     exp = _fixed(tmp_path, trainer, 1)
     study, trial_dir, _number = fabricate_stale_trial(exp, "p", attempt_id="killed-attempt")
     study.set_user_attr(PHASE_FINGERPRINT_ATTR, _phase_fingerprint(exp, exp.phases[0], {}))
     write_attempt_lifecycle(trial_dir, attempt_id="killed-attempt", state="allocated")
 
-    with pytest.raises(NoFeasibleTrialError):
-        run_experiment(exp)
-    assert _states(exp) == ["FAIL"]
-    assert _call_count(calls) == 0
-
-    with pytest.raises(TrialTargetRefusedError, match="use at most 2, not 3"):
-        run_experiment(_fixed(tmp_path, trainer, 3))
-    assert _call_count(calls) == 0
-
-    assert run_experiment(_fixed(tmp_path, trainer, 2))["p"].metric == 1.0
+    assert run_experiment(exp)["p"].metric == 1.0
     assert _call_count(calls) == 1
     assert _states(exp) == ["FAIL", "COMPLETE"]
+
+    with pytest.raises(TrialTargetRefusedError, match="already has a completed trial"):
+        run_experiment(_fixed(tmp_path, trainer, 2))
+    assert _call_count(calls) == 1
 
 
 def test_fresh_persistent_fixed_configuration_refuses_a_larger_target_before_any_launch(

@@ -8,8 +8,9 @@ from phasesweep.engine.state import TERMINAL_TRIAL_STATES, TRIAL_STATE_NAMES
 
 
 def test_trial_state_names_match_optuna_trial_state() -> None:
-    """``TRIAL_STATE_NAMES`` names exactly Optuna's ``TrialState`` members."""
-    assert set(TRIAL_STATE_NAMES) == {state.name for state in optuna.trial.TrialState}
+    """``TRIAL_STATE_NAMES`` names exactly Optuna's ``TrialState`` members plus ``INTERRUPTED``."""
+    optuna_names = {state.name for state in optuna.trial.TrialState}
+    assert set(TRIAL_STATE_NAMES) == optuna_names | {"INTERRUPTED"}
     assert len(TRIAL_STATE_NAMES) == len(set(TRIAL_STATE_NAMES))
 
 

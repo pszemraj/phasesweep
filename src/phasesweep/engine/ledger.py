@@ -100,6 +100,7 @@ from phasesweep.engine.optuna import (
     _phase_study_name,
     _PhaseTrialStats,
     _published_trial_matches,
+    _trial_count_state,
     _TrialRef,
 )
 from phasesweep.engine.state import (
@@ -107,6 +108,7 @@ from phasesweep.engine.state import (
     GENERATION_ID_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    _recovered_trial_state,
 )
 from phasesweep.runtime.files import fsync_directory, journal_file_path
 
@@ -893,11 +895,12 @@ def _phase_trial_stats(
     for trial in trials:
         if published_trial is not None and _published_trial_matches(trial, published_trial):
             published_trial_available = True
-        counts[trial.state.name] = counts.get(trial.state.name, 0) + 1
+        state = _trial_count_state(trial)
+        counts[state] = counts.get(state, 0) + 1
         generation_id = trial.user_attrs.get(GENERATION_ID_ATTR)
         if isinstance(generation_id, str):
             states = generation_counts.setdefault(generation_id, {})
-            states[trial.state.name] = states.get(trial.state.name, 0) + 1
+            states[state] = states.get(state, 0) + 1
         if trial.state.name != "RUNNING":
             continue
         attempt_id = trial.user_attrs.get(ATTEMPT_ID_ATTR)
@@ -906,6 +909,7 @@ def _phase_trial_stats(
                 trial_number=trial.number,
                 generation_id=generation_id if isinstance(generation_id, str) else None,
                 attempt_id=attempt_id if isinstance(attempt_id, str) else None,
+                recovers_as=_recovered_trial_state(trial),
             )
         )
     return _PhaseTrialStats(

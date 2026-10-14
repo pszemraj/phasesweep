@@ -39,7 +39,12 @@ from phasesweep.engine.paths import (
     _winner_path,
 )
 from phasesweep.engine.repeats import RepeatMember, spread
-from phasesweep.engine.state import Winner, WinnerSource
+from phasesweep.engine.state import (
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
+    Winner,
+    WinnerSource,
+)
 from phasesweep.mcp import runner as mcp_runner
 from phasesweep.mcp.snapshots import RunResultSnapshot
 from tests.conftest import (
@@ -324,7 +329,7 @@ def test_snapshot_finalization_keeps_prior_attempt_out_of_generation_counts(
 
     phase = finalized["status"]["phases"][0]
     assert phase["trials"]["RUNNING"] == 0
-    assert phase["trials"]["FAIL"] == 1
+    assert phase["trials"]["INTERRUPTED"] == 1
     assert phase["generation_trials"] == {}
     assert study.get_trials(deepcopy=False)[0].state == optuna.trial.TrialState.RUNNING
 
@@ -587,8 +592,14 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     identified = study.ask()
     identified.set_user_attr("phasesweep_generation_id", "current-generation")
     identified.set_user_attr("phasesweep_attempt_id", "current-attempt")
+    # Its objective recorded a failure before the orchestrator died, so recovery keeps it.
+    identified.set_user_attr(
+        TRIAL_OUTCOME_ATTR,
+        {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": "failure"},
+    )
     # A RUNNING row written before attempt identity existed: reported with
-    # null identity, never dropped, so the counts and the list agree.
+    # null identity, never dropped, so the counts and the list agree. It
+    # recorded nothing, so recovery records it as interrupted.
     study.ask()
 
     snapshot = mcp_runner.capture_result_snapshot(
@@ -604,8 +615,14 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
             "trial_number": 0,
             "generation_id": "current-generation",
             "attempt_id": "current-attempt",
+            "recovers_as": "FAIL",
         },
-        {"trial_number": 1, "generation_id": None, "attempt_id": None},
+        {
+            "trial_number": 1,
+            "generation_id": None,
+            "attempt_id": None,
+            "recovers_as": "INTERRUPTED",
+        },
     ]
 
     finalized = mcp_runner.finalize_result_snapshot(
@@ -617,7 +634,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     assert finalized_phase["trials"] == {"RUNNING": 1, "FAIL": 1}
     assert finalized_phase["generation_trials"] == {"RUNNING": 0, "FAIL": 1}
     assert finalized_phase["running_attempts"] == [
-        {"trial_number": 1, "generation_id": None, "attempt_id": None}
+        {"trial_number": 1, "generation_id": None, "attempt_id": None, "recovers_as": "INTERRUPTED"}
     ]
 
     fully_finalized = mcp_runner.finalize_result_snapshot(
@@ -629,7 +646,7 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     )
 
     fully_finalized_phase = fully_finalized["status"]["phases"][0]
-    assert fully_finalized_phase["trials"] == {"RUNNING": 0, "FAIL": 2}
+    assert fully_finalized_phase["trials"] == {"RUNNING": 0, "FAIL": 1, "INTERRUPTED": 1}
     assert fully_finalized_phase["generation_trials"] == {"RUNNING": 0, "FAIL": 1}
     assert fully_finalized_phase["running_attempts"] == []
 
