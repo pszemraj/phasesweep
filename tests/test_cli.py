@@ -227,8 +227,9 @@ _ENVIRONMENT_CONTRACT_CASES = [
     ),
     pytest.param(
         {"execution": ExecutionContext(inherit_env="all")},
-        "environment: inherit_env=all (every ambient variable is inherited and digested, "
-        "except the passthrough_env names); env keys: none; "
+        "environment: inherit_env=all (inherited whole, and digested: "
+        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}; other ambient variables are not compared); "
+        "env keys: none; "
         "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
         id="all",
     ),
@@ -828,6 +829,58 @@ def test_boolean_warning_is_only_for_argparse(
     caplog.set_level(logging.INFO)
     run_experiment(experiment, dry_run=True)
     assert not [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+
+
+_CREDENTIAL_WARNING = (
+    "warning: execution.inherit_env lists names that look like credentials: {names}. "
+    "Each trial records the value of every listed name in plain text in the study ledger, "
+    "and rotating one refuses a resume. Credentials belong in execution.passthrough_env, "
+    "which is inherited without being recorded or compared."
+)
+
+
+@pytest.mark.parametrize(
+    ("inherit_env", "named"),
+    [
+        pytest.param(
+            ["HF_HOME", "HF_TOKEN", "api_key", "DB_Password", "AWS_SECRET_ACCESS_KEY"],
+            "AWS_SECRET_ACCESS_KEY, DB_Password, HF_TOKEN, api_key",
+            id="each-marker-in-any-case",
+        ),
+        pytest.param(["MY_CREDENTIALS"], "MY_CREDENTIALS", id="credential"),
+        pytest.param(["HF_HOME", "PYTHONPATH"], None, id="plain-names"),
+        pytest.param("none", None, id="none"),
+        pytest.param("all", None, id="all"),
+    ],
+)
+def test_validate_and_dry_run_warn_about_a_credential_in_inherit_env(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    inherit_env: str | list[str],
+    named: str | None,
+) -> None:
+    """A listed name that looks like a credential is warned about, never refused."""
+    experiment = make_experiment(
+        workdir=tmp_path / "runs",
+        execution=ExecutionContext(inherit_env=inherit_env, passthrough_env=["HF_PASSTHROUGH_KEY"]),
+    )
+    config = tmp_path / "experiment.yaml"
+    config.write_text(yaml.safe_dump(experiment.model_dump(mode="json")))
+    expected = [] if named is None else [_CREDENTIAL_WARNING.format(names=named)]
+
+    result = CliRunner().invoke(cli_main, ["validate", str(config)])
+
+    assert result.exit_code == 0, result.output
+    printed = [line.strip() for line in result.output.splitlines() if "warning:" in line]
+    assert [line for line in printed if "inherit_env" in line] == expected
+    caplog.set_level(logging.INFO)
+    run_experiment(experiment, dry_run=True)
+    logged = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("DRY RUN warning:") and "inherit_env" in r.getMessage()
+    ]
+    assert logged == [f"DRY RUN {line}" for line in expected]
 
 
 _REPEATS_BUDGET_WARNING = (

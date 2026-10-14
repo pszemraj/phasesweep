@@ -38,6 +38,7 @@ from phasesweep.engine.paths import (
 from phasesweep.engine.publication import _resolve_publication_pointer
 from phasesweep.engine.state import ARTIFACT_ROOT_ATTR
 from tests.fixtures.make_ledger_fixtures import (
+    FIXTURE_ENVIRONMENT,
     LEDGER_FILENAME,
     experiment_payload,
     storage_url,
@@ -207,6 +208,23 @@ def copy_fixture(name: str, dest: Path) -> Path:
             if child.is_dir():
                 child.chmod(0o700)
     return dest
+
+
+def pin_fixture_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give this process the base environment the fixture's trials were generated under.
+
+    A test that resumes a fixture study and allocates new trials passes the environment
+    cohort check only from that environment, since each recorded trial holds its tracked
+    values. Without this the test follows the shell that runs it, and fails under the commit
+    hook, whose ``PATH`` differs from the developer's.
+
+    :param pytest.MonkeyPatch monkeypatch: The test's monkeypatch, which undoes the pin.
+    """
+    for name, value in FIXTURE_ENVIRONMENT.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
 
 
 def _write_config(

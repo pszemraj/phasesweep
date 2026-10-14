@@ -859,22 +859,40 @@ def test_environment_identity_digest_tracks_values(
     assert identity_for({"TOKEN": "old"}) != identity_for({"TOKEN": "new"})
 
 
-def test_environment_identity_names_are_sorted_and_hold_no_values(
+def test_environment_identity_tracks_names_and_values_in_plain_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Names are the diagnostic surface; values stay inside the digest only."""
-    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
+    """The tracked mapping is sorted by name and holds each configured and listed value."""
+    monkeypatch.setenv("PHASESWEEP_TEST_LISTED", "ambient-value")
     identity = _environment_identity(
         make_experiment(
-            env={"ZULU": "z-secret", "ALPHA": "a-secret"},
-            execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
+            env={"ZULU": "z-value", "ALPHA": "a-value"},
+            execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_LISTED"]),
         ),
         "p",
     )
 
-    assert list(identity.names) == sorted(identity.names)
-    assert {"ALPHA", "ZULU", "PHASESWEEP_TEST_TOKEN"} <= set(identity.names)
-    assert not {"a-secret", "z-secret", "ambient-secret"} & set(identity.names)
+    assert list(identity.tracked) == sorted(identity.tracked)
+    assert identity.tracked["ALPHA"] == "a-value"
+    assert identity.tracked["ZULU"] == "z-value"
+    assert identity.tracked["PHASESWEEP_TEST_LISTED"] == "ambient-value"
+
+
+def test_environment_digest_is_a_checksum_of_the_tracked_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The digest is the SHA-256 of the compact JSON of the tracked pairs, sorted by name."""
+    monkeypatch.setenv("PHASESWEEP_TEST_LISTED", "ambient-value")
+    identity = _environment_identity(
+        make_experiment(
+            env={"ALPHA": "a-value"},
+            execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_LISTED"]),
+        ),
+        "p",
+    )
+
+    encoded = json.dumps(sorted(identity.tracked.items()), separators=(",", ":"))
+    assert identity.digest == hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def test_launch_trial_records_private_environment_json_when_opted_in(
@@ -902,7 +920,7 @@ def test_launch_trial_records_private_environment_json_when_opted_in(
     assert payload["passthrough_env"] == ["TMPDIR"]
     assert payload["env"]["PHASESWEEP_TEST_TOKEN"] == "ambient-secret"
     assert payload["env"]["CONFIGURED"] == "value"
-    assert sorted(payload["env"]) == list(identity.names)
+    assert payload["env"] == identity.values
 
 
 def test_passthrough_value_rotation_preserves_semantic_environment_digest(
@@ -951,7 +969,8 @@ def test_environment_digest_ignores_tmpdir_only(
     assert first.digest == second.digest
     assert first.values["TMPDIR"] == "/sandbox/tmp"
     assert second.values["TMPDIR"] == "/tmp"
-    assert "TMPDIR" in first.names
+    assert "TMPDIR" in first.values
+    assert "TMPDIR" not in first.tracked
     assert third.digest != second.digest
 
 
@@ -1021,7 +1040,7 @@ def test_configured_env_value_cannot_be_exempted_as_passthrough() -> None:
 def test_launch_trial_writes_no_environment_json_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Values are secrets: nothing is written unless the operator opts in."""
+    """The full composed environment can hold credentials, so no file is written unless the operator opts in."""
     _capture_launch_env(tmp_path, monkeypatch)
 
     assert not (tmp_path / "trial_0" / "environment.json").exists()

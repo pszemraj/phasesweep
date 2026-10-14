@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, TypedDict
 
@@ -22,6 +22,12 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     TrialTargetRefusedError,
 )
+from phasesweep.engine.fingerprints import (
+    _ABSENT,
+    _MAX_REPORTED_CHANGES,
+    _changed_payload_keys,
+    _render_changed_values,
+)
 from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
@@ -32,9 +38,8 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
-    TRAINER_ENV_BASE_DIGESTS_ATTR,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
@@ -649,84 +654,77 @@ def _restore_prelaunch_environment_identity(
     return True
 
 
-_MAX_NAMED_VARIABLES = 8
-_NO_VARIABLE_FOUND = (
-    "No differing variable name or base value was found, so one of the values from "
-    "env or inherit_env differs."
+_NO_RECORDED_ENVIRONMENT = (
+    "No trial from the other cohort recorded its environment, so the difference cannot be named."
 )
 
 
-def _variable_list(names: Iterable[str]) -> str:
-    """Render variable names for a refusal, capped so a wide ``inherit_env`` stays readable.
-
-    :param Iterable[str] names: Variable names, in any order.
-    :return str: The sorted names joined by commas, ``"none"`` when empty, and a count of the
-        names beyond the first :data:`_MAX_NAMED_VARIABLES`.
-    """
-    ordered = sorted(names)
-    if not ordered:
-        return "none"
-    shown = ", ".join(ordered[:_MAX_NAMED_VARIABLES])
-    hidden = len(ordered) - _MAX_NAMED_VARIABLES
-    return shown if hidden <= 0 else f"{shown} and {hidden} more"
-
-
-def _recorded_environment(
-    trial: optuna.trial.FrozenTrial,
-) -> tuple[set[str], dict[str, str]] | None:
-    """Read the variable names and base-value digests a trial recorded for its environment.
+def _recorded_environment(trial: optuna.trial.FrozenTrial) -> dict[str, str] | None:
+    """Read the tracked environment a trial recorded.
 
     :param optuna.trial.FrozenTrial trial: Trial from another environment cohort.
-    :return tuple[set[str], dict[str, str]] | None: The recorded names and the per-name base
-        digests, or ``None`` when the trial lacks either or holds a malformed one.
+    :return dict[str, str] | None: The recorded name-to-value mapping, or ``None`` when the
+        trial recorded none (an allocation that died before it landed) or holds a malformed one.
     """
-    names = trial.user_attrs.get(TRAINER_ENV_NAMES_ATTR)
-    digests = trial.user_attrs.get(TRAINER_ENV_BASE_DIGESTS_ATTR)
-    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
-        return None
-    if not isinstance(digests, dict) or not all(
-        isinstance(name, str) and isinstance(digest, str) for name, digest in digests.items()
+    recorded = trial.user_attrs.get(TRAINER_ENV_ATTR)
+    if not isinstance(recorded, dict) or not all(
+        isinstance(name, str) and isinstance(value, str) for name, value in recorded.items()
     ):
         return None
-    return set(names), dict(digests)
+    return dict(recorded)
+
+
+def _describe_environment_changes(old: dict[str, str], new: dict[str, str]) -> str:
+    """Render how a tracked environment differs, with the values on both sides.
+
+    The values are cut by the window :func:`~phasesweep.engine.fingerprints._render_changed_values`
+    applies to a phase fingerprint refusal, so a long ``PATH`` shows where the two differ.
+
+    :param dict[str, str] old: Mapping a trial of the other cohort recorded.
+    :param dict[str, str] new: Mapping this invocation composes.
+    :return str: Each differing variable as ``NAME old -> new``, then each added name with its
+        value and each removed name with its old value, up to :data:`_MAX_REPORTED_CHANGES`
+        entries and a count of the rest; empty when the mappings are equal.
+    """
+    changed: list[str] = []
+    added: list[str] = []
+    removed: list[str] = []
+    for name, before, after in _changed_payload_keys(old, new):
+        old_text, new_text = _render_changed_values(before, after)
+        if before is _ABSENT:
+            added.append(f"added {name}={new_text}")
+        elif after is _ABSENT:
+            removed.append(f"removed {name} (was {old_text})")
+        else:
+            changed.append(f"{name} {old_text} -> {new_text}")
+    entries = [*changed, *added, *removed]
+    shown = entries[:_MAX_REPORTED_CHANGES]
+    if len(entries) > _MAX_REPORTED_CHANGES:
+        shown.append(f"and {len(entries) - _MAX_REPORTED_CHANGES} more")
+    return "; ".join(shown)
 
 
 def _environment_difference(
     current: EnvironmentIdentity, trials: Sequence[optuna.trial.FrozenTrial]
 ) -> str:
-    """Name what differs between this invocation's environment and another cohort's trial.
+    """Show what differs between this invocation's environment and another cohort's trial.
 
-    Compares against the latest of ``trials`` that recorded its variable names and base-value
-    digests. Only names appear, never a value or a digest. A name the digest leaves out in this
-    invocation (``passthrough``) is ignored on both sides, since it cannot split a cohort.
+    Compares the tracked mapping against the latest of ``trials`` that recorded one. Pass-through
+    names are in neither mapping, since they cannot split a cohort.
 
     :param EnvironmentIdentity current: Environment this invocation composes.
     :param Sequence[optuna.trial.FrozenTrial] trials: Trials from other cohorts, oldest first.
-    :return str: A sentence naming the differing base variables and the names added or removed,
-        or one saying the difference must be in a value from ``env`` or ``inherit_env``.
+    :return str: A sentence showing each differing, added and removed variable with its values,
+        or one saying no trial of the other cohort recorded its environment.
     """
     for trial in reversed(trials):
         recorded = _recorded_environment(trial)
         if recorded is None:
             continue
-        names, digests = recorded
-        differing = [
-            name
-            for name, digest in current.base_digests.items()
-            if name in digests and digests[name] != digest
-        ]
-        present = set(current.names) - current.passthrough
-        earlier = names - current.passthrough
-        added = present - earlier
-        removed = earlier - present
-        if not (differing or added or removed):
-            break
-        return (
-            f"Compared with trial {trial.number}, base variables with a different value: "
-            f"{_variable_list(differing)}; names added: {_variable_list(added)}; "
-            f"names removed: {_variable_list(removed)}."
-        )
-    return _NO_VARIABLE_FOUND
+        description = _describe_environment_changes(recorded, current.tracked)
+        if description:
+            return f"Compared with trial {trial.number}: {description}."
+    return _NO_RECORDED_ENVIRONMENT
 
 
 def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdentity) -> None:
@@ -737,8 +735,8 @@ def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdenti
     :raises StudySchemaMismatchError: A populated study has a trial with
         no usable environment identity.
     :raises StudyFingerprintMismatchError: Recorded trials belong to another
-        semantic environment cohort. The message names the base variables whose
-        value differs and the names added or removed, never a value.
+        semantic environment cohort. The message shows each variable that differs,
+        was added or was removed, with its old and new value.
     """
     trials = study.get_trials(deepcopy=False)
     if not trials:

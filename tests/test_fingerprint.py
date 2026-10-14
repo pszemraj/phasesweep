@@ -73,7 +73,6 @@ from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
     Winner,
@@ -1858,43 +1857,6 @@ def test_from_phase_reports_published_winner_manifest_failure(tmp_path: Path) ->
         "does not match its recorded hash",
     ):
         run_experiment(exp, from_phase="lr")
-
-
-@pytest.mark.integration
-def test_winner_and_trial_attrs_record_trainer_environment_identity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Every trial records which environment produced it; the winner keeps the digest.
-
-    Names are diagnostic and persisted; values are secrets and never leave the
-    process.
-    """
-    monkeypatch.setenv("PHASESWEEP_TEST_TOKEN", "ambient-secret")
-    trainer = write_constant_trainer(tmp_path)
-    exp = make_experiment(
-        persistent=tmp_path,
-        trainer=trainer,
-        env={"PHASESWEEP_TEST_SECRET": "config-secret"},
-        execution=ExecutionContext(inherit_env=["PHASESWEEP_TEST_TOKEN"]),
-        n_trials=1,
-    )
-
-    run_experiment(exp)
-
-    identity = _environment_identity(exp, "p")
-    data = yaml.safe_load(_winner_path(exp, "p").read_text())
-    assert data["trainer_env_digest"] == identity.digest
-    assert data["trainer_inherit_env"] == ["PHASESWEEP_TEST_TOKEN"]
-
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
-    attrs = study.get_trials(deepcopy=False)[0].user_attrs
-    names = attrs[TRAINER_ENV_NAMES_ATTR]
-    assert attrs[TRAINER_ENV_DIGEST_ATTR] == identity.digest
-    assert names == sorted(names) == list(identity.names)
-    assert {"PHASESWEEP_TEST_SECRET", "PHASESWEEP_TEST_TOKEN"} <= set(names)
-    serialized = json.dumps(attrs, default=str)
-    assert "config-secret" not in serialized
-    assert "ambient-secret" not in serialized
 
 
 def test_save_winner_replace_failure_preserves_existing_file(

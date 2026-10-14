@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import string
 from collections.abc import Iterator, Mapping
 from pathlib import Path
@@ -167,7 +168,31 @@ def experiment_warnings(experiment: Experiment) -> list[str]:
             "value, so set such flags in trial_command or have the trainer accept a value. "
             f"Rendered that way: {', '.join(flags)}."
         )
+    credentials = _credential_like_inherited_names(experiment)
+    if credentials:
+        warnings.append(
+            f"execution.inherit_env lists names that look like credentials: {', '.join(credentials)}. "
+            "Each trial records the value of every listed name in plain text in the study "
+            "ledger, and rotating one refuses a resume. Credentials belong in "
+            "execution.passthrough_env, which is inherited without being recorded or compared."
+        )
     return warnings
+
+
+_CREDENTIAL_NAME = re.compile(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
+
+
+def _credential_like_inherited_names(experiment: Experiment) -> list[str]:
+    """Name each ``inherit_env`` list entry whose name suggests a credential.
+
+    :param Experiment experiment: Loaded experiment.
+    :return list[str]: The listed names containing ``TOKEN``, ``KEY``, ``SECRET``, ``PASSWORD``
+        or ``CREDENTIAL`` in any case, sorted, empty under ``none`` and ``all``.
+    """
+    contract = experiment.execution.inherit_env
+    if not isinstance(contract, list):
+        return []
+    return sorted(name for name in contract if _CREDENTIAL_NAME.search(name))
 
 
 def _argparse_boolean_flags(experiment: Experiment) -> list[str]:
@@ -266,21 +291,25 @@ def _environment_contract_line(experiment: Experiment) -> str:
     """
     execution = experiment.execution
     contract = execution.inherit_env
-    admitted = execution.inherited_env_names()
     configured = set(experiment.env)
     passed_through = set(execution.effective_passthrough_env())
     # A configured value is never inherited and always digested, even under a passthrough name.
     excluded = passed_through - configured
-    if admitted is None:
-        inherited = "inherit_env=all (every ambient variable is inherited and digested" + (
-            ", except the passthrough_env names)" if excluded else ")"
+    digested = (
+        ", ".join(
+            name
+            for name in execution.tracked_env_names()
+            if name not in passed_through | configured
+        )
+        or "none"
+    )
+    if contract == "all":
+        inherited = (
+            f"inherit_env=all (inherited whole, and digested: {digested}; "
+            "other ambient variables are not compared)"
         )
     else:
         label = f"[{', '.join(contract)}]" if isinstance(contract, list) else contract
-        digested = (
-            ", ".join(name for name in admitted if name not in passed_through | configured)
-            or "none"
-        )
         inherited = f"inherit_env={label} (inherited when set, and digested: {digested})"
     built_in = sorted(excluded & set(BUILTIN_PASSTHROUGH_ENV))
     listed = sorted(excluded - set(BUILTIN_PASSTHROUGH_ENV))
@@ -819,10 +848,14 @@ class ExecutionContext(_Frozen):
             "credentials. A list inherits the base plus exactly the named "
             "variables. 'all' opts in to the full ambient environment. "
             "Configured `env` values are always applied on top and are always "
-            "semantic. In persistent studies, inherited values outside "
-            "`passthrough_env` and the built-in `TMPDIR` must match the "
-            "existing trial cohort before another trial is allocated, so a "
-            "different `PATH` is refused."
+            "semantic. In persistent studies, the base variables, the listed "
+            "names and `env`, except `passthrough_env` and the built-in "
+            "`TMPDIR`, must match the existing trial cohort before another "
+            "trial is allocated, so a different `PATH` is refused. Under 'all' "
+            "the cohort covers only the base variables, and every other "
+            "ambient variable is inherited without being compared. Each trial "
+            "records the compared values in plain text, so a credential "
+            "belongs in `passthrough_env`, not in a list."
         ),
     )
     passthrough_env: list[str] = Field(
@@ -843,13 +876,13 @@ class ExecutionContext(_Frozen):
         description=(
             "Write the trainer environment into each trial directory as "
             "`environment.json` (digest, inherit_env contract, and every "
-            "name-value pair). Off by default because those values are "
-            "secrets; the file is created owner-only (0600), unlike the rest "
-            "of the trial directory. Every trial always records the "
-            "environment's SHA-256 digest and its variable NAMES as study "
-            "attributes regardless of this flag. The digest covers semantic "
-            "values only; pass-through values are never persisted in study "
-            "attributes."
+            "name-value pair, pass-through values included). Off by default "
+            "because it holds the whole composed environment, credentials "
+            "among it; the file is created owner-only (0600), unlike the rest "
+            "of the trial directory. Regardless of this flag, every trial "
+            "records the environment's SHA-256 digest and the compared "
+            "name-value pairs in the study ledger, which leave out the "
+            "pass-through values."
         ),
     )
 
@@ -917,15 +950,23 @@ class ExecutionContext(_Frozen):
         """
         return tuple(sorted({*BUILTIN_PASSTHROUGH_ENV, *self.passthrough_env}))
 
+    def tracked_env_names(self) -> tuple[str, ...]:
+        """List the ambient variable names the environment cohort covers.
+
+        :return tuple[str, ...]: The base set plus any listed names. ``inherit_env: all`` adds
+            none, so an ambient variable outside this set is inherited without being compared.
+        """
+        if isinstance(self.inherit_env, list):
+            return (*BASE_INHERITED_ENV, *self.inherit_env)
+        return BASE_INHERITED_ENV
+
     def inherited_env_names(self) -> tuple[str, ...] | None:
         """List the ambient variable names the ``inherit_env`` contract admits.
 
         :return tuple[str, ...] | None: The base set plus any listed names, or None
             when ``inherit_env`` is ``all`` and every ambient variable is admitted.
         """
-        if isinstance(self.inherit_env, list):
-            return (*BASE_INHERITED_ENV, *self.inherit_env)
-        return None if self.inherit_env == "all" else BASE_INHERITED_ENV
+        return None if self.inherit_env == "all" else self.tracked_env_names()
 
 
 class Experiment(_Frozen):

@@ -18,8 +18,8 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     CLEANUP_CONFIRMED_ATTR,
     GENERATION_ID_ATTR,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_TARGET_ATTR,
 )
@@ -108,7 +108,7 @@ def fabricate_stale_trial(
     trial = study.ask()
     identity = _environment_identity(experiment, phase_name)
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
-    trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
+    trial.set_user_attr(TRAINER_ENV_ATTR, dict(identity.tracked))
     trial_dir = _trial_dir_for(
         experiment,
         phase_name,

@@ -38,8 +38,8 @@ from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
     PHASE_FINGERPRINT_ATTR,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
@@ -155,7 +155,7 @@ def _record(
     for sequence, state in enumerate(states, 1):
         attrs: dict[str, object] = {
             TRAINER_ENV_DIGEST_ATTR: identity.digest,
-            TRAINER_ENV_NAMES_ATTR: list(identity.names),
+            TRAINER_ENV_ATTR: dict(identity.tracked),
         }
         if outcomes and state != _STATE.RUNNING:
             attrs[TRIAL_OUTCOME_ATTR] = {

@@ -53,8 +53,8 @@ from phasesweep.engine.state import (
     PHASE_FINGERPRINT_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
@@ -243,7 +243,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
     stamp_artifact_root(study, exp)
     identity = _environment_identity(exp, "a")
     t.set_user_attr(TRAINER_ENV_DIGEST_ATTR, identity.digest)
-    t.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(identity.names))
+    t.set_user_attr(TRAINER_ENV_ATTR, dict(identity.tracked))
     claimed = engine_ledger.claim_ledger(engine_ledger.validate_ledger(exp))
 
     # Will raise on fingerprint mismatch, but reap must have run first.

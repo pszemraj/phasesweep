@@ -58,9 +58,8 @@ from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
     RETURN_CODE_ATTR,
-    TRAINER_ENV_BASE_DIGESTS_ATTR,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRAINER_INPUT_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
@@ -969,8 +968,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     # a peer abort or failure creating lifecycle/registry metadata must remain in
     # the study's known semantic cohort on the next invocation.
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, run.environment_identity.digest)
-    trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(run.environment_identity.names))
-    trial.set_user_attr(TRAINER_ENV_BASE_DIGESTS_ATTR, dict(run.environment_identity.base_digests))
+    trial.set_user_attr(TRAINER_ENV_ATTR, dict(run.environment_identity.tracked))
 
     if run.aborted:
         raise optuna.TrialPruned("phase aborted")

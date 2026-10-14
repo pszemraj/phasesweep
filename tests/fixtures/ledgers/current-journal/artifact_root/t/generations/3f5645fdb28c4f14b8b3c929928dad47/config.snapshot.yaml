@@ -1,7 +1,7 @@
 experiment: t
 storage: journal:////home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/ledger/study.journal
 workdir: /home/pszemraj/workspace/projects/productivity/phasesweep/tests/fixtures/ledgers/current-journal/artifact_root
-trial_command: python -c 'print("PSWOBJ=0.5")' {overrides}
+trial_command: printf 'PSWOBJ=0.5\n' {overrides}
 trainer_config: {}
 provenance:
   revision: golden-fixture-v1

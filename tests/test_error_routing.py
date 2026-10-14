@@ -115,6 +115,7 @@ from tests.ledger_fixtures import (
     Materialized,
     ledger_file,
     materialize,
+    pin_fixture_environment,
     published_generation_id,
     republish_as_incomplete,
 )
@@ -159,9 +160,7 @@ def _populated_study(name: str = "routing") -> optuna.Study:
 
 def _digest_only_identity(digest: str) -> EnvironmentIdentity:
     """Return an environment identity that carries a digest and nothing else."""
-    return EnvironmentIdentity(
-        digest=digest, names=(), values={}, passthrough=frozenset(), base_digests={}
-    )
+    return EnvironmentIdentity(digest=digest, tracked={}, values={})
 
 
 def test_every_operator_error_declares_its_action():
@@ -1292,15 +1291,15 @@ def _rerun_aborted_phase(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
 def _resume_with_streak_at_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Resume, at its accepted target, a phase whose failure streak meets a lowered limit.
 
-    The fixture's trials carry the environment digest of the shell that generated
-    it, so preflight's cohort check (routed by ``environment_cohort_changed``) is
-    stubbed to keep this case independent of the ambient environment.
+    The fixture's trials record the pinned environment they were generated under, so the
+    cohort check that allocation needs (routed by ``environment_cohort_changed``) passes
+    only from that environment, whatever shell runs the test.
     """
+    pin_fixture_environment(monkeypatch)
     experiment = materialize("current-journal", tmp_path, mode="tree").experiment
     study = _fixture_study(experiment)
     _append_failure_outcomes(study, 2)
     study.set_user_attr(TRIAL_TARGET_ATTR, 5)
-    monkeypatch.setattr(guards, "_validate_environment_cohort", lambda study, digest: None)
     phase = experiment.phases[0].model_copy(update={"n_trials": 5, "max_consecutive_failures": 2})
     return run_experiment(experiment.model_copy(update={"phases": [phase]}))
 

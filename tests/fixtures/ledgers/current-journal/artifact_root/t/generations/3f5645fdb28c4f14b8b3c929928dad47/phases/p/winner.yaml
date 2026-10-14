@@ -16,26 +16,26 @@ completion:
   incomplete: false
   reason: null
   timeout_scope: null
-generation_id: 7100783fbe084c35871484632d6498b7
-attempt_id: 8d01de8bc14646f3a38ba2c33dc41d9d
+generation_id: 3f5645fdb28c4f14b8b3c929928dad47
+attempt_id: 37d04e1a49454256a56fae2831cf593b
 winner_source:
   kind: phase_trial
   phase: p
   trial_number: 0
-  generation_id: 7100783fbe084c35871484632d6498b7
-  attempt_id: 8d01de8bc14646f3a38ba2c33dc41d9d
+  generation_id: 3f5645fdb28c4f14b8b3c929928dad47
+  attempt_id: 37d04e1a49454256a56fae2831cf593b
 trainer_input:
   schema_version: 1
   format: argparse
   filename: overrides_resolved.json
   size_bytes: 13
   sha256: 5e36b6560513586ced65eca0e8b025fe88edbcab82ba2cb67a5fcb2d7b202383
-phase_fingerprint: 337cf32bc10c23785c181b2dcab6ad486f42cef6ebd22bb1c5b132669161fd87
+phase_fingerprint: 832e0119fefa26cb674c8c6231ed8dd0102c8971b8e390e2811e6024bb151a02
 objective_provenance:
   extractor:
     config_sha256: b7b4aa1d877c36c43b4c3c2c1ff207148492ab08e2b0e0a4096f8b4b43e6e1a2
     kind: log_regex
-  recorded_at: '2026-10-14T15:29:17+00:00'
+  recorded_at: '2026-10-14T16:26:46+00:00'
   schema_version: 3
   source:
     kind: file
@@ -44,7 +44,7 @@ objective_provenance:
     path: stdout.log
     sha256: 4aefd9d9b7f57cbfc31e8739fd45762b4eef95203a53299f58a0584920ef8087
     size_bytes: 11
-trainer_env_digest: 6d68543da7965a4d9fc4dbf82313f1898c5cc460d8cc15d1861af8e95313fce6
+trainer_env_digest: 1338386f7f8cdbfd4bdfc268ad6097810d7e41d44100270d843e81c446aa528e
 trainer_inherit_env: none
 confound:
   schema_version: 2

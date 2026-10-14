@@ -12,7 +12,9 @@ Run it from the repository root, in the environment under test::
 
 The experiment pins ``execution.cwd`` to ``/``, so the phase fingerprints it
 stores name no directory of the generating checkout: a fixture read from any
-clone path recomputes the fingerprint it was published with.
+clone path recomputes the fingerprint it was published with. The trials are
+generated under the pinned ``FIXTURE_ENVIRONMENT``, so their recorded trainer
+environment names no variable of the generating shell.
 """
 
 from __future__ import annotations
@@ -26,6 +28,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -51,10 +55,29 @@ OBJECTIVE_TOKEN = "PSWOBJ"
 #: Constant objective the inline trainer reports.
 OBJECTIVE_VALUE = "0.5"
 #: Inline trainer: no file on disk, so the fingerprinted ``trial_command`` holds
-#: no generation-time path and a materialized fixture reproduces it exactly.
-#: ``render_command`` runs ``str.format`` over this template, so it must not
-#: contain a literal ``{`` or ``}``.
-TRIAL_COMMAND = f"python -c 'print(\"{OBJECTIVE_TOKEN}={OBJECTIVE_VALUE}\")' {{overrides}}"
+#: no generation-time path and a materialized fixture reproduces it exactly. It
+#: uses only the shell's ``printf`` builtin, so the trial launches under the
+#: pinned ``PATH`` below, which holds no interpreter. ``printf`` ignores the
+#: override arguments it is given. ``render_command`` runs ``str.format`` over
+#: this template, so it must not contain a literal ``{`` or ``}``.
+TRIAL_COMMAND = f"printf '{OBJECTIVE_TOKEN}={OBJECTIVE_VALUE}\\n' {{overrides}}"
+#: The base environment a fixture's trials are generated under, and the one a test
+#: applies before it resumes a fixture study and allocates new trials. A persistent
+#: study refuses a resume whose tracked environment differs from the one recorded
+#: on its trials, and each trial records its tracked values in plain text, so
+#: generating under the shell at hand would commit that shell's ``PATH`` and
+#: make every other shell, the commit hook's included, a different cohort. ``None``
+#: means unset. Only the base names ``inherit_env: none`` tracks belong here; this
+#: module is stdlib only, so the generator can read it before PhaseSweep is imported.
+FIXTURE_ENVIRONMENT: dict[str, str | None] = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/home/phasesweep",
+    "USER": "phasesweep",
+    "LOGNAME": "phasesweep",
+    "LANG": "C.UTF-8",
+    "TZ": "UTC",
+    "LC_ALL": None,
+}
 
 #: PhaseSweep study schema this fixture set is asserted against. Mirrors
 #: ``phasesweep.engine.state.STUDY_SCHEMA_VERSION``; kept as a literal so this
@@ -104,9 +127,8 @@ def experiment_payload(*, storage_url: str, workdir: Path) -> dict[str, Any]:
         "workdir": str(workdir),
         "trial_command": TRIAL_COMMAND,
         "override_format": "argparse",
-        # Without a narrowed contract the trial records every ambient variable
-        # NAME in the ledger, which would commit the generating operator's
-        # environment shape and make the fixture unreproducible elsewhere.
+        # The contract is declared rather than left to the default, so the
+        # fixture does not move when the default does.
         "execution": {"cwd": TRAINER_CWD, "inherit_env": "none"},
         "metric": {
             "name": "objective",
@@ -241,6 +263,29 @@ def _isolate_environment(sandbox: Path) -> None:
     os.environ["PHASESWEEP_LOCK_DIR"] = str(locks)
 
 
+@contextmanager
+def _pinned_environment() -> Iterator[None]:
+    """Apply :data:`FIXTURE_ENVIRONMENT` to this process, then restore what was there.
+
+    :return Iterator[None]: A context in which every pinned variable has its pinned value, or is
+        unset when the pin is ``None``.
+    """
+    saved = {name: os.environ.get(name) for name in FIXTURE_ENVIRONMENT}
+    try:
+        for name, value in FIXTURE_ENVIRONMENT.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def _git_describe(path: Path) -> str:
     """Describe the git checkout a path belongs to.
 
@@ -361,7 +406,8 @@ def _run_experiment_into(paths: FixturePaths, scratch: Path) -> None:
     )
     config_path = scratch / "experiment.yaml"
     config_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-    run_experiment(load_experiment(config_path))
+    with _pinned_environment():
+        run_experiment(load_experiment(config_path))
     tree_gitignore = paths.experiment_dir / ".gitignore"
     if tree_gitignore.is_file():
         tree_gitignore.write_text(FIXTURE_TREE_GITIGNORE, encoding="utf-8")

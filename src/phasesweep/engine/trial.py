@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, Observation, check_bounds
-from phasesweep.config.models import BASE_INHERITED_ENV, _wandb_query
+from phasesweep.config.models import _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
     OperatorAction,
@@ -157,6 +157,7 @@ def _trainer_environment(
     phase_name: str,
     *,
     require_wandb_online: bool = True,
+    tracked_only: bool = False,
 ) -> dict[str, str]:
     """Compose the trainer environment per the execution contract.
 
@@ -172,15 +173,20 @@ def _trainer_environment(
     :param str phase_name: Phase whose remote consumers manage W&B identity.
     :param bool require_wandb_online: Reject offline/disabled W&B modes when the
         caller is preparing new remote work.
+    :param bool tracked_only: Start from the ambient names the environment cohort covers even
+        under ``inherit_env: all``, which gives the names :func:`_environment_identity` tracks.
     :raises PhaseSweepError: The W&B environment cannot be composed because explicit
         settings conflict or remote logging is disabled (``FIX_CONFIG``).
     :return dict[str, str]: The composed trainer environment.
     """
     admitted = experiment.execution.inherited_env_names()
-    if admitted is None:
+    if admitted is None and not tracked_only:
         env = os.environ.copy()
     else:
-        names = [*admitted, *experiment.execution.effective_passthrough_env()]
+        names = [
+            *experiment.execution.tracked_env_names(),
+            *experiment.execution.effective_passthrough_env(),
+        ]
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
     # These values are assigned for each trial after the base environment is
@@ -252,25 +258,21 @@ def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
 class EnvironmentIdentity:
     """Semantic identity of the base environment a trainer receives.
 
-    ``digest`` excludes the pass-through values (the built-in ``TMPDIR`` and
-    ``passthrough_env``) so credentials can rotate without contaminating a
-    persistent study. ``values``
-    remains the full composed mapping used for launch and the opt-in
-    ``environment.json`` record; it can hold secrets and must never be persisted
-    or logged outside that owner-only record.
+    ``tracked`` is the name-to-value mapping the environment cohort covers: the base names,
+    the ``inherit_env`` list names, the ``env`` entries and the keys PhaseSweep composes from
+    config. It leaves out the pass-through names (the built-in ``TMPDIR`` and
+    ``passthrough_env``) so credentials can rotate without contaminating a persistent study.
+    Each trial records it in plain text, so the refusal for a different cohort can show both
+    values. ``digest`` is the SHA-256 of that mapping, the compact key the cohort check compares.
 
-    ``passthrough`` is every name whose value the digest leaves out, set or not.
-    ``base_digests`` maps each digested :data:`~phasesweep.config.models.BASE_INHERITED_ENV`
-    name to the SHA-256 of its value and holds no other name: it lets a cohort
-    refusal name a differing base variable without a credential's digest ever
-    being recorded.
+    ``values`` is the full composed mapping used for launch and the opt-in ``environment.json``
+    record. It also holds the pass-through values and, under ``inherit_env: all``, every
+    ambient variable outside the cohort, so it is recorded nowhere but that owner-only file.
     """
 
     digest: str
-    names: tuple[str, ...]
+    tracked: dict[str, str]
     values: dict[str, str]
-    passthrough: frozenset[str]
-    base_digests: dict[str, str]
 
 
 def _environment_identity(
@@ -279,55 +281,62 @@ def _environment_identity(
     *,
     require_wandb_online: bool = True,
 ) -> EnvironmentIdentity:
-    """Fingerprint the semantic part of the composed trainer environment.
+    """Identify the semantic part of the composed trainer environment.
 
-    Values named by the effective pass-through set (the built-in ``TMPDIR``
-    plus ``execution.passthrough_env``) are deliberately excluded: they are
-    scratch, credential or transport inputs allowed to change between
-    invocations. Every other inherited value is semantic and must remain in
-    one cohort for persistent-study reuse. Configured ``experiment.env``
-    entries remain semantic even if they reuse a pass-through name, except
-    trial bindings assigned by PhaseSweep, which are removed first.
+    The cohort covers the names the narrowed contract composes: the base names, the
+    ``inherit_env`` list names, the ``experiment.env`` entries and the W&B and MLflow keys
+    PhaseSweep sets from config. Under ``inherit_env: all`` the trainer still inherits every
+    ambient variable, but one outside that set is inherited untracked, so shell state such as
+    ``SHLVL`` or ``OLDPWD`` cannot split a persistent study.
 
-    The digest is the SHA-256 of the compact JSON encoding of the
+    Values named by the effective pass-through set (the built-in ``TMPDIR`` plus
+    ``execution.passthrough_env``) are also excluded: they are scratch, credential or
+    transport inputs allowed to change between invocations. Configured ``experiment.env``
+    entries remain semantic even if they reuse a pass-through name, except trial bindings
+    assigned by PhaseSweep, which are removed first.
+
+    The digest is the SHA-256 of the compact JSON encoding of the tracked
     ``[[name, value], ...]`` pairs sorted by name. JSON is used rather than a
     delimiter join because ``experiment.env`` keys are arbitrary config
     strings: encoding ``{"A": "B=1"}`` and ``{"A=B": "1"}`` as ``A=B=1``
     would collide, while JSON string quoting keeps the encoding injective.
-    Sorting makes the digest independent of mapping order.
+    Sorting makes the digest independent of mapping order. It is a checksum of the tracked
+    mapping, not a secrecy measure: each trial records both.
 
     The digest is stored on every allocated trial and checked against every
-    populated persistent study before another trial is allocated. The values
-    themselves never enter config metadata. The per-name digests of the
-    digested base variables are recorded beside it, drawn from the same
-    ``digested`` mapping so they cover exactly what the digest covers.
+    populated persistent study before another trial is allocated.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :param str phase_name: Phase whose remote consumers normalize W&B defaults.
     :param bool require_wandb_online: Reject offline/disabled W&B modes when the
         caller is preparing new remote work.
-    :return EnvironmentIdentity: Digest, sorted variable names, the composed
-        name-to-value mapping the digest covers, the names it leaves out, and
-        the per-name digests of the digested base variables.
+    :return EnvironmentIdentity: The digest, the tracked name-to-value mapping it covers, and
+        the full composed mapping the trainer receives.
     """
     env = _trainer_environment(
         experiment,
         phase_name,
         require_wandb_online=require_wandb_online,
     )
+    cohort_names = set(
+        _trainer_environment(
+            experiment,
+            phase_name,
+            require_wandb_online=require_wandb_online,
+            tracked_only=True,
+        )
+    )
     passthrough = frozenset(experiment.execution.effective_passthrough_env()) - set(experiment.env)
-    digested = {name: value for name, value in env.items() if name not in passthrough}
-    encoded = json.dumps(sorted(digested.items()), separators=(",", ":"), ensure_ascii=False)
+    tracked = {
+        name: value
+        for name, value in sorted(env.items())
+        if name in cohort_names and name not in passthrough
+    }
+    encoded = json.dumps(list(tracked.items()), separators=(",", ":"), ensure_ascii=False)
     return EnvironmentIdentity(
         digest=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
-        names=tuple(sorted(env)),
+        tracked=tracked,
         values=env,
-        passthrough=passthrough,
-        base_digests={
-            name: hashlib.sha256(value.encode("utf-8")).hexdigest()
-            for name, value in sorted(digested.items())
-            if name in BASE_INHERITED_ENV
-        },
     )
 
 
@@ -338,8 +347,9 @@ def _record_trainer_environment(
 ) -> None:
     """Write the opt-in raw environment record for one trial.
 
-    A no-op unless ``execution.record_env`` is set. The record holds ambient
-    *values*, so it is written owner-only (0600) through
+    A no-op unless ``execution.record_env`` is set. The record holds the whole
+    composed environment, pass-through values and every ambient variable under
+    ``inherit_env: all`` included, so it is written owner-only (0600) through
     :func:`phasesweep.runtime.files.private_atomic_write_text` rather than the
     umask-governed artifact writer the rest of the trial directory uses. Only
     the file is hardened: the trial directory itself stays operator-trusted, so
@@ -348,7 +358,7 @@ def _record_trainer_environment(
     The recorded mapping is the full contract-composed environment before the
     per-trial ``PHASESWEEP_*`` and GPU bindings. ``passthrough_env`` lists the
     effective pass-through names, built-in ``TMPDIR`` included, whose values are
-    excluded from the accompanying semantic digest.
+    left out of the tracked mapping and its digest.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :param EnvironmentIdentity identity: Identity of the composed environment.

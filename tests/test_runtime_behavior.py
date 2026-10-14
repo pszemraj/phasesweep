@@ -61,8 +61,8 @@ from phasesweep.engine.state import (
     FEASIBLE_ATTR,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
-    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
@@ -1005,7 +1005,7 @@ def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch)
     assert [trial.state.name for trial in previous] == ["FAIL", "PRUNED"]
     for trial in previous:
         assert trial.user_attrs[TRAINER_ENV_DIGEST_ATTR]
-        assert TRAINER_ENV_NAMES_ATTR in trial.user_attrs
+        assert TRAINER_ENV_ATTR in trial.user_attrs
 
     updated = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 3})]}

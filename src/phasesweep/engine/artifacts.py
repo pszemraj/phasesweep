@@ -30,6 +30,7 @@ from phasesweep.engine.repeats import (
     group_labels,
 )
 from phasesweep.engine.state import (
+    TRAINER_ENV_ATTR,
     Winner,
     _parse_winner_source,
     _validate_observed_block,
@@ -123,6 +124,9 @@ def _write_trials_csv(
     in the trial's group so far, grouped by the same key selection uses. An
     incomplete group's label moves as more members are allocated.
 
+    Every user attribute is a column except the tracked trainer environment, which is
+    ledger provenance: its ``PATH`` and ``HOME`` values are noise in a results table.
+
     :param optuna.Study study: Study whose trials are serialized.
     :param Path path: Destination CSV path.
     :param RepeatAxis | None repeats: The phase's repeat axis, or ``None`` without repeats.
@@ -131,7 +135,7 @@ def _write_trials_csv(
     if not trials:
         return
     param_names = sorted({n for t in trials for n in t.params})
-    attr_names = sorted({n for t in trials for n in t.user_attrs})
+    attr_names = sorted({n for t in trials for n in t.user_attrs} - {TRAINER_ENV_ATTR})
     labels = (
         {} if repeats is None else group_labels(((t.number, t.params) for t in trials), repeats)
     )
