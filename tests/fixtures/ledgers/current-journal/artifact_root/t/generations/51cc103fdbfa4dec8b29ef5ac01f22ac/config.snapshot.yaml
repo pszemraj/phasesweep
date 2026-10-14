@@ -54,7 +54,6 @@ env: {}
 execution:
   cwd: /
   inherit_env: none
-  passthrough_env:
-  - TMPDIR
+  passthrough_env: []
   record_env: false
 timeout_seconds_per_run: null

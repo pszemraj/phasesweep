@@ -592,20 +592,20 @@ def test_execution_rejects_ambiguous_environment_classification() -> None:
         ExecutionContext(inherit_env=["HF_TOKEN"], passthrough_env=["HF_TOKEN"])
 
 
-def test_passthrough_env_defaults_to_tmpdir_and_a_written_list_replaces_it() -> None:
-    assert ExecutionContext().passthrough_env == ["TMPDIR"]
-    assert ExecutionContext(passthrough_env=[]).passthrough_env == []
-    assert ExecutionContext(passthrough_env=["HF_TOKEN"]).passthrough_env == ["HF_TOKEN"]
+def test_tmpdir_is_builtin_passthrough_and_a_written_list_adds_to_it() -> None:
+    """``passthrough_env`` defaults to ``[]``; the effective set always holds ``TMPDIR``."""
+    assert ExecutionContext().passthrough_env == []
+    assert ExecutionContext().effective_passthrough_env() == ("TMPDIR",)
+    assert ExecutionContext(passthrough_env=["TMPDIR"]).effective_passthrough_env() == ("TMPDIR",)
+    written = ExecutionContext(passthrough_env=["WANDB_API_KEY", "HF_TOKEN"])
+    assert written.effective_passthrough_env() == ("HF_TOKEN", "TMPDIR", "WANDB_API_KEY")
 
 
-def test_inherit_env_naming_tmpdir_is_refused_with_the_way_to_digest_it() -> None:
-    """Listing ``TMPDIR`` under ``inherit_env`` clashes with the default; the error says how to resolve it."""
-    with pytest.raises(ValidationError, match=r"must not overlap.*passthrough_env: \[\]"):
-        ExecutionContext(inherit_env=["TMPDIR", "HF_HOME"])
-    assert ExecutionContext(inherit_env=["TMPDIR"], passthrough_env=[]).inherit_env == ["TMPDIR"]
-    with pytest.raises(ValidationError, match="must not overlap") as explicit:
-        ExecutionContext(inherit_env=["TMPDIR"], passthrough_env=["TMPDIR"])
-    assert "defaults to" not in str(explicit.value)
+@pytest.mark.parametrize("passthrough", [[], ["TMPDIR"], ["HF_TOKEN"]])
+def test_inherit_env_naming_tmpdir_is_refused(passthrough: list[str]) -> None:
+    """``TMPDIR`` is always inherited and never digested, so an ``inherit_env`` list may not name it."""
+    with pytest.raises(ValidationError, match=r"inherit_env must not name \['TMPDIR'\].*remove it"):
+        ExecutionContext(inherit_env=["TMPDIR", "HF_HOME"], passthrough_env=passthrough)
 
 
 # ---- migrated from version-named files ----

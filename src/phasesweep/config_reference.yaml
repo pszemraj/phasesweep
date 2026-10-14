@@ -1113,7 +1113,7 @@ mlflow: object | null = null
 # Overrides: execution.inherit_env, execution.passthrough_env (a configured value replaces an inherited or passed-through value of the same name).
 # Explicit phases[].gpu_ids and phases[].gpu_devices take priority over env.CUDA_VISIBLE_DEVICES for pool discovery. The trainer receives its leased device token.
 # env.CUDA_VISIBLE_DEVICES of "" or -1 disables CUDA for the phase. Under single_per_trial any other value must name devices that exist, and an unknown token fails when the phase launches. Under none it reaches the trainer unchecked.
-# Recommended: put rotating credentials and proxy settings in execution.passthrough_env, together with TMPDIR when it should stay excluded from the environment digest, and make them available to the controller too. Trainer telemetry settings are kept when their backend is not an evidence consumer.
+# Recommended: put rotating credentials and proxy settings in execution.passthrough_env and make them available to the controller too. Trainer telemetry settings are kept when their backend is not an evidence consumer.
 # Recommended: under gpu_policy none set CUDA_VISIBLE_DEVICES here, or list it in execution.inherit_env (or choose all), because the default inherit_env none drops an ambient GPU restriction.
 # Recommended: set cache variables such as HF_HOME, HF_DATASETS_CACHE, TORCH_HOME and TMPDIR to writable locations when needed. A TMPDIR set here is part of the environment digest. PhaseSweep does not provision or warm trainer caches.
 env: map[string, string] = {}
@@ -1138,8 +1138,8 @@ execution: object = {}
   # CUDA_VISIBLE_DEVICES is never in the base set. Bind it with env.CUDA_VISIBLE_DEVICES or name it here.
   # The same selection applies to the environment of PhaseSweep's own MLflow and W&B workers.
   # Overridden by: env (a configured value replaces an inherited value of the same name).
-  # Conflicts with: execution.passthrough_env (a name cannot be in both; config load fails). Names in a list must be unique, nonempty, unpadded and free of = and NUL characters.
-  # Warning: before each phase that still has work, the composed environment must match the one recorded for the study's earlier attempts, or the run is refused with a fingerprint mismatch. The check compares one digest over the sorted name and value pairs, without execution.passthrough_env names (TMPDIR by default), the PHASESWEEP_* names listed under env, or GPU bindings.
+  # Conflicts with: execution.passthrough_env (a name cannot be in both; config load fails). A list that names TMPDIR also fails config load, because TMPDIR is always inherited when set and never digested. Names in a list must be unique, nonempty, unpadded and free of = and NUL characters.
+  # Warning: before each phase that still has work, the composed environment must match the one recorded for the study's earlier attempts, or the run is refused with a fingerprint mismatch. The check compares one digest over the sorted name and value pairs, without TMPDIR, the execution.passthrough_env names, the PHASESWEEP_* names listed under env, or GPU bindings.
   # PATH is in the digest because it decides which interpreter and tools run, so resuming from a shell with a different PATH is refused: another environment, a shell that has not activated one, or a server or sandbox that sets its own PATH. Pin env.PATH and give trial_command an absolute interpreter path so every shell composes the same value, or add PATH to execution.passthrough_env when PATH differences are harmless.
   # With all, that digest includes variables such as PWD, SHLVL and the ambient CUDA_VISIBLE_DEVICES, so unrelated shell changes can prevent reuse.
   # To clear a mismatch, restore the environment, move the variable to execution.passthrough_env, or use a new experiment name.
@@ -1147,20 +1147,19 @@ execution: object = {}
   # Recommended: list the model, cache and GPU variables the trainer needs. Narrowed inheritance does not later pick up excluded credential or cache variables.
   inherit_env: "all" | "none" | list[string] = "none"
 
-  # Names of ambient variables whose values may change between invocations, for example MLFLOW_TRACKING_TOKEN, HTTPS_PROXY or a scratch directory. Names must be unique, nonempty, unpadded and free of = and NUL characters.
-  # The default is TMPDIR, a scratch location that differs between a sandboxed and an ordinary shell without changing any result. PATH is not in it, because it decides which interpreter and tools run.
-  # A list written here replaces the default, so a config that passes a credential through and still wants TMPDIR excluded lists both. [] puts TMPDIR back in the environment digest.
+  # Names of ambient variables whose values may change between invocations, for example MLFLOW_TRACKING_TOKEN or HTTPS_PROXY. Names must be unique, nonempty, unpadded and free of = and NUL characters.
+  # TMPDIR is built in: it is always inherited when set and never digested, so a sandboxed and an ordinary shell agree on it, and it is not written here. A list adds names to it, and listing TMPDIR anyway changes nothing. PATH is not built in, because it decides which interpreter and tools run.
   # With inherit_env all this list adds nothing to the environment, because every ambient variable is already inherited. With none or a list, it adds these variables to the base set.
-  # The names are part of the study fingerprint and their values are excluded from the environment digest, so they can rotate without stopping reuse. A variable missing from the ambient environment is not invented.
+  # The effective names, TMPDIR included, are part of the study fingerprint and their values are excluded from the environment digest, so they can rotate without stopping reuse. A variable missing from the ambient environment is not invented.
   # These variables also reach PhaseSweep's own MLflow and W&B workers, so they must exist in the controller's environment, including for sync-tracking.
-  # Conflicts with: execution.inherit_env (a name cannot be in both an explicit inherit_env list and this list; config load fails). Because the default list is TMPDIR, an inherit_env list that names TMPDIR also fails to load unless passthrough_env is written, for example as [].
-  # Overridden by: env (a configured value replaces a passed-through value of the same name and stays semantic).
+  # Conflicts with: execution.inherit_env (a name cannot be in both an explicit inherit_env list and this list; config load fails).
+  # Overridden by: env (a configured value replaces a passed-through value of the same name and stays semantic, TMPDIR included).
   # Warning: model, data and cache settings that change what a trial means belong in env or execution.inherit_env instead.
   # Recommended: add PATH only when differences in it are harmless, for example when trial_command names an absolute interpreter path.
-  passthrough_env: list[string] = ["TMPDIR"]
+  passthrough_env: list[string] = []
 
   # Write the composed base environment to environment.json in each attempt directory with owner-only mode 0600.
-  # The file holds the digest, the inherit_env setting, the sorted passthrough_env names and the full env mapping. It is written before the per-trial PHASESWEEP_* names, the GPU bindings and the per-attempt W&B and MLflow bindings are added, so they are absent from it.
+  # The file holds the digest, the inherit_env setting, the sorted effective passthrough_env names (TMPDIR included) and the full env mapping. It is written before the per-trial PHASESWEEP_* names, the GPU bindings and the per-attempt W&B and MLflow bindings are added, so they are absent from it.
   # The variable names and the semantic digest are recorded in the study whether or not this is true.
   # Excluded from the study fingerprint.
   # Warning: true stores ambient and passed-through secrets in the file. Use it only when keeping the full environment is intended.

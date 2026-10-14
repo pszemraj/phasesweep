@@ -162,8 +162,9 @@ def _trainer_environment(
 
     ``inherit_env: none`` (the default) starts from the minimal base; a list
     adds exactly the named semantic ambient variables on top of that base, and
-    ``all`` copies the whole ambient environment. ``passthrough_env`` adds
-    credential/transport variables to either narrowed contract. Configured
+    ``all`` copies the whole ambient environment. The pass-through names (the
+    built-in ``TMPDIR`` plus ``passthrough_env``) are inherited under either
+    narrowed contract. Configured
     ``experiment.env`` values apply last, except trial-bound keys that
     PhaseSweep assigns for each attempt.
 
@@ -179,7 +180,7 @@ def _trainer_environment(
     if admitted is None:
         env = os.environ.copy()
     else:
-        names = [*admitted, *experiment.execution.passthrough_env]
+        names = [*admitted, *experiment.execution.effective_passthrough_env()]
         env = {name: os.environ[name] for name in names if name in os.environ}
     env.update(experiment.env)
     # These values are assigned for each trial after the base environment is
@@ -251,8 +252,9 @@ def _inherit_env_contract(experiment: Experiment) -> str | list[str]:
 class EnvironmentIdentity:
     """Semantic identity of the base environment a trainer receives.
 
-    ``digest`` excludes explicitly classified ``passthrough_env`` values so
-    credentials can rotate without contaminating a persistent study. ``values``
+    ``digest`` excludes the pass-through values (the built-in ``TMPDIR`` and
+    ``passthrough_env``) so credentials can rotate without contaminating a
+    persistent study. ``values``
     remains the full composed mapping used for launch and the opt-in
     ``environment.json`` record; it can hold secrets and must never be persisted
     or logged outside that owner-only record.
@@ -271,8 +273,9 @@ def _environment_identity(
 ) -> EnvironmentIdentity:
     """Fingerprint the semantic part of the composed trainer environment.
 
-    Values named by ``execution.passthrough_env`` are deliberately excluded:
-    they are credentials or transport inputs allowed to rotate between
+    Values named by the effective pass-through set (the built-in ``TMPDIR``
+    plus ``execution.passthrough_env``) are deliberately excluded: they are
+    scratch, credential or transport inputs allowed to change between
     invocations. Every other inherited value is semantic and must remain in
     one cohort for persistent-study reuse. Configured ``experiment.env``
     entries remain semantic even if they reuse a pass-through name, except
@@ -301,7 +304,7 @@ def _environment_identity(
         phase_name,
         require_wandb_online=require_wandb_online,
     )
-    passthrough = set(experiment.execution.passthrough_env) - set(experiment.env)
+    passthrough = set(experiment.execution.effective_passthrough_env()) - set(experiment.env)
     items = sorted((name, value) for name, value in env.items() if name not in passthrough)
     encoded = json.dumps(items, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return EnvironmentIdentity(
@@ -326,8 +329,9 @@ def _record_trainer_environment(
     logs and evidence remain readable by ordinary tooling.
 
     The recorded mapping is the full contract-composed environment before the
-    per-trial ``PHASESWEEP_*`` and GPU bindings. ``passthrough_env`` names the
-    values excluded from the accompanying semantic digest.
+    per-trial ``PHASESWEEP_*`` and GPU bindings. ``passthrough_env`` lists the
+    effective pass-through names, built-in ``TMPDIR`` included, whose values are
+    excluded from the accompanying semantic digest.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :param EnvironmentIdentity identity: Identity of the composed environment.
@@ -341,7 +345,7 @@ def _record_trainer_environment(
     payload = {
         "digest": identity.digest,
         "inherit_env": _inherit_env_contract(experiment),
-        "passthrough_env": sorted(experiment.execution.passthrough_env),
+        "passthrough_env": list(experiment.execution.effective_passthrough_env()),
         "env": identity.values,
     }
     private_atomic_write_text(

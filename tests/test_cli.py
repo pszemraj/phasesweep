@@ -204,17 +204,14 @@ def test_validate_does_not_preflight_ambient_wandb_environment(
     assert "goal=minimize" in result.output
 
 
-_BASE_ENV_NAMES = "PATH, HOME, LANG, LC_ALL, TMPDIR, USER, LOGNAME, TZ"
 _BASE_ENV_NAMES_WITHOUT_TMPDIR = "PATH, HOME, LANG, LC_ALL, USER, LOGNAME, TZ"
-_REFUSES_TO_RESUME = (
-    "a persistent study refuses to resume when any value outside passthrough_env changes"
-)
+_REFUSES_TO_RESUME = "a persistent study refuses to resume when any digested value changes"
 _ENVIRONMENT_CONTRACT_CASES = [
     pytest.param(
         {},
         "environment: inherit_env=none (inherited when set, and digested: "
         f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: none; "
-        "passthrough_env: TMPDIR (inherited when set, excluded from the digest)",
+        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
         id="default-in-memory",
     ),
     pytest.param(
@@ -223,24 +220,25 @@ _ENVIRONMENT_CONTRACT_CASES = [
             "env": {"B_FLAG": "1", "A_FLAG": "2"},
             "persistent": True,
         },
-        f"environment: inherit_env=[HF_HOME] (inherited when set, and digested: {_BASE_ENV_NAMES}, "
-        "HF_HOME); env keys: A_FLAG, B_FLAG; "
-        "passthrough_env: HF_TOKEN (inherited when set, excluded from the digest); "
-        + _REFUSES_TO_RESUME,
+        "environment: inherit_env=[HF_HOME] (inherited when set, and digested: "
+        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}, HF_HOME); env keys: A_FLAG, B_FLAG; "
+        "passthrough_env: HF_TOKEN and built-in TMPDIR "
+        "(inherited when set, excluded from the digest); " + _REFUSES_TO_RESUME,
         id="list-and-passthrough-persistent",
     ),
     pytest.param(
         {"execution": ExecutionContext(inherit_env="all")},
         "environment: inherit_env=all (every ambient variable is inherited and digested, "
         "except the passthrough_env names); env keys: none; "
-        "passthrough_env: TMPDIR (inherited when set, excluded from the digest)",
+        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
         id="all",
     ),
     pytest.param(
-        {"execution": ExecutionContext(passthrough_env=[])},
-        f"environment: inherit_env=none (inherited when set, and digested: {_BASE_ENV_NAMES}); "
-        "env keys: none; passthrough_env: none",
-        id="empty-passthrough-digests-tmpdir",
+        {"execution": ExecutionContext(passthrough_env=["TMPDIR"])},
+        "environment: inherit_env=none (inherited when set, and digested: "
+        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: none; "
+        "passthrough_env: TMPDIR (built in; inherited when set, excluded from the digest)",
+        id="listed-tmpdir-is-redundant",
     ),
     pytest.param(
         {"env": {"TMPDIR": "/scratch"}},
@@ -248,6 +246,14 @@ _ENVIRONMENT_CONTRACT_CASES = [
         f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: TMPDIR; "
         "passthrough_env: none (TMPDIR set under env, so the configured value is digested)",
         id="configured-tmpdir-stays-digested",
+    ),
+    pytest.param(
+        {"execution": ExecutionContext(passthrough_env=["HF_TOKEN"]), "env": {"TMPDIR": "/s"}},
+        "environment: inherit_env=none (inherited when set, and digested: "
+        f"{_BASE_ENV_NAMES_WITHOUT_TMPDIR}); env keys: TMPDIR; "
+        "passthrough_env: HF_TOKEN (inherited when set, excluded from the digest) "
+        "(TMPDIR set under env, so the configured value is digested)",
+        id="configured-tmpdir-beside-a-listed-token",
     ),
 ]
 
@@ -310,12 +316,12 @@ def test_environment_contract_line_lists_each_variable_once(
     assert line == expected
     digested = re.search(r"digested: ([^)]*)\)", line)
     env_keys = re.search(r"env keys: ([^;]*)", line)
-    passed = re.search(r"passthrough_env: ([A-Z_, ]+?)(?: \(|;|$)", line)
+    passed = re.search(r"passthrough_env: ([^(;]*?)(?: \(|;|$)", line)
     names = [
         name
         for match in (digested, env_keys, passed)
         if match is not None
-        for name in match.group(1).split(", ")
+        for name in re.split(r", | and built-in ", match.group(1))
         if name != "none"
     ]
     assert len(names) == len(set(names)), line

@@ -268,7 +268,7 @@ def _environment_contract_line(experiment: Experiment) -> str:
     contract = execution.inherit_env
     admitted = execution.inherited_env_names()
     configured = set(experiment.env)
-    passed_through = set(execution.passthrough_env)
+    passed_through = set(execution.effective_passthrough_env())
     # A configured value is never inherited and always digested, even under a passthrough name.
     excluded = passed_through - configured
     if admitted is None:
@@ -282,11 +282,18 @@ def _environment_contract_line(experiment: Experiment) -> str:
             or "none"
         )
         inherited = f"inherit_env={label} (inherited when set, and digested: {digested})"
-    passthrough = (
-        f"passthrough_env: {', '.join(sorted(excluded))} (inherited when set, excluded from the digest)"
-        if excluded
-        else "passthrough_env: none"
-    )
+    built_in = sorted(excluded & set(BUILTIN_PASSTHROUGH_ENV))
+    listed = sorted(excluded - set(BUILTIN_PASSTHROUGH_ENV))
+    if not excluded:
+        passthrough = "passthrough_env: none"
+    elif not listed:
+        passthrough = (
+            f"passthrough_env: {', '.join(built_in)} (built in; inherited when set, "
+            "excluded from the digest)"
+        )
+    else:
+        names = ", ".join(listed) + (f" and built-in {', '.join(built_in)}" if built_in else "")
+        passthrough = f"passthrough_env: {names} (inherited when set, excluded from the digest)"
     shadowed = sorted(passed_through & configured)
     if shadowed:
         passthrough += (
@@ -294,9 +301,7 @@ def _environment_contract_line(experiment: Experiment) -> str:
         )
     parts = [inherited, f"env keys: {', '.join(sorted(configured)) or 'none'}", passthrough]
     if experiment.storage is not None:
-        parts.append(
-            "a persistent study refuses to resume when any value outside passthrough_env changes"
-        )
+        parts.append("a persistent study refuses to resume when any digested value changes")
     return "environment: " + "; ".join(parts)
 
 
@@ -772,11 +777,11 @@ def _is_environment_name(name: str) -> bool:
 # list to opt its ambient value in explicitly.
 BASE_INHERITED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "TZ")
 
-# Inherited names whose values stay out of the environment digest unless the config
-# says otherwise. TMPDIR is a scratch location, not a scientific input, and a
-# sandboxed shell sets its own. PATH stays digested: it decides which interpreter
-# and tools run.
-DEFAULT_PASSTHROUGH_ENV = ("TMPDIR",)
+# Pass-through names every config has, listed or not: inherited when set and never
+# digested. TMPDIR is a scratch location, not a scientific input, and a sandboxed
+# shell sets its own. PATH stays digested: it decides which interpreter and tools
+# run. ``execution.passthrough_env`` adds names to this set.
+BUILTIN_PASSTHROUGH_ENV = ("TMPDIR",)
 
 
 class ExecutionContext(_Frozen):
@@ -815,24 +820,22 @@ class ExecutionContext(_Frozen):
             "variables. 'all' opts in to the full ambient environment. "
             "Configured `env` values are always applied on top and are always "
             "semantic. In persistent studies, inherited values outside "
-            "`passthrough_env` (by default only `TMPDIR`) must match the "
+            "`passthrough_env` and the built-in `TMPDIR` must match the "
             "existing trial cohort before another trial is allocated, so a "
             "different `PATH` is refused."
         ),
     )
     passthrough_env: list[str] = Field(
-        default_factory=lambda: list(DEFAULT_PASSTHROUGH_ENV),
+        default_factory=list,
         description=(
             "Ambient variables that may change without changing a persistent "
-            "study's semantic environment cohort: rotating credentials, proxies "
-            "and scratch locations. These names are inherited in addition to a "
-            "narrowed `inherit_env` contract, but their values are excluded from "
-            "the cohort digest. Their sorted names and classification remain "
-            "part of the config fingerprint. The default is `TMPDIR`, a scratch "
-            "location that differs between a sandboxed and an ordinary shell "
-            "without changing any result; a list written here replaces the "
-            "default, and `[]` digests `TMPDIR` like every other inherited "
-            "variable."
+            "study's semantic environment cohort, such as rotating credentials "
+            "and proxies. These names are inherited in addition to a narrowed "
+            "`inherit_env` contract, but their values are excluded from the "
+            "cohort digest. They add to the built-in `TMPDIR`, a scratch "
+            "location that is always inherited when set and never digested, so "
+            "a sandboxed and an ordinary shell agree. The effective sorted "
+            "names remain part of the config fingerprint."
         ),
     )
     record_env: bool = Field(
@@ -876,7 +879,8 @@ class ExecutionContext(_Frozen):
         """Reject inherited-variable names that no environment variable can have.
 
         :raises ValueError: A listed variable name is empty, padded, or contains
-            ``=`` or NUL, or a name list repeats a name or the two lists overlap.
+            ``=`` or NUL, a name list repeats a name, the two lists overlap, or an
+            ``inherit_env`` list names a built-in pass-through variable.
         :return ExecutionContext: Self, unchanged.
         """
         named_contracts = {"passthrough_env": self.passthrough_env}
@@ -892,22 +896,26 @@ class ExecutionContext(_Frozen):
             if len(set(names)) != len(names):
                 raise ValueError(f"{label} names must be unique.")
         if isinstance(self.inherit_env, list):
+            built_in = sorted(set(self.inherit_env) & set(BUILTIN_PASSTHROUGH_ENV))
+            if built_in:
+                raise ValueError(
+                    f"inherit_env must not name {built_in!r}: it is always inherited when set "
+                    "and never digested, so remove it."
+                )
             overlap = sorted(set(self.inherit_env) & set(self.passthrough_env))
             if overlap:
-                hint = ""
-                if "passthrough_env" not in self.model_fields_set and set(overlap) == set(
-                    DEFAULT_PASSTHROUGH_ENV
-                ):
-                    hint = (
-                        f" (passthrough_env defaults to {list(DEFAULT_PASSTHROUGH_ENV)!r}, "
-                        "which keeps it out of the environment digest; to digest it, set "
-                        "`passthrough_env: []`)"
-                    )
                 raise ValueError(
                     "inherit_env and passthrough_env must not overlap; classify each "
-                    f"ambient variable once: {overlap!r}{hint}"
+                    f"ambient variable once: {overlap!r}"
                 )
         return self
+
+    def effective_passthrough_env(self) -> tuple[str, ...]:
+        """List every pass-through name: the built-in ones plus ``passthrough_env``.
+
+        :return tuple[str, ...]: Sorted unique names inherited when set and never digested.
+        """
+        return tuple(sorted({*BUILTIN_PASSTHROUGH_ENV, *self.passthrough_env}))
 
     def inherited_env_names(self) -> tuple[str, ...] | None:
         """List the ambient variable names the ``inherit_env`` contract admits.

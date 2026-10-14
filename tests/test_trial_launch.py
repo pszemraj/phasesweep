@@ -927,12 +927,18 @@ def test_passthrough_value_rotation_preserves_semantic_environment_digest(
         pytest.param(ExecutionContext(), id="default"),
         pytest.param(ExecutionContext(inherit_env="all"), id="all"),
         pytest.param(ExecutionContext(inherit_env=["HF_HOME"]), id="list"),
+        pytest.param(ExecutionContext(passthrough_env=["SOME_TOKEN"]), id="written-token"),
+        pytest.param(ExecutionContext(passthrough_env=["TMPDIR"]), id="written-tmpdir"),
+        pytest.param(
+            ExecutionContext(inherit_env=["HF_HOME"], passthrough_env=["SOME_TOKEN"]),
+            id="list-and-written-token",
+        ),
     ],
 )
-def test_default_environment_digest_ignores_tmpdir_only(
+def test_environment_digest_ignores_tmpdir_only(
     monkeypatch: pytest.MonkeyPatch, execution: ExecutionContext
 ) -> None:
-    """``TMPDIR`` is passed through by default, so a sandbox's scratch path never splits a cohort."""
+    """``TMPDIR`` is built-in pass-through, so a sandbox's scratch path never splits a cohort."""
     experiment = make_experiment(execution=execution)
 
     monkeypatch.setenv("TMPDIR", "/sandbox/tmp")
@@ -949,31 +955,7 @@ def test_default_environment_digest_ignores_tmpdir_only(
     assert third.digest != second.digest
 
 
-@pytest.mark.parametrize(
-    "execution",
-    [
-        pytest.param(ExecutionContext(passthrough_env=[]), id="none"),
-        pytest.param(ExecutionContext(inherit_env="all", passthrough_env=[]), id="all"),
-        pytest.param(
-            ExecutionContext(inherit_env=["HF_HOME"], passthrough_env=["HF_TOKEN"]), id="replaced"
-        ),
-    ],
-)
-def test_emptied_or_replaced_passthrough_env_digests_tmpdir(
-    monkeypatch: pytest.MonkeyPatch, execution: ExecutionContext
-) -> None:
-    """A ``passthrough_env`` written in the config replaces the ``TMPDIR`` default."""
-    experiment = make_experiment(execution=execution)
-
-    monkeypatch.setenv("TMPDIR", "/sandbox/tmp")
-    first = _environment_identity(experiment, "p")
-    monkeypatch.setenv("TMPDIR", "/tmp")
-    second = _environment_identity(experiment, "p")
-
-    assert first.digest != second.digest
-
-
-def test_configured_tmpdir_stays_digested_under_the_default_passthrough() -> None:
+def test_configured_tmpdir_stays_digested_beside_the_builtin_passthrough() -> None:
     """An ``env`` value for ``TMPDIR`` is semantic even though ``TMPDIR`` is passed through."""
     first = _environment_identity(make_experiment(env={"TMPDIR": "/scratch/a"}), "p")
     second = _environment_identity(make_experiment(env={"TMPDIR": "/scratch/b"}), "p")

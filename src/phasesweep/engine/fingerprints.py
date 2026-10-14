@@ -61,25 +61,24 @@ def _execution_identity(experiment: Experiment) -> dict[str, Any]:
     cwd contributes the resolved invocation directory because that is where
     the trainer actually runs. Ambient variable *values* are enforced through
     the trial environment cohort rather than embedded in this config digest.
-    Pass-through names and their classification are config semantics, but
-    their credential values may rotate. Put fixed semantic values in ``env``,
-    which is fingerprinted.
+    The effective pass-through names (the built-in ``TMPDIR`` plus the
+    configured ``passthrough_env``) and their classification are config
+    semantics, but their values may change. Put fixed semantic values in
+    ``env``, which is fingerprinted.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :return dict[str, Any]: JSON-serialisable execution-identity payload.
     """
     contract = experiment.execution.inherit_env
-    identity = {
+    return {
         "cwd": str(
             Path(experiment.execution.cwd).expanduser().resolve()
             if experiment.execution.cwd is not None
             else Path.cwd().resolve()
         ),
         "inherit_env": sorted(contract) if isinstance(contract, list) else contract,
+        "passthrough_env": list(experiment.execution.effective_passthrough_env()),
     }
-    if experiment.execution.passthrough_env:
-        identity["passthrough_env"] = sorted(experiment.execution.passthrough_env)
-    return identity
 
 
 def _semantic_payload_digest(payload: object) -> str:

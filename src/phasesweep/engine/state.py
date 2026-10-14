@@ -141,8 +141,9 @@ class Winner:
     # even if the older Optuna ledger is no longer available.
     trainer_input: dict[str, Any] | None = None
     # Identity of the semantic environment the winning trial ran under: the
-    # SHA-256 of its composed trainer environment after explicitly classified
-    # ``passthrough_env`` values are removed, plus the ``inherit_env`` contract.
+    # SHA-256 of its composed trainer environment after the pass-through values
+    # (built-in ``TMPDIR`` and ``passthrough_env``) are removed, plus the
+    # ``inherit_env`` contract.
     # Variable NAMES stay on the trial attrs — the winner file keeps the
     # compact identity.
     trainer_env_digest: str | None = None
@@ -201,8 +202,8 @@ OBJECTIVE_PROVENANCE_ATTR = "phasesweep_objective_provenance"
 # SHA-256; the generated file itself remains the evidence.
 TRAINER_INPUT_ATTR = "phasesweep_trainer_input"
 TRAINER_INPUT_SCHEMA_VERSION = 1
-# SHA-256 of the semantic trainer environment, excluding values explicitly
-# classified under ``execution.passthrough_env``. Written at allocation, so
+# SHA-256 of the semantic trainer environment, excluding the pass-through
+# values (built-in ``TMPDIR`` and ``execution.passthrough_env``). Written at allocation, so
 # failed trials carry it too. Ambient VALUES are never stored here; the names
 # attr lists the complete base environment (including pass-through names), and
 # raw values land only in the opt-in owner-only ``environment.json``.

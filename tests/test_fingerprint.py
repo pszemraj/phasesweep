@@ -542,14 +542,15 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
         "cwd": make_experiment(execution=ExecutionContext(cwd=str(tmp_path))),
         "inherit_all": make_experiment(execution=ExecutionContext(inherit_env="all")),
         "inherit_names": make_experiment(execution=ExecutionContext(inherit_env=["HF_TOKEN"])),
-        "digest_tmpdir": make_experiment(execution=ExecutionContext(passthrough_env=[])),
+        "explicit_tmpdir": make_experiment(execution=ExecutionContext(passthrough_env=["TMPDIR"])),
     }
     experiment_fps = {name: _experiment_semantic_fingerprint(exp) for name, exp in variants.items()}
     phase_fps = {name: _phase_fingerprint(exp, exp.phases[0], {}) for name, exp in variants.items()}
 
-    # Writing the default block out longhand is not a semantic edit.
-    assert experiment_fps["unbound"] == experiment_fps["explicit_default"]
-    assert phase_fps["unbound"] == phase_fps["explicit_default"]
+    # Writing the default block out longhand, or the built-in TMPDIR, is not a semantic edit.
+    for longhand in ("explicit_default", "explicit_tmpdir"):
+        assert experiment_fps["unbound"] == experiment_fps[longhand]
+        assert phase_fps["unbound"] == phase_fps[longhand]
 
     monkeypatch.chdir(invocation_b)
     second_invocation = make_experiment()
@@ -563,7 +564,7 @@ def test_execution_context_is_semantic_in_experiment_and_phase_fingerprints(
     assert _experiment_semantic_fingerprint(explicit_first) == experiment_fps["unbound"]
     assert _phase_fingerprint(explicit_first, explicit_first.phases[0], {}) == phase_fps["unbound"]
 
-    distinct = ["unbound", "cwd", "inherit_all", "inherit_names", "digest_tmpdir"]
+    distinct = ["unbound", "cwd", "inherit_all", "inherit_names"]
     assert len({experiment_fps[name] for name in distinct}) == len(distinct)
     assert len({phase_fps[name] for name in distinct}) == len(distinct)
 
