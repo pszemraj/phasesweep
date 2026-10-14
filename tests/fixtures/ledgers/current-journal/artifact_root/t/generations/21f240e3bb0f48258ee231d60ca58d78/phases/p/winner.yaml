@@ -16,14 +16,14 @@ completion:
   incomplete: false
   reason: null
   timeout_scope: null
-generation_id: edf233da76ca469b86263cbcecc7a59a
-attempt_id: 7cb300c7af9d4f70a1c8bd385900c002
+generation_id: 21f240e3bb0f48258ee231d60ca58d78
+attempt_id: af46a07e68304be2a5411802d0b228c6
 winner_source:
   kind: phase_trial
   phase: p
   trial_number: 0
-  generation_id: edf233da76ca469b86263cbcecc7a59a
-  attempt_id: 7cb300c7af9d4f70a1c8bd385900c002
+  generation_id: 21f240e3bb0f48258ee231d60ca58d78
+  attempt_id: af46a07e68304be2a5411802d0b228c6
 trainer_input:
   schema_version: 1
   format: argparse
@@ -35,7 +35,7 @@ objective_provenance:
   extractor:
     config_sha256: b7b4aa1d877c36c43b4c3c2c1ff207148492ab08e2b0e0a4096f8b4b43e6e1a2
     kind: log_regex
-  recorded_at: '2026-10-14T01:14:09+00:00'
+  recorded_at: '2026-10-14T01:53:10+00:00'
   schema_version: 3
   source:
     kind: file
@@ -44,7 +44,7 @@ objective_provenance:
     path: stdout.log
     sha256: 4aefd9d9b7f57cbfc31e8739fd45762b4eef95203a53299f58a0584920ef8087
     size_bytes: 11
-trainer_env_digest: 7b61d78f0a3261d4463f25b3f0882c40fd365473a574bed043d53f9b8661dc4d
+trainer_env_digest: 1a78f75d67b1f10f2fa590712fa8fbab15c2e23bfd4f6475e105ce30f9931f42
 trainer_inherit_env: none
 confound:
   schema_version: 1
@@ -54,7 +54,8 @@ confound:
   checks:
     evaluation_point:
       verdict: n/a
-      reason: log_regex objectives report no evaluation position
+      reason: log_regex objectives report no evaluation position; json_envelope (report_objective),
+        wandb (evaluation_axis) or mlflow (selected step) would bind one
     survivorship:
       verdict: ok
       detail:
