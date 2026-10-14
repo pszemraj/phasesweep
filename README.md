@@ -47,7 +47,7 @@ The packaged fake trainer uses the optional `report_objective(...)` envelope hel
 
 ## Install and try it
 
-Requirements: Python 3.11+ and a POSIX host for real runs. GPUs are optional.
+Requirements: Python 3.11+ and a Linux host for real runs. GPUs are optional.
 
 ```bash
 pip install phasesweep
