@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from phasesweep.config import Experiment, Gate, Observation, check_bounds
-from phasesweep.config.models import _wandb_query
+from phasesweep.config.models import BASE_INHERITED_ENV, _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
     OperatorAction,
@@ -258,11 +258,19 @@ class EnvironmentIdentity:
     remains the full composed mapping used for launch and the opt-in
     ``environment.json`` record; it can hold secrets and must never be persisted
     or logged outside that owner-only record.
+
+    ``passthrough`` is every name whose value the digest leaves out, set or not.
+    ``base_digests`` maps each digested :data:`~phasesweep.config.models.BASE_INHERITED_ENV`
+    name to the SHA-256 of its value and holds no other name: it lets a cohort
+    refusal name a differing base variable without a credential's digest ever
+    being recorded.
     """
 
     digest: str
     names: tuple[str, ...]
     values: dict[str, str]
+    passthrough: frozenset[str]
+    base_digests: dict[str, str]
 
 
 def _environment_identity(
@@ -290,27 +298,36 @@ def _environment_identity(
 
     The digest is stored on every allocated trial and checked against every
     populated persistent study before another trial is allocated. The values
-    themselves never enter config metadata.
+    themselves never enter config metadata. The per-name digests of the
+    digested base variables are recorded beside it, drawn from the same
+    ``digested`` mapping so they cover exactly what the digest covers.
 
     :param Experiment experiment: Parsed experiment supplying the contract.
     :param str phase_name: Phase whose remote consumers normalize W&B defaults.
     :param bool require_wandb_online: Reject offline/disabled W&B modes when the
         caller is preparing new remote work.
-    :return EnvironmentIdentity: Digest, sorted variable names, and the
-        composed name-to-value mapping the digest covers.
+    :return EnvironmentIdentity: Digest, sorted variable names, the composed
+        name-to-value mapping the digest covers, the names it leaves out, and
+        the per-name digests of the digested base variables.
     """
     env = _trainer_environment(
         experiment,
         phase_name,
         require_wandb_online=require_wandb_online,
     )
-    passthrough = set(experiment.execution.effective_passthrough_env()) - set(experiment.env)
-    items = sorted((name, value) for name, value in env.items() if name not in passthrough)
-    encoded = json.dumps(items, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    passthrough = frozenset(experiment.execution.effective_passthrough_env()) - set(experiment.env)
+    digested = {name: value for name, value in env.items() if name not in passthrough}
+    encoded = json.dumps(sorted(digested.items()), separators=(",", ":"), ensure_ascii=False)
     return EnvironmentIdentity(
-        digest=hashlib.sha256(encoded).hexdigest(),
+        digest=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
         names=tuple(sorted(env)),
         values=env,
+        passthrough=passthrough,
+        base_digests={
+            name: hashlib.sha256(value.encode("utf-8")).hexdigest()
+            for name, value in sorted(digested.items())
+            if name in BASE_INHERITED_ENV
+        },
     )
 
 

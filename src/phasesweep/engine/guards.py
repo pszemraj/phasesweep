@@ -184,7 +184,7 @@ def _preflight_existing_studies(
                 )
                 if needs_new_trials:
                     _validate_environment_cohort(
-                        study, _environment_identity(experiment, phase.name).digest
+                        study, _environment_identity(experiment, phase.name)
                     )
         except Exception as exc:
             errors.append(exc)

@@ -82,6 +82,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
+from phasesweep.engine.trial import EnvironmentIdentity
 from phasesweep.errors import ForeignPidNamespaceError, OperatorAction, PhaseSweepError
 from phasesweep.evidence.wandb import require_wandb_sdk
 from phasesweep.mcp import runner as mcp_runner
@@ -156,6 +157,13 @@ def _populated_study(name: str = "routing") -> optuna.Study:
     return study
 
 
+def _digest_only_identity(digest: str) -> EnvironmentIdentity:
+    """Return an environment identity that carries a digest and nothing else."""
+    return EnvironmentIdentity(
+        digest=digest, names=(), values={}, passthrough=frozenset(), base_digests={}
+    )
+
+
 def test_every_operator_error_declares_its_action():
     classes = _operator_error_classes()
     names = {cls.__name__ for cls in classes}
@@ -220,7 +228,9 @@ _UNMARKED_STUDY_REMEDY_MARKERS = {
         ("trial target", lambda: study_policy._accepted_trial_target(_populated_study())),
         (
             "environment cohort",
-            lambda: study_policy._validate_environment_cohort(_populated_study(), "d" * 64),
+            lambda: study_policy._validate_environment_cohort(
+                _populated_study(), _digest_only_identity("d" * 64)
+            ),
         ),
         (
             "phase fingerprint",
@@ -1383,7 +1393,7 @@ def _top_up_from_another_environment(tmp_path: Path, monkeypatch: pytest.MonkeyP
             user_attrs={TRAINER_ENV_DIGEST_ATTR: "e" * 64},
         )
     )
-    return study_policy._validate_environment_cohort(study, "d" * 64)
+    return study_policy._validate_environment_cohort(study, _digest_only_identity("d" * 64))
 
 
 def _clean_trial_from_foreign_namespace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:

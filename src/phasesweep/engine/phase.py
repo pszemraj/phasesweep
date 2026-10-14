@@ -58,6 +58,7 @@ from phasesweep.engine.state import (
     PHASE_DECISION_ATTR,
     PHASE_DECISION_SCHEMA_VERSION,
     RETURN_CODE_ATTR,
+    TRAINER_ENV_BASE_DIGESTS_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_ENV_NAMES_ATTR,
     TRAINER_INPUT_ATTR,
@@ -969,6 +970,7 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
     # the study's known semantic cohort on the next invocation.
     trial.set_user_attr(TRAINER_ENV_DIGEST_ATTR, run.environment_identity.digest)
     trial.set_user_attr(TRAINER_ENV_NAMES_ATTR, list(run.environment_identity.names))
+    trial.set_user_attr(TRAINER_ENV_BASE_DIGESTS_ATTR, dict(run.environment_identity.base_digests))
 
     if run.aborted:
         raise optuna.TrialPruned("phase aborted")
@@ -1620,7 +1622,7 @@ def _run_phase(
     # online W&B environment, while every new allocation still joins the
     # study's established semantic environment cohort.
     environment_identity = _environment_identity(experiment, phase.name)
-    _validate_environment_cohort(study, environment_identity.digest)
+    _validate_environment_cohort(study, environment_identity)
 
     from phasesweep.config.models import _wandb_query
     from phasesweep.evidence.wandb import require_wandb_sdk

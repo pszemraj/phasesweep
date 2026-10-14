@@ -44,6 +44,6 @@ A regeneration is not byte-identical, and is not expected to be. These differ ev
 - `datetime_start` / `datetime_complete` / `recorded_at` timestamps, `run.log`, and trial durations;
 - `phasesweep_version` in `summary.yaml` and `reproducibility.json`, which moves with the SCM revision;
 - absolute paths, which name the checkout the fixture was generated in, and with them `artifact_root_binding.json`'s `artifact_root` and its `storage_key` digest (`tests/ledger_fixtures.py` rewrites both for the copy it reads);
-- `phasesweep_trainer_env_digest`, which covers the inherited base environment except `TMPDIR` and the `passthrough_env` names, as described by the [trainer contract](../../../docs/config.md#trainer-contract).
+- `phasesweep_trainer_env_digest`, which covers the inherited base environment except `TMPDIR` and the `passthrough_env` names, as described by the [trainer contract](../../../docs/config.md#trainer-contract), and `phasesweep_trainer_env_base_digests`, the SHA-256 of each digested base variable's value. Both follow the shell that generated the fixture.
 
 The read-path tests check format-bearing state, including the study schema stamp and the artifact-root binding's `schema_version`. Regenerate when the stored format changes. Timestamps, identities, and paths make the resulting diff larger than the format change itself.

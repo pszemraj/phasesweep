@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, TypedDict
 
@@ -31,11 +32,14 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_SCHEMA_VERSION,
     STUDY_SCHEMA_ATTR,
     STUDY_SCHEMA_VERSION,
+    TRAINER_ENV_BASE_DIGESTS_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
+    TRAINER_ENV_NAMES_ATTR,
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
 )
+from phasesweep.engine.trial import EnvironmentIdentity
 
 _ALLOCATION_CONTEXT_ATTR = "phasesweep_allocation_context"
 _ALLOCATION_CONTEXT_SCHEMA_VERSION = 1
@@ -645,45 +649,128 @@ def _restore_prelaunch_environment_identity(
     return True
 
 
-def _validate_environment_cohort(study: optuna.Study, current_digest: str) -> None:
+_MAX_NAMED_VARIABLES = 8
+_NO_VARIABLE_FOUND = (
+    "No differing variable name or base value was found, so one of the values from "
+    "env or inherit_env differs."
+)
+
+
+def _variable_list(names: Iterable[str]) -> str:
+    """Render variable names for a refusal, capped so a wide ``inherit_env`` stays readable.
+
+    :param Iterable[str] names: Variable names, in any order.
+    :return str: The sorted names joined by commas, ``"none"`` when empty, and a count of the
+        names beyond the first :data:`_MAX_NAMED_VARIABLES`.
+    """
+    ordered = sorted(names)
+    if not ordered:
+        return "none"
+    shown = ", ".join(ordered[:_MAX_NAMED_VARIABLES])
+    hidden = len(ordered) - _MAX_NAMED_VARIABLES
+    return shown if hidden <= 0 else f"{shown} and {hidden} more"
+
+
+def _recorded_environment(
+    trial: optuna.trial.FrozenTrial,
+) -> tuple[set[str], dict[str, str]] | None:
+    """Read the variable names and base-value digests a trial recorded for its environment.
+
+    :param optuna.trial.FrozenTrial trial: Trial from another environment cohort.
+    :return tuple[set[str], dict[str, str]] | None: The recorded names and the per-name base
+        digests, or ``None`` when the trial lacks either or holds a malformed one.
+    """
+    names = trial.user_attrs.get(TRAINER_ENV_NAMES_ATTR)
+    digests = trial.user_attrs.get(TRAINER_ENV_BASE_DIGESTS_ATTR)
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        return None
+    if not isinstance(digests, dict) or not all(
+        isinstance(name, str) and isinstance(digest, str) for name, digest in digests.items()
+    ):
+        return None
+    return set(names), dict(digests)
+
+
+def _environment_difference(
+    current: EnvironmentIdentity, trials: Sequence[optuna.trial.FrozenTrial]
+) -> str:
+    """Name what differs between this invocation's environment and another cohort's trial.
+
+    Compares against the latest of ``trials`` that recorded its variable names and base-value
+    digests. Only names appear, never a value or a digest. A name the digest leaves out in this
+    invocation (``passthrough``) is ignored on both sides, since it cannot split a cohort.
+
+    :param EnvironmentIdentity current: Environment this invocation composes.
+    :param Sequence[optuna.trial.FrozenTrial] trials: Trials from other cohorts, oldest first.
+    :return str: A sentence naming the differing base variables and the names added or removed,
+        or one saying the difference must be in a value from ``env`` or ``inherit_env``.
+    """
+    for trial in reversed(trials):
+        recorded = _recorded_environment(trial)
+        if recorded is None:
+            continue
+        names, digests = recorded
+        differing = [
+            name
+            for name, digest in current.base_digests.items()
+            if name in digests and digests[name] != digest
+        ]
+        present = set(current.names) - current.passthrough
+        earlier = names - current.passthrough
+        added = present - earlier
+        removed = earlier - present
+        if not (differing or added or removed):
+            break
+        return (
+            f"Compared with trial {trial.number}, base variables with a different value: "
+            f"{_variable_list(differing)}; names added: {_variable_list(added)}; "
+            f"names removed: {_variable_list(removed)}."
+        )
+    return _NO_VARIABLE_FOUND
+
+
+def _validate_environment_cohort(study: optuna.Study, current: EnvironmentIdentity) -> None:
     """Refuse to allocate into a different or unknown semantic environment cohort.
 
     :param optuna.Study study: Existing study whose trials define the cohort.
-    :param str current_digest: Semantic environment digest for this invocation.
+    :param EnvironmentIdentity current: Semantic environment this invocation composes.
     :raises StudySchemaMismatchError: A populated study has a trial with
         no usable environment identity.
     :raises StudyFingerprintMismatchError: Recorded trials belong to another
-        semantic environment cohort.
+        semantic environment cohort. The message names the base variables whose
+        value differs and the names added or removed, never a value.
     """
     trials = study.get_trials(deepcopy=False)
     if not trials:
         return
     missing: list[int] = []
     recorded: set[str] = set()
+    elsewhere: list[optuna.trial.FrozenTrial] = []
     for trial in trials:
         environment = trial.user_attrs.get(TRAINER_ENV_DIGEST_ATTR)
-        if isinstance(environment, str) and environment:
-            recorded.add(environment)
-            continue
-        environment = _prelaunch_trial_environment(study, trial)
+        if not (isinstance(environment, str) and environment):
+            environment = _prelaunch_trial_environment(study, trial)
         if environment is None:
             missing.append(trial.number)
-        else:
-            recorded.add(environment)
+            continue
+        recorded.add(environment)
+        if environment != current.digest:
+            elsewhere.append(trial)
     if missing:
         raise StudySchemaMismatchError(
             f"Study {study.study_name!r} contains populated trial(s) without a "
             f"semantic trainer-environment identity: {missing}. PhaseSweep cannot guess "
             "which environment cohort owns those results. Use a new experiment name.",
         )
-    if recorded != {current_digest}:
+    if recorded != {current.digest}:
         rendered = ", ".join(sorted(digest[:12] for digest in recorded))
         raise StudyFingerprintMismatchError(
             f"Study {study.study_name!r} contains trial(s) from semantic trainer "
             f"environment cohort(s) [{rendered}], but this invocation composes "
-            f"{current_digest[:12]}. No trial was allocated. Restore the original "
-            "semantic environment (a different PATH counts), classify variables "
-            "that may differ, such as rotating credentials, under "
-            "execution.passthrough_env, or use a new experiment name.",
+            f"{current.digest[:12]}. {_environment_difference(current, elsewhere)} "
+            "No trial was allocated. Restore the original semantic environment, pin "
+            "the value under env, classify variables that may differ, such as "
+            "rotating credentials, under execution.passthrough_env, or use a new "
+            "experiment name.",
             action=OperatorAction.FIX_CONFIG,
         )

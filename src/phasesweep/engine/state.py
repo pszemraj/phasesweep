@@ -215,6 +215,11 @@ TRAINER_ENV_DIGEST_ATTR = "phasesweep_trainer_env_digest"
 # Sorted list of the variable NAMES in that environment: diagnostic, and
 # non-sensitive by construction.
 TRAINER_ENV_NAMES_ATTR = "phasesweep_trainer_env_names"
+# Name -> SHA-256 of the value, for the digested ``BASE_INHERITED_ENV`` names
+# only, so a cohort refusal can name which base variable differs. Never widen it
+# past the base names: a name from ``env`` or an ``inherit_env`` list can hold a
+# credential, and the digest of a low-entropy secret can be guessed.
+TRAINER_ENV_BASE_DIGESTS_ATTR = "phasesweep_trainer_env_base_digests"
 RETURN_CODE_ATTR = "phasesweep_return_code"
 DURATION_ATTR = "phasesweep_duration_s"
 OVERRIDES_ATTR = "phasesweep_overrides"
