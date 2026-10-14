@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import statistics
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, TypedDict, get_args
@@ -22,7 +23,7 @@ from phasesweep.engine.state import _validate_observed_block
 from phasesweep.runtime.json import JsonObject, json_object
 
 if TYPE_CHECKING:
-    from phasesweep.config import Phase
+    from phasesweep.config import Phase, Repeats
 
 ReduceName = Literal["mean", "median"]
 """How a group's member metrics combine into the value that ranks it."""
@@ -513,6 +514,54 @@ def _validate_repeats_block(
         if isinstance(block, Mapping) and key in block:
             raise ValueError(f"repeats key {key!r} appears in the winner's {field}")
     return {"key": key, "reduce": reduce, "spread": recomputed, "members": members}
+
+
+def _scalar_identity(value: RepeatValue) -> tuple[type, RepeatValue]:
+    """Return a repeat value paired with its type, so ``1``, ``1.0`` and ``True`` stay distinct.
+
+    :param RepeatValue value: One repeat value.
+    :return tuple[type, RepeatValue]: The value's type and the value.
+    """
+    return (type(value), value)
+
+
+def _check_repeats_axis(record: RepeatsRecord | None, configured: Repeats | None) -> None:
+    """Require a validated ``repeats`` block to be the one a phase's repeat axis produces.
+
+    :func:`_validate_repeats_block` proves a block consistent with the winner
+    beside it, and its key and reducer come from the block itself. This
+    compares them with the configured axis: the same key and reducer, one
+    member per configured repeat value, and every configured value exactly once.
+
+    :param RepeatsRecord | None record: The block :func:`_validate_repeats_block` returned.
+    :param Repeats | None configured: The phase's configured ``repeats``, or ``None``.
+    :raises ValueError: The winner has a block and the phase configures none, or the
+        reverse, or the block's key, reducer, member count or repeat values differ
+        from the configured ones.
+    """
+    if record is None and configured is None:
+        return
+    if configured is None:
+        raise ValueError("the winner records repeats but the phase configures none")
+    if record is None:
+        raise ValueError("the winner records no repeats but the phase configures them")
+    if record["key"] != configured.key:
+        raise ValueError(
+            f"repeats key {record['key']!r} is not the configured repeats.key {configured.key!r}"
+        )
+    if record["reduce"] != configured.reduce:
+        raise ValueError(
+            f"repeats reduce {record['reduce']!r} is not the configured "
+            f"repeats.reduce {configured.reduce!r}"
+        )
+    recorded = [_scalar_identity(member["repeat"]) for member in record["members"]]
+    if len(recorded) != len(configured.values):
+        raise ValueError(
+            f"repeats has {len(recorded)} members but repeats.values configures "
+            f"{len(configured.values)}"
+        )
+    if Counter(recorded) != Counter(_scalar_identity(value) for value in configured.values):
+        raise ValueError("repeats member values are not the configured repeats.values")
 
 
 def _repeats_summary(record: RepeatsRecord) -> RepeatsSummary:

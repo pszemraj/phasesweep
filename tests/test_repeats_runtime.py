@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import csv
 import statistics
+from dataclasses import replace
 from pathlib import Path
 
 import optuna
 import pytest
 import yaml
 
+import phasesweep.engine.artifacts as artifact_io
 from phasesweep import run_experiment
 from phasesweep.config import (
     CategoricalParam,
@@ -20,12 +22,15 @@ from phasesweep.config import (
     Sampler,
     sampler_search_space,
 )
-from phasesweep.engine import read_status, read_trial_tables, read_winner
+from phasesweep.engine import WinnerIntegrityError, read_status, read_trial_tables, read_winner
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import _build_sampler, _suggest
-from phasesweep.engine.paths import _generation_winner_path, _phase_dir
+from phasesweep.engine.paths import _generation_summary_path, _generation_winner_path, _phase_dir
 from phasesweep.engine.publication import _resolve_publication_pointer
+from phasesweep.engine.publication_validation import ValidatedWinner
 from phasesweep.engine.read import _winner_view
+from phasesweep.engine.repeats import ReduceName, reduce_values, spread
+from phasesweep.engine.resume import _published_for_resume
 from phasesweep.runtime.json import JsonObject
 from tests.conftest import make_experiment, write_trainer
 from tests.ledger_fixtures import published_generation_id
@@ -157,10 +162,12 @@ def test_repeats_phase_runs_children_without_the_repeat_key(tmp_path: Path) -> N
     assert read_status(experiment)["publication_integrity"] == "ok"
 
 
-def _repeats_publication(tmp_path: Path) -> tuple[Experiment, str]:
+def _repeats_publication(tmp_path: Path, **phase_overrides: object) -> tuple[Experiment, str]:
     """Publish one seeded random repeats phase and return it with its generation id."""
     experiment = make_experiment(
-        persistent=tmp_path, trainer=_seed_trainer(tmp_path), phases=[_repeats_phase()]
+        persistent=tmp_path,
+        trainer=_seed_trainer(tmp_path),
+        phases=[_repeats_phase(**phase_overrides)],
     )
     run_experiment(experiment)
     generation_id = published_generation_id(experiment)
@@ -221,6 +228,132 @@ def test_group_winner_repeats_block_is_manifest_validated(
     assert pointer.error is not None
     assert "winner for phase 'p' has no valid repeats block" in pointer.error
     assert reason in pointer.error
+
+
+_SKEWED_REPEATS = Repeats(key="seed", values=[0, 1, 5])
+"""Three repeat values whose member metrics have different means and medians."""
+
+
+def _block(payload: JsonObject, name: str) -> JsonObject:
+    """Return one nested mapping of a winner payload."""
+    block = payload[name]
+    assert isinstance(block, dict)
+    return block
+
+
+def _forge_axis_mismatch(winner: JsonObject, tamper: str) -> float:
+    """Rewrite a skewed three-repeat winner so it disagrees with the configured axis.
+
+    Every derived field is recomputed, so the block stays consistent with itself and
+    with the confound block, and only a comparison with the configured axis can refuse it.
+
+    :param JsonObject winner: The published winner payload, edited in place.
+    :param str tamper: ``reduce``, ``foreign-values`` or ``missing-member``.
+    :return float: The forged aggregate, which the summary must also record.
+    """
+    repeats = _block(winner, "repeats")
+    reduce: ReduceName = "mean"
+    if tamper == "reduce":
+        reduce = "median"
+        repeats["reduce"] = reduce
+    elif tamper == "foreign-values":
+        for member, foreign in zip(_members(winner), ("a", "b", "c"), strict=True):
+            member["repeat"] = foreign
+    else:
+        confound = _block(winner, "confound")
+        ranked, groups = confound["ranked_trials"], confound["ranked_groups"]
+        assert isinstance(ranked, list) and isinstance(groups, list)
+        assert all(isinstance(group, list) for group in groups)
+        dropped = {group[0] for group in groups if isinstance(group, list)}
+        repeats["members"] = _members(winner)[1:]
+        confound["ranked_trials"] = [number for number in ranked if number not in dropped]
+        confound["ranked_groups"] = [
+            [number for number in group if number not in dropped]
+            for group in groups
+            if isinstance(group, list)
+        ]
+        counts = _block(_block(_block(confound, "checks"), "survivorship"), "detail")
+        counts["ranked"] = len(ranked) - len(dropped)
+    metrics = [member["metric"] for member in _members(winner)]
+    assert all(isinstance(value, float) for value in metrics)
+    values = [value for value in metrics if isinstance(value, float)]
+    aggregate = reduce_values(values, reduce)
+    repeats["spread"] = dict(spread(values))
+    metric = _block(winner, "metric")
+    name = next(key for key in metric if key != "goal")
+    metric[name] = aggregate
+    return aggregate
+
+
+def _publish_forgery(
+    experiment: Experiment, generation_id: str, winner: JsonObject, aggregate: float
+) -> None:
+    """Record a forged aggregate in the summary, then re-anchor the winner, manifest and pointer."""
+    summary_path = _generation_summary_path(experiment, generation_id)
+    summary = yaml.safe_load(summary_path.read_text())
+    next(item for item in summary["phases"] if item["name"] == "p")["metric"] = aggregate
+    summary_path.write_text(yaml.safe_dump(summary, sort_keys=False))
+    _reseal_winner(experiment, generation_id, winner)
+
+
+_AXIS_MISMATCHES = [
+    pytest.param(
+        "reduce",
+        "repeats reduce 'median' is not the configured repeats.reduce 'mean'",
+        id="reduce",
+    ),
+    pytest.param(
+        "foreign-values",
+        "repeats member values are not the configured repeats.values",
+        id="foreign-values",
+    ),
+    pytest.param(
+        "missing-member",
+        "repeats has 2 members but repeats.values configures 3",
+        id="missing-member",
+    ),
+]
+
+
+@pytest.mark.parametrize(("tamper", "reason"), _AXIS_MISMATCHES)
+def test_manifest_binds_the_repeats_block_to_the_snapshot_axis(
+    tmp_path: Path, tamper: str, reason: str
+) -> None:
+    """A resealed, self-consistent block that is not the snapshot phase's axis fails publication.
+
+    With three repeat values the forged reducer changes the aggregate, so the winner and the
+    summary are rewritten to agree with it and only the axis comparison can refuse the block.
+    """
+    experiment, generation_id = _repeats_publication(tmp_path, repeats=_SKEWED_REPEATS)
+    winner = _winner_payload(experiment, generation_id)
+    aggregate = _forge_axis_mismatch(winner, tamper)
+    _publish_forgery(experiment, generation_id, winner, aggregate)
+
+    pointer = _resolve_publication_pointer(experiment)
+    assert pointer.state == "failed"
+    assert pointer.error is not None
+    assert "winner for phase 'p' has no valid repeats block" in pointer.error
+    assert reason in pointer.error
+    assert read_status(experiment)["publication_integrity"] == "failed"
+    assert read_winner(experiment, "p") is None
+
+
+@pytest.mark.parametrize(("tamper", "reason"), _AXIS_MISMATCHES)
+def test_load_winner_binds_the_repeats_block_to_the_configured_axis(
+    tmp_path: Path, tamper: str, reason: str
+) -> None:
+    """The winner a skipped phase loads must carry the repeat axis the current config declares."""
+    experiment, generation_id = _repeats_publication(tmp_path, repeats=_SKEWED_REPEATS)
+    winner = _winner_payload(experiment, generation_id)
+    _forge_axis_mismatch(winner, tamper)
+    published = _published_for_resume(experiment)
+    forged = replace(published, winners={"p": ValidatedWinner(content=b"", payload=winner)})
+
+    with pytest.raises(WinnerIntegrityError) as raised:
+        artifact_io._load_winner(experiment, experiment.phases[0], {}, publication=forged)
+
+    assert "invalid or incomplete for skipped phase 'p'" in str(raised.value)
+    assert reason in str(raised.value)
 
 
 def test_winner_view_projects_the_repeats_summary(tmp_path: Path) -> None:

@@ -14,13 +14,13 @@ from typing import Any, NamedTuple
 import yaml
 
 import phasesweep.engine.paths as path_ops
-from phasesweep.config import Experiment, Metric
+from phasesweep.config import Experiment, Metric, Repeats
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
 from phasesweep.config.models import _metric_semantics_payload
 from phasesweep.engine.confound import _validate_confound_block
 from phasesweep.engine.errors import PublicationAccessError, PublicationIntegrityError
 from phasesweep.engine.paths import GENERATION_SUMMARY_FILENAME
-from phasesweep.engine.repeats import _validate_repeats_block
+from phasesweep.engine.repeats import _check_repeats_axis, _validate_repeats_block
 from phasesweep.engine.state import (
     _GENERATION_FILE_FILENAMES,
     _MANIFEST_GENERATION_FILE_KINDS,
@@ -39,6 +39,15 @@ class PlannedPhase(NamedTuple):
 
     name: str
     comment: str | None
+
+
+class SnapshotPhases(NamedTuple):
+    """What a generation's validated config snapshot says about each of its phases."""
+
+    inherits: Mapping[str, tuple[str, ...]]
+    """Each phase's parents, in plan order."""
+    repeats: Mapping[str, Repeats | None]
+    """Each phase's configured ``repeats``, or ``None`` for a phase without them."""
 
 
 @dataclass(frozen=True)
@@ -247,8 +256,10 @@ def _validate_generation_manifest(
     :raises PublicationAccessError: An artifact cannot be read by the current user.
     :raises PublicationIntegrityError: The manifest is missing, malformed, any artifact is
         absent, altered, unparsable, or inconsistent with the summary, a
-        winner cites a source generation this tree does not hold, or the
-        provenance graph loops back on a generation still being validated.
+        winner cites a source generation this tree does not hold, a winner's
+        ``repeats`` block is not the repeat axis its config snapshot phase
+        configures, or the provenance graph loops back on a generation still
+        being validated.
     :return ValidatedPublication: The summary, its phase plan and metric
         semantics, and every winner exactly as this validation read it.
     """
@@ -308,7 +319,7 @@ def _validate_generation_manifest(
         if key in listed:
             raise _fail(f"duplicate artifact entry for {key}")
         listed[key] = entry
-    inherits = _validate_generation_provenance_files(
+    snapshot_phases = _validate_generation_provenance_files(
         generation_dir,
         summary,
         listed_files,
@@ -449,9 +460,12 @@ def _validate_generation_manifest(
                     f"winner for phase {name!r} has no valid observed block ({exc})"
                 ) from exc
             try:
-                _validate_repeats_block(
+                repeats = _validate_repeats_block(
                     payload, metric_value=float(value), ranked_groups=confound["ranked_groups"]
                 )
+                if name not in snapshot_phases.repeats:
+                    raise ValueError("the config snapshot plans no such phase")
+                _check_repeats_axis(repeats, snapshot_phases.repeats[name])
             except ValueError as exc:
                 raise _fail(
                     f"winner for phase {name!r} has no valid repeats block ({exc})"
@@ -470,7 +484,7 @@ def _validate_generation_manifest(
         generation_id=generation_id,
         summary=summary,
         phase_plan=phase_plan,
-        inherits=inherits,
+        inherits=snapshot_phases.inherits,
         metric=metric,
         winners=winners,
     )
@@ -688,7 +702,7 @@ def _validate_generation_provenance_files(
     listed_files: Mapping[str, Mapping[str, Any]],
     fail: Callable[[str], PublicationIntegrityError],
     permission_fail: Callable[[str], PublicationAccessError],
-) -> Mapping[str, tuple[str, ...]]:
+) -> SnapshotPhases:
     """Validate a generation's claim-time provenance files against its manifest.
 
     Extends the manifest invariant -- every listed artifact exists and hashes
@@ -719,7 +733,8 @@ def _validate_generation_provenance_files(
     :raises PublicationIntegrityError: Whatever ``fail`` builds, when a provenance file is
         listed without its partner, is absent, unreadable, altered,
         unparsable, or disagrees with the summary's own identity.
-    :return Mapping[str, tuple[str, ...]]: Each snapshot phase's parents, in plan order.
+    :return SnapshotPhases: Each snapshot phase's parents, in plan order, and its
+        configured ``repeats``.
     """
     for kind, filename in _GENERATION_FILE_FILENAMES.items():
         if (generation_dir / filename).is_file() and kind not in listed_files:
@@ -798,6 +813,7 @@ def _validate_generation_provenance_files(
     # Rebuilding a generation's lineage reads this graph, never the current
     # config's, so every parent must name a phase planned before its child.
     inherits: dict[str, tuple[str, ...]] = {}
+    repeats: dict[str, Repeats | None] = {}
     for phase in snapshot_phases:
         parents = phase.get("inherits")
         if not isinstance(parents, list) or any(
@@ -805,7 +821,16 @@ def _validate_generation_provenance_files(
         ):
             raise fail("config_snapshot artifact has a malformed inheritance graph")
         inherits[phase["name"]] = tuple(parents)
-    return inherits
+        try:
+            raw_repeats = phase.get("repeats")
+            repeats[phase["name"]] = (
+                None if raw_repeats is None else Repeats.model_validate(raw_repeats)
+            )
+        except ValueError as exc:
+            raise fail(
+                f"config_snapshot artifact has a malformed repeats block for {phase['name']!r}"
+            ) from exc
+    return SnapshotPhases(inherits=inherits, repeats=repeats)
 
 
 @dataclass(frozen=True)

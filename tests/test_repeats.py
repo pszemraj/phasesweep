@@ -9,8 +9,10 @@ import statistics
 import pytest
 import yaml
 
+from phasesweep.config import Repeats
 from phasesweep.engine.repeats import (
     RepeatAxis,
+    _check_repeats_axis,
     _repeats_summary,
     _validate_repeats_block,
     group_key,
@@ -157,6 +159,32 @@ def test_repeats_block_and_confound_groups_agree_on_the_winning_group() -> None:
             _validate_repeats_block(
                 _payload(), metric_value=_metric(_payload()), ranked_groups=groups
             )
+
+
+def test_repeats_block_must_be_the_configured_axis() -> None:
+    """The block's key, reducer and repeat values are compared with the phase's own."""
+    payload = _payload()
+    record = _validate_repeats_block(payload, metric_value=_metric(payload), ranked_groups=_GROUPS)
+    assert record is not None
+
+    _check_repeats_axis(None, None)
+    _check_repeats_axis(record, Repeats(key="seed", values=[2, 0, 1]))
+    mismatches = [
+        (None, Repeats(key="seed", values=[0, 1, 2]), "records no repeats but the phase"),
+        (record, None, "records repeats but the phase configures none"),
+        (record, Repeats(key="shard", values=[0, 1, 2]), "key 'seed' is not the configured"),
+        (
+            record,
+            Repeats(key="seed", values=[0, 1, 2], reduce="median"),
+            "reduce 'mean' is not the configured repeats.reduce 'median'",
+        ),
+        (record, Repeats(key="seed", values=[0, 1]), "3 members but repeats.values configures 2"),
+        (record, Repeats(key="seed", values=[0, 1, 3]), "not the configured repeats.values"),
+        (record, Repeats(key="seed", values=[0, 1, 2.0]), "not the configured repeats.values"),
+    ]
+    for recorded, configured, error in mismatches:
+        with pytest.raises(ValueError, match=error):
+            _check_repeats_axis(recorded, configured)
 
 
 def _tampered(edit: str) -> JsonObject:

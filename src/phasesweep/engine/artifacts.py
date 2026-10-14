@@ -23,7 +23,12 @@ from phasesweep.engine.errors import (
     WinnerIntegrityError,
 )
 from phasesweep.engine.publication_validation import ValidatedPublication
-from phasesweep.engine.repeats import RepeatAxis, _validate_repeats_block, group_labels
+from phasesweep.engine.repeats import (
+    RepeatAxis,
+    _check_repeats_axis,
+    _validate_repeats_block,
+    group_labels,
+)
 from phasesweep.engine.state import (
     Winner,
     _parse_winner_source,
@@ -342,8 +347,9 @@ def _load_winner(
 
     Raises:
         FileNotFoundError: The publication holds no winner for the phase.
-        WinnerIntegrityError: The winner is incomplete or incompatible with
-            the current partial-result policy.
+        WinnerIntegrityError: The winner is incomplete, incompatible with
+            the current partial-result policy, or carries a ``repeats`` block
+            that is not the phase's configured repeat axis.
         StudyFingerprintMismatchError: The stored fingerprint disagrees with
             the freshly computed one.
 
@@ -386,6 +392,10 @@ def _load_winner(
         confound = _validate_confound_block(
             data["confound"], winner_trial=int(data["trial_number"])
         )
+        repeats = _validate_repeats_block(
+            data, metric_value=metric, ranked_groups=confound["ranked_groups"]
+        )
+        _check_repeats_axis(repeats, phase.repeats)
         winner = Winner(
             trial_number=int(data["trial_number"]),
             params=dict(data["params"]),
@@ -408,9 +418,7 @@ def _load_winner(
             ),
             confound=confound,
             observed=_validate_observed_block(data["observed"]),
-            repeats=_validate_repeats_block(
-                data, metric_value=metric, ranked_groups=confound["ranked_groups"]
-            ),
+            repeats=repeats,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise WinnerIntegrityError(
