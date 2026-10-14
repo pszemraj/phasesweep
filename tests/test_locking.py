@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from phasesweep.config import (
+    IntParam,
     Phase,
     Sampler,
 )
@@ -636,11 +637,12 @@ def test_run_lock_blocks_even_when_processes_target_different_phases(
     """
     storage = f"journal:///{tmp_path / 'shared.journal'}"
     seeded = Sampler(type="random", seed=0)
+    depth = {"depth": IntParam(type="int", low=1, high=9)}
     phases_a = [
-        Phase(name="arch", n_trials=1, sampler=seeded, search_space={}),
+        Phase(name="arch", n_trials=1, sampler=seeded, search_space=depth),
         Phase(name="lr", inherits=["arch"], n_trials=1, sampler=seeded, search_space={}),
     ]
-    phases_b = [Phase(name="arch", n_trials=2, sampler=seeded, search_space={})]  # top-up
+    phases_b = [Phase(name="arch", n_trials=2, sampler=seeded, search_space=depth)]  # top-up
 
     exp_a = make_experiment(workdir=str(tmp_path / "runs_a"), storage=storage, phases=phases_a)
     exp_b = make_experiment(workdir=str(tmp_path / "runs_b"), storage=storage, phases=phases_b)

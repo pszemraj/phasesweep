@@ -1612,10 +1612,10 @@ def _validate_trial_command_template(
             raise ValueError("{overrides_path} is only available with json_file.")
         required_placeholder = "overrides"
 
-    # When a phase has no overrides at all (no inherited, fixed, or sampled
-    # keys) and no trainer_config to deliver, a constant trial_command is
-    # legitimate — the user is sweeping the same configuration repeatedly,
-    # e.g. for variance estimation.
+    # When a phase has no overrides at all (no inherited, fixed, sampled, or
+    # repeat keys) and no trainer_config to deliver, a constant trial_command
+    # is legitimate: the phase is one fixed run of a trainer that takes no
+    # input. Repeated runs of one configuration always carry a repeat key.
     if not has_overrides:
         return
 

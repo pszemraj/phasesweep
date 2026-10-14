@@ -26,6 +26,7 @@ from phasesweep.config import (
     LogRegexExtractor,
     Metric,
     Phase,
+    Repeats,
     Sampler,
 )
 from phasesweep.engine import (
@@ -695,6 +696,59 @@ def test_dry_run_does_not_warn_when_tpe_leaves_startup(
     run_experiment(exp, dry_run=True)
 
     assert not [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+
+
+_REPEATS_BUDGET_WARNING = (
+    "warning: Phase 'lr': max_consecutive_failures=3 <= 3 repeats.values, so one configuration "
+    "that fails on every repeat value can abort the phase by itself; under seeded random its "
+    "repeats run back to back. Set max_consecutive_failures above 3."
+)
+_REPEATS_BODY = (
+    "n_trials: 6\nsampler: { type: random, seed: 0 }\nsearch_space: "
+    f"{_LR_SPACE}\nrepeats: {{ key: seed, values: [0, 1, 2] }}\n"
+)
+
+
+@pytest.mark.parametrize(("limit", "warns"), [(3, True), (2, True), (4, False)])
+def test_validate_warns_when_one_configuration_can_exhaust_the_failure_budget(
+    tmp_path: Path, limit: int, warns: bool
+) -> None:
+    """A warning, never a refusal: the run is still the operator's call."""
+    body = _REPEATS_BODY + f"max_consecutive_failures: {limit}"
+    result = CliRunner().invoke(
+        cli_main, ["validate", str(_write_tpe_budget_config(tmp_path, body))]
+    )
+
+    assert result.exit_code == 0, result.output
+    warnings = [line.strip() for line in result.output.splitlines() if "warning:" in line]
+    expected = _REPEATS_BUDGET_WARNING.replace("=3 <=", f"={limit} <=")
+    assert warnings == ([expected] if warns else [])
+
+
+def test_dry_run_warns_when_one_configuration_can_exhaust_the_failure_budget(
+    tmp_path: Path, caplog
+) -> None:
+    caplog.set_level(logging.INFO)
+    exp = make_experiment(
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(
+                name="lr",
+                n_trials=6,
+                max_consecutive_failures=3,
+                sampler=Sampler(type="random", seed=0),
+                search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
+                repeats=Repeats(key="seed", values=[0, 1, 2]),
+            )
+        ],
+    )
+
+    run_experiment(exp, dry_run=True)
+
+    warnings = [r for r in caplog.records if r.getMessage().startswith("DRY RUN warning:")]
+    assert [(r.levelno, r.getMessage()) for r in warnings] == [
+        (logging.WARNING, f"DRY RUN {_REPEATS_BUDGET_WARNING}")
+    ]
 
 
 def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:

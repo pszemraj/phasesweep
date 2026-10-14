@@ -693,7 +693,7 @@ def test_yaml_merge_keys_allow_explicit_overrides(tmp_path: Path) -> None:
 experiment: t
 storage: null
 provenance: {revision: test-fixture-v1}
-trial_command: "echo"
+trial_command: "echo {overrides}"
 override_format: argparse
 metric:
   name: loss
@@ -703,6 +703,8 @@ phases:
   - &phase_defaults
     name: baseline
     n_trials: 1
+    sampler: { type: random, seed: 0 }
+    search_space: { x: { type: int, low: 0, high: 9 } }
   - <<: *phase_defaults
     name: tuned
     n_trials: 2
@@ -910,6 +912,28 @@ def test_empty_search_space_skips_seed_and_acknowledge_on_persistent_storage(
     )
     assert experiment.phases[0].sampler.seed is None
     assert experiment.phases[0].sampler.acknowledge_nonresumable is False
+
+
+@pytest.mark.parametrize(
+    "sampler", [{"type": "tpe"}, {"type": "random", "seed": 0}, {"type": "grid"}]
+)
+def test_empty_search_space_refuses_identical_trials(sampler: JsonObject) -> None:
+    """Several runs of one fixed configuration are repeats, so only repeats may ask for them."""
+    with pytest.raises(ValidationError) as excinfo:
+        make_experiment(
+            phases=[Phase.model_validate({"name": "x", "n_trials": 3, "sampler": sampler})]
+        )
+    assert (
+        "Phase 'x': n_trials=3 with an empty search_space would run 3 identical trials. Use "
+        "n_trials: 1 for a fixed configuration, or repeats to measure seed noise."
+    ) in str(excinfo.value)
+
+    fixed = make_experiment(phases=[Phase.model_validate({"name": "x", "n_trials": 1})])
+    assert fixed.phases[0].n_trials == 1
+    audit = Phase.model_validate(
+        {"name": "x", "n_trials": 3, "sampler": {"type": "grid"}, "repeats": _SEEDS}
+    )
+    assert make_experiment(phases=[audit]).phases[0].repeats is not None
 
 
 @pytest.mark.parametrize("storage", ["", "storage: null\n"], ids=["omitted", "explicit_null"])

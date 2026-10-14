@@ -493,7 +493,12 @@ def test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup(
 ) -> None:
     """A newly reached W&B phase must validate before an existing phase can top up."""
     trainer = write_constant_trainer(tmp_path)
-    local = Phase(name="local", n_trials=1, sampler=Sampler(type="random", seed=0))
+    local = Phase(
+        name="local",
+        n_trials=1,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
     initial = make_experiment(
         persistent=tmp_path,
         trainer=trainer,
@@ -902,11 +907,14 @@ def test_stateful_sampler_continuation_guard_ignores_a_phase_that_draws_nothing(
     _validate_sampler_continuation(study, fixed.model_copy(update={"n_trials": 4}))
 
 
-@pytest.mark.integration
-def test_fixed_configuration_tpe_phase_resumes_mid_target(tmp_path: Path) -> None:
-    """A default, unseeded tpe phase with an empty search space loads and resumes mid-target."""
+def test_fixed_configuration_tpe_phase_runs_once_and_never_grows(tmp_path: Path) -> None:
+    """A default, unseeded tpe phase with an empty search space loads, runs its one trial, and stops.
+
+    A second trial of a fixed configuration would be an identical copy, so the
+    target that once let it resume mid-target is refused at load.
+    """
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
-    phase = Phase(name="p", n_trials=3, max_consecutive_failures=1, fixed_overrides={"x": 1})
+    phase = Phase(name="p", n_trials=1, max_consecutive_failures=1, fixed_overrides={"x": 1})
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     assert experiment.phases[0].sampler == Sampler()
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
@@ -914,15 +922,13 @@ def test_fixed_configuration_tpe_phase_resumes_mid_target(tmp_path: Path) -> Non
 
     storage = _resolve_storage(experiment.storage)
     study = optuna.load_study(study_name="t::p", storage=storage)
-    assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 
-    write_constant_trainer(tmp_path)
-    top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
-    run_experiment(top_up)
-
-    study = optuna.load_study(study_name="t::p", storage=storage)
-    assert len(study.trials) == 4
+    with pytest.raises(ValueError, match="n_trials=4 with an empty search_space would run 4"):
+        make_experiment(
+            persistent=tmp_path, trainer=trainer, phases=[phase.model_copy(update={"n_trials": 4})]
+        )
 
 
 def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch):

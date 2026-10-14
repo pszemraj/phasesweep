@@ -20,6 +20,7 @@ import pytest
 import phasesweep.engine.ledger as engine_ledger
 from phasesweep.config import (
     Experiment,
+    IntParam,
     Phase,
     Sampler,
 )
@@ -287,7 +288,7 @@ def test_run_reaps_later_phase_orphan_before_first_phase_launch(tmp_path: Path) 
                 name="b",
                 n_trials=2,
                 sampler=Sampler(type="random", seed=0),
-                search_space={},
+                search_space={"x": IntParam(type="int", low=0, high=10)},
             ),
         ],
     )

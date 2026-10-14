@@ -574,7 +574,14 @@ def test_terminal_snapshot_reports_running_attempts_from_the_status_read(
     experiment = make_experiment(
         workdir=tmp_path / "runs",
         storage=f"journal:///{tmp_path / 'studies.journal'}",
-        phases=[Phase(name="p", n_trials=2, sampler=SEEDED_RANDOM, search_space={})],
+        phases=[
+            Phase(
+                name="p",
+                n_trials=2,
+                sampler=SEEDED_RANDOM,
+                search_space={"x": {"type": "int", "low": 0, "high": 9}},
+            )
+        ],
     )
     journal = _resolve_storage(experiment.resolved_storage)
     study = optuna.create_study(study_name="t::p", storage=journal, direction="minimize")

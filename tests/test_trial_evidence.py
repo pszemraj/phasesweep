@@ -31,6 +31,7 @@ from phasesweep.config import (
     Constraint,
     ExecutionContext,
     Experiment,
+    IntParam,
     JsonExtractor,
     Metric,
     Phase,
@@ -178,6 +179,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
         from pathlib import Path
         parser = argparse.ArgumentParser()
         parser.add_argument("--x", type=int)
+        parser.add_argument("--y", type=int, default=0)
         parser.add_argument("--receipt", required=True)
         args = parser.parse_args()
         Path(args.receipt).write_text(json.dumps({
@@ -242,6 +244,7 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
                 inherits=["first"],
                 gates=gates,
                 sampler=Sampler(type="random", seed=0),
+                search_space={"y": IntParam(type="int", low=0, high=9)},
             ),
         ],
     )
@@ -249,7 +252,8 @@ def test_wandb_supervised_capture_publication_inheritance_and_offline_replay(
     monkeypatch.setenv("WANDB_RUN_ID", "ambient-old-run")
     monkeypatch.setenv("WANDB_PROJECT", "ambient-old-project")
     winners = run_experiment(experiment)
-    assert winners["next"].effective_overrides == {"x": 7}
+    assert set(winners["next"].params) == {"y"}
+    assert winners["next"].effective_overrides == {"x": 7, "y": winners["next"].params["y"]}
     # One shared capture per trial, and one position read per accepted W&B objective.
     remote_reads = 4 if consumers in {"primary", "combined"} else 2
     assert len(calls_path.read_text().splitlines()) == remote_reads
@@ -448,6 +452,7 @@ def _from_phase_evidence_experiment(
                 n_trials=resumed_trials,
                 sampler=Sampler(type="random", seed=1),
                 fixed_overrides={"phase_marker": str(marker)},
+                search_space={"lr": IntParam(type="int", low=1, high=9)},
             ),
         ],
     )

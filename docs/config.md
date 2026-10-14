@@ -55,7 +55,7 @@ Every exported override key has an origin. A diamond is valid when both parent p
 
 `fixed_overrides` and `search_space` are local alternatives: one key cannot appear in both. Dotted keys use the same namespace everywhere, so a key and its prefix cannot coexist (for example, `optimizer` and `optimizer.lr`). Phase names must be unique and can inherit only from earlier declared phases.
 
-A list of fixed runs is one phase per configuration with `fixed_overrides` and no `search_space`. A phase with an empty `search_space` is a fixed configuration: it draws nothing from its sampler, so it needs no sampler seed and no `acknowledge_nonresumable` on persistent storage, and `validate` and the dry run report it as `fixed configuration, no sampler draws (resumable)`.
+A list of fixed runs is one phase per configuration with `fixed_overrides` and no `search_space`. A phase with an empty `search_space` is a fixed configuration: it draws nothing from its sampler, so it needs no sampler seed and no `acknowledge_nonresumable` on persistent storage, and `validate` and the dry run report it as `fixed configuration, no sampler draws (resumable)`. It runs once: `n_trials` above 1 would run identical trials and is refused at load. To run one configuration several times, for example across seeds, use [repeats](#repeats). Because the single trial is the whole phase, a fixed configuration on persistent storage whose trial failed replays that failure on a rerun; fix the cause and use a new experiment name.
 
 ```yaml
 phases:
@@ -73,13 +73,11 @@ phases:
       optimizer.lr: {type: categorical, choices: [0.0001, 0.0003]}
   - name: optimizer_b
     inherits: [architecture]
-    n_trials: 2
-    sampler: {type: random, seed: 8}
+    n_trials: 1
     fixed_overrides: {optimizer.family: sgd}
   - name: resolved_comparison
     inherits: [optimizer_a, optimizer_b]
-    n_trials: 2
-    sampler: {type: random, seed: 9}
+    n_trials: 1
     fixed_overrides: {optimizer.family: adamw}
 ```
 
@@ -144,7 +142,7 @@ phases:
 
 Choose the sampler by what you can afford. Grid runs every configuration with every value and is the honest choice for a small discrete space. Seeded random runs `n_trials / R` configurations, each drawn once and run with every value in `R` consecutive trial numbers, so a time-limited phase or one enlarged later never leaves more than one group half-run. An empty `search_space` with `repeats` is a seed audit: one fixed configuration run once per value, which reports the seed spread of a baseline before you search around it.
 
-A configuration ranks only when every member completed, is feasible, and lies inside `metric.min` and `metric.max`; one failed or out-of-bounds member keeps the whole group out, and a failed member is not retried. Use `metric.min` or `metric.max` so a collapsed seed cannot drag a configuration's mean, and size `max_consecutive_failures` above the number of values, or one configuration that fails every repeat aborts the phase. Report-only `observe` values are averaged over the members that recorded them. The winner names its group by the group's last member and publishes the reduced metric with the spread and every member under `repeats` in `winner.yaml` (see [runtime behavior](runtime.md#repeat-groups)). Its params and effective overrides never carry the repeat key, so a later phase that inherits it runs its own repeats, a fixed seed, or the trainer's default.
+A configuration ranks only when every member completed, is feasible, and lies inside `metric.min` and `metric.max`; one failed or out-of-bounds member keeps the whole group out, and a failed member is not retried. Use `metric.min` or `metric.max` so a collapsed seed cannot drag a configuration's mean, and size `max_consecutive_failures` above the number of values, or one configuration that fails every repeat can abort the phase; `validate` and the dry run warn when it is not. Report-only `observe` values are averaged over the members that recorded them. The winner names its group by the group's last member and publishes the reduced metric with the spread and every member under `repeats` in `winner.yaml` (see [runtime behavior](runtime.md#repeat-groups)). Its params and effective overrides never carry the repeat key, so a later phase that inherits it runs its own repeats, a fixed seed, or the trainer's default.
 
 ## Trainer inputs
 

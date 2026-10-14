@@ -274,12 +274,14 @@ phases: list[object] (required)
     # With storage null every invocation is a fresh in-memory study and runs the whole target again.
     # A persistent phase cannot lower its target below the one it already accepted.
     # Raising it is refused while a later phase that inherits from this one, directly or through other phases, already has trials. Use a new experiment name for that.
-    # With sampler.type tpe or cmaes and a nonempty phases[].search_space, raising it on a study that has trials is refused. Run the whole target in one invocation, or use a new experiment name. A phase with an empty search_space draws nothing and is not refused.
-    # A fixed configuration is a phase with an empty phases[].search_space, no phases[].repeats, and its values in phases[].fixed_overrides. A list of fixed runs is one such phase per configuration.
+    # With sampler.type tpe or cmaes and a nonempty phases[].search_space, raising it on a study that has trials is refused. Run the whole target in one invocation, or use a new experiment name.
+    # A fixed configuration is a phase with an empty phases[].search_space, no phases[].repeats, n_trials 1, and its values in phases[].fixed_overrides. A list of fixed runs is one such phase per configuration.
+    # Warning: a fixed configuration runs exactly once, so on persistent storage, when its one trial fails, rerunning the same config replays the failure; fix the cause and use a new experiment name.
     # With random or grid, raising it also recovers a phase that stopped on a durable abort or on an accepted partial timeout. Repeating the same target preserves that decision.
     # Excluded from the study fingerprint.
     # Requires: with phases[].sampler.type grid, n_trials equals the grid size unless phases[].allow_partial_grid is true, and it never exceeds the grid size. Config load fails otherwise.
     # Requires: with phases[].repeats, n_trials covers every repeat of every configuration: the number of values for an empty search_space, a multiple of it under seeded random, and the grid size (configurations times values) under grid. Config load fails otherwise.
+    # Requires: with an empty phases[].search_space and no phases[].repeats, n_trials is 1, because every trial would run the same configuration. Use phases[].repeats to run one configuration several times. Config load fails otherwise.
     n_trials: int (required)
 
     # Free-text design note for the phase, for example why this search space and what is being tested.
@@ -316,7 +318,7 @@ phases: list[object] (required)
     # Map from a dotted trainer-defined override key to the parameter that is sampled for it. optimizer.lr below is an example key; replace it with any valid dotted name.
     # The key rules are the same as for phases[].fixed_overrides, and the sampled value is passed to the trainer like a fixed value.
     # Float and int values reach the trainer as Python floats and ints, and categorical choices keep their YAML type.
-    # An empty search_space without phases[].repeats is a fixed configuration: the phase draws nothing from its sampler and runs phases[].fixed_overrides as they are. validate and the dry run say "fixed configuration, no sampler draws (resumable)".
+    # An empty search_space without phases[].repeats is a fixed configuration: the phase draws nothing from its sampler and runs phases[].fixed_overrides as they are, once, so phases[].n_trials must be 1. validate and the dry run say "fixed configuration, no sampler draws (resumable)".
     # An empty search_space with phases[].repeats is a seed audit: one configuration run once per repeat value.
     # A key that is exactly seed or ends in .seed fails config load, because a searched seed lets seed noise win as if it were a configuration. Fix the seed in phases[].fixed_overrides, or measure seed noise with phases[].repeats. The match is case sensitive.
     # Overrides: trainer_config (the sampled value replaces the base value at the same dotted path).
@@ -512,6 +514,7 @@ phases: list[object] (required)
     # Lowering the limit to at most the replayed count refuses new work until phases[].n_trials is raised.
     # Excluded from the study fingerprint.
     # Recommended: lower it for an expensive trainer when a broken configuration should stop the phase quickly.
+    # Recommended: with phases[].repeats, keep it above the number of repeat values. At or below it, one configuration that fails on every value can abort the phase by itself (under seeded random its repeats run back to back), and validate and the dry run print a warning.
     max_consecutive_failures: int = 5
 
     # Wallclock limit for one trainer process, in seconds, finite and >= 0. null means no per-trial limit.

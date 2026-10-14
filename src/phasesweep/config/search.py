@@ -424,18 +424,28 @@ def sampler_warnings(phase: Phase) -> list[str]:
     warning never blocks a run. A phase that draws nothing has no sampler to
     warn about.
 
-    :param Phase phase: Phase whose sampler and trial target are checked.
+    :param Phase phase: Phase whose sampler, trial target and failure budget are checked.
     :return list[str]: One sentence per warning, empty when nothing is amiss.
     """
     sampler = phase.sampler
+    warnings: list[str] = []
     if sampler.type == "tpe" and phase_draws(phase) and phase.n_trials <= sampler.n_startup_trials:
-        return [
+        warnings.append(
             f"Phase {phase.name!r}: tpe with n_trials={phase.n_trials} <= "
             f"n_startup_trials={sampler.n_startup_trials}, so every trial is sampled at random "
             "and TPE never fits its model. Use sampler.type: random with a seed (resumable, "
             "same coverage), or set sampler.n_startup_trials below n_trials."
-        ]
-    return []
+        )
+    repeats = phase.repeats
+    if repeats is not None and phase.max_consecutive_failures <= len(repeats.values):
+        count = len(repeats.values)
+        warnings.append(
+            f"Phase {phase.name!r}: max_consecutive_failures={phase.max_consecutive_failures} "
+            f"<= {count} repeats.values, so one configuration that fails on every repeat value "
+            "can abort the phase by itself; under seeded random its repeats run back to back. "
+            f"Set max_consecutive_failures above {count}."
+        )
+    return warnings
 
 
 def _validate_sampler_search_space(phase: Phase) -> None:
@@ -445,6 +455,9 @@ def _validate_sampler_search_space(phase: Phase) -> None:
 
     * ``allow_partial_grid: true`` with a sampler other than ``grid``; the
       switch is read only for grid, so any other sampler would silently ignore it.
+    * An empty search space without ``repeats`` and ``n_trials`` above 1, which
+      would run the same fixed configuration several times and rank the copies
+      against each other.
     * CMA-ES with categorical parameters — Optuna's ``CmaEsSampler`` is float-only;
       categorical params silently fail every trial trying to cast 'b' to float.
     * CMA-ES without the ``cmaes`` package importable. ``cmaes`` is a declared
@@ -472,7 +485,8 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     :param Phase phase: Phase whose sampler and search space are checked together.
     :raises ValueError: If ``allow_partial_grid`` is set with a non-grid sampler
         or with ``repeats``, if ``repeats`` is set without grid or seeded random
-        or with a trial count that does not cover every repeat, if the CMA-ES
+        or with a trial count that does not cover every repeat, if an empty
+        search space without ``repeats`` asks for more than one trial, if the CMA-ES
         sampler is paired with categorical params or the ``cmaes`` package is
         not importable, if the grid sampler cannot enumerate a parameter
         (raised by :func:`grid_search_space`), or if ``n_trials`` exceeds the
@@ -490,6 +504,12 @@ def _validate_sampler_search_space(phase: Phase) -> None:
         )
     if phase.repeats is not None:
         _validate_repeat_sampling(phase, phase.repeats)
+    elif not space and phase.n_trials > 1:
+        raise ValueError(
+            f"Phase {phase.name!r}: n_trials={phase.n_trials} with an empty search_space "
+            f"would run {phase.n_trials} identical trials. Use n_trials: 1 for a fixed "
+            "configuration, or repeats to measure seed noise."
+        )
 
     if sampler_type == "cmaes":
         cats = [name for name, p in space.items() if isinstance(p, CategoricalParam)]

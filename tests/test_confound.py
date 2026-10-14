@@ -809,10 +809,20 @@ def _candidate_attrs(number: int, provenance: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _seeded_phase(*, n_trials: int) -> Phase:
+    """Return phase ``p`` sampling the ``x`` the hand-built trials record."""
+    return Phase(
+        name="p",
+        n_trials=n_trials,
+        sampler=Sampler(type="random", seed=0),
+        search_space={"x": IntParam(type="int", low=0, high=10)},
+    )
+
+
 def test_selection_records_the_block_and_logs_each_flagged_check(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    experiment = make_experiment(phases=[Phase(name="p", n_trials=3)])
+    experiment = make_experiment(phases=[_seeded_phase(n_trials=3)])
     study = optuna.create_study(direction="minimize")
     for number, (value, step) in enumerate([(0.2, 1000), (0.3, 400)]):
         study.add_trial(
@@ -845,7 +855,7 @@ def test_selection_records_the_block_and_logs_each_flagged_check(
 
 def test_unreadable_loser_provenance_leaves_selection_to_the_winner() -> None:
     """Confound verdicts are advisory: a losing trial's bad record cannot fail selection."""
-    experiment = make_experiment(phases=[Phase(name="p", n_trials=2)])
+    experiment = make_experiment(phases=[_seeded_phase(n_trials=2)])
     study = optuna.create_study(direction="minimize")
     for number, value in enumerate([0.2, 0.9]):
         attrs = _candidate_attrs(number, _envelope())

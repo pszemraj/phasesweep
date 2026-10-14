@@ -62,7 +62,7 @@ def _sleeping_score_experiment(
         n_trials=n_trials,
         timeout_seconds_per_phase=timeout_seconds_per_phase,
         allow_incomplete_on_timeout=allow_incomplete_on_timeout,
-        search_space={},
+        sampler=Sampler(type="random", seed=0),
     ).model_copy(update={"timeout_seconds_per_run": timeout_seconds_per_run})
 
 
@@ -217,7 +217,7 @@ def test_timeout_after_all_terminal_trials_is_complete_enough(
         n_trials=2,
         timeout_seconds_per_phase=8.0,
         allow_incomplete_on_timeout=allow_incomplete_on_timeout,
-        search_space={},
+        sampler=Sampler(type="random", seed=0),
     )
 
     winners = run_experiment(exp)
@@ -257,7 +257,6 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
         timeout_seconds_per_phase=8.0,
         allow_incomplete_on_timeout=True,
         sampler=Sampler(type="random", seed=7),
-        search_space={},
     )
 
     winners = run_experiment(exp)
@@ -524,7 +523,6 @@ def test_refused_partial_timeout_consumes_simultaneous_failure_abort(
         gpu_policy="none",
         allow_no_gpu_isolation=True,
         sampler=Sampler(type="random", seed=7),
-        search_space={},
     )
 
     offset = {"seconds": 0.0}
@@ -642,7 +640,7 @@ def test_gpu_lease_timeout_type_decides_partial_winner_versus_fatal_abort(
         max_consecutive_failures=1,
         timeout_seconds_per_phase=600.0,
         allow_incomplete_on_timeout=True,
-        search_space={},
+        sampler=Sampler(type="random", seed=0),
     )
 
     exc_type = GpuLeaseTimeoutError if lease_timeout else TimeoutError
