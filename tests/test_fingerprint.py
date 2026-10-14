@@ -797,14 +797,14 @@ _SEEDED_TPE = Sampler(type="tpe", seed=0, n_startup_trials=10)
 
 @pytest.mark.integration
 def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> None:
-    """A TPE phase that aborted continues when its target rises, drawing what one run of that target draws."""
+    """An aborted TPE phase continues when its target rises, drawing from TPE's model what one run with the same outcomes draws."""
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     phase = Phase(
         name="p",
         n_trials=3,
         max_consecutive_failures=1,
-        sampler=_SEEDED_TPE,
+        sampler=Sampler(type="tpe", seed=0, n_startup_trials=0),  # all draws from the model
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
@@ -814,10 +814,22 @@ def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> 
     write_constant_trainer(tmp_path)
     top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
     run_experiment(top_up)
+    # One uninterrupted run whose trial 0 fails as the aborted one did.
+    control_trainer = write_trainer(
+        tmp_path / "control_trainer.py",
+        """
+        import json, os, sys
+        if os.environ["PHASESWEEP_TRIAL_ID"] == "0":
+            sys.exit(1)
+        with open(sys.argv[sys.argv.index("--out") + 1], "w") as out:
+            out.write(json.dumps({"x": 0.5}))
+        print("x=0.5")
+        """,
+    )
     control = make_experiment(
         persistent=tmp_path / "control",
-        trainer=trainer,
-        phases=[phase.model_copy(update={"n_trials": 4})],
+        trainer=control_trainer,
+        phases=[phase.model_copy(update={"n_trials": 4, "max_consecutive_failures": 2})],
     )
     run_experiment(control)
 

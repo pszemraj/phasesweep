@@ -5,12 +5,14 @@ from __future__ import annotations
 import contextlib
 import inspect
 import pickle
+from collections.abc import Callable
 
 import optuna
 import pytest
 from optuna.samplers._lazy_random_state import LazyRandomState
 
 from phasesweep.config import CategoricalParam, FloatParam, IntParam, Repeats, Sampler, SearchParam
+from phasesweep.engine.attempts import _record_stale_trial_outcome
 from phasesweep.engine.optuna import (
     _build_sampler,
     _draw_positions,
@@ -19,6 +21,7 @@ from phasesweep.engine.optuna import (
     _suggest,
 )
 from phasesweep.engine.state import RERUN_OF_ATTR
+from phasesweep.engine.study_policy import _record_reruns
 
 _GRID_SPACE: dict[str, SearchParam] = {
     "x": CategoricalParam(type="categorical", choices=[1, 2, 3]),
@@ -110,24 +113,19 @@ def _run(
 
 
 def _interrupt_and_rerun(study: optuna.Study) -> int:
-    """Fail every RUNNING trial and add one WAITING rerun of it carrying its params and system attrs.
+    """Recover every RUNNING trial as stale recovery does, then schedule reruns as a run does.
 
     :param optuna.Study study: Study left with RUNNING trials by an interruption.
-    :return int: Number of reruns added.
+    :return int: Number of reruns production scheduled.
     """
-    stale = [t for t in study.get_trials(deepcopy=False) if t.state.name == "RUNNING"]
-    for trial in stale:
+    for trial in [t for t in study.get_trials(deepcopy=False) if t.state.name == "RUNNING"]:
+        _record_stale_trial_outcome(study, trial)
         study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
-        study.add_trial(
-            optuna.trial.create_trial(
-                state=optuna.trial.TrialState.WAITING,
-                params=trial.params,
-                distributions=trial.distributions,
-                system_attrs=dict(trial.system_attrs),
-                user_attrs={RERUN_OF_ATTR: trial.number},
-            )
-        )
-    return len(stale)
+    reruns = _record_reruns(study)
+    trials = study.get_trials(deepcopy=False)
+    # A rerun reuses its source's configuration; it never redraws one.
+    assert all(trials[rerun].params == trials[source].params for source, rerun in reruns)
+    return len(reruns)
 
 
 def _finished_draws(study: optuna.Study) -> list[tuple[int, tuple[object, ...]]]:
@@ -214,15 +212,12 @@ def test_a_rerun_without_params_draws_its_source_grid_point() -> None:
     _run(control, _GRID_SPACE, 3)
     study = _study(_build_sampler(Sampler(type="grid", seed=0), _GRID_SPACE))
     _run(study, _GRID_SPACE, 2)
-    study.add_trial(optuna.trial.create_trial(state=optuna.trial.TrialState.FAIL))
-    study.add_trial(
-        optuna.trial.create_trial(
-            state=optuna.trial.TrialState.WAITING, user_attrs={RERUN_OF_ATTR: 2}
-        )
-    )
+    assert study.ask().params == {}
+    assert _interrupt_and_rerun(study) == 1
     _run(study, _GRID_SPACE, 1)
 
     rerun = study.get_trials()[3]
+    assert rerun.user_attrs[RERUN_OF_ATTR] == 2
     assert rerun.system_attrs["grid_id"] == 2
     assert rerun.params == control.get_trials()[2].params
 
@@ -318,7 +313,8 @@ def test_model_samplers_resume_exactly_as_an_uninterrupted_run(
 @pytest.mark.parametrize(
     ("cfg", "space", "first", "target"),
     [
-        pytest.param(_TPE, _MODEL_SPACE, 3, 12, id="tpe"),
+        # Six trials put the first process past TPE's four startup draws, into its model.
+        pytest.param(_TPE, _MODEL_SPACE, 6, 12, id="tpe"),
         pytest.param(_CMAES, _CMA_SPACE, 4, 14, id="cmaes"),
     ],
 )
@@ -336,22 +332,60 @@ def test_model_samplers_top_up_exactly_as_one_larger_run(
     assert _finished_draws(study) == _finished_draws(control)
 
 
+# A categorical CMA-ES cannot model, so every trial draws it from the independent sampler.
+_CMA_WITH_CHOICE: dict[str, SearchParam] = {
+    **_CMA_SPACE,
+    "c": CategoricalParam(type="categorical", choices=list(range(1000))),
+}
+
+
 @pytest.mark.parametrize(
-    ("cfg", "space"),
-    [pytest.param(_TPE, _MODEL_SPACE, id="tpe"), pytest.param(_CMAES, _CMA_SPACE, id="cmaes")],
+    ("cfg", "space", "independent"),
+    [
+        # Positions 0-3 are TPE's startup draws whichever trials have finished.
+        pytest.param(_TPE, _MODEL_SPACE, lambda position, _name: position < 4, id="tpe"),
+        # Position 0 draws every parameter independently, and every position draws ``c``.
+        pytest.param(
+            _CMAES,
+            _CMA_WITH_CHOICE,
+            lambda position, name: position == 0 or name == "c",
+            id="cmaes",
+        ),
+    ],
 )
-def test_model_samplers_resume_under_two_workers_without_repeating_a_draw(
-    cfg: Sampler, space: dict[str, SearchParam]
+def test_model_samplers_resume_under_two_workers_drawing_by_position(
+    cfg: Sampler,
+    space: dict[str, SearchParam],
+    independent: Callable[[int, str], bool],
 ) -> None:
-    """Under ``n_jobs: 2`` a resume meets the target with one rerun per interruption and no repeated configuration."""
+    """Under ``n_jobs: 2`` every independent draw is the one its position gives, and each rerun keeps its source's configuration.
+
+    Stock seeded samplers reseed per worker thread, so their independent draws would
+    differ from an uninterrupted ``n_jobs: 1`` run's.
+    """
+    control = _study(_build_sampler(cfg, space))
+    _run(control, space, 12)
     study = _study(_build_sampler(cfg, space, 2))
     _run(study, space, 12, interrupt_at=frozenset({5}), n_jobs=2)
     _resume(_reopen(study, cfg, space, 2), space, 12, n_jobs=2)
 
     trials = study.get_trials()
-    complete = [tuple(sorted(t.params.items())) for t in trials if t.state.name == "COMPLETE"]
-    assert len(complete) == len(set(complete)) == 12
-    assert [t.user_attrs.get(RERUN_OF_ATTR) for t in trials].count(5) == 1
+    positions = _draw_positions(trials)
+    # The control has no reruns, so each of its trials sits at the position of its number.
+    expected = {t.number: t.params for t in control.get_trials()}
+    complete = [t for t in trials if t.state.name == "COMPLETE"]
+    assert len(complete) == len({tuple(sorted(t.params.items())) for t in complete}) == 12
+    drawn = [
+        (positions[t.number], name, value)
+        for t in complete
+        for name, value in t.params.items()
+        if independent(positions[t.number], name)
+    ]
+    assert drawn
+    assert all(expected[position][name] == value for position, name, value in drawn)
+    reruns = [t for t in trials if RERUN_OF_ATTR in t.user_attrs]
+    assert [t.user_attrs[RERUN_OF_ATTR] for t in reruns] == [5]
+    assert all(t.params == trials[t.user_attrs[RERUN_OF_ATTR]].params for t in reruns)
 
 
 def _carrier(
@@ -399,6 +433,19 @@ def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:
         "cma:optimizer",
     )
     assert list(inspect.signature(cma._restore_optimizer).parameters) == ["completed_trials"]
+    # The position copy of the trial reaches only the ask seed, and a worker thread's
+    # reseed leaves the thread-local ask stream alone.
+    assert _code_of(optuna.samplers.CmaEsSampler.sample_relative).count("trial.number") == 1
+    assert "_cma_rng" not in _code_of(optuna.samplers.CmaEsSampler.reseed_rng)
+
+
+def _code_of(function: Callable[..., object]) -> str:
+    """Return a function's source with its comments removed.
+
+    :param Callable[..., object] function: Function to read.
+    :return str: Its source lines, each cut at its first ``#``.
+    """
+    return "\n".join(line.split("#", 1)[0] for line in inspect.getsource(function).splitlines())
 
     grid = optuna.samplers.GridSampler({"x": [0, 1]}, seed=0)
     assert grid._search_space == {"x": [0, 1]}
