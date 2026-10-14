@@ -97,6 +97,15 @@ def _metric_scoring_line(metric: Metric) -> str:
     )
 
 
+def experiment_contract_lines(experiment: Experiment) -> list[str]:
+    """List the experiment-level contract lines that ``validate`` and ``run --dry-run`` print.
+
+    :param Experiment experiment: Loaded experiment.
+    :return list[str]: One line per experiment-wide contract, in print order.
+    """
+    return [_metric_scoring_line(experiment.metric)]
+
+
 class Constraint(_Frozen):
     """A scalar bound that trials must satisfy to be considered feasible."""
 
