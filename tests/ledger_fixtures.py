@@ -395,8 +395,9 @@ def republish_as_incomplete(experiment: Experiment, phase: str = "p") -> None:
 def forbid_file_backed_storage(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Make any file-backed storage construction fail, and record every attempt.
 
-    Durability invariant 6: a read path never creates a study and never builds
-    file-backed storage, and its SQLite reads open the database ``mode=ro``.
+    Durability invariant 6 ("Read paths construct and write nothing"): a read
+    path never creates a study and never builds file-backed storage, and its
+    SQLite reads open the database ``mode=ro``.
     Three constructors can break that -- ``RDBStorage`` (which runs
     ``metadata.create_all`` and a version manager on open), ``JournalFileBackend``
     (which creates the journal if absent), and ``optuna.create_study`` -- plus

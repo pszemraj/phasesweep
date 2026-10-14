@@ -1,9 +1,10 @@
 """Every read path, against the golden ledger, writes nothing and refuses honestly.
 
 Two durability invariants meet here. A read path never creates a study and
-never constructs file-backed storage (invariant 3); and it validates the
-artifact-root binding and then the ledger format *before* any bind, claim, or
-open, leaving the bytes untouched when it refuses (invariant 2). The golden
+never constructs file-backed storage, invariant 6 ("Read paths construct and
+write nothing"); and it validates the artifact-root binding and then the
+ledger format *before* any bind, claim, or open, leaving the bytes untouched
+when it refuses, invariant 2 ("Validation writes nothing"). The golden
 fixture under ``tests/fixtures/ledgers`` is real PhaseSweep output for these
 checks to run against, rather than bytes a test invented.
 

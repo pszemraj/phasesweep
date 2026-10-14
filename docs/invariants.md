@@ -132,7 +132,7 @@ A phase abort is written in the same record as the outcome that trips it, and re
 
 #### 12. An unreadable ledger means cleanup is uncertain
 
-A ledger that cannot be read makes cleanup uncertain, never confirmed, and the attempt stays registered for a later retry. A journal's partial final record does not make it unreadable: the registry opener repairs it first (invariant 2) and reads the attempt as it would on a healthy journal.
+A ledger that cannot be read makes cleanup uncertain, never confirmed, and the attempt stays registered for a later retry. A journal's partial final record does not make it unreadable: the registry opener repairs it first, as invariant 2 ("Validation writes nothing") describes, and reads the attempt as it would on a healthy journal.
 
 **Held by:** `engine.cleanup._reap_stale_trials`, which raises `ProcessCleanupUncertainError`; `engine.attempts._registry_attempt_fail_stale_trial`, which opens through `engine.ledger.open_registry_study` and retains the entry when storage is unreachable; `engine.guards._preflight_existing_studies`, which marks the cleanup report uncertain\
 **Tests:** `tests/test_stale_reaper.py::test_registry_storage_failure_marks_cleanup_report_uncertain`, `tests/test_stale_reaper.py::test_registry_retains_attempt_when_journal_snapshot_is_unreadable`, `tests/test_stale_reaper.py::test_registry_reads_its_attempt_after_repairing_a_partial_journal_record`
@@ -166,7 +166,7 @@ A process is identified by PID, start time, boot id, and PID namespace together,
 
 A dead runner with no terminal status stays in the live set until `recover-run` decides; liveness alone never concludes a run. The one exception is a runner from a boot that has ended: nothing from that boot survived, and a boot never comes back, so the run reads `failed` without a signal. Deriving state writes nothing, so a read tool never creates or removes a marker: the writers that must reserve cleanup (cancel, failed-spawn cleanup, `recover-run`) persist their own marker, and a marker that a later status or boot supersedes is read as inert. A runner recorded in a PID namespace the server cannot observe is neither alive nor dead: it stays live on durable evidence alone, is never reaped, probed, or signalled, and `cancel_run` and `recover-run` refuse it. When the host's initial namespace proves its processes gone, it reads as a dead runner that needs recovery, never as terminal, because that proof says nothing of its trials and a later reader may be unable to repeat it; only `recover-run` settles the run, and the status it writes outlives any later proof.
 
-**Held by:** `mcp.runs.RunStore.state`, `RunStore._marker_reserves`, `RunStore.runner_view`, and `RunStore.recovery_required`, resolved only by `mcp.recovery.recover_run`\
+**Held by:** `mcp.runs.RunStore.state`, `mcp.runs.RunStore._marker_reserves`, `mcp.runs.RunStore.runner_view`, and `mcp.runs.RunStore.recovery_required`, resolved only by `mcp.recovery.recover_run`\
 **Tests:** `tests/test_mcp_runs.py::test_dead_runner_without_status_stays_live_until_recovery_evidence`, `tests/test_pid_namespace.py::test_foreign_namespace_runner_reads_running_and_writes_nothing`, `tests/test_pid_namespace.py::test_absent_runner_reads_as_a_dead_runner_that_needs_recovery`, `tests/test_pid_namespace.py::test_a_blocker_between_reads_never_reads_failed_and_never_unsettles_a_run`, `tests/test_pid_namespace.py::test_recover_run_settles_an_absent_runner_without_signalling`, `tests/test_pid_namespace.py::test_cancel_refuses_foreign_namespace_without_signalling_or_marker`
 
 ### Errors and fixtures
@@ -175,7 +175,7 @@ A dead runner with no terminal status stays in the live set until `recover-run` 
 
 Every operator-facing error declares one remediation, and a wrap preserves it instead of replacing it with the wrapper's own advice. Alternatives route the one that keeps the operator's existing work, repairs of which none suffices alone route to reading the logs, and retrying what failed after a repair is implied. A preflight that collects several refusals routes the remediation they share, or reading the logs when they disagree. `recover-run` never routes a refusal back to itself except to a confirmed run, so `RunRecoveryError` defaults to reading the logs. An MCP run's failure payload takes its next steps only from the action, so no error type gives the agent advice of its own; unconfirmed cleanup adds recover-run after the repair.
 
-**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.action`, `errors.PhaseSweepError.rewrap`, `mcp.runner._OPERATOR_STEPS`, `mcp.runner._cleanup_steps`\
+**Held by:** `errors.OperatorAction`, `errors.PhaseSweepError.default_action` with the `action` each instance carries, `errors.PhaseSweepError.rewrap`, `mcp.runner._OPERATOR_STEPS`, `mcp.runner._cleanup_steps`\
 **Tests:** `tests/test_error_routing.py::test_every_operator_error_declares_its_action`, `tests/test_error_routing.py::test_raise_sites_route_their_declared_action`, `tests/test_error_routing.py::test_runner_payload_follows_the_routed_steps`
 
 #### 18. Refusals are tested against a real ledger
@@ -191,7 +191,7 @@ Refusals are tested against a ledger produced by the public API, and read paths 
 
 The confound block is computed once per selection and frozen onto the winner; `n/a` means a check could not run and must never be rendered or counted as `ok`. In a repeats phase it ranks complete groups, lists them as `ranked_groups`, and the validator requires the winner's `repeats` members to be one of them. No downstream phase fingerprint depends on any block's content, so an observation can never invalidate a study or block a top-up, and a top-up that reselects the same trial for a larger ranked population publishes a fresh block rather than reusing the old one. A `--from-phase` resume carries the parent winner's block verbatim. The block's authoritative copy is the generation's `phases/<phase>/winner.yaml`, which the generation manifest covers: an edited verdict there fails `publication_integrity` like any other tampered artifact. The per-phase `winner.yaml` projection is never read back.
 
-**Held by:** `engine.confound._assess_population`, `engine.confound._validate_check` refusing an `n/a` record without a `reason`, `engine.fingerprints._phase_fingerprint`, which never reads `Winner.confound`, and `engine.publication_validation._validate_generation_manifest`, which calls `engine.confound._validate_confound_block`\
+**Held by:** `engine.confound._assess_population`, `engine.confound._validate_check` refusing an `n/a` record without a `reason`, `engine.fingerprints._phase_fingerprint`, which never reads `engine.state.Winner.confound`, and `engine.publication_validation._validate_generation_manifest`, which calls `engine.confound._validate_confound_block`\
 **Tests:** `tests/test_confound.py::test_verdicts_are_three_distinct_values_and_not_checked_is_never_ok`, `tests/test_confound.py::test_confound_block_never_moves_a_downstream_fingerprint`, `tests/test_confound.py::test_published_block_is_manifest_covered`, `tests/test_confound.py::test_top_up_reselection_publishes_a_fresh_block_for_its_larger_population`, `tests/test_confound.py::test_inheriting_phases_are_warned_and_from_phase_carries_the_block`, `tests/test_repeats.py::test_repeats_block_and_confound_groups_agree_on_the_winning_group`
 
 #### 20. A repeat group is fixed once complete and its last member names it
@@ -203,10 +203,10 @@ A repeat group holds exactly one trial per repeat value: under grid its key is t
 
 ## Detached-run recovery rationale
 
-A dead runner without terminal status may still have trials being reaped, so invariant 16 keeps its capacity slot occupied until `recover-run` decides from durable evidence. Invariant 7 governs that recovery's ledger access. Process identity includes the boot id because PID and `/proc` start time can both be reused after reboot, and the PID namespace because the same numbers name unrelated processes in another one; an unknown boot id or PID namespace on either side refuses to signal.
+A dead runner without terminal status may still have trials being reaped, so invariant 16 ("A dead runner stays live until recovery decides") keeps its capacity slot occupied until `recover-run` decides from durable evidence. Invariant 7 ("Recovery validates before it opens") governs that recovery's ledger access. Process identity includes the boot id because PID and `/proc` start time can both be reused after reboot, and the PID namespace because the same numbers name unrelated processes in another one; an unknown boot id or PID namespace on either side refuses to signal.
 
 ### Persisted spawned handle
 
 A detached runner outlives its parent by design. If the server restarts with no handle on disk, it has no record of that runner, and a second `launch_run` spawns a duplicate sweep against the same ledger. The handle is created before `Popen`, replaced by the runner's own receipt once the runner has persisted its identity, and confirmed through a ready/ack handshake, so no child ever exists without a durable handle naming it.
 
-**Held by:** `mcp.run_control.RunControl._spawn`, `_terminate_failed_spawn`, and `_pending_handle`; `mcp.runner._persist_spawned_handle` refuses to persist a runner receipt without a boot id or PID namespace.
+**Held by:** `mcp.run_control.RunControl._spawn`, `mcp.run_control.RunControl._terminate_failed_spawn`, and `mcp.run_control.RunControl._pending_handle`; `mcp.runner._persist_spawned_handle` refuses to persist a runner receipt without a boot id or PID namespace.
