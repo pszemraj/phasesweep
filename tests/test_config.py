@@ -917,16 +917,25 @@ def test_empty_search_space_skips_seed_and_acknowledge_on_persistent_storage(
 @pytest.mark.parametrize(
     "sampler", [{"type": "tpe"}, {"type": "random", "seed": 0}, {"type": "grid"}]
 )
-def test_empty_search_space_refuses_identical_trials(sampler: JsonObject) -> None:
-    """Several runs of one fixed configuration are repeats, so only repeats may ask for them."""
+def test_in_memory_fixed_configuration_refuses_identical_trials(
+    tmp_path: Path, sampler: JsonObject
+) -> None:
+    """With ``storage: null`` nothing is ever retried, so load refuses what every launch would.
+
+    Several runs of one fixed configuration are repeats, so only repeats may ask for them. A
+    persistent study may hold failed attempts for the extra trials to replace, which only a
+    launch can see, so the same phase loads there.
+    """
+    phase = Phase.model_validate({"name": "x", "n_trials": 3, "sampler": sampler})
     with pytest.raises(ValidationError) as excinfo:
-        make_experiment(
-            phases=[Phase.model_validate({"name": "x", "n_trials": 3, "sampler": sampler})]
-        )
+        make_experiment(phases=[phase])
     assert (
         "Phase 'x': n_trials=3 with an empty search_space would run 3 identical trials. Use "
         "n_trials: 1 for a fixed configuration, or repeats to measure seed noise."
     ) in str(excinfo.value)
+
+    persistent = make_experiment(storage=f"journal:///{tmp_path}/phases.journal", phases=[phase])
+    assert persistent.phases[0].n_trials == 3
 
     fixed = make_experiment(phases=[Phase.model_validate({"name": "x", "n_trials": 1})])
     assert fixed.phases[0].n_trials == 1

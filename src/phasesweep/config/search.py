@@ -422,13 +422,19 @@ def sampler_warnings(phase: Phase) -> list[str]:
 
     Shared by ``phasesweep validate`` and ``phasesweep run --dry-run``. A
     warning never blocks a run. A phase that draws nothing has no sampler to
-    warn about.
+    warn about, but a fixed configuration asking for several trials is told
+    that only a launch can say whether they are retries.
 
     :param Phase phase: Phase whose sampler, trial target and failure budget are checked.
     :return list[str]: One sentence per warning, empty when nothing is amiss.
     """
     sampler = phase.sampler
     warnings: list[str] = []
+    if not phase_draws(phase) and phase.n_trials > 1:
+        warnings.append(
+            f"phase {phase.name!r} is a fixed configuration: n_trials above 1 only retries "
+            "failed attempts, and a launch refuses more than one past the failed ones."
+        )
     if sampler.type == "tpe" and phase_draws(phase) and phase.n_trials <= sampler.n_startup_trials:
         warnings.append(
             f"Phase {phase.name!r}: tpe with n_trials={phase.n_trials} <= "
@@ -448,6 +454,55 @@ def sampler_warnings(phase: Phase) -> list[str]:
     return warnings
 
 
+def fixed_configuration_target_refusal(
+    phase: Phase, *, finished: int, completed: int
+) -> str | None:
+    """Say why a fixed configuration may not run to ``phase.n_trials``, if it may not.
+
+    A fixed configuration runs the same trial every time, so it keeps at most
+    one completed result, and ``n_trials`` above 1 only replaces failed
+    attempts. With ``finished`` terminal attempts and none completed, the
+    target may reach ``finished + 1``: one more attempt than the failures it
+    replaces. Once one attempt completed, feasible or not, the configuration
+    has been measured and the target may not pass the attempts already made, or
+    a rerun would shop for a better draw of the same configuration. A phase
+    that draws is never refused here.
+
+    :param Phase phase: Phase whose ``n_trials`` is checked.
+    :param int finished: Terminal attempts its study already holds, zero when
+        the study does not exist yet.
+    :param int completed: How many of those attempts are COMPLETE, whether or
+        not they are feasible.
+    :return str | None: The refusal, which names the fix, or ``None`` when the
+        target is allowed.
+    """
+    if phase_draws(phase):
+        return None
+    name, target = phase.name, phase.n_trials
+    if completed >= 1:
+        if target <= finished:
+            return None
+        return (
+            f"Phase {name!r} is a fixed configuration that already has a completed trial; "
+            f"n_trials={target} would run the same configuration again. Keep n_trials at "
+            f"{finished}, or use repeats to measure seed noise."
+        )
+    if target <= finished + 1:
+        return None
+    if finished == 0:
+        return (
+            f"Phase {name!r}: n_trials={target} with an empty search_space would run {target} "
+            "identical trials. Use n_trials: 1 for a fixed configuration, or repeats to "
+            "measure seed noise."
+        )
+    plural = "" if finished == 1 else "s"
+    return (
+        f"Phase {name!r} is a fixed configuration with {finished} failed attempt{plural} and "
+        "no completed one; raising n_trials retries it one attempt at a time, so use at most "
+        f"{finished + 1}, not {target}."
+    )
+
+
 def _validate_sampler_search_space(phase: Phase) -> None:
     """Reject sampler/search-space combinations Optuna will not accept at runtime.
 
@@ -455,9 +510,6 @@ def _validate_sampler_search_space(phase: Phase) -> None:
 
     * ``allow_partial_grid: true`` with a sampler other than ``grid``; the
       switch is read only for grid, so any other sampler would silently ignore it.
-    * An empty search space without ``repeats`` and ``n_trials`` above 1, which
-      would run the same fixed configuration several times and rank the copies
-      against each other.
     * CMA-ES with categorical parameters — Optuna's ``CmaEsSampler`` is float-only;
       categorical params silently fail every trial trying to cast 'b' to float.
     * CMA-ES without the ``cmaes`` package importable. ``cmaes`` is a declared
@@ -481,12 +533,14 @@ def _validate_sampler_search_space(phase: Phase) -> None:
     are rejected by :class:`CategoricalParam` and float collapse by
     :func:`grid_search_space`, both before this product is taken. The repeat
     axis is part of the grid, so it counts toward the cardinality and its cap.
+    The grid checks cover only a phase that draws: a fixed configuration
+    consults no sampler, so a one-point grid does not bound its target. The
+    retry rule in :func:`fixed_configuration_target_refusal` does.
 
     :param Phase phase: Phase whose sampler and search space are checked together.
     :raises ValueError: If ``allow_partial_grid`` is set with a non-grid sampler
         or with ``repeats``, if ``repeats`` is set without grid or seeded random
-        or with a trial count that does not cover every repeat, if an empty
-        search space without ``repeats`` asks for more than one trial, if the CMA-ES
+        or with a trial count that does not cover every repeat, if the CMA-ES
         sampler is paired with categorical params or the ``cmaes`` package is
         not importable, if the grid sampler cannot enumerate a parameter
         (raised by :func:`grid_search_space`), or if ``n_trials`` exceeds the
@@ -504,12 +558,6 @@ def _validate_sampler_search_space(phase: Phase) -> None:
         )
     if phase.repeats is not None:
         _validate_repeat_sampling(phase, phase.repeats)
-    elif not space and phase.n_trials > 1:
-        raise ValueError(
-            f"Phase {phase.name!r}: n_trials={phase.n_trials} with an empty search_space "
-            f"would run {phase.n_trials} identical trials. Use n_trials: 1 for a fixed "
-            "configuration, or repeats to measure seed noise."
-        )
 
     if sampler_type == "cmaes":
         cats = [name for name, p in space.items() if isinstance(p, CategoricalParam)]
@@ -528,7 +576,7 @@ def _validate_sampler_search_space(phase: Phase) -> None:
                 "or install it directly with `pip install cmaes`."
             ) from exc
 
-    if sampler_type == "grid":
+    if sampler_type == "grid" and phase_draws(phase):
         cardinality = math.prod(
             len(values)
             for values in grid_search_space(

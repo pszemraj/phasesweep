@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
 
+import optuna
+
 import phasesweep.engine.artifacts as artifact_io
 import phasesweep.engine.attempts as attempt_ops
 import phasesweep.engine.evidence as evidence_ops
@@ -21,11 +23,12 @@ import phasesweep.engine.locking as locking_ops
 import phasesweep.engine.paths as path_ops
 import phasesweep.engine.publication_validation as validation_ops
 import phasesweep.engine.resume as resume_ops
+import phasesweep.engine.study_policy as study_policy_ops
 from phasesweep._metadata import __version__
 from phasesweep.config import Experiment
 from phasesweep.config.common import _validate_safe_name
 from phasesweep.config.models import _metric_semantics_payload, experiment_contract_lines
-from phasesweep.config.search import sampler_capability_line, sampler_warnings
+from phasesweep.config.search import phase_draws, sampler_capability_line, sampler_warnings
 from phasesweep.engine.confound import _describe_flagged
 from phasesweep.engine.errors import (
     IncompleteJournalRecordError,
@@ -77,6 +80,57 @@ def _preflight_missing_reached_phase_environments(
     for _index, phase in experiment.phases_from(from_phase):
         if phase.name not in existing_studies:
             _trainer_environment(experiment, phase.name)
+
+
+def _preview_fixed_configuration_targets(
+    experiment: Experiment,
+    *,
+    from_phase: str | None,
+) -> None:
+    """Refuse in a dry run a fixed configuration's target that a launch would refuse.
+
+    Only a reached fixed configuration asking for more than one trial depends
+    on the ledger, so only then does the preview read it, through the same
+    write-nothing door ``status`` uses. A missing ledger or study counts zero
+    attempts. A stale RUNNING attempt counts as failed, because a launch
+    recovers it as failed before it checks the target. A phase whose trials
+    cannot be read is skipped: the preview cannot tell, and a launch refuses an
+    unreadable ledger on its own.
+
+    :param Experiment experiment: Parsed experiment being previewed.
+    :param str | None from_phase: Optional first phase a launch would execute.
+    :raises TrialTargetRegressionError: A reached fixed configuration asks for
+        more attempts than it may retry given the trials recorded so far.
+    :raises ArtifactRootConflictError: The tree is bound to a different owner.
+    :raises StudySchemaMismatchError: A ledger study uses an unsupported schema.
+    :raises StudyStorageUnavailableError: An unbound tree's ledger cannot be inspected.
+    """
+    candidates = [
+        phase
+        for _index, phase in experiment.phases_from(from_phase)
+        if not phase_draws(phase) and phase.n_trials > 1
+    ]
+    if not candidates:
+        return
+    ledger = ledger_ops.validate_ledger(experiment)
+    stats = ledger_ops.read_trial_stats(ledger, {}) if ledger.backend == "journal" else {}
+    for phase in candidates:
+        phase_stats = stats.get(phase.name)
+        if phase_stats is not None and not phase_stats.available:
+            continue
+        counts = {} if phase_stats is None else phase_stats.counts
+        completed = counts.get(optuna.trial.TrialState.COMPLETE.name, 0)
+        finished = completed + sum(
+            counts.get(state.name, 0)
+            for state in (
+                optuna.trial.TrialState.PRUNED,
+                optuna.trial.TrialState.FAIL,
+                optuna.trial.TrialState.RUNNING,
+            )
+        )
+        study_policy_ops._validate_fixed_configuration_target(
+            phase, finished=finished, completed=completed
+        )
 
 
 @dataclass(frozen=True)
@@ -404,6 +458,11 @@ def _run_experiment_outcome(
                 from_phase=from_phase,
                 existing_studies=existing_studies,
             )
+            resume_ops._reject_fixed_targets_without_study(
+                experiment,
+                from_phase=from_phase,
+                existing_studies=existing_studies,
+            )
             preloaded_winners = resume_ops._preflight_skipped_winners(
                 experiment,
                 from_phase=from_phase,
@@ -686,6 +745,7 @@ def _run_experiment_inner(
             log.info("DRY RUN %s", sampler_capability_line(previewed))
             for warning in sampler_warnings(previewed):
                 log.warning("DRY RUN warning: %s", warning)
+        _preview_fixed_configuration_targets(experiment, from_phase=from_phase)
 
     # Only a dry run resumes without preloaded winners; it resolves the
     # publication once for every phase it skips.

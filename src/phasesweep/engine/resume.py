@@ -214,6 +214,35 @@ def _reject_unsupported_sampler_topups(
             study_policy_ops._validate_sampler_continuation(study, phase)
 
 
+def _reject_fixed_targets_without_study(
+    experiment: Experiment,
+    *,
+    from_phase: str | None,
+    existing_studies: dict[str, optuna.Study],
+) -> None:
+    """Reject a fixed configuration's oversized target before any phase launches.
+
+    A reached phase with no durable study has no failed attempt to replace, so
+    it counts zero finished and zero completed trials. Reached phases that do
+    have a study were already checked against their trials by the recovery
+    preflight (:func:`phasesweep.engine.study_policy._validate_trial_target`).
+    Checking the missing ones here keeps a later phase's refusal from arriving
+    after an earlier phase has already run.
+
+    :param Experiment experiment: Parsed experiment whose phase chain is scanned
+        from ``from_phase`` (or the start) onward.
+    :param str | None from_phase: Optional resume point; phases before it are skipped.
+    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
+        phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
+    :raises TrialTargetRegressionError: A reached fixed configuration without a
+        study asks for more than one trial; delegated to
+        :func:`phasesweep.engine.study_policy._validate_fixed_configuration_target`.
+    """
+    for _index, phase in experiment.phases_from(from_phase):
+        if phase.name not in existing_studies:
+            study_policy_ops._validate_fixed_configuration_target(phase, finished=0, completed=0)
+
+
 def _preflight_reached_fingerprint(
     experiment: Experiment,
     *,

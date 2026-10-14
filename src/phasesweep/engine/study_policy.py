@@ -8,7 +8,11 @@ from typing import Any, Literal, NamedTuple, TypedDict
 import optuna
 
 from phasesweep.config import Phase
-from phasesweep.config.search import NON_RESUMABLE_SAMPLERS, phase_draws
+from phasesweep.config.search import (
+    NON_RESUMABLE_SAMPLERS,
+    fixed_configuration_target_refusal,
+    phase_draws,
+)
 from phasesweep.engine.attempts import _parsed_trial_outcome
 from phasesweep.engine.errors import (
     OperatorAction,
@@ -17,7 +21,7 @@ from phasesweep.engine.errors import (
     StudySchemaMismatchError,
     TrialTargetRegressionError,
 )
-from phasesweep.engine.optuna import _finished_trial_count
+from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -416,12 +420,17 @@ def _accepted_trial_target(study: optuna.Study) -> int:
 
 
 def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
-    """Reject a target lower than the study's durable accepted target.
+    """Reject a target the study's durable state does not allow.
+
+    A target lower than the accepted one is refused, and so is a fixed
+    configuration's target past what it may retry (see
+    :func:`_validate_fixed_configuration_target`).
 
     :param optuna.Study study: Existing study whose accepted target is checked.
     :param Phase phase: Phase config supplying the requested ``n_trials`` target.
     :raises TrialTargetRegressionError: ``phase.n_trials`` is lower than the
-        study's durable accepted target.
+        study's durable accepted target, or a fixed configuration asks for more
+        attempts than it may retry.
     """
     accepted_target = _accepted_trial_target(study)
     if phase.n_trials < accepted_target:
@@ -430,6 +439,33 @@ def _validate_trial_target(study: optuna.Study, phase: Phase) -> None:
             f"trial(s), but the current config requests {phase.n_trials}. Use at least the prior "
             "target or a new experiment name."
         )
+    trials = study.get_trials(deepcopy=False)
+    _validate_fixed_configuration_target(
+        phase,
+        finished=_finished_trial_count(trials),
+        completed=_completed_trial_count(trials),
+    )
+
+
+def _validate_fixed_configuration_target(phase: Phase, *, finished: int, completed: int) -> None:
+    """Reject a fixed configuration's target that would repeat a measured configuration.
+
+    A fixed configuration draws nothing, so every attempt runs the same trial.
+    Raising ``n_trials`` retries it only while no attempt has completed: after
+    ``finished`` failed attempts the target may reach ``finished + 1``, and a
+    completed attempt, feasible or not, closes it. A phase that draws is not
+    checked here. A study that does not exist yet counts zero finished and
+    zero completed.
+
+    :param Phase phase: Phase config supplying the requested ``n_trials`` target.
+    :param int finished: Terminal attempts the phase's study holds.
+    :param int completed: How many of those are COMPLETE.
+    :raises TrialTargetRegressionError: The fixed configuration asks for more
+        attempts than it may retry; the message names the largest allowed target.
+    """
+    refusal = fixed_configuration_target_refusal(phase, finished=finished, completed=completed)
+    if refusal is not None:
+        raise TrialTargetRegressionError(refusal)
 
 
 def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
@@ -442,7 +478,8 @@ def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
     duplicates. Until PhaseSweep persists real sampler continuation state, a
     stateful phase is restartable only before its first terminal trial or after
     reaching its accepted target. A phase with an empty search space draws
-    nothing, so it has no sampler state to lose and resumes freely.
+    nothing, so it has no sampler state to lose and resumes freely; how far it
+    may be raised is :func:`_validate_fixed_configuration_target`'s rule.
 
     :param optuna.Study study: Existing study whose finished-trial count is checked.
     :param Phase phase: Phase config supplying the sampler type and trial target.

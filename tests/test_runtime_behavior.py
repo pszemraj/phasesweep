@@ -30,7 +30,6 @@ from phasesweep.config import (
 from phasesweep.engine import (
     PhaseSweepError,
     ProcessCleanupUncertainError,
-    SamplerContinuationUnsupportedError,
     StudyStorageUnavailableError,
     TerminalReport,
     read_status,
@@ -887,33 +886,28 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     assert n < 30, f"expected early abort, got {n} trials"
 
 
-def test_stateful_sampler_continuation_guard_ignores_a_phase_that_draws_nothing() -> None:
-    """The mid-target resume refusal protects sampler state, so a fixed configuration has none."""
-    study = optuna.create_study()
-    study.set_user_attr(TRIAL_TARGET_ATTR, 3)
-    study.add_trial(optuna.trial.create_trial(value=1.0))
-    sampler = Sampler(type="tpe", seed=0, acknowledge_nonresumable=True)
-    drawing = Phase(
-        name="p",
-        n_trials=3,
-        sampler=sampler,
-        search_space={"x": IntParam(type="int", low=0, high=10)},
-    )
-    fixed = Phase(name="p", n_trials=3, sampler=sampler, fixed_overrides={"x": 1})
+def test_default_tpe_fixed_configuration_retries_without_sampler_continuation(
+    tmp_path: Path,
+) -> None:
+    """A failed, unseeded tpe fixed configuration retries when raised, drawing nothing to continue.
 
-    with pytest.raises(SamplerContinuationUnsupportedError, match="interrupted at 1/3"):
-        _validate_sampler_continuation(study, drawing)
-    _validate_sampler_continuation(study, fixed)
-    _validate_sampler_continuation(study, fixed.model_copy(update={"n_trials": 4}))
-
-
-def test_fixed_configuration_tpe_phase_runs_once_and_never_grows(tmp_path: Path) -> None:
-    """A default, unseeded tpe phase with an empty search space loads, runs its one trial, and stops.
-
-    A second trial of a fixed configuration would be an identical copy, so the
-    target that once let it resume mid-target is refused at load.
+    The stateful-sampler refusal protects sampler state a fixed configuration does not have, so
+    raising its target after a failure is the retry and not a mid-target continuation.
     """
-    trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
+    marker = tmp_path / "failed-once"
+    trainer = write_trainer(
+        tmp_path / "trainer.py",
+        f"""
+        import sys
+        from pathlib import Path
+
+        marker = Path({str(marker)!r})
+        if not marker.exists():
+            marker.touch()
+            sys.exit(1)
+        print("x=1.0")
+        """,
+    )
     phase = Phase(name="p", n_trials=1, max_consecutive_failures=1, fixed_overrides={"x": 1})
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     assert experiment.phases[0].sampler == Sampler()
@@ -925,10 +919,15 @@ def test_fixed_configuration_tpe_phase_runs_once_and_never_grows(tmp_path: Path)
     assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
     assert len(study.trials) == 1
 
-    with pytest.raises(ValueError, match="n_trials=4 with an empty search_space would run 4"):
-        make_experiment(
-            persistent=tmp_path, trainer=trainer, phases=[phase.model_copy(update={"n_trials": 4})]
-        )
+    retry = make_experiment(
+        persistent=tmp_path, trainer=trainer, phases=[phase.model_copy(update={"n_trials": 2})]
+    )
+    _validate_sampler_continuation(study, retry.phases[0])
+    assert run_experiment(retry)["p"].metric == 1.0
+
+    study = optuna.load_study(study_name="t::p", storage=storage)
+    assert study.user_attrs[TRIAL_TARGET_ATTR] == 2
+    assert [trial.state.name for trial in study.trials] == ["FAIL", "COMPLETE"]
 
 
 def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch):

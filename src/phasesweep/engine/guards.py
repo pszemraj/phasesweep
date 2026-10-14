@@ -97,7 +97,8 @@ def _preflight_existing_studies(
     :raises StudySchemaMismatchError: A phase's study uses an incompatible
         storage schema.
     :raises TrialTargetRegressionError: A phase's study already accepted a
-        higher trial target than the current config requests.
+        higher trial target than the current config requests, or a fixed
+        configuration asks for more attempts than its trials let it retry.
     :raises ProcessCleanupUncertainError: Stale-trial cleanup could not be
         confirmed safe for a phase's study.
     :raises PhaseSweepError: Multiple studies failed preflight for mixed

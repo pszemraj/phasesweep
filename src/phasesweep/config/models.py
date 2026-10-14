@@ -29,6 +29,7 @@ from phasesweep.config.search import (
     SearchParam,
     _placeholder_values_for,
     _validate_sampler_search_space,
+    fixed_configuration_target_refusal,
     phase_draws,
     sampler_search_space,
 )
@@ -1187,6 +1188,7 @@ class Experiment(_Frozen):
 
             _validate_sampler_search_space(phase)
             _validate_sampler_resumability(self.resolved_storage, phase)
+            _validate_in_memory_fixed_target(self.resolved_storage, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
             from phasesweep.evidence.mlflow import compile_query
@@ -1323,6 +1325,28 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
             "to accept that contract, or use sampler.type: random with a seed (resumable and "
             "reproducible) or sampler.type: grid."
         )
+
+
+def _validate_in_memory_fixed_target(storage: str | None, phase: Phase) -> None:
+    """Require ``n_trials: 1`` for a fixed configuration that has no durable study.
+
+    Every invocation on in-memory storage (``storage: null``) starts a fresh
+    study, so a fixed configuration there has nothing to retry and
+    :func:`phasesweep.config.search.fixed_configuration_target_refusal` would
+    demand one trial at every launch; the config says so at load. A persistent
+    study may hold failed attempts for a larger ``n_trials`` to replace, which
+    only a launch can see, so persistent storage is checked there.
+
+    :param str | None storage: Experiment-level storage URL, or ``None``.
+    :param Phase phase: Phase whose trial target is checked.
+    :raises ValueError: ``storage`` is in-memory and the phase, a fixed
+        configuration, asks for more than one trial.
+    """
+    if storage is not None:
+        return
+    refusal = fixed_configuration_target_refusal(phase, finished=0, completed=0)
+    if refusal is not None:
+        raise ValueError(refusal)
 
 
 def _validate_cli_override_values(experiment: Experiment, phase: Phase) -> None:
@@ -1615,7 +1639,8 @@ def _validate_trial_command_template(
     # When a phase has no overrides at all (no inherited, fixed, sampled, or
     # repeat keys) and no trainer_config to deliver, a constant trial_command
     # is legitimate: the phase is one fixed run of a trainer that takes no
-    # input. Repeated runs of one configuration always carry a repeat key.
+    # input. Only a failed attempt is run again; repeated runs that all count
+    # carry a repeat key.
     if not has_overrides:
         return
 
