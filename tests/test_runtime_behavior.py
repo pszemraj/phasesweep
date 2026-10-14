@@ -34,6 +34,7 @@ from phasesweep.engine import (
     read_status,
     read_winner,
 )
+from phasesweep.engine.attempts import _fail_stale_running_trial
 from phasesweep.engine.ledger import (
     _resolve_storage,
     claim_ledger,
@@ -90,6 +91,7 @@ from tests.conftest import (
     write_param_echo_trainer,
     write_trainer,
 )
+from tests.recovery_helpers import fabricate_stale_trial
 
 
 @pytest.mark.parametrize(
@@ -234,6 +236,41 @@ def test_grid_top_up_does_not_repeat_stored_assignments(tmp_path: Path) -> None:
     loaded = optuna.load_study(study_name="stable-grid::p", storage=storage)
     assert len(loaded.trials) == 4
     assert {trial.params["x"] for trial in loaded.trials} == {1, 2, 3, 4}
+
+
+def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
+    """Failing a stale trial that holds a grid's last unfinished point commits FAIL.
+
+    GridSampler.after_trial calls study.stop() once no grid point is left
+    unfinished, and study.stop() raises outside optimize, so recovery must not
+    report the committed FAIL as a storage failure.
+    """
+    search_space = {"x": CategoricalParam(type="categorical", choices=[1])}
+    exp = make_experiment(
+        experiment="gridstale",
+        workdir=tmp_path / "runs",
+        storage=f"journal:///{tmp_path / 'g.journal'}",
+        phases=[
+            Phase(name="p", n_trials=1, sampler=Sampler(type="grid"), search_space=search_space)
+        ],
+    )
+    _, _trial_dir, stale_number = fabricate_stale_trial(exp, "p", attempt_id="grid-attempt")
+    # Recovery reopens the phase study with its configured GridSampler, as the
+    # engine does; the stale trial must also hold a grid point, so give it the
+    # attrs GridSampler.before_trial would have written at ask time.
+    study = optuna.load_study(
+        study_name="gridstale::p",
+        storage=_resolve_storage(exp.resolved_storage),
+        sampler=_build_sampler(Sampler(type="grid"), search_space),
+    )
+    stale = study.get_trials(deepcopy=False)[stale_number]
+    study._storage.set_trial_system_attr(stale._trial_id, "search_space", {"x": [1]})
+    study._storage.set_trial_system_attr(stale._trial_id, "grid_id", 0)
+    stale = study.get_trials(deepcopy=False)[stale_number]
+
+    _fail_stale_running_trial(study, stale, failure_message="stale grid trial")
+
+    assert study.get_trials(deepcopy=False)[stale_number].state == optuna.trial.TrialState.FAIL
 
 
 @pytest.mark.parametrize(

@@ -1687,9 +1687,11 @@ def _dry_run_phase(
     log.info("DRY RUN phase=%s would launch %d trials", phase.name, remaining)
     sampled: dict[str, Any] | None = None
     if remaining > 0:
+        # The preview study is discarded unfinished: telling it would run
+        # GridSampler.after_trial, whose study.stop() is illegal outside
+        # optimize once a one-point grid is exhausted.
         sample_trial = study.ask()
         sampled = {name: _suggest(sample_trial, name, p) for name, p in phase.search_space.items()}
-        study.tell(sample_trial, state=optuna.trial.TrialState.FAIL)
         overrides = _composed_overrides(phase, sampled, inherited_winners)
         preview_dir = _phase_dir(experiment, phase.name) / "trial_dryrun"
         cmd = render_command(

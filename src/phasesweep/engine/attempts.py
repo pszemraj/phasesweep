@@ -1360,7 +1360,13 @@ def _fail_stale_running_trial(
     try:
         study.tell(trial.number, state=optuna.trial.TrialState.FAIL)
     except Exception as exc:
-        raise StudyStorageUnavailableError(failure_message) from exc
+        # When this trial held a grid's last unfinished point,
+        # GridSampler.after_trial calls study.stop(), which raises outside
+        # optimize after tell has already committed FAIL; only an uncommitted
+        # state is a storage failure.
+        committed = study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.FAIL,))
+        if not any(done.number == trial.number for done in committed):
+            raise StudyStorageUnavailableError(failure_message) from exc
 
 
 def _cleanup_recovered_trial_numbers(study: optuna.Study) -> set[int]:

@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from phasesweep import load_experiment, run_experiment
 from phasesweep.cli import cli as cli_main
 from phasesweep.config import (
+    CategoricalParam,
     Experiment,
     FloatParam,
     JsonEnvelopeExtractor,
@@ -490,6 +491,36 @@ def test_dry_run_does_not_launch(tmp_path, caplog, monkeypatch):
         ), logged
     assert winners["a"].params["lr"] == exp.phases[0].search_space["lr"].low
     assert winners["b"].effective_overrides["lr"] == winners["a"].params["lr"]
+
+
+@pytest.mark.parametrize(
+    "search_space",
+    [{"lr": CategoricalParam(type="categorical", choices=[0.1])}, {}],
+    ids=["one-categorical-choice", "empty-search-space"],
+)
+def test_dry_run_previews_a_one_point_grid(tmp_path, caplog, search_space):
+    """A one-point grid previews without the sampler stopping the study.
+
+    Exhausting the grid makes GridSampler.after_trial call study.stop(), which
+    raises outside optimize, so the preview must never finish its trial.
+    """
+    caplog.set_level(logging.INFO)
+    exp = make_experiment(
+        persistent=tmp_path,
+        trial_command="echo {overrides}",
+        phases=[
+            Phase(
+                name="p",
+                n_trials=1,
+                sampler=Sampler(type="grid"),
+                search_space=search_space,
+                fixed_overrides={"x": 1},
+            )
+        ],
+    )
+    winners = run_experiment(exp, dry_run=True)
+    assert set(winners) == {"p"}
+    assert any("DRY RUN example command" in r.message for r in caplog.records)
 
 
 @pytest.mark.integration
