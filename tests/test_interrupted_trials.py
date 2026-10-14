@@ -206,6 +206,19 @@ def test_stale_recovery_records_interrupted_unless_the_objective_recorded_a_fail
     assert _load_phase_policy_state(study).consecutive_failures == streak
 
 
+def test_an_interruption_between_two_failures_leaves_the_streak_at_two() -> None:
+    """Failure, stale-recovered interruption, failure replays as a streak of 2: the interruption neither counts nor resets it."""
+    study = optuna.create_study()
+    _finished(study, 1, "failure")
+    stale = _running_trial(study, None)
+    _record_stale_trial_outcome(study, stale)
+    study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
+    _finished(study, 3, "failure")
+
+    assert _trial_interrupted(study.trials[stale.number])
+    assert _load_phase_policy_state(study).consecutive_failures == 2
+
+
 def test_a_running_trial_is_not_interrupted_until_it_is_terminal() -> None:
     """Only a terminal trial counts as interrupted, even when its objective already recorded the label."""
     study = optuna.create_study()
