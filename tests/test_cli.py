@@ -39,7 +39,6 @@ from phasesweep.engine import (
     NoFeasibleTrialError,
     PhaseSweepError,
     ProcessCleanupUncertainError,
-    SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -576,12 +575,19 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
             search_space: {{ d: {{ type: categorical, choices: [4, 8] }} }}
           - name: lr
             n_trials: 2
-            sampler: {{ type: tpe, seed: 0, acknowledge_nonresumable: true }}
+            sampler: {{ type: tpe, seed: 0 }}
             search_space: {{ lr: {{ type: float, low: 0.1, high: 1.0 }} }}
           - name: wd
             n_trials: 2
             sampler: {{ type: random, seed: 3 }}
             search_space: {{ wd: {{ type: float, low: 0.0, high: 0.3 }} }}
+          - name: reg
+            n_trials: 2
+            n_jobs: 2
+            gpu_policy: none
+            allow_no_gpu_isolation: true
+            sampler: {{ type: cmaes, seed: 1 }}
+            search_space: {{ dropout: {{ type: float, low: 0.0, high: 0.3 }} }}
         """)
     )
 
@@ -589,15 +595,14 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "phase 'depth': sampler=grid (resumable)" in result.output
-    assert (
-        "phase 'lr': sampler=tpe seed=0 (non-resumable: run each target in one invocation)"
-        in result.output
-    )
+    assert "phase 'lr': sampler=tpe seed=0 (resumable, reproducible)" in result.output
     assert "phase 'wd': sampler=random seed=3 (resumable, reproducible)" in result.output
+    # Under several workers a model sampler's draws depend on which trials have finished.
+    assert "phase 'reg': sampler=cmaes seed=1 (resumable)" in result.output
 
 
 def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path) -> None:
-    """A phase with no search_space needs no seed or acknowledgement and is reported as fixed."""
+    """A phase with no search_space needs no seed and is reported as fixed."""
     p = tmp_path / "exp.yaml"
     p.write_text(
         textwrap.dedent(f"""
@@ -626,7 +631,7 @@ def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path)
 _TPE_STARTUP_WARNING = (
     "warning: Phase 'lr': tpe with n_trials=5 <= n_startup_trials=10, so every trial is "
     "sampled at random and TPE never fits its model. Use sampler.type: random with a seed "
-    "(resumable, same coverage), or set sampler.n_startup_trials below n_trials."
+    "(same coverage), or set sampler.n_startup_trials below n_trials."
 )
 _LR_SPACE = "{ lr: { type: float, low: 0.1, high: 1.0 } }"
 
@@ -673,9 +678,7 @@ def test_validate_warns_when_tpe_never_leaves_startup(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     lines = [line.strip() for line in result.output.splitlines()]
-    capability = lines.index(
-        "phase 'lr': sampler=tpe (non-resumable: run each target in one invocation)"
-    )
+    capability = lines.index("phase 'lr': sampler=tpe (resumable)")
     assert lines[capability + 1] == _TPE_STARTUP_WARNING
 
 
@@ -1236,7 +1239,7 @@ def test_dry_run_discloses_each_phases_sampler_capability(tmp_path, caplog):
             Phase(
                 name="lr",
                 n_trials=2,
-                sampler=Sampler(type="tpe", seed=0, acknowledge_nonresumable=True),
+                sampler=Sampler(type="tpe", seed=0),
                 search_space={"lr": FloatParam(type="float", low=0.1, high=1.0)},
             ),
             Phase(
@@ -1255,7 +1258,7 @@ def test_dry_run_discloses_each_phases_sampler_capability(tmp_path, caplog):
         r.getMessage() for r in caplog.records if r.getMessage().startswith("DRY RUN phase '")
     ] == [
         "DRY RUN phase 'depth': sampler=grid (resumable)",
-        "DRY RUN phase 'lr': sampler=tpe seed=0 (non-resumable: run each target in one invocation)",
+        "DRY RUN phase 'lr': sampler=tpe seed=0 (resumable, reproducible)",
         "DRY RUN phase 'wd': sampler=random seed=3 (resumable, reproducible)",
         "DRY RUN phase 'fixed': fixed configuration, no sampler draws (resumable)",
     ]
@@ -1898,7 +1901,6 @@ def test_expected_operational_failures_share_one_base() -> None:
         UnsafeProcessCleanupError,
         ExperimentLockBusyError,
         GpuConfigurationError,
-        SamplerContinuationUnsupportedError,
         StudyContextConflictError,
         StudyFingerprintMismatchError,
         StudySchemaMismatchError,

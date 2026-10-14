@@ -30,7 +30,6 @@ from phasesweep.engine import (
     NoFeasibleTrialError,
     ProcessCleanupUncertainError,
     PublishedStudyMissingError,
-    SamplerContinuationUnsupportedError,
     TerminalReport,
     TrackingTargetUnavailableError,
     TrialTargetRefusedError,
@@ -240,12 +239,6 @@ def _spawned_runner(
 @pytest.mark.parametrize(
     ("error", "code", "remediation_fragment"),
     [
-        pytest.param(
-            SamplerContinuationUnsupportedError("unsupported continuation"),
-            "sampler_continuation_unsupported",
-            "fresh artifact root and local storage",
-            id="sampler",
-        ),
         pytest.param(
             TrackingTargetUnavailableError("MLflow tracking target is not ready"),
             "tracking_unavailable",

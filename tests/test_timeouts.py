@@ -308,12 +308,7 @@ def test_scheduler_deadline_decides_partial_winner_versus_failure_abort(
                 allow_incomplete_on_timeout=True,
                 gpu_policy="none",
                 allow_no_gpu_isolation=True,
-                sampler=Sampler(
-                    type="tpe",
-                    seed=7,
-                    n_startup_trials=10,
-                    acknowledge_nonresumable=True,
-                ),
+                sampler=Sampler(type="tpe", seed=7, n_startup_trials=10),
                 search_space={"x": IntParam(type="int", low=1, high=3)},
             ),
             Phase(

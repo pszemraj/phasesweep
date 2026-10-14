@@ -23,7 +23,6 @@ from phasesweep.engine import (
     NoFeasibleTrialError,
     PublicationIntegrityError,
     PublishedStudyMissingError,
-    SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudySchemaMismatchError,
     TrialEvidenceMissingError,
@@ -70,8 +69,8 @@ _PLACEHOLDERS = "placeholders until 'a' publishes a winner: a_x"
 _RUNNING_WARNING = (
     "DRY RUN warning: phase={name} has 1 RUNNING attempt(s) that a real run recovers before it "
     "checks the phase, as failed where the trial recorded a failure and otherwise as "
-    "interrupted, which reruns; they are counted that way, and its accepted target, sampler "
-    "continuation and abort state are not checked"
+    "interrupted, which reruns; they are counted that way, and its accepted target and abort "
+    "state are not checked"
 )
 
 
@@ -542,22 +541,15 @@ def test_lowered_target_is_refused_as_a_run_refuses(tmp_path: Path) -> None:
     _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
 
 
-@pytest.mark.parametrize(
-    ("target", "match"),
-    [
-        pytest.param(4, "interrupted at 2/4", id="interrupted-mid-target"),
-        pytest.param(2, "raises its accepted target from 2 to 4", id="target-raised"),
-    ],
-)
-def test_stateful_sampler_continuation_is_refused_as_a_run_refuses(
-    tmp_path: Path, target: int, match: str
+@pytest.mark.parametrize("target", [4, 2], ids=["interrupted-mid-target", "target-raised"])
+def test_tpe_phase_cut_short_or_raised_previews_its_remaining_trials(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, target: int
 ) -> None:
-    """A tpe phase cut short, or raised past its target, gives the real run's refusal."""
-    tpe = Sampler(type="tpe", seed=0, acknowledge_nonresumable=True)
-    experiment = _persistent(tmp_path, _phase("a", 4, sampler=tpe))
+    """A tpe phase cut short, or raised past its target, previews the trials it still needs."""
+    experiment = _persistent(tmp_path, _phase("a", 4, sampler=Sampler(type="tpe", seed=0)))
     _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=target)
 
-    _refusals_match(experiment, tmp_path, SamplerContinuationUnsupportedError, match)
+    assert _preview(experiment, tmp_path, caplog)[-1] == "DRY RUN phase=a would launch 2 trials"
 
 
 @pytest.mark.parametrize("persistent", [True, False], ids=["persistent", "in-memory"])
@@ -686,12 +678,11 @@ def test_publication_the_ledger_cannot_back_is_refused_as_a_run_refuses(
 
 
 def test_first_refusal_is_the_one_a_run_gives(tmp_path: Path) -> None:
-    """A tpe phase cut short and a later oversized fixed configuration: the run names the tpe phase."""
-    tpe = Sampler(type="tpe", seed=0, acknowledge_nonresumable=True)
-    experiment = _persistent(tmp_path, _phase("a", 4, sampler=tpe), _phase("b", 3, fixed=True))
+    """A lowered target and a later oversized fixed configuration: the run names the lowered target."""
+    experiment = _persistent(tmp_path, _phase("a", 2), _phase("b", 3, fixed=True))
     _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=4)
 
-    _refusals_match(experiment, tmp_path, SamplerContinuationUnsupportedError, "interrupted at 2/4")
+    _refusals_match(experiment, tmp_path, TrialTargetRefusedError, "already accepted a target of 4")
 
 
 def test_several_refused_studies_are_reported_together_as_a_run_reports_them(

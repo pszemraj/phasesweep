@@ -498,8 +498,8 @@ def _truncate_incomplete_journal_record(lock: _JournalLock) -> tuple[Path, int] 
 _JOURNAL_LOCK_WAIT_SECONDS = 30.0
 
 #: How often a repair refreshes the journal's modification time while it
-#: holds Optuna's journal lock. Optuna 4.2 and later force-release a lock
-#: whose journal a waiting writer has seen unchanged for 30 seconds.
+#: holds Optuna's journal lock. Optuna force-releases a lock whose journal a
+#: waiting writer has seen unchanged for 30 seconds.
 _JOURNAL_LOCK_REFRESH_SECONDS = 1.0
 
 
@@ -508,11 +508,10 @@ class _JournalLock:
 
     Optuna's lock is a ``<journal>.lock`` symlink to the journal that records
     no owner. Its ``acquire`` has no timeout, so a lock a killed writer left
-    behind can block it forever: Optuna 4.0 and 4.1 never release a stale
-    lock, and later releases retry forever when the symlink dangles. Those
-    later releases also remove a lock whose journal a waiting writer has seen
-    unchanged for 30 seconds, then take their own, and a repair can hold the
-    lock that long on a large journal.
+    behind can block it forever: Optuna retries forever when the symlink
+    dangles. Optuna also removes a lock whose journal a waiting writer has
+    seen unchanged for 30 seconds, then takes its own, and a repair can hold
+    the lock that long on a large journal.
 
     :meth:`acquire` therefore waits at most :data:`_JOURNAL_LOCK_WAIT_SECONDS`
     and never removes a lock it did not take. The journal's modification time

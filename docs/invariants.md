@@ -125,7 +125,7 @@ Recovery signals nothing for an attempt only on a durable lifecycle state that p
 
 Environment preflight finishes before the generation claim, and the continuation preflight finishes before the generation is marked running or any attempt is registered.
 
-**Held by:** `engine.run._run_experiment_outcome`, which calls `_preflight_missing_reached_phase_environments` before `engine.generation._claim_generation`, then `engine.guards._preflight_existing_studies`, `engine.evidence._validate_selection_evidence`, `engine.resume._reject_bound_descendant_topups`, `engine.resume._reject_unsupported_sampler_topups`, `engine.resume._preflight_skipped_winners`, and `engine.resume._preflight_reached_fingerprint` before the running state\
+**Held by:** `engine.run._run_experiment_outcome`, which calls `_preflight_missing_reached_phase_environments` before `engine.generation._claim_generation`, then `engine.guards._preflight_existing_studies`, `engine.evidence._validate_selection_evidence`, `engine.resume._reject_bound_descendant_topups`, `engine.resume._preflight_skipped_winners`, and `engine.resume._preflight_reached_fingerprint` before the running state\
 **Tests:** `tests/test_runtime_behavior.py::test_existing_tree_preflights_missing_reached_phase_before_claim_or_topup`, `tests/test_trial_evidence.py::test_topup_refuses_a_candidate_whose_evidence_left_the_tree`
 
 `claim_ledger` runs before environment preflight, and the generation claim runs before the continuation chain, so the chain guards the running state and the attempts, not either claim.

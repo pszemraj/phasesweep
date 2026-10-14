@@ -9,14 +9,9 @@ from typing import Any, Literal, NamedTuple, TypedDict
 import optuna
 
 from phasesweep.config import Phase
-from phasesweep.config.search import (
-    NON_RESUMABLE_SAMPLERS,
-    fixed_configuration_target_refusal,
-    phase_draws,
-)
+from phasesweep.config.search import fixed_configuration_target_refusal
 from phasesweep.engine.errors import (
     OperatorAction,
-    SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     TrialTargetRefusedError,
@@ -27,11 +22,7 @@ from phasesweep.engine.fingerprints import (
     _changed_payload_keys,
     _render_changed_values,
 )
-from phasesweep.engine.optuna import (
-    _completed_trial_count,
-    _drawn_trial_count,
-    _finished_trial_count,
-)
+from phasesweep.engine.optuna import _completed_trial_count, _finished_trial_count
 from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GENERATION_ID_ATTR,
@@ -481,55 +472,6 @@ def _validate_fixed_configuration_target(phase: Phase, *, finished: int, complet
     refusal = fixed_configuration_target_refusal(phase, finished=finished, completed=completed)
     if refusal is not None:
         raise TrialTargetRefusedError(refusal)
-
-
-def _validate_sampler_continuation(study: optuna.Study, phase: Phase) -> None:
-    """Reject any cross-process continuation of a partially complete stateful study.
-
-    TPE and CMA-ES suggestions depend on process-local RNG/optimizer state that
-    Optuna storage does not persist. Recreating a seeded sampler in a fresh
-    process restarts that stream, so a mid-target resume can exactly repeat
-    already-evaluated startup suggestions and spend the remaining budget on
-    duplicates. Until PhaseSweep persists real sampler continuation state, a
-    stateful phase is restartable only before its first draw or once every draw
-    of its accepted target was made; a rerun of an interrupted trial reuses its
-    source's params and needs no sampler state. A phase with an empty search
-    space draws nothing, so it has no sampler state to lose and resumes freely;
-    how far it may be raised is :func:`_validate_fixed_configuration_target`'s rule.
-
-    :param optuna.Study study: Existing study whose drawn-trial count is checked.
-    :param Phase phase: Phase config supplying the sampler type and trial target.
-    :raises SamplerContinuationUnsupportedError: The phase draws from a stateful
-        sampler (``tpe`` or ``cmaes``) and either raises its previously accepted
-        trial target or was interrupted before drawing all of it.
-    """
-    drawn = _drawn_trial_count(study.get_trials(deepcopy=False))
-    if phase.sampler.type not in NON_RESUMABLE_SAMPLERS or not phase_draws(phase) or drawn == 0:
-        return
-
-    accepted_target = _accepted_trial_target(study)
-    partial_decision = _load_accepted_partial_decision(study)
-    if partial_decision is not None and phase.n_trials == partial_decision.trial_target:
-        # An accepted partial timeout is terminal at its frozen target.
-        # Identical replay launches no suggestions, so no process-local
-        # sampler state needs to be reconstructed.
-        return
-    if phase.n_trials > accepted_target:
-        raise SamplerContinuationUnsupportedError(
-            f"Phase {phase.name!r} uses {phase.sampler.type!r} and raises its accepted target "
-            f"from {accepted_target} to {phase.n_trials} terminal trial(s). PhaseSweep cannot "
-            "reproduce this sampler's process-local continuation state safely. Use a new "
-            "experiment name, or run the full target in one invocation."
-        )
-    if drawn < accepted_target:
-        raise SamplerContinuationUnsupportedError(
-            f"Phase {phase.name!r} uses {phase.sampler.type!r} and was interrupted at "
-            f"{drawn}/{accepted_target} terminal trial(s). PhaseSweep cannot reconstruct "
-            "this sampler's exact process-local continuation state, so resuming could "
-            "re-evaluate identical suggestions and waste the remaining budget. Use a new "
-            "experiment name (optionally with a stateless random/grid sampler), or run the "
-            "full target in one uninterrupted invocation."
-        )
 
 
 def _record_trial_target(study: optuna.Study, phase: Phase) -> None:

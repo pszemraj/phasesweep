@@ -294,11 +294,6 @@ def sampler_search_space(phase: Phase) -> dict[str, SearchParam]:
     return space
 
 
-# Samplers whose suggestions depend on process-local RNG/optimizer state that
-# Optuna storage does not persist. `phasesweep.engine.study_policy.
-# _validate_sampler_continuation` refuses to resume a phase that draws from one
-# of these mid-target, so each trial target must be run in a single invocation.
-NON_RESUMABLE_SAMPLERS = frozenset({"tpe", "cmaes"})
 # Samplers that draw randomly and therefore need an explicit seed to make a
 # durable study reproducible. `grid` is excluded: it enumerates a fixed matrix.
 STOCHASTIC_SAMPLERS = frozenset({"tpe", "random", "cmaes"})
@@ -318,35 +313,6 @@ class Sampler(_Frozen):
             "sampler types never read it and must leave it at the default."
         ),
     )
-    acknowledge_nonresumable: bool = Field(
-        default=False,
-        description=(
-            "Acknowledge that this sampler's trial target must run in one "
-            "invocation. TPE and CMA-ES suggestions depend on process-local "
-            "state Optuna storage does not persist, so PhaseSweep refuses to "
-            "resume such a phase mid-target. Required for sampler.type 'tpe' "
-            "or 'cmaes' on persistent storage when the phase has a "
-            "search_space; rejected for 'grid' and 'random', which resume safely."
-        ),
-    )
-
-    @model_validator(mode="after")
-    def _validate_acknowledgement_applies(self) -> Sampler:
-        """Reject an acknowledgement of a restriction this sampler does not impose.
-
-        :raises ValueError: ``acknowledge_nonresumable`` is set for a sampler
-            type outside :data:`NON_RESUMABLE_SAMPLERS`.
-        :return Sampler: Self, unchanged.
-        """
-        if self.acknowledge_nonresumable and self.type not in NON_RESUMABLE_SAMPLERS:
-            raise ValueError(
-                f"sampler.acknowledge_nonresumable is set for sampler.type={self.type!r}, "
-                "which resumes safely: PhaseSweep reattaches it to an existing study and "
-                "tops the study up. Only "
-                f"{sorted(NON_RESUMABLE_SAMPLERS)} carry the run-the-target-in-one-invocation "
-                "contract this flag acknowledges. Remove acknowledge_nonresumable."
-            )
-        return self
 
     @model_validator(mode="after")
     def _validate_n_startup_trials_applies(self) -> Sampler:
@@ -391,6 +357,9 @@ def sampler_capability_line(phase: Phase) -> str:
 
     Shared by ``phasesweep validate`` and ``phasesweep run --dry-run`` so both
     surfaces state the same contract in the same words before any trial runs.
+    Every phase resumes. A seeded phase is reproducible too, except TPE and
+    CMA-ES under ``n_jobs`` above 1, whose draws depend on which trials have
+    finished when each one is drawn.
 
     :param Phase phase: Phase whose sampler capability is described.
     :return str: One line naming the phase and either its sampler type, seed,
@@ -401,9 +370,7 @@ def sampler_capability_line(phase: Phase) -> str:
         return f"phase {phase.name!r}: fixed configuration, no sampler draws (resumable)"
     sampler = phase.sampler
     seed = "" if sampler.seed is None else f" seed={sampler.seed}"
-    if sampler.type in NON_RESUMABLE_SAMPLERS:
-        capability = "non-resumable: run each target in one invocation"
-    elif sampler.seed is None:
+    if sampler.seed is None or (sampler.type in ("tpe", "cmaes") and phase.n_jobs > 1):
         capability = "resumable"
     else:
         capability = "resumable, reproducible"
@@ -438,8 +405,8 @@ def sampler_warnings(phase: Phase) -> list[str]:
         warnings.append(
             f"Phase {phase.name!r}: tpe with n_trials={phase.n_trials} <= "
             f"n_startup_trials={sampler.n_startup_trials}, so every trial is sampled at random "
-            "and TPE never fits its model. Use sampler.type: random with a seed (resumable, "
-            "same coverage), or set sampler.n_startup_trials below n_trials."
+            "and TPE never fits its model. Use sampler.type: random with a seed (same "
+            "coverage), or set sampler.n_startup_trials below n_trials."
         )
     repeats = phase.repeats
     if repeats is not None and phase.max_consecutive_failures <= len(repeats.values):

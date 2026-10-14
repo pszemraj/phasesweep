@@ -42,7 +42,6 @@ from phasesweep.engine.errors import (
     OperatorAction,
     PhaseSweepError,
     PublishedStudyMissingError,
-    SamplerContinuationUnsupportedError,
     StudyContextConflictError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
@@ -81,7 +80,6 @@ FailureCode: TypeAlias = Literal[
     "storage_unavailable",
     "tracking_unavailable",
     "published_study_missing",
-    "sampler_continuation_unsupported",
     "trial_target_refused",
     "experiment_busy",
     "trainer_failed",
@@ -212,7 +210,6 @@ _FAILURE_CODES: tuple[tuple[type[PhaseSweepError], FailureCode], ...] = (
     (TrackingTargetUnavailableError, "tracking_unavailable"),
     # An unwritable workdir still fits the storage category.
     (ActiveAttemptPersistenceError, "storage_unavailable"),
-    (SamplerContinuationUnsupportedError, "sampler_continuation_unsupported"),
     (TrialTargetRefusedError, "trial_target_refused"),
     (NoFeasibleTrialError, "trainer_failed"),
 )

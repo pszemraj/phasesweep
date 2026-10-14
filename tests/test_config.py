@@ -837,27 +837,15 @@ def _sampler_policy_experiment(
         pytest.param({"type": "tpe"}, "requires an explicit sampler.seed", id="tpe_unseeded"),
         pytest.param({"type": "cmaes"}, "requires an explicit sampler.seed", id="cmaes_unseeded"),
         pytest.param({"type": "random"}, "requires an explicit sampler.seed", id="random_unseeded"),
-        pytest.param(
-            {"type": "tpe", "seed": 0},
-            "requires sampler.acknowledge_nonresumable: true",
-            id="tpe_unacknowledged",
-        ),
-        pytest.param(
-            {"type": "cmaes", "seed": 1},
-            "requires sampler.acknowledge_nonresumable: true",
-            id="cmaes_unacknowledged",
-        ),
     ],
 )
-def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
+def test_persistent_storage_rejects_unseeded_samplers(
     tmp_path: Path, sampler: JsonObject | None, message: str
 ) -> None:
-    """Persistent storage must state the sampler contract at config load, not mid-run.
+    """Persistent storage refuses an unseeded stochastic sampler at config load.
 
-    An unseeded stochastic sampler makes a durable study irreproducible, and
-    TPE/CMA-ES hold process-local state Optuna storage does not persist, so
-    ``_validate_sampler_continuation`` hard-rejects a mid-target resume — but
-    only after the operator has already been interrupted.
+    The seed keys every draw by its position in the study, which is what lets
+    a durable study resume and grow without drawing a configuration twice.
     """
     storage = f"journal:///{tmp_path}/phases.journal"
     with pytest.raises(ValueError, match=message) as excinfo:
@@ -868,15 +856,13 @@ def test_persistent_storage_rejects_unseeded_and_unacknowledged_samplers(
 @pytest.mark.parametrize(
     "sampler",
     [
-        pytest.param({"type": "tpe", "seed": 0, "acknowledge_nonresumable": True}, id="tpe"),
-        pytest.param({"type": "cmaes", "seed": 1, "acknowledge_nonresumable": True}, id="cmaes"),
-        pytest.param({"type": "random", "seed": 3}, id="random_needs_no_acknowledgement"),
+        pytest.param({"type": "tpe", "seed": 0}, id="tpe"),
+        pytest.param({"type": "cmaes", "seed": 1}, id="cmaes"),
+        pytest.param({"type": "random", "seed": 3}, id="random"),
     ],
 )
-def test_persistent_storage_accepts_seeded_and_acknowledged_samplers(
-    tmp_path: Path, sampler: JsonObject
-) -> None:
-    """A seeded sampler with the required acknowledgement loads unchanged."""
+def test_persistent_storage_accepts_seeded_samplers(tmp_path: Path, sampler: JsonObject) -> None:
+    """A seeded sampler loads unchanged on persistent storage."""
     experiment = _sampler_policy_experiment(
         storage=f"journal:///{tmp_path}/phases.journal", sampler=sampler
     )
@@ -896,8 +882,8 @@ def test_sampler_seed_accepts_optuna_domain_boundaries(seed: int) -> None:
     assert Sampler(type="random", seed=seed).seed == seed
 
 
-def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_path: Path) -> None:
-    """Grid enumerates a fixed matrix and resumes from stored assignments, so it is exempt."""
+def test_persistent_storage_accepts_grid_without_seed(tmp_path: Path) -> None:
+    """Grid enumerates a fixed matrix, so it needs no seed."""
     experiment = _sampler_policy_experiment(
         storage=f"journal:///{tmp_path}/phases.journal",
         sampler={"type": "grid"},
@@ -905,7 +891,6 @@ def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_pat
         search_space={"lr": {"type": "float", "low": 0.0, "high": 1.0, "step": 0.5}},
     )
     assert experiment.phases[0].sampler.seed is None
-    assert experiment.phases[0].sampler.acknowledge_nonresumable is False
 
 
 @pytest.mark.parametrize(
@@ -917,10 +902,10 @@ def test_persistent_storage_accepts_grid_without_seed_or_acknowledgement(tmp_pat
         pytest.param({"type": "random"}, id="random"),
     ],
 )
-def test_empty_search_space_skips_seed_and_acknowledge_on_persistent_storage(
+def test_empty_search_space_skips_the_seed_on_persistent_storage(
     tmp_path: Path, sampler: JsonObject | None
 ) -> None:
-    """A fixed configuration draws nothing, so no seed or acknowledgement is owed."""
+    """A fixed configuration draws nothing, so no seed is owed."""
     experiment = _sampler_policy_experiment(
         storage=f"journal:///{tmp_path}/phases.journal",
         sampler=sampler,
@@ -928,7 +913,6 @@ def test_empty_search_space_skips_seed_and_acknowledge_on_persistent_storage(
         search_space={},
     )
     assert experiment.phases[0].sampler.seed is None
-    assert experiment.phases[0].sampler.acknowledge_nonresumable is False
 
 
 @pytest.mark.parametrize(
@@ -983,13 +967,6 @@ def test_in_memory_storage_keeps_the_sampler_block_optional(tmp_path: Path, stor
     experiment = load_experiment(write_yaml(tmp_path, body))
     assert experiment.phases[0].sampler.type == "tpe"
     assert experiment.phases[0].sampler.seed is None
-
-
-@pytest.mark.parametrize("sampler_type", ["grid", "random"])
-def test_acknowledge_nonresumable_rejected_on_resumable_samplers(sampler_type: str) -> None:
-    """The acknowledgement states a contract these samplers do not impose."""
-    with pytest.raises(ValidationError, match="acknowledge_nonresumable"):
-        Sampler(type=sampler_type, seed=0, acknowledge_nonresumable=True)  # type: ignore[arg-type]
 
 
 def test_metric_bounds_are_optional_finite_and_ordered() -> None:

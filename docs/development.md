@@ -82,7 +82,7 @@ An autouse fixture, `guard_runner_signals` in `tests/conftest.py`, fails any tes
 
 GitHub Actions intentionally has one Linux pull-request check job for Ruff linting, Ruff format checking, mypy, the whole-suite collection the tier guard hook runs, and the contract tests, all imported from `src/` without building the package. That test step runs on one Python version and stays within about 20 seconds; the full suite stays local to control CI cost. Live tests remain opt-in.
 
-The supported Optuna range is `>=4.0,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range; do not widen it without targeted validation.
+The supported Optuna range is `>=4.6,<4.10`. PhaseSweep's local storage and read-only inspection behavior depends on that range, and the position-seeded TPE and CMA-ES samplers override private Optuna names that `tests/test_draw_positions.py::test_the_optuna_internals_the_position_samplers_build_on_exist` pins; do not widen it without targeted validation.
 
 The W&B reader supports `>=0.28,<0.29`. Tests exercise that SDK's summary decoding and error behavior with controlled responses, plus supervised worker fixtures for deadlines, cleanup faults, and recovery; only the live W&B round trip reaches the service. Input tests use the real Hydra 1.3 parser and entrypoint; rendering itself has no Hydra runtime dependency.
 

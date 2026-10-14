@@ -6,15 +6,18 @@ chokepoint; nothing here opens a ledger.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import threading
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, assert_never
+from typing import TYPE_CHECKING, Any, assert_never
 
 import optuna
 from optuna.exceptions import ExperimentalWarning
+from optuna.samplers._lazy_random_state import LazyRandomState
 
 from phasesweep.config import (
     CategoricalParam,
@@ -38,6 +41,9 @@ from phasesweep.engine.state import (
     TrialStateName,
     _trial_interrupted,
 )
+
+if TYPE_CHECKING:
+    from optuna.samplers._cmaes import CmaClass
 
 
 @dataclass(frozen=True)
@@ -110,15 +116,6 @@ def _finished_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
     :return int: Number of trials in a state of :data:`~phasesweep.engine.state.TERMINAL_TRIAL_STATES`.
     """
     return sum(1 for trial in trials if _trial_count_state(trial) in TERMINAL_TRIAL_STATES)
-
-
-def _drawn_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
-    """Return the number of draw positions a study has used: its trials that are not reruns.
-
-    :param Iterable[optuna.trial.FrozenTrial] trials: Every trial of one study.
-    :return int: Number of trials without :data:`~phasesweep.engine.state.RERUN_OF_ATTR`.
-    """
-    return sum(1 for trial in trials if RERUN_OF_ATTR not in trial.user_attrs)
 
 
 def _completed_trial_count(trials: Iterable[optuna.trial.FrozenTrial]) -> int:
@@ -398,6 +395,184 @@ class _PositionGridSampler(optuna.samplers.GridSampler):
         return
 
 
+class _ThreadRandomState(threading.local):
+    """The random state the calling thread's draw in progress seeded."""
+
+    state: LazyRandomState | None = None
+
+    def current(self) -> LazyRandomState:
+        """Return the calling thread's random state.
+
+        :raises RuntimeError: No draw on this thread seeded one.
+        :return LazyRandomState: The state the draw in progress seeded.
+        """
+        if self.state is None:
+            raise RuntimeError("A position-seeded sampler drew before it seeded its random state.")
+        return self.state
+
+
+class _PositionTPESampler(optuna.samplers.TPESampler):
+    """Seeded TPE whose every random choice is a function of the trial's draw position.
+
+    Stock TPE draws its startup trials and its candidates from two streams
+    that restart at the seed in every process, so a resumed study would draw
+    its first configurations again. Here the startup draws come from
+    :class:`_PositionRandomSampler` and each candidate draw from a stream
+    seeded by its position, per thread, so a resumed or enlarged study draws
+    no configuration twice, and at ``n_jobs: 1`` draws what an uninterrupted
+    one would have, given the same trial values.
+    """
+
+    def __init__(self, *, seed: int, n_startup_trials: int, constant_liar: bool) -> None:
+        """Build the stock sampler, then key its two random sources by draw position.
+
+        :param int seed: Base seed supplied by the phase's sampler config.
+        :param int n_startup_trials: Random trials before TPE fits its model.
+        :param bool constant_liar: Whether running trials count as pessimistic observations.
+        """
+        self._thread_rng = _ThreadRandomState()
+        super().__init__(seed=seed, n_startup_trials=n_startup_trials, constant_liar=constant_liar)
+        self._base_seed = seed
+        self._random_sampler = _PositionRandomSampler(seed=seed)
+
+    @property
+    def _rng(self) -> LazyRandomState:
+        """Return the stream the calling thread's candidate draw seeded.
+
+        :return LazyRandomState: That thread's position-seeded state.
+        """
+        return self._thread_rng.current()
+
+    @_rng.setter
+    def _rng(self, value: LazyRandomState) -> None:
+        """Set the calling thread's candidate stream.
+
+        :param LazyRandomState value: The state its next candidate draw uses.
+        """
+        self._thread_rng.state = value
+
+    def reseed_rng(self) -> None:
+        """Do nothing: every draw seeds its own stream from its draw position."""
+        return
+
+    def sample_independent(
+        self,
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        param_name: str,
+        param_distribution: optuna.distributions.BaseDistribution,
+    ) -> object:
+        """Seed this thread's candidate stream from the draw position, then sample as TPE does.
+
+        :param optuna.Study study: The active study; its name is part of the seed.
+        :param optuna.trial.FrozenTrial trial: The trial being sampled for.
+        :param str param_name: Name of the parameter being sampled.
+        :param optuna.distributions.BaseDistribution param_distribution: The
+            parameter's distribution.
+        :return object: The sampled value.
+        """
+        position = _draw_position(study, trial)
+        label = f"tpe:{param_name}"
+        self._rng = LazyRandomState(
+            _position_seed(self._base_seed, study.study_name, position, label)
+        )
+        return super().sample_independent(study, trial, param_name, param_distribution)
+
+
+class _PositionCmaEsSampler(optuna.samplers.CmaEsSampler):
+    """Seeded CMA-ES whose every random choice is a function of the trial's draw position.
+
+    The optimizer itself already lives in storage. Stock CMA-ES seeds each ask
+    from a process-local stream plus the trial number, so a resumed study
+    searches differently from an uninterrupted one. Here each ask is seeded
+    from the trial's draw position, the independent draws come from
+    :class:`_PositionRandomSampler`, and the optimizer is restored from the
+    newest generation's snapshot.
+    """
+
+    def __init__(self, *, seed: int) -> None:
+        """Build the stock sampler with a position-keyed independent sampler and ask stream.
+
+        :param int seed: Base seed supplied by the phase's sampler config.
+        """
+        self._thread_rng = _ThreadRandomState()
+        super().__init__(seed=seed, independent_sampler=_PositionRandomSampler(seed=seed))
+        self._base_seed = seed
+
+    @property
+    def _cma_rng(self) -> LazyRandomState:
+        """Return the stream the calling thread's relative draw seeded.
+
+        :return LazyRandomState: That thread's position-seeded state.
+        """
+        return self._thread_rng.current()
+
+    @_cma_rng.setter
+    def _cma_rng(self, value: LazyRandomState) -> None:
+        """Set the calling thread's relative-draw stream.
+
+        :param LazyRandomState value: The state its next relative draw uses.
+        """
+        self._thread_rng.state = value
+
+    def sample_relative(
+        self,
+        study: optuna.Study,
+        trial: optuna.trial.FrozenTrial,
+        search_space: dict[str, optuna.distributions.BaseDistribution],
+    ) -> dict[str, object]:
+        """Sample as CMA-ES does, with the ask seeded by the draw position instead of the trial number.
+
+        The trial handed on is a copy numbered by position; its trial id is the
+        real one, so every storage write lands on the real trial.
+
+        :param optuna.Study study: The active study; its name is part of the seed.
+        :param optuna.trial.FrozenTrial trial: The trial being sampled for.
+        :param dict[str, optuna.distributions.BaseDistribution] search_space: The
+            relative search space.
+        :return dict[str, object]: The sampled parameters, empty when CMA-ES defers
+            to the independent sampler.
+        """
+        position = _draw_position(study, trial)
+        self._cma_rng = LazyRandomState(
+            _position_seed(self._base_seed, study.study_name, position, "cmaes")
+        )
+        positioned = copy.copy(trial)
+        positioned.number = position
+        return super().sample_relative(study, positioned, search_space)
+
+    def _restore_optimizer(
+        self, completed_trials: list[optuna.trial.FrozenTrial]
+    ) -> CmaClass | None:
+        """Restore the optimizer from the completed trial holding the newest generation's snapshot.
+
+        Stock CMA-ES restores from the highest-numbered snapshot. A rerun of the
+        trial that told a generation copies that trial's snapshot, so under
+        ``n_jobs > 1`` it can hold an older snapshot under a higher number than
+        a generation told meanwhile; the newest generation wins, ties to the
+        highest number.
+
+        :param list[optuna.trial.FrozenTrial] completed_trials: The study's
+            completed trials.
+        :return CmaClass | None: The restored optimizer, or None before any tell.
+        """
+        carriers = [
+            completed
+            for completed in completed_trials
+            if any(key.startswith(self._attr_key_optimizer) for key in completed.system_attrs)
+        ]
+        if not carriers:
+            return None
+        newest = max(
+            carriers,
+            key=lambda carrier: (
+                carrier.system_attrs[self._attr_key_generation],
+                carrier.number,
+            ),
+        )
+        return super()._restore_optimizer([newest])
+
+
 def _build_sampler(
     cfg: Sampler,
     search_space: dict[str, SearchParam],
@@ -419,6 +594,9 @@ def _build_sampler(
 
     Returns:
         A configured :class:`optuna.samplers.BaseSampler` subclass instance.
+        A seeded stochastic sampler draws by draw position, so a study resumes
+        and grows without drawing a configuration twice; an unseeded one is
+        Optuna's own, which only in-memory storage allows.
 
     Raises:
         ValueError: The validated grid search space cannot be enumerated.
@@ -431,7 +609,11 @@ def _build_sampler(
                 category=ExperimentalWarning,
                 message=r"Argument ``constant_liar`` is an experimental feature.*",
             )
-            return optuna.samplers.TPESampler(
+            if cfg.seed is None:
+                return optuna.samplers.TPESampler(
+                    n_startup_trials=cfg.n_startup_trials, constant_liar=(n_jobs > 1)
+                )
+            return _PositionTPESampler(
                 seed=cfg.seed,
                 n_startup_trials=cfg.n_startup_trials,
                 constant_liar=(n_jobs > 1),
@@ -443,7 +625,9 @@ def _build_sampler(
     if cfg.type == "grid":
         return _PositionGridSampler(grid_search_space(search_space), seed=cfg.seed)
     if cfg.type == "cmaes":
-        return optuna.samplers.CmaEsSampler(seed=cfg.seed)
+        if cfg.seed is None:
+            return optuna.samplers.CmaEsSampler()
+        return _PositionCmaEsSampler(seed=cfg.seed)
     assert_never(cfg.type)
 
 

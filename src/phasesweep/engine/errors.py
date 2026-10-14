@@ -166,12 +166,6 @@ class ExperimentLockBusyError(PhaseSweepError):
     default_action: ClassVar[OperatorAction] = OperatorAction.RETRY
 
 
-class SamplerContinuationUnsupportedError(PhaseSweepError):
-    """Raised when a stateful sampler cannot safely continue across invocations."""
-
-    default_action: ClassVar[OperatorAction] = OperatorAction.FRESH_NAMESPACE
-
-
 class TrialTargetRefusedError(PhaseSweepError):
     """Raised when a phase's trial target contradicts the trials its study already holds.
 

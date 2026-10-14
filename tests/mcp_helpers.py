@@ -34,8 +34,7 @@ from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_pro
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
 
-# Persistent storage rejects an unseeded stochastic sampler; seeded random is
-# reproducible and resumable, so it needs no non-resumable acknowledgement.
+# Persistent storage rejects an unseeded stochastic sampler.
 SEEDED_RANDOM = Sampler(type="random", seed=0)
 
 

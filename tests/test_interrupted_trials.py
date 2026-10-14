@@ -14,7 +14,6 @@ from phasesweep.engine.fingerprints import _phase_fingerprint
 from phasesweep.engine.ledger import _resolve_storage
 from phasesweep.engine.optuna import (
     _draw_positions,
-    _drawn_trial_count,
     _finished_trial_count,
     _trial_count_state,
 )
@@ -219,7 +218,7 @@ def test_an_interrupted_trial_is_counted_apart_and_never_toward_the_target() -> 
 
     assert [_trial_count_state(t) for t in trials] == ["FAIL", "INTERRUPTED", "WAITING"]
     assert _finished_trial_count(trials) == 1
-    assert _drawn_trial_count(trials) == 2
+    assert _draw_positions(trials) == {0: 0, 1: 1, 2: 1}
 
 
 def test_each_interrupted_trial_gets_exactly_one_waiting_rerun_carrying_its_draw() -> None:

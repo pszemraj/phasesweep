@@ -475,9 +475,7 @@ def _render_experiment_phases(experiment: Experiment, *, indent: str = "  ") -> 
         deps = f" inherits={p.inherits}" if p.inherits else ""
         sampling = f"sampler={p.sampler.type}" if phase_draws(p) else "(fixed configuration)"
         click.echo(f"{indent}- {p.name}: n_trials={p.n_trials} {sampling}{deps}")
-        # Capability disclosure: state the resume/reproduce contract before a
-        # trial runs, not after an interrupted operator hits the runtime
-        # continuation guard.
+        # Capability disclosure: state the resume/reproduce contract before a trial runs.
         click.echo(f"{indent}    {sampler_capability_line(p)}")
         for warning in sampler_warnings(p):
             click.echo(f"{indent}    warning: {warning}")

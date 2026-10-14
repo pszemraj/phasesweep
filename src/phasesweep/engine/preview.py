@@ -191,8 +191,6 @@ def _refuse_as_a_launch_would(
         attempts than it may retry.
     :raises StudyContextConflictError: An upstream top-up would invalidate a
         descendant study already bound to its winner.
-    :raises SamplerContinuationUnsupportedError: A stateful sampler's study
-        cannot continue.
     """
     studies = {name: record.study for name, record in recorded.items() if record.study is not None}
     if _artifact_root_binding_applies(experiment):
@@ -224,9 +222,6 @@ def _refuse_as_a_launch_would(
     _raise_collected_errors(errors)
     settled = {name: study for name, study in studies.items() if not recorded[name].running}
     resume_ops._reject_bound_descendant_topups(
-        experiment, from_phase=from_phase, existing_studies=settled
-    )
-    resume_ops._reject_unsupported_sampler_topups(
         experiment, from_phase=from_phase, existing_studies=settled
     )
     resume_ops._reject_fixed_targets_without_study(
@@ -355,7 +350,7 @@ def _preview_phase(
             "DRY RUN warning: phase=%s has %d RUNNING attempt(s) that a real run recovers "
             "before it checks the phase, as failed where the trial recorded a failure and "
             "otherwise as interrupted, which reruns; they are counted that way, and its "
-            "accepted target, sampler continuation and abort state are not checked",
+            "accepted target and abort state are not checked",
             phase.name,
             recorded.running,
         )

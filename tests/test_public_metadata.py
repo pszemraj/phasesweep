@@ -176,7 +176,6 @@ def test_engine_exports_all_typed_preflight_errors() -> None:
     """Engine callers can catch every typed preflight failure from the public API."""
     names = (
         "ExperimentLockBusyError",
-        "SamplerContinuationUnsupportedError",
         "StudyContextConflictError",
         "StudyFingerprintMismatchError",
         "StudySchemaMismatchError",

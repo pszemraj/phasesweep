@@ -33,7 +33,6 @@ from phasesweep.engine import (
     NoFeasibleTrialError,
     PublishedStudyMissingError,
     RunRequestError,
-    SamplerContinuationUnsupportedError,
     StudyFingerprintMismatchError,
     StudySchemaMismatchError,
     StudyStorageUnavailableError,
@@ -732,31 +731,6 @@ def test_populated_study_without_environment_identity_fails_closed(
     assert [trial.number for trial in study.get_trials(deepcopy=False)] == [0]
 
 
-def test_acknowledge_nonresumable_is_run_control_not_semantics() -> None:
-    """Toggling the acknowledgement must not move the phase fingerprint.
-
-    The flag never changes what a trial samples or means — on persistent
-    storage its legal value is fully determined by ``sampler.type`` — so
-    acknowledging an existing study's sampler must not invalidate that study.
-    """
-    from phasesweep.engine.fingerprints import _phase_semantic_payload
-
-    plain = make_experiment(sampler=Sampler(type="tpe", seed=0))
-    acknowledged = make_experiment(
-        sampler=Sampler(type="tpe", seed=0, acknowledge_nonresumable=True)
-    )
-    assert _phase_fingerprint(plain, plain.phases[0], {}) == _phase_fingerprint(
-        acknowledged, acknowledged.phases[0], {}
-    )
-    payload = _phase_semantic_payload(acknowledged, acknowledged.phases[0], {})
-    assert "acknowledge_nonresumable" not in payload["phase"]["sampler"]
-    # The semantic sampler fields still move the fingerprint.
-    reseeded = make_experiment(sampler=Sampler(type="tpe", seed=1, acknowledge_nonresumable=True))
-    assert _phase_fingerprint(acknowledged, acknowledged.phases[0], {}) != _phase_fingerprint(
-        reseeded, reseeded.phases[0], {}
-    )
-
-
 def test_json_equals_gate_scalar_types_move_the_phase_fingerprint() -> None:
     """A json_equals gate value's *type* is semantic, so it must be in the digest.
 
@@ -818,65 +792,52 @@ def test_n_trials_top_up_preserves_existing_trials(tmp_path: Path) -> None:
     assert len(finished) == 4, f"expected 4 trials after top-up, got {len(finished)}"
 
 
-# The runtime continuation guard keys only on NON_RESUMABLE_SAMPLERS
-# membership, so one stateful sampler stands for TPE and CMA-ES. Persistent
-# storage requires the config-level non-resumable acknowledgement, which does
-# not weaken that guard.
-_STATEFUL_SAMPLER = Sampler(type="tpe", seed=0, n_startup_trials=10, acknowledge_nonresumable=True)
+_SEEDED_TPE = Sampler(type="tpe", seed=0, n_startup_trials=10)
 
 
 @pytest.mark.integration
-def test_stateful_sampler_rejects_interrupted_resume_and_top_up(tmp_path: Path) -> None:
-    """A partially complete TPE/CMA-ES study can be neither resumed nor topped up.
-
-    Optuna storage does not persist process-local sampler state, so a fresh
-    process would restart the seeded suggestion stream and could re-evaluate
-    identical startup suggestions.
-    """
+def test_tpe_recovers_an_aborted_phase_by_raising_its_target(tmp_path: Path) -> None:
+    """A TPE phase that aborted continues when its target rises, drawing what one run of that target draws."""
     trainer = write_trainer(tmp_path / "trainer.py", "raise SystemExit(1)")
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     phase = Phase(
         name="p",
         n_trials=3,
         max_consecutive_failures=1,
-        sampler=_STATEFUL_SAMPLER,
+        sampler=_SEEDED_TPE,
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
     with pytest.raises(NoFeasibleTrialError, match="aborted"):
         run_experiment(experiment)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    assert study.user_attrs[TRIAL_TARGET_ATTR] == 3
-    assert len(study.trials) == 1
-
     write_constant_trainer(tmp_path)
-    with pytest.raises(SamplerContinuationUnsupportedError, match="interrupted at 1/3"):
-        run_experiment(experiment)
-
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    assert len(study.trials) == 1
-
     top_up = experiment.model_copy(update={"phases": [phase.model_copy(update={"n_trials": 4})]})
-    with pytest.raises(
-        SamplerContinuationUnsupportedError,
-        match="process-local continuation state.*new experiment name",
-    ):
-        run_experiment(top_up)
+    run_experiment(top_up)
+    control = make_experiment(
+        persistent=tmp_path / "control",
+        trainer=trainer,
+        phases=[phase.model_copy(update={"n_trials": 4})],
+    )
+    run_experiment(control)
 
-    study = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage))
-    assert len(study.trials) == 1
+    trials = optuna.load_study(study_name="t::p", storage=_resolve_storage(storage)).trials
+    expected = optuna.load_study(
+        study_name="t::p", storage=_resolve_storage(control.resolved_storage)
+    ).trials
+    assert [t.state.name for t in trials] == ["FAIL", "COMPLETE", "COMPLETE", "COMPLETE"]
+    assert [t.params for t in trials] == [t.params for t in expected]
 
 
 @pytest.mark.integration
-def test_stateful_sampler_completed_target_reruns_as_noop(tmp_path: Path) -> None:
-    """A stateful study that reached its accepted target republishes without new trials."""
+def test_tpe_completed_target_reruns_as_noop(tmp_path: Path) -> None:
+    """A TPE study that reached its accepted target republishes without new trials."""
     trainer = write_constant_trainer(tmp_path)
     storage = f"journal:///{tmp_path / 'studies.journal'}"
     phase = Phase(
         name="p",
         n_trials=2,
-        sampler=_STATEFUL_SAMPLER,
+        sampler=_SEEDED_TPE,
         search_space={"x": IntParam(type="int", low=0, high=10)},
     )
     experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])

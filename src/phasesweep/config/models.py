@@ -22,7 +22,6 @@ from phasesweep.config.common import (
     anchor_relative_path,
 )
 from phasesweep.config.search import (
-    NON_RESUMABLE_SAMPLERS,
     STOCHASTIC_SAMPLERS,
     CategoricalParam,
     Repeats,
@@ -1346,7 +1345,7 @@ class Experiment(_Frozen):
                 )
 
             _validate_sampler_search_space(phase)
-            _validate_sampler_resumability(self.resolved_storage, phase)
+            _validate_persistent_sampler_seed(self.resolved_storage, phase)
             _validate_in_memory_fixed_target(self.resolved_storage, phase)
             _validate_cli_override_values(self, phase)
             _validate_trial_command_template(self, phase, frozenset(inherited_origins))
@@ -1429,36 +1428,26 @@ def _sampled_locked_origins(inherited: Mapping[str, set[str]]) -> dict[str, set[
     return locked
 
 
-def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
-    """Require an explicit seed, and a non-resumable acknowledgement, on persistent storage.
+def _validate_persistent_sampler_seed(storage: str | None, phase: Phase) -> None:
+    """Require an explicit seed for a stochastic sampler on persistent storage.
 
-    A persistent study outlives the process that created it, which makes two
-    sampler properties operator decisions rather than defaults:
+    A persistent study outlives the process that created it. An unseeded
+    ``tpe``/``random``/``cmaes`` phase draws a different sequence on every
+    invocation, so the durable trials it accumulates cannot be reproduced or
+    explained afterwards, and a resumed or enlarged study could draw a
+    configuration it already ran. A seed keys every draw by its position in
+    the study, so a resume draws what an uninterrupted run would have.
 
-    1. Reproducibility. An unseeded ``tpe``/``random``/``cmaes`` phase draws a
-       different sequence on every invocation, so the durable trials it
-       accumulates cannot be reproduced or explained afterwards.
-    2. Resumability. ``tpe`` and ``cmaes`` suggestions depend on process-local
-       RNG/optimizer state Optuna storage does not persist, so
-       :func:`phasesweep.engine.study_policy._validate_sampler_continuation` hard-rejects
-       resuming such a phase mid-target. That guard fires only *after* the
-       operator has been interrupted; requiring ``acknowledge_nonresumable``
-       here puts the run-the-target-in-one-invocation contract in front of them
-       at config load instead.
-
-    ``grid`` is exempt from both: it enumerates a fixed matrix and resumes from
-    stored grid assignments. A phase with an empty ``search_space`` is exempt
-    too, whatever its sampler: it draws nothing, so there is no sequence to
-    reproduce and no sampler state to lose. In-memory storage (``storage: null``,
-    the only in-memory spelling) is exempt entirely — there is no durable study
-    to reproduce or resume, so the ``sampler`` block stays optional and the
-    ``tpe`` default remains fine.
+    ``grid`` is exempt: it enumerates a fixed matrix. A phase with an empty
+    ``search_space`` is exempt too, whatever its sampler: it draws nothing.
+    In-memory storage (``storage: null``, the only in-memory spelling) is
+    exempt entirely — there is no durable study to reproduce or resume, so the
+    ``sampler`` block stays optional and the ``tpe`` default remains fine.
 
     :param str | None storage: Experiment-level storage URL, or ``None``.
     :param Phase phase: Phase whose sampler contract is checked.
     :raises ValueError: ``storage`` is persistent and the phase draws from a
-        stochastic sampler without an explicit ``seed``, or from a
-        non-resumable one without ``acknowledge_nonresumable: true``.
+        stochastic sampler without an explicit ``seed``.
     """
     if storage is None or not phase_draws(phase):
         return
@@ -1471,17 +1460,6 @@ def _validate_sampler_resumability(storage: str | None, phase: Phase) -> None:
             "process that created it, so an unseeded stochastic sampler leaves trials nobody "
             "can reproduce or explain. Add an integer 'seed' to this phase's sampler block, "
             "or use sampler.type: grid to enumerate a fixed matrix."
-        )
-    if sampler.type in NON_RESUMABLE_SAMPLERS and not sampler.acknowledge_nonresumable:
-        raise ValueError(
-            f"Phase {phase.name!r}: sampler.type={sampler.type!r} with persistent storage "
-            "requires sampler.acknowledge_nonresumable: true. This sampler's "
-            "suggestions depend on process-local state Optuna storage does not persist, so "
-            "PhaseSweep refuses to resume the phase mid-target: an interrupted run cannot be "
-            "continued and n_trials cannot be raised later — each target must run in one "
-            "invocation. Add 'acknowledge_nonresumable: true' to this phase's sampler block "
-            "to accept that contract, or use sampler.type: random with a seed (resumable and "
-            "reproducible) or sampler.type: grid."
         )
 
 

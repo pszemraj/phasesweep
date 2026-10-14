@@ -10,7 +10,6 @@ set -euo pipefail
 
 limit=2000
 declare -A ceilings=(
-  [tests/test_fingerprint.py]=2027
   [tests/test_process_supervision.py]=2154
 )
 

@@ -47,16 +47,14 @@ def test_auto_storage_resolves_without_writing(
     assert _run_lock_paths(experiment) == _run_lock_paths(explicit)
 
 
-@pytest.mark.parametrize("invalid", ["provenance", "seed", "acknowledgement"])
+@pytest.mark.parametrize("invalid", ["provenance", "seed"])
 def test_auto_storage_requires_persistent_contract(invalid: str) -> None:
     payload = make_experiment(storage="auto").model_dump()
     if invalid == "provenance":
         payload["provenance"] = {}
     else:
-        payload["phases"][0]["sampler"] = (
-            Sampler(type="random") if invalid == "seed" else Sampler(type="tpe", seed=0)
-        ).model_dump()
-    with pytest.raises(ValidationError, match="provenance|seed|acknowledge_nonresumable"):
+        payload["phases"][0]["sampler"] = Sampler(type="random").model_dump()
+    with pytest.raises(ValidationError, match="provenance|seed"):
         Experiment.model_validate(payload)
 
 

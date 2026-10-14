@@ -1,14 +1,23 @@
-"""Draw positions: a rerun takes its source's position, so seeded random and grid draw the same set however often a phase is interrupted."""
+"""Draw positions: a rerun takes its source's position, so every seeded sampler draws the same configurations however often a phase is interrupted or enlarged."""
 
 from __future__ import annotations
 
 import contextlib
+import inspect
+import pickle
 
 import optuna
 import pytest
+from optuna.samplers._lazy_random_state import LazyRandomState
 
 from phasesweep.config import CategoricalParam, FloatParam, IntParam, Repeats, Sampler, SearchParam
-from phasesweep.engine.optuna import _build_sampler, _draw_positions, _suggest
+from phasesweep.engine.optuna import (
+    _build_sampler,
+    _draw_positions,
+    _position_seed,
+    _PositionCmaEsSampler,
+    _suggest,
+)
 from phasesweep.engine.state import RERUN_OF_ATTR
 
 _GRID_SPACE: dict[str, SearchParam] = {
@@ -90,7 +99,11 @@ def _run(
             _suggest(trial, name, param)
         if trial.number in interrupt_at and RERUN_OF_ATTR not in trial.user_attrs:
             raise _Interrupt
-        return 0.0
+        return sum(
+            (value - 0.3) ** 2
+            for value in trial.params.values()
+            if isinstance(value, int | float) and not isinstance(value, bool)
+        )
 
     with contextlib.suppress(_Interrupt):
         study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs)
@@ -228,3 +241,155 @@ def test_seeded_random_draws_the_same_set_however_it_is_interrupted(
     _resume(study, space, 8, n_jobs=n_jobs)
 
     assert _finished_draws(study) == _finished_draws(control)
+
+
+def test_seeded_random_draws_what_it_drew_before_draw_positions_existed() -> None:
+    """The position seed is the trial-number seed seeded random always used, so no seeded study changes its draws."""
+    assert _position_seed(11, "t::p", 3, "lr") == 2070613593
+    study = _study(_build_sampler(Sampler(type="random", seed=11), {}))
+    _run(study, {"lr": _RANDOM_SPACE["lr"]}, 4)
+    assert study.get_trials()[3].params["lr"] == 0.0030591554960112855
+
+
+_MODEL_SPACE: dict[str, SearchParam] = {
+    "a": FloatParam(type="float", low=-1.0, high=1.0),
+    "b": FloatParam(type="float", low=-1.0, high=1.0),
+    "k": IntParam(type="int", low=0, high=4),
+}
+_CMA_SPACE: dict[str, SearchParam] = {name: _MODEL_SPACE[name] for name in ("a", "b")}
+_TPE = Sampler(type="tpe", seed=5, n_startup_trials=4)
+_CMAES = Sampler(type="cmaes", seed=5)
+
+
+def _reopen(
+    study: optuna.Study, cfg: Sampler, space: dict[str, SearchParam], n_jobs: int = 1
+) -> optuna.Study:
+    """Open ``study`` again under a new sampler object, as a new process would.
+
+    :param optuna.Study study: Study whose storage is reopened.
+    :param Sampler cfg: Sampler config to build the new sampler from.
+    :param dict[str, SearchParam] space: The phase's search space.
+    :param int n_jobs: Optuna worker threads the sampler is built for.
+    :return optuna.Study: The same study under a fresh sampler.
+    """
+    return optuna.load_study(
+        study_name=study.study_name,
+        storage=study._storage,
+        sampler=_build_sampler(cfg, space, n_jobs),
+    )
+
+
+@pytest.mark.parametrize(
+    ("cfg", "space", "target", "interrupts"),
+    [
+        # Trial 2 is position 2, inside the four startup draws; trial 7 is position 6, after them.
+        pytest.param(_TPE, _MODEL_SPACE, 12, (2, 7), id="tpe"),
+        # Two floats give popsize 6: position 0 draws independently, positions 1-6 are generation 0,
+        # trial 3 is mid-generation, and trial 8 is position 7, the trial that tells generation 0.
+        pytest.param(_CMAES, _CMA_SPACE, 14, (3, 8), id="cmaes"),
+    ],
+)
+def test_model_samplers_resume_exactly_as_an_uninterrupted_run(
+    cfg: Sampler, space: dict[str, SearchParam], target: int, interrupts: tuple[int, int]
+) -> None:
+    """TPE and CMA-ES interrupted twice, each resume in a fresh sampler, draw what an uninterrupted run draws."""
+    control = _study(_build_sampler(cfg, space))
+    _run(control, space, target)
+
+    study = _study(_build_sampler(cfg, space))
+    _run(study, space, target, interrupt_at=frozenset({interrupts[0]}))
+    _resume(_reopen(study, cfg, space), space, target, interrupt_at=frozenset({interrupts[1]}))
+    _resume(_reopen(study, cfg, space), space, target)
+
+    assert len(study.get_trials()) == target + 2
+    assert _finished_draws(study) == _finished_draws(control)
+
+
+@pytest.mark.parametrize(
+    ("cfg", "space", "first", "target"),
+    [
+        pytest.param(_TPE, _MODEL_SPACE, 3, 12, id="tpe"),
+        pytest.param(_CMAES, _CMA_SPACE, 4, 14, id="cmaes"),
+    ],
+)
+def test_model_samplers_top_up_exactly_as_one_larger_run(
+    cfg: Sampler, space: dict[str, SearchParam], first: int, target: int
+) -> None:
+    """Raising the target of a finished TPE or CMA-ES phase draws what one run of the larger target draws."""
+    control = _study(_build_sampler(cfg, space))
+    _run(control, space, target)
+
+    study = _study(_build_sampler(cfg, space))
+    _run(study, space, first)
+    _resume(_reopen(study, cfg, space), space, target)
+
+    assert _finished_draws(study) == _finished_draws(control)
+
+
+@pytest.mark.parametrize(
+    ("cfg", "space"),
+    [pytest.param(_TPE, _MODEL_SPACE, id="tpe"), pytest.param(_CMAES, _CMA_SPACE, id="cmaes")],
+)
+def test_model_samplers_resume_under_two_workers_without_repeating_a_draw(
+    cfg: Sampler, space: dict[str, SearchParam]
+) -> None:
+    """Under ``n_jobs: 2`` a resume meets the target with one rerun per interruption and no repeated configuration."""
+    study = _study(_build_sampler(cfg, space, 2))
+    _run(study, space, 12, interrupt_at=frozenset({5}), n_jobs=2)
+    _resume(_reopen(study, cfg, space, 2), space, 12, n_jobs=2)
+
+    trials = study.get_trials()
+    complete = [tuple(sorted(t.params.items())) for t in trials if t.state.name == "COMPLETE"]
+    assert len(complete) == len(set(complete)) == 12
+    assert [t.user_attrs.get(RERUN_OF_ATTR) for t in trials].count(5) == 1
+
+
+def _carrier(
+    sampler: _PositionCmaEsSampler, number: int, generation: int, snapshot: str
+) -> optuna.trial.FrozenTrial:
+    """Build a completed trial holding a CMA-ES optimizer snapshot.
+
+    :param _PositionCmaEsSampler sampler: Sampler whose attribute keys are used.
+    :param int number: Trial number.
+    :param int generation: The trial's ``cma:generation``.
+    :param str snapshot: Stand-in object pickled as the optimizer.
+    :return optuna.trial.FrozenTrial: The trial.
+    """
+    attrs = sampler._split_optimizer_str(pickle.dumps(snapshot).hex())
+    trial = optuna.trial.create_trial(
+        value=0.0, system_attrs={**attrs, sampler._attr_key_generation: generation}
+    )
+    trial.number = number
+    return trial
+
+
+def test_cmaes_restores_the_newest_generation_not_the_highest_numbered_snapshot() -> None:
+    """A rerun of an older generation's tell trial, numbered after a newer tell, never rolls the optimizer back."""
+    sampler = _PositionCmaEsSampler(seed=0)
+    told_three = _carrier(sampler, 20, 3, "generation 3")
+    rerun_of_two = _carrier(sampler, 21, 2, "generation 2")
+    plain = optuna.trial.create_trial(value=0.0, system_attrs={sampler._attr_key_generation: 3})
+
+    assert sampler._restore_optimizer([told_three, rerun_of_two, plain]) == "generation 3"
+    assert sampler._restore_optimizer([plain]) is None
+
+
+def test_the_optuna_internals_the_position_samplers_build_on_exist() -> None:
+    """Fail loudly when an Optuna release renames a private name the position samplers override."""
+    tpe = optuna.samplers.TPESampler(seed=0)
+    assert isinstance(tpe._random_sampler, optuna.samplers.RandomSampler)
+    assert isinstance(tpe._rng, LazyRandomState)
+
+    independent = optuna.samplers.RandomSampler(seed=0)
+    cma = optuna.samplers.CmaEsSampler(seed=0, independent_sampler=independent)
+    assert cma._independent_sampler is independent
+    assert isinstance(cma._cma_rng, LazyRandomState)
+    assert (cma._attr_key_generation, cma._attr_key_optimizer) == (
+        "cma:generation",
+        "cma:optimizer",
+    )
+    assert list(inspect.signature(cma._restore_optimizer).parameters) == ["completed_trials"]
+
+    grid = optuna.samplers.GridSampler({"x": [0, 1]}, seed=0)
+    assert grid._search_space == {"x": [0, 1]}
+    assert len(grid._all_grids) == 2

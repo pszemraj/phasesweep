@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import stat
@@ -690,9 +689,9 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
 ) -> None:
     """A journal lock a killed writer left behind ends the repair in a bounded refusal.
 
-    Optuna 4.0 and 4.1 wait on such a lock forever, and later releases retry
-    forever when its symlink dangles, as a lock taken through a nested
-    relative journal path does. The repair gives up once its wait has run
+    Optuna retries forever when its symlink dangles, as a lock taken
+    through a nested relative journal path does, and waits out a grace
+    period before it takes over one that does not. The repair gives up once its wait has run
     out, leaves the lock and the journal as they were, and names the lock to
     remove. It runs in a thread so a wait that never ends fails the test
     instead of hanging the suite.
@@ -920,15 +919,13 @@ def test_waiting_optuna_writer_never_takes_over_a_long_repairs_journal_lock(
 ) -> None:
     """A writer waiting out its grace period gets the lock only once the repair releases it.
 
-    Optuna 4.2 and later remove a lock whose journal a waiting writer has
+    Optuna removes a lock whose journal a waiting writer has
     seen unchanged for its grace period, 30 seconds by default, and a
     repair of a large journal can hold the lock longer. The repair
     refreshes the journal's modification time while it holds the lock, so
     a real Optuna writer with a one-second grace period, waiting through
     three seconds of the repair, never takes it over.
     """
-    if "grace_period" not in inspect.signature(JournalFileSymlinkLock).parameters:
-        pytest.skip("Optuna before 4.2 never takes a journal lock over")
     materialized = materialize("current-journal", tmp_path, mode="tree")
     journal = ledger_file(materialized, "journal")
     complete = journal.read_bytes()

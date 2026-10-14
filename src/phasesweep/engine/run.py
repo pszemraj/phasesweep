@@ -415,11 +415,6 @@ def _run_experiment_outcome(
                 from_phase=from_phase,
                 existing_studies=existing_studies,
             )
-            resume_ops._reject_unsupported_sampler_topups(
-                experiment,
-                from_phase=from_phase,
-                existing_studies=existing_studies,
-            )
             resume_ops._reject_fixed_targets_without_study(
                 experiment,
                 from_phase=from_phase,

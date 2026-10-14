@@ -191,29 +191,6 @@ def _reject_bound_descendant_topups(
             )
 
 
-def _reject_unsupported_sampler_topups(
-    experiment: Experiment,
-    *,
-    from_phase: str | None,
-    existing_studies: dict[str, optuna.Study],
-) -> None:
-    """Reject stateful sampler continuation after bound-descendant checks.
-
-    :param Experiment experiment: Parsed experiment whose phase chain is scanned
-        from ``from_phase`` (or the start) onward.
-    :param str | None from_phase: Optional resume point; phases before it are skipped.
-    :param dict[str, optuna.Study] existing_studies: Existing Optuna studies keyed by
-        phase name, as returned by :func:`phasesweep.engine.guards._preflight_existing_studies`.
-    :raises SamplerContinuationUnsupportedError: A reached phase's study cannot
-        safely continue with its configured stateful sampler; delegated to
-        :func:`phasesweep.engine.study_policy._validate_sampler_continuation`.
-    """
-    for _index, phase in experiment.phases_from(from_phase):
-        study = existing_studies.get(phase.name)
-        if study is not None:
-            study_policy_ops._validate_sampler_continuation(study, phase)
-
-
 def _reject_fixed_targets_without_study(
     experiment: Experiment,
     *,

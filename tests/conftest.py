@@ -547,11 +547,8 @@ def make_experiment(
         )
         base.update(phase_overrides)
         if storage is not None and "sampler" not in base:
-            # Persistent storage rejects an unseeded stochastic sampler and
-            # requires acknowledge_nonresumable for tpe/cmaes, so the default
-            # tpe sampler cannot be the fixture default here. Seeded random is
-            # stochastic, reproducible, and resumable: it satisfies the policy
-            # without asking every caller to acknowledge anything.
+            # Persistent storage rejects an unseeded stochastic sampler, so the
+            # default unseeded tpe sampler cannot be the fixture default here.
             base["sampler"] = Sampler(type="random", seed=0)
         phases = [Phase(**base)]  # type: ignore[arg-type]
 

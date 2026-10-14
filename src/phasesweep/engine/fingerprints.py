@@ -157,10 +157,6 @@ def _semantic_phase_dump(phase: Phase) -> dict[str, Any]:
     :return dict[str, Any]: JSON-serializable semantic phase payload.
     """
     dump = {k: v for k, v in phase.model_dump(mode="json").items() if k not in _RUN_CONTROL_KEYS}
-    # acknowledge_nonresumable is run-control, not semantics: it never changes
-    # what a trial samples or means (on persistent storage its legal value is
-    # fully determined by sampler.type), so it must not invalidate a study.
-    dump["sampler"].pop("acknowledge_nonresumable", None)
     if phase.gpu_policy == "whole_node":
         tokens = phase.gpu_ids if phase.gpu_ids is not None else phase.gpu_devices
         dump["whole_node_device_count"] = len(tokens or [])

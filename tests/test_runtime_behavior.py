@@ -74,7 +74,6 @@ from phasesweep.engine.study_policy import (
     _consecutive_failure_threshold_tripped,
     _load_phase_policy_state,
     _record_recovery_boundary,
-    _validate_sampler_continuation,
 )
 from phasesweep.engine.trial import (
     ExecutedTrial,
@@ -328,20 +327,18 @@ def test_stale_trial_holding_last_grid_point_recovers(tmp_path: Path) -> None:
             "_PositionGridSampler",
             id="grid",
         ),
-        # tpe/cmaes are the point of these two cases, so they carry the
-        # acknowledgement persistent storage requires for a non-resumable sampler.
         pytest.param(
-            Sampler(type="tpe", seed=0, n_startup_trials=3, acknowledge_nonresumable=True),
+            Sampler(type="tpe", seed=0, n_startup_trials=3),
             {"x": CategoricalParam(type="categorical", choices=[1, 2])},
             1,
-            "TPESampler",
+            "_PositionTPESampler",
             id="tpe",
         ),
         pytest.param(
-            Sampler(type="cmaes", seed=0, acknowledge_nonresumable=True),
+            Sampler(type="cmaes", seed=0),
             {"x": IntParam(type="int", low=1, high=2)},
             1,
-            "CmaEsSampler",
+            "_PositionCmaEsSampler",
             id="cmaes",
         ),
     ],
@@ -414,7 +411,7 @@ def test_parallel_trials_e2e(tmp_path):
         n_trials=8,
         n_jobs=4,
         allow_no_gpu_isolation=True,
-        sampler=Sampler(type="tpe", seed=42, acknowledge_nonresumable=True),
+        sampler=Sampler(type="tpe", seed=42),
         search_space={"lr": FloatParam(type="float", low=1e-5, high=1e-2, log=True)},
     )
     winners = run_experiment(exp)
@@ -913,50 +910,6 @@ def test_max_consecutive_failures_aborts_phase(tmp_path):
     study = optuna.load_study(study_name="failtest::a", storage=_resolve_storage(storage))
     n = len(study.get_trials(deepcopy=False))
     assert n < 30, f"expected early abort, got {n} trials"
-
-
-def test_default_tpe_fixed_configuration_retries_without_sampler_continuation(
-    tmp_path: Path,
-) -> None:
-    """A failed, unseeded tpe fixed configuration retries when raised, drawing nothing to continue.
-
-    The stateful-sampler refusal protects sampler state a fixed configuration does not have, so
-    raising its target after a failure is the retry and not a mid-target continuation.
-    """
-    marker = tmp_path / "failed-once"
-    trainer = write_trainer(
-        tmp_path / "trainer.py",
-        f"""
-        import sys
-        from pathlib import Path
-
-        marker = Path({str(marker)!r})
-        if not marker.exists():
-            marker.touch()
-            sys.exit(1)
-        print("x=1.0")
-        """,
-    )
-    phase = Phase(name="p", n_trials=1, max_consecutive_failures=1, fixed_overrides={"x": 1})
-    experiment = make_experiment(persistent=tmp_path, trainer=trainer, phases=[phase])
-    assert experiment.phases[0].sampler == Sampler()
-    with pytest.raises(NoFeasibleTrialError, match="aborted"):
-        run_experiment(experiment)
-
-    storage = _resolve_storage(experiment.storage)
-    study = optuna.load_study(study_name="t::p", storage=storage)
-    assert study.user_attrs[TRIAL_TARGET_ATTR] == 1
-    assert len(study.trials) == 1
-
-    retry = make_experiment(
-        persistent=tmp_path, trainer=trainer, phases=[phase.model_copy(update={"n_trials": 2})]
-    )
-    _validate_sampler_continuation(study, retry.phases[0])
-    assert run_experiment(retry)["p"].metric == 1.0
-
-    study = optuna.load_study(study_name="t::p", storage=storage)
-    assert study.user_attrs[TRIAL_TARGET_ATTR] == 2
-    assert [trial.state.name for trial in study.trials] == ["FAIL", "COMPLETE"]
 
 
 def test_parallel_abort_stamps_environment_before_pruning(tmp_path, monkeypatch):
@@ -1881,10 +1834,7 @@ def test_categorical_value_keeps_its_type_across_every_persisted_surface(
     [
         pytest.param(Sampler(type="grid", seed=0), id="grid"),
         pytest.param(Sampler(type="random", seed=0), id="random"),
-        pytest.param(
-            Sampler(type="tpe", seed=0, acknowledge_nonresumable=True),
-            id="tpe",
-        ),
+        pytest.param(Sampler(type="tpe", seed=0), id="tpe"),
     ],
 )
 def test_categorical_suggestion_round_trips_through_storage_for_every_sampler(
