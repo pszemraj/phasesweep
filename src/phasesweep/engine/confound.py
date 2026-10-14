@@ -203,9 +203,9 @@ def _tie(
     ranked: Sequence[optuna.trial.FrozenTrial],
     winner: optuna.trial.FrozenTrial,
 ) -> dict[str, Any]:
-    """Check whether the trial-number tiebreak chose between distinct configs.
+    """Check whether the draw-position tiebreak chose between distinct configs.
 
-    Selection breaks exact ties by lower trial number. Tied trials that share
+    Selection breaks exact ties by lower draw position. Tied trials that share
     the winner's params are repeats of one configuration and change nothing;
     tied trials with other params mean the winner was chosen arbitrarily.
     Single trials carry no noise estimate, so ``within_noise`` is ``None``.
@@ -233,7 +233,7 @@ def _group_tie(
     """Check whether the winning repeat group stands clear of the other groups.
 
     ``tied_trials`` names the groups whose aggregate equals the winner's
-    exactly; the lowest member trial number broke that tie. ``within_noise``
+    exactly; the lowest member draw position broke that tie. ``within_noise``
     names the groups whose aggregate lies within two combined standard errors
     of the winner's, exact ties included. Each group is named by its last
     member. A group with the winner's params is another slot of the same
@@ -612,7 +612,7 @@ def _describe_flagged(block: Mapping[str, Any]) -> list[str]:
             tied = ", ".join(str(number) for number in detail["tied_trials"])
             lines.append(
                 f"tie: trial(s) {tied} matched the winner's value exactly with different "
-                "params, and the lower trial number won"
+                "params, and the lower draw position won"
             )
         else:
             lines.extend(_describe_group_tie(detail["tied_trials"], detail["within_noise"]))
@@ -631,7 +631,7 @@ def _describe_group_tie(tied: Sequence[int], noisy: Sequence[int]) -> list[str]:
         lines.append(
             f"tie: the repeat group(s) ending at trial(s) {', '.join(map(str, tied))} matched "
             "the winning group's aggregate exactly with different params, and the group "
-            "with the lowest trial number won"
+            "with the lowest draw position won"
         )
     untied = [number for number in noisy if number not in tied]
     if untied:

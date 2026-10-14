@@ -1505,7 +1505,7 @@ def test_status_trials_renders_rows_per_phase_and_keeps_publication_exit(
     ]
     rows = lines[lines.index(heading) + 2 :]
     assert [row.split()[:2] for row in rows] == [["0", "COMPLETE"], ["1", "COMPLETE"]]
-    # The fixture's two trials tie on the metric, and the tie goes to the lower trial number.
+    # The fixture's two trials tie on the metric, and the tie goes to the lower draw position.
     assert rows[0].endswith("*") and not rows[1].endswith("*")
 
     assert invoke_cli_boundary(["status", str(config_path)], monkeypatch) == 0

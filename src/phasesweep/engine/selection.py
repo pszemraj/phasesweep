@@ -107,19 +107,21 @@ def select_winner(
       2. The metric value must lie inside the metric's ``min``/``max`` bounds,
          and all constraint values (read from user_attrs) must satisfy theirs.
       3. Among survivors, argmin/argmax on metric.
-      4. Ties — exact float equality only — broken by lower trial_number.
+      4. Ties — exact float equality only — broken by lower draw position
+         (:func:`phasesweep.engine.optuna._draw_positions`), so the winner
+         never depends on which trials an interruption made rerun later.
 
     With ``repeats``, the ranked units are complete repeat groups: a
     configuration ranks only when it has one trial per repeat value and every
     one of them passes rules 1 and 2. Groups rank by the reducer over their
-    member metrics, exact ties go to the group with the lowest member trial
-    number, and the group's highest-numbered member names the winner.
+    member metrics, exact ties go to the group with the lowest member draw
+    position, and the group's highest-numbered member names the winner.
 
     Ordering is exact, never approximate. An absolute epsilon (say 1e-12)
     would fold everything within that distance of the optimum into one "tie"
     band, which silently reorders any objective whose natural scale sits at or
     below it: two genuinely different results at 1e-13 and 3e-13 would rank by
-    trial number rather than by value. PhaseSweep has no way to know a
+    draw position rather than by value. PhaseSweep has no way to know a
     config's meaningful resolution, so it does not guess one.
 
     The ranked population is also classified for confounds
@@ -177,6 +179,7 @@ def select_winner(
         )
 
     winning: RankedGroup | None = None
+    positions = _draw_positions(trials)
     if ranking is None:
         best_value = (
             min(_trial_value(t) for t in survivors)
@@ -185,10 +188,13 @@ def select_winner(
         )
         # Exact equality, not a tolerance band.
         tied = [t for t in survivors if _trial_value(t) == best_value]
-        best = min(tied, key=lambda t: t.number)
+        best = min(tied, key=lambda t: positions[t.number])
     else:
         sign = 1.0 if minimize else -1.0
-        winning = min(ranking.groups, key=lambda group: (sign * group.aggregate, group.numbers[0]))
+        winning = min(
+            ranking.groups,
+            key=lambda group: (sign * group.aggregate, min(positions[n] for n in group.numbers)),
+        )
         best = ranking.members[winning.representative][-1]
 
     constraint_vals = {

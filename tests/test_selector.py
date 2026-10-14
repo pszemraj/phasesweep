@@ -15,8 +15,11 @@ from phasesweep.engine.state import (
     GATES_ATTR,
     GENERATION_ID_ATTR,
     OBJECTIVE_PROVENANCE_ATTR,
+    RERUN_OF_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
+    TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
     constraint_attr,
 )
 from phasesweep.evidence.evaluation import EVIDENCE_PROVENANCE_SCHEMA_VERSION
@@ -178,7 +181,7 @@ def test_metric_ordering_preserves_representable_differences(
     """Any representable metric difference decides the winner, never the trial number.
 
     1e-13 and 3e-13 are 2e-13 apart, which an absolute 1e-12 tie epsilon would
-    swallow — the lower trial number would win regardless of which result was
+    swallow — the lower draw position would win regardless of which result was
     actually better.
     """
     exp = _make_exp(goal=goal)
@@ -204,6 +207,42 @@ def test_exact_tie_is_anchored_to_optimum_not_iteration_order():
 
     assert w.trial_number == 1
     assert w.params == {"x": 1}
+
+
+def _add_interrupted(study, params: dict[str, int]) -> None:  # noqa: ANN001
+    """Add a FAIL trial that recorded its params before an interruption stopped it."""
+    study.add_trial(
+        optuna.trial.create_trial(
+            params=params,
+            distributions={
+                name: optuna.distributions.IntDistribution(low=value, high=value)
+                for name, value in params.items()
+            },
+            user_attrs={
+                TRIAL_OUTCOME_ATTR: {
+                    "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
+                    "sequence": len(study.trials) + 1,
+                    "outcome": "interrupted",
+                }
+            },
+            state=optuna.trial.TrialState.FAIL,
+        )
+    )
+
+
+def test_exact_tie_goes_to_the_lowest_draw_position_not_the_lowest_trial_number() -> None:
+    """A rerun keeps its source's draw position, so it wins a tie its source would have won."""
+    study = _make_study()
+    _add_trial(study, 1.0, params={"x": 0})
+    _add_interrupted(study, {"x": 1})
+    _add_trial(study, 0.0, params={"x": 2})
+    _add_trial(study, 0.0, params={"x": 1}, extra_user_attrs={RERUN_OF_ATTR: 1})
+
+    winner = select_winner(study, _make_exp())
+
+    assert winner.trial_number == 3
+    assert winner.params == {"x": 1}
+    assert winner.confound["checks"]["tie"]["detail"]["tied_trials"] == [2]
 
 
 def test_rejects_nan_constraint_values_defensively():
@@ -427,6 +466,22 @@ def test_repeats_tie_goes_to_lowest_group_and_highest_member_names_it() -> None:
     tie = winner.confound["checks"]["tie"]
     assert tie["verdict"] == "heterogeneous"
     assert tie["detail"] == {"tied_trials": [4], "within_noise": [4]}
+
+
+def test_repeats_tie_goes_to_the_group_with_the_lowest_member_draw_position() -> None:
+    """A group completed by a rerun of the first trial wins a tie against a group numbered earlier."""
+    study = _make_study()
+    _add_interrupted(study, {"x": 2, "seed": 0})
+    _add_group(study, 1, [0.3, 0.3, 0.3])
+    _add_trial(study, 0.3, params={"x": 2, "seed": 1})
+    _add_trial(study, 0.3, params={"x": 2, "seed": 2})
+    _add_trial(study, 0.3, params={"x": 2, "seed": 0}, extra_user_attrs={RERUN_OF_ATTR: 0})
+
+    winner = select_winner(study, _make_exp(), repeats=_axis())
+
+    assert winner.params == {"x": 2}
+    assert winner.trial_number == 6
+    assert winner.confound["checks"]["tie"]["detail"]["tied_trials"] == [3]
 
 
 def test_repeats_within_noise_flags_a_close_runner_up_and_clears_a_distant_one() -> None:

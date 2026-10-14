@@ -365,7 +365,7 @@ def _evidence_experiment(
     default one.
     """
     # Every trial of the default constant trainer logs the same objective, so
-    # the tie break (lowest trial number) makes trial 0 the winner however many
+    # the tie break (lowest draw position) makes trial 0 the winner however many
     # top-ups run, whatever the sampler draws.
     if trainer_body is None:
         trainer = write_constant_trainer(tmp_path)

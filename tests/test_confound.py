@@ -449,7 +449,7 @@ def test_repeats_exact_group_tie_is_within_noise_and_clear_groups_are_ok() -> No
     )
     tied = _assess_groups(trials, [[0, 1], [2, 3]])
     assert tied["checks"]["tie"]["detail"] == {"tied_trials": [3], "within_noise": [3]}
-    assert "lowest trial number won" in _describe_flagged(tied)[0]
+    assert "lowest draw position won" in _describe_flagged(tied)[0]
 
     clear = _seeded_trials(
         (_COMPLETE, 0.50, 1, 0),

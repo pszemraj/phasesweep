@@ -85,7 +85,7 @@ metric: object (required)
   # Direction used to rank the per-trial scalar across trials: minimize selects the smallest, maximize the largest.
   # It also sets the direction the Optuna sampler optimizes, and a stored persistent study with a different direction is rejected.
   # It does not change metric.extractor.select (log_regex, mlflow), which only chooses within one trial.
-  # Exact ties select the lowest Optuna trial number among feasible candidates.
+  # Exact ties select the feasible candidate with the lowest draw position, which outside reruns of interrupted trials is the lowest Optuna trial number.
   goal: "minimize" | "maximize" = "minimize"
 
   # Scalar source, selected by type. Each variant below replaces this one object; do not combine their keys.
@@ -396,7 +396,7 @@ phases: list[object] (required)
     # The sampler draws the repeat value as one more axis, so a phase of N configurations with R values runs N x R trials.
     # Under grid every cell is one configuration with one repeat value. Under seeded random each slot of R consecutive draw positions draws one configuration and runs it once per value, value number position mod R. A trial's draw position counts the trials before it that are not reruns, and a rerun of an interrupted trial takes its source's position.
     # A configuration ranks only as a complete group: one trial per repeat value, every one COMPLETE, feasible, inside metric.min and metric.max and every constraint. A group with a failed or infeasible member never ranks, and a failed member is not retried. An interrupted member belongs to no group; its rerun takes its place.
-    # Groups rank by phases[].repeats.reduce over their member metrics. Exact ties go to the group with the lowest trial number, and the group's highest trial number names the winner.
+    # Groups rank by phases[].repeats.reduce over their member metrics. Exact ties go to the group with the lowest member draw position, and the group's highest trial number names the winner.
     # winner.yaml records the reduced metric, observed values averaged over the members that recorded them, and a repeats block with the spread and every member. The scalar winner fields describe the last member.
     # The winner's params and effective overrides never carry the repeat key, so a phase that inherits this one runs with its own value of that key or none.
     # trials.csv gains a repeat_group column: the highest trial number of each trial's group so far.
