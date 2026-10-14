@@ -160,8 +160,9 @@ def _enqueue(
 def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Projection:
     """Freeze one accepted trial's result from its durable Optuna record.
 
-    Constraints come from the trial's own attributes rather than the current
-    config, so the projection can be rebuilt for any accepted trial later.
+    Constraints and observed values come from the trial's own attributes rather
+    than the current config, so the projection can be rebuilt for any accepted
+    trial later.
 
     :param FrozenTrial trial: COMPLETE trial.
     :param Mapping[str, str] inherits: Native run of each parent winner the attempt inherited.
@@ -171,6 +172,7 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
         CONSTRAINT_PREFIX,
         DURATION_ATTR,
         FEASIBLE_ATTR,
+        OBSERVED_PREFIX,
         OVERRIDES_ATTR,
     )
 
@@ -181,12 +183,18 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
         for key in sorted(trial.user_attrs)
         if key.startswith(CONSTRAINT_PREFIX)
     }
+    observed = {
+        key.removeprefix(OBSERVED_PREFIX): json_number(trial.user_attrs, key)
+        for key in sorted(trial.user_attrs)
+        if key.startswith(OBSERVED_PREFIX)
+    }
     return _projection(
         metrics={
             "phasesweep.objective": float(trial.value),
             "phasesweep.feasible": float(trial.user_attrs[FEASIBLE_ATTR]),
             "phasesweep.duration_seconds": json_number(trial.user_attrs, DURATION_ATTR),
             **{f"phasesweep.constraint.{k}": v for k, v in constraints.items()},
+            **{f"phasesweep.observed.{k}": v for k, v in observed.items()},
         },
         params={
             f"phasesweep.override.{k}": json.dumps(v, sort_keys=True) for k, v in overrides.items()
@@ -200,6 +208,7 @@ def _accepted_projection(trial: FrozenTrial, inherits: Mapping[str, str]) -> Pro
                 "trial_number": trial.number,
                 "metric": trial.value,
                 "constraints": constraints,
+                "observed": observed,
                 "effective_overrides": overrides,
             }
         ),

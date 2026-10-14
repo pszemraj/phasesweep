@@ -517,6 +517,13 @@ class WinnerPhasePayload(_ToolPayload):
             "inherit it."
         )
     )
+    observed: dict[str, float] = Field(
+        description=(
+            "Report-only values the winning trial recorded, by observation name. They never "
+            "influenced selection; the metric did. A name whose read failed on that trial is "
+            "absent, and the map is empty when the experiment declares no observations."
+        )
+    )
 
 
 class GetRunResultsResult(_ToolPayload):

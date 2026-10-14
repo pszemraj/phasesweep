@@ -25,7 +25,7 @@
 # Values passed through unchanged to the trainer (trainer_config, fixed_overrides, categorical choices) keep their YAML type, so a bare 1e-3 there reaches the trainer as a string.
 # env and provenance values must be YAML strings. An unquoted number or boolean in either map fails config load.
 # Each list or object variant below is an alternative selected by its type. Do not combine keys from two variants.
-# A block that appears more than once, such as the extractor variants under metric.extractor and constraints[].extractor, is documented in full each time.
+# A block that appears more than once, such as the extractor variants under metric.extractor, constraints[].extractor and observe[].extractor, is documented in full each time.
 # <key> in a path stands for any valid dotted override name. optimizer.lr illustrates it under phases[].search_space.
 # Environment variables PhaseSweep itself reads outside the YAML, in a plain phasesweep run: the ambient environment (the base of the trainer environment, filtered by execution.inherit_env), PHASESWEEP_LOCK_DIR, HOME, PATH and CUDA_VISIBLE_DEVICES.
 # CUDA_VISIBLE_DEVICES is read for GPU pool discovery, PATH to find the supervisor interpreter, and HOME for ~ expansion.
@@ -65,7 +65,7 @@ trial_command: string (required)
 # Primary objective: the finite scalar each trial reports and how trials are ranked.
 # PhaseSweep does no pruning, evaluation scheduling or checkpoint selection.
 # The whole block is part of the study fingerprint, so changing it stops a populated study from being reused.
-# Requires: metric.name and constraints[].name must all be distinct; duplicate names fail config load.
+# Requires: metric.name, constraints[].name and observe[].name must all be distinct; duplicate names fail config load.
 # Selection records three advisory confound verdicts on the winner: evaluation_point, survivorship and tie. They cannot be disabled or tuned and never block selection or publication.
 # evaluation_point is flagged when the lowest ranked position on the evaluation axis is more than 1% short of the furthest.
 # survivorship is flagged when failed plus pruned trials are at least max(1, ranked trials). Infeasible trials are counted but never flagged.
@@ -77,7 +77,7 @@ trial_command: string (required)
 metric: object (required)
   # Name the objective is published under, for example validation_loss.
   # goal is reserved and rejected. No other restriction is validated.
-  # Requires: constraints[].name values must all be distinct from metric.name.
+  # Requires: constraints[].name and observe[].name values must all be distinct from metric.name.
   name: string = "objective"
 
   # Direction used to rank the per-trial scalar across trials: minimize selects the smallest, maximize the largest.
@@ -740,10 +740,10 @@ provenance: map[string, string] = {}
 # A violation counts toward phases[].max_consecutive_failures, and a gate failure on a violating attempt still fails it.
 # Missing, invalid or non-finite evidence fails the attempt. Every constraint is evaluated even after an earlier one is violated.
 # Constraints are part of the study fingerprint.
-# Requires: constraints[].name values are distinct from metric.name and from each other.
+# Requires: constraints[].name values are distinct from metric.name, from observe[].name and from each other.
 constraints: list[object] = []
   # Constraint name, any string the schema accepts. It labels the measured value in published results.
-  # Requires: distinct from metric.name and from every other constraints[].name; duplicates fail config load.
+  # Requires: distinct from metric.name, from every observe[].name and from every other constraints[].name; duplicates fail config load.
   - name: string (required)
 
     # Finite scalar reader with the same variants and keys as metric.extractor above.
@@ -899,6 +899,95 @@ constraints: list[object] = []
     # Unset: no lower bound.
     min: float | null = null
 
+# ---------- Observations ----------
+
+# Report-only scalars read from each accepted trial, separate from metric ranking and constraints. Values below describe one item.
+# Each observation is read with a local extractor after the trial is accepted and its objective position located, so reading one can never spend the budget acceptance needed.
+# A read that fails, or yields a non-finite value, logs a warning and records nothing for that name on that trial. It never fails the trial or changes feasibility, ranking or selection.
+# A recorded value is stored on the trial as the user attribute observed:<name>, which trials.csv carries as user_attr:observed:<name>. The selected winner's values are published as observed in winner.yaml, and a winner whose trial recorded none publishes an empty map.
+# An MLflow attempt run receives each recorded value as the metric phasesweep.observed.<name>, and the MCP results view returns the winner's values as observed.
+# Excluded from the study fingerprint: adding, removing or changing an observation never invalidates a populated study, and trials that ran before it was added report nothing for it.
+# Only local extractors are accepted. wandb and mlflow extractors wait for every requested key, so a key the trainer never wrote would stall the trial until the poll timeout, and they fail config load. Write the value with report_objective(..., extra=...) and read it with a json extractor.
+# Requires: observe[].name values are distinct from metric.name, from every constraints[].name and from each other; duplicates fail config load.
+observe: list[object] = []
+  # Observation name, any string the schema accepts. It labels the recorded value in trials.csv, winner.yaml, MLflow and MCP results.
+  # Requires: distinct from metric.name, from every constraints[].name and from every other observe[].name; duplicates fail config load.
+  - name: string (required)
+
+    # Scalar reader with the same json, json_envelope and log_regex variants and keys as metric.extractor above. The wandb and mlflow variants are not accepted.
+    # Requires: a json_envelope observation leaves its evaluation_axis at the default, because only the metric extractor's axis is read; a different value fails config load.
+    extractor: json | json_envelope | log_regex (required)
+      # Variant json; selected by type: json.
+      # Read one number from a JSON file in the attempt directory.
+      # The file must be strict JSON. Duplicate member names, or NaN, Infinity or -Infinity tokens anywhere in the file, invalidate the whole file.
+      # The value must be a JSON number: a boolean, string or container records nothing, and so does a number that converts to a non-finite float, such as 1e999.
+      type: "json" (required)
+
+      # Path of the JSON file relative to the attempt directory, for example result.json.
+      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
+      # The trainer must write it inside its own attempt directory, which it finds through the {trial_dir} placeholder or the PHASESWEEP_TRIAL_DIR environment variable.
+      path: string (required)
+
+      # Dotted path of object keys to the number, for example eval.loss. Every segment must be nonempty.
+      # Each segment is looked up as an object key only. List indexes are not supported and a key that itself contains a dot cannot be addressed.
+      key: string (required)
+
+      # Variant json_envelope; selected by type: json_envelope.
+      # Read an attempt-bound result envelope that the trainer writes with phasesweep.report_objective() or the phasesweep report-objective command.
+      # The envelope must report schema_version 1, status "complete", and the generation ID, attempt ID and overrides_sha256 that PhaseSweep gave this attempt. Any mismatch records nothing.
+      # overrides_sha256 is the SHA-256 of the trainer input file generated for this attempt, not a hash of the envelope.
+      # The envelope must also report a nonempty evaluation.checkpoint, an integer evaluation.step >= 0 and a finite numeric objective.value. Extra top-level keys are allowed.
+      # PhaseSweep exports PHASESWEEP_OBJECTIVE_PATH only for a json_envelope metric extractor, so the trainer must write an observation's envelope to the path configured here.
+      type: "json_envelope" (required)
+
+      # Path of the envelope file relative to the attempt directory, for example result.json.
+      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
+      # Use a different path from the metric extractor, or both read the same envelope.
+      path: string = "result.json"
+
+      # Exact objective.name the envelope must report, for example eval_loss. Must be nonempty. A mismatch records nothing.
+      objective_name: string (required)
+
+      # Exact objective.split the envelope must report, for example validation. Must be nonempty. A mismatch records nothing.
+      split: string (required)
+
+      # Exact evaluation.policy the envelope must report, for example final or best. Must be nonempty. A mismatch records nothing.
+      # This validates the reported metadata only. It does not select a checkpoint.
+      policy: string (required)
+
+      # Exact evaluation.checkpoint identity the envelope must report. Must be nonempty. It never loads weights.
+      # Unset: any nonempty checkpoint identity the trainer reports is accepted.
+      checkpoint: string | null = null
+
+      # Exact evaluation.step the envelope must report, an integer >= 0. It does not schedule evaluation.
+      # Unset: any nonnegative step the trainer reports is accepted.
+      expected_step: int | null = null
+
+      # Progress axis for the evaluation_point confound check. Must be nonempty.
+      # Only used when: this is metric.extractor. An observe[].extractor must leave it at step or config load fails, because only the objective's axis is read.
+      evaluation_axis: string = "step"
+
+      # Variant log_regex; selected by type: log_regex.
+      # Extract numbers from a log file in the attempt directory with a regular expression.
+      # A missing file, a file that is not valid UTF-8, or no numeric match records nothing. A selected non-finite value also records nothing.
+      type: "log_regex" (required)
+
+      # Log file relative to the attempt directory, for example stdout.log.
+      # It must be nonempty, relative, free of NUL characters and .. segments, and name a file below the attempt directory rather than the directory itself.
+      # stdout.log and stderr.log are written automatically and are separate files. Python logging writes to stderr by default, so a value logged that way needs stderr.log.
+      file: string = "stdout.log"
+
+      # Python regular expression with a named group (?P<value>...) that captures the number, for example eval_loss=(?P<value>[0-9.eE+-]+).
+      # An invalid expression, or one without a group named value, fails config load.
+      # The file is split into lines at \n, \r\n and bare \r, and the expression is searched in each line separately, so a match cannot span lines. Every non-overlapping match in a line is one candidate value.
+      # Python's default flags apply and inline flags such as (?i) work.
+      # Captures that float() cannot parse are skipped. float() also accepts nan, inf and 1_0, so a loose capture can yield a non-finite value.
+      pattern: string (required)
+
+      # Which candidate value within this trial is recorded: last or first by position in the file, min or max by value (the first of equal extremes).
+      # Warning: with min or max a NaN capture is order dependent: a NaN seen first is never replaced, while a NaN seen after a number is ignored.
+      select: "last" | "first" | "min" | "max" = "last"
+
 # ---------- MLflow target and ownership ----------
 
 # Optional native MLflow integration: the source of the objective's metrics and the destination of PhaseSweep's result projections, on one existing MLflow experiment.
@@ -911,7 +1000,7 @@ constraints: list[object] = []
 # validate and --dry-run do not check authentication or the experiment. Each phase with trials left to run checks both before it allocates a trial.
 # The first phase to run creates one summary run per invocation in the experiment, and managed attempt runs are created under it.
 # Result projections are queued for each accepted trial, for generation winners and summaries, and, for managed runs, as a status-only record that ends the run of a failed or pruned attempt.
-# A projection is written to the attempt's run as phasesweep.* metrics at step 0 (objective, feasible, duration_seconds, constraint.<name>), phasesweep.override.<key> params, phasesweep.* tags and a phasesweep/<name>.json artifact.
+# A projection is written to the attempt's run as phasesweep.* metrics at step 0 (objective, feasible, duration_seconds, constraint.<name>, observed.<name>), phasesweep.override.<key> params, phasesweep.* tags and a phasesweep/<name>.json artifact.
 # A failed upload leaves a pending delivery without invalidating accepted scientific results.
 # phasesweep sync-tracking CONFIG retries every pending upload of every generation and rebuilds a published generation's unsaved winner records from its artifacts; --generation ID limits it to one generation. It trains nothing and rereads no metrics.
 # sync-tracking takes the experiment lock, so it cannot run while a sweep is active. It exits nonzero while uploads remain pending, and when no deliveries exist.

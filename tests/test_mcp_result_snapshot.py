@@ -39,6 +39,7 @@ from phasesweep.engine.paths import (
 )
 from phasesweep.engine.state import Winner, WinnerSource
 from phasesweep.mcp import runner as mcp_runner
+from phasesweep.mcp.snapshots import RunResultSnapshot
 from tests.conftest import (
     make_experiment,
     mark_current_format,
@@ -670,6 +671,40 @@ def test_snapshot_freezes_engine_winners_without_rereading_files(tmp_path: Path)
         "generation_id": "engine-generation",
         "attempt_id": "engine-attempt",
     }
+
+
+def test_snapshot_freezes_observed_values(tmp_path: Path) -> None:
+    """A winner's report-only values are frozen with it and come back out of the stored view."""
+    experiment = make_experiment(workdir=tmp_path / "runs", n_trials=1)
+    winner = Winner(
+        trial_number=0,
+        params={"x": 3},
+        effective_overrides={"x": 3},
+        metric=0.25,
+        completion={"incomplete": False},
+        generation_id="engine-generation",
+        attempt_id="engine-attempt",
+        source=WinnerSource(
+            kind="phase_trial",
+            phase="p",
+            trial_number=0,
+            generation_id="engine-generation",
+            attempt_id="engine-attempt",
+        ),
+        confound=single_trial_confound(0),
+        observed={"peak": 7.5, "steps": 3.0},
+    )
+
+    snapshot = mcp_runner.capture_result_snapshot(
+        experiment,
+        generation_id="engine-generation",
+        engine_winners={"p": winner},
+    )
+
+    (frozen,) = snapshot["winners"]
+    assert frozen["observed"] == {"peak": 7.5, "steps": 3.0}
+    stored = RunResultSnapshot.model_validate(snapshot)
+    assert [view.observed for view in stored.winner_views()] == [{"peak": 7.5, "steps": 3.0}]
 
 
 @pytest.mark.parametrize("from_phase", [None, "b"])

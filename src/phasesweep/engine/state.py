@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast, get_args
@@ -147,6 +148,9 @@ class Winner:
     # at that selection (:mod:`phasesweep.engine.confound`). A carried winner
     # keeps them verbatim; no fingerprint reads them.
     confound: dict[str, Any] | None = None
+    # Report-only values the selected trial recorded, by observation name.
+    # Winner-only: they never enter summary.yaml, a fingerprint, or selection.
+    observed: dict[str, float] = field(default_factory=dict)
 
 
 TRIAL_DIR_ATTR = "phasesweep_trial_dir"
@@ -219,6 +223,40 @@ def constraint_attr(name: str) -> str:
     :return str: Optuna user-attr key used to store the constraint value.
     """
     return f"{CONSTRAINT_PREFIX}{name}"
+
+
+OBSERVED_PREFIX = "observed:"
+
+
+def observed_attr(name: str) -> str:
+    """Return the persisted user-attr key for a report-only observed value.
+
+    :param str name: Observation name from the experiment config.
+    :return str: Optuna user-attr key used to store the observed value.
+    """
+    return f"{OBSERVED_PREFIX}{name}"
+
+
+def _validate_observed_block(value: object) -> dict[str, float]:
+    """Check a winner's ``observed`` mapping: nonempty string names to finite numbers.
+
+    :param object value: The decoded ``observed`` field of a winner payload.
+    :raises ValueError: The value is not a mapping, a name is not a nonempty string,
+        or a value is not a finite number.
+    :return dict[str, float]: The mapping with every value as a float.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError("observed must be a mapping of observation name to value")
+    observed: dict[str, float] = {}
+    for name, number in value.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"observed name {name!r} must be a nonempty string")
+        if isinstance(number, bool) or not isinstance(number, int | float):
+            raise ValueError(f"observed value for {name!r} must be a number")
+        if not math.isfinite(number):
+            raise ValueError(f"observed value for {name!r} must be finite")
+        observed[name] = float(number)
+    return observed
 
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 3

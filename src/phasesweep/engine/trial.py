@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from phasesweep.config import Experiment, Gate, check_bounds
+from phasesweep.config import Experiment, Gate, Observation, check_bounds
 from phasesweep.config.models import _wandb_query
 from phasesweep.engine.state import TRAINER_INPUT_SCHEMA_VERSION
 from phasesweep.errors import (
@@ -105,6 +105,9 @@ class TrialResult:
     # fail, rather than merely having elapsed by the time another failure was
     # observed.
     deadline_exhausted: bool = False
+    # Report-only values read after acceptance, by observation name. A name
+    # whose extraction failed or came out non-finite is absent.
+    observed: dict[str, float] = field(default_factory=dict)
 
 
 _TRIAL_BOUND_ENV = (
@@ -786,7 +789,9 @@ def extract_trial_result(
     — that's a valid evaluation, not an instrumentation failure, and should still
     inform the sampler. Expected extraction and gate
     failures are returned in :class:`TrialResult`; this function has no domain
-    exception outcome for callers to catch.
+    exception outcome for callers to catch. Report-only observations are read last,
+    after acceptance; one that cannot be read warns and is left out of
+    ``TrialResult.observed`` without affecting the result.
 
     Args:
         experiment: Parsed config; supplies the metric and constraint extractors.
@@ -1005,6 +1010,7 @@ def extract_trial_result(
     locate_objective_position(
         executed.ctx, experiment.metric.extractor, objective_provenance, deadline=deadline
     )
+    observed = _observe(executed.ctx, experiment.observe, deadline=deadline)
     return TrialResult(
         metric=metric_value,
         constraints=constraint_values,
@@ -1014,7 +1020,48 @@ def extract_trial_result(
         failure_reason=None,
         gate_results=gate_results,
         objective_provenance=objective_provenance or None,
+        observed=observed,
     )
+
+
+def _observe(
+    ctx: TrialContext, observations: list[Observation], *, deadline: float | None
+) -> dict[str, float]:
+    """Read the report-only observations of an accepted trial.
+
+    An observation is advisory, so a failed or non-finite read warns and records
+    nothing for that name. It never changes the trial's result and, running after
+    acceptance, can never spend the budget acceptance needed.
+
+    :param TrialContext ctx: Trial context of the accepted attempt.
+    :param list[Observation] observations: Configured report-only observations.
+    :param float | None deadline: Optional absolute ``time.monotonic()`` deadline.
+    :return dict[str, float]: Finite value of each observation that was read.
+    """
+    observed: dict[str, float] = {}
+    for observation in observations:
+        try:
+            value = run_extractor(ctx, observation.extractor, deadline=deadline)
+        except ExtractorError as exc:
+            log.warning(
+                "[%s/trial_%d] observation %s not recorded: %s",
+                ctx.phase,
+                ctx.trial_id,
+                observation.name,
+                exc,
+            )
+            continue
+        if not math.isfinite(value):
+            log.warning(
+                "[%s/trial_%d] observation %s not recorded: extractor returned non-finite value %r",
+                ctx.phase,
+                ctx.trial_id,
+                observation.name,
+                value,
+            )
+            continue
+        observed[observation.name] = value
+    return observed
 
 
 def _json_dump_overrides(overrides: dict[str, Any]) -> str:

@@ -21,9 +21,11 @@ from phasesweep.engine.state import (
     ATTEMPT_ID_ATTR,
     GATES_ATTR,
     GENERATION_ID_ATTR,
+    OBSERVED_PREFIX,
     TRAINER_ENV_DIGEST_ATTR,
     TRAINER_INPUT_ATTR,
     Winner,
+    _validate_observed_block,
     constraint_attr,
 )
 
@@ -55,6 +57,8 @@ class SelectedTrial:
     confound: dict[str, Any]
     constraints: dict[str, float] = field(default_factory=dict)
     gates: list[dict[str, Any]] = field(default_factory=list)
+    # Report-only values the selected trial recorded, by observation name.
+    observed: dict[str, float] = field(default_factory=dict)
 
 
 class NoFeasibleTrialError(PhaseSweepError):
@@ -194,7 +198,31 @@ def select_winner(
         trainer_env_digest=str(best.user_attrs[TRAINER_ENV_DIGEST_ATTR]),
         trainer_input=dict(best.user_attrs[TRAINER_INPUT_ATTR]),
         confound=confound,
+        observed=_observed_values(best),
     )
+
+
+def _observed_values(trial: optuna.trial.FrozenTrial) -> dict[str, float]:
+    """Read the report-only values one trial recorded, from its own attributes.
+
+    The values come from the trial, not the current config, so a later edit to
+    ``observe`` cannot change what an already-run trial reports.
+
+    :param optuna.trial.FrozenTrial trial: The selected trial.
+    :raises TrialEvidenceMissingError: A recorded value is not a finite number.
+    :return dict[str, float]: Observed value by observation name, sorted by name.
+    """
+    recorded = {
+        key.removeprefix(OBSERVED_PREFIX): value
+        for key, value in sorted(trial.user_attrs.items())
+        if key.startswith(OBSERVED_PREFIX)
+    }
+    try:
+        return _validate_observed_block(recorded)
+    except ValueError as exc:
+        raise TrialEvidenceMissingError(
+            f"Winning trial {trial.number} has a malformed {OBSERVED_PREFIX!r} value: {exc}."
+        ) from exc
 
 
 def _eligible(trial: optuna.trial.FrozenTrial, experiment: Experiment) -> bool:

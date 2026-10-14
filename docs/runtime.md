@@ -40,6 +40,8 @@ demo/
 
 The root `summary.yaml` and per-phase `winner.yaml` files are convenience projections. `last_successful_generation.yaml` points to the immutable generation that authoritatively represents the latest successful result. A failed invocation does not replace that pointer.
 
+`trials.csv` lists every trial with its sampled parameters and user attributes, including the `observed:<name>` values that [`observe`](config.md#objective-evidence-constraints-and-gates) recorded. Each `winner.yaml` carries the selected trial's `observed` map, which is empty when the experiment declares none or the trial recorded none.
+
 `config.snapshot.yaml` is the executed configuration, including materialized defaults and the resolved invocation context. `reproducibility.json` is the shareable generation identity record. Trial directories retain local evidence and attempt lifecycle information used for supported continuation and winner validation.
 
 MLflow-backed experiments additionally retain native run bindings in each trial directory and mutable delivery state and worker cleanup receipts under `tracking/<generation-id>/`. These records support upload retries and recovery and are separate from the committed scientific manifests. Disposable supervised-worker scratch uses `~/.cache/phasesweep/<backend>/workers/`, or the corresponding `XDG_CACHE_HOME/phasesweep` root; the default home comes from `Path.home()`. Each operation removes its temporary directory. Host lock placement retains its separate OS-account-home contract. See [MLflow tracking](mlflow.md) for ownership and offline replay.

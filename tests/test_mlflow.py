@@ -1527,3 +1527,43 @@ def test_binding_helper_checks_target_and_preserves_parent(tmp_path, monkeypatch
         bind_mlflow_run(binding["run_id"])
         assert read_binding(tmp_path) == binding
         assert run.data.tags["mlflow.parentRunId"] == "trainer-parent"
+
+
+def test_accepted_projection_reports_observed_values() -> None:
+    """Observed values are read from the trial's own attributes and mirrored as metrics."""
+    import optuna
+
+    from phasesweep.engine.state import (
+        DURATION_ATTR,
+        FEASIBLE_ATTR,
+        OVERRIDES_ATTR,
+        constraint_attr,
+        observed_attr,
+    )
+    from phasesweep.tracking.publication import _accepted_projection
+
+    def projection(**observed: float):
+        return _accepted_projection(
+            optuna.trial.create_trial(
+                value=0.5,
+                state=optuna.trial.TrialState.COMPLETE,
+                user_attrs={
+                    OVERRIDES_ATTR: json.dumps({"lr": 0.1}),
+                    FEASIBLE_ATTR: True,
+                    DURATION_ATTR: 1.5,
+                    constraint_attr("memory"): 4.0,
+                    **{observed_attr(name): value for name, value in observed.items()},
+                },
+            ),
+            {},
+        )
+
+    reported = projection(peak=7.5, steps=3)
+    assert reported["metrics"]["phasesweep.observed.peak"] == 7.5
+    assert reported["metrics"]["phasesweep.observed.steps"] == 3
+    assert reported["metrics"]["phasesweep.constraint.memory"] == 4.0
+    assert reported["summary"]["observed"] == {"peak": 7.5, "steps": 3}
+
+    bare = projection()
+    assert not any(key.startswith("phasesweep.observed.") for key in bare["metrics"])
+    assert bare["summary"]["observed"] == {}

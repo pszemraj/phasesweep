@@ -28,6 +28,7 @@ from phasesweep.engine.state import (
     PUBLICATION_POINTER_SCHEMA_VERSION,
     WINNER_FILENAME,
     _parse_winner_source,
+    _validate_observed_block,
 )
 from phasesweep.runtime.files import file_sha256, nofollow_flag
 
@@ -438,6 +439,12 @@ def _validate_generation_manifest(
                 raise _fail(
                     f"winner for phase {name!r} has no valid confound block ({exc})"
                 ) from exc
+            try:
+                _validate_observed_block(payload.get("observed"))
+            except ValueError as exc:
+                raise _fail(
+                    f"winner for phase {name!r} has no valid observed block ({exc})"
+                ) from exc
             winners[name] = ValidatedWinner(content=content, payload=payload)
     phases_dir = generation_dir / "phases"
     if phases_dir.is_dir():
@@ -653,6 +660,7 @@ def _validate_winner_source_generation(
         "trainer_input",
         "trainer_env_digest",
         "trainer_inherit_env",
+        "observed",
     ):
         if source_payload.get(field_name) != payload.get(field_name):
             raise fail(

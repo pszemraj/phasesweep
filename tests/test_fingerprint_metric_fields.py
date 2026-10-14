@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from phasesweep.config import LogRegexExtractor, Metric
+from phasesweep.config import LogRegexExtractor, Metric, Observation
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint, _phase_fingerprint
 from tests.conftest import make_experiment
 
@@ -30,3 +30,27 @@ def test_metric_bounds_are_semantic() -> None:
 
     assert len(set(phase_fps.values())) == len(variants)
     assert len(set(experiment_fps.values())) == len(variants)
+
+
+def test_observe_is_not_semantic() -> None:
+    """Observations never affect selection or an evidence binding, so they never move identity."""
+
+    def observation(name: str, pattern: str) -> Observation:
+        return Observation(
+            name=name, extractor=LogRegexExtractor(type="log_regex", pattern=pattern)
+        )
+
+    variants = [
+        make_experiment(),
+        make_experiment(observe=[observation("peak", r"p=(?P<value>[0-9.]+)")]),
+        make_experiment(observe=[observation("peak", r"q=(?P<value>[0-9.]+)")]),
+        make_experiment(
+            observe=[
+                observation("peak", r"p=(?P<value>[0-9.]+)"),
+                observation("temp", r"t=(?P<value>[0-9.]+)"),
+            ]
+        ),
+    ]
+
+    assert len({_phase_fingerprint(e, e.phases[0], {}) for e in variants}) == 1
+    assert len({_experiment_semantic_fingerprint(e) for e in variants}) == 1

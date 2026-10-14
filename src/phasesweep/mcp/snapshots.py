@@ -241,6 +241,7 @@ class WinnerSnapshot(_SnapshotModel):
     attempt_id: str | None = None
     source: WinnerSourceSnapshot
     confound: ConfoundSummary
+    observed: dict[str, float]
 
 
 def _winner_source_snapshot(
@@ -303,6 +304,7 @@ def _winner_snapshot(
         attempt_id=winner.attempt_id,
         source=_winner_source_snapshot(winner),
         confound=ConfoundSummary.model_validate(confound),
+        observed=dict(winner.observed),
     )
 
 
@@ -355,6 +357,7 @@ class RunResultSnapshot(_SnapshotModel):
                     attempt_id=winner.source.attempt_id,
                 ),
                 confound=winner.confound.model_dump(mode="json"),
+                observed=dict(winner.observed),
             )
             for winner in self.winners
         ]

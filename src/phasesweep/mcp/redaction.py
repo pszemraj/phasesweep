@@ -150,6 +150,7 @@ def winners_payload(
                 "gates_passed": view.gates_passed,
                 "incomplete": view.incomplete,
                 "confound": view.confound,
+                "observed": view.observed,
             }
         )
     return {

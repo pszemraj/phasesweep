@@ -64,6 +64,7 @@ from phasesweep.engine.state import (
     Winner,
     WinnerSource,
     constraint_attr,
+    observed_attr,
 )
 from phasesweep.engine.study_policy import (
     _accepted_trial_target,
@@ -1065,6 +1066,8 @@ def _execute_objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
 
     for cname, cval in result.constraints.items():
         trial.set_user_attr(constraint_attr(cname), cval)
+    for oname, oval in result.observed.items():
+        trial.set_user_attr(observed_attr(oname), oval)
 
     _record_outcome(
         run,
@@ -1663,6 +1666,7 @@ def _select_phase_winner(
         trainer_env_digest=selected.trainer_env_digest,
         trainer_inherit_env=_inherit_env_contract(experiment),
         confound=selected.confound,
+        observed=selected.observed,
     )
 
 

@@ -18,6 +18,7 @@ metric:
   max: null
   min: null
 constraints: []
+observe: []
 phases:
 - name: p
   comment: null

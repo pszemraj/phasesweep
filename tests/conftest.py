@@ -34,6 +34,7 @@ from phasesweep.config import (
     JsonEnvelopeExtractor,
     LogRegexExtractor,
     Metric,
+    Observation,
     Phase,
     Sampler,
 )
@@ -496,6 +497,7 @@ def make_experiment(
     trainer_config: dict[str, Any] | None = None,
     metric: Metric | None = None,
     constraints: list[Constraint] | None = None,
+    observe: list[Observation] | None = None,
     phases: list[Phase] | None = None,
     env: dict[str, str] | None = None,
     execution: ExecutionContext | None = None,
@@ -577,6 +579,8 @@ def make_experiment(
         kwargs["provenance"] = provenance
     if constraints is not None:
         kwargs["constraints"] = constraints
+    if observe is not None:
+        kwargs["observe"] = observe
     if env is not None:
         kwargs["env"] = env
     if execution is not None:

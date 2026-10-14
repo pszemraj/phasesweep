@@ -5,7 +5,7 @@ from __future__ import annotations
 import string
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 
@@ -35,6 +35,7 @@ from phasesweep.evidence.models import (
     Extractor,
     Gate,
     JsonEnvelopeExtractor,
+    LocalExtractor,
     ObjectiveExtractor,
     WandbExtractor,
     WandbQuery,
@@ -225,11 +226,40 @@ def _trainer_cwd_line(experiment: Experiment) -> str:
     return f"trainer cwd: {resolved} (execution.cwd; part of the study identity)"
 
 
-class Constraint(_Frozen):
-    """A scalar bound that trials must satisfy to be considered feasible."""
+class _NamedExtractor(_Frozen):
+    """A named scalar read from a trial by an extractor, besides the metric."""
+
+    _label: ClassVar[str]
 
     name: str
     extractor: Extractor = Field(discriminator="type")
+
+    @model_validator(mode="after")
+    def _validate_evaluation_axis_unused(self) -> Self:
+        """Reject a non-default ``evaluation_axis`` that nothing would read.
+
+        Only the metric extractor's axis feeds selection's ``evaluation_point``
+        check, so a named extractor that sets one is a misplaced setting.
+
+        :raises ValueError: The extractor sets ``evaluation_axis``.
+        :return Self: Self, unchanged.
+        """
+        extractor = self.extractor
+        if not isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor):
+            return self
+        if extractor.evaluation_axis != type(extractor).model_fields["evaluation_axis"].default:
+            raise ValueError(
+                f"{self._label} {self.name!r} sets evaluation_axis, which only the metric "
+                "extractor's evaluation_point check reads; remove it."
+            )
+        return self
+
+
+class Constraint(_NamedExtractor):
+    """A scalar bound that trials must satisfy to be considered feasible."""
+
+    _label: ClassVar[str] = "Constraint"
+
     max: ConfigFloat | None = None
     min: ConfigFloat | None = None
 
@@ -248,25 +278,33 @@ class Constraint(_Frozen):
         )
         return self
 
-    @model_validator(mode="after")
-    def _validate_evaluation_axis_unused(self) -> Constraint:
-        """Reject a non-default ``evaluation_axis`` that nothing would read.
 
-        Only the metric extractor's axis feeds selection's ``evaluation_point``
-        check, so a constraint that sets one is a misplaced setting.
+class Observation(_NamedExtractor):
+    """A scalar recorded beside the metric that never affects selection or identity."""
 
-        :raises ValueError: The constraint extractor sets ``evaluation_axis``.
-        :return Constraint: Self, unchanged.
+    _label: ClassVar[str] = "Observation"
+
+    extractor: LocalExtractor = Field(discriminator="type")
+
+    @field_validator("extractor", mode="before")
+    @classmethod
+    def _refuse_remote_extractor(cls, value: object, info: ValidationInfo) -> object:
+        """Refuse a W&B or MLflow extractor with the reason and the local alternative.
+
+        :param object value: Raw or already built extractor.
+        :param ValidationInfo info: Validation info carrying the observation's name.
+        :raises ValueError: The extractor is a remote kind.
+        :return object: The value, unchanged.
         """
-        extractor = self.extractor
-        if not isinstance(extractor, JsonEnvelopeExtractor | WandbExtractor):
-            return self
-        if extractor.evaluation_axis != type(extractor).model_fields["evaluation_axis"].default:
+        kind = value.get("type") if isinstance(value, Mapping) else getattr(value, "type", None)
+        if kind in ("wandb", "mlflow"):
             raise ValueError(
-                f"Constraint {self.name!r} sets evaluation_axis, which only the metric "
-                "extractor's evaluation_point check reads; remove it."
+                f"Observation {info.data.get('name')!r} cannot use a {kind} extractor: "
+                "remote extractors wait for every requested key, so a value the trainer "
+                "never wrote would stall the trial until the poll timeout. Write the value "
+                "with report_objective(..., extra=...) and read it with a local json extractor."
             )
-        return self
+        return value
 
 
 GpuPolicy = Literal["single_per_trial", "whole_node", "none"]
@@ -793,6 +831,13 @@ class Experiment(_Frozen):
     mlflow: MlflowSettings | None = None
     metric: Metric
     constraints: list[Constraint] = Field(default_factory=list)
+    observe: list[Observation] = Field(
+        default_factory=list,
+        description=(
+            "Report-only scalars read from each accepted trial with local extractors. They "
+            "are recorded and published, never ranked, never fingerprinted, and never fail a trial."
+        ),
+    )
     phases: list[Phase] = Field(min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
     execution: ExecutionContext = Field(
@@ -1126,9 +1171,13 @@ class Experiment(_Frozen):
             seen[phase.name] = phase
             seen_casefolded[casefolded_name] = phase.name
 
-        names = {self.metric.name} | {c.name for c in self.constraints}
-        if len(names) != 1 + len(self.constraints):
-            raise ValueError("Metric and constraint names must all be distinct.")
+        names = [
+            self.metric.name,
+            *(c.name for c in self.constraints),
+            *(o.name for o in self.observe),
+        ]
+        if len(set(names)) != len(names):
+            raise ValueError("Metric, constraint and observe names must all be distinct.")
         return self
 
 

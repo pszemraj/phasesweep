@@ -313,6 +313,7 @@ def test_reference_entries_record_their_section_and_are_immutable() -> None:
         "Trainer inputs",
         "Storage and provenance",
         "Constraints",
+        "Observations",
         "MLflow target and ownership",
         "Execution environment",
     }

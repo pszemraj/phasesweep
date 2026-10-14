@@ -7,6 +7,7 @@ from phasesweep.config.models import (
     ExecutionContext,
     Experiment,
     Metric,
+    Observation,
     Phase,
 )
 from phasesweep.config.search import (
@@ -57,6 +58,7 @@ __all__ = [
     "MlflowRequiredGate",
     "MlflowSettings",
     "ObjectiveExtractor",
+    "Observation",
     "Phase",
     "RequiredFileGate",
     "Sampler",

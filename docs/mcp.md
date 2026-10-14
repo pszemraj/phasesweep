@@ -126,6 +126,8 @@ Every winner carries frozen, advisory [confound verdicts](runtime.md#confound-ve
 
 Also report a winner's `incomplete: true`: a wallclock timeout cut its phase short, so selection used a partial population. The confound checks do not cover this limitation.
 
+Each winner's `observed` maps the experiment's report-only observation names to the values its winning trial recorded. They never influenced selection, and a name is absent when its read failed on that trial.
+
 `recovery_required: true` means cleanup, launch handoff, or snapshot finalization needs operator recovery. Agents should stop rather than guessing at process or result state; [run state and recovery](#run-state-and-recovery) shows where each case comes from.
 
 `runner_observable: false` appears only while a run is `running`, its runner was recorded in another PID namespace than the server's, and the server cannot prove that runner gone. The server then cannot tell whether the runner is alive and cannot cancel it, so the run reads `running` from durable evidence alone. Agents keep monitoring, never call `cancel_run`, and tell the user if trial counts stop advancing; [PID namespaces](#pid-namespaces) explains the cause.

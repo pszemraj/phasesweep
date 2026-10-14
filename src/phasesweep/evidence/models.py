@@ -313,6 +313,8 @@ ObjectiveExtractor = (
     JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor | MlflowExtractor
 )
 Extractor = ObjectiveExtractor
+LocalExtractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor
+"""The extractors that read a trial's own files. The remote kinds wait for every requested key."""
 
 ExtractorKind = Literal["json", "json_envelope", "log_regex", "wandb", "mlflow"]
 """The ``type`` of every objective extractor, as recorded evidence names it."""

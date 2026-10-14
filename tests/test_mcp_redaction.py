@@ -306,6 +306,34 @@ def test_winners_payload_computes_phase_completeness_and_provenance() -> None:
     assert payload["published_config_matches_current"] is False
 
 
+def test_winners_payload_exposes_observed_values() -> None:
+    """Report-only values reach the agent-visible phase payload and default to none."""
+    source = WinnerSource(
+        kind="phase_trial",
+        phase="p1",
+        trial_number=2,
+        generation_id="generation-1",
+        attempt_id="attempt-1",
+    )
+    payload = winners_payload(
+        "exp",
+        [
+            PhaseWinnerView(
+                "p1", 2, 0.1, {}, {}, None, False, source=source, observed={"peak": 7.5}
+            ),
+            PhaseWinnerView("p2", 3, 0.2, {}, {}, None, False, source=source),
+        ],
+        metric={"name": "loss", "goal": "minimize"},
+        declared_phases=["p1", "p2"],
+        result_source="frozen_run_snapshot",
+        publication_integrity="ok",
+        run_id="exp-run",
+        represented_generation_id="generation-1",
+    )
+
+    assert [phase["observed"] for phase in payload["phases"]] == [{"peak": 7.5}, {}]
+
+
 def test_winners_payload_defaults_claim_no_historical_provenance() -> None:
     """An undisclosed provenance reads as unknown, never as "no drift".
 

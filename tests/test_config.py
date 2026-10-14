@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from phasesweep.config import (
     Experiment,
     JsonEnvelopeExtractor,
     Metric,
+    Observation,
     Phase,
     Sampler,
     WandbExtractor,
@@ -971,3 +973,91 @@ def test_metric_bounds_are_optional_finite_and_ordered() -> None:
     assert "bounds={'max': 2.0, 'min': 0.5}" in bounded
     only_max = experiment_contract_lines(make_experiment(metric=metric(max=2)))[0]
     assert "bounds={'max': 2.0}" in only_max
+
+
+_LOG_EXTRACTOR: JsonObject = {"type": "log_regex", "pattern": r"m=(?P<value>[0-9.]+)"}
+
+
+def _observation(name: str) -> Observation:
+    """Return a local ``log_regex`` observation called ``name``."""
+    return Observation.model_validate({"name": name, "extractor": _LOG_EXTRACTOR})
+
+
+def test_observe_names_are_distinct_from_metric_and_constraints() -> None:
+    """One namespace covers the metric, constraints and observations."""
+    metric = Metric.model_validate({"name": "loss", "extractor": _LOG_EXTRACTOR})
+    memory = Constraint.model_validate({"name": "memory", "extractor": _LOG_EXTRACTOR, "max": 5})
+
+    def build(*names: str) -> Experiment:
+        return make_experiment(
+            metric=metric,
+            constraints=[memory],
+            observe=[_observation(name) for name in names],
+        )
+
+    for clash in (("loss",), ("memory",), ("peak", "peak")):
+        with pytest.raises(ValidationError, match="Metric, constraint and observe names"):
+            build(*clash)
+    assert [o.name for o in build("peak", "temperature").observe] == ["peak", "temperature"]
+    assert make_experiment().observe == []
+
+
+@pytest.mark.parametrize(
+    "extractor",
+    [
+        {"type": "wandb", "entity": "e", "project": "p", "metric_key": "peak"},
+        {"type": "mlflow", "metric_key": "peak", "select": "last"},
+    ],
+    ids=["wandb", "mlflow"],
+)
+def test_observe_refuses_remote_extractors(extractor: JsonObject, tmp_path: Path) -> None:
+    """Remote readers wait for every key, so an observation may only read local files."""
+    reason = (
+        r"Observation 'peak' cannot use a \w+ extractor: remote extractors wait for every "
+        r"requested key.*report_objective\(\.\.\., extra=\.\.\.\).*local json extractor"
+    )
+    with pytest.raises(ValidationError, match=reason):
+        Observation.model_validate({"name": "peak", "extractor": extractor})
+    with pytest.raises(ValidationError, match=reason):
+        Observation(
+            name="peak",
+            extractor=WandbExtractor(type="wandb", entity="e", project="p", metric_key="k"),
+        )
+
+    body = (
+        "experiment: t\n"
+        'trial_command: "echo {overrides}"\n'
+        "override_format: argparse\n"
+        "metric:\n"
+        "  extractor: { type: json_envelope, objective_name: x, split: test, policy: test }\n"
+        f"observe:\n  - {{ name: peak, extractor: {json.dumps(extractor)} }}\n"
+        "phases:\n"
+        "  - name: lr\n"
+        "    n_trials: 2\n"
+        "    search_space: { lr: { type: float, low: 0.1, high: 1.0 } }\n"
+    )
+    with pytest.raises(ValidationError, match="local json extractor"):
+        load_experiment(write_yaml(tmp_path, body))
+    local = body.replace(
+        json.dumps(extractor), "{ type: json, path: result.json, key: peak_memory_gb }"
+    )
+    loaded = load_experiment(write_yaml(tmp_path, local))
+    assert [(o.name, o.extractor.type) for o in loaded.observe] == [("peak", "json")]
+
+
+def test_observe_rejects_evaluation_axis() -> None:
+    """Only the metric extractor's axis is read, so an observation may not set one."""
+    envelope: JsonObject = {
+        "type": "json_envelope",
+        "objective_name": "peak",
+        "split": "test",
+        "policy": "final",
+    }
+    assert Observation.model_validate({"name": "peak", "extractor": envelope}).name == "peak"
+    with pytest.raises(
+        ValidationError,
+        match="Observation 'peak' sets evaluation_axis, which only the metric extractor's",
+    ):
+        Observation.model_validate(
+            {"name": "peak", "extractor": {**envelope, "evaluation_axis": "tokens"}}
+        )

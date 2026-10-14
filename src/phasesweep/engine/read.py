@@ -21,7 +21,7 @@ validated publication (pinned, unfinished, or failed) is read from its files.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
 
@@ -50,6 +50,7 @@ from phasesweep.engine.state import (
     PublicationState,
     WinnerSource,
     _parse_winner_source,
+    _validate_observed_block,
 )
 from phasesweep.evidence.models import EXTRACTOR_KINDS, _ObjectiveEvidenceFields
 
@@ -92,6 +93,8 @@ class PhaseWinnerView:
     # Path-free projection of the winner's confound block: verdicts, check
     # names, and counts only (:func:`phasesweep.engine.confound._confound_summary`).
     confound: dict[str, Any] | None = None
+    # Report-only values the winning trial recorded, by observation name.
+    observed: dict[str, float] = field(default_factory=dict)
 
 
 def _phase_status_payloads(
@@ -213,6 +216,7 @@ def _winner_view(data: Mapping[str, Any], phase_name: str) -> PhaseWinnerView | 
             ),
             source=source,
             confound=confound,
+            observed=_validate_observed_block(data.get("observed")),
         )
     except (KeyError, ValueError, TypeError):
         return None

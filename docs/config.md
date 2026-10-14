@@ -135,6 +135,14 @@ The metric is a finite scalar extracted after the trainer exits successfully. Us
 
 `metric.min` and `metric.max` are optional inclusive viability bounds on the metric itself. They must be finite, `min` may not exceed `max`, and either may be set alone. A trial whose metric falls outside them is infeasible exactly like a violated constraint: it completes with its real value (the sampler still learns from it), counts toward `max_consecutive_failures` and as `infeasible` in the `survivorship` verdict, and selection re-checks the bounds from the stored value. A bound refuses a degenerate score, such as a loss of exactly 0 from a leaked evaluation set; it does not steer the search. When no trial survives, the `NoFeasibleTrialError` names the bound or bounds and the best value among the completed trials with its trial number. The bounds are part of the metric's identity, so changing one starts a new study.
 
+**Report-only observations.** `observe` lists extra scalars to record from each accepted trial without letting them influence anything. Each entry is a `name` and an `extractor`, and the extractor is `json`, `json_envelope` or `log_regex`: a `wandb` or `mlflow` extractor is refused at load, because remote readers wait for every requested key and a value the trainer never wrote would stall the trial. A value written with `report_objective(..., extra=...)` is read with a local `json` extractor. An observation is read after the trial is accepted, so a read that fails or yields a non-finite value logs a warning, records nothing for that name, and leaves the trial untouched. Recorded values appear as `user_attr:observed:<name>` columns in `trials.csv`, as `observed` in the selected winner's `winner.yaml` and in MCP results, and as `phasesweep.observed.<name>` metrics on a managed [MLflow](mlflow.md#result-delivery-and-recovery) attempt run. Observations never enter the study fingerprint and never affect selection, so editing `observe` does not invalidate a study. Names must be distinct from the metric and the constraints, and an observation may not set `evaluation_axis`.
+
+```yaml
+observe:
+  - name: peak_memory_gb
+    extractor: {type: json, path: result.json, key: peak_memory_gb}
+```
+
 All local evidence paths are relative to the fresh attempt directory; there is no latest-file discovery or fallback to a shared result. Objective extraction, gate failure, a non-finite metric, or a nonzero trainer exit fails the attempt. When no feasible eligible trial remains, the phase fails; PhaseSweep does not invent a carried baseline.
 
 These scoring decisions are separate:
