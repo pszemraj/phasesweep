@@ -481,6 +481,7 @@ phases: list[object] (required)
       # Optuna strategy. tpe fits a surrogate model after its random startup trials, random samples independently, grid enumerates a concrete matrix, and cmaes runs CMA-ES on numeric spaces.
       # tpe and cmaes are non-resumable: their state lives in the process, so a persistent phase must finish its target in one invocation.
       # Seeded random derives each draw from the seed, study name, trial number and parameter name, so it is independent of n_jobs and restarts. With phases[].repeats the configuration slot, trial_number divided by the number of repeat values, takes the place of the trial number.
+      # Every random draw is independent and with replacement, seeded or not, so three trials over a three-value categorical cover all three values only about 2 times in 9, and a value can repeat or never be drawn. Use grid when every value must be covered.
       # cmaes needs the cmaes package; config load fails with an install hint when it is missing.
       # Requires: with cmaes every phases[].search_space parameter is numeric.
       # Requires: with grid on a phase that draws, the search space has no log parameter, every float has a step, there are at most 4096 distinct combinations, and phases[].n_trials equals the combination count unless phases[].allow_partial_grid is true. The repeat axis of phases[].repeats counts toward the combinations.
