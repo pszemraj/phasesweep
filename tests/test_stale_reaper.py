@@ -37,7 +37,7 @@ from phasesweep.engine.attempts import (
     _AttemptRecord,
     _preflight_active_attempts,
     _PreflightCleanupReport,
-    _record_stale_trial_failure,
+    _record_stale_trial_outcome,
     _register_active_attempt,
 )
 from phasesweep.engine.cleanup import _reap_stale_trials
@@ -216,7 +216,7 @@ def test_reap_runs_before_fingerprint_check(tmp_path, monkeypatch):
         # Don't actually call the real reaper; just mark FAIL.
         for t_ in args[0].get_trials(deepcopy=False):
             if t_.state == optuna.trial.TrialState.RUNNING:
-                _record_stale_trial_failure(args[0], t_)
+                _record_stale_trial_outcome(args[0], t_)
                 args[0].tell(t_.number, state=optuna.trial.TrialState.FAIL)
         return 1
 
@@ -1040,7 +1040,7 @@ def test_reaper_raises_for_malformed_trial_dir_attr(
 @pytest.mark.parametrize(
     ("failure_site", "match"),
     [
-        pytest.param("outcome", "durable failure outcome could not be recorded", id="outcome"),
+        pytest.param("outcome", "durable interrupted outcome could not be recorded", id="outcome"),
         pytest.param("ledger", "cleanup recovery ledger could not be updated", id="ledger"),
         pytest.param("tell", "Optuna state could not be updated", id="tell"),
     ],

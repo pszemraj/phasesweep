@@ -18,6 +18,7 @@ from phasesweep.engine.state import (
     PHASE_RECOVERY_ATTR,
     TRAINER_ENV_DIGEST_ATTR,
     TRIAL_OUTCOME_ATTR,
+    TRIAL_OUTCOME_SCHEMA_VERSION,
     TRIAL_TARGET_ATTR,
 )
 from phasesweep.engine.study_policy import _ALLOCATION_CONTEXT_ATTR, _load_phase_policy_state
@@ -106,7 +107,7 @@ def test_abort_recovery_target_with_no_remaining_slots_is_schema_mismatch(
                 user_attrs={
                     TRAINER_ENV_DIGEST_ATTR: cohort_digest,
                     TRIAL_OUTCOME_ATTR: {
-                        "schema_version": 1,
+                        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
                         "sequence": sequence,
                         "outcome": "failure",
                         "cause": "simulated external terminal row",

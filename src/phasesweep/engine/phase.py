@@ -19,7 +19,6 @@ from phasesweep.config import Experiment, Phase
 from phasesweep.config.search import _placeholder_values_for, sampler_search_space
 from phasesweep.engine.artifacts import _warn_environment_drift, _write_trials_csv
 from phasesweep.engine.attempts import (
-    _parsed_trial_outcome,
     _register_active_attempt,
     _retire_active_attempt,
     _trial_requires_cleanup_recovery,
@@ -67,6 +66,7 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_SCHEMA_VERSION,
     Winner,
     WinnerSource,
+    _parsed_trial_outcome,
     constraint_attr,
     observed_attr,
 )
@@ -853,7 +853,7 @@ def _record_outcome(
         run: The phase execution the outcome belongs to.
         trial: The Optuna trial whose terminal outcome is being recorded.
         outcome: One of ``"success"``, ``"failure"``, ``"pruned"``,
-            ``"cancelled"``, or ``"fatal"``.
+            ``"interrupted"``, or ``"fatal"``.
         cause: Optional human-readable explanation stored on the outcome
             payload.
         fatal_policy: Optional policy name stored on the outcome payload
@@ -924,7 +924,7 @@ def _record_outcome(
             "attempt record intact, so no terminal trial exists without its "
             "outcome record. Once storage accepts writes again, the next run "
             "recovers it through the standard stale-attempt protocol, which "
-            "records the failure before marking the trial FAIL."
+            "records its outcome before marking the trial FAIL."
         )
         run.record_fatal(unrecorded)
         raise unrecorded from write_error
@@ -1226,7 +1226,7 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         _record_outcome(run, trial, "pruned", cause=str(exc))
         raise
     except _DeadlineTrialExecutionError as exc:
-        _record_outcome(run, trial, "cancelled", cause=str(exc))
+        _record_outcome(run, trial, "interrupted", cause=str(exc))
         raise
     except TrialExecutionError as exc:
         _record_outcome(run, trial, "failure", cause=str(exc))
@@ -1269,7 +1269,7 @@ def _objective(run: _PhaseExecution, trial: optuna.Trial) -> float:
         _record_outcome(
             run,
             trial,
-            "cancelled",
+            "interrupted",
             cause=f"orchestrator interrupted by signal {exc.signum}",
         )
         raise

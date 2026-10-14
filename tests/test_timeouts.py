@@ -280,7 +280,7 @@ def test_timeout_winner_is_not_masked_by_consecutive_failure_abort(tmp_path: Pat
     deadline_trials = [
         trial
         for trial in study.trials
-        if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "cancelled"
+        if trial.user_attrs.get(TRIAL_OUTCOME_ATTR, {}).get("outcome") == "interrupted"
     ]
     assert len(deadline_trials) == 1
     assert _load_phase_policy_state(study).abort is None
@@ -604,7 +604,7 @@ def test_shutdown_during_objective_does_not_persist_fatal_phase_abort(
 
     study = optuna.load_study(study_name="t::p", storage=_resolve_storage(exp.storage))
     assert _load_phase_policy_state(study).abort is None
-    assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "cancelled"
+    assert study.trials[0].user_attrs[TRIAL_OUTCOME_ATTR]["outcome"] == "interrupted"
 
     winners = run_experiment(exp)
     assert winners["p"].metric == pytest.approx(0.5)

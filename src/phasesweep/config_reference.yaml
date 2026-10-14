@@ -512,8 +512,8 @@ phases: list[object] (required)
       acknowledge_nonresumable: bool = false
 
     # Stop the phase after this many consecutive failed or infeasible attempts, an integer >= 1.
-    # These count as failures: a nonzero trainer exit, a per-trial timeout, a failed extraction or gate, a violated constraint or metric bound, a failed MLflow run preparation, a stale attempt recovered after a crash, and a fatal error.
-    # A feasible success resets the count. Pruned and cancelled attempts (phase or run deadline, host shutdown) leave it unchanged.
+    # These count as failures: a nonzero trainer exit, a per-trial timeout, a failed extraction or gate, a violated constraint or metric bound, a failed MLflow run preparation, and a fatal error.
+    # A feasible success resets the count. Pruned and interrupted attempts (phase or run deadline, host shutdown, an attempt recovered after its orchestrator stopped) leave it unchanged.
     # Failed attempts still count toward phases[].n_trials.
     # The count and a recorded abort persist on durable storage in completion order.
     # Raising the limit does not undo a recorded abort. A resumable sampler needs a larger phases[].n_trials, or a new experiment name, to continue.
@@ -527,7 +527,7 @@ phases: list[object] (required)
     # The clock starts when the supervised launch starts, including supervisor startup, after the GPU lease is held. It does not cover the wait for a lease or the evidence reads after the trainer exits.
     # A trainer killed by this limit fails the attempt and counts toward phases[].max_consecutive_failures. 0 expires immediately: the trainer never starts and every attempt fails.
     # The phase and run deadlines also cover the lease wait and the evidence reads, and the earliest active deadline limits the work.
-    # A trainer killed because a phase or run deadline arrived first is cancelled rather than failed.
+    # A trainer killed because a phase or run deadline arrived first is interrupted rather than failed.
     # Part of the study fingerprint, so changing it stops a populated phase from being reused.
     # Requires: null needs phases[].allow_unbounded_trials true; config load fails otherwise.
     timeout_seconds_per_trial: float | null = 259200.0

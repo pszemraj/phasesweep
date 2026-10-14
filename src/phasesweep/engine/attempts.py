@@ -33,6 +33,8 @@ from phasesweep.engine.state import (
     TRIAL_OUTCOME_ABORT_KEY,
     TRIAL_OUTCOME_ATTR,
     TRIAL_OUTCOME_SCHEMA_VERSION,
+    _parsed_trial_outcome,
+    _stale_recovery_outcome,
 )
 from phasesweep.engine.trial import ProcessCleanupUncertainError
 from phasesweep.errors import RERUN_CLEANUP_RECOVERY
@@ -45,7 +47,7 @@ from phasesweep.runtime.files import (
     read_private_text_at,
     storage_recovery_locator,
 )
-from phasesweep.runtime.json import strict_json_loads
+from phasesweep.runtime.json import JsonObject, strict_json_loads
 from phasesweep.runtime.process import AttemptLifecycle, read_attempt_lifecycle
 from phasesweep.runtime.reaper import (
     PROCESS_IDENTITY_FILE,
@@ -54,20 +56,7 @@ from phasesweep.runtime.reaper import (
     read_stale_process_identity,
 )
 
-_TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "cancelled", "fatal"})
 log = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class _ParsedTrialOutcome:
-    """Validated durable terminal-outcome fields for one trial."""
-
-    sequence: int
-    outcome: str
-    cause: str | None
-    policy: str | None
-    abort: dict[str, Any] | None
-    """The phase abort this outcome tripped, recorded with the outcome itself."""
 
 
 @dataclass
@@ -598,77 +587,6 @@ def _registry_attempt_record(entry: Mapping[str, Any], entry_path: Path) -> _Att
     )
 
 
-def _valid_abort_record(value: object, *, sequence: int) -> bool:
-    """Return whether the abort record stored with an outcome is well formed.
-
-    :param object value: Raw abort record carried by a terminal outcome.
-    :param int sequence: Completion sequence of the outcome that carries it.
-    :return bool: Whether the record names that sequence, a positive trial
-        target, and a non-empty policy and cause.
-    """
-    if not isinstance(value, dict):
-        return False
-    completion_sequence = value.get("completion_sequence")
-    trial_target = value.get("trial_target")
-    policy = value.get("policy")
-    cause = value.get("cause")
-    return (
-        value.get("schema_version") == 1
-        and type(completion_sequence) is int
-        and completion_sequence == sequence
-        and type(trial_target) is int
-        and trial_target >= 1
-        and isinstance(policy, str)
-        and bool(policy)
-        and isinstance(cause, str)
-        and bool(cause)
-    )
-
-
-def _parsed_trial_outcome(value: Any) -> _ParsedTrialOutcome | None:
-    """Return the ordered outcome fields when a trial attr is well formed.
-
-    :param Any value: Raw ``TRIAL_OUTCOME_ATTR`` user-attr value to validate.
-    :return _ParsedTrialOutcome | None: Validated outcome, including the fatal
-        policy needed to distinguish cleanup uncertainty from ordinary errors
-        and the abort record a failure or fatal outcome tripped; ``None`` when
-        the payload is malformed.
-    """
-    if not isinstance(value, dict):
-        return None
-    schema_version = value.get("schema_version")
-    sequence = value.get("sequence")
-    outcome = value.get("outcome")
-    cause = value.get("cause")
-    policy = value.get("policy")
-    abort = value.get(TRIAL_OUTCOME_ABORT_KEY)
-    if (
-        schema_version != TRIAL_OUTCOME_SCHEMA_VERSION
-        or type(sequence) is not int
-        or sequence < 1
-        or outcome not in _TRIAL_OUTCOMES
-        or (cause is not None and not isinstance(cause, str))
-        or (
-            policy is not None and (outcome != "fatal" or not isinstance(policy, str) or not policy)
-        )
-        or (
-            abort is not None
-            and (
-                outcome not in {"failure", "fatal"}
-                or not _valid_abort_record(abort, sequence=sequence)
-            )
-        )
-    ):
-        return None
-    return _ParsedTrialOutcome(
-        sequence=sequence,
-        outcome=outcome,
-        cause=cause,
-        policy=policy,
-        abort=abort,
-    )
-
-
 def _trial_requires_cleanup_recovery(trial: optuna.trial.FrozenTrial) -> bool:
     """Return whether a terminal trial still lacks positive cleanup evidence.
 
@@ -689,17 +607,18 @@ def _trial_requires_cleanup_recovery(trial: optuna.trial.FrozenTrial) -> bool:
     return trial.user_attrs.get(CLEANUP_CONFIRMED_ATTR) is False or unsafe_outcome
 
 
-def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-    """Persist a failure-policy outcome before marking a stale trial ``FAIL``.
+def _record_stale_trial_outcome(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+    """Persist the outcome stale recovery assigns before marking a stale trial ``FAIL``.
 
     An objective may have written its outcome immediately before the
-    orchestrator died. Preserve a recorded failure, fatal exception, or explicit
-    host cancellation, with any abort it tripped; convert a not-yet-committed
-    success/prune to failure because recovery is about to commit the trial as
-    ``FAIL``. Recovery itself never records an abort decision. Malformed or duplicate
-    records are replaced with a fresh sequence so current-schema validation
-    can still diagnose any other corrupt row without stranding this stale
-    process.
+    orchestrator died. A recorded failure or fatal exception stands, with any
+    abort it tripped, and so does a recorded interruption. A success or prune
+    Optuna never committed, and a trial with no record, become ``interrupted``
+    (:func:`phasesweep.engine.state._stale_recovery_outcome`): recovery cannot
+    prove what such a trial measured, so it reruns. Recovery itself never
+    records an abort decision. Malformed or duplicate records are replaced
+    with a fresh sequence so current-schema validation can still diagnose any
+    other corrupt row without stranding this stale process.
 
     :param optuna.Study study: Study containing ``trial``, used to read every
         trial's recorded outcome and assign a fresh sequence if needed.
@@ -707,7 +626,7 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
         marked ``FAIL``.
     :raises StudyStorageUnavailableError: The outcome could not be written to trial user
         attrs; the trial is left ``RUNNING`` rather than risk silently
-        dropping the failure from ``max_consecutive_failures``.
+        dropping a recorded failure from ``max_consecutive_failures``.
     """
     trials = study.get_trials(deepcopy=False)
     parsed_by_trial = {
@@ -718,24 +637,24 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
     }
     used_sequences = [parsed.sequence for parsed in parsed_by_trial.values()]
     existing = parsed_by_trial.get(trial.number)
+    if existing is not None and used_sequences.count(existing.sequence) != 1:
+        existing = None
+    outcome = _stale_recovery_outcome(existing)
     policy: str | None = None
-    abort: dict[str, Any] | None = None
-    if existing is not None and used_sequences.count(existing.sequence) == 1:
+    abort: JsonObject | None = None
+    if existing is None:
+        sequence = max(used_sequences, default=0) + 1
+        cause: str | None = "stale RUNNING trial recovered after its orchestrator stopped"
+    elif existing.outcome == outcome:
         sequence = existing.sequence
-        outcome = existing.outcome
         cause = existing.cause
         policy = existing.policy
         abort = existing.abort
-        if outcome not in {"failure", "fatal", "cancelled"}:
-            outcome = "failure"
-            cause = "orchestrator stopped before Optuna committed the terminal trial state"
-            policy = None
     else:
-        sequence = max(used_sequences, default=0) + 1
-        outcome = "failure"
-        cause = "stale RUNNING trial recovered after its orchestrator stopped"
+        sequence = existing.sequence
+        cause = "orchestrator stopped before Optuna committed the terminal trial state"
 
-    payload: dict[str, Any] = {
+    payload: JsonObject = {
         "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
         "sequence": sequence,
         "outcome": outcome,
@@ -752,9 +671,9 @@ def _record_stale_trial_failure(study: optuna.Study, trial: optuna.trial.FrozenT
     except Exception as exc:
         raise StudyStorageUnavailableError(
             f"Process cleanup completed for stale RUNNING trial {trial.number} in study "
-            f"{study.study_name!r}, but its durable failure outcome could not be recorded. "
-            "The trial remains RUNNING so a later retry cannot silently omit this failure "
-            "from max_consecutive_failures."
+            f"{study.study_name!r}, but its durable {outcome} outcome could not be recorded. "
+            "The trial remains RUNNING so a later retry records its outcome before anything "
+            "counts it."
         ) from exc
 
 
@@ -1341,7 +1260,7 @@ def _fail_stale_running_trial(
 ) -> None:
     """Commit a stale RUNNING trial as ``FAIL`` once its attempt is resolved.
 
-    The failure outcome and then the cleanup-recovery ledger are written
+    The recovered outcome and then the cleanup-recovery ledger are written
     before Optuna's terminal state retires the trial's RUNNING authority.
 
     :param optuna.Study study: Study containing ``trial``.
@@ -1349,11 +1268,11 @@ def _fail_stale_running_trial(
         can no longer leak a process.
     :param str failure_message: The refusal to raise when Optuna cannot
         record ``FAIL``.
-    :raises StudyStorageUnavailableError: The failure outcome, the recovery
-        ledger, or the terminal state could not be recorded; the trial is left
-        RUNNING rather than silently dropping the failure.
+    :raises StudyStorageUnavailableError: The outcome, the recovery ledger, or
+        the terminal state could not be recorded; the trial is left RUNNING
+        rather than committed without its outcome.
     """
-    _record_stale_trial_failure(study, trial)
+    _record_stale_trial_outcome(study, trial)
     _record_cleanup_recovery(study, trial)
     try:
         study.tell(trial.number, state=optuna.trial.TrialState.FAIL)

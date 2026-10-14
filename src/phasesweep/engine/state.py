@@ -7,7 +7,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
+from phasesweep.runtime.json import JsonObject, json_object
+
 if TYPE_CHECKING:
+    from optuna.trial import FrozenTrial
+
     from phasesweep.engine.repeats import RepeatsRecord
 
 WinnerSourceKind = Literal["phase_trial"]
@@ -184,8 +188,12 @@ TRIAL_TARGET_ATTR = "phasesweep_trial_target"
 # a restarted orchestrator cannot reinterpret the same terminal trials as a
 # completed phase.
 TRIAL_OUTCOME_ATTR = "phasesweep_trial_outcome"
-TRIAL_OUTCOME_SCHEMA_VERSION = 1
+TRIAL_OUTCOME_SCHEMA_VERSION = 2
 TRIAL_OUTCOME_ABORT_KEY = "abort"
+# ``interrupted`` is the one label for a trial whose orchestrator stopped it before it
+# could finish: a signal, a phase or run deadline, or recovery after the orchestrator died.
+# The outcome's ``cause`` says which.
+_TRIAL_OUTCOMES = frozenset({"success", "failure", "pruned", "interrupted", "fatal"})
 # Durable boundary established when the operator explicitly raises n_trials
 # after an abort. Outcomes through this sequence belong to the aborted attempt;
 # later failures form the new recovery streak.
@@ -273,6 +281,126 @@ def _validate_observed_block(value: object) -> dict[str, float]:
             raise ValueError(f"observed value for {name!r} must be finite")
         observed[name] = float(number)
     return observed
+
+
+@dataclass(frozen=True)
+class _ParsedTrialOutcome:
+    """Validated durable terminal-outcome fields for one trial."""
+
+    sequence: int
+    outcome: str
+    cause: str | None
+    policy: str | None
+    abort: JsonObject | None
+    """The phase abort this outcome tripped, recorded with the outcome itself."""
+
+
+def _valid_abort_record(value: object, *, sequence: int) -> bool:
+    """Return whether the abort record stored with an outcome is well formed.
+
+    :param object value: Raw abort record carried by a terminal outcome.
+    :param int sequence: Completion sequence of the outcome that carries it.
+    :return bool: Whether the record names that sequence, a positive trial
+        target, and a non-empty policy and cause.
+    """
+    if not isinstance(value, dict):
+        return False
+    completion_sequence = value.get("completion_sequence")
+    trial_target = value.get("trial_target")
+    policy = value.get("policy")
+    cause = value.get("cause")
+    return (
+        value.get("schema_version") == 1
+        and type(completion_sequence) is int
+        and completion_sequence == sequence
+        and type(trial_target) is int
+        and trial_target >= 1
+        and isinstance(policy, str)
+        and bool(policy)
+        and isinstance(cause, str)
+        and bool(cause)
+    )
+
+
+def _parsed_trial_outcome(value: object) -> _ParsedTrialOutcome | None:
+    """Return the ordered outcome fields when a trial attr is well formed.
+
+    :param object value: Raw ``TRIAL_OUTCOME_ATTR`` user-attr value to validate.
+    :return _ParsedTrialOutcome | None: Validated outcome, including the fatal
+        policy needed to distinguish cleanup uncertainty from ordinary errors
+        and the abort record a failure or fatal outcome tripped; ``None`` when
+        the payload is malformed.
+    """
+    if not isinstance(value, dict):
+        return None
+    schema_version = value.get("schema_version")
+    sequence = value.get("sequence")
+    outcome = value.get("outcome")
+    cause = value.get("cause")
+    policy = value.get("policy")
+    abort = value.get(TRIAL_OUTCOME_ABORT_KEY)
+    if (
+        schema_version != TRIAL_OUTCOME_SCHEMA_VERSION
+        or type(sequence) is not int
+        or sequence < 1
+        or not isinstance(outcome, str)
+        or outcome not in _TRIAL_OUTCOMES
+        or (cause is not None and not isinstance(cause, str))
+        or (
+            policy is not None and (outcome != "fatal" or not isinstance(policy, str) or not policy)
+        )
+        or (
+            abort is not None
+            and (
+                outcome not in {"failure", "fatal"}
+                or not _valid_abort_record(abort, sequence=sequence)
+            )
+        )
+    ):
+        return None
+    try:
+        abort_record = None if abort is None else json_object(abort)
+    except ValueError:
+        return None
+    return _ParsedTrialOutcome(
+        sequence=sequence,
+        outcome=outcome,
+        cause=cause,
+        policy=policy,
+        abort=abort_record,
+    )
+
+
+def _stale_recovery_outcome(parsed: _ParsedTrialOutcome | None) -> str:
+    """Return the outcome stale recovery records for a RUNNING trial whose orchestrator stopped.
+
+    A failure or fatal error the objective already recorded stands, and so does an
+    interruption; anything else, including a success or prune Optuna never committed and
+    no record at all, becomes ``interrupted``. Shared by recovery and the dry run, so the
+    preview predicts what recovery writes.
+
+    :param _ParsedTrialOutcome | None parsed: The trial's valid, unduplicated recorded
+        outcome, or ``None`` when it has none.
+    :return str: ``failure``, ``fatal`` or ``interrupted``.
+    """
+    if parsed is not None and parsed.outcome in {"failure", "fatal", "interrupted"}:
+        return parsed.outcome
+    return "interrupted"
+
+
+def _trial_interrupted(trial: FrozenTrial) -> bool:
+    """Return whether a terminal trial was interrupted rather than measured.
+
+    A RUNNING trial whose objective recorded ``interrupted`` is not counted yet;
+    stale recovery makes it terminal before any count is taken.
+
+    :param FrozenTrial trial: Trial to classify.
+    :return bool: Whether the trial is finished and its recorded outcome is ``interrupted``.
+    """
+    if not trial.state.is_finished():
+        return False
+    parsed = _parsed_trial_outcome(trial.user_attrs.get(TRIAL_OUTCOME_ATTR))
+    return parsed is not None and parsed.outcome == "interrupted"
 
 
 GENERATION_SUMMARY_SCHEMA_VERSION = 3

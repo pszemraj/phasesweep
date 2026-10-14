@@ -14,7 +14,6 @@ from phasesweep.config.search import (
     fixed_configuration_target_refusal,
     phase_draws,
 )
-from phasesweep.engine.attempts import _parsed_trial_outcome
 from phasesweep.engine.errors import (
     OperatorAction,
     SamplerContinuationUnsupportedError,
@@ -43,6 +42,7 @@ from phasesweep.engine.state import (
     TRIAL_DIR_ATTR,
     TRIAL_OUTCOME_ATTR,
     TRIAL_TARGET_ATTR,
+    _parsed_trial_outcome,
 )
 from phasesweep.engine.trial import EnvironmentIdentity
 
@@ -70,7 +70,7 @@ def _next_consecutive_failures(consecutive_failures: int, outcome: str) -> int:
     :param int consecutive_failures: Count observed before ``outcome``.
     :param str outcome: Terminal outcome. ``"failure"`` or ``"fatal"``
         increments the count, ``"success"`` resets it to zero, and any other
-        outcome (e.g. ``"pruned"``, ``"cancelled"``) leaves it unchanged.
+        outcome (e.g. ``"pruned"``, ``"interrupted"``) leaves it unchanged.
     :return int: The count after applying ``outcome``.
     """
     if outcome in {"failure", "fatal"}:

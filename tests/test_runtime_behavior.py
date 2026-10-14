@@ -1219,9 +1219,9 @@ def test_persistent_outcome_write_failure_leaves_trial_running_until_recovery(
         optuna.trial.TrialState.COMPLETE,
     ]
     assert trials[0].user_attrs[TRIAL_OUTCOME_ATTR] == {
-        "schema_version": 1,
+        "schema_version": TRIAL_OUTCOME_SCHEMA_VERSION,
         "sequence": 1,
-        "outcome": "failure",
+        "outcome": "interrupted",
         "cause": "stale RUNNING trial recovered after its orchestrator stopped",
     }
     # The whole point: the ledger still validates, so the study is reusable.
@@ -1534,7 +1534,7 @@ def test_parallel_failure_threshold_uses_completion_order(tmp_path: Path) -> Non
     "outcomes",
     [
         ["failure", "failure", "success", "failure", "failure"],
-        ["success", "pruned", "failure", "cancelled", "failure"],
+        ["success", "pruned", "failure", "interrupted", "failure"],
         ["fatal", "success", "failure"],
     ],
 )
