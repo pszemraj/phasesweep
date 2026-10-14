@@ -1703,10 +1703,12 @@ def _select_phase_winner(
     :param optuna.Study study: Study whose terminal trials supply the winner.
     :param str phase_fingerprint: Verified semantic fingerprint for the phase.
     :param dict[str, Any] completion: Completion metadata persisted with the winner.
-    :raises NoFeasibleTrialError: Every terminal trial was infeasible.
-    :raises TrialEvidenceMissingError: The selected trial's evidence directory,
-        audit artifacts, or objective source are missing or no longer match the
-        provenance frozen when its metric was extracted.
+    :raises NoFeasibleTrialError: No trial is complete, feasible and inside the metric's
+        bounds, or with ``repeats`` no group is complete.
+    :raises TrialEvidenceMissingError: The evidence directory, audit artifacts,
+        generated trainer input, or objective source of the selected trial, or of
+        any member of its group, are missing or no longer match the provenance
+        frozen when its metric was extracted.
     :return Winner: The selected winner with composed overrides and source identity.
     """
     selected = select_winner(study, experiment, phase_name=phase.name, repeats=repeat_axis(phase))
