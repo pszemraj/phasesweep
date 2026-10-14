@@ -357,6 +357,22 @@ def _preview_phase(
     finished = 0 if recorded is None else recorded.finished
     reruns = 0 if recorded is None else recorded.reruns
     remaining = max(0, phase.n_trials - finished)
+    study: optuna.Study | None = None
+    resume: _PhaseResume | None = None
+    if recorded is not None and not recorded.running and recorded.study is not None:
+        study = recorded.study
+        resumed = _preview_resume_phase(experiment, phase, inherited_winners, study)
+        if isinstance(resumed, Winner):
+            # A run replays an accepted partial result before it logs a header.
+            log.info(
+                "DRY RUN phase=%s accepted a partial result at %d of %d trials: would "
+                "replay it and launch no trials",
+                phase.name,
+                finished,
+                phase.n_trials,
+            )
+            return PhasePreview(winner=resumed, launches=0, reruns=0, replays=True)
+        resume = resumed
     log.info(
         "phase=%s study=%s finished=%d remaining=%d reruns=%d n_jobs=%d",
         phase.name,
@@ -366,8 +382,6 @@ def _preview_phase(
         reruns,
         phase.n_jobs,
     )
-    study: optuna.Study | None = None
-    resume: _PhaseResume | None = None
     if recorded is None:
         log.warning(
             "DRY RUN warning: phase=%s recorded trials could not be read, so it is "
@@ -383,19 +397,6 @@ def _preview_phase(
             phase.name,
             recorded.running,
         )
-    elif recorded.study is not None:
-        study = recorded.study
-        resumed = _preview_resume_phase(experiment, phase, inherited_winners, study)
-        if isinstance(resumed, Winner):
-            log.info(
-                "DRY RUN phase=%s accepted a partial result at %d of %d trials: would "
-                "replay it and launch no trials",
-                phase.name,
-                finished,
-                phase.n_trials,
-            )
-            return PhasePreview(winner=resumed, launches=0, reruns=0, replays=True)
-        resume = resumed
     if remaining == 0:
         log.info(
             "DRY RUN phase=%s target met (%d of %d trials recorded): would replay its "

@@ -366,11 +366,13 @@ def _accept_partial_timeout(tmp_path: Path) -> tuple[Experiment, Winner]:
 def test_accepted_partial_timeout_previews_a_replay_and_launches_nothing(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A partial result a timeout accepted at the same target replays, as a real run replays it."""
+    """A partial result a timeout accepted at the same target replays, as a real run replays it.
+
+    Like a run, the preview prints no header with trials ``remaining`` for a phase that replays.
+    """
     accepting, _winner = _accept_partial_timeout(tmp_path)
 
     assert _preview(accepting, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=2 reruns=0 n_jobs=1",
         "DRY RUN phase=a accepted a partial result at 2 of 4 trials: would replay it and "
         "launch no trials",
     ]
