@@ -93,7 +93,7 @@ from phasesweep.mcp.recovery import (
     _publication_recovery_action,
     recover_run,
 )
-from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunStore
+from phasesweep.mcp.runs import _STATE_FORMAT_MARKER_NAME, RunHandle, RunnerView, RunStore
 from phasesweep.mcp.snapshots import capture_pre_generation_result_snapshot
 from phasesweep.runtime.files import (
     PlatformCapabilityError,
@@ -1210,7 +1210,7 @@ def _recheck_live_runner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> obj
         store.cleanup_identity(handle),
         load_only_recovery_needs(),
         confirm=True,
-        provably_gone=False,
+        view=RunnerView("observable"),
         cleanup_recorded=False,
     )
 
@@ -1411,7 +1411,7 @@ ORIGIN_CASES = (
         trigger=_clean_trial_from_foreign_namespace,
         raised=ForeignPidNamespaceError,
         action=OperatorAction.FIX_CONFIG,
-        message="Act from the namespace that launched it",
+        message="only the host's initial PID namespace can see another namespace's processes",
     ),
     RoutingCase(
         id="claim_ledger_tree_changed",
@@ -1595,7 +1595,7 @@ ORIGIN_CASES = (
         trigger=_recover_run_from_foreign_namespace,
         raised=RunRecoveryError,
         action=OperatorAction.FIX_CONFIG,
-        message="Act from the namespace that launched it",
+        message="only the host's initial PID namespace can see another namespace's processes",
     ),
     RoutingCase(
         id="prior_phase_abort",

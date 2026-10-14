@@ -47,6 +47,7 @@ from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     ProcessIdentity,
     RunHandle,
+    RunnerView,
     RunStore,
     UnsupportedStateFormatError,
     load_experiment_snapshot,
@@ -60,7 +61,6 @@ from phasesweep.mcp.snapshots import (
 )
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.reaper import (
-    foreign_pid_namespace_reason,
     is_same_live_process,
     kill_stale_group,
     read_boot_id,
@@ -138,7 +138,11 @@ def recover_run(
         _recover_pre_spawn_orphan(store, run_id, confirm=confirm, emit=emit)
         return
     handle, terminal_status = _resolve_launch_state(store, handle)
-    needs = _recovery_needs(store, handle, terminal_status)
+    # One derivation of the runner serves every decision below: a runner
+    # proven absent from the host cannot come back, and a later reader's
+    # different view must not mix into this recovery.
+    view = store.runner_view(handle)
+    needs = _recovery_needs(store, handle, terminal_status, view)
     if (
         not needs.cleanup_needed
         and not needs.snapshot_finalize_needed
@@ -148,14 +152,12 @@ def recover_run(
         return
 
     identity = store.cleanup_identity(handle)
-    visibility = store.runner_visibility(handle)
-    if visibility == "unobservable":
+    if view.visibility == "unobservable":
         # The recorded PID, start time, and group are numbered in another PID
         # namespace, where they name unrelated processes: neither a liveness
         # check nor a signal would mean anything, so nothing is touched.
         raise RunRecoveryError(
-            f"the runner of {run_id} cannot be inspected from here: "
-            f"{foreign_pid_namespace_reason(identity.pid_namespace)}",
+            f"the runner of {run_id} cannot be inspected from here: {view.reason}",
             action=OperatorAction.FIX_CONFIG,
         )
     current_boot = read_boot_id()
@@ -164,8 +166,7 @@ def recover_run(
             "runner boot id is unavailable; refusing automated process-group cleanup "
             "because PID reuse after reboot cannot be ruled out"
         )
-    provably_gone = visibility == "gone"
-    _require_dead_runner(identity, provably_gone=provably_gone, cleanup_needed=needs.cleanup_needed)
+    _require_dead_runner(identity, view=view, cleanup_needed=needs.cleanup_needed)
     config = _load_recovery_config(store, handle)
     recovery_lock = _experiment_lock(config) if confirm else contextlib.nullcontext()
     transition_lock = store.transition_lock(handle) if confirm else contextlib.nullcontext()
@@ -175,14 +176,14 @@ def recover_run(
                 identity,
                 needs,
                 confirm=confirm,
-                provably_gone=provably_gone,
+                view=view,
                 cleanup_recorded=store._cleanup_recovered(handle),
             )
             # The runner may have written its terminal status after the initial
             # read. Cleanup has now confirmed it is dead, so use its final status
             # before deciding whether recovery must synthesize or repair one.
             terminal_status = store.recorded_terminal_status(handle)
-            needs = _recovery_needs(store, handle, terminal_status)
+            needs = _recovery_needs(store, handle, terminal_status, view)
             publication_action, publication_summary = _publication_recovery_action(config, needs)
             evidence = _recover_trial_evidence(store, handle, config, needs, confirm=confirm)
             if not confirm:
@@ -348,7 +349,10 @@ def _resolve_launch_state(
 
 
 def _recovery_needs(
-    store: RunStore, handle: RunHandle, terminal_status: dict[str, Any] | None
+    store: RunStore,
+    handle: RunHandle,
+    terminal_status: dict[str, object] | None,
+    view: RunnerView,
 ) -> _RecoveryNeeds:
     """Derive cleanup, publication, and snapshot recovery decisions from stored evidence.
 
@@ -357,12 +361,13 @@ def _recovery_needs(
 
     :param RunStore store: Existing run store used to inspect recovery markers.
     :param RunHandle handle: Resolved durable handle for the run.
-    :param dict[str, Any] | None terminal_status: Recorded terminal status, if available.
+    :param dict[str, object] | None terminal_status: Recorded terminal status, if available.
+    :param RunnerView view: This recovery's one derivation of the runner.
     :raises RunRecoveryError: No immutable snapshot remains for a result that cannot be rebuilt.
     :return _RecoveryNeeds: Decisions and parsed terminal evidence used by later recovery steps.
     """
-    cleanup_required = store.cleanup_recovery_required(handle)
-    snapshot_recovery_required = store.snapshot_recovery_required(handle)
+    cleanup_required = store.cleanup_recovery_required(handle, view=view)
+    snapshot_recovery_required = store.snapshot_recovery_required(handle, view=view)
     terminal_cleanup_uncertain = (
         terminal_status is not None
         and terminal_status.get("cleanup_confirmed") is False
@@ -426,36 +431,33 @@ def _recovery_needs(
 
 
 def _require_dead_runner(
-    identity: ProcessIdentity, *, provably_gone: bool, cleanup_needed: bool
+    identity: ProcessIdentity, *, view: RunnerView, cleanup_needed: bool
 ) -> None:
     """Reject a live runner or an identity that cannot be checked safely.
 
-    A prior boot, or a PID namespace with no process left, proves recorded processes are gone.
-    Otherwise, a cleanup requiring a PID must include its Linux start time before the
-    live-process check can safely distinguish PID reuse. The caller has already refused a runner
-    recorded in a PID namespace this process cannot observe.
+    A prior boot proves the runner and its descendants gone, and a runner recorded in another PID
+    namespace was proven absent from the host without probing its numbers here. Otherwise, a
+    cleanup requiring a PID must include its Linux start time before the live-process check can
+    safely distinguish PID reuse. The caller has already refused a runner it can neither observe
+    nor prove absent.
 
     :param ProcessIdentity identity: Recorded runner PID, start time, process group, boot ID, and PID namespace.
-    :param bool provably_gone: Whether the recorded boot or PID namespace proves no process remains.
+    :param RunnerView view: This recovery's one derivation of the runner.
     :param bool cleanup_needed: Whether recovery would need to clean up the runner group.
     :raises RunRecoveryError: The runner is live or PID reuse cannot be excluded.
     """
-    # PID and /proc start time are unique only within one boot and PID namespace.
-    # Either ending proves the runner and descendants are gone without signalling
-    # a recycled PID.
-    if (
-        cleanup_needed
-        and not provably_gone
-        and identity.pid is not None
-        and identity.pid_starttime is None
-    ):
+    # PID and /proc start time are unique only within one boot and PID
+    # namespace, and only this namespace's numbers may be probed.
+    if view.visibility != "observable":
+        return
+    if cleanup_needed and identity.pid is not None and identity.pid_starttime is None:
         raise RunRecoveryError(
             "runner process identity has no Linux /proc start time; refusing automated "
             "recovery because PID reuse cannot be ruled out"
         )
     # The live runner holds the run: once cancel_run stops it, the same request
     # can proceed, while another recover-run would stop at this same check.
-    if not provably_gone and is_same_live_process(identity.pid, identity.pid_starttime):
+    if is_same_live_process(identity.pid, identity.pid_starttime):
         raise RunRecoveryError(
             "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
         )
@@ -503,31 +505,34 @@ def _cleanup_runner(
     needs: _RecoveryNeeds,
     *,
     confirm: bool,
-    provably_gone: bool,
+    view: RunnerView,
     cleanup_recorded: bool,
 ) -> None:
     """Re-check and, when confirmed, clean the recorded runner process group.
 
     For confirmed calls, the caller holds the experiment lock across this liveness re-check and
-    any signals so study recovery and recovery-state writes cannot race the runner.
+    any signals so study recovery and recovery-state writes cannot race the runner. A runner from
+    an ended boot, or one proven absent from another PID namespace, is neither probed nor
+    signalled: its group is already proven gone, and a dead group never comes back.
 
     :param ProcessIdentity identity: Recorded runner process identity and process-group ID.
     :param _RecoveryNeeds needs: Decisions indicating whether runner cleanup is required.
     :param bool confirm: Enable liveness checks and any required process-group cleanup.
-    :param bool provably_gone: Whether the recorded boot or PID namespace proves no process remains.
+    :param RunnerView view: This recovery's one derivation of the runner.
     :param bool cleanup_recorded: Prior durable recovery evidence already confirms group cleanup.
     :raises RunRecoveryError: A runner is still live or process-group cleanup remains uncertain.
     """
+    if view.visibility != "observable":
+        return
     # Keep the lock from this liveness check through every signal, study
     # mutation, and recovery-state write in recover_run.
-    if confirm and not provably_gone and is_same_live_process(identity.pid, identity.pid_starttime):
+    if confirm and is_same_live_process(identity.pid, identity.pid_starttime):
         raise RunRecoveryError(
             "runner still appears live; use cancel_run first", action=OperatorAction.RETRY
         )
     if (
         needs.cleanup_needed
         and confirm
-        and not provably_gone
         and not cleanup_recorded
         and not kill_stale_group(
             identity.pid, identity.pid_starttime, pgid=identity.pgid, grace_seconds=30.0

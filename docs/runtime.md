@@ -1,6 +1,6 @@
 # Runtime behavior
 
-PhaseSweep runs one ordered Experiment on a POSIX host. It uses same-host file locks and process groups to serialize a persistent experiment and clean up trainer subprocesses. GPUs are optional; the core CLI can run CPU-only work. The optional MCP server additionally requires Linux `/proc` process identity information for detached-run cancellation and recovery.
+PhaseSweep runs one ordered Experiment on a Linux host. It uses same-host file locks and process groups to serialize a persistent experiment and clean up trainer subprocesses. Every trial's process identity records the PID namespace its numbers belong to, so `/proc` must be the procfs of the orchestrator's own PID namespace, with that namespace's PID 1 readable; the trial launcher refuses to start a trial otherwise. GPUs are optional; the core CLI can run CPU-only work. The optional MCP server additionally requires Linux `/proc` process start times for detached-run cancellation and recovery.
 
 ## Output layout
 

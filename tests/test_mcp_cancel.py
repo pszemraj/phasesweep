@@ -17,7 +17,7 @@ from phasesweep.mcp.errors import (
     PermissionDeniedError,
     RunLaunchUnsettledError,
 )
-from phasesweep.mcp.runs import RunHandle, RunState
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunState
 from phasesweep.runtime.reaper import (
     read_boot_id,
     read_pid_namespace,
@@ -78,9 +78,11 @@ def test_cancel_refuses_unsettled_launch_without_runner_identity(
     original_state = store.state
     first_read = True
 
-    def complete_launch_after_state_read(saved: RunHandle) -> RunState:
+    def complete_launch_after_state_read(
+        saved: RunHandle, *, view: RunnerView | None = None
+    ) -> RunState:
         nonlocal first_read
-        state = original_state(saved)
+        state = original_state(saved, view=view)
         if first_read:
             first_read = False
             store.update(spawned)
@@ -418,9 +420,9 @@ def test_cancel_does_not_resurrect_marker_after_operator_recovery(
     original_state = store.state
     first_cancel_read = True
 
-    def pause_cancel_state(saved: RunHandle) -> RunState:
+    def pause_cancel_state(saved: RunHandle, *, view: RunnerView | None = None) -> RunState:
         nonlocal first_cancel_read
-        state = original_state(saved)
+        state = original_state(saved, view=view)
         if threading.current_thread() is not threading.main_thread() and first_cancel_read:
             first_cancel_read = False
             read_running.set()

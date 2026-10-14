@@ -2,7 +2,7 @@
 
 The optional PhaseSweep MCP server exposes only experiments an operator has listed in a reviewed catalog. It launches detached local processes and stores durable run IDs, so a client disconnect or server restart does not end an approved run. PhaseSweep owns the server and catalog; each MCP client owns its own connection configuration and instructions. See [MCP setup](mcp_setup.md) for installation and client-owned configuration.
 
-The server runs over local stdio and is supported on Linux. It needs readable `/proc` process start times and its own PID namespace to distinguish process reuse during cancellation and recovery.
+The server runs over local stdio and is supported on Linux. It needs readable `/proc` process start times and its own PID namespace, including the start time of that namespace's PID 1, to distinguish process reuse during cancellation and recovery. On a host whose `/proc` hides other users' processes (`hidepid`), exempt the operator through its `gid=` option, or the server and the trial launcher refuse to start.
 
 ## The catalog
 
@@ -128,7 +128,7 @@ Also report a winner's `incomplete: true`: a wallclock timeout cut its phase sho
 
 `recovery_required: true` means cleanup, launch handoff, or snapshot finalization needs operator recovery. Agents should stop rather than guessing at process or result state; [run state and recovery](#run-state-and-recovery) shows where each case comes from.
 
-`runner_observable: false` appears only while a run is `running` and its runner was recorded in another PID namespace than the server's. The server then cannot tell whether the runner is alive and cannot cancel it, so the run reads `running` from durable evidence alone. Agents keep monitoring, never call `cancel_run`, and tell the user if trial counts stop advancing; [PID namespaces](#pid-namespaces) explains the cause.
+`runner_observable: false` appears only while a run is `running`, its runner was recorded in another PID namespace than the server's, and the server cannot prove that runner gone. The server then cannot tell whether the runner is alive and cannot cancel it, so the run reads `running` from durable evidence alone. Agents keep monitoring, never call `cancel_run`, and tell the user if trial counts stop advancing; [PID namespaces](#pid-namespaces) explains the cause.
 
 Winner results describe selected values, not convergence curves, robustness, causality, or unreturned trial history. Confound counts describe the population selection ranked, not the winner's robustness. Treat `<redacted>` values as deliberate catalog policy, not missing data.
 
@@ -172,11 +172,13 @@ Without `--confirm`, the command only inspects the run and reports the actions i
 
 ### PID namespaces
 
-A PID and its start time identify a process only inside one PID namespace, so each saved process identity also records the namespace its numbers belong to, and the server records its own when it launches a runner. This matters when a sandbox, container, or other isolation gives different MCP server processes different views of the same state directory.
+A PID and its start time identify a process only inside one PID namespace, so each saved process identity also records the namespace its numbers belong to, as `pid:[<inode>]@<start time of its PID 1>`: the kernel hands a freed namespace's inode to a new namespace within seconds, and the start time of the new namespace's PID 1 tells the two apart. The server records its own namespace when it launches a runner, and the trial launcher records it with every trial. This matters when a sandbox, container, or other isolation gives different processes different views of the same state directory: a sandboxed shell command can read the state of a runner that the host's MCP server launched, and when a whole session, MCP server included, runs inside one sandbox, its runners belong to that sandbox and end with it.
 
-A run whose runner was recorded in another namespace is neither alive nor dead from here. It stays `running`, holds its concurrency slot, and reports `runner_observable: false`; the server never waits on, probes, or signals the numbers it recorded, because they name unrelated processes in its own namespace. `cancel_run` refuses it with nothing signalled, and `recover-run` refuses it with a message naming both namespaces. Act from the namespace that launched the run instead.
+A run whose runner was recorded in another namespace is neither alive nor dead from a reader in a third namespace. It stays `running`, holds its concurrency slot, and reports `runner_observable: false`; the server never waits on, probes, or signals the numbers it recorded, because they name unrelated processes in its own namespace. `cancel_run` refuses it with nothing signalled, and `recover-run` refuses it with a message naming both namespaces. While the launching sandbox still runs, cancel or recover the run from inside it.
 
-From the host's initial PID namespace, a recorded namespace that has no process left settles like a reboot: nothing in it can still hold a resource, so the run reads as `failed` and recovery clears it without a signal. The server proves that by finding no process in the recorded namespace after scanning all of `/proc`, and any process it cannot inspect, including another user's when `/proc` is mounted with `hidepid`, or a sandboxed one that is not dumpable, counts as possibly still in it. On such a host the namespace cannot be proven empty, and recovery from the initial namespace refuses with the blocking process named.
+The host's initial PID namespace sees every process, so a server or `recover-run` there looks for the run's own processes instead: any process whose PID, or whose process group and session, matches a recorded one at any nesting level, from the `NSpid`, `NSpgid` and `NSsid` lines of `/proc/<pid>/status`, which are readable for every process. A match whose namespace link names another namespace is ruled out. A match in the recorded namespace, or one whose namespace link cannot be read, such as a sandboxed browser process that is not dumpable, could still be the run's, so it blocks the proof. When nothing blocks it, the runner is dead, and the run reads `running` with `recovery_required: true`, exactly like a dead runner in the server's own namespace: its trials may outlive it, so no read ever settles the run. When something blocks it, the run stays `runner_observable: false`. Nothing is ever signalled across namespaces.
+
+When the launching sandbox has already ended, run `recover-run` from a host shell outside any sandbox. It checks the runner and every stale trial of the run the same way, writes the terminal status, and clears the run. If it cannot rule a process out, it refuses and names every host process that blocked it; inspect them with the `ps` command the message gives, and retry once they have exited.
 
 ## Security boundary
 

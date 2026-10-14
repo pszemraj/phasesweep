@@ -263,8 +263,10 @@ class RunNamespaceMismatchError(McpToolError):
         super().__init__(
             f"run {run_id!r} was launched in another PID namespace, where its recorded "
             "process ids name unrelated processes for this server, so nothing was "
-            "signalled. Do not retry. Keep monitoring the run with get_run_status, and "
-            "tell the user it can only be cancelled from the environment that launched it."
+            "signalled. Do not retry. Keep monitoring the run with await_run, and tell the "
+            "user this server cannot cancel it: the operator can cancel it from the "
+            "environment that launched it while that environment runs, or recover it with "
+            "phasesweep mcp recover-run from the host once that environment has ended."
         )
 
 

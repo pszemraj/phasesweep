@@ -129,11 +129,12 @@ class UnsafeProcessCleanupError(ProcessCleanupUncertainError):
 
 
 class ForeignPidNamespaceError(ProcessCleanupUncertainError):
-    """Raised when a recorded process lives in a PID namespace this process cannot probe.
+    """Raised when a process recorded in another PID namespace cannot be proven gone.
 
     Its PID numbers name unrelated processes here, so the process can be neither
-    observed nor safely signalled; the remedy is to act from the namespace that
-    launched it, not to clean up by hand.
+    observed nor safely signalled. The remedy is to act from the host's initial
+    PID namespace, which proves the recorded processes gone without signalling
+    them, once any process it names has exited; never to clean up by hand.
     """
 
     default_action: ClassVar[OperatorAction] = OperatorAction.FIX_CONFIG

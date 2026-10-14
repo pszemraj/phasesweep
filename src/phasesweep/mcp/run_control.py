@@ -419,8 +419,9 @@ class RunControl:
             resolved = {"experiment_id": handle.experiment_id, "run_id": run_id}
             if not self._cancel_allowed(handle):
                 raise PermissionDeniedError("cancel", handle.experiment_id)
-            before = self._runs.state(handle)
-            recovery_required = self._runs.recovery_required(handle)
+            view = self._runs.runner_view(handle)
+            before = self._runs.state(handle, view=view)
+            recovery_required = self._runs.recovery_required(handle, view=view)
             state_before = {
                 "run_state": before,
                 "recovery_required": recovery_required,
@@ -429,14 +430,16 @@ class RunControl:
                 with self._runs.transition_lock(handle):
                     # Launch may have durably replaced a pending handle with
                     # its runner identity, and recovery may have finalized the
-                    # run after the first read. Use the latest handle for both
-                    # the state decision and any subsequent signal.
+                    # run after the first read. Use the latest handle, and one
+                    # derivation of its runner, for both the state decision and
+                    # any subsequent signal.
                     refreshed = self._runs.get(run_id)
                     if refreshed is None:
                         raise UnknownRunError(run_id)
                     handle = refreshed
-                    before = self._runs.state(handle)
-                    recovery_required = self._runs.recovery_required(handle)
+                    view = self._runs.runner_view(handle)
+                    before = self._runs.state(handle, view=view)
+                    recovery_required = self._runs.recovery_required(handle, view=view)
                     state_before = {
                         "run_state": before,
                         "recovery_required": recovery_required,
@@ -445,10 +448,7 @@ class RunControl:
                         # No PID/PGID is durable yet. Signalling an empty identity
                         # could let launch continue after a false cancel response.
                         raise RunLaunchUnsettledError(run_id)
-                    if (
-                        before == "running"
-                        and self._runs.runner_visibility(handle) == "unobservable"
-                    ):
+                    if before == "running" and view.visibility == "unobservable":
                         # The recorded PID and process group are numbered in
                         # another PID namespace, where they name unrelated
                         # processes. Refuse before reserving or signalling.
@@ -473,21 +473,25 @@ class RunControl:
                 # uncertainty, child trial PGIDs may still live, so keep the run
                 # counted as live and fail closed.
                 identity = self._runs.cleanup_identity(handle)
-                visibility = self._runs.runner_visibility(handle)
-                gone = visibility == "gone"
+                gone = view.visibility == "gone"
                 same_boot = identity.boot_id is not None and identity.boot_id == read_boot_id()
-                # A prior boot, or a PID namespace with no process left, proves
-                # cleanup without a signal. An unknown boot cannot make saved
-                # PID/starttime safe to signal after reboot, and another live
+                # A prior boot proves the runner and its trials gone without a
+                # signal; a runner proven absent from another PID namespace
+                # proves only its own group gone. An unknown boot cannot make
+                # saved PID/starttime safe to signal after reboot, and another
                 # PID namespace cannot be signalled from here at all.
-                runner_group_gone = gone or (
-                    same_boot
-                    and visibility == "observable"
-                    and kill_stale_group(
-                        identity.pid,
-                        identity.pid_starttime,
-                        pgid=identity.pgid,
-                        grace_seconds=30.0,
+                runner_group_gone = (
+                    gone
+                    or view.visibility == "absent"
+                    or (
+                        same_boot
+                        and view.visibility == "observable"
+                        and kill_stale_group(
+                            identity.pid,
+                            identity.pid_starttime,
+                            pgid=identity.pgid,
+                            grace_seconds=30.0,
+                        )
                     )
                 )
                 with self._runs.transition_lock(handle):
@@ -505,8 +509,8 @@ class RunControl:
                         # Recovery owns any remaining marker after recording
                         # cleanup; it may still be repairing the frozen result.
                         self._runs.clear_cleanup_uncertain(handle)
-                    after = self._runs.state(handle)
-                    recovery_required = self._runs.recovery_required(handle)
+                    after = self._runs.state(handle, view=view)
+                    recovery_required = self._runs.recovery_required(handle, view=view)
             result = {
                 "run_id": run_id,
                 "state": after,

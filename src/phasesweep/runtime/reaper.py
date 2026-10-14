@@ -15,7 +15,7 @@ import signal
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, TypeAlias, TypeGuard
+from typing import TypeGuard
 
 from phasesweep.errors import ForeignPidNamespaceError
 from phasesweep.runtime.json import strict_json_loads
@@ -37,12 +37,6 @@ INITIAL_PID_NAMESPACE_LINK = "pid:[4026531836]"
 #: pair names one namespace per boot.
 _PID_NAMESPACE_PATTERN = re.compile(r"pid:\[[1-9][0-9]*\]@(?:0|[1-9][0-9]*)")
 _PROC = Path("/proc")
-
-#: How a recorded PID namespace relates to the reader's. ``same``: PIDs recorded
-#: there can be probed here. ``gone``: the namespace provably has no process
-#: left. ``foreign``: PID numbers recorded there name unrelated processes here,
-#: so liveness is unknown.
-PidNamespaceVerdict: TypeAlias = Literal["same", "gone", "foreign"]
 
 
 @dataclass(frozen=True)
@@ -133,109 +127,133 @@ def read_pid_namespace() -> str | None:
     return value if is_pid_namespace(value) else None
 
 
-def pid_namespace_verdict(pid_namespace: str | None) -> PidNamespaceVerdict:
-    """Relate a recorded PID namespace to this process's.
+def same_pid_namespace(pid_namespace: str) -> bool:
+    """Return whether PIDs recorded in ``pid_namespace`` can be probed from this process.
 
-    ``same`` needs both the inode and the start time of the namespace's PID 1
-    to match, so a namespace that reuses an ended one's inode does not pass
-    for it. ``gone`` is available only from the initial PID namespace, whose
-    ``/proc`` lists every process on the host: when no process anywhere still
-    lives in the recorded namespace, its init has exited, and the kernel
-    killed every member with it, so nothing recorded there can still run. Any
-    doubt, such as a hidden process entry, a missing ``NSpid`` line, or an
-    unreadable namespace link, is ``foreign``.
+    Both the inode and the start time of the namespace's PID 1 must match, so
+    a namespace that reuses an ended one's inode does not pass for it. An
+    unreadable namespace on this side never matches.
 
-    :param str | None pid_namespace: Namespace recorded with the process identity.
-    :return PidNamespaceVerdict: ``same``, ``gone``, or ``foreign``.
+    :param str pid_namespace: Namespace recorded with the process identity.
+    :return bool: Whether this process is in that namespace.
     """
     current = read_pid_namespace()
-    if current is None or pid_namespace is None or not is_pid_namespace(pid_namespace):
-        return "foreign"
-    if pid_namespace == current:
-        return "same"
-    if (
-        _pid_namespace_link(current) == INITIAL_PID_NAMESPACE_LINK
-        and _pid_namespace_blocker(_pid_namespace_link(pid_namespace)) is None
-    ):
-        return "gone"
-    return "foreign"
+    return current is not None and current == pid_namespace
 
 
-def foreign_pid_namespace_reason(pid_namespace: str | None) -> str:
-    """Explain why a recorded PID namespace cannot be probed from this process.
+def recorded_process_blocker(
+    pid_namespace: str, *, pids: Collection[int], pgids: Collection[int]
+) -> str | None:
+    """Explain what stops this process from proving recorded processes of another namespace gone.
 
-    :param str | None pid_namespace: Namespace recorded with the process identity.
-    :return str: A clause naming both namespaces, the remedy, and from the
-        initial namespace what stopped the host from proving the namespace empty.
+    Only the host's initial PID namespace sees every process, and the
+    world-readable ``NSpid``, ``NSpgid`` and ``NSsid`` lines of
+    ``/proc/<pid>/status`` give each one's PID, process group and session at
+    every nesting level, outermost first. One pass over ``/proc`` finds
+    candidates: a process whose group at some nested level is a recorded group
+    that also names its session there (runners and trials lead their own
+    sessions), which still finds a group whose leader has exited, or whose
+    innermost PID is a recorded PID. A candidate's ``ns/pid`` link breaks the
+    tie: a readable link to any other namespace rules it out, while a link to
+    the recorded namespace or an unreadable one blocks the proof. A group match
+    at an outer level puts the candidate in a namespace nested below the
+    matched one, which its link cannot name, so it blocks too. Start times are
+    never compared, because a time namespace shifts them. A process that has
+    left its recorded group is not seen, the same blind spot same-namespace
+    cleanup accepts.
+
+    :param str pid_namespace: Namespace the processes were recorded in.
+    :param Collection[int] pids: Recorded PIDs, numbered in that namespace.
+    :param Collection[int] pgids: Recorded process groups, numbered in that namespace.
+    :return str | None: ``None`` when no candidate remains; otherwise a clause
+        naming what blocked the proof, including every blocking host PID.
     """
-    recorded = pid_namespace if pid_namespace is not None else "unrecorded"
-    current = read_pid_namespace() or "unreadable"
-    reason = (
-        f"it was recorded in PID namespace {recorded}, but this process is in {current}, "
-        "so its PID numbers name unrelated processes here. Act from the namespace that "
-        "launched it, or from the host's initial PID namespace once that namespace has "
-        "no process left"
-    )
-    if _pid_namespace_link(current) == INITIAL_PID_NAMESPACE_LINK and is_pid_namespace(
-        pid_namespace
-    ):
-        blocker = _pid_namespace_blocker(_pid_namespace_link(pid_namespace))
-        if blocker == 0:
-            reason += " (this host's /proc hides other users' processes, so that cannot be proven)"
-        elif blocker is not None:
-            reason += (
-                f" (host process {blocker} is in that namespace or its namespace is unreadable,"
-                " so it cannot be proven empty)"
-            )
-    return reason
-
-
-def _pid_namespace_blocker(link: str) -> int | None:
-    """Find what stops a ``/proc`` scan from proving a namespace empty.
-
-    Only meaningful from the initial PID namespace. Fails closed: a procfs that
-    hides other users' processes, a process without an ``NSpid`` line, or a
-    nested process whose namespace link cannot be read (a browser sandbox, for
-    one, is not dumpable) means absence is not proven.
-
-    :param str link: ``ns/pid`` link text of the namespace to look for.
-    :return int | None: ``None`` when every process was inspected and none is in
-        the namespace; ``0`` when the scan cannot run at all; otherwise the host
-        PID of the first process that is in it or could not be ruled out.
-    """
+    current = read_pid_namespace()
+    if current is None or _pid_namespace_link(current) != INITIAL_PID_NAMESPACE_LINK:
+        return (
+            "only the host's initial PID namespace can see another namespace's processes, "
+            "so run this from there"
+        )
+    link = _pid_namespace_link(pid_namespace)
+    if link == INITIAL_PID_NAMESPACE_LINK:
+        # That namespace is never freed, so a differing PID 1 start time means
+        # the identity was recorded under another clock (a time namespace).
+        return "it names the host's initial PID namespace under another clock"
     try:
-        (_PROC / "1" / "status").read_bytes()
         entries = tuple(_PROC.iterdir())
     except OSError:
-        return 0
-    for entry in entries:
-        if not entry.name.isdigit():
-            continue
-        try:
-            status = (entry / "status").read_text(encoding="utf-8", errors="replace")
-        except (FileNotFoundError, ProcessLookupError):
-            continue  # exited during the scan
-        except OSError:
-            return int(entry.name)
-        nspid = next(
-            (line.split()[1:] for line in status.splitlines() if line.startswith("NSpid:")),
-            None,
-        )
-        if nspid is None:
-            return int(entry.name)
-        if len(nspid) < 2:
-            continue  # a member of the initial namespace itself
-        try:
-            entry_link = os.readlink(entry / "ns" / "pid")
-        except (FileNotFoundError, ProcessLookupError):
-            if entry.exists():
-                return int(entry.name)
-            continue
-        except OSError:
-            return int(entry.name)
-        if entry_link == link:
-            return int(entry.name)
-    return None
+        return "/proc cannot be listed"
+    blockers = [
+        entry.name
+        for entry in entries
+        if entry.name.isdigit() and _may_be_recorded_process(entry, link, pids, pgids)
+    ]
+    if not blockers:
+        return None
+    named = ",".join(sorted(blockers, key=int))
+    return (
+        f"host process(es) {named} may be among its recorded processes; inspect them with "
+        f"`ps -o pid,pgid,sid,cmd -p {named}` and retry once they have exited"
+    )
+
+
+def _may_be_recorded_process(
+    entry: Path, link: str, pids: Collection[int], pgids: Collection[int]
+) -> bool:
+    """Return whether one ``/proc`` entry may be a recorded process of another namespace.
+
+    :param Path entry: ``/proc/<pid>`` directory of the initial namespace's procfs.
+    :param str link: ``ns/pid`` link text of the recorded namespace.
+    :param Collection[int] pids: Recorded PIDs, numbered in that namespace.
+    :param Collection[int] pgids: Recorded process groups, numbered in that namespace.
+    :return bool: Whether the entry is a candidate that its namespace link
+        cannot rule out. A process that exits mid-scan is not.
+    """
+    try:
+        status = (entry / "status").read_text(encoding="utf-8", errors="replace")
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except OSError:
+        return True
+    levels: dict[str, tuple[int, ...]] = {}
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        if key in {"NSpid", "NSpgid", "NSsid"}:
+            try:
+                levels[key] = tuple(int(number) for number in value.split())
+            except ValueError:
+                return True
+    nspid, nspgid, nssid = (levels.get(key, ()) for key in ("NSpid", "NSpgid", "NSsid"))
+    if not nspid or not len(nspid) == len(nspgid) == len(nssid):
+        # Without these lines (Linux before 4.1) nesting cannot be read.
+        return True
+    leads_recorded_group = [
+        nspgid[level] in pgids and nssid[level] == nspgid[level] for level in range(len(nspid))
+    ]
+    if any(leads_recorded_group[1:-1]):
+        return True
+    if len(nspid) < 2 or not (nspid[-1] in pids or leads_recorded_group[-1]):
+        return False
+    try:
+        return os.readlink(entry / "ns" / "pid") == link
+    except (FileNotFoundError, ProcessLookupError):
+        return entry.exists()
+    except OSError:
+        return True
+
+
+def foreign_pid_namespace_reason(pid_namespace: str, blocker: str) -> str:
+    """Explain why processes recorded in another PID namespace cannot be acted on here.
+
+    :param str pid_namespace: Namespace recorded with the process identity.
+    :param str blocker: What stopped the proof, from :func:`recorded_process_blocker`.
+    :return str: A clause naming both namespaces and what blocked the proof.
+    """
+    current = read_pid_namespace() or "unreadable"
+    return (
+        f"it was recorded in PID namespace {pid_namespace}, but this process is in {current}, "
+        f"so its PID numbers name unrelated processes here, and {blocker}"
+    )
 
 
 @dataclass(frozen=True)
@@ -476,26 +494,27 @@ def cleanup_stale_trial_process(
 
     When ``identity.boot_id`` differs from the current boot id, the host has
     rebooted since launch, so no process from that boot can still be alive and
-    cleanup is trivially complete. A recorded PID namespace that provably has
-    no process left settles the same way. A namespace this process cannot
-    probe is refused before anything else: its PID numbers name unrelated
-    processes here, so signalling them could kill an innocent group. Within
-    this namespace, cleanup refuses to act when ``identity`` lacks a recorded
-    boot id or start time, or the current boot id cannot be read, since
-    PID-reuse safety cannot be verified in that case, and otherwise delegates
-    to :func:`kill_stale_group` with the identity's ``pid``/``pgid``/starttime.
+    cleanup is trivially complete. An identity recorded in another PID
+    namespace is never probed or signalled, because its numbers name unrelated
+    processes here: from the host's initial namespace, the absence of its own
+    process and group (:func:`recorded_process_blocker`) settles it the same
+    way, and anything else refuses. Within this namespace, cleanup refuses to
+    act when ``identity`` lacks a recorded boot id or start time, or the
+    current boot id cannot be read, since PID-reuse safety cannot be verified
+    in that case, and otherwise delegates to :func:`kill_stale_group` with the
+    identity's ``pid``/``pgid``/starttime.
 
     :param StaleProcessIdentity identity: Durable process identity read from
         ``process_identity.json``.
     :param float grace_seconds: Seconds to wait after SIGTERM before escalating
         to SIGKILL; forwarded to :func:`kill_stale_group`.
-    :raises ForeignPidNamespaceError: The identity was recorded in a PID
-        namespace this process cannot probe and cannot prove empty.
+    :raises ForeignPidNamespaceError: The identity was recorded in another PID
+        namespace and its processes cannot be proven gone from here.
     :return bool: ``True`` when it is safe to mark the trial ``FAIL`` (nothing
-        to clean, the host rebooted, the namespace is gone, or cleanup was
-        confirmed). ``False`` when identity cannot be verified or
-        :func:`kill_stale_group` reports cleanup is uncertain; callers must not
-        advance state in that case.
+        to clean, the host rebooted, its processes in another namespace are
+        provably gone, or cleanup was confirmed). ``False`` when identity
+        cannot be verified or :func:`kill_stale_group` reports cleanup is
+        uncertain; callers must not advance state in that case.
     """
     current_boot_id = read_boot_id()
     if identity_from_earlier_boot(identity.boot_id, current_boot_id):
@@ -504,18 +523,21 @@ def cleanup_stale_trial_process(
             identity.attempt_id,
         )
         return True
-    verdict = pid_namespace_verdict(identity.pid_namespace)
-    if verdict == "gone":
-        log.warning(
-            "Attempt %s belongs to PID namespace %s, which has no process left.",
-            identity.attempt_id,
-            identity.pid_namespace,
+    if not same_pid_namespace(identity.pid_namespace):
+        blocker = recorded_process_blocker(
+            identity.pid_namespace, pids=(identity.pid,), pgids=(identity.pgid,)
         )
-        return True
-    if verdict == "foreign":
+        if blocker is None:
+            log.warning(
+                "Attempt %s was recorded in PID namespace %s, where none of its processes remains.",
+                identity.attempt_id,
+                identity.pid_namespace,
+            )
+            return True
         raise ForeignPidNamespaceError(
             f"Attempt {identity.attempt_id} (pid={identity.pid}) cannot be cleaned from here: "
-            f"{foreign_pid_namespace_reason(identity.pid_namespace)}. Nothing was signalled."
+            f"{foreign_pid_namespace_reason(identity.pid_namespace, blocker)}. "
+            "Nothing was signalled."
         )
     if identity.boot_id is None or identity.proc_starttime is None or current_boot_id is None:
         log.warning(
@@ -834,9 +856,9 @@ def kill_stale_group(
     GPU, scribble over W&B runs, or starve the host scheduler.
 
     Precondition: the caller has established that ``pid`` and ``pgid`` were
-    recorded in this process's PID namespace (:func:`pid_namespace_verdict`
-    returned ``same``), or that the identity is a child this process just
-    spawned. In another namespace the same numbers name unrelated processes.
+    recorded in this process's PID namespace (:func:`same_pid_namespace`), or
+    that the identity is a child this process just spawned. In another
+    namespace the same numbers name unrelated processes.
 
     Recovery order (review v0.5.3 / blocker 2):
 

@@ -49,7 +49,7 @@ from phasesweep.mcp.errors import (
     UnknownRunError,
 )
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunStore
+from phasesweep.mcp.runs import RunHandle, RunnerView, RunStore
 from phasesweep.mcp.server import (
     AwaitRunResult,
     GetRunResultsResult,
@@ -57,6 +57,7 @@ from phasesweep.mcp.server import (
 )
 from phasesweep.mcp.snapshots import capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
+from phasesweep.runtime.json import JsonObject
 from tests.conftest import (
     write_constant_trainer,
 )
@@ -260,7 +261,7 @@ def test_mcp_run_reads_redact_downgraded_persistent_ledger(
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
 
     experiment = registry.get("srv").experiment
     study = optuna.load_study(
@@ -307,7 +308,7 @@ def test_mcp_winners_hide_unusable_frozen_publications_before_and_after_live_rea
     # progress. The second branch must apply the same winner suppression to
     # the snapshot that replaced that temporary live view.
     write_run_status(store, **{**unusable, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
     original_live_result = app._live_result
     finalized = False
 
@@ -344,7 +345,7 @@ def test_mcp_winners_hide_unusable_live_publications(
     app, _registry, store = make_mcp_app(catalog)
     experiment = app._registry.get("srv").experiment
     store.status_path(run_id).unlink()
-    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
     if integrity == "failed":
         _generation_summary_path(experiment, run_id).unlink()
     else:
@@ -612,13 +613,15 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
-    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: True)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
     original_run_payload = app._run_payload
     finalized = False
 
-    def finish_after_run_payload(saved: RunHandle) -> dict[str, Any]:
+    def finish_after_run_payload(
+        saved: RunHandle, view: RunnerView | None = None, **force: bool
+    ) -> JsonObject:
         nonlocal finalized
-        run = original_run_payload(saved)
+        run = original_run_payload(saved, view, **force)
         if not finalized:
             assert run["state"] == "running"
             finalized = True
@@ -658,7 +661,7 @@ def test_run_scoped_read_rereads_pending_snapshot_after_runner_exit(
     store.config_snapshot_path(run_id).unlink()
     finalized = False
 
-    def finish_before_reporting_exit(_handle: RunHandle) -> bool:
+    def finish_before_reporting_exit(_handle: RunHandle, **_view: object) -> bool:
         nonlocal finalized
         assert not finalized
         finalized = True
@@ -722,7 +725,7 @@ def test_run_scoped_live_read_uses_snapshot_completed_during_read(
     else:
         write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
     runner_live = True
-    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle: runner_live)
+    monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: runner_live)
     monkeypatch.setattr(
         "phasesweep.mcp.runs.is_same_live_process", lambda _pid, _starttime: runner_live
     )
@@ -806,9 +809,11 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
     original_run_payload = app._run_payload
     marked = False
 
-    def reserve_after_run_payload(saved: RunHandle) -> dict[str, Any]:
+    def reserve_after_run_payload(
+        saved: RunHandle, view: RunnerView | None = None, **force: bool
+    ) -> JsonObject:
         nonlocal marked
-        run = original_run_payload(saved)
+        run = original_run_payload(saved, view, **force)
         if not marked:
             assert run["state"] == "succeeded"
             marked = True
