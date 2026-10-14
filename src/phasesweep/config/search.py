@@ -427,7 +427,8 @@ def fixed_configuration_target_refusal(
 
     A fixed configuration runs the same trial every time, so it keeps at most
     one completed result, and ``n_trials`` above 1 only replaces failed
-    attempts. With ``finished`` terminal attempts and none completed, the
+    attempts; an interrupted attempt reruns without one and never counts. With
+    ``finished`` attempts and none completed, the
     target may reach ``finished + 1``: one more attempt than the failures it
     replaces. Once one attempt completed, feasible or not, the configuration
     has been measured and the target may not pass the attempts already made, or
@@ -435,8 +436,8 @@ def fixed_configuration_target_refusal(
     that draws is never refused here.
 
     :param Phase phase: Phase whose ``n_trials`` is checked.
-    :param int finished: Terminal attempts its study already holds, zero when
-        the study does not exist yet.
+    :param int finished: Finished attempts its study already holds, interrupted
+        ones left out, zero when the study does not exist yet.
     :param int completed: How many of those attempts are COMPLETE, whether or
         not they are feasible.
     :return str | None: The refusal, which names the fix, or ``None`` when the

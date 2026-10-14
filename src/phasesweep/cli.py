@@ -791,7 +791,7 @@ def _render_trial_tables(tables: TrialTables, *, persisted: bool) -> str:
     else:
         marks = (
             f"winner (*) marks published generation {tables.published_generation_id}; "
-            "it does not follow a rerun until that rerun publishes"
+            "it does not follow a later run until that run publishes"
         )
     lines = [f"experiment {tables.experiment}: {marks}"]
     for table in tables.phases:

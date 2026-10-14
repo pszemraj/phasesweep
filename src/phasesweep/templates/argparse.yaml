@@ -52,7 +52,7 @@ phases:
   - name: learning_rate
     comment: "Search the learning rate on a log scale, with a fixed seed so the draws repeat."
     n_trials: 4
-    # Each draw derives from this seed and the trial number, so an interrupted run resumes.
+    # Each draw derives from this seed and the draw position, so an interrupted trial reruns its exact draw.
     sampler: { type: random, seed: 0 }
     search_space:
       optimizer.lr: { type: float, low: 0.0001, high: 0.001, log: true }

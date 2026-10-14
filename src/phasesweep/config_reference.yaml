@@ -70,7 +70,7 @@ trial_command: string (required)
 # Requires: metric.name, constraints[].name and observe[].name must all be distinct; duplicate names fail config load.
 # Selection records three advisory confound verdicts on the winner: evaluation_point, survivorship and tie. They cannot be disabled or tuned and never block selection or publication.
 # evaluation_point is flagged when the lowest ranked position on the evaluation axis is more than 1% short of the furthest.
-# survivorship is flagged when failed plus pruned trials are at least max(1, ranked trials). Infeasible trials, including those outside metric.min or metric.max, are counted but never flagged, and so are feasible trials of a phases[].repeats group that never completed (incomplete_group).
+# survivorship is flagged when failed plus pruned trials are at least max(1, ranked trials). Interrupted trials are not counted, because their reruns stand in for them. Infeasible trials, including those outside metric.min or metric.max, are counted but never flagged, and so are feasible trials of a phases[].repeats group that never completed (incomplete_group).
 # tie is flagged when another ranked trial has exactly the winner's value with different sampled parameters. With phases[].repeats it compares complete groups: it is also flagged when another group's reduced value lies within two standard errors of the winning group's (within_noise), a heuristic rather than a significance test.
 # A verdict of n/a means not checked. evaluation_point is n/a when fewer than two trials were ranked, and tie when fewer than two trials, or with repeats fewer than two groups, were ranked.
 # evaluation_point needs a recorded position, and only json_envelope, wandb and mlflow objectives record one. It is always n/a for json and log_regex objectives; report through json_envelope (report_objective), wandb (evaluation_axis) or mlflow (the selected step) when the comparison needs it. phasesweep validate and run --dry-run print an evaluation_point check: line that says which case applies.
@@ -269,15 +269,16 @@ phases: list[object] (required)
   # Renaming a phase starts a new study (<experiment>::<phase>).
   - name: string (required)
 
-    # Target number of terminal attempts in this phase, an integer >= 1. An attempt is terminal once it has failed or finished.
+    # Target number of finished attempts in this phase, an integer >= 1. An attempt is finished once it has failed, been pruned or completed.
     # Failed and infeasible attempts consume the target, not only successes. If no feasible result is eligible the phase fails.
-    # Rerunning the same config on persistent storage re-ranks the stored trials and republishes when the target is already reached.
+    # An interrupted attempt (phase or run deadline, host shutdown, an attempt recovered after its orchestrator stopped) never consumes the target: on persistent storage the next run reruns it with its parameters before any new draw.
+    # Running the same config again on persistent storage re-ranks the stored trials and republishes when the target is already reached.
     # Raising the target on persistent storage runs the remaining attempts in the same study.
     # With storage null every invocation is a fresh in-memory study and runs the whole target again.
     # A persistent phase cannot lower its target below the one it already accepted.
     # Raising it is refused while a later phase that inherits from this one, directly or through other phases, already has trials. Use a new experiment name for that.
     # A fixed configuration is a phase with an empty phases[].search_space, no phases[].repeats, and its values in phases[].fixed_overrides. A list of fixed runs is one such phase per configuration.
-    # A fixed configuration keeps at most one completed result. On persistent storage a failed, timed-out or interrupted trial still counts toward n_trials, so rerunning the same config replays the failure. Raising n_trials by one per failed attempt retries it, under any sampler, and never once an attempt completed, feasible or not.
+    # A fixed configuration keeps at most one completed result. On persistent storage a failed or timed-out trial still counts toward n_trials, so running the same config again replays the failure, while an interrupted one reruns by itself. Raising n_trials by one per failed attempt retries it, under any sampler, and never once an attempt completed, feasible or not.
     # Warning: validate and the dry run print a warning when a fixed configuration has n_trials above 1, because only a launch can say whether the extra trials are retries. A launch and the dry run, which reads the recorded attempts, refuse a larger target before any phase runs.
     # Raising it also recovers a phase that stopped on a durable abort or on an accepted partial timeout. Repeating the same target preserves that decision. With phases[].repeats this works only under seeded random over a nonempty search_space, because a grid and a seed audit run their full matrix.
     # Excluded from the study fingerprint.
@@ -393,8 +394,8 @@ phases: list[object] (required)
     # Run every configuration once per repeat value, typically seeds, and rank configurations by a reducer over their members instead of by any single trial.
     # A targeted tool: R values multiply the phase's cost by R. Use it to compare a few discrete finalists, such as architectures or another categorical choice, whose gap is near the noise; to measure how far one configuration moves with the seed; or to report a final configuration's spread. For a continuous hyperparameter such as the learning rate, more distinct values of it, one trial each (a denser grid or more seeded random draws over a log range), cover the same ground, and the trend across neighbors shows the noise.
     # The sampler draws the repeat value as one more axis, so a phase of N configurations with R values runs N x R trials.
-    # Under grid every cell is one configuration with one repeat value. Under seeded random each slot of R consecutive trial numbers draws one configuration and runs it once per value, value number trial_number mod R.
-    # A configuration ranks only as a complete group: one trial per repeat value, every one COMPLETE, feasible, inside metric.min and metric.max and every constraint. A group with a failed or infeasible member never ranks, and a failed member is not retried.
+    # Under grid every cell is one configuration with one repeat value. Under seeded random each slot of R consecutive draw positions draws one configuration and runs it once per value, value number position mod R. A trial's draw position counts the trials before it that are not reruns, and a rerun of an interrupted trial takes its source's position.
+    # A configuration ranks only as a complete group: one trial per repeat value, every one COMPLETE, feasible, inside metric.min and metric.max and every constraint. A group with a failed or infeasible member never ranks, and a failed member is not retried. An interrupted member belongs to no group; its rerun takes its place.
     # Groups rank by phases[].repeats.reduce over their member metrics. Exact ties go to the group with the lowest trial number, and the group's highest trial number names the winner.
     # winner.yaml records the reduced metric, observed values averaged over the members that recorded them, and a repeats block with the spread and every member. The scalar winner fields describe the last member.
     # The winner's params and effective overrides never carry the repeat key, so a phase that inherits this one runs with its own value of that key or none.
@@ -480,7 +481,8 @@ phases: list[object] (required)
     sampler: object = {}
       # Optuna strategy. tpe fits a surrogate model after its random startup trials, random samples independently, grid enumerates a concrete matrix, and cmaes runs CMA-ES on numeric spaces.
       # Seeded tpe and cmaes key every random choice to the trial's draw position, so a persistent phase resumes after an interruption and grows when phases[].n_trials rises without drawing a configuration twice. At n_jobs 1 the draws match an uninterrupted run, given the same trial values; above 1 they depend on which trials have finished when each is drawn.
-      # Seeded random derives each draw from the seed, study name, trial number and parameter name, so it is independent of n_jobs and restarts. With phases[].repeats the configuration slot, trial_number divided by the number of repeat values, takes the place of the trial number.
+      # Seeded random derives each draw from the seed, study name, draw position and parameter name, so it is independent of n_jobs and restarts. With phases[].repeats the configuration slot, the position divided by the number of repeat values, takes the place of the position.
+      # Grid runs at each draw position the grid point its seeded order puts there. Under every sampler a rerun of an interrupted trial runs its source's parameters without consulting the sampler.
       # Every random draw is independent and with replacement, seeded or not, so three trials over a three-value categorical cover all three values only about 2 times in 9, and a value can repeat or never be drawn. Use grid when every value must be covered.
       # cmaes needs the cmaes package; config load fails with an install hint when it is missing.
       # Requires: with cmaes every phases[].search_space parameter is numeric.
@@ -518,7 +520,7 @@ phases: list[object] (required)
     # The clock starts when the supervised launch starts, including supervisor startup, after the GPU lease is held. It does not cover the wait for a lease or the evidence reads after the trainer exits.
     # A trainer killed by this limit fails the attempt and counts toward phases[].max_consecutive_failures. 0 expires immediately: the trainer never starts and every attempt fails.
     # The phase and run deadlines also cover the lease wait and the evidence reads, and the earliest active deadline limits the work.
-    # A trainer killed because a phase or run deadline arrived first is interrupted rather than failed.
+    # A trainer killed because a phase or run deadline arrived first is interrupted rather than failed, and reruns once the phase continues.
     # Part of the study fingerprint, so changing it stops a populated phase from being reused.
     # Requires: null needs phases[].allow_unbounded_trials true; config load fails otherwise.
     timeout_seconds_per_trial: float | null = 259200.0
@@ -540,7 +542,7 @@ phases: list[object] (required)
 
     # Accept a feasible winner from fewer than phases[].n_trials attempts after a phase or run wallclock timeout, and persist that decision. false fails closed. Reusing a stored partial winner also requires true.
     # Only used when: phases[].timeout_seconds_per_phase or timeout_seconds_per_run leaves the phase incomplete. It never substitutes a baseline or lets missing or infeasible evidence win.
-    # Repeating the same accepted phases[].n_trials replays the partial decision without running its unused slots. A resumable sampler needs a larger target to run new work.
+    # Repeating the same accepted phases[].n_trials replays the partial decision without running its unused slots or rerunning the attempts the deadline interrupted. A larger target runs those reruns first, then new work.
     # A per-trial timeout alone does not enable partial acceptance.
     # Excluded from the study fingerprint.
     allow_incomplete_on_timeout: bool = false
@@ -748,7 +750,7 @@ override_format: "yaml_file" | "argparse" | "hydra" | "json_file" = "yaml_file"
 # Requires: provenance is nonempty for auto or a journal; phases with a nonempty search_space also need phases[].sampler.seed when stochastic. Config load fails otherwise.
 # Requires: workdir and the experiment name keep pointing at the same ledger. An artifact root <workdir>/<experiment> remembers its storage identity, which includes null, so switching between null and a journal or between two journals is refused, and so is opening one journal under another workdir or experiment name.
 # Excluded from the study fingerprint.
-# Warning: null cannot resume or top up a later invocation.
+# Warning: null cannot resume or top up a later invocation, and nothing it interrupts reruns.
 storage: string | null = null
 
 # Directory that holds per-experiment generations, phase and attempt directories, logs and winner files.
@@ -1160,7 +1162,7 @@ execution: object = {}
 
 # Wallclock budget for one invocation of phasesweep run, in seconds, finite and >= 0. 0 expires immediately.
 # The clock starts after the generation is claimed, before execution preflight and phase work. Initial locking and ledger setup are outside it.
-# The clock restarts at every invocation: a rerun, a --from-phase resume or an MCP launch gets a fresh budget, and the time earlier invocations spent does not count against it.
+# The clock restarts at every invocation: a later run, a --from-phase resume or an MCP launch gets a fresh budget, and the time earlier invocations spent does not count against it.
 # The earliest of this deadline and each phase's own deadlines limits the work. W&B evidence reads and MLflow resolution, run creation and capture are capped by the remaining budget too; MLflow result uploads are not.
 # An incomplete phase fails closed unless phases[].allow_incomplete_on_timeout permits a feasible partial winner.
 # Cleanup and publication can run past the deadline, and the deadline never waives process-cleanup requirements.

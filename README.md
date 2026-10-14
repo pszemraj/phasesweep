@@ -61,7 +61,7 @@ phasesweep run starter.yaml         # four tiny trials, a few seconds
 
 `phasesweep init` never overwrites an existing file. `phasesweep init --list` names the other templates, which cover a trainer that takes `--key=value` flags, one phase per architecture, a chained search and a [noisy objective](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#noisy-objectives-and-small-budgets); `--template NAME` writes one, and `-o PATH` names the file or a directory that receives `NAME.yaml`. Every template runs as written on the packaged toy trainer, so replace its trainer command, keys and extractor with your own.
 
-The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining directly and gains one `TRIAL` line per finished trial; `tail -f` follows it while a sweep runs (abridged):
+The run log, `runs/phasesweep_starter/run.log` beside the config, shows the phase chaining directly and gains one `TRIAL` line per trial that ends; `tail -f` follows it while a sweep runs (abridged):
 
 ```text
 [depth/trial_0] python -m phasesweep.examples.fake_train --config .../trainer_config.yaml
@@ -104,7 +104,7 @@ phasesweep status starter.yaml --trials
 ```
 
 ```text
-experiment phasesweep_starter: winner (*) marks published generation be4f520d0ec04175ac623ac6184d342e; it does not follow a rerun until that rerun publishes
+experiment phasesweep_starter: winner (*) marks published generation be4f520d0ec04175ac623ac6184d342e; it does not follow a later run until that run publishes
 
 === depth === (2 trials)
 trial  state     value  params            duration_s  winner
@@ -116,6 +116,8 @@ trial  state        value  params               duration_s  winner
     0  COMPLETE       0.3  optimizer.lr=0.0003         0.6  *
     1  COMPLETE  0.413822  optimizer.lr=0.0001         0.6
 ```
+
+A run stopped by Ctrl-C or a kill resumes when you run the same config again: finished phases replay their winners, and a phase cut short reruns the trials the stop interrupted, with their parameters, before it draws anything new. An interrupted trial never counts toward `n_trials`, so the resumed phase evaluates what an uninterrupted run would ([interrupted trials rerun](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#interrupted-trials-rerun)).
 
 ## Use your own trainer
 
@@ -131,7 +133,7 @@ Start from the [template](https://github.com/pszemraj/phasesweep/blob/main/docs/
 `argparse` renders a boolean as `--key=true` or `--key=false`, which a plain `store_true` flag rejects; `validate` and `--dry-run` warn when a configured value would render that way. Write such a flag in `trial_command` instead, or have the trainer accept a value.
 
 > [!TIP]
-> `phasesweep run starter.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects. A phase that inherits another that still has trials to run previews with stand-in values for the parent's winner, and its line names the inherited keys that hold them. Over an experiment that already has recorded trials it also reports how many trials each phase would still launch, refuses most of what a run would refuse over them, and says that a phase that has reached its `n_trials` would replay its existing result and launch nothing; the phases that inherit it preview with that result's winner. [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) lists the refusals it does and does not make.
+> `phasesweep run starter.yaml --dry-run` prints one rendered command per phase without launching work. Use it to check that your placeholders render what the trainer expects. A phase that inherits another that still has trials to run previews with stand-in values for the parent's winner, and its line names the inherited keys that hold them. Over an experiment that already has recorded trials it also reports how many trials each phase would still launch, reruns of interrupted trials included, refuses most of what a run would refuse over them, and says that a phase that has reached its `n_trials` would replay its existing result and launch nothing; the phases that inherit it preview with that result's winner. [Runtime behavior](https://github.com/pszemraj/phasesweep/blob/main/docs/runtime.md#inspection-commands) lists the refusals it does and does not make.
 
 The trainer runs in `execution.cwd`, or in the directory you started PhaseSweep from when that is unset, with a minimal environment: `PATH`, `HOME`, `TMPDIR` and a few more, not the shell's `PYTHONPATH`, conda settings, caches or credentials. Name what it needs under `env` or `execution.inherit_env`; `validate` and `--dry-run` print the `environment:` and `trainer cwd:` lines, and a relative path in the config resolves against the config file's directory. The [trainer contract](https://github.com/pszemraj/phasesweep/blob/main/docs/config.md#trainer-contract) has the details.
 
