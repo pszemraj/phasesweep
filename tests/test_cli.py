@@ -53,7 +53,6 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _winner_path,
 )
-from phasesweep.engine.phase import _is_placeholder_winner
 from phasesweep.engine.state import Winner
 from phasesweep.errors import GpuConfigurationError
 from phasesweep.mcp.errors import CatalogError
@@ -1072,9 +1071,10 @@ def test_dry_run_marks_inherited_values_as_placeholders(tmp_path, caplog):
         "DRY RUN example command (placeholders until 'a' publishes a winner: depth):\n"
     )
     assert "--depth=6" in commands[1]
-    assert all(_is_placeholder_winner(winner) for winner in winners.values())
+    assert winners["a"].placeholder_keys == frozenset({"depth"})
+    assert winners["b"].placeholder_keys == frozenset({"depth", "lr"})
     published = Winner(trial_number=3, params={}, effective_overrides={}, metric=1.0)
-    assert not _is_placeholder_winner(published)
+    assert published.placeholder_keys == frozenset()
 
 
 def test_dry_run_names_the_placeholder_keys_by_parent(tmp_path, caplog):

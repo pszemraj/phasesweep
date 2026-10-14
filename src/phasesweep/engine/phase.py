@@ -1861,16 +1861,6 @@ def _select_phase_winner(
     )
 
 
-def _is_placeholder_winner(winner: Winner) -> bool:
-    """Say whether a winner was synthesized for a dry-run preview.
-
-    :param Winner winner: A winner a dry run inherits from.
-    :return bool: ``True`` for the placeholder :func:`_placeholder_winner` builds, ``False``
-        for one loaded from a published result.
-    """
-    return winner.trial_number == -1
-
-
 def _placeholder_winner(
     experiment: Experiment,
     phase: Phase,
