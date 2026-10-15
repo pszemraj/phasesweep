@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import os
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+import typing
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, Required, TypedDict, Unpack
@@ -27,6 +29,9 @@ from phasesweep.mcp.tools import PhaseSweepMCP
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from phasesweep.runtime.time import utc_now_iso
 from tests.conftest import REPO, make_experiment, reaped_pid, restored_signal_ownership
+
+if typing.TYPE_CHECKING:
+    from mcp.types import CallToolResult
 
 # Persistent storage rejects an unseeded stochastic sampler.
 SEEDED_RANDOM = Sampler(type="random", seed=0)
@@ -176,6 +181,30 @@ def make_mcp_app(catalog: Path) -> tuple[PhaseSweepMCP, Registry, RunStore]:
     registry = Registry.load(catalog)
     store = RunStore(registry.state_dir)
     return PhaseSweepMCP(registry, store), registry, store
+
+
+def call_mcp_tool(
+    app: PhaseSweepMCP, tool_name: str, arguments: dict[str, object]
+) -> CallToolResult:
+    """Dispatch raw arguments through the FastMCP request handler.
+
+    :param PhaseSweepMCP app: Server whose tools the handler exposes.
+    :param str tool_name: Registered tool to call.
+    :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
+    :return CallToolResult: Client-visible error, content and structured result.
+    """
+    from mcp import types
+
+    from phasesweep.mcp.server import build_server
+
+    handler = build_server(app)._mcp_server.request_handlers[types.CallToolRequest]
+    request = types.CallToolRequest(
+        params=types.CallToolRequestParams(name=tool_name, arguments=arguments)
+    )
+    result = asyncio.run(handler(request)).root
+    if not isinstance(result, types.CallToolResult):
+        raise TypeError(f"A tool call answered with {type(result).__name__}, not CallToolResult.")
+    return result
 
 
 def wait_for_mcp_running_trial(app: PhaseSweepMCP, run_id: str, *, timeout: float) -> str:

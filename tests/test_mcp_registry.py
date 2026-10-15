@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from phasesweep.mcp.errors import CatalogError, UnknownExperimentError
-from phasesweep.mcp.registry import Registry
+from phasesweep.mcp.registry import RegisteredExperiment, Registry
 from tests.mcp_helpers import mcp_experiment_config_text, write_mcp_catalog
 
 REPO = Path(__file__).resolve().parents[1]
@@ -277,44 +277,38 @@ def test_catalog_rejects_invalid_visible_params_policy(tmp_path: Path) -> None:
         )
 
 
-def test_relative_workdir_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
+def _registered_nested_config(tmp_path: Path, body: str) -> tuple[RegisteredExperiment, Path]:
+    """Register an experiment whose configuration lives below the catalog directory."""
     config_dir = tmp_path / "configs"
     config_dir.mkdir()
-    config = _write(
-        config_dir / "exp.yaml",
+    config = _write(config_dir / "exp.yaml", body)
+    return Registry.load(_catalog(tmp_path, config)).get("reg_ok"), config_dir
+
+
+def test_relative_workdir_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
+    registered, config_dir = _registered_nested_config(
+        tmp_path,
         _experiment_yaml(tmp_path).replace(f"workdir: {tmp_path}/runs/reg_ok", "workdir: runs"),
     )
-
-    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
-
     assert registered.experiment.workdir == str(config_dir.resolve() / "runs")
 
 
 def test_relative_execution_cwd_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
     """A relative trainer cwd names one directory for the CLI and the detached runner."""
-    config_dir = tmp_path / "configs"
-    config_dir.mkdir()
-    config = _write(
-        config_dir / "exp.yaml",
+    registered, config_dir = _registered_nested_config(
+        tmp_path,
         _experiment_yaml(tmp_path) + "execution:\n  cwd: trainer\n",
     )
-
-    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
-
     assert registered.experiment.execution.cwd == str(config_dir.resolve() / "trainer")
 
 
 def test_relative_journal_resolves_against_the_config_for_mcp(tmp_path: Path) -> None:
-    config_dir = tmp_path / "configs"
-    config_dir.mkdir()
-    config = _write(
-        config_dir / "exp.yaml",
+    registered, config_dir = _registered_nested_config(
+        tmp_path,
         _experiment_yaml(tmp_path).replace(
             f"journal:///{tmp_path}/reg_ok.journal", '"journal:///relative.journal"'
         ),
     )
-
-    registered = Registry.load(_catalog(tmp_path, config)).get("reg_ok")
 
     assert registered.experiment.storage == f"journal:///{config_dir.resolve()}/relative.journal"
 

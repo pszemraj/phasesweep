@@ -7,7 +7,6 @@ import importlib.util
 import json
 from importlib.machinery import ModuleSpec
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
 from click.testing import CliRunner, Result
@@ -19,10 +18,12 @@ from phasesweep.mcp.tool_names import (
     TOOL_LAUNCH_RUN,
     TOOL_LIST_EXPERIMENTS,
 )
-from tests.mcp_helpers import make_mcp_app, mcp_experiment_config_text, write_mcp_config_catalog
-
-if TYPE_CHECKING:
-    from mcp.types import CallToolResult
+from tests.mcp_helpers import (
+    call_mcp_tool,
+    make_mcp_app,
+    mcp_experiment_config_text,
+    write_mcp_config_catalog,
+)
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("mcp") is None, reason="the mcp extra is not installed"
@@ -57,28 +58,6 @@ def _mcp_call(catalog: Path, tool: str, *arguments: str) -> Result:
     )
 
 
-def _client_result(catalog: Path, tool: str, arguments: dict[str, object]) -> CallToolResult:
-    """Dispatch one tool call through the request handler a connected client reaches.
-
-    :param Path catalog: Catalog to serve.
-    :param str tool: Tool name.
-    :param dict[str, object] arguments: Raw tool arguments, sent unvalidated.
-    :return CallToolResult: The call's result, whose ``isError`` and ``content`` the caller inspects.
-    """
-    from mcp import types
-
-    from phasesweep.mcp.server import build_server
-
-    app, _registry, _store = make_mcp_app(catalog)
-    handler = build_server(app)._mcp_server.request_handlers[types.CallToolRequest]
-    request = types.CallToolRequest(
-        params=types.CallToolRequestParams(name=tool, arguments=arguments)
-    )
-    result = asyncio.run(handler(request)).root
-    assert isinstance(result, types.CallToolResult)
-    return result
-
-
 def test_mcp_call_prints_structured_result_as_json(tmp_path: Path) -> None:
     """The printed object is the structured content a client receives, for default and given arguments."""
     catalog = _catalog(tmp_path)
@@ -88,7 +67,7 @@ def test_mcp_call_prints_structured_result_as_json(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert result.stderr == ""
     assert result.stdout.startswith('{\n  "experiments": [')
-    client = _client_result(catalog, TOOL_LIST_EXPERIMENTS, {})
+    client = call_mcp_tool(make_mcp_app(catalog)[0], TOOL_LIST_EXPERIMENTS, {})
     assert client.isError is False
     assert json.loads(result.stdout) == client.structuredContent
     assert [entry["id"] for entry in json.loads(result.stdout)["experiments"]] == ["srv", "other"]
@@ -119,7 +98,7 @@ def test_mcp_call_tool_error_matches_client_is_error_text(
     # A launch outside the initial PID namespace also warns; keep stderr to the error text.
     monkeypatch.setattr("phasesweep.mcp.server.in_initial_pid_namespace", lambda: True)
     catalog = _catalog(tmp_path)
-    client = _client_result(catalog, tool, arguments)
+    client = call_mcp_tool(make_mcp_app(catalog)[0], tool, arguments)
     assert client.isError is True
 
     result = _mcp_call(catalog, tool, json.dumps(arguments))

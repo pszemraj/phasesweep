@@ -362,10 +362,9 @@ def test_damaged_storage_recovery_restores_catalog_capacity(
 ) -> None:
     """Repairing a pre-launch ledger failure must let operator recovery release its slot.
 
-    A torn or garbage *final* record is now self-repaired before a write, so
-    only damage a repair may never cut remains here: a malformed record
-    another record follows (never repaired, an interior corruption cannot be
-    an in-flight append) and a permission denial (the repair itself refused).
+    Torn or malformed final records are repaired before writes. Interior
+    corruption cannot be an in-flight append, and permission denial prevents
+    repair; both require operator restoration before recovery releases capacity.
     """
     published = history != "fresh"
     from_phase = "q" if history == "resume" else None
@@ -1394,7 +1393,7 @@ def test_runner_exits_nonzero_when_terminal_evidence_cannot_be_persisted(
 ) -> None:
     """A sweep with no MCP-visible outcome is not a clean exit.
 
-    The required precommit snapshot write now fails the publication itself.
+    A failed required precommit snapshot write prevents publication.
     The process entry point converts this propagated error to a nonzero exit;
     an in-process invocation sees the original error and no pointer advances.
     """
