@@ -14,7 +14,7 @@ from phasesweep.config.models import Experiment
 from phasesweep.engine.paths import _generation_winner_path
 from phasesweep.engine.read import read_status
 from tests.conftest import make_experiment
-from tests.ledger_fixtures import ledger_file, materialize, published_generation_id
+from tests.ledger_fixtures import materialize, published_generation_id
 
 EXPERIMENT_STATUS_KEYS = [
     "kind",
@@ -104,7 +104,7 @@ def test_experiment_status_shape_is_pinned(tmp_path: Path) -> None:
 
     assert list(payload) == EXPERIMENT_STATUS_KEYS
     assert not READ_STATUS_ONLY_KEYS & set(payload)
-    assert payload["ledger_path"] == str(ledger_file(materialized, "journal").resolve())
+    assert payload["ledger_path"] == str(materialized.ledger_path.resolve())
     assert "ledger_path" not in read_status(experiment)
     assert payload["kind"] == "experiment"
     assert payload["is_published"] is True

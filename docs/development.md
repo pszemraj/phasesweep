@@ -62,7 +62,8 @@ Plain `pytest` runs the complete non-live qualification suite. For broader check
 while iterating, use two process workers for the fast lane:
 
 ```bash
-pytest -n 2 --dist loadfile -m "not live and not integration and not signals_own_pid"
+pytest -n 2 --dist loadfile -m "not live and not integration and not signals_own_pid" \
+  --durations=25 --durations-min=1
 ```
 
 `loadfile` keeps each test module in one worker. Test homes, caches, journals and
@@ -84,7 +85,7 @@ retain their existing serial collection and contract-test scope.
 To inspect the cost of a qualification run:
 
 ```bash
-pytest --durations=25
+pytest --durations=25 --durations-min=1
 ```
 
 > [!NOTE]
@@ -97,9 +98,9 @@ PHASESWEEP_WANDB_ENTITY=YOUR_ENTITY PHASESWEEP_WANDB_PROJECT=YOUR_PROJECT \
   pytest -m live tests/test_wandb_live.py
 ```
 
-A test is `@pytest.mark.integration` when it manages real processes, waits on wall-clock time, drives a multi-step durable recovery workflow, or is otherwise slow: its call phase takes at least `SLOW_CALL_SECONDS` from `tests/tiers.py`. Everything else stays in the fast tier, including engine runs with quick trainers, such as `run_experiment` over an `echo` trainer, which spawn their subprocess inside the package.
+A test is `@pytest.mark.integration` when it manages real processes, waits on wall-clock time, drives a multi-step durable recovery workflow, or is otherwise slow: its call phase takes at least one second. Everything else stays in the fast tier, including engine runs with quick trainers, such as `run_experiment` over an `echo` trainer, which spawn their subprocess inside the package.
 
-The guard enforces only what a test's source shows: `tests/conftest.py` fails collection when a test manages processes or waits on the clock *directly*, in its body or a same-module helper or fixture, without the marker (`tests/tiers.py` lists the primitives). A test that is slow for any other reason is marked by the classification rule above. To keep one visible, a run that excludes `integration` ends with a list of unmarked tests at or over the threshold. The list is a report, not a failure, because timing thresholds flake on loaded hosts.
+The guard enforces only what a test's source shows: `tests/conftest.py` fails collection when a test manages processes or waits on the clock *directly*, in its body or a same-module helper or fixture, without the marker (`tests/tiers.py` lists the primitives). A test that is slow for any other reason is marked by the classification rule above. Use pytest's built-in duration report in the fast-lane command above to identify these cases. Durations are advisory; timing thresholds do not fail a run.
 
 The scanner cannot follow a call into another module, so a helper shared from a non-test module under `tests/` that spawns or waits is registered by name in `PROCESS_DRIVER_CALLS` or `WALLCLOCK_HELPER_CALLS` in `tests/tiers.py`, and a test that calls it, or requests it as a fixture, is classified as if it did the work itself. `test_shared_helpers_that_spawn_or_wait_are_registered` in `tests/test_tier_guard.py` scans those modules and fails until every such helper is registered. `reaped_pid` is deliberately not registered: its child has exited before it returns, so its caller neither manages a live process nor waits.
 

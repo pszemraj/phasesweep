@@ -55,7 +55,6 @@ from tests.conftest import (
     write_constant_trainer,
 )
 from tests.ledger_fixtures import (
-    ledger_file,
     materialize,
     tree_snapshot,
 )
@@ -563,7 +562,7 @@ def test_writers_repair_a_partial_final_journal_record(tmp_path: Path, damage: s
         # journal it runs against, so the four scenarios cannot share one.
         materialized = materialize("current-journal", tmp_path / label, mode="tree")
         experiment = materialized.experiment
-        journal = ledger_file(materialized, "journal")
+        journal = materialized.ledger_path
         complete = journal.read_bytes()
         damaged = complete + _PARTIAL_FINAL_RECORDS[damage]
         journal.write_bytes(damaged)
@@ -610,7 +609,7 @@ def test_repair_leaves_an_append_that_finished_while_it_awaited_the_lock(
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
 
@@ -666,7 +665,7 @@ def test_repair_waits_for_a_journal_lock_another_writer_holds(
 ) -> None:
     """A journal lock held when the repair starts is awaited, then taken, not refused on sight."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
     lock_path = journal.with_name(f"{journal.name}.lock")
@@ -696,7 +695,7 @@ def test_repair_refuses_a_journal_lock_that_is_never_released(
     instead of hanging the suite.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     damaged = journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
     journal.write_bytes(damaged)
     lock_path = journal.with_name(f"{journal.name}.lock")
@@ -812,7 +811,7 @@ def test_repair_truncates_only_while_holding_the_journal_lock(
     """The truncation step only ever runs while this process holds Optuna's own journal lock."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
     lock_path = journal.with_name(f"{journal.name}.lock")
@@ -875,7 +874,7 @@ def test_repair_never_truncates_under_or_releases_a_lock_another_process_took_ov
     survives, so the writer holding it stays excluded.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     complete = journal.read_bytes()
     damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
     journal.write_bytes(damaged)
@@ -926,7 +925,7 @@ def test_waiting_optuna_writer_never_takes_over_a_long_repairs_journal_lock(
     three seconds of the repair, never takes it over.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     complete = journal.read_bytes()
     journal.write_bytes(complete + _PARTIAL_FINAL_RECORDS["torn"])
     monkeypatch.setattr(engine_ledger, "_JOURNAL_LOCK_REFRESH_SECONDS", 0.1)
@@ -962,7 +961,7 @@ def test_repair_backup_is_no_more_permissive_than_the_journal(tmp_path: Path) ->
     is created with the journal's mode, which the umask can only narrow.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     journal.write_bytes(journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"])
     journal.chmod(0o600)
 
@@ -981,7 +980,7 @@ def test_repair_refuses_a_journal_with_another_hard_linked_name(tmp_path: Path) 
     before writing a backup, and the journal keeps every byte.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     damaged = journal.read_bytes() + _PARTIAL_FINAL_RECORDS["torn"]
     journal.write_bytes(damaged)
     os.link(journal, tmp_path / "other-name.journal")
@@ -1007,7 +1006,7 @@ def test_repair_refuses_a_journal_that_grew_under_its_lock(
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment = materialized.experiment
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     complete = journal.read_bytes()
     damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
     journal.write_bytes(damaged)
@@ -1045,7 +1044,7 @@ def test_repair_that_cannot_write_beside_the_journal_leaves_it_unchanged(
     and is driven directly.
     """
     materialized = materialize("current-journal", tmp_path, mode="tree")
-    journal = ledger_file(materialized, "journal")
+    journal = materialized.ledger_path
     complete = journal.read_bytes()
     damaged = complete + _PARTIAL_FINAL_RECORDS["torn"]
     journal.write_bytes(damaged)

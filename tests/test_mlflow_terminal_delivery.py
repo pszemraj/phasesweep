@@ -155,6 +155,22 @@ def test_unresolved_attempt_upload_worker_fails_the_run(tmp_path, monkeypatch, n
     assert set(uploaded_phases) == {"depth"}
 
 
+def _add_bound_attempt(
+    experiment, study, phase, generation, attempt, number, *, trial, run_mode="managed"
+):
+    """Persist a fresh trial and its native binding in the same attempt directory."""
+    directory = _trial_dir_for(
+        experiment, phase, number, generation_id=generation, attempt_id=attempt
+    )
+    write_record(
+        directory / BINDING_FILE,
+        {**_binding(), "phase": phase, "attempt_id": attempt, "run_mode": run_mode},
+    )
+    trial.user_attrs.update({ATTEMPT_ID_ATTR: attempt, GENERATION_ID_ATTR: generation})
+    study.add_trial(trial)
+    return directory
+
+
 def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path, monkeypatch):
     """The Optuna outcome, never a missing record, decides what an unrecorded attempt reports."""
     experiment = native_experiment(tmp_path)
@@ -174,26 +190,26 @@ def test_failed_generation_reports_each_unrecorded_attempt_by_its_trial(tmp_path
     }
     for number, (digit, (mode, state)) in enumerate(attempts.items()):
         attempt = digit * 32
-        directory = _trial_dir_for(
-            experiment, "depth", number, generation_id=generation, attempt_id=attempt
-        )
-        binding = {**_binding(), "phase": "depth", "attempt_id": attempt, "run_mode": mode}
-        write_record(directory / BINDING_FILE, binding)
-        write_record(directory / INHERITS_FILE, {"schema_version": 1, "inherits": {}})
-        study.add_trial(
-            create_trial(
+        directory = _add_bound_attempt(
+            experiment,
+            study,
+            "depth",
+            generation,
+            attempt,
+            number,
+            run_mode=mode,
+            trial=create_trial(
                 state=state,
                 value=0.5 if state == TrialState.COMPLETE else None,
                 user_attrs={
-                    ATTEMPT_ID_ATTR: attempt,
-                    GENERATION_ID_ATTR: generation,
                     OVERRIDES_ATTR: json.dumps({"model.depth": 2}),
                     FEASIBLE_ATTR: True,
                     DURATION_ATTR: 3.0,
                     constraint_attr("cost"): 1.0,
                 },
-            )
+            ),
         )
+        write_record(directory / INHERITS_FILE, {"schema_version": 1, "inherits": {}})
     write_record(
         tracking_root(experiment) / generation / "delivery" / f"attempt-{'2' * 32}.json",
         {"schema_version": 1, "generation_id": generation, "state": "delivered"},
@@ -231,22 +247,14 @@ def test_recovered_cleanup_settles_only_the_attempt_of_its_own_study(tmp_path, m
         if recovered:
             study.set_user_attr(CLEANUP_RECOVERED_TRIALS_ATTR, recovered)
         attempt = digit * 32
-        directory = _trial_dir_for(
-            experiment, phase, 0, generation_id=generation, attempt_id=attempt
-        )
-        write_record(
-            directory / BINDING_FILE,
-            {**_binding(), "phase": phase, "attempt_id": attempt, "run_mode": "managed"},
-        )
-        study.add_trial(
-            create_trial(
-                state=TrialState.FAIL,
-                user_attrs={
-                    ATTEMPT_ID_ATTR: attempt,
-                    GENERATION_ID_ATTR: generation,
-                    CLEANUP_CONFIRMED_ATTR: False,
-                },
-            )
+        _add_bound_attempt(
+            experiment,
+            study,
+            phase,
+            generation,
+            attempt,
+            0,
+            trial=create_trial(state=TrialState.FAIL, user_attrs={CLEANUP_CONFIRMED_ATTR: False}),
         )
     publication._rebuild_attempt_intents(experiment, [generation])
     delivery = tracking_root(experiment) / generation / "delivery"
@@ -265,23 +273,15 @@ def test_interrupted_attempt_finishes_its_managed_run_killed(tmp_path, monkeypat
     study.set_user_attr(STUDY_SCHEMA_ATTR, STUDY_SCHEMA_VERSION)
     for number, (digit, outcome) in enumerate((("1", "interrupted"), ("2", "failure"))):
         attempt = digit * 32
-        directory = _trial_dir_for(
-            experiment, phase.name, number, generation_id=generation, attempt_id=attempt
-        )
-        write_record(
-            directory / BINDING_FILE,
-            {**_binding(), "phase": phase.name, "attempt_id": attempt, "run_mode": "managed"},
-        )
         record = {"schema_version": TRIAL_OUTCOME_SCHEMA_VERSION, "sequence": 1, "outcome": outcome}
-        study.add_trial(
-            create_trial(
-                state=TrialState.FAIL,
-                user_attrs={
-                    ATTEMPT_ID_ATTR: attempt,
-                    GENERATION_ID_ATTR: generation,
-                    TRIAL_OUTCOME_ATTR: record,
-                },
-            )
+        _add_bound_attempt(
+            experiment,
+            study,
+            phase.name,
+            generation,
+            attempt,
+            number,
+            trial=create_trial(state=TrialState.FAIL, user_attrs={TRIAL_OUTCOME_ATTR: record}),
         )
     publication._rebuild_attempt_intents(experiment, [generation])
     delivery = tracking_root(experiment) / generation / "delivery"

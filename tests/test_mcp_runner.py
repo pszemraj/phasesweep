@@ -14,6 +14,7 @@ import sys
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from unittest.mock import Mock
 
 import optuna
 import pytest
@@ -931,13 +932,7 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
             child_pgids=(1234,),
         ),
     )
-    preflight_calls = 0
-
-    def preflight(_ledger: engine_ledger.ClaimedLedger, *, cleanup_report, from_phase) -> dict:
-        nonlocal preflight_calls
-        del cleanup_report, from_phase
-        preflight_calls += 1
-        return {}
+    preflight = Mock(return_value={})
 
     def cancel_run(*args: object, **kwargs: object) -> None:
         raise shutdown
@@ -950,7 +945,7 @@ def test_terminal_report_preserves_shutdown_cleanup_uncertainty(
         run_experiment(experiment, terminal_callback=captured.append)
 
     assert exc_info.value is shutdown
-    assert preflight_calls == 2
+    assert preflight.call_count == 2
     assert len(captured) == 1
     report = captured[0]
     assert report.primary_error is shutdown
@@ -996,15 +991,7 @@ def test_shutdown_during_post_error_reconciliation_preserves_cleanup_evidence(
             child_pgids=(),
         ),
     )
-    preflight_calls = 0
-
-    def preflight(_ledger: engine_ledger.ClaimedLedger, *, cleanup_report, from_phase) -> dict:
-        nonlocal preflight_calls
-        del cleanup_report, from_phase
-        preflight_calls += 1
-        if preflight_calls == 2:
-            raise shutdown
-        return {}
+    preflight = Mock(side_effect=[{}, shutdown])
 
     def fail_run(*args: object, **kwargs: object) -> None:
         raise initial_error

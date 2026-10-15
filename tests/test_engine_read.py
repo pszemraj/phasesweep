@@ -42,7 +42,7 @@ from tests.conftest import (
     write_constant_trainer,
     write_trainer,
 )
-from tests.ledger_fixtures import ledger_file, materialize, published_generation_id, tree_snapshot
+from tests.ledger_fixtures import materialize, published_generation_id, tree_snapshot
 
 
 def _experiment(tmp_path: Path, *, storage: str | None = None) -> Experiment:
@@ -172,7 +172,7 @@ def _journal_experiment(tmp_path: Path, *, published: bool) -> tuple[Experiment,
     """
     if published:
         materialized = materialize("current-journal", tmp_path, mode="tree")
-        experiment, ledger = materialized.experiment, ledger_file(materialized, "journal")
+        experiment, ledger = materialized.experiment, materialized.ledger_path
     else:
         ledger = tmp_path / "study.journal"
         experiment = make_experiment(workdir=tmp_path / "runs", storage=f"journal:///{ledger}")

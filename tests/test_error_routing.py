@@ -107,7 +107,6 @@ from phasesweep.tracking.mlflow import require_mlflow_sdk
 from tests.conftest import make_experiment, requires_nonroot
 from tests.ledger_fixtures import (
     Materialized,
-    ledger_file,
     materialize,
     pin_fixture_environment,
     published_generation_id,
@@ -332,7 +331,7 @@ def _materialize_damaged(
 ) -> Materialized:
     """Copy a current golden ledger and apply ``damage`` to its ledger file."""
     materialized = materialize(fixture, tmp_path, mode=mode)
-    damage(ledger_file(materialized, fixture.removeprefix("current-")))
+    damage(materialized.ledger_path)
     return materialized
 
 
@@ -446,7 +445,7 @@ def _read_only_once_locked(journal: Path, monkeypatch: pytest.MonkeyPatch) -> It
 def _run_over_unbackuppable_repair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
     """Start a run whose journal repair can lock its torn record but not back it up."""
     materialized = _materialize_damaged(tmp_path, "current-journal", "tree", _truncated)
-    with _read_only_once_locked(ledger_file(materialized, "journal"), monkeypatch):
+    with _read_only_once_locked(materialized.ledger_path, monkeypatch):
         return run_experiment(materialized.experiment)
 
 
@@ -458,7 +457,7 @@ def _recovery_studies_confirmed_over_unbackuppable_repair(
     needs = load_only_recovery_needs()
     with (
         _experiment_lock(materialized.experiment),
-        _read_only_once_locked(ledger_file(materialized, "journal"), monkeypatch),
+        _read_only_once_locked(materialized.ledger_path, monkeypatch),
     ):
         return _load_recovery_studies(materialized.experiment, needs, confirm=True)
 

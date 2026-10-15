@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -26,7 +27,6 @@ from phasesweep.engine.paths import (
     _last_successful_generation_path,
     _phase_dir,
 )
-from phasesweep.engine.publication_validation import ValidatedPublication
 from phasesweep.engine.run import run_experiment
 from phasesweep.mcp.audit import AuditLogger
 from phasesweep.mcp.errors import (
@@ -348,20 +348,13 @@ def test_resume_gate_applies_the_run_preflight_acceptance_rule(
     shutil.rmtree(_phase_dir(published, "q"))
     app, _registry, store = make_mcp_app(_catalog(tmp_path, config, allow=ALLOW_SIDE_EFFECTS))
 
-    original_validate = validation_ops._validate_generation_manifest
-    calls = 0
-
-    def counting_validate(*args: Any, **kwargs: Any) -> ValidatedPublication:
-        nonlocal calls
-        calls += 1
-        return original_validate(*args, **kwargs)
-
-    monkeypatch.setattr(validation_ops, "_validate_generation_manifest", counting_validate)
+    validate = Mock(wraps=validation_ops._validate_generation_manifest)
+    monkeypatch.setattr(validation_ops, "_validate_generation_manifest", validate)
 
     with pytest.raises(ResumeNotReadyError, match="earlier phase 'q' has no compatible winner"):
         app.launch("srv", from_phase="r")
 
-    assert calls == 1
+    validate.assert_called_once()
     assert store.list_handles() == []
 
 

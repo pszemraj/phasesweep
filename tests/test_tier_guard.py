@@ -1,4 +1,4 @@
-"""The integration-tier scanner and slow-test report that ``tests/conftest.py`` applies.
+"""The integration-tier scanner applied by ``tests/conftest.py``.
 
 Each source below is synthetic text handed straight to ``scan_module``; nothing
 here imports or executes it. Keeping the probes as module-level constants also
@@ -15,12 +15,9 @@ import pytest
 
 from tests.tiers import (
     PROCESS_DRIVER_CALLS,
-    SLOW_CALL_SECONDS,
     WALLCLOCK_HELPER_CALLS,
-    excludes_integration,
     scan_helpers,
     scan_module,
-    slow_unmarked,
 )
 
 #: Rule id -> (probe source defining ``test_probe``, fragment its reason must contain).
@@ -268,47 +265,3 @@ def test_shared_helpers_that_spawn_or_wait_are_registered():
         if name not in registered
     }
     assert unregistered == {}, "register these in tests/tiers.py"
-
-
-def _report(nodeid, *, duration, when="call", markers=()):
-    keywords = {nodeid.rpartition("::")[2]: 1, **dict.fromkeys(markers, 1)}
-    return pytest.TestReport(
-        nodeid=nodeid,
-        location=("t.py", 0, nodeid),
-        keywords=keywords,
-        outcome="passed",
-        longrepr=None,
-        when=when,
-        duration=duration,
-    )
-
-
-def test_slow_report_lists_unmarked_call_phases_at_or_over_the_threshold():
-    reports = [
-        _report("t.py::test_fast", duration=SLOW_CALL_SECONDS - 0.01),
-        _report("t.py::test_edge", duration=SLOW_CALL_SECONDS),
-        _report("t.py::test_slow", duration=SLOW_CALL_SECONDS + 1.5),
-        _report("t.py::test_marked", duration=9.0, markers=("integration",)),
-        _report("t.py::test_live", duration=9.0, markers=("live",)),
-        _report("t.py::test_slow_setup", duration=9.0, when="setup"),
-    ]
-
-    assert slow_unmarked(reports) == [
-        ("t.py::test_slow", SLOW_CALL_SECONDS + 1.5),
-        ("t.py::test_edge", SLOW_CALL_SECONDS),
-    ]
-
-
-@pytest.mark.parametrize(
-    ("markexpr", "excluded"),
-    [
-        ("not live and not integration", True),
-        ("not (integration or live)", True),
-        ("unit", True),
-        ("not live", False),
-        ("integration and not live", False),
-        ("", False),
-    ],
-)
-def test_slow_report_runs_only_when_the_integration_tier_is_left_out(markexpr, excluded):
-    assert excludes_integration(markexpr) is excluded

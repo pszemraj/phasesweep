@@ -40,7 +40,7 @@ from phasesweep.evidence.evaluation import TrialContext
 from phasesweep.evidence.models import JsonEnvelopeExtractor, LogRegexExtractor
 from phasesweep.runtime.files import file_url_path
 from phasesweep.runtime.reaper import _read_proc_stat
-from tests.tiers import SLOW_CALL_SECONDS, excludes_integration, flagged_tests, slow_unmarked
+from tests.tiers import flagged_tests
 
 # Repository root, derived from the conftest location. Tests that copy/edit
 # the example experiment.yaml read this so they don't hard-code paths.
@@ -65,9 +65,7 @@ def pytest_collection_modifyitems(session, config, items) -> None:
     whatever was collected and fails loudly. There is no escape hatch: a test
     that matches the rules is an integration test, and a test that should not
     match should stop using the primitive. Engine runs that spawn a quick
-    trainer inside the package are out of its reach by design, and
-    :func:`pytest_terminal_summary` reports any unmarked test that turns out
-    slow.
+    trainer inside the package are not flagged by this source scan.
     """
     scanned: dict[Path, dict[str, str]] = {}
     offenders: dict[tuple[Path, str], str] = {}
@@ -91,33 +89,6 @@ def pytest_collection_modifyitems(session, config, items) -> None:
             + "\n\nAdd @pytest.mark.integration (see docs/development.md, "
             "'Quality gates') or stop using the primitive."
         )
-
-
-def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
-    """List unmarked slow tests in a run that leaves the integration tier out.
-
-    The collection guard cannot see a test that is slow for reasons its source
-    does not show, so this makes such a test visible where it lands: in the
-    fast tier. It is a report, not a failure, because a timing threshold would
-    flake on a loaded host.
-    """
-    if not excludes_integration(config.option.markexpr):
-        return
-    reports = [
-        report
-        for group in terminalreporter.stats.values()
-        for report in group
-        if isinstance(report, pytest.TestReport)
-    ]
-    slow = slow_unmarked(reports)
-    if not slow:
-        return
-    terminalreporter.write_sep(
-        "=",
-        f"unmarked tests at or over {SLOW_CALL_SECONDS:g}s: classify them (docs/development.md)",
-    )
-    for nodeid, seconds in slow:
-        terminalreporter.write_line(f"{seconds:6.2f}s {nodeid}")
 
 
 def raise_after_first_successful_call(

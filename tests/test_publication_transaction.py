@@ -23,6 +23,7 @@ import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import yaml
@@ -1278,11 +1279,18 @@ def test_deleted_pointer_with_an_intact_namespace_reports_absent(
     assert read_result(experiment, phase_names=["p"])[1] == []
 
 
-def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path) -> None:
-    """A pointer whose whole target namespace is gone is corruption, not a fresh tree."""
+@pytest.mark.parametrize("damage", ["deleted-target", "missing-generation-root"])
+def test_generation_loss_with_a_surviving_pointer_reports_failed(
+    tmp_path: Path, damage: str
+) -> None:
+    """Losing published generation artifacts cannot authorize convenience-winner fallback."""
     experiment, generation_id = _golden_publication(tmp_path)
-
-    shutil.rmtree(_generation_dir(experiment, generation_id))
+    if damage == "deleted-target":
+        shutil.rmtree(_generation_dir(experiment, generation_id))
+    else:
+        _generation_path(experiment).unlink()
+        generations = _generations_dir(experiment)
+        generations.rename(generations.with_name(f"saved-{generations.name}"))
 
     pointer = _resolve_publication_pointer(experiment)
     assert pointer.state == "failed"
@@ -1292,6 +1300,8 @@ def test_pointer_to_a_deleted_generation_namespace_reports_failed(tmp_path: Path
     status = read_status(experiment)
     assert status["publication_integrity"] == "failed"
     assert status["publication_error"] == pointer.error
+    assert status["is_published"] is False
+    assert status["phases"][0]["winner_present"] is False
     assert published_generation_id(experiment) is None
     assert read_result(experiment, phase_names=["p"])[1] == []
 
@@ -1348,20 +1358,13 @@ def test_from_phase_preflight_validates_the_published_manifest_once(
     )
     run_experiment(experiment)
 
-    original_validate = validation_ops._validate_generation_manifest
-    calls = 0
-
-    def counting_validate(*args: Any, **kwargs: Any) -> validation_ops.ValidatedPublication:
-        nonlocal calls
-        calls += 1
-        return original_validate(*args, **kwargs)
-
-    monkeypatch.setattr(validation_ops, "_validate_generation_manifest", counting_validate)
+    validate = Mock(wraps=validation_ops._validate_generation_manifest)
+    monkeypatch.setattr(validation_ops, "_validate_generation_manifest", validate)
 
     winners = _preflight_skipped_winners(experiment, from_phase="d", run_deadline=None)
 
     assert set(winners) == {"a", "b", "c"}
-    assert calls == 1
+    validate.assert_called_once()
 
 
 def test_dangling_last_success_pointer_is_corrupt_and_blocks_rerun(tmp_path: Path) -> None:
@@ -1459,22 +1462,6 @@ def test_unreadable_pointer_is_an_access_refusal_for_resume(tmp_path: Path) -> N
             run_experiment(_with_later_phase(experiment), from_phase="q", dry_run=True)
     finally:
         pointer_path.chmod(original_mode)
-
-
-def test_surviving_pointer_prevents_root_projection_fallback_after_generation_loss(
-    tmp_path: Path,
-) -> None:
-    experiment, _ = _golden_publication(tmp_path)
-    _generation_path(experiment).unlink()
-    generations = _generations_dir(experiment)
-    generations.rename(generations.with_name(f"saved-{generations.name}"))
-
-    assert _resolve_publication_pointer(experiment).state == "failed"
-    status = read_status(experiment)
-    assert status["publication_integrity"] == "failed"
-    assert status["is_published"] is False
-    assert status["phases"][0]["winner_present"] is False
-    assert read_result(experiment, phase_names=["p"])[1] == []
 
 
 def test_dangling_generation_root_does_not_enable_projected_winner(tmp_path: Path) -> None:

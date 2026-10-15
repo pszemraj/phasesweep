@@ -393,27 +393,28 @@ def test_accepted_partial_replay_proves_the_winners_evidence_but_the_preview_lea
         run_experiment(accepting)
 
 
+@pytest.mark.parametrize(
+    ("target", "remaining", "expected_launch"),
+    [
+        pytest.param(4, 2, "DRY RUN phase=a would launch 2 trials", id="plural-two-remaining"),
+        pytest.param(3, 1, "DRY RUN phase=a would launch 1 trial", id="singular-one-remaining"),
+    ],
+)
 def test_dry_run_counts_a_failed_attempt_as_spent(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    target: int,
+    remaining: int,
+    expected_launch: str,
 ) -> None:
-    """A failed attempt uses up one trial of the target, so a phase at 2 of 4 launches 2."""
-    experiment = _persistent(tmp_path, _phase("a", 4))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=4)
+    """Failed attempts consume the target; the remaining-work sentence uses matching grammar."""
+    experiment = _persistent(tmp_path, _phase("a", target))
+    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=target)
 
     assert _preview(experiment, tmp_path, caplog) == [
-        "phase=a study=t::a finished=2 remaining=2 reruns=0 n_jobs=1",
-        "DRY RUN phase=a would launch 2 trials",
+        f"phase=a study=t::a finished=2 remaining={remaining} reruns=0 n_jobs=1",
+        expected_launch,
     ]
-
-
-def test_one_remaining_trial_reads_in_the_singular(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The launch sentence says "1 trial", not "1 trials"."""
-    experiment = _persistent(tmp_path, _phase("a", 3))
-    _record(experiment, "a", _STATE.COMPLETE, _STATE.FAIL, target=3)
-
-    assert _preview(experiment, tmp_path, caplog)[-1] == "DRY RUN phase=a would launch 1 trial"
 
 
 def test_running_attempt_is_noted_and_its_phase_previews_from_counts_alone(

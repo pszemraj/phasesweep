@@ -134,7 +134,7 @@ class Materialized:
     root: Path
     experiment: Experiment
     config_path: Path
-    ledger_dir: Path
+    ledger_path: Path
     before: dict[str, TreeEntry]
 
     def unchanged(self) -> bool:
@@ -342,22 +342,9 @@ def materialize(name: str, tmp_path: Path, *, mode: str) -> Materialized:
         root=root,
         experiment=experiment,
         config_path=tmp_path / "experiment.yaml",
-        ledger_dir=root / "ledger",
+        ledger_path=root / "ledger" / LEDGER_FILENAME,
         before=tree_snapshot(root),
     )
-
-
-def ledger_file(materialized: Materialized, backend: str) -> Path:
-    """Return the ledger file inside a materialized fixture.
-
-    :param Materialized materialized: Copied fixture.
-    :param str backend: Ledger backend recorded in the manifest; every
-        materialized fixture is ``"journal"``, kept as an explicit parameter
-        so a call site names what it expects to read.
-    :return Path: Absolute path to ``study.journal``.
-    """
-    assert backend == "journal", f"unsupported fixture ledger backend: {backend!r}"
-    return materialized.ledger_dir / LEDGER_FILENAME
 
 
 def published_generation_id(

@@ -43,7 +43,6 @@ from tests.ledger_fixtures import (
     discover_ledger_fixtures,
     fixture_by_name,
     forbid_file_backed_storage,
-    ledger_file,
     materialize,
     tree_changes,
     tree_snapshot,
@@ -299,7 +298,7 @@ def test_current_fixture_carries_this_release_format(tmp_path: Path) -> None:
     fixture_name = "current-journal"
     fixture = fixture_by_name(fixture_name)
     materialized = materialize(fixture_name, tmp_path, mode="tree")
-    ledger = ledger_file(materialized, "journal")
+    ledger = materialized.ledger_path
 
     stamps = [
         record["user_attr"][STUDY_SCHEMA_ATTR]

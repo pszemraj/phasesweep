@@ -234,6 +234,26 @@ def _repeats_publication(tmp_path: Path, **phase_overrides: object) -> tuple[Exp
     return experiment, generation_id
 
 
+@pytest.fixture(scope="module")
+def readonly_repeats_publication(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[Experiment, str]:
+    """Publish one CPU-only repeat group tree for consumers that never mutate its files."""
+    root = tmp_path_factory.mktemp("repeats-read")
+    locks = root / "locks"
+    locks.mkdir(mode=0o700)
+    locks.chmod(0o700)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv("PHASESWEEP_HOME", raising=False)
+        patch.setenv("XDG_STATE_HOME", str(root / "state-home"))
+        patch.setenv("XDG_CACHE_HOME", str(root / "cache-home"))
+        patch.setenv("PHASESWEEP_LOCK_DIR", str(locks))
+        patch.setenv("CUDA_VISIBLE_DEVICES", "")
+        patch.setattr("phasesweep.runtime.gpu._detect_gpu_inventory", lambda: ([], {}))
+        patch.setattr("phasesweep.runtime.gpu._nvidia_driver_reports_gpus", lambda: False)
+        return _repeats_publication(root)
+
+
 def _winner_payload(experiment: Experiment, generation_id: str) -> JsonObject:
     """Return phase ``p``'s winner as one generation published it."""
     loaded = yaml.safe_load(_generation_winner_path(experiment, generation_id, "p").read_text())
@@ -415,9 +435,11 @@ def test_load_winner_binds_the_repeats_block_to_the_configured_axis(
     assert reason in str(raised.value)
 
 
-def test_winner_view_projects_the_repeats_summary(tmp_path: Path) -> None:
+def test_winner_view_projects_the_repeats_summary(
+    readonly_repeats_publication: tuple[Experiment, str],
+) -> None:
     """Reads expose the reducer and spread, and a malformed block hides the winner."""
-    experiment, generation_id = _repeats_publication(tmp_path)
+    experiment, generation_id = readonly_repeats_publication
     winner = _winner_payload(experiment, generation_id)
     metrics = [member["metric"] for member in _members(winner)]
     assert all(isinstance(value, float) for value in metrics)
@@ -435,9 +457,11 @@ def test_winner_view_projects_the_repeats_summary(tmp_path: Path) -> None:
     assert _winner_view(winner, "p") is None
 
 
-def test_trial_tables_label_repeat_groups_and_star_every_winning_member(tmp_path: Path) -> None:
+def test_trial_tables_label_repeat_groups_and_star_every_winning_member(
+    readonly_repeats_publication: tuple[Experiment, str],
+) -> None:
     """A repeats phase's table groups trials as trials.csv does and stars the whole winning group."""
-    experiment, _ = _repeats_publication(tmp_path)
+    experiment, _ = readonly_repeats_publication
     _, (view,) = read_result(experiment, phase_names=["p"])
     assert view is not None and view.repeats is not None
 

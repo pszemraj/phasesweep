@@ -12,10 +12,8 @@ What the scanner does not see is deliberate. An engine run with a quick trainer,
 such as ``run_experiment`` over an ``echo`` trainer, spawns its subprocess inside
 the package; it stays in the fast tier, which relies on those runs for engine
 coverage. Any other slow test is marked by the classification rule in
-``docs/development.md``, not by this scanner. To keep such a test visible,
-``tests/conftest.py`` lists unmarked tests whose call phase took at least
-:data:`SLOW_CALL_SECONDS` in any run that leaves the integration tier out. The
-list is a report, never a failure: timing-based failures flake on loaded hosts.
+``docs/development.md``, not by this scanner. Pytest's duration report identifies
+slow tests at runtime.
 
 Detection is syntactic: it never imports the module under inspection and never
 touches the filesystem beyond reading source. Two rules fire here:
@@ -51,11 +49,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Protocol
-
-from _pytest.mark.expression import Expression
 
 #: Root package -> attribute leaves that start or signal a real process. A
 #: reference counts whatever path reaches the leaf, so ``multiprocessing.Pool``
@@ -104,12 +98,6 @@ WAIT_METHOD = "wait"
 
 #: ``sleep(`` inside a string literal, i.e. a delay embedded in a generated script.
 SLEEP_IN_SOURCE_STRING = re.compile(r"\bsleep\(")
-
-#: Call-phase seconds at which an unmarked test is slow enough to classify.
-SLOW_CALL_SECONDS = 1.0
-
-#: Markers that already keep a test out of the fast tier.
-TIER_MARKERS = frozenset({"integration", "live"})
 
 _FunctionDef = ast.FunctionDef | ast.AsyncFunctionDef
 
@@ -487,42 +475,3 @@ def flagged_tests(path: Path) -> dict[str, str]:
     :raises SyntaxError: If ``path`` does not contain parseable Python.
     """
     return scan_module(path.read_text(encoding="utf-8"))
-
-
-class CallReport(Protocol):
-    """The fields of a ``pytest.TestReport`` the slow-test report reads."""
-
-    nodeid: str
-    when: str
-    duration: float
-    keywords: Mapping[str, object]
-
-
-def excludes_integration(markexpr: str) -> bool:
-    """Return whether a ``-m`` expression deselects a test marked only ``integration``.
-
-    :param str markexpr: The run's effective marker expression, possibly empty.
-    :return: ``True`` when the run leaves the integration tier out.
-    """
-    if not markexpr:
-        return False
-    return not Expression.compile(markexpr).evaluate(lambda name, **_: name == "integration")
-
-
-def slow_unmarked(
-    reports: Iterable[CallReport], threshold: float = SLOW_CALL_SECONDS
-) -> list[tuple[str, float]]:
-    """Return unmarked tests whose call phase took at least ``threshold`` seconds.
-
-    :param Iterable[CallReport] reports: Test reports from one run, any phase.
-    :param float threshold: Call-phase seconds at which a test is listed.
-    :return: ``(node id, seconds)`` pairs, slowest first.
-    """
-    slow = [
-        (report.nodeid, report.duration)
-        for report in reports
-        if report.when == "call"
-        and report.duration >= threshold
-        and TIER_MARKERS.isdisjoint(report.keywords)
-    ]
-    return sorted(slow, key=lambda pair: (-pair[1], pair[0]))
