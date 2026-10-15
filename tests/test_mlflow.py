@@ -1065,7 +1065,10 @@ def test_pending_sync_uses_retained_projection(tmp_path, monkeypatch):
         raise RuntimeError("Disconnected")
 
     monkeypatch.setattr(publication, "call_tracking", outage)
-    publication._enqueue(experiment, binding["generation_id"], "test", binding, projection, {})
+    path = publication._save_intent(
+        experiment, binding["generation_id"], "test", binding, projection
+    )
+    assert publication._deliver(experiment, path, {}) is False
     assert publication.delivery_status(experiment) == {"pending": 1, "delivered": 0}
     requests = []
 
@@ -1125,7 +1128,9 @@ def test_delivery_counts_are_scoped_to_their_reader(tmp_path, terminal):
             run_id,
             returncode=1,
             result_snapshot_state="complete",
-            result_snapshot=capture_pre_generation_result_snapshot(experiment),
+            result_snapshot=capture_pre_generation_result_snapshot(experiment).model_dump(
+                mode="json"
+            ),
         )
     else:
         store.create(

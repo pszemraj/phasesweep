@@ -431,24 +431,34 @@ def unlock_file(handle: IO[str]) -> None:
         handle.close()
 
 
-def fsync_directory(path: Path) -> None:
-    """Best-effort fsync for a directory after an atomic replace or create.
+def fsync_directory(path: Path, *, strict: bool = False) -> None:
+    """Fsync a directory using the caller's publication policy.
 
-    Never raises. By the time this runs, the caller's rename or exclusive
-    create has already changed the destination, so a directory-durability
-    failure here must not be reported as a failed commit: a caller reacting
-    to the exception would wrongly reclassify an already-authoritative write
-    (e.g. a committed last-success pointer marked ``publication_failed``).
-    The failure is logged as a durability warning instead — the commit
-    stands; only its crash-durability is uncertain.
+    Shared artifact writes use ordinary paths and treat an fsync failure as
+    a durability warning after publication. Strict MCP state transitions
+    validate an owner-only directory without following links and propagate
+    failures so their callers can roll back uncommitted state.
+
+    :param Path path: Directory whose entries should be durable.
+    :param bool strict: Require safe private addressing and successful fsync.
+    :raises OSError: If strict opening or fsync fails, or descriptor closing fails.
+    :raises UnsafePrivatePathError: If strict addressing finds an unsafe directory.
     """
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = (
+            open_directory_fd(path, create=False, private_final=True)
+            if strict
+            else os.open(path, os.O_RDONLY)
+        )
     except OSError:
+        if strict:
+            raise
         return
     try:
         os.fsync(fd)
     except OSError:
+        if strict:
+            raise
         log.warning(
             "Directory fsync failed after an atomic write in %s; the write is "
             "committed but its durability across a crash is uncertain.",

@@ -16,11 +16,15 @@ import inspect
 import json
 import logging
 import sys
+import typing
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
+
+if typing.TYPE_CHECKING:
+    from mcp.types import ToolAnnotations
 
 from phasesweep import __version__
 from phasesweep.config.common import SAFE_NAME_PATTERN
@@ -744,7 +748,7 @@ def _tool_annotations(
     destructive: bool = False,
     idempotent: bool = True,
     open_world: bool = False,
-) -> Any:
+) -> ToolAnnotations:
     """Return MCP annotations for one tool's side-effect contract.
 
     :param str title: Human-readable tool title.
@@ -752,7 +756,7 @@ def _tool_annotations(
     :param bool destructive: Whether the tool can perform destructive side effects.
     :param bool idempotent: Whether repeated calls have the same side effects.
     :param bool open_world: Whether the tool interacts beyond the local server boundary.
-    :return Any: MCP ``ToolAnnotations`` instance.
+    :return ToolAnnotations: MCP tool annotations.
     """
     from mcp.types import ToolAnnotations
 
@@ -817,13 +821,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
     # underlying version unset advertises the MCP SDK as PhaseSweep's version.
     mcp._mcp_server.version = __version__
 
-    @mcp.tool(
-        name=TOOL_LIST_EXPERIMENTS,
-        description=DESCRIPTION_LIST_EXPERIMENTS,
-        annotations=_tool_annotations("List Experiments"),
-        structured_output=True,
-    )
-    @_safe_tool
     def list_experiments(
         limit: ListLimit = DEFAULT_LIST_LIMIT,
         cursor: MaybeCursor = None,
@@ -838,13 +835,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
             app.list_experiments(limit=limit, cursor=cursor)
         )
 
-    @mcp.tool(
-        name=TOOL_EXPLAIN_CONFIG,
-        description=DESCRIPTION_EXPLAIN_CONFIG,
-        annotations=_tool_annotations("Explain Config"),
-        structured_output=True,
-    )
-    @_safe_tool
     def explain_config(key: ConfigKey = None) -> ExplainConfigResult:
         """Explain a configuration key and everything below it, or list the top-level keys. Read-only; needs no catalog entry.
 
@@ -853,13 +843,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
         """
         return ExplainConfigResult.model_validate(app.explain_config(key))
 
-    @mcp.tool(
-        name=TOOL_INSPECT_EXPERIMENT,
-        description=DESCRIPTION_INSPECT_EXPERIMENT,
-        annotations=_tool_annotations("Inspect Experiment"),
-        structured_output=True,
-    )
-    @_safe_tool
     async def inspect_experiment(experiment_id: ExperimentId) -> InspectExperimentResult:
         """Return the phase structure (names, trial counts, samplers, inherited phases, search-space keys) for an experiment. Read-only; launches nothing.
 
@@ -870,13 +853,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
             await asyncio.to_thread(app.validate, experiment_id)
         )
 
-    @mcp.tool(
-        name=TOOL_GET_LATEST_RUN,
-        description=DESCRIPTION_GET_LATEST_RUN,
-        annotations=_tool_annotations("Get Latest Run"),
-        structured_output=True,
-    )
-    @_safe_tool
     async def get_latest_run(experiment_id: ExperimentId) -> GetLatestRunResult:
         """Return the newest recorded MCP run for one experiment, already selected by launch time.
 
@@ -887,13 +863,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
             await asyncio.to_thread(app.latest_run, experiment_id)
         )
 
-    @mcp.tool(
-        name=TOOL_GET_RUN_STATUS,
-        description=DESCRIPTION_GET_RUN_STATUS,
-        annotations=_tool_annotations("Get Run Status"),
-        structured_output=True,
-    )
-    @_safe_tool
     async def get_run_status(run_id: RunId) -> GetRunStatusResult:
         """Return per-phase trial counts, winner presence, and one run's process state.
 
@@ -902,13 +871,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
         """
         return GetRunStatusResult.model_validate(await asyncio.to_thread(app.status, run_id))
 
-    @mcp.tool(
-        name=TOOL_AWAIT_RUN,
-        description=DESCRIPTION_AWAIT_RUN,
-        annotations=_tool_annotations("Await Run"),
-        structured_output=True,
-    )
-    @_safe_tool
     async def await_run(
         run_id: RunId,
         timeout_seconds: AwaitTimeoutSeconds = AWAIT_DEFAULT_TIMEOUT_SECONDS,
@@ -924,13 +886,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
         )
         return result
 
-    @mcp.tool(
-        name=TOOL_GET_RUN_RESULTS,
-        description=DESCRIPTION_GET_RUN_RESULTS,
-        annotations=_tool_annotations("Get Run Results"),
-        structured_output=True,
-    )
-    @_safe_tool
     async def get_run_results(run_id: RunId) -> GetRunResultsResult:
         """Return policy-filtered winning sampled hyperparameters for one run.
 
@@ -939,19 +894,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
         """
         return GetRunResultsResult.model_validate(await asyncio.to_thread(app.winners, run_id))
 
-    @mcp.tool(
-        name=TOOL_LAUNCH_RUN,
-        description=DESCRIPTION_LAUNCH_RUN,
-        annotations=_tool_annotations(
-            "Launch Run",
-            read_only=False,
-            destructive=True,
-            idempotent=False,
-            open_world=True,
-        ),
-        structured_output=True,
-    )
-    @_safe_tool
     async def launch_run(
         experiment_id: ExperimentId,
         from_phase: MaybePhaseName = None,
@@ -966,17 +908,6 @@ def build_server(app: PhaseSweepMCP) -> Any:
             await asyncio.to_thread(app.launch, experiment_id, from_phase=from_phase)
         )
 
-    @mcp.tool(
-        name=TOOL_CANCEL_RUN,
-        description=DESCRIPTION_CANCEL_RUN,
-        annotations=_tool_annotations(
-            "Cancel Run",
-            read_only=False,
-            destructive=True,
-        ),
-        structured_output=True,
-    )
-    @_safe_tool
     async def cancel_run(run_id: RunId) -> CancelRunResult:
         """Stop a running sweep by run_id. Terminates the orchestrator and its training processes.
 
@@ -987,6 +918,68 @@ def build_server(app: PhaseSweepMCP) -> Any:
         # thread. Cancellation may spend its 30-second grace period waiting
         # for a process group, so isolate it from concurrent await/status calls.
         return CancelRunResult.model_validate(await asyncio.to_thread(app.cancel, run_id))
+
+    # Keep schema-bearing adapters explicit; register their common SDK policy once.
+    registrations: tuple[tuple[Callable[..., object], str, str, ToolAnnotations], ...] = (
+        (
+            list_experiments,
+            TOOL_LIST_EXPERIMENTS,
+            DESCRIPTION_LIST_EXPERIMENTS,
+            _tool_annotations("List Experiments"),
+        ),
+        (
+            explain_config,
+            TOOL_EXPLAIN_CONFIG,
+            DESCRIPTION_EXPLAIN_CONFIG,
+            _tool_annotations("Explain Config"),
+        ),
+        (
+            inspect_experiment,
+            TOOL_INSPECT_EXPERIMENT,
+            DESCRIPTION_INSPECT_EXPERIMENT,
+            _tool_annotations("Inspect Experiment"),
+        ),
+        (
+            get_latest_run,
+            TOOL_GET_LATEST_RUN,
+            DESCRIPTION_GET_LATEST_RUN,
+            _tool_annotations("Get Latest Run"),
+        ),
+        (
+            get_run_status,
+            TOOL_GET_RUN_STATUS,
+            DESCRIPTION_GET_RUN_STATUS,
+            _tool_annotations("Get Run Status"),
+        ),
+        (await_run, TOOL_AWAIT_RUN, DESCRIPTION_AWAIT_RUN, _tool_annotations("Await Run")),
+        (
+            get_run_results,
+            TOOL_GET_RUN_RESULTS,
+            DESCRIPTION_GET_RUN_RESULTS,
+            _tool_annotations("Get Run Results"),
+        ),
+        (
+            launch_run,
+            TOOL_LAUNCH_RUN,
+            DESCRIPTION_LAUNCH_RUN,
+            _tool_annotations(
+                "Launch Run", read_only=False, destructive=True, idempotent=False, open_world=True
+            ),
+        ),
+        (
+            cancel_run,
+            TOOL_CANCEL_RUN,
+            DESCRIPTION_CANCEL_RUN,
+            _tool_annotations("Cancel Run", read_only=False, destructive=True),
+        ),
+    )
+    for adapter, name, description, tool_annotations in registrations:
+        mcp.tool(
+            name=name,
+            description=description,
+            annotations=tool_annotations,
+            structured_output=True,
+        )(_safe_tool(adapter))
 
     @mcp.resource(
         CATALOG_RESOURCE_URI,

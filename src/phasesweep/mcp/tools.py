@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
@@ -54,7 +55,7 @@ from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import (
     RunHandle,
     RunnerView,
-    RunState,
+    RunObservation,
     RunStore,
     load_experiment_snapshot,
 )
@@ -323,15 +324,18 @@ class PhaseSweepMCP(RunControl):
         """
         if view is None:
             view = self._runs.runner_view(handle)
-        state = self._runs.state(handle, view=view)
+        observation = self._runs.observe(handle, view=view)
+        state = observation.state
         return {
             "run_id": handle.run_id,
             "state": state,
             "started_at": handle.started_at,
-            "recovery_required": self._runs.recovery_required(handle, view=view),
+            "recovery_required": observation.recovery_required,
             "runner_observable": not (state == "running" and view.visibility == "unobservable"),
             "failure": self._run_failure_payload(
-                handle, state=state, force_snapshot_unavailable=force_snapshot_unavailable
+                handle,
+                observation=observation,
+                force_snapshot_unavailable=force_snapshot_unavailable,
             ),
         }
 
@@ -339,17 +343,18 @@ class PhaseSweepMCP(RunControl):
         self,
         handle: RunHandle,
         *,
-        state: RunState | None = None,
         view: RunnerView | None = None,
+        observation: RunObservation | None = None,
         force_snapshot_unavailable: bool = False,
     ) -> dict[str, Any] | None:
         """Return a validated safe terminal failure, never the raw exception text.
 
         :param RunHandle handle: Run handle whose recorded terminal status
             should be inspected.
-        :param RunState | None state: Already-derived run state, when available.
         :param RunnerView | None view: The read's derivation of the runner, used
-            only when ``state`` must be derived here.
+            when a fresh observation must be derived here.
+        :param RunObservation | None observation: State and terminal evidence already read
+            together for this payload; otherwise read a fresh decision here.
         :param bool force_snapshot_unavailable: The result response has already
             refused a non-finalized or missing snapshot even if run state stays live.
         :return dict[str, Any] | None: The run's ``failure`` payload validated
@@ -358,8 +363,9 @@ class PhaseSweepMCP(RunControl):
             snapshot-unavailable failure; otherwise returns ``None`` when no
             valid failure was recorded.
         """
-        # A runner lost across a reboot is terminal even without a status file.
-        terminal = self._runs.recorded_terminal_status(handle) or {}
+        if observation is None:
+            observation = self._runs.observe(handle, view=view)
+        terminal: Mapping[str, object] = observation.terminal_status or {}
         persisted: dict[str, Any] | None = None
         try:
             if terminal.get("failure") is not None:
@@ -369,8 +375,7 @@ class PhaseSweepMCP(RunControl):
         except ValidationError:
             pass
         if force_snapshot_unavailable or (
-            (state if state is not None else self._runs.state(handle, view=view)) != "running"
-            and parse_result_snapshot(terminal) is None
+            observation.state != "running" and parse_result_snapshot(terminal) is None
         ):
             failure: dict[str, Any] = {
                 "code": "result_snapshot_unavailable",
@@ -775,9 +780,7 @@ class PhaseSweepMCP(RunControl):
             assert experiment is not None
             # No frozen result is available after the runner stopped or
             # cleanup became uncertain. Discard the earlier mutable winner view.
-            unavailable = RunResultSnapshot.model_validate(
-                capture_pre_generation_result_snapshot(experiment)
-            )
+            unavailable = capture_pre_generation_result_snapshot(experiment)
             status = self._snapshot_status_payload(
                 target_id, unavailable, result_source="terminal_snapshot_unavailable"
             )
@@ -855,7 +858,7 @@ class PhaseSweepMCP(RunControl):
             assert experiment is not None
             placeholder = capture_pre_generation_result_snapshot(experiment)
             return (
-                RunResultSnapshot.model_validate(placeholder),
+                placeholder,
                 "terminal_snapshot_unavailable",
             )
         return (

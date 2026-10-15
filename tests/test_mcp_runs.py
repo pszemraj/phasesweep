@@ -20,7 +20,7 @@ import pytest
 
 import phasesweep.mcp.runs as mcp_runs
 from phasesweep.mcp.recovery import RunRecoveryError, recover_run
-from phasesweep.mcp.runs import RunStore, write_status_file
+from phasesweep.mcp.runs import RunHandle, RunStore, TerminalStatus, write_status_file
 from phasesweep.runtime.files import UnsafePrivatePathError, private_atomic_write_text
 from phasesweep.runtime.reaper import read_boot_id, read_pid_namespace, read_proc_starttime
 from tests.conftest import (
@@ -1689,3 +1689,76 @@ def test_state_reserves_recovery_for_zombie_runner_without_status(tmp_path: Path
         assert not is_pid_zombie(proc.pid)
     finally:
         proc.wait()
+
+
+def test_observation_uses_one_terminal_record_for_state_and_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent replacement cannot mix terminal cleanup facts within a decision."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-observation")
+    write_unsafe_cleanup_status(store, handle.run_id)
+    read_status = store._read_status
+    reads = 0
+
+    def read_then_replace(saved: RunHandle) -> TerminalStatus | None:
+        nonlocal reads
+        reads += 1
+        status = read_status(saved)
+        write_run_status(store, saved.run_id, returncode=0, cleanup_confirmed=True)
+        return status
+
+    monkeypatch.setattr(store, "_read_status", read_then_replace)
+    observation = store.observe(handle)
+
+    assert reads == 1
+    assert observation.state == "running"
+    assert observation.recovery_required
+    assert observation.cleanup_recovery_required
+    assert observation.terminal_status is not None
+    assert observation.terminal_status["cleanup_confirmed"] is False
+    assert store.observe(handle).state == "succeeded"
+
+
+def test_observation_rechecks_pending_snapshot_after_runner_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A final status published during the dead-runner probe supersedes pending evidence."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-observation-race")
+    write_run_status(store, handle.run_id, returncode=0, result_snapshot_state="pending")
+
+    def finish_snapshot(_pid: int | None, _starttime: int | None) -> bool:
+        write_run_status(store, handle.run_id, returncode=0, result_snapshot_state="failed")
+        return False
+
+    monkeypatch.setattr(mcp_runs, "is_same_live_process", finish_snapshot)
+    observation = store.observe(handle)
+
+    assert observation.state == "succeeded"
+    assert not observation.recovery_required
+    assert not observation.snapshot_recovery_required
+    assert observation.terminal_status is not None
+    assert observation.terminal_status["result_snapshot_state"] == "failed"
+
+
+def test_terminal_record_preserves_optional_nulls_and_unknown_fields(tmp_path: Path) -> None:
+    """Field validation leaves unrelated current-format JSON and explicit nulls intact."""
+    store = RunStore(tmp_path / "state")
+    handle = make_dead_run_handle(run_id="exp-terminal-extras")
+    write_run_status(
+        store,
+        handle.run_id,
+        returncode=0,
+        uncertain_attempt_ids=None,
+        recovered_attempt_ids=None,
+        recovered_attempt_generations=None,
+        diagnostic={"nested": [1, "two", None]},
+    )
+
+    terminal = store.recorded_terminal_status(handle)
+    assert terminal is not None
+    assert terminal["uncertain_attempt_ids"] is None
+    assert terminal["recovered_attempt_ids"] is None
+    assert terminal["diagnostic"] == {"nested": [1, "two", None]}
+    assert store.cleanup_uncertain_attempt_ids(handle) == set()

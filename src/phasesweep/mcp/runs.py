@@ -14,11 +14,11 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import IO, Literal, TypeAlias, TypeGuard, cast
+from typing import IO, Literal, NotRequired, TypeAlias, TypedDict, TypeGuard, cast
 from uuid import UUID, uuid4
 
 from phasesweep.config.common import SAFE_NAME_PATTERN, is_sha256_hex
@@ -28,6 +28,7 @@ from phasesweep.runtime.files import (
     UnsafePrivatePathError,
     absolute_path,
     ensure_private_dir,
+    fsync_directory,
     open_directory_fd,
     open_lock_file,
     private_atomic_create_text,
@@ -117,18 +118,6 @@ class UnsupportedStateFormatError(ValueError):
     """
 
 
-def _strict_fsync_directory(path: Path) -> None:
-    """Fsync one private directory and propagate any durability failure.
-
-    :param Path path: Private directory whose entries must be durable.
-    """
-    directory_fd = open_directory_fd(path, create=False, private_final=True)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
 def _strict_unlink(path: Path) -> None:
     """Unlink one private file and durably record its removal.
 
@@ -204,6 +193,59 @@ class RunnerView:
     #: For an ``unobservable`` runner, why it cannot be acted on from here,
     #: naming any host process that stopped the proof; ``None`` otherwise.
     reason: str | None = None
+
+
+class TerminalStatus(TypedDict):
+    """Validated current-format terminal fields; unrelated JSON fields remain intact."""
+
+    run_id: str
+    returncode: int
+    cleanup_confirmed: bool
+    error_class: NotRequired[str | None]
+    failure: NotRequired[dict[str, object] | None]
+    ended_at: NotRequired[str | None]
+    result_snapshot_state: NotRequired[Literal["pending", "complete", "failed"] | None]
+    result_snapshot: NotRequired[object]
+    result_publication_state: NotRequired[Literal["prepared", "committed"] | None]
+    result_publication_generation_id: NotRequired[str | None]
+    result_snapshot_error: NotRequired[str | None]
+    recovered_attempt_ids: NotRequired[list[str] | None]
+    recovered_attempt_generations: NotRequired[dict[str, str] | None]
+    uncertain_attempt_ids: NotRequired[list[str] | None]
+
+
+class RecoveredAttemptLocation(TypedDict):
+    """Validated trial location named by operator cleanup evidence."""
+
+    phase: str
+    trial_number: int
+    generation_id: str
+
+
+class CleanupRecovery(TypedDict):
+    """Validated recovery evidence bound to one run and configuration digest."""
+
+    run_id: str
+    config_sha256: str
+    cleanup_confirmed: Literal[True]
+    reaped_attempt_ids: list[str]
+    reaped_attempt_locations: dict[str, RecoveredAttemptLocation]
+
+
+@dataclass(frozen=True)
+class RunObservation:
+    """One coherent run decision from terminal, cleanup and process evidence.
+
+    The terminal status is reread after a dead-runner probe. Reuse this
+    observation within one payload, and obtain a new one after acquiring a
+    transition lock, performing cleanup or reading mutable result artifacts.
+    """
+
+    state: RunState
+    recovery_required: bool
+    cleanup_recovery_required: bool
+    snapshot_recovery_required: bool
+    terminal_status: TerminalStatus | None
 
 
 @dataclass(frozen=True)
@@ -753,7 +795,7 @@ class RunStore:
         target = self._runs_dir / f"{handle.run_id}.json"
         payload = json.dumps(asdict(handle), indent=2)
         private_atomic_write_text(target, payload + "\n")
-        _strict_fsync_directory(target.parent)
+        fsync_directory(target.parent, strict=True)
 
     def get(self, run_id: str) -> RunHandle | None:
         """Load a run handle by id, or ``None`` if there is no such handle.
@@ -1056,99 +1098,92 @@ class RunStore:
             or ``None`` to derive it here.
         :return RunState: One of ``running`` / ``succeeded`` / ``failed`` / ``cancelled``.
         """
+        return self.observe(handle, view=view).state
+
+    def observe(self, handle: RunHandle, *, view: RunnerView | None = None) -> RunObservation:
+        """Read and classify one run without mutating its persisted evidence.
+
+        A valid uncertainty marker reserves capacity unless terminal cleanup
+        or an ended boot supersedes it. An ended boot settles processes but
+        leaves explicit uncertain trial cleanup subject to reconciliation.
+        Pending snapshots reserve capacity until finalization; only a dead
+        runner makes that pending state require operator recovery.
+
+        :param RunHandle handle: Run whose state and recovery facts are needed.
+        :param RunnerView | None view: Runner visibility already derived for this decision.
+        :return RunObservation: State, recovery requirements and the same terminal status.
+        """
         if view is None:
             view = self.runner_view(handle)
-        # Reap the runner if it has exited. The runner is our child; without
-        # this it lingers as a zombie until the server dies, and every state
-        # query is a natural place to clean it up (no signal handler needed).
-        # Only in the namespace its PID is numbered in: elsewhere the number
-        # may be an unrelated child of this process.
         if handle.pid is not None and view.visibility == "observable":
             reap_child(handle.pid)
         status = self._read_status(handle)
         gone = view.visibility == "gone"
-        if not gone and self._marker_reserves(handle, status, gone=False):
-            return "running"
-        if status is not None:
-            return self._state_from_status(handle, status, view)
-        if handle.launch_state == "launching" or handle.pid is None:
-            # The launching record is durable before Popen. After a server
-            # crash it cannot distinguish "not spawned" from "spawned but the
-            # child has not self-persisted yet", so reserve concurrency until
-            # a known launch error or operator recovery writes terminal status.
-            return "running"
-        if gone:
-            # The host rebooted since this runner was spawned. Neither the
-            # runner nor any descendant it ever had can still hold a GPU or a
-            # lock, and a boot never comes back, so cleanup is confirmed with
-            # no signal sent and the run derives terminal instead of parking
-            # in cleanup-uncertain recovery.
-            return "failed"
-        if view.visibility == "unobservable":
-            return "running"
-        # No status.json: the run is live only if its process is genuinely alive.
-        # A zombie (exited without recording a cause - SIGKILL/OOM, or an early
-        # SIGTERM before the engine installed its handlers) still answers
-        # kill(pid, 0), so it is filtered out of the live path below.
-        if self.runner_may_be_alive(handle, view=view):
-            return "running"
-        # A runner can publish its terminal status while the liveness probe
-        # observes its exit, so re-read before treating it as dead.
-        status = self._read_status(handle)
-        if status is not None:
-            return self._state_from_status(handle, status, view)
-        if self._cleanup_recovered(handle):
-            return "failed"
-        # Dead without a status or recovery evidence: its trial descendants may
-        # live on, so the run holds its capacity until recovery settles it.
-        return "running"
-
-    def _marker_reserves(
-        self,
-        handle: RunHandle,
-        status: Mapping[str, object] | None,
-        *,
-        gone: bool,
-    ) -> bool:
-        """Return whether a cleanup marker still reserves the run.
-
-        A marker is evidence that cleanup was never confirmed. It stops
-        counting once a confirmed terminal status says otherwise, or once the
-        runner is provably gone and no status reports unconfirmed cleanup. The
-        marker file is not deleted: a superseded marker is simply inert.
-
-        :param RunHandle handle: Run whose marker is checked.
-        :param Mapping[str, object] | None status: Validated terminal status, if any.
-        :param bool gone: Whether the runner is conclusively gone.
-        :return bool: Whether a valid, unsuperseded marker reserves the run.
-        """
-        if not self.cleanup_uncertain(handle):
-            return False
-        cleanup_confirmed = None if status is None else status.get("cleanup_confirmed")
-        if cleanup_confirmed is True:
-            return False
-        return not (gone and cleanup_confirmed is not False)
-
-    def _state_from_status(
-        self, handle: RunHandle, status: Mapping[str, object], view: RunnerView
-    ) -> RunState:
-        """Classify a recorded status after the run's cleanup marker is considered.
-
-        :param RunHandle handle: Run whose terminal status was recorded.
-        :param Mapping[str, object] status: Validated status payload.
-        :param RunnerView view: The caller's derivation of the runner.
-        :return RunState: Derived running or terminal state.
-        """
-        if self._terminal_cleanup_uncertain(handle, status, view):
-            return "running"
-        if status.get("result_snapshot_state") == "pending":
-            return "running"
-        rc = status.get("returncode")
-        if rc == 0:
-            return "succeeded"
-        if rc in _SIGNALLED_EXIT_CODES or status.get("error_class") == "cancelled":
-            return "cancelled"
-        return "failed"
+        runner_alive = False
+        if (status is None or status.get("result_snapshot_state") == "pending") and (
+            handle.launch_state == "spawned" and not gone
+        ):
+            runner_alive = self.runner_may_be_alive(handle, view=view)
+            if not runner_alive:
+                # The runner can publish its terminal status while the probe observes
+                # its exit. Pending and absent status must both be checked again.
+                latest_status = self._read_status(handle)
+                if latest_status is not None:
+                    status = latest_status
+        cleanup_confirmed = None if status is None else status["cleanup_confirmed"]
+        marker_reserves = (
+            self.cleanup_uncertain(handle)
+            and cleanup_confirmed is not True
+            and not (gone and cleanup_confirmed is not False)
+        )
+        needs_recovery_evidence = cleanup_confirmed is False or (
+            status is None and handle.launch_state == "spawned" and not runner_alive and not gone
+        )
+        cleanup_recovered = needs_recovery_evidence and self._cleanup_recovered(handle)
+        terminal_cleanup_uncertain = cleanup_confirmed is False and not cleanup_recovered
+        cleanup_recovery = marker_reserves or terminal_cleanup_uncertain
+        snapshot_recovery = (
+            status is not None
+            and status.get("result_snapshot_state") == "pending"
+            and not runner_alive
+        )
+        launch_outcome_unknown = handle.launch_state == "launching" and status is None
+        dead_without_status = (
+            handle.launch_state == "spawned"
+            and status is None
+            and view.visibility in {"observable", "absent"}
+            and not runner_alive
+        )
+        if (not gone and marker_reserves) or (terminal_cleanup_uncertain and not gone):
+            state: RunState = "running"
+        elif status is not None:
+            if status.get("result_snapshot_state") == "pending":
+                state = "running"
+            elif status["returncode"] == 0:
+                state = "succeeded"
+            elif (
+                status["returncode"] in _SIGNALLED_EXIT_CODES
+                or status.get("error_class") == "cancelled"
+            ):
+                state = "cancelled"
+            else:
+                state = "failed"
+        elif (
+            handle.pid is None
+            or launch_outcome_unknown
+            or runner_alive
+            or view.visibility == "unobservable"
+        ):
+            state = "running"
+        else:
+            state = "failed" if gone or cleanup_recovered else "running"
+        return RunObservation(
+            state,
+            launch_outcome_unknown or dead_without_status or cleanup_recovery or snapshot_recovery,
+            cleanup_recovery,
+            snapshot_recovery,
+            status,
+        )
 
     def recorded_terminal_status(self, handle: RunHandle) -> dict[str, object] | None:
         """Return the runner-written terminal status payload, if readable.
@@ -1156,7 +1191,8 @@ class RunStore:
         :param RunHandle handle: Run handle whose terminal status should be returned.
         :return dict[str, object] | None: Decoded status payload, or ``None`` when absent or malformed.
         """
-        return self._read_status(handle)
+        status = self._read_status(handle)
+        return None if status is None else dict(status)
 
     def mark_cleanup_uncertain(self, handle: RunHandle) -> None:
         """Persist that a cancel attempt could not confirm process-group cleanup.
@@ -1298,23 +1334,7 @@ class RunStore:
             or proven dead left no terminal status, or terminal snapshot
             finalization was interrupted after the runner exited.
         """
-        if view is None:
-            view = self.runner_view(handle)
-        status = self._read_status(handle)
-        launch_outcome_unknown = handle.launch_state == "launching" and status is None
-        dead_spawned_without_status = (
-            handle.launch_state == "spawned"
-            and status is None
-            and view.visibility in {"observable", "absent"}
-            and not self.runner_may_be_alive(handle, view=view)
-            and self._read_status(handle) is None
-        )
-        return (
-            launch_outcome_unknown
-            or dead_spawned_without_status
-            or self.cleanup_recovery_required(handle, view=view)
-            or self.snapshot_recovery_required(handle, view=view)
-        )
+        return self.observe(handle, view=view).recovery_required
 
     def cleanup_recovery_required(
         self, handle: RunHandle, *, view: RunnerView | None = None
@@ -1329,14 +1349,7 @@ class RunStore:
             A prior boot proves processes dead but does not update their
             durable trial rows or an already-frozen result snapshot.
         """
-        if view is None:
-            view = self.runner_view(handle)
-        status = self._read_status(handle)
-        gone = view.visibility == "gone"
-        if self._marker_reserves(handle, status, gone=gone):
-            return True
-        terminal_cleanup_uncertain = status is not None and status.get("cleanup_confirmed") is False
-        return terminal_cleanup_uncertain and not self._cleanup_recovered(handle)
+        return self.observe(handle, view=view).cleanup_recovery_required
 
     def cleanup_recovered_attempt_evidence(
         self,
@@ -1356,7 +1369,7 @@ class RunStore:
         if status is not None:
             generations = status.get("recovered_attempt_generations")
             recovered_ids = status.get("recovered_attempt_ids")
-            if isinstance(generations, dict) and isinstance(recovered_ids, list):
+            if generations is not None and recovered_ids is not None:
                 attempt_ids.update(
                     attempt_id
                     for attempt_id in recovered_ids
@@ -1365,15 +1378,9 @@ class RunStore:
         payload = self._read_cleanup_recovery(handle)
         if payload is None:
             return attempt_ids, {}
-        recovered_ids = payload.get("reaped_attempt_ids")
-        locations = payload.get("reaped_attempt_locations")
-        # _read_cleanup_recovery already refused malformed ids and locations.
-        if not isinstance(recovered_ids, list):
-            return attempt_ids, {}
-        authorized = set(recovered_ids)
+        authorized = set(payload["reaped_attempt_ids"])
+        locations = payload["reaped_attempt_locations"]
         attempt_ids.update(authorized)
-        if not isinstance(locations, dict):
-            return attempt_ids, {}
         return attempt_ids, {
             attempt_id: (raw["phase"], raw["trial_number"], raw["generation_id"])
             for attempt_id, raw in locations.items()
@@ -1393,9 +1400,7 @@ class RunStore:
         status = self._read_status(handle)
         if status is None:
             return set()
-        # _read_status refused any status whose ids are not nonempty strings.
-        uncertain_attempt_ids = cast(list[str], status.get("uncertain_attempt_ids", []))
-        return set(uncertain_attempt_ids)
+        return set(status.get("uncertain_attempt_ids") or [])
 
     def snapshot_recovery_required(
         self, handle: RunHandle, *, view: RunnerView | None = None
@@ -1413,12 +1418,7 @@ class RunStore:
             or ``None`` to derive it here.
         :return bool: True only for an orphaned pending snapshot state.
         """
-        status = self._read_status(handle)
-        return (
-            status is not None
-            and status.get("result_snapshot_state") == "pending"
-            and not self.runner_may_be_alive(handle, view=view)
-        )
+        return self.observe(handle, view=view).snapshot_recovery_required
 
     def runner_may_be_alive(self, handle: RunHandle, *, view: RunnerView | None = None) -> bool:
         """Return whether a spawned handle may still identify a live runner.
@@ -1439,98 +1439,14 @@ class RunStore:
             return view.visibility == "unobservable"
         return is_same_live_process(handle.pid, handle.pid_starttime)
 
-    def _read_status(self, handle: RunHandle) -> dict[str, object] | None:
+    def _read_status(self, handle: RunHandle) -> TerminalStatus | None:
         """Read the runner-written terminal status payload.
 
         :param RunHandle handle: Run handle whose status file should be read.
-        :return dict[str, object] | None: Decoded JSON payload, or ``None`` when absent or malformed.
+        :return TerminalStatus | None: Validated JSON fields, or ``None`` when absent or malformed.
         """
         payload = _read_json_object(self.status_path(handle.run_id))
-        if payload is None:
-            return None
-        if payload.get("run_id") != handle.run_id:
-            return None
-        if type(payload.get("returncode")) is not int:
-            return None
-        cleanup_confirmed = payload.get("cleanup_confirmed")
-        if type(cleanup_confirmed) is not bool:
-            return None
-        error_class = payload.get("error_class")
-        if error_class is not None and not isinstance(error_class, str):
-            return None
-        failure = payload.get("failure")
-        if failure is not None and not isinstance(failure, dict):
-            return None
-        ended_at = payload.get("ended_at")
-        if ended_at is not None and not isinstance(ended_at, str):
-            return None
-        result_snapshot_state = payload.get("result_snapshot_state")
-        if result_snapshot_state is not None and result_snapshot_state not in {
-            "pending",
-            "complete",
-            "failed",
-        }:
-            return None
-        if result_snapshot_state == "complete" and not isinstance(
-            payload.get("result_snapshot"), dict
-        ):
-            return None
-        result_publication_state = payload.get("result_publication_state")
-        result_publication_generation_id = payload.get("result_publication_generation_id")
-        if (result_publication_state is None) != (result_publication_generation_id is None):
-            return None
-        if result_publication_state is not None:
-            if result_publication_state not in {"prepared", "committed"}:
-                return None
-            if (
-                not isinstance(result_publication_generation_id, str)
-                or not SAFE_NAME_PATTERN.fullmatch(result_publication_generation_id)
-                or not isinstance(payload.get("result_snapshot"), dict)
-            ):
-                return None
-            if result_publication_state == "prepared" and result_snapshot_state != "pending":
-                return None
-        result_snapshot_error = payload.get("result_snapshot_error")
-        if result_snapshot_error is not None and not isinstance(result_snapshot_error, str):
-            return None
-        recovered_attempt_ids = payload.get("recovered_attempt_ids")
-        if recovered_attempt_ids is not None and (
-            not isinstance(recovered_attempt_ids, list)
-            or any(not isinstance(value, str) or not value for value in recovered_attempt_ids)
-        ):
-            return None
-        recovered_attempt_generations = payload.get("recovered_attempt_generations")
-        if recovered_attempt_generations is not None and (
-            not isinstance(recovered_attempt_generations, dict)
-            or any(
-                not isinstance(key, str) or not key or not isinstance(value, str) or not value
-                for key, value in recovered_attempt_generations.items()
-            )
-        ):
-            return None
-        uncertain_attempt_ids = payload.get("uncertain_attempt_ids")
-        if uncertain_attempt_ids is not None and (
-            not isinstance(uncertain_attempt_ids, list)
-            or any(not isinstance(value, str) or not value for value in uncertain_attempt_ids)
-        ):
-            return None
-        return payload
-
-    def _terminal_cleanup_uncertain(
-        self, handle: RunHandle, status: Mapping[str, object], view: RunnerView
-    ) -> bool:
-        """Return whether a terminal status still needs operator cleanup recovery.
-
-        :param RunHandle handle: Run handle whose recovery evidence should be checked.
-        :param Mapping[str, object] status: Terminal runner status payload.
-        :param RunnerView view: The caller's derivation of the runner.
-        :return bool: Whether cleanup is uncertain and lacks recovery evidence.
-        """
-        return (
-            status.get("cleanup_confirmed") is False
-            and not self._cleanup_recovered(handle)
-            and view.visibility != "gone"
-        )
+        return payload if payload is not None and _valid_terminal_status(payload, handle) else None
 
     def _cleanup_recovered(self, handle: RunHandle) -> bool:
         """Return whether operator recovery evidence confirms cleanup for this run.
@@ -1540,44 +1456,17 @@ class RunStore:
         """
         return self._read_cleanup_recovery(handle) is not None
 
-    def _read_cleanup_recovery(self, handle: RunHandle) -> dict[str, object] | None:
+    def _read_cleanup_recovery(self, handle: RunHandle) -> CleanupRecovery | None:
         """Read matching operator cleanup evidence for a run handle.
 
         :param RunHandle handle: Run handle whose recovery evidence should be read.
-        :return dict[str, object] | None: The recovery payload when the file
+        :return CleanupRecovery | None: The recovery payload when the file
             exists, parses as a JSON object, and its ``run_id``,
             ``config_sha256``, and ``cleanup_confirmed`` fields match this
             handle; ``None`` otherwise.
         """
         payload = _read_json_object(self.cleanup_recovery_path(handle.run_id))
-        if payload is None:
-            return None
-        if not (
-            payload.get("run_id") == handle.run_id
-            and payload.get("config_sha256") == handle.config_sha256
-            and payload.get("cleanup_confirmed") is True
-        ):
-            return None
-        reaped_attempt_ids = payload.get("reaped_attempt_ids")
-        if not isinstance(reaped_attempt_ids, list) or any(
-            not isinstance(value, str) or not value for value in reaped_attempt_ids
-        ):
-            return None
-        locations = payload.get("reaped_attempt_locations")
-        if not isinstance(locations, dict) or any(
-            not isinstance(attempt_id, str)
-            or not attempt_id
-            or not isinstance(raw, dict)
-            or not isinstance(raw.get("phase"), str)
-            or not raw.get("phase")
-            or type(raw.get("trial_number")) is not int
-            or raw["trial_number"] < 0
-            or not isinstance(raw.get("generation_id"), str)
-            or not raw.get("generation_id")
-            for attempt_id, raw in locations.items()
-        ):
-            return None
-        return payload
+        return payload if payload is not None and _valid_cleanup_recovery(payload, handle) else None
 
     def _read_cleanup_identity(
         self,
@@ -1660,6 +1549,115 @@ class RunStore:
             ):
                 return None
         return identity
+
+
+def _valid_terminal_status(
+    payload: dict[str, object], handle: RunHandle
+) -> TypeGuard[TerminalStatus]:
+    """Validate current terminal fields and their publication/finalization relationships.
+
+    :param dict[str, object] payload: Decoded terminal JSON, including unrelated extra fields.
+    :param RunHandle handle: Run identity that the terminal record must name.
+    :return bool: Whether current terminal fields and cross-field relationships are valid.
+    """
+    if payload.get("run_id") != handle.run_id:
+        return False
+    if type(payload.get("returncode")) is not int:
+        return False
+    cleanup_confirmed = payload.get("cleanup_confirmed")
+    if type(cleanup_confirmed) is not bool:
+        return False
+    error_class = payload.get("error_class")
+    if error_class is not None and not isinstance(error_class, str):
+        return False
+    failure = payload.get("failure")
+    if failure is not None and not isinstance(failure, dict):
+        return False
+    ended_at = payload.get("ended_at")
+    if ended_at is not None and not isinstance(ended_at, str):
+        return False
+    result_snapshot_state = payload.get("result_snapshot_state")
+    if result_snapshot_state is not None and result_snapshot_state not in {
+        "pending",
+        "complete",
+        "failed",
+    }:
+        return False
+    if result_snapshot_state == "complete" and not isinstance(payload.get("result_snapshot"), dict):
+        return False
+    result_publication_state = payload.get("result_publication_state")
+    result_publication_generation_id = payload.get("result_publication_generation_id")
+    if (result_publication_state is None) != (result_publication_generation_id is None):
+        return False
+    if result_publication_state is not None:
+        if result_publication_state not in {"prepared", "committed"}:
+            return False
+        if (
+            not isinstance(result_publication_generation_id, str)
+            or not SAFE_NAME_PATTERN.fullmatch(result_publication_generation_id)
+            or not isinstance(payload.get("result_snapshot"), dict)
+        ):
+            return False
+        if result_publication_state == "prepared" and result_snapshot_state != "pending":
+            return False
+    result_snapshot_error = payload.get("result_snapshot_error")
+    if result_snapshot_error is not None and not isinstance(result_snapshot_error, str):
+        return False
+    recovered_attempt_ids = payload.get("recovered_attempt_ids")
+    if recovered_attempt_ids is not None and (
+        not isinstance(recovered_attempt_ids, list)
+        or any(not isinstance(value, str) or not value for value in recovered_attempt_ids)
+    ):
+        return False
+    recovered_attempt_generations = payload.get("recovered_attempt_generations")
+    if recovered_attempt_generations is not None and (
+        not isinstance(recovered_attempt_generations, dict)
+        or any(
+            not isinstance(key, str) or not key or not isinstance(value, str) or not value
+            for key, value in recovered_attempt_generations.items()
+        )
+    ):
+        return False
+    uncertain_attempt_ids = payload.get("uncertain_attempt_ids")
+    return uncertain_attempt_ids is None or (
+        isinstance(uncertain_attempt_ids, list)
+        and all(isinstance(value, str) and bool(value) for value in uncertain_attempt_ids)
+    )
+
+
+def _valid_cleanup_recovery(
+    payload: dict[str, object], handle: RunHandle
+) -> TypeGuard[CleanupRecovery]:
+    """Validate run binding and every operator-authorized recovered trial location.
+
+    :param dict[str, object] payload: Decoded operator cleanup recovery JSON.
+    :param RunHandle handle: Run and configuration identity that the record must name.
+    :return bool: Whether the binding and every recovered attempt location are valid.
+    """
+    if not (
+        payload.get("run_id") == handle.run_id
+        and payload.get("config_sha256") == handle.config_sha256
+        and payload.get("cleanup_confirmed") is True
+    ):
+        return False
+    reaped_attempt_ids = payload.get("reaped_attempt_ids")
+    if not isinstance(reaped_attempt_ids, list) or any(
+        not isinstance(value, str) or not value for value in reaped_attempt_ids
+    ):
+        return False
+    locations = payload.get("reaped_attempt_locations")
+    return isinstance(locations, dict) and not any(
+        not isinstance(attempt_id, str)
+        or not attempt_id
+        or not isinstance(raw, dict)
+        or not isinstance(raw.get("phase"), str)
+        or not raw.get("phase")
+        or type(raw.get("trial_number")) is not int
+        or raw["trial_number"] < 0
+        or not isinstance(raw.get("generation_id"), str)
+        or not raw.get("generation_id")
+        for attempt_id, raw in locations.items()
+    )
 
 
 def _valid_positive_optional_int(value: object) -> TypeGuard[int | None]:

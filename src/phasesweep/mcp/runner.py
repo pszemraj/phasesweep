@@ -1032,7 +1032,9 @@ def main(argv: list[str] | None = None) -> int:
             publication_hook.clear_uncommitted_marker()
         if result_snapshot is None and terminal_report is None and config is not None:
             try:
-                result_snapshot = capture_pre_generation_result_snapshot(config)
+                result_snapshot = capture_pre_generation_result_snapshot(config).model_dump(
+                    mode="json"
+                )
             except Exception as exc:  # noqa: BLE001 - preserve the terminal engine failure
                 result_snapshot_error = type(exc).__name__
             else:

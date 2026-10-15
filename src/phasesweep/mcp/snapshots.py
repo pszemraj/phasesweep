@@ -428,7 +428,7 @@ class RunResultSnapshot(_SnapshotModel):
         ]
 
 
-def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, Any]:
+def capture_pre_generation_result_snapshot(experiment: Experiment) -> RunResultSnapshot:
     """Freeze known config shape without reading mutable study or winner state.
 
     Used when the engine crashed before ever claiming a generation, so no
@@ -439,10 +439,10 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
 
     :param Experiment experiment: Exact config snapshot the detached runner
         attempted to execute.
-    :return dict[str, Any]: JSON-serializable placeholder result snapshot.
+    :return RunResultSnapshot: Validated placeholder result snapshot.
     """
     zero_counts: dict[str, int] = {state: 0 for state in TRIAL_STATE_NAMES}
-    snapshot = RunResultSnapshot(
+    return RunResultSnapshot(
         status=StatusSnapshot(
             current_generation_id=None,
             published_generation_id=None,
@@ -479,7 +479,6 @@ def capture_pre_generation_result_snapshot(experiment: Experiment) -> dict[str, 
         winners=[],
         represented_config_fingerprint=None,
     )
-    return snapshot.model_dump(mode="json")
 
 
 def capture_result_snapshot(

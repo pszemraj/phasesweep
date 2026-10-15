@@ -582,7 +582,9 @@ def _recover_pending_snapshot_while(failing: str, error: Exception) -> Trigger:
             RunStore.open_existing(state_dir),
             run_id,
             returncode=1,
-            result_snapshot=capture_pre_generation_result_snapshot(materialized.experiment),
+            result_snapshot=capture_pre_generation_result_snapshot(
+                materialized.experiment
+            ).model_dump(mode="json"),
             result_snapshot_state="pending",
         )
         monkeypatch.setattr(f"phasesweep.mcp.recovery.{failing}", _raiser(error))
@@ -597,7 +599,9 @@ def _finalize_complete_snapshot_while(failing: str, error: Exception) -> Trigger
     def trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> object:
         terminal_status = {
             "run_id": "wrap-recover",
-            "result_snapshot": capture_pre_generation_result_snapshot(make_experiment()),
+            "result_snapshot": capture_pre_generation_result_snapshot(make_experiment()).model_dump(
+                mode="json"
+            ),
             "result_snapshot_state": "complete",
         }
         monkeypatch.setattr(f"phasesweep.mcp.recovery.{failing}", _raiser(error))
