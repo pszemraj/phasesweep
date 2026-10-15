@@ -269,15 +269,6 @@ class Repeats(_Frozen):
         return values
 
 
-def repeat_param(repeats: Repeats) -> CategoricalParam:
-    """Return the categorical axis the sampler draws repeat values from.
-
-    :param Repeats repeats: The phase's repeats block.
-    :return CategoricalParam: One choice per repeat value, in configured order.
-    """
-    return CategoricalParam(type="categorical", choices=list(repeats.values))
-
-
 def sampler_search_space(phase: Phase) -> dict[str, SearchParam]:
     """Return every axis the phase's sampler draws: the search space plus the repeat axis.
 
@@ -290,7 +281,9 @@ def sampler_search_space(phase: Phase) -> dict[str, SearchParam]:
     """
     space: dict[str, SearchParam] = dict(phase.search_space)
     if phase.repeats is not None:
-        space[phase.repeats.key] = repeat_param(phase.repeats)
+        space[phase.repeats.key] = CategoricalParam(
+            type="categorical", choices=list(phase.repeats.values)
+        )
     return space
 
 
@@ -489,15 +482,8 @@ def _validate_sampler_search_space(phase: Phase) -> None:
       switch is read only for grid, so any other sampler would silently ignore it.
     * CMA-ES with categorical parameters — Optuna's ``CmaEsSampler`` is float-only;
       categorical params silently fail every trial trying to cast 'b' to float.
-    * CMA-ES without the ``cmaes`` package importable. ``cmaes`` is a declared
-      hard dependency, but a declared dependency is not an enforced one: an
-      environment can lose it (partial install, manual uninstall, a checkout
-      run without installing). Without this preflight the failure surfaces
-      inside ``optuna.samplers.CmaEsSampler`` during ``_build_sampler``, i.e.
-      after the generation is claimed, the experiment lock is held, and earlier
-      phases have already burned GPU time — and with an Optuna-internal message
-      instead of an install hint. This is an environment check, not a
-      closed-contract type check; do not "simplify" it away.
+    * CMA-ES without the ``cmaes`` package importable; reports an installation
+      hint before any generation is claimed or trial starts.
     * Grid sampler with log-scale floats or ints — Optuna's ``GridSampler`` does
       not enumerate log-spaced values.
     * Grid sampler with float param missing ``step``.

@@ -299,7 +299,6 @@ class MlflowRequiredGate(_Frozen):
 ObjectiveExtractor = (
     JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor | WandbExtractor | MlflowExtractor
 )
-Extractor = ObjectiveExtractor
 LocalExtractor = JsonExtractor | JsonEnvelopeExtractor | LogRegexExtractor
 """The extractors that read a trial's own files. The remote kinds wait for every requested key."""
 
@@ -399,15 +398,9 @@ def objective_evidence_assurance(extractor: ObjectiveExtractor) -> dict[str, str
 
 
 class _ObjectiveEvidenceFields(BaseModel):
-    """Assurance-flag field set shared by MCP result payloads and persisted snapshots.
+    """Assurance flags for the shared MCP objective-evidence model.
 
-    ``phasesweep.mcp.server.ObjectiveEvidencePayload`` and
-    ``phasesweep.mcp.snapshots.ObjectiveEvidenceSnapshot`` each subclass this
-    alongside their own strict base (``extra="forbid"``, and for snapshots also
-    ``allow_inf_nan=False``, inert here since every field below is a bool or
-    ``Literal``) so the identical field set is declared exactly once while each
-    site keeps its own class name and JSON schema entry. See
-    :func:`objective_evidence_assurance` for exactly what each flag means.
+    See :func:`objective_evidence_assurance` for each flag's meaning.
     """
 
     kind: ExtractorKind

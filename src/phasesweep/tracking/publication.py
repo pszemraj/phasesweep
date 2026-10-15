@@ -261,32 +261,6 @@ def publish_trial(
     )
 
 
-def _finish_attempt(
-    experiment: Experiment,
-    generation_id: str,
-    binding: RunBinding,
-    status: str,
-    environment: Mapping[str, str],
-) -> None:
-    """Queue the end of a managed attempt run that produced no accepted result.
-
-    :param Experiment experiment: Configured experiment.
-    :param str generation_id: Producing generation.
-    :param RunBinding binding: The attempt's managed run binding.
-    :param str status: Terminal MLflow status for a still-running run.
-    :param Mapping[str, str] environment: Composed authentication environment.
-    """
-    _enqueue(
-        experiment,
-        generation_id,
-        f"attempt-{binding['attempt_id']}",
-        binding,
-        _unaccepted_projection(binding, status),
-        environment,
-        finish=status,
-    )
-
-
 def publish_unaccepted_trial(
     experiment: Experiment,
     generation_id: str,
@@ -313,7 +287,15 @@ def publish_unaccepted_trial(
     binding = read_binding(Path(directory))
     if binding["run_mode"] == "managed":
         status = "KILLED" if _trial_interrupted(trial) else "FAILED"
-        _finish_attempt(experiment, generation_id, binding, status, environment)
+        _enqueue(
+            experiment,
+            generation_id,
+            f"attempt-{binding['attempt_id']}",
+            binding,
+            _unaccepted_projection(binding, status),
+            environment,
+            finish=status,
+        )
 
 
 def _unrecorded_attempts(
@@ -663,21 +645,12 @@ def delivery_status(experiment: Experiment, generation_id: str | None = None) ->
     :return dict[str, int]: Path-free pending and delivered counts.
     """
     counts = {"pending": 0, "delivered": 0}
-    for path in tracking_root(experiment).glob(_delivery_pattern(generation_id)):
+    for path in tracking_root(experiment).glob(f"{generation_id or '*'}/delivery/*.json"):
         state = json_text(read_record(path), "state")
         if state not in counts:
             raise ValueError(f"Tracking delivery record {path.name!r} has unknown state {state!r}.")
         counts[state] += 1
     return counts
-
-
-def _delivery_pattern(generation_id: str | None) -> str:
-    """Select one generation's delivery records, or every generation's.
-
-    :param str | None generation_id: Generation filter, or ``None`` for all.
-    :return str: Glob relative to the tracking root.
-    """
-    return f"{generation_id or '*'}/delivery/*.json"
 
 
 def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> dict[str, int]:
@@ -734,7 +707,7 @@ def sync_tracking(experiment: Experiment, generation_id: str | None = None) -> d
             ):
                 continue
             _save_generation_intents(experiment, parent.parent.name)
-        paths = sorted(root.glob(_delivery_pattern(generation_id)))
+        paths = sorted(root.glob(f"{generation_id or '*'}/delivery/*.json"))
         if not paths:
             raise ValueError("No tracking deliveries exist for this scope.")
         for path in paths:

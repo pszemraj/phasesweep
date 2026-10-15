@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any
 from phasesweep.errors import UnsafeProcessCleanupError
 from phasesweep.evidence.models import (
     ArtifactSizeGate,
-    Extractor,
     Gate,
     JsonEnvelopeExtractor,
     JsonEqualsGate,
@@ -24,6 +23,7 @@ from phasesweep.evidence.models import (
     LogRegexExtractor,
     MlflowExtractor,
     MlflowRequiredGate,
+    ObjectiveExtractor,
     RequiredFileGate,
     Sha256Gate,
     WandbExtractor,
@@ -55,14 +55,14 @@ EVIDENCE_PROVENANCE_SCHEMA_VERSION = 3
 LOG_REGEX_EVALUATION_REVISION = 2
 
 
-def extractor_config_fingerprint(cfg: Extractor) -> str:
+def extractor_config_fingerprint(cfg: ObjectiveExtractor) -> str:
     """Return the SHA-256 identity of an extractor's evaluation contract.
 
     Frozen into evidence provenance so a forensic review can prove which
     extractor contract produced a published scalar even after the experiment
     config changes.
 
-    :param Extractor cfg: Concrete extractor config to fingerprint.
+    :param ObjectiveExtractor cfg: Concrete extractor config to fingerprint.
     :return str: Hex SHA-256 of the canonical configuration and, for log-regex,
         its evaluation revision.
     """
@@ -591,7 +591,7 @@ def _extract_wandb(
 
 def locate_objective_position(
     ctx: TrialContext,
-    cfg: Extractor,
+    cfg: ObjectiveExtractor,
     provenance: dict[str, Any],
     *,
     deadline: float | None = None,
@@ -751,7 +751,7 @@ def _remaining_budget_seconds(deadline: float | None) -> float | None:
 
 def run_extractor(
     ctx: TrialContext,
-    cfg: Extractor,
+    cfg: ObjectiveExtractor,
     *,
     deadline: float | None = None,
     provenance: dict[str, Any] | None = None,

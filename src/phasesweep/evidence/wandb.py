@@ -14,13 +14,10 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from phasesweep.runtime.json import json_text, progress_position
-
-if TYPE_CHECKING:
-    from phasesweep.runtime.json import JsonObject
-    from phasesweep.runtime.process import ProcessResult
+from phasesweep.runtime.remote_worker import run_worker
 
 _HistoryRead = Literal["settled", "lagging", "retry"]
 """How one history read ended: an answer, history behind the summary, or a
@@ -169,39 +166,6 @@ def _error_detail(exc: Exception) -> str:
     return f"{type(exc).__name__}{suffix}"
 
 
-def _run_worker(
-    request: Mapping[str, object],
-    *,
-    statuses: frozenset[str],
-    run_id: str,
-    trial_dir: Path,
-    environment: Mapping[str, str] | None,
-    deadline: float,
-) -> tuple[ProcessResult, JsonObject, Path | None]:
-    """Run a W&B request in the registered attempt's process slot.
-
-    :param Mapping[str, object] request: Backend request payload; it must serialize to JSON.
-    :param frozenset[str] statuses: Accepted worker response statuses.
-    :param str run_id: PhaseSweep attempt identity, not a remote run ID.
-    :param Path trial_dir: Registered process slot.
-    :param Mapping[str, str] | None environment: Composed trainer environment.
-    :param float deadline: Absolute monotonic operation deadline.
-    :return tuple[ProcessResult, JsonObject, Path | None]: Process, response, diagnostic.
-    """
-    from phasesweep.runtime.remote_worker import run_worker
-
-    return run_worker(
-        request,
-        Path(__file__).resolve(),
-        "wandb",
-        statuses=statuses,
-        run_id=run_id,
-        trial_dir=trial_dir,
-        environment=environment,
-        deadline=deadline,
-    )
-
-
 def poll_wandb_summary(
     *,
     base_url: str,
@@ -241,7 +205,7 @@ def poll_wandb_summary(
     )
     if time.monotonic() >= deadline:
         raise WandbPollTimeout(run_id, timeout_seconds)
-    result, response, diagnostic_path = _run_worker(
+    result, response, diagnostic_path = run_worker(
         {
             "task": "summary",
             "base_url": base_url,
@@ -254,6 +218,8 @@ def poll_wandb_summary(
             "presence_keys": list(presence_keys),
             "deadline": deadline,
         },
+        Path(__file__).resolve(),
+        "wandb",
         statuses=frozenset(
             {
                 "summary",
@@ -346,7 +312,7 @@ def locate_wandb_position(
     )
     if time.monotonic() >= deadline:
         return None
-    result, response, _ = _run_worker(
+    result, response, _ = run_worker(
         {
             "task": "position",
             "base_url": base_url,
@@ -359,6 +325,8 @@ def locate_wandb_position(
             "value": value,
             "deadline": deadline,
         },
+        Path(__file__).resolve(),
+        "wandb",
         statuses=frozenset({"position", "import_error"}),
         run_id=run_id,
         trial_dir=trial_dir,

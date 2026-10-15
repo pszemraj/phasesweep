@@ -35,7 +35,6 @@ from phasesweep.config.search import (
 )
 from phasesweep.evidence.models import (
     POSITIONED_EXTRACTOR_KINDS,
-    Extractor,
     Gate,
     JsonEnvelopeExtractor,
     JsonExtractor,
@@ -359,7 +358,7 @@ class _NamedExtractor(_Frozen):
     _label: ClassVar[str]
 
     name: str
-    extractor: Extractor = Field(discriminator="type")
+    extractor: ObjectiveExtractor = Field(discriminator="type")
 
     @model_validator(mode="after")
     def _validate_evaluation_axis_unused(self) -> Self:

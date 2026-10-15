@@ -752,7 +752,7 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
 
     monkeypatch.setattr(public, "Api", lambda **_: SimpleNamespace(run=lambda path: Run()))
 
-    def in_process_worker(request, *, deadline, **_):
+    def in_process_worker(request, _worker_path, _backend, *, deadline, **_):
         # The supervised worker, run in-process; the parent stops it at its deadline.
         request = dict(request)
         if request.pop("task") == "summary":
@@ -767,7 +767,7 @@ def test_slow_wandb_position_read_never_costs_an_accepted_trial(
             }
         return SimpleNamespace(timed_out=clock[0] >= deadline), response, None
 
-    monkeypatch.setattr(wandb_evidence, "_run_worker", in_process_worker)
+    monkeypatch.setattr(wandb_evidence, "run_worker", in_process_worker)
     objective = WandbExtractor(
         type="wandb", entity="e", project="p", metric_key="eval/loss", evaluation_axis="eval/step"
     )

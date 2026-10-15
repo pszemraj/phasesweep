@@ -21,8 +21,7 @@ class ConfigError(ValueError):
     """Raised when a config file cannot be read or parsed into a mapping.
 
     The message always names the source, so the CLI reports it as one line and
-    exits without a traceback. Subclassing ``ValueError`` keeps every existing
-    ``except ValueError`` caller behaving as before.
+    exits without a traceback. This exception subclasses ``ValueError``.
     """
 
 

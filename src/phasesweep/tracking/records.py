@@ -138,12 +138,6 @@ TrackingAction: TypeAlias = ResolveAction | CreateAction | FindAction | PublishA
 """A controller request before the configured target is attached."""
 
 
-class ResolveRequest(ResolveAction):
-    """A resolve action with its target."""
-
-    settings: MlflowTarget
-
-
 class CreateRequest(CreateAction):
     """A create action with its target."""
 

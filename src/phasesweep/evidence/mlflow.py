@@ -18,7 +18,6 @@ from phasesweep.runtime.json import dump_json, json_object, json_text_map
 
 if TYPE_CHECKING:
     from phasesweep.config.models import Experiment
-    from phasesweep.runtime.json import JsonObject
     from phasesweep.tracking.records import MlflowCapture, MlflowQuery, Observation
 
 
@@ -135,18 +134,6 @@ def select_observation(
     return selected
 
 
-def _members(query: JsonObject, key: str) -> JsonObject:
-    """Read an object member of a decoded query.
-
-    :param JsonObject query: Decoded query.
-    :param str key: Member name.
-    :raises KeyError: The member is absent.
-    :raises ValueError: The member is not an object.
-    :return JsonObject: The member.
-    """
-    return json_object(query[key])
-
-
 def parse_query(value: object) -> MlflowQuery:
     """Narrow a decoded query to the shape :func:`compile_query` produces.
 
@@ -164,10 +151,10 @@ def parse_query(value: object) -> MlflowQuery:
         raise ValueError("Invalid MLflow query gates.")
     return {
         "revision": 1,
-        "objective": _members(query, "objective"),
-        "constraints": {k: json_object(v) for k, v in _members(query, "constraints").items()},
+        "objective": json_object(query["objective"]),
+        "constraints": {k: json_object(v) for k, v in json_object(query["constraints"]).items()},
         "gates": [json_object(gate) for gate in gates],
-        "selections": {k: json_object(v) for k, v in _members(query, "selections").items()},
+        "selections": {k: json_object(v) for k, v in json_object(query["selections"]).items()},
     }
 
 
