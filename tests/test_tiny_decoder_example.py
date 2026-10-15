@@ -240,19 +240,20 @@ def test_wrapper_rejects_a_config_from_another_attempt(tmp_path, monkeypatch, ml
     assert not (trial_dir / "result.json").exists()
 
 
+class _FakeEvaluationModel:
+    def to(self, _device):
+        return self
+
+    def load_state_dict(self, _state):
+        return None
+
+    def eval(self):
+        return None
+
+
 def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
     wrapper = _load_wrapper()
     observed: list[int] = []
-
-    class FakeModel:
-        def to(self, _device):
-            return self
-
-        def load_state_dict(self, _state):
-            return None
-
-        def eval(self):
-            return None
 
     fake_torch = SimpleNamespace(
         load=lambda *_args, **_kwargs: {
@@ -264,7 +265,7 @@ def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
     fake_trainer = SimpleNamespace(
         torch=fake_torch,
         get_optimal_device=lambda: ("cpu", "cpu", None),
-        Llama=lambda **_kwargs: FakeModel(),
+        Llama=lambda **_kwargs: _FakeEvaluationModel(),
         load_data=lambda _path: (_ for _ in ()).throw(RuntimeError("evaluation reached data")),
     )
     monkeypatch.setattr(wrapper, "_load_upstream_trainer", lambda _root: fake_trainer)
@@ -278,16 +279,6 @@ def test_final_evaluator_applies_zero_seed(tmp_path, monkeypatch) -> None:
 def test_final_evaluator_rejects_empty_validation_budget(tmp_path, monkeypatch) -> None:
     """A zero-batch evaluation cannot publish a data-free validation objective."""
     wrapper = _load_wrapper()
-
-    class FakeModel:
-        def to(self, _device):
-            return self
-
-        def load_state_dict(self, _state):
-            return None
-
-        def eval(self):
-            return None
 
     fake_torch = SimpleNamespace(
         load=lambda *_args, **_kwargs: {
@@ -303,7 +294,7 @@ def test_final_evaluator_rejects_empty_validation_budget(tmp_path, monkeypatch) 
     fake_trainer = SimpleNamespace(
         torch=fake_torch,
         get_optimal_device=lambda: ("cpu", "cpu", None),
-        Llama=lambda **_kwargs: FakeModel(),
+        Llama=lambda **_kwargs: _FakeEvaluationModel(),
         load_data=lambda _path: (b"train", b"validation"),
         SequenceDataset=lambda *_args: object(),
         DataLoader=lambda *_args, **_kwargs: object(),

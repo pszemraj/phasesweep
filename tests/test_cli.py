@@ -557,37 +557,31 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
     operator has already been interrupted; the capability line puts the same
     contract in front of them before any trial runs.
     """
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent(f"""
-        experiment: t
-        storage: journal:///{tmp_path}/phases.journal
-        provenance: {{revision: test-fixture-v1}}
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: depth
-            n_trials: 2
-            sampler: {{ type: grid }}
-            search_space: {{ d: {{ type: categorical, choices: [4, 8] }} }}
-          - name: lr
-            n_trials: 2
-            sampler: {{ type: tpe, seed: 0 }}
-            search_space: {{ lr: {{ type: float, low: 0.1, high: 1.0 }} }}
-          - name: wd
-            n_trials: 2
-            sampler: {{ type: random, seed: 3 }}
-            search_space: {{ wd: {{ type: float, low: 0.0, high: 0.3 }} }}
-          - name: reg
-            n_trials: 2
-            n_jobs: 2
-            gpu_policy: none
-            allow_no_gpu_isolation: true
-            sampler: {{ type: cmaes, seed: 1 }}
-            search_space: {{ dropout: {{ type: float, low: 0.0, high: 0.3 }} }}
-        """)
+    p = _write_validation_config(
+        tmp_path,
+        """
+        - name: depth
+          n_trials: 2
+          sampler: { type: grid }
+          search_space: { d: { type: categorical, choices: [4, 8] } }
+        - name: lr
+          n_trials: 2
+          sampler: { type: tpe, seed: 0 }
+          search_space: { lr: { type: float, low: 0.1, high: 1.0 } }
+        - name: wd
+          n_trials: 2
+          sampler: { type: random, seed: 3 }
+          search_space: { wd: { type: float, low: 0.0, high: 0.3 } }
+        - name: reg
+          n_trials: 2
+          n_jobs: 2
+          gpu_policy: none
+          allow_no_gpu_isolation: true
+          sampler: { type: cmaes, seed: 1 }
+          search_space: { dropout: { type: float, low: 0.0, high: 0.3 } }
+        """,
+        persistent=True,
+        phase_name=None,
     )
 
     result = CliRunner().invoke(cli_main, ["validate", str(p)])
@@ -603,21 +597,15 @@ def test_validate_cli_discloses_sampler_capability(tmp_path: Path) -> None:
 
 def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path) -> None:
     """A phase with no search_space needs no seed and is reported as fixed."""
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent(f"""
-        experiment: t
-        storage: journal:///{tmp_path}/phases.journal
-        provenance: {{revision: test-fixture-v1}}
-        trial_command: "echo {{overrides}}"
-        override_format: argparse
-        metric:
-          extractor: {{ type: json_envelope, objective_name: x, split: test, policy: test }}
-        phases:
-          - name: baseline
-            n_trials: 1
-            fixed_overrides: {{ lr: 0.1 }}
-        """)
+    p = _write_validation_config(
+        tmp_path,
+        """
+        - name: baseline
+          n_trials: 1
+          fixed_overrides: { lr: 0.1 }
+        """,
+        persistent=True,
+        phase_name=None,
     )
 
     result = CliRunner().invoke(cli_main, ["validate", str(p)])
@@ -630,26 +618,21 @@ def test_validate_calls_empty_search_space_a_fixed_configuration(tmp_path: Path)
 
 def test_validate_says_an_in_memory_phase_cannot_resume(tmp_path: Path) -> None:
     """Without persistent storage the study ends with the process, so no phase line claims a resume."""
-    p = tmp_path / "exp.yaml"
-    p.write_text(
-        textwrap.dedent("""
-        experiment: t
-        trial_command: "echo {overrides}"
-        override_format: argparse
-        metric:
-          extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
-        phases:
-          - name: lr
-            n_trials: 11
-            search_space: { lr: { type: float, low: 0.1, high: 1.0 } }
-          - name: wd
-            n_trials: 2
-            sampler: { type: random, seed: 3 }
-            search_space: { wd: { type: float, low: 0.0, high: 0.3 } }
-          - name: baseline
-            n_trials: 1
-            fixed_overrides: { lr: 0.1 }
-        """)
+    p = _write_validation_config(
+        tmp_path,
+        """
+        - name: lr
+          n_trials: 11
+          search_space: { lr: { type: float, low: 0.1, high: 1.0 } }
+        - name: wd
+          n_trials: 2
+          sampler: { type: random, seed: 3 }
+          search_space: { wd: { type: float, low: 0.0, high: 0.3 } }
+        - name: baseline
+          n_trials: 1
+          fixed_overrides: { lr: 0.1 }
+        """,
+        phase_name=None,
     )
 
     result = CliRunner().invoke(cli_main, ["validate", str(p)])
@@ -689,21 +672,29 @@ _QUIET_TPE_BUDGETS = [
 ]
 
 
-def _write_tpe_budget_config(tmp_path: Path, phase_body: str) -> Path:
-    """Write an in-memory experiment whose single phase ``lr`` has ``phase_body``."""
+def _write_validation_config(
+    tmp_path: Path, phases: str, *, persistent: bool = False, phase_name: str | None = "lr"
+) -> Path:
+    """Write an echo-trainer config from one phase body or a phase-list YAML."""
     path = tmp_path / "exp.yaml"
-    body = textwrap.indent(phase_body, "    ")
+    storage = (
+        f"storage: journal:///{tmp_path}/phases.journal\nprovenance: {{revision: test-fixture-v1}}\n"
+        if persistent
+        else ""
+    )
+    if phase_name is not None:
+        phases = f"- name: {phase_name}\n" + textwrap.indent(phases, "  ")
     path.write_text(
-        textwrap.dedent("""
+        storage
+        + textwrap.dedent("""
         experiment: t
         trial_command: "echo {overrides}"
         override_format: argparse
         metric:
           extractor: { type: json_envelope, objective_name: x, split: test, policy: test }
         phases:
-          - name: lr
         """)
-        + body
+        + textwrap.indent(textwrap.dedent(phases).strip(), "  ")
         + "\n"
     )
     return path
@@ -711,7 +702,7 @@ def _write_tpe_budget_config(tmp_path: Path, phase_body: str) -> Path:
 
 def test_validate_warns_when_tpe_never_leaves_startup(tmp_path: Path) -> None:
     """A tpe budget at or below its startup trials is random search; validate says so."""
-    path = _write_tpe_budget_config(tmp_path, f"n_trials: 5\nsearch_space: {_LR_SPACE}")
+    path = _write_validation_config(tmp_path, f"n_trials: 5\nsearch_space: {_LR_SPACE}")
 
     result = CliRunner().invoke(cli_main, ["validate", str(path)])
 
@@ -722,7 +713,7 @@ def test_validate_warns_when_tpe_never_leaves_startup(tmp_path: Path) -> None:
 
 
 def test_validate_warns_at_the_startup_boundary(tmp_path: Path) -> None:
-    path = _write_tpe_budget_config(tmp_path, f"n_trials: 10\nsearch_space: {_LR_SPACE}")
+    path = _write_validation_config(tmp_path, f"n_trials: 10\nsearch_space: {_LR_SPACE}")
 
     result = CliRunner().invoke(cli_main, ["validate", str(path)])
 
@@ -732,7 +723,7 @@ def test_validate_warns_at_the_startup_boundary(tmp_path: Path) -> None:
 @pytest.mark.parametrize("phase_body", _QUIET_TPE_BUDGETS)
 def test_validate_does_not_warn_when_tpe_leaves_startup(tmp_path: Path, phase_body: str) -> None:
     result = CliRunner().invoke(
-        cli_main, ["validate", str(_write_tpe_budget_config(tmp_path, phase_body))]
+        cli_main, ["validate", str(_write_validation_config(tmp_path, phase_body))]
     )
 
     assert result.exit_code == 0, result.output
@@ -943,7 +934,7 @@ def test_validate_warns_when_one_configuration_can_exhaust_the_failure_budget(
     """A warning, never a refusal: the run is still the operator's call."""
     body = _REPEATS_BODY + f"max_consecutive_failures: {limit}"
     result = CliRunner().invoke(
-        cli_main, ["validate", str(_write_tpe_budget_config(tmp_path, body))]
+        cli_main, ["validate", str(_write_validation_config(tmp_path, body))]
     )
 
     assert result.exit_code == 0, result.output
@@ -1017,7 +1008,7 @@ def test_show_winners_renders_comment_before_winner(tmp_path: Path) -> None:
 
 
 def test_show_winners_uses_only_the_last_successful_generation(tmp_path: Path) -> None:
-    """Mutable compatibility files must not outrank immutable generation results."""
+    """Root cache files must not outrank immutable generation results."""
     materialized = materialize("current-journal", tmp_path, mode="tree")
     experiment, config_path = materialized.experiment, materialized.config_path
     _winner_path(experiment, "p").write_text("trial_number: 99\n")

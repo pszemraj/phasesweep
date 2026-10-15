@@ -85,83 +85,77 @@ def _refusal(study: optuna.Study, current: EnvironmentIdentity) -> str:
     return str(caught.value)
 
 
-def test_changed_tz_shows_both_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    experiment = make_experiment()
-    study = _record(_identity(experiment))
-    monkeypatch.setenv("TZ", "Asia/Tokyo")
-
-    message = _refusal(study, _identity(experiment))
-
-    assert 'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo". No trial was allocated.' in (
-        message
-    )
-
-
-def test_changed_path_shows_both_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    experiment = make_experiment()
-    study = _record(_identity(experiment))
-    monkeypatch.setenv("PATH", "/opt/second/bin:/usr/bin")
-
-    message = _refusal(study, _identity(experiment))
-
-    assert 'PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin".' in message
-
-
-def test_several_changed_variables_are_listed_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    experiment = make_experiment()
-    study = _record(_identity(experiment))
-    monkeypatch.setenv("TZ", "Asia/Tokyo")
-    monkeypatch.setenv("PATH", "/opt/second/bin:/usr/bin")
-
-    message = _refusal(study, _identity(experiment))
-
-    assert (
-        'Compared with trial 0: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin"; '
-        'TZ "Europe/Berlin" -> "Asia/Tokyo".'
-    ) in message
-
-
-def test_added_inherited_name_is_shown_with_its_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    experiment = make_experiment(execution=ExecutionContext(inherit_env=["HF_HOME"]))
-    study = _record(_identity(experiment))
-    monkeypatch.setenv("HF_HOME", "/data/hf-cache")
-
-    message = _refusal(study, _identity(experiment))
-
-    assert 'Compared with trial 0: added HF_HOME="/data/hf-cache".' in message
-
-
-def test_removed_inherited_name_is_shown_with_its_old_value(
+@pytest.mark.parametrize(
+    "initial,changes,inherit_env,expected",
+    [
+        pytest.param(
+            {},
+            {"TZ": "Asia/Tokyo"},
+            [],
+            'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo". No trial was allocated.',
+            id="changed-timezone",
+        ),
+        pytest.param(
+            {},
+            {"PATH": "/opt/second/bin:/usr/bin"},
+            [],
+            'PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin".',
+            id="changed-path",
+        ),
+        pytest.param(
+            {},
+            {"TZ": "Asia/Tokyo", "PATH": "/opt/second/bin:/usr/bin"},
+            [],
+            'Compared with trial 0: PATH "/opt/first/bin:/usr/bin" -> "/opt/second/bin:/usr/bin"; '
+            'TZ "Europe/Berlin" -> "Asia/Tokyo".',
+            id="two-changed-variables",
+        ),
+        pytest.param(
+            {},
+            {"HF_HOME": "/data/hf-cache"},
+            ["HF_HOME"],
+            'Compared with trial 0: added HF_HOME="/data/hf-cache".',
+            id="added-inherited-name",
+        ),
+        pytest.param(
+            {"HF_HOME": "/data/hf-cache"},
+            {"HF_HOME": None},
+            ["HF_HOME"],
+            'Compared with trial 0: removed HF_HOME (was "/data/hf-cache").',
+            id="removed-inherited-name",
+        ),
+        pytest.param(
+            {"XDG_CACHE_HOME": "/data/cache"},
+            {"XDG_CACHE_HOME": None, "HF_HOME": "/data/hf-cache", "TZ": "Asia/Tokyo"},
+            ["HF_HOME", "XDG_CACHE_HOME"],
+            'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo"; added HF_HOME="/data/hf-cache"; '
+            'removed XDG_CACHE_HOME (was "/data/cache").',
+            id="changed-added-removed",
+        ),
+    ],
+)
+def test_environment_mutation_names_each_difference(
     monkeypatch: pytest.MonkeyPatch,
+    initial: dict[str, str],
+    changes: dict[str, str | None],
+    inherit_env: list[str],
+    expected: str,
 ) -> None:
-    experiment = make_experiment(execution=ExecutionContext(inherit_env=["HF_HOME"]))
-    monkeypatch.setenv("HF_HOME", "/data/hf-cache")
-    study = _record(_identity(experiment))
-    monkeypatch.delenv("HF_HOME")
-
-    message = _refusal(study, _identity(experiment))
-
-    assert 'Compared with trial 0: removed HF_HOME (was "/data/hf-cache").' in message
-
-
-def test_changed_added_and_removed_variables_share_one_sentence(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    experiment = make_experiment(
-        execution=ExecutionContext(inherit_env=["HF_HOME", "XDG_CACHE_HOME"])
+    experiment = (
+        make_experiment(execution=ExecutionContext(inherit_env=inherit_env))
+        if inherit_env
+        else make_experiment()
     )
-    monkeypatch.setenv("XDG_CACHE_HOME", "/data/cache")
+    for name, value in initial.items():
+        monkeypatch.setenv(name, value)
     study = _record(_identity(experiment))
-    monkeypatch.delenv("XDG_CACHE_HOME")
-    monkeypatch.setenv("HF_HOME", "/data/hf-cache")
-    monkeypatch.setenv("TZ", "Asia/Tokyo")
+    for name, value in changes.items():
+        if value is None:
+            monkeypatch.delenv(name)
+        else:
+            monkeypatch.setenv(name, value)
 
-    message = _refusal(study, _identity(experiment))
-
-    assert (
-        'Compared with trial 0: TZ "Europe/Berlin" -> "Asia/Tokyo"; added HF_HOME="/data/hf-cache"; '
-        'removed XDG_CACHE_HOME (was "/data/cache").'
-    ) in message
+    assert expected in _refusal(study, _identity(experiment))
 
 
 def test_pass_through_names_are_in_neither_the_mapping_nor_the_refusal(
@@ -211,7 +205,7 @@ def test_the_tracked_mapping_holds_what_the_digest_covers(monkeypatch: pytest.Mo
     """``TMPDIR`` and ``passthrough_env`` names stay out of it, unless ``env`` sets them."""
     monkeypatch.setenv("TMPDIR", "/scratch/sandbox")
     default = _identity(make_experiment())
-    assert default.tracked == {"PATH": _AMBIENT["PATH"], **_without(_AMBIENT, "PATH")}
+    assert default.tracked == _AMBIENT
     assert "TMPDIR" not in default.tracked
     assert default.values["TMPDIR"] == "/scratch/sandbox"
 
@@ -222,11 +216,6 @@ def test_the_tracked_mapping_holds_what_the_digest_covers(monkeypatch: pytest.Mo
     pinned = _identity(make_experiment(env={"TMPDIR": "/pinned", "TZ": "Asia/Tokyo"}))
     assert pinned.tracked["TMPDIR"] == "/pinned"
     assert pinned.tracked["TZ"] == "Asia/Tokyo"
-
-
-def _without(mapping: dict[str, str], name: str) -> dict[str, str]:
-    """Return ``mapping`` without ``name``."""
-    return {key: value for key, value in mapping.items() if key != name}
 
 
 def test_base_value_pinned_under_env_is_shown_like_an_ambient_one() -> None:
