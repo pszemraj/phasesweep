@@ -609,9 +609,6 @@ def test_inherit_env_naming_tmpdir_is_refused(passthrough: list[str]) -> None:
         ExecutionContext(inherit_env=["TMPDIR", "HF_HOME"], passthrough_env=passthrough)
 
 
-# ---- migrated from version-named files ----
-
-
 @pytest.mark.parametrize(
     ("body", "match"),
     [

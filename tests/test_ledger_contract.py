@@ -13,14 +13,11 @@ referencing, or importing one all count. ``optuna.Study`` and
 the same classes annotate study and connection objects.
 
 The chokepoint is ``phasesweep/engine/ledger.py``. Its private names are read
-from its own source, so a new helper is private the moment it is defined. Two
-ratchet dicts (:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) record
-what is still reachable from outside it. They are compared for *equality*, not
-containment: adding a call site fails, and removing one fails until the ratchet
-is tightened in the same commit. Both are empty: every storage constructor and
-every storage-private helper is reached only through the ledger's public handle
-API, so any entry added to either one is a new bypass that needs a stated
-reason.
+from its own source, so a helper is private as soon as it is defined. The two
+exception maps (:data:`_LEGACY_SITES`, :data:`_LEGACY_PRIVATE_IMPORTS`) are empty
+and compared for exact equality. Every external storage constructor or
+storage-private helper access is rejected; callers use the public ledger
+handle API.
 
 Optuna's journal is PhaseSweep's only durable backend, so SQLite and generic
 SQLAlchemy-RDB constructors (:data:`BANNED_EVERYWHERE`) are refused even inside

@@ -416,12 +416,11 @@ def forbid_file_backed_storage(
     """Make any file-backed storage construction fail, and record every attempt.
 
     Durability invariant 6 ("Read paths construct and write nothing"): a read
-    path never creates a study and never builds file-backed storage, and its
-    SQLite reads open the database ``mode=ro``.
-    Three constructors can break that -- ``RDBStorage`` (which runs
+    path never creates a study and never builds file-backed storage.
+    The tripwires cover ``RDBStorage`` (which runs
     ``metadata.create_all`` and a version manager on open), ``JournalFileBackend``
     (which creates the journal if absent), and ``optuna.create_study`` -- plus
-    any read-write ``sqlite3.connect``.
+    any read-write ``sqlite3.connect``. SQLite is not a supported ledger backend.
 
     ``optuna.load_study`` is deliberately *not* patched: the journal read path
     legitimately loads a study over an in-memory ``_JournalSnapshot``, which

@@ -331,9 +331,8 @@ def _trials_deleted(path: Path) -> None:
 
     Every trial-scoped journal record (``CREATE_TRIAL`` and later) carries an
     ``op_code`` of 4 or above; study-level records (create study, study user
-    attrs) are 0-3. Keeping only the low op codes reproduces exactly what the
-    old ``DELETE FROM trials`` did for the SQLite backend: the study, its
-    schema stamp, and its other attributes survive, but every trial is gone.
+    attrs) are 0-3. Keeping only the low op codes preserves the study, its
+    schema stamp, and its other attributes while deleting every trial.
     """
     lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     kept = [line for line in lines if json.loads(line).get("op_code", 0) < 4]

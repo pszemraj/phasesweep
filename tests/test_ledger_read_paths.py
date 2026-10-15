@@ -330,22 +330,14 @@ def test_current_fixture_carries_this_release_format(tmp_path: Path) -> None:
     )
 
 
-def _fixtures_from_this_generator() -> list[str]:
-    """Name every published fixture the working tree's generator produces.
-
-    The ``release-*`` fixtures are the old release's own output: they carry its
-    fingerprints, and every read path refuses them before comparing one.
-
-    :return list[str]: Fixture names with a ledger and a current-generator origin.
-    """
-    return [
+@pytest.mark.parametrize(
+    "fixture_name",
+    [
         fixture.name
         for fixture in discover_ledger_fixtures()
-        if fixture.manifest["backend"] is not None and not fixture.name.startswith("release-")
-    ]
-
-
-@pytest.mark.parametrize("fixture_name", _fixtures_from_this_generator())
+        if fixture.manifest["backend"] is not None
+    ],
+)
 def test_fixture_fingerprints_do_not_depend_on_the_working_directory(
     fixture_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -370,7 +362,7 @@ def test_fixture_fingerprints_do_not_depend_on_the_working_directory(
 
 
 def test_required_ledger_fixtures_are_present() -> None:
-    """Every fixture the matrix depends on is committed."""
+    """Every fixture the matrix depends on is present."""
     present = tuple(fixture.name for fixture in discover_ledger_fixtures())
     assert present == REQUIRED_FIXTURES
 
@@ -378,10 +370,7 @@ def test_required_ledger_fixtures_are_present() -> None:
 def test_every_ledger_fixture_is_documented() -> None:
     """Each fixture records its provenance and read modes and appears in the inventory README.
 
-    A ``release-<version>-*`` fixture claims to be the old release's own
-    output, so it must name exactly that tag: ``unknown``, a ``-dirty``
-    checkout, or commits past the tag all mean the claim is unproven. A
-    fixture with a ledger must declare a read mode, or the matrix silently
+    A fixture with a ledger must declare a read mode, or the matrix silently
     drops it; one without a ledger has nothing to read.
     """
     readme = (Path(__file__).resolve().parent / "fixtures" / "ledgers" / "README.md").read_text(
@@ -392,12 +381,6 @@ def test_every_ledger_fixture_is_documented() -> None:
         assert isinstance(produced_by, dict) and produced_by.get("phasesweep_git"), (
             f"{fixture.name} has no produced_by provenance"
         )
-        if fixture.name.startswith("release-"):
-            version = fixture.name.removeprefix("release-").rpartition("-")[0]
-            assert produced_by["phasesweep_git"] == f"v{version}", (
-                f"{fixture.name} was produced by {produced_by['phasesweep_git']!r}, "
-                f"not a clean checkout of v{version}"
-            )
         assert fixture.name in readme, f"{fixture.name} is missing from the fixture README"
 
         modes = fixture.modes

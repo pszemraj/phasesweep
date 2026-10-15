@@ -405,7 +405,7 @@ def test_inconclusive_scan_on_a_bound_tree_never_reports_unchecked_counts(
     """Status reports trial data unavailable rather than counts no scan checked.
 
     A bound tree tolerates an unreadable scan so publication data stays
-    readable, but the ledger may hold state this release refuses, and only a
+    readable, but the ledger may hold unsupported state, and only a
     completed scan can tell. Counts read around that gap would present the
     ledger as current-format when nothing verified it.
     """

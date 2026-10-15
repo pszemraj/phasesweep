@@ -757,9 +757,6 @@ def test_argparse_fixed_override_values_keep_distinct_phase_fingerprints():
     assert len(set(fingerprints.values())) == len(fingerprints)
 
 
-# ---- migrated from version-named files ----
-
-
 @pytest.mark.parametrize("override_format", ["argparse", "hydra"])
 @pytest.mark.integration
 def test_effective_overrides_include_fixed(tmp_path, override_format):

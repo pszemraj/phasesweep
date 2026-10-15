@@ -158,7 +158,7 @@ def test_no_feasible_raises():
     ],
 )
 def test_corrupt_winner_evidence_attrs_fail_closed(attr: str, value: str) -> None:
-    """Present-but-corrupt evidence is not treated as absent legacy state."""
+    """Present-but-corrupt evidence is refused."""
     exp = _make_exp()
     study = _make_study()
     _add_trial(study, 0.1, extra_user_attrs={attr: value})

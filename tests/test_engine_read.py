@@ -619,7 +619,7 @@ def test_published_trial_status_requires_the_exact_completed_attempt(
 
 
 def test_read_status_untouched_workdir_is_not_published(tmp_path: Path) -> None:
-    """No generation metadata *and* no legacy winner is still "nothing published"."""
+    """An untouched workdir has no published generation."""
     exp = _experiment(tmp_path)
 
     status = read_status(exp)
@@ -843,11 +843,8 @@ def test_published_result_keeps_its_own_phase_plan_after_a_rename(tmp_path: Path
 def test_read_result_rejects_a_winner_source_naming_another_phase(tmp_path: Path) -> None:
     """A winner_source citing another phase reads as absent, not as that phase's winner.
 
-    Reads of a generation that is not the validated publication (here, one
-    whose winner was edited after publishing, so it no longer validates) go
-    through the permissive ``engine.read._read_winner_path``, so this proves
-    the phase-agreement check now lives in the permissive reader itself
-    (``_parse_winner_source``), not only in the stricter manifest validator.
+    The permissive reader enforces phase agreement through
+    ``_parse_winner_source``, including when publication validation fails.
     """
     experiment = _published(tmp_path)
     generation_id = published_generation_id(experiment)

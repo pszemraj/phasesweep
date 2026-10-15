@@ -1386,12 +1386,9 @@ def test_registry_discards_attempt_whose_journal_ledger_is_gone_without_recreati
 
 
 def test_registry_refuses_a_foreign_ledger_holding_unsupported_state(tmp_path: Path) -> None:
-    """A registry entry cannot reap through a ledger this release refuses.
+    """A registry entry cannot reap through a ledger with unsupported state.
 
-    This release wrote the entry, so the ledger it names was current-format
-    when the attempt registered. Unsupported state there now means the locator
-    no longer names that ledger, so the run stops with the entry and the
-    foreign ledger's bytes both intact instead of marking a trial FAIL in it.
+    Refusal preserves both the registry entry and the foreign ledger's bytes.
     """
 
     def _exp(db_name: str) -> Experiment:

@@ -955,8 +955,8 @@ def test_parallel_abort_stamps_environment_before_stopping_a_queued_trial(tmp_pa
     updated = experiment.model_copy(
         update={"phases": [experiment.phases[0].model_copy(update={"n_trials": 3})]}
     )
-    # The raised target reruns the stopped trial before any new draw, without a
-    # schema/migration error. Under two workers the new draw may launch too.
+    # The raised target reruns the stopped trial before any new draw.
+    # Under two workers the new draw may launch too.
     with pytest.raises(NoFeasibleTrialError):
         run_experiment(updated)
     assert launched[0] == 0 and 2 in launched and 1 not in launched
@@ -1681,8 +1681,8 @@ _FIDELITY_LOSSES = {"0": 3.0, "1.5": 2.0, "one": 1.0, "true": 0.0}
 def _assert_identical_scalar(actual: Any, expected: Any, *, surface: str) -> None:
     """Assert two scalars match in both value and concrete type.
 
-    Plain ``==`` is exactly the comparison that cannot see this bug: a winner
-    reporting ``1`` for a trial that ran ``True`` compares equal to the truth.
+    Equality alone cannot distinguish ``1`` from ``True``; both value and
+    concrete type must match.
 
     :param Any actual: Value read back from the surface under test.
     :param Any expected: Value the engine actually sampled.
