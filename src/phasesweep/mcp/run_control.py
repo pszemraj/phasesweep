@@ -968,7 +968,7 @@ class RunControl:
 
         When the id is gone from the catalog there is no current policy to
         intersect with, and the launch-time permission stands alone. Refusing
-        there would strand a live detached runner: ``_resolve_read_target``
+        there would strand a live detached runner: ``status``
         still reports it as ``running`` from its snapshot, and
         ``phasesweep mcp recover-run`` refuses while the runner is alive, so
         the operator would be left hunting the PGID by hand. Cancellation is

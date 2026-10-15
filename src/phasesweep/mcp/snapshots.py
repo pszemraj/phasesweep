@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Collection, Mapping
+from dataclasses import asdict
 from typing import Annotated, Any, Literal
 
 import yaml
@@ -19,7 +20,13 @@ from phasesweep.engine.confound import (
 from phasesweep.engine.fingerprints import _experiment_semantic_fingerprint
 from phasesweep.engine.optuna import _published_phase_trial_refs
 from phasesweep.engine.paths import _generation_record_path
-from phasesweep.engine.read import PhaseWinnerView, ResultContext, read_result, read_status
+from phasesweep.engine.read import (
+    EngineStatus,
+    PhaseWinnerView,
+    ResultContext,
+    read_result,
+    read_status,
+)
 from phasesweep.engine.repeats import RepeatsSummary, _repeats_summary
 from phasesweep.engine.state import (
     TRIAL_STATE_NAMES,
@@ -54,11 +61,16 @@ class ObjectiveEvidenceSnapshot(_SnapshotModel, _ObjectiveEvidenceFields):
 
 
 class MetricSnapshot(_SnapshotModel):
-    """Optimization metric stored with a terminal run snapshot."""
+    """Optimization metric and objective-evidence assurance."""
 
-    name: str
-    goal: Literal["minimize", "maximize"]
-    objective_evidence: ObjectiveEvidenceSnapshot
+    name: str = Field(description="Metric key extracted from trial output.")
+    goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
+    objective_evidence: ObjectiveEvidenceSnapshot = Field(
+        description=(
+            "False flags mean the identity is not enforced, not that it failed. kind names the "
+            "extractor. Only json_envelope, wandb and mlflow bind an evaluation position."
+        )
+    )
 
 
 class RunningAttemptSnapshot(_SnapshotModel):
@@ -298,27 +310,6 @@ class WinnerSnapshot(_SnapshotModel):
     repeats: RepeatsSpread | None
 
 
-def _winner_source_snapshot(
-    winner: PhaseWinnerView | Winner,
-) -> WinnerSourceSnapshot:
-    """Return the concrete source model for a stored or engine-returned winner.
-
-    :param PhaseWinnerView | Winner winner: Winner whose source should be captured.
-    :raises RuntimeError: The winner carries no source provenance.
-    :return WinnerSourceSnapshot: Concrete, validated source snapshot.
-    """
-    source = winner.source
-    if source is None:
-        raise RuntimeError("Current-format winner is missing source provenance.")
-    return WinnerSourceSnapshot(
-        kind=source.kind,
-        phase=source.phase,
-        trial_number=source.trial_number,
-        generation_id=source.generation_id,
-        attempt_id=source.attempt_id,
-    )
-
-
 def _winner_snapshot(
     phase: str,
     winner: PhaseWinnerView | Winner,
@@ -349,6 +340,9 @@ def _winner_snapshot(
             raise RuntimeError("Current-format winner is missing confound verdicts.")
         confound = winner.confound
         repeats = winner.repeats
+    source = winner.source
+    if source is None:
+        raise RuntimeError("Current-format winner is missing source provenance.")
     return WinnerSnapshot(
         phase=phase,
         trial_number=winner.trial_number,
@@ -358,7 +352,7 @@ def _winner_snapshot(
         incomplete=incomplete,
         generation_id=winner.generation_id,
         attempt_id=winner.attempt_id,
-        source=_winner_source_snapshot(winner),
+        source=WinnerSourceSnapshot.model_validate(asdict(source)),
         confound=ConfoundSummary.model_validate(confound),
         observed=dict(winner.observed),
         repeats=None if repeats is None else RepeatsSpread.model_validate(repeats),
@@ -380,15 +374,28 @@ class RunResultSnapshot(_SnapshotModel):
     unrelated working directory.
     """
 
-    def status_payload(self) -> dict[str, Any]:
+    def status_payload(self) -> EngineStatus:
         """Return the stored status in the engine reader's path-free shape.
 
-        :return dict[str, Any]: Status mapping accepted by the MCP payload builder.
+        :return EngineStatus: Status mapping accepted by the MCP payload builder.
         """
-        payload = self.status.model_dump(mode="json")
-        for phase in payload["phases"]:
-            phase.pop("running_attempts", None)
-        return payload
+        status = self.status
+        return {
+            "current_generation_id": status.current_generation_id,
+            "published_generation_id": status.published_generation_id,
+            "represented_generation_id": status.represented_generation_id,
+            "is_published": status.is_published,
+            "publication_integrity": status.publication_integrity,
+            "metric": status.metric.model_dump(mode="json"),
+            "phases": [
+                phase.model_dump(mode="json", exclude={"running_attempts"})
+                for phase in status.phases
+            ],
+            "summary_present": status.summary_present,
+            "result_context": status.result_context,
+            "published_config_matches_current": status.published_config_matches_current,
+            "result_phase_plan": list(status.result_phase_plan),
+        }
 
     def winner_views(self) -> list[PhaseWinnerView]:
         """Return stored winners as the engine view consumed by MCP redaction.
@@ -556,18 +563,20 @@ def capture_result_snapshot(
         status, winner_views = read_result(experiment, generation_id=generation_id)
         winner_snapshots = [_winner_snapshot(winner.phase, winner) for winner in winner_views]
     snapshot = RunResultSnapshot(
-        status=StatusSnapshot(
-            current_generation_id=status["current_generation_id"],
-            published_generation_id=status["published_generation_id"],
-            represented_generation_id=status["represented_generation_id"],
-            is_published=status["is_published"],
-            publication_integrity=status["publication_integrity"],
-            metric=status["metric"],
-            phases=status["phases"],
-            summary_present=status["summary_present"],
-            result_context=status["result_context"],
-            published_config_matches_current=status["published_config_matches_current"],
-            result_phase_plan=status["result_phase_plan"],
+        status=StatusSnapshot.model_validate(
+            {
+                "current_generation_id": status["current_generation_id"],
+                "published_generation_id": status["published_generation_id"],
+                "represented_generation_id": status["represented_generation_id"],
+                "is_published": status["is_published"],
+                "publication_integrity": status["publication_integrity"],
+                "metric": status["metric"],
+                "phases": status["phases"],
+                "summary_present": status["summary_present"],
+                "result_context": status["result_context"],
+                "published_config_matches_current": status["published_config_matches_current"],
+                "result_phase_plan": status["result_phase_plan"],
+            }
         ),
         winners=winner_snapshots,
         represented_config_fingerprint=(

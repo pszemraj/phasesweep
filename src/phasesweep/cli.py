@@ -618,12 +618,11 @@ def _raise_on_failed_publication(
 ) -> None:
     """Escalate an unusable publication verdict to its typed operator error.
 
-    Reads the verdict of the resolution that was just rendered rather than
-    re-resolving the pointer, so the exit status can never disagree with what
-    the operator was shown.
+    Uses the supplied resolution without re-resolving the pointer, so output
+    and exit status describe the same publication.
 
     :param str experiment: Experiment the publication belongs to.
-    :param str integrity: ``publication_integrity`` of the rendered resolution.
+    :param str integrity: ``publication_integrity`` of the supplied resolution.
     :param str | None error: ``publication_error`` beside a ``failed`` or ``permission_denied`` verdict.
     :param Path workdir: Artifact root holding the generation namespaces.
     :raises PublicationAccessError: Publication validation was denied by permissions.
@@ -667,17 +666,9 @@ def _show_experiment_winners(experiment: Experiment) -> None:
     """
     validate_ledger(experiment)
     publication = _resolve_publication_pointer(experiment)
-    if publication.state == "permission_denied":
-        raise _publication_access_error(
-            f"Experiment {experiment.experiment!r}",
-            str(publication.error),
-        )
-    if publication.state == "failed":
-        raise _publication_integrity_error(
-            f"Experiment {experiment.experiment!r}",
-            str(publication.error),
-            _experiment_dir(experiment),
-        )
+    _raise_on_failed_publication(
+        experiment.experiment, publication.state, publication.error, _experiment_dir(experiment)
+    )
     validated = publication.validated
     phase_plan: list[tuple[str, str | None]] = [(p.name, p.comment) for p in experiment.phases]
     if validated is not None:

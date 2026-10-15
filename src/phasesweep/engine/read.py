@@ -21,6 +21,7 @@ validated publication (pinned, unfinished, or failed) is read from its files.
 from __future__ import annotations
 
 import logging
+import typing
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +81,25 @@ generation's own recorded summary, so they describe the result as it was
 produced. ``"current_config"``: no represented result is available, so the
 currently loaded config describes the status payload.
 """
+
+
+class EngineStatus(typing.TypedDict):
+    """Current or frozen path-free status facts shared by engine and MCP readers."""
+
+    experiment: typing.NotRequired[str]
+    current_generation_id: str | None
+    published_generation_id: str | None
+    represented_generation_id: str | None
+    is_published: bool
+    publication_integrity: PublicationState | Literal["unknown"]
+    publication_error: typing.NotRequired[str | None]
+    result_context: ResultContext
+    published_config_matches_current: bool | None
+    result_phase_plan: list[str]
+    metric: JsonObject
+    phases: list[JsonObject]
+    summary_present: bool
+    tracking_delivery: typing.NotRequired[dict[str, int]]
 
 
 @dataclass(frozen=True)
@@ -362,11 +382,11 @@ _OBJECTIVE_EVIDENCE_KEYS = frozenset(_ObjectiveEvidenceFields.model_fields)
 """The ``objective_evidence`` keys, taken from the model its writers declare."""
 
 
-def _recorded_objective_evidence(candidate: object) -> dict[str, str | bool] | None:
+def _recorded_objective_evidence(candidate: object) -> JsonObject | None:
     """Return a complete current-format assurance payload, if present.
 
     :param object candidate: Summary ``objective_evidence`` value.
-    :return dict[str, str | bool] | None: Complete recorded flags, or ``None``.
+    :return JsonObject | None: Complete recorded flags, or ``None``.
     """
     if not isinstance(candidate, Mapping) or set(candidate) != _OBJECTIVE_EVIDENCE_KEYS:
         return None
@@ -406,7 +426,7 @@ def read_status(
     *,
     generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
-) -> dict[str, Any]:
+) -> EngineStatus:
     """Per-phase trial counts and winner presence for one experiment.
 
     The payload is always path-free: no field ever carries a filesystem path.
@@ -514,7 +534,7 @@ def read_status(
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` is not a safe generation name.
-    :return dict[str, Any]: A mapping with the experiment name, the four
+    :return EngineStatus: A mapping with the experiment name, the four
         identity fields above, ``publication_integrity`` (plus
         ``publication_error`` only when validation failed or was denied), the metric
         descriptor, a per-phase list of trial counts plus winner presence, and
@@ -548,7 +568,7 @@ def read_result(
     generation_id: str | None = None,
     comparison_experiment: Experiment | None = None,
     phase_names: Sequence[str] | None = None,
-) -> tuple[dict[str, Any], list[PhaseWinnerView]]:
+) -> tuple[EngineStatus, list[PhaseWinnerView]]:
     """Read status and the represented generation's winners from one pointer resolution.
 
     A caller that reports both must use this single read: separate pointer
@@ -569,7 +589,7 @@ def read_result(
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` or an explicit phase name is not safe.
-    :return tuple[dict[str, Any], list[PhaseWinnerView]]: The path-free
+    :return tuple[EngineStatus, list[PhaseWinnerView]]: The path-free
         :func:`read_status` payload and one winner view per recorded phase
         that has a usable winner.
     """
@@ -597,7 +617,7 @@ def _read_status(
     *,
     generation_id: str | None,
     comparison_experiment: Experiment | None,
-) -> tuple[dict[str, Any], PublicationPointer]:
+) -> tuple[EngineStatus, PublicationPointer]:
     """Build the :func:`read_status` payload and return the resolution behind it.
 
     :param Experiment experiment: Parsed experiment config whose phases are inspected.
@@ -607,7 +627,7 @@ def _read_status(
     :raises ArtifactRootConflictError: If the artifact root cannot be read or
         is bound to a different storage ledger or experiment.
     :raises ValueError: If ``generation_id`` is not a safe generation name.
-    :return tuple[dict[str, Any], PublicationPointer]: The status payload and
+    :return tuple[EngineStatus, PublicationPointer]: The status payload and
         the single pointer resolution every fact in it came from.
     """
     ledger = validate_ledger(experiment)
@@ -650,7 +670,7 @@ def _read_status(
     # interpretation; only when it records none does the current config
     # describe the result.
     comparison = comparison_experiment or experiment
-    metric_payload = _metric_semantics_payload(comparison.metric)
+    metric_payload: JsonObject = _metric_semantics_payload(comparison.metric)
     result_phase_plan = [phase.name for phase in experiment.phases]
     result_context: ResultContext = "current_config"
     summary_payload: Mapping[str, Any] | None
@@ -712,18 +732,13 @@ def _read_status(
 
     publication_state: PublicationState = publication.state
 
-    status = {
+    status: EngineStatus = {
         "experiment": experiment.experiment,
         "current_generation_id": current_generation_id,
         "published_generation_id": published_generation_id,
         "represented_generation_id": represented_generation_id,
         "is_published": is_published,
         "publication_integrity": publication_state,
-        **(
-            {"publication_error": publication.error}
-            if publication.state in {"failed", "permission_denied"}
-            else {}
-        ),
         "result_context": result_context,
         "published_config_matches_current": published_config_matches_current,
         "result_phase_plan": result_phase_plan,
@@ -766,6 +781,8 @@ def _read_status(
         ),
         "summary_present": summary_present,
     }
+    if publication.state in {"failed", "permission_denied"}:
+        status["publication_error"] = publication.error
     return status, publication
 
 

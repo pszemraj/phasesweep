@@ -29,7 +29,7 @@ from phasesweep.engine.paths import (
     _generation_winner_path,
     _last_successful_generation_path,
 )
-from phasesweep.engine.read import PhaseWinnerView, read_result
+from phasesweep.engine.read import EngineStatus, PhaseWinnerView, read_result
 from phasesweep.engine.run import run_experiment
 from phasesweep.engine.state import (
     STUDY_SCHEMA_ATTR,
@@ -43,16 +43,16 @@ from phasesweep.mcp.errors import (
     RunSnapshotUnavailableError,
     UnknownRunError,
 )
+from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
-from phasesweep.mcp.runs import RunHandle, RunnerView, RunStore
+from phasesweep.mcp.runs import RunHandle, RunStore
 from phasesweep.mcp.server import (
     AwaitRunResult,
     GetRunResultsResult,
     GetRunStatusResult,
 )
-from phasesweep.mcp.snapshots import capture_result_snapshot
+from phasesweep.mcp.snapshots import RunResultSnapshot, capture_result_snapshot
 from phasesweep.mcp.tools import PhaseSweepMCP
-from phasesweep.runtime.json import JsonObject
 from tests.conftest import (
     write_constant_trainer,
 )
@@ -609,21 +609,19 @@ def test_run_scoped_status_refreshes_state_when_snapshot_finishes(
     assert complete is not None
     write_run_status(store, **{**complete, "result_snapshot_state": "pending"})
     monkeypatch.setattr(store, "runner_may_be_alive", lambda _handle, **_view: True)
-    original_run_payload = app._run_payload
+    original_load_config = app._load_run_experiment
     finalized = False
 
-    def finish_after_run_payload(
-        saved: RunHandle, view: RunnerView | None = None, **force: bool
-    ) -> JsonObject:
+    def finish_after_config_snapshot(saved: RunHandle) -> Experiment:
         nonlocal finalized
-        run = original_run_payload(saved, view, **force)
+        experiment = original_load_config(saved)
         if not finalized:
-            assert run["state"] == "running"
+            assert store.state(saved) == "running"
             finalized = True
             write_run_status(store, **complete)
-        return run
+        return experiment
 
-    monkeypatch.setattr(app, "_run_payload", finish_after_run_payload)
+    monkeypatch.setattr(app, "_load_run_experiment", finish_after_config_snapshot)
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     payload = (
@@ -801,22 +799,22 @@ def test_run_scoped_status_refreshes_cleanup_added_after_frozen_snapshot(
     assert handle is not None
     complete = store.recorded_terminal_status(handle)
     assert complete is not None
-    original_run_payload = app._run_payload
+    original_status_payload = app._snapshot_status_payload
     marked = False
 
-    def reserve_after_run_payload(
-        saved: RunHandle, view: RunnerView | None = None, **force: bool
-    ) -> JsonObject:
+    def reserve_after_snapshot_payload(
+        experiment_id: str, snapshot: RunResultSnapshot, *, result_source: ResultSource
+    ) -> EngineStatus:
         nonlocal marked
-        run = original_run_payload(saved, view, **force)
+        status = original_status_payload(experiment_id, snapshot, result_source=result_source)
         if not marked:
-            assert run["state"] == "succeeded"
+            assert store.state(handle) == "succeeded"
             marked = True
             write_run_status(store, **{**complete, "cleanup_confirmed": False})
-            store.mark_cleanup_uncertain(saved)
-        return run
+            store.mark_cleanup_uncertain(handle)
+        return status
 
-    monkeypatch.setattr(app, "_run_payload", reserve_after_run_payload)
+    monkeypatch.setattr(app, "_snapshot_status_payload", reserve_after_snapshot_payload)
     monkeypatch.setattr("phasesweep.mcp.tools.AWAIT_MIN_TIMEOUT_SECONDS", 0)
 
     payload = (

@@ -26,7 +26,6 @@ from phasesweep import __version__
 from phasesweep.config.common import SAFE_NAME_PATTERN
 from phasesweep.engine.read import ResultContext as ResultContextLiteral
 from phasesweep.engine.state import TrialStateName, WinnerSourceKind
-from phasesweep.evidence.models import _ObjectiveEvidenceFields
 from phasesweep.mcp import MCP_EXTRA_INSTALL_COMMAND, agent_prompt_text
 from phasesweep.mcp.audit import AUDIT_LOG_NAME, AuditLogger, AuditTransport
 from phasesweep.mcp.errors import CatalogError, McpToolError
@@ -34,7 +33,12 @@ from phasesweep.mcp.redaction import ResultSource
 from phasesweep.mcp.registry import Registry
 from phasesweep.mcp.runner import FailurePayload
 from phasesweep.mcp.runs import RunState, RunStore
-from phasesweep.mcp.snapshots import ConfoundSummary, McpPublicationState, RepeatsSpread
+from phasesweep.mcp.snapshots import (
+    ConfoundSummary,
+    McpPublicationState,
+    MetricSnapshot,
+    RepeatsSpread,
+)
 from phasesweep.mcp.tool_names import (
     TOOL_AWAIT_RUN,
     TOOL_CANCEL_RUN,
@@ -236,27 +240,6 @@ class _ToolPayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ObjectiveEvidencePayload(_ToolPayload, _ObjectiveEvidenceFields):
-    """Assurance properties enforced by the configured objective extractor.
-
-    See :func:`phasesweep.evidence.models.objective_evidence_assurance` for
-    exactly what each flag means and which runtime checks back it.
-    """
-
-
-class MetricPayload(_ToolPayload):
-    """Optimization metric descriptor."""
-
-    name: str = Field(description="Metric key extracted from trial output.")
-    goal: Literal["minimize", "maximize"] = Field(description="Optimization direction.")
-    objective_evidence: ObjectiveEvidencePayload = Field(
-        description=(
-            "False flags mean the identity is not enforced, not that it failed. kind names the "
-            "extractor. Only json_envelope, wandb and mlflow bind an evaluation position."
-        )
-    )
-
-
 class CapabilitiesPayload(_ToolPayload):
     """Catalog-authorized actions for one experiment."""
 
@@ -273,7 +256,7 @@ class ExperimentSummaryPayload(_ToolPayload):
     id: ExperimentId
     description: str = Field(description="Operator-authored catalog description.")
     phases: list[PhaseName] = Field(description="Declared phases, in execution order.")
-    metric: MetricPayload
+    metric: MetricSnapshot
     capabilities: CapabilitiesPayload
 
 
@@ -356,7 +339,7 @@ class InspectExperimentResult(_ToolPayload):
     """Structured output for inspect_experiment."""
 
     experiment_id: ExperimentId
-    metric: MetricPayload
+    metric: MetricSnapshot
     capabilities: CapabilitiesPayload
     phases: list[PhaseValidationPayload]
 
@@ -514,7 +497,7 @@ class GetRunStatusResult(_ToolPayload):
             "run would execute."
         )
     )
-    metric: MetricPayload
+    metric: MetricSnapshot
     phases: list[PhaseStatusPayload]
     summary_present: bool
     run: RunPayload
@@ -649,7 +632,7 @@ class GetRunResultsResult(_ToolPayload):
     publication_integrity: PublicationIntegrity
     result_context: ResultContext
     published_config_matches_current: PublishedConfigMatchesCurrent
-    metric: MetricPayload
+    metric: MetricSnapshot
     declared_phase_count: int = Field(
         ge=0, description="Phases the represented generation's own plan declared."
     )
@@ -1051,16 +1034,15 @@ def _open_app(registry: Registry, transport: AuditTransport) -> PhaseSweepMCP:
     return PhaseSweepMCP(registry, RunStore(registry.state_dir), audit=audit)
 
 
-def serve(catalog: Path) -> int:
-    """Load the catalog, build the run store, and serve the nine tools over stdio.
+def _load_server_registry(catalog: Path, *, log_level: int) -> Registry | None:
+    """Configure stderr logging and load a catalog when MCP support is installed.
 
     :param Path catalog: Operator-authored catalog file.
-    :return int: Process exit code, where 2 means a startup prerequisite or
-        catalog validation failed before the server could run.
+    :param int log_level: Logging level for the selected server transport.
+    :return Registry | None: Loaded registry, or None after reporting a startup failure.
     """
-    # stdio transport owns stdout for JSON-RPC. All logging goes to stderr.
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         stream=sys.stderr,
         format="%(asctime)s %(levelname).1s %(name)s %(message)s",
         datefmt="%H:%M:%S",
@@ -1072,12 +1054,24 @@ def serve(catalog: Path) -> int:
             f"`{MCP_EXTRA_INSTALL_COMMAND}`.",
             file=sys.stderr,
         )
-        return 2
+        return None
 
     try:
-        registry = Registry.load(catalog)
+        return Registry.load(catalog)
     except CatalogError as exc:
         print(f"phasesweep mcp: {exc}", file=sys.stderr)
+        return None
+
+
+def serve(catalog: Path) -> int:
+    """Load the catalog, build the run store, and serve the nine tools over stdio.
+
+    :param Path catalog: Operator-authored catalog file.
+    :return int: Process exit code, where 2 means a startup prerequisite or
+        catalog validation failed before the server could run.
+    """
+    registry = _load_server_registry(catalog, log_level=logging.INFO)
+    if registry is None:
         return 2
 
     build_server(_open_app(registry, "stdio")).run(transport="stdio")
@@ -1099,25 +1093,8 @@ def call(catalog: Path, tool: str, arguments: JsonObject) -> int:
         JSON on stdout, 1 after a tool error is printed on stderr, and 2 when a
         startup prerequisite or the catalog failed before the tool could run.
     """
-    logging.basicConfig(
-        level=logging.WARNING,
-        stream=sys.stderr,
-        format="%(asctime)s %(levelname).1s %(name)s %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
-    if importlib.util.find_spec("mcp") is None:
-        print(
-            f"phasesweep mcp: MCP support is not installed; install with "
-            f"`{MCP_EXTRA_INSTALL_COMMAND}`.",
-            file=sys.stderr,
-        )
-        return 2
-
-    try:
-        registry = Registry.load(catalog)
-    except CatalogError as exc:
-        print(f"phasesweep mcp: {exc}", file=sys.stderr)
+    registry = _load_server_registry(catalog, log_level=logging.WARNING)
+    if registry is None:
         return 2
 
     if tool == TOOL_LAUNCH_RUN and not in_initial_pid_namespace():
